@@ -27,6 +27,45 @@ GEMINI_ENV_FALLBACKS = (
     Path("/Users/ultra/xp/ExpenseSyncBot/.env"),
 )
 
+# Short default for the interactive multi-call modes; classic review keeps 1200s.
+PANEL_TIMEOUT_DEFAULT = 240
+MODERATOR_CANDIDATES = ("codex", "gemini")
+
+# Distinct expert personas for brainstorm rotation (pool >= 5). Each round assigns
+# >= 3 of these, rotating so backends see a fresh role each round.
+PERSONAS = (
+    (
+        "Pragmatic staff engineer",
+        "20 years shipping production systems; values simplicity, "
+        "incremental delivery, and proven tech over novelty.",
+    ),
+    (
+        "Security-paranoid reviewer",
+        "thinks adversarially about every input, trust boundary, secret, "
+        "and failure mode; assumes the worst actor and the worst case.",
+    ),
+    (
+        "DX / ergonomics designer",
+        "obsessed with developer and user experience: clear APIs, good "
+        "defaults, discoverability, error messages, and minimal friction.",
+    ),
+    (
+        "Skeptical SRE",
+        "cares about operability, observability, blast radius, rollback, "
+        "and what breaks at 3am; distrusts anything without a failure plan.",
+    ),
+    (
+        "Product-minded architect",
+        "connects technical choices to user value and roadmap; weighs "
+        "long-term flexibility against time-to-market.",
+    ),
+    (
+        "Cost-conscious performance engineer",
+        "watches latency, throughput, token/compute spend, and resource "
+        "footprint; allergic to waste and premature scale.",
+    ),
+)
+
 
 @dataclass(frozen=True)
 class ReviewResult:
@@ -91,7 +130,9 @@ def _split_models(raw: list[str]) -> list[str]:
     return values
 
 
-def _payload(prompt: str, diff: str) -> str:
+def _payload(prompt: str, diff: str = "") -> str:
+    if not diff.strip():
+        return prompt
     return f"{prompt}\n\n```diff\n{diff}\n```"
 
 
@@ -142,12 +183,18 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int)
         tmp = Path(tmp_raw)
         _run(["git", "init", "-q"], cwd=tmp, timeout=30)
         _ensure_opencode_readonly_agent(tmp, oc_model)
-        context = tmp / "review.diff"
-        context.write_text(diff, encoding="utf-8")
-        message = (
-            f"{prompt}\n\nYou are running outside the source repo; do not edit files. "
-            f"Review this diff:\n\n```diff\n{diff}\n```"
-        )
+        if diff.strip():
+            context = tmp / "review.diff"
+            context.write_text(diff, encoding="utf-8")
+            message = (
+                f"{prompt}\n\nYou are running outside the source repo; do not edit files. "
+                f"Review this diff:\n\n```diff\n{diff}\n```"
+            )
+        else:
+            message = (
+                f"{prompt}\n\nYou are running outside any source repo; do not edit files "
+                "or run shell commands. Answer based on the prompt alone."
+            )
         argv = [
             _which("opencode"),
             "run",
@@ -264,14 +311,223 @@ def format_result(result: ReviewResult) -> str:
     return "\n\n".join(parts)
 
 
+def backend_available(model: str) -> bool:
+    """Cheap availability probe so moderator selection never picks a dead backend."""
+    backend = resolve_backend(model)
+    try:
+        if backend is review_gemini:
+            _gemini_key()
+            return True
+        if backend is review_codex:
+            _which("codex")
+            return True
+        if backend is review_claude:
+            _which("claude-p")
+            return True
+        if backend is review_opencode:
+            _which("opencode")
+            return True
+    except RuntimeError:
+        return False
+    return False
+
+
+def pick_moderator(explicit: str | None, panel: list[str]) -> str:
+    if explicit:
+        return explicit
+    for candidate in MODERATOR_CANDIDATES:
+        if backend_available(candidate):
+            return candidate
+    return panel[0]
+
+
+@dataclass(frozen=True)
+class PanelJob:
+    model: str
+    prompt: str
+    diff: str = ""
+    label: str | None = None
+
+
+def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResult]:
+    """Run jobs in parallel, returning results in the SAME order as `jobs`."""
+    results: list[ReviewResult | None] = [None] * len(jobs)
+    if not jobs:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = {
+            pool.submit(resolve_backend(job.model), job.model, job.prompt, job.diff, cwd, timeout): index
+            for index, job in enumerate(jobs)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            index = futures[future]
+            model = jobs[index].label or jobs[index].model
+            try:
+                base = future.result()
+                results[index] = ReviewResult(
+                    model=jobs[index].label or base.model,
+                    command=base.command,
+                    returncode=base.returncode,
+                    stdout=base.stdout,
+                    stderr=base.stderr,
+                )
+            except Exception as exc:  # noqa: BLE001 - report, never crash the panel
+                results[index] = ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc))
+    return [r for r in results if r is not None]
+
+
+def run_single(model: str, prompt: str, cwd: Path, timeout: int, diff: str = "") -> ReviewResult:
+    return run_panel([PanelJob(model=model, prompt=prompt, diff=diff)], cwd, timeout)[0]
+
+
+def _diff_context_block(diff: str) -> str:
+    if not diff.strip():
+        return ""
+    return f"\n\nAdditional context — a git diff:\n\n```diff\n{diff}\n```"
+
+
+def mode_just_ask(question: str, models: list[str], diff: str, cwd: Path, timeout: int) -> int:
+    prompt = (
+        "Answer this question directly and concisely. Do not edit files or run commands.\n\n"
+        f"QUESTION:\n{question}" + _diff_context_block(diff)
+    )
+    jobs = [PanelJob(model=model, prompt=prompt, diff="") for model in models]
+    results = run_panel(jobs, cwd, timeout)
+    print("\n\n---\n\n".join(format_result(r) for r in results))
+    return 0 if all(r.returncode == 0 for r in results) else 1
+
+
+def mode_quorum(question: str, models: list[str], diff: str, cwd: Path, timeout: int, moderator: str) -> int:
+    expert_prompt = (
+        "You are one expert on a panel. Give a clear RECOMMENDATION on the question below. "
+        "Cite concrete evidence for every claim (file path, line number, command output, "
+        "or a verifiable fact). If you do not have an evidence base to answer, say exactly "
+        "'INSUFFICIENT EVIDENCE' and explain what you would need — do NOT guess. "
+        "Do not edit files or run commands.\n\n"
+        f"QUESTION:\n{question}" + _diff_context_block(diff)
+    )
+    jobs = [PanelJob(model=model, prompt=expert_prompt, diff="") for model in models]
+    expert_results = run_panel(jobs, cwd, timeout)
+
+    transcript = "\n\n".join(
+        f"### Expert: {r.model} [{'ok' if r.returncode == 0 else f'exit {r.returncode}'}]\n"
+        f"{(r.stdout.strip() or r.stderr.strip() or '(no output)')}"
+        for r in expert_results
+    )
+    mod_prompt = (
+        "You are the MODERATOR of an expert panel. Below are independent expert answers to "
+        "one question. Produce a structured summary with exactly these sections:\n"
+        "1. QUORUM — points where a majority of experts agree AND cite evidence "
+        "(state the point, who agrees, and the evidence).\n"
+        "2. DISAGREEMENT / NO QUORUM — points where experts conflict or no majority exists.\n"
+        "3. ABSTAINED — experts who said INSUFFICIENT EVIDENCE, and on what.\n"
+        "Do not invent agreement. Do not edit files.\n\n"
+        f"QUESTION:\n{question}\n\n=== EXPERT ANSWERS ===\n{transcript}"
+    )
+    mod_result = run_single(moderator, mod_prompt, cwd, timeout)
+
+    out = ["# Expert answers", "\n\n---\n\n".join(format_result(r) for r in expert_results)]
+    out += ["\n# Moderator summary", format_result(mod_result)]
+    print("\n\n".join(out))
+    ok = all(r.returncode == 0 for r in expert_results) and mod_result.returncode == 0
+    return 0 if ok else 1
+
+
+def mode_brainstorm(
+    topic: str,
+    models: list[str],
+    cwd: Path,
+    timeout: int,
+    moderator: str,
+    rounds: int,
+    max_rounds: int,
+) -> int:
+    min_rounds = max(rounds, 5)
+    max_rounds = max(max_rounds, min_rounds)
+    panel = models  # run-as-is; personas always fill >= 3 slots even if panel < 3
+    transcript_blocks: list[str] = []
+    out: list[str] = [f"# Brainstorm: {topic}", f"panel={','.join(panel)} moderator={moderator} "
+                      f"rounds>={min_rounds} max={max_rounds}"]
+
+    persona_index = 0
+    completed = 0
+    for round_no in range(1, max_rounds + 1):
+        shared = "\n\n".join(transcript_blocks) if transcript_blocks else "(this is the first round)"
+        jobs: list[PanelJob] = []
+        # Assign >= 3 distinct personas this round, rotating across the pool.
+        slot_count = max(3, len(panel))
+        for slot in range(slot_count):
+            persona_name, persona_bg = PERSONAS[persona_index % len(PERSONAS)]
+            persona_index += 1
+            model = panel[slot % len(panel)]
+            prompt = (
+                f"You are a '{persona_name}' ({persona_bg}). You are in round {round_no} of a "
+                "multi-round brainstorm. Build on the shared transcript of prior rounds — "
+                "react, extend, challenge, or propose new angles from YOUR perspective. "
+                "Be concrete; offer ideas, not pleasantries. Do not edit files.\n\n"
+                f"TOPIC:\n{topic}\n\n=== SHARED TRANSCRIPT (prior rounds) ===\n{shared}"
+            )
+            jobs.append(PanelJob(model=model, prompt=prompt, diff="", label=f"{persona_name} ({model})"))
+
+        round_results = run_panel(jobs, cwd, timeout)
+        round_text = "\n\n".join(
+            f"#### {r.model}\n{(r.stdout.strip() or r.stderr.strip() or '(no output)')}"
+            for r in round_results
+        )
+        transcript_blocks.append(f"## Round {round_no}\n{round_text}")
+        out.append(f"\n# Round {round_no}\n" + "\n\n---\n\n".join(format_result(r) for r in round_results))
+        completed = round_no
+
+        # Moderator summary + continue/stop decision (cannot stop before min_rounds).
+        mod_prompt = (
+            "You are the MODERATOR of a brainstorm. Summarize the round below in a few bullets, "
+            "then decide whether the discussion has CONVERGED / saturated (diminishing new ideas). "
+            "End your reply with a final line that is EXACTLY one of: 'DECISION: STOP' or "
+            "'DECISION: CONTINUE'.\n\n"
+            f"TOPIC:\n{topic}\n\n=== ROUND {round_no} ===\n{round_text}"
+        )
+        mod_result = run_single(moderator, mod_prompt, cwd, timeout)
+        out.append(f"\n## Moderator (round {round_no})\n" + format_result(mod_result))
+
+        if round_no < min_rounds:
+            continue
+        decision = mod_result.stdout.upper()
+        if "DECISION: STOP" in decision:
+            break
+
+    # Final synthesis.
+    full_transcript = "\n\n".join(transcript_blocks)
+    synth_prompt = (
+        "You are the MODERATOR. The brainstorm is complete. Read the full transcript and produce a "
+        "final synthesis with: BEST IDEAS (ranked), TRADEOFFS, and a single concrete RECOMMENDATION.\n\n"
+        f"TOPIC:\n{topic}\n\n=== FULL TRANSCRIPT ({completed} rounds) ===\n{full_transcript}"
+    )
+    synth = run_single(moderator, synth_prompt, cwd, timeout)
+    out.append("\n# Final synthesis\n" + format_result(synth))
+    print("\n\n".join(out))
+    return 0 if synth.returncode == 0 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run read-only code reviews across multiple model backends.")
     parser.add_argument("-m", "--model", action="append", default=[], help="model/backend to run; repeat or comma-separate")
     parser.add_argument("-C", "--cwd", default=".", help="repository directory")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="review prompt")
     parser.add_argument("--staged", action="store_true", help="review staged diff instead of unstaged diff")
-    parser.add_argument("--timeout", type=int, default=1200, help="per-review timeout seconds")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="per-call timeout seconds (default 1200 for review, 240 for panel modes)",
+    )
     parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
+    parser.add_argument("--moderator", default=None, help="moderator backend for --quorum/--brainstorm")
+    parser.add_argument("--rounds", type=int, default=5, help="brainstorm minimum rounds (min & default 5)")
+    parser.add_argument("--max-rounds", type=int, default=8, help="brainstorm hard cap on rounds")
+    panel = parser.add_mutually_exclusive_group()
+    panel.add_argument("--just-ask", metavar="QUESTION", help="ask all backends a plain question, no diff required")
+    panel.add_argument("--quorum", metavar="QUESTION", help="experts answer + moderator finds quorum/disagreement")
+    panel.add_argument("--brainstorm", metavar="TOPIC", help="multi-round persona ideation with a moderator")
     args = parser.parse_args(argv)
 
     if args.list_defaults:
@@ -280,9 +536,25 @@ def main(argv: list[str] | None = None) -> int:
 
     cwd = Path(args.cwd).expanduser().resolve()
     models = _split_models(args.model) or list(DEFAULT_MODELS)
+
+    panel_mode = args.just_ask or args.quorum or args.brainstorm
+    timeout = args.timeout if args.timeout is not None else (PANEL_TIMEOUT_DEFAULT if panel_mode else 1200)
+
+    # Diff is optional in panel modes (piped/--staged used as context if present).
     diff = _read_stdin_if_piped()
-    if diff is None:
+    if diff is None and (args.staged or not panel_mode):
         diff = _git_diff(cwd, args.staged)
+    diff = diff or ""
+
+    if args.just_ask is not None:
+        return mode_just_ask(args.just_ask, models, diff, cwd, timeout)
+    if args.quorum is not None:
+        return mode_quorum(args.quorum, models, diff, cwd, timeout, pick_moderator(args.moderator, models))
+    if args.brainstorm is not None:
+        return mode_brainstorm(
+            args.brainstorm, models, cwd, timeout, pick_moderator(args.moderator, models), args.rounds, args.max_rounds
+        )
+
     if not diff.strip():
         print("No diff to review.", file=sys.stderr)
         return 1
@@ -290,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
     results: list[ReviewResult] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
         futures = {
-            pool.submit(resolve_backend(model), model, args.prompt, diff, cwd, args.timeout): model
+            pool.submit(resolve_backend(model), model, args.prompt, diff, cwd, timeout): model
             for model in models
         }
         for future in concurrent.futures.as_completed(futures):
