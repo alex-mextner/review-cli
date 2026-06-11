@@ -120,6 +120,35 @@ def test_timeout_preserves_partial_output():
     assert "TIMEOUT" in result.stdout, "TIMEOUT marker missing from the preserved buffer"
 
 
+def test_flushed_partial_line_survives_timeout():
+    """Output that is FLUSHED without a trailing newline must still be captured.
+
+    Line-buffered iteration would hold a newline-less chunk until a newline or EOF;
+    if an escaped descendant keeps the pipe open, EOF never comes in the grace window
+    and that already-written text would be lost. Chunk-based reads must capture it.
+    """
+    code = (
+        "import sys, subprocess, time\n"
+        "sys.stdout.write('partial-no-newline')\n"  # flushed, but NO newline
+        "sys.stdout.flush()\n"
+        # escaped descendant keeps stdout open so the parent's pipe never EOFs
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "start_new_session=True)\n"
+        "time.sleep(60)\n"
+    )
+    argv = [sys.executable, "-c", code]
+
+    result = review._run_streamed(
+        argv, cwd=REPO_ROOT, timeout=2, backend="faketest-partial", round_no=7
+    )
+
+    assert result.returncode == 124
+    assert "partial-no-newline" in result.stdout, (
+        "flushed newline-less output was lost on timeout"
+    )
+    assert "TIMEOUT" in result.stdout
+
+
 def test_timeout_kills_process_tree_without_hanging():
     """A backend that spawns a grandchild inheriting stdout must NOT hang the runner.
 

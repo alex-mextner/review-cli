@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import concurrent.futures
 import json
 import os
@@ -224,8 +225,9 @@ def _run_streamed(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
-            text=True,
-            bufsize=1,  # line-buffered text streams
+            # BINARY pipes: we read fixed CHUNKS off the raw fd (os.read), not lines, so
+            # flushed-but-newline-less output is captured immediately and is never lost
+            # if a descendant keeps the pipe open past the deadline.
             start_new_session=True,  # own process group, so we can kill the whole tree
         )
         running = proc  # non-None alias for the nested closures
@@ -241,23 +243,55 @@ def _run_streamed(
             if input_text is None or running.stdin is None:
                 return
             try:
-                running.stdin.write(input_text)
+                running.stdin.write(input_text.encode("utf-8"))
                 running.stdin.close()
             except (BrokenPipeError, ValueError, OSError):
                 pass
 
         # Both pipes are drained on DAEMON threads so the main flow never blocks on a
         # pipe that some escaped/daemonized descendant keeps open past the deadline.
-        # Each appended line is TEEd to its buffer and to the live log. Buffers are
-        # plain lists (atomic append in CPython); we snapshot them under log_lock.
+        # We os.read() chunks (returns as soon as ANY bytes are available, b'' on EOF),
+        # decode incrementally (multibyte-safe), and TEE to buffer + live log. Buffers
+        # are plain lists (atomic append in CPython); snapshotted under log_lock. The
+        # log tags stderr per line via a small remainder splitter.
         def _drain(stream, buf: list[str], tag: str) -> None:
             if stream is None:
                 return
-            for line in stream:
-                with log_lock:
-                    buf.append(line)
-                    log_fh.write((tag + line) if tag else line)
-                    log_fh.flush()
+            fd = stream.fileno()
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            line_rem = ""  # only for tagging stderr lines in the log
+            try:
+                while True:
+                    try:
+                        chunk = os.read(fd, 65536)
+                    except OSError:
+                        break
+                    if not chunk:  # EOF
+                        text = decoder.decode(b"", final=True)
+                    else:
+                        text = decoder.decode(chunk)
+                    if text:
+                        with log_lock:
+                            buf.append(text)
+                            if tag:
+                                line_rem += text
+                                while "\n" in line_rem:
+                                    one, line_rem = line_rem.split("\n", 1)
+                                    log_fh.write(tag + one + "\n")
+                            else:
+                                log_fh.write(text)
+                            log_fh.flush()
+                    if not chunk:
+                        if tag and line_rem:  # flush a trailing tagged remainder
+                            with log_lock:
+                                log_fh.write(tag + line_rem + "\n")
+                                log_fh.flush()
+                        break
+            finally:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
         stdin_thread = threading.Thread(target=_feed_stdin, daemon=True)
         stdout_thread = threading.Thread(target=_drain, args=(proc.stdout, out_buf, ""), daemon=True)
