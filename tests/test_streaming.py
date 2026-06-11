@@ -262,6 +262,49 @@ def test_timeout_when_grandchild_escapes_the_process_group():
     assert result.returncode == 124
 
 
+def test_no_daemon_traceback_when_escaped_writer_outlives_close():
+    """An escaped descendant that KEEPS WRITING after the runner returns and closes the
+    log must not crash the still-alive daemon drain thread (write-after-close).
+
+    Run in a child process so we can assert its stderr carries no traceback.
+    """
+    import subprocess as _sp
+    import tempfile
+
+    driver = (
+        "import os, sys, time\n"
+        "os.environ.setdefault('REVIEW_LOG_DIR', %r)\n"
+        "import importlib.util as u\n"
+        "from importlib.machinery import SourceFileLoader\n"
+        "loader = SourceFileLoader('rv', %r)\n"
+        "spec = u.spec_from_loader('rv', loader); rv = u.module_from_spec(spec)\n"
+        "sys.modules['rv'] = rv; loader.exec_module(rv)\n"
+        "code = (\n"
+        "  \"import sys, subprocess, time\\n\"\n"
+        "  \"print('p', flush=True)\\n\"\n"
+        "  \"subprocess.Popen([sys.executable,'-c','import sys,time\\\\nwhile True:\\\\n \"\n"
+        "  \"sys.stdout.write(chr(120))\\\\n sys.stdout.flush()\\\\n time.sleep(0.2)'], \"\n"
+        "  \"start_new_session=True)\\n\"\n"
+        "  \"time.sleep(60)\\n\"\n"
+        ")\n"
+        "r = rv._run_streamed([sys.executable,'-c',code], cwd=rv.Path('.'), timeout=2, "
+        "backend='postclose', round_no=1)\n"
+        "assert r.returncode == 124 and 'p' in r.stdout\n"
+        "time.sleep(2)\n"  # let any post-close daemon write surface as a traceback
+        "print('DRIVER_OK')\n"
+    ) % (tempfile.mkdtemp(), str(BIN_REVIEW))
+
+    proc = _sp.run([sys.executable, "-c", driver], cwd=str(REPO_ROOT),
+                   capture_output=True, text=True, timeout=40)
+    # cleanup any survivors the driver spawned
+    _sp.run(["pkill", "-f", "while True"], capture_output=True)
+    assert "DRIVER_OK" in proc.stdout, f"driver failed: {proc.stdout}\n{proc.stderr}"
+    lowered = proc.stderr.lower()
+    assert "traceback" not in lowered and "exception in thread" not in lowered, (
+        f"daemon thread wrote after close:\n{proc.stderr}"
+    )
+
+
 def test_log_file_is_private():
     """Logs may contain reviewed prompts/diffs, so files must be 0600 (owner-only)."""
     import stat

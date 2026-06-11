@@ -205,6 +205,7 @@ def _run_streamed(
     out_buf: list[str] = []
     err_buf: list[str] = []
     log_lock = threading.Lock()
+    stopping = threading.Event()
     timed_out = False
     proc: subprocess.Popen | None = None
     pgid: int | None = None
@@ -248,6 +249,21 @@ def _run_streamed(
             except (BrokenPipeError, ValueError, OSError):
                 pass
 
+        # `stopping` (defined above) lets the finalizer tell still-alive drain threads
+        # (an escaped descendant can keep a pipe open past the bounded joins) to stop
+        # touching the shared buffers and the log handle, so nothing writes after the
+        # result is built or after log_fh is closed.
+        def _log_write(text: str) -> None:
+            # Guarded so a drain thread that wakes after close()/stop is a silent no-op
+            # rather than a daemon-thread traceback.
+            if stopping.is_set():
+                return
+            try:
+                log_fh.write(text)
+                log_fh.flush()
+            except (ValueError, OSError):  # closed handle / write error
+                pass
+
         # Both pipes are drained on DAEMON threads so the main flow never blocks on a
         # pipe that some escaped/daemonized descendant keeps open past the deadline.
         # We os.read() chunks (returns as soon as ANY bytes are available, b'' on EOF),
@@ -261,7 +277,7 @@ def _run_streamed(
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             line_rem = ""  # only for tagging stderr lines in the log
             try:
-                while True:
+                while not stopping.is_set():
                     try:
                         chunk = os.read(fd, 65536)
                     except OSError:
@@ -272,20 +288,20 @@ def _run_streamed(
                         text = decoder.decode(chunk)
                     if text:
                         with log_lock:
+                            if stopping.is_set():
+                                break
                             buf.append(text)
                             if tag:
                                 line_rem += text
                                 while "\n" in line_rem:
                                     one, line_rem = line_rem.split("\n", 1)
-                                    log_fh.write(tag + one + "\n")
+                                    _log_write(tag + one + "\n")
                             else:
-                                log_fh.write(text)
-                            log_fh.flush()
+                                _log_write(text)
                     if not chunk:
                         if tag and line_rem:  # flush a trailing tagged remainder
                             with log_lock:
-                                log_fh.write(tag + line_rem + "\n")
-                                log_fh.flush()
+                                _log_write(tag + line_rem + "\n")
                         break
             finally:
                 try:
@@ -312,15 +328,17 @@ def _run_streamed(
             except subprocess.TimeoutExpired:
                 pass
 
-        # The process has exited (or been killed). Give stdout a short grace window to
-        # flush. If the reader is STILL blocked, a child the parent left behind is
-        # holding the pipe open — reap the whole group to free our fd so we never hang.
+        # The process has exited (or been killed). Give the readers a short grace window
+        # to flush. If EITHER is STILL blocked, a child is holding a pipe open — reap
+        # the whole group to free our fds so we never hang.
         stdout_thread.join(timeout=2)
-        if stdout_thread.is_alive():
+        stderr_thread.join(timeout=2)
+        if stdout_thread.is_alive() or stderr_thread.is_alive():
             _kill_tree(proc, pgid)
-        # Final bounded joins: if a descendant escaped the group entirely and keeps the
-        # fd open, these time out and we return the partial buffer anyway — the daemon
-        # readers can't block interpreter exit, and buffers are read under the lock.
+        # Final bounded joins: if a descendant escaped the group entirely and keeps an
+        # fd open, these time out and we return the partial buffer anyway. We then SET
+        # `stopping` so any drain thread still alive stops touching the buffers/log
+        # before we snapshot and the finally closes log_fh.
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
         stdin_thread.join(timeout=1)
@@ -330,21 +348,28 @@ def _run_streamed(
             returncode = 124  # conventional timeout exit code (overrides the kill signal)
 
         with log_lock:
+            stopping.set()  # freeze the buffers + stop late log writes
             stdout = "".join(out_buf)
             stderr = "".join(err_buf)
-        if timed_out:
-            marker = f"\n[review-cli] TIMEOUT after {timeout}s — partial output above]\n"
-            stdout += marker
-            with log_lock:
-                log_fh.write(marker)
-                log_fh.flush()
+            if timed_out:
+                marker = f"\n[review-cli] TIMEOUT after {timeout}s — partial output above]\n"
+                stdout += marker
+                try:
+                    log_fh.write(marker)
+                    log_fh.flush()
+                except (ValueError, OSError):
+                    pass
         return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
     finally:
         # The log handle ALWAYS closes, even if Popen or a write raised before the
         # normal return path (the docstring's partial-output promise depends on it).
+        # Set `stopping` first so a still-alive drain thread won't write to a closing
+        # handle (no-op if already set on the normal path).
+        stopping.set()
         if proc is not None:
             _kill_tree(proc, pgid)
-        log_fh.close()
+        with log_lock:
+            log_fh.close()
 
 
 def _which(name: str) -> str:
