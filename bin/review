@@ -184,13 +184,15 @@ def _run_streamed(
 
     Unlike `_run` (subprocess.run, which blocks until exit and DROPS the buffer on
     TimeoutExpired), this:
-      * reads child stdout line-by-line as it arrives (no wait-for-exit buffering);
-      * TEEs every line to an in-memory accumulator AND a per-call log file under
-        log_dir(), flushed per line so `tail -f <path>` shows live progress;
-      * drains stderr on a side thread into both the accumulator-stderr and the log;
-      * enforces `timeout` as a wall-clock deadline; on breach it terminate()s then
-        kill()s the child's whole process group but RETURNS the partial buffer plus a
-        clear TIMEOUT marker and returncode 124 — it never raises the buffer away.
+      * drains stdout AND stderr on daemon threads, TEEing each line to an in-memory
+        accumulator AND a per-call log file under log_dir(), flushed per line so
+        `tail -f <path>` shows live progress as output arrives (no wait-for-exit);
+      * enforces `timeout` on the PROCESS via proc.wait(timeout) — NOT on pipe EOF —
+        so a leaked stdout fd held by an escaped/daemonized descendant cannot make
+        the call hang past its deadline; on timeout it SIGTERM→SIGKILLs the child's
+        whole process group, gives the readers a brief grace flush, then RETURNS the
+        partial buffer plus a clear TIMEOUT marker and returncode 124 — it never
+        raises the buffer away.
 
     Returns a CompletedProcess-compatible object (.returncode/.stdout/.stderr) so
     callers like review_codex need no structural change.
@@ -235,8 +237,6 @@ def _run_streamed(
         except (ProcessLookupError, OSError):
             pgid = None
 
-        reader_done = threading.Event()
-
         def _feed_stdin() -> None:
             if input_text is None or running.stdin is None:
                 return
@@ -246,69 +246,58 @@ def _run_streamed(
             except (BrokenPipeError, ValueError, OSError):
                 pass
 
-        def _drain_stderr() -> None:
-            if running.stderr is None:
+        # Both pipes are drained on DAEMON threads so the main flow never blocks on a
+        # pipe that some escaped/daemonized descendant keeps open past the deadline.
+        # Each appended line is TEEd to its buffer and to the live log. Buffers are
+        # plain lists (atomic append in CPython); we snapshot them under log_lock.
+        def _drain(stream, buf: list[str], tag: str) -> None:
+            if stream is None:
                 return
-            for line in running.stderr:
-                err_buf.append(line)
+            for line in stream:
                 with log_lock:
-                    log_fh.write("[stderr] " + line)
+                    buf.append(line)
+                    log_fh.write((tag + line) if tag else line)
                     log_fh.flush()
 
         stdin_thread = threading.Thread(target=_feed_stdin, daemon=True)
-        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stdout_thread = threading.Thread(target=_drain, args=(proc.stdout, out_buf, ""), daemon=True)
+        stderr_thread = threading.Thread(target=_drain, args=(proc.stderr, err_buf, "[stderr] "), daemon=True)
         stdin_thread.start()
+        stdout_thread.start()
         stderr_thread.start()
 
-        deadline = time.monotonic() + timeout
-
-        # Read stdout incrementally. readline() blocks, so a silent child can't be
-        # interrupted by polling the clock between lines; a watchdog enforces the
-        # deadline by killing the process GROUP, which closes the pipe so the read
-        # loop unblocks with EOF. The watchdog runs until the reader finishes OR the
-        # deadline passes — crucially NOT just until the direct child exits, because a
-        # grandchild can outlive the parent and keep the pipe open.
-        def _watchdog() -> None:
-            nonlocal timed_out
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    # Deadline hit and the reader is still blocked (pipe still open) —
-                    # this is a real timeout; reap the whole group.
-                    if not reader_done.is_set():
-                        timed_out = True
-                        _kill_tree(running, pgid)
-                    return
-                # Wake when the reader finishes (clean exit) or after a short slice.
-                if reader_done.wait(timeout=min(remaining, 0.25)):
-                    return
-
-        watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
-        watchdog_thread.start()
-
+        # Enforce the timeout on the PROCESS, not on pipe EOF. proc.wait(timeout) is
+        # immune to a leaked fd held by an escaped descendant.
         try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                out_buf.append(line)
-                with log_lock:
-                    log_fh.write(line)
-                    log_fh.flush()
-            proc.wait()
-        finally:
-            # The read loop is done (EOF or error); tell the watchdog to stand down,
-            # then make sure nothing in the tree is left running.
-            reader_done.set()
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
             _kill_tree(proc, pgid)
-            watchdog_thread.join(timeout=5)
-            stderr_thread.join(timeout=5)
-            stdin_thread.join(timeout=1)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+
+        # The process has exited (or been killed). Give stdout a short grace window to
+        # flush. If the reader is STILL blocked, a child the parent left behind is
+        # holding the pipe open — reap the whole group to free our fd so we never hang.
+        stdout_thread.join(timeout=2)
+        if stdout_thread.is_alive():
+            _kill_tree(proc, pgid)
+        # Final bounded joins: if a descendant escaped the group entirely and keeps the
+        # fd open, these time out and we return the partial buffer anyway — the daemon
+        # readers can't block interpreter exit, and buffers are read under the lock.
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+        stdin_thread.join(timeout=1)
 
         returncode = proc.returncode if proc.returncode is not None else -1
         if timed_out:
             returncode = 124  # conventional timeout exit code (overrides the kill signal)
 
-        stdout = "".join(out_buf)
-        stderr = "".join(err_buf)
+        with log_lock:
+            stdout = "".join(out_buf)
+            stderr = "".join(err_buf)
         if timed_out:
             marker = f"\n[review-cli] TIMEOUT after {timeout}s — partial output above]\n"
             stdout += marker

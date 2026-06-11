@@ -155,19 +155,19 @@ def test_timeout_kills_process_tree_without_hanging():
     assert "TIMEOUT" in result.stdout
 
 
-def test_timeout_when_parent_exits_but_grandchild_holds_pipe():
-    """The HARD case: the parent backend EXITS immediately, leaving a grandchild in
-    the same process group still holding stdout open.
+def test_clean_exit_with_grandchild_holding_pipe_does_not_hang_or_leak():
+    """The parent backend EXITS CLEANLY but leaves a grandchild in the same process
+    group still holding stdout open.
 
-    Killing only the direct child (or giving up once proc.poll() != None) leaves the
-    grandchild's open pipe, so the stdout read loop never EOFs and the call hangs
-    forever. The watchdog must enforce the deadline by signalling the whole process
-    GROUP even after the direct child has already exited.
+    An EOF-dependent reader would block forever on that open pipe. The runner must NOT
+    hang, must still return the parent's captured output, and must reap the group so
+    no grandchild is left running. Because the process itself exited 0, this is a
+    clean success (rc 0) — not a timeout — so no TIMEOUT marker is appended.
     """
     code = (
         "import sys, subprocess, time\n"
         "print('parent-line', flush=True)\n"
-        # grandchild inherits stdout and sleeps; parent exits right away.
+        # grandchild inherits stdout (same group) and sleeps; parent exits right away.
         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
         "sys.exit(0)\n"
     )
@@ -177,14 +177,56 @@ def test_timeout_when_parent_exits_but_grandchild_holds_pipe():
     result = review._run_streamed(
         argv,
         cwd=REPO_ROOT,
-        timeout=3,
-        backend="faketree-orphan",
+        timeout=30,  # generous: the parent exits instantly, so we never hit it
+        backend="faketree-clean",
         round_no=5,
     )
     elapsed = time.monotonic() - started
 
     assert elapsed < 20, (
         f"runner hung on a grandchild after the parent exited (took {elapsed:.1f}s)"
+    )
+    assert "parent-line" in result.stdout
+    assert result.returncode == 0
+    # The group must be reaped: no 60s sleeper should survive this call.
+    import subprocess as _sp
+
+    survivors = _sp.run(
+        ["pgrep", "-f", "import time; time.sleep(60)"], capture_output=True, text=True
+    ).stdout.strip()
+    assert not survivors, f"grandchild leaked (surviving pids: {survivors})"
+
+
+def test_timeout_when_grandchild_escapes_the_process_group():
+    """The HARDEST case: a grandchild puts itself in its OWN session (new process
+    group) while inheriting stdout, then sleeps long. killpg(parent_group) cannot
+    reach it, so the inherited stdout fd stays open and an EOF-dependent reader would
+    hang forever. The timeout must be independent of pipe EOF: kill what we can, then
+    return partial output at the deadline regardless of the escaped fd.
+    """
+    code = (
+        "import sys, subprocess, time\n"
+        "print('parent-line', flush=True)\n"
+        # grandchild starts a NEW session -> escapes the parent's process group, but
+        # still inherits stdout (fd 1) and holds it open while sleeping.
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        "start_new_session=True)\n"
+        "time.sleep(60)\n"
+    )
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=3,
+        backend="faketree-escape",
+        round_no=6,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 20, (
+        f"runner hung on a grandchild that escaped the process group (took {elapsed:.1f}s)"
     )
     assert "parent-line" in result.stdout
     assert "TIMEOUT" in result.stdout
