@@ -21,7 +21,15 @@ DEFAULT_PROMPT = (
     "Review this uncommitted git diff for bugs, regressions, security issues, "
     "and missing tests. Return only actionable findings. Do not edit files."
 )
-DEFAULT_MODELS = ("codex", "gemini", "oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo")
+DEFAULT_MODELS = ("codex", "fable5")
+# Brainstorm pulls in a third, diverse perspective when its backend is reachable
+# (gemini is API-key gated; backend_available filters it out gracefully if unset).
+BRAINSTORM_DEFAULT_MODELS = ("codex", "fable5", "gemini")
+# Friendly aliases expanded in _split_models() so `-m fable5` == `-m claude:claude-fable-5`.
+MODEL_ALIASES = {
+    "fable": "claude:claude-fable-5",
+    "fable5": "claude:claude-fable-5",
+}
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
     Path("/Users/ultra/xp/ExpenseSyncBot/.env"),
@@ -120,13 +128,17 @@ def _read_stdin_if_piped() -> str | None:
     return data if data else None
 
 
+def _expand_alias(model: str) -> str:
+    return MODEL_ALIASES.get(model.lower(), model)
+
+
 def _split_models(raw: list[str]) -> list[str]:
     values: list[str] = []
     for item in raw:
         for part in item.split(","):
             part = part.strip()
             if part:
-                values.append(part)
+                values.append(_expand_alias(part))
     return values
 
 
@@ -535,7 +547,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cwd = Path(args.cwd).expanduser().resolve()
-    models = _split_models(args.model) or list(DEFAULT_MODELS)
+    explicit_models = _split_models(args.model)
+    # Brainstorm defaults add gemini for perspective diversity, but only if its
+    # backend is actually reachable — drop unreachable defaults so a missing
+    # GEMINI_API_KEY never aborts the run. Explicit -m is always honored as-is.
+    if explicit_models:
+        models = explicit_models
+    elif args.brainstorm is not None:
+        models = [m for m in (_expand_alias(x) for x in BRAINSTORM_DEFAULT_MODELS) if backend_available(m)]
+        if not models:
+            models = [_expand_alias(m) for m in DEFAULT_MODELS]
+    else:
+        models = [_expand_alias(m) for m in DEFAULT_MODELS]
 
     panel_mode = args.just_ask or args.quorum or args.brainstorm
     timeout = args.timeout if args.timeout is not None else (PANEL_TIMEOUT_DEFAULT if panel_mode else 1200)
