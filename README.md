@@ -98,6 +98,14 @@ reads all expert answers, and emits a structured summary with three sections —
 
 Use when a question has real stakes and you want cited consensus, not vibes.
 
+**Live logs & partial output.** Each backend call streams its output in real time
+to a per-call log under `~/.cache/review-cli/logs/` (override with `$REVIEW_LOG_DIR`;
+files are private, mode 0600). Panel modes print the log path to stderr at the start
+of each call, so you can `tail -f` it to watch a long run progress instead of staring
+at a frozen terminal. If a call hits its `--timeout`, the partial output captured so
+far is still returned (with a `[review-cli] TIMEOUT after Ns]` marker and exit 124)
+rather than being thrown away.
+
 ```bash
 review --quorum "Should we cap brainstorm at 8 rounds?"
 git diff | review --quorum "Is this diff safe to merge?" -m codex,gemini,fable5
