@@ -101,7 +101,7 @@ def test_log_file_grows_incrementally_before_exit():
 
 
 def test_timeout_preserves_partial_output():
-    """(b) On timeout, return partial stdout + a TIMEOUT marker and non-zero rc."""
+    """(b) On timeout, return partial stdout + a TIMEOUT marker and rc 124."""
     argv = _slow_argv(lines=40, interval=0.4)  # ~16s; we cut it off at 2s
 
     result = review._run_streamed(
@@ -112,10 +112,60 @@ def test_timeout_preserves_partial_output():
         round_no=2,
     )
 
-    assert result.returncode != 0, "timed-out call must report a non-zero returncode"
+    assert result.returncode == 124, (
+        f"timed-out call must report rc 124, got {result.returncode}"
+    )
     assert result.stdout.strip(), "partial output was lost on timeout (stdout empty)"
     assert "line-0" in result.stdout, "early lines missing from the preserved buffer"
     assert "TIMEOUT" in result.stdout, "TIMEOUT marker missing from the preserved buffer"
+
+
+def test_timeout_kills_process_tree_without_hanging():
+    """A backend that spawns a grandchild inheriting stdout must NOT hang the runner.
+
+    If we only signalled the direct child, the grandchild would keep the stdout pipe
+    open and the read loop would block past the deadline forever. start_new_session +
+    process-group kill must reap the whole tree, so the call returns near the deadline.
+    """
+    # Parent prints one line, spawns a long-sleeping grandchild that INHERITS stdout,
+    # then exits — leaving the pipe open via the grandchild.
+    code = (
+        "import os, sys, subprocess, time\n"
+        "print('parent-line', flush=True)\n"
+        # grandchild keeps stdout (fd 1) open while sleeping 60s
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "time.sleep(60)\n"
+    )
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=3,
+        backend="faketree",
+        round_no=3,
+    )
+    elapsed = time.monotonic() - started
+
+    # Must return shortly after the deadline, not hang on the grandchild's open pipe.
+    assert elapsed < 20, f"runner hung on the process tree (took {elapsed:.1f}s)"
+    assert result.returncode == 124
+    assert "parent-line" in result.stdout
+    assert "TIMEOUT" in result.stdout
+
+
+def test_log_file_is_private():
+    """Logs may contain reviewed prompts/diffs, so files must be 0600 (owner-only)."""
+    import stat
+
+    argv = [sys.executable, "-c", "print('x', flush=True)"]
+    review._run_streamed(argv, cwd=REPO_ROOT, timeout=10, backend="faketest", round_no=4)
+    log_dir = review.log_dir()
+    logs = sorted(log_dir.glob("*-faketest-*.log"), key=lambda p: p.stat().st_mtime)
+    assert logs, "no log file produced"
+    mode = stat.S_IMODE(logs[-1].stat().st_mode)
+    assert mode & 0o077 == 0, f"log file is group/other-readable (mode {oct(mode)})"
 
 
 if __name__ == "__main__":
