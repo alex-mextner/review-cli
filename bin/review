@@ -10,9 +10,12 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -40,6 +43,11 @@ GEMINI_ENV_FALLBACKS = (
 # Short default for the interactive multi-call modes; classic review keeps 1200s.
 PANEL_TIMEOUT_DEFAULT = 240
 MODERATOR_CANDIDATES = ("codex", "gemini")
+
+# When True, streamed backend calls print their live-log path to stderr at start so
+# the user knows what to `tail -f`. Enabled by the panel modes (--just-ask/--quorum/
+# --brainstorm); the plain single-diff review path keeps stderr quiet.
+_ANNOUNCE_LOGS = False
 
 # Distinct expert personas for brainstorm rotation (pool >= 5). Each round assigns
 # >= 3 of these, rotating so backends see a fresh role each round.
@@ -104,6 +112,152 @@ def _run(
         env=env,
         timeout=timeout,
     )
+
+
+def log_dir() -> Path:
+    """Predictable dir for per-call live logs that an external `tail -f` can watch.
+
+    Honors $REVIEW_LOG_DIR (used by tests), else ~/.cache/review-cli/logs.
+    """
+    override = os.environ.get("REVIEW_LOG_DIR")
+    base = Path(override) if override else (Path.home() / ".cache" / "review-cli" / "logs")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _open_log(backend: str, round_no: int) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    safe_backend = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in backend) or "backend"
+    return log_dir() / f"{stamp}-{safe_backend}-r{round_no}.log"
+
+
+def _run_streamed(
+    argv: list[str],
+    *,
+    cwd: Path,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+    timeout: int = 1200,
+    backend: str = "backend",
+    round_no: int = 0,
+    announce: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a long backend call, streaming its output in real time.
+
+    Unlike `_run` (subprocess.run, which blocks until exit and DROPS the buffer on
+    TimeoutExpired), this:
+      * reads child stdout line-by-line as it arrives (no wait-for-exit buffering);
+      * TEEs every line to an in-memory accumulator AND a per-call log file under
+        log_dir(), flushed per line so `tail -f <path>` shows live progress;
+      * drains stderr on a side thread into both the accumulator-stderr and the log;
+      * enforces `timeout` as a wall-clock deadline; on breach it terminate()s then
+        kill()s the child but RETURNS the partial buffer plus a clear TIMEOUT marker
+        and a non-zero returncode — it never raises the captured output away.
+
+    Returns a CompletedProcess-compatible object (.returncode/.stdout/.stderr) so
+    callers like review_codex need no structural change.
+    """
+    path = _open_log(backend, round_no)
+    if announce:
+        print(f"[review-cli] {backend} live log: {path} (tail -f to follow)", file=sys.stderr, flush=True)
+
+    out_buf: list[str] = []
+    err_buf: list[str] = []
+    log_lock = threading.Lock()
+    log_fh = path.open("w", encoding="utf-8", buffering=1)  # line-buffered
+    log_fh.write(f"[review-cli] $ {' '.join(argv)}\n")
+    log_fh.flush()
+
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(cwd),
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        bufsize=1,  # line-buffered text streams
+    )
+
+    def _feed_stdin() -> None:
+        if input_text is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(input_text)
+            proc.stdin.close()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+
+    def _drain_stderr() -> None:
+        if proc.stderr is None:
+            return
+        for line in proc.stderr:
+            err_buf.append(line)
+            with log_lock:
+                log_fh.write("[stderr] " + line)
+                log_fh.flush()
+
+    stdin_thread = threading.Thread(target=_feed_stdin, daemon=True)
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stdin_thread.start()
+    stderr_thread.start()
+
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    # Read stdout incrementally. readline() blocks, so we cannot purely poll the
+    # clock between lines on a silent child; guard with a watchdog that kills the
+    # process once the deadline passes, which unblocks readline() with EOF.
+    def _watchdog() -> None:
+        nonlocal timed_out
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                return
+            if proc.poll() is not None:
+                return
+            time.sleep(min(0.25, max(0.01, remaining)))
+
+    watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    watchdog_thread.start()
+
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            out_buf.append(line)
+            with log_lock:
+                log_fh.write(line)
+                log_fh.flush()
+        proc.wait()
+    finally:
+        # Always reap helper threads and never raise the buffer away: even if the
+        # read loop dies unexpectedly, the partial accumulator is returned below.
+        if proc.poll() is None:
+            proc.kill()
+        watchdog_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        stdin_thread.join(timeout=1)
+
+    stdout = "".join(out_buf)
+    stderr = "".join(err_buf)
+    returncode = proc.returncode if proc.returncode is not None else -1
+
+    if timed_out:
+        marker = f"\n[review-cli] TIMEOUT after {timeout}s — partial output above]\n"
+        stdout += marker
+        with log_lock:
+            log_fh.write(marker)
+            log_fh.flush()
+        if returncode == 0:
+            returncode = 124  # match the conventional timeout exit code
+
+    log_fh.close()
+    return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 def _which(name: str) -> str:
@@ -171,7 +325,10 @@ def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int) ->
         argv += ["-m", codex_model]
     argv.append("-")
     command = " ".join(argv[:-1]) + " -"
-    proc = _run(argv, cwd=cwd, input_text=_payload(prompt, diff), timeout=timeout)
+    proc = _run_streamed(
+        argv, cwd=cwd, input_text=_payload(prompt, diff), timeout=timeout,
+        backend="codex", announce=_ANNOUNCE_LOGS,
+    )
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
@@ -232,7 +389,7 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int)
             oc_model,
             message,
         ]
-        proc = _run(argv, cwd=tmp, timeout=timeout)
+        proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", announce=_ANNOUNCE_LOGS)
     command = f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
@@ -309,7 +466,7 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
     if claude_model:
         argv += ["--model", claude_model]
     argv += ["-p", _payload(prompt, diff)]
-    proc = _run(argv, cwd=cwd, timeout=timeout + 30)
+    proc = _run_streamed(argv, cwd=cwd, timeout=timeout + 30, backend="claude", announce=_ANNOUNCE_LOGS)
     command = "claude-p --permission-mode plan --disallowedTools Edit Write Bash -p <prompt>"
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
@@ -829,6 +986,12 @@ def main(argv: list[str] | None = None) -> int:
 
     panel_mode = args.just_ask or args.quorum or args.brainstorm
     timeout = args.timeout if args.timeout is not None else (PANEL_TIMEOUT_DEFAULT if panel_mode else 1200)
+
+    # Panel modes are interactive and long-running, so announce each streamed
+    # backend's live-log path to stderr; the plain review path stays quiet.
+    if panel_mode:
+        global _ANNOUNCE_LOGS
+        _ANNOUNCE_LOGS = True
 
     # Diff is optional in panel modes (piped/--staged used as context if present).
     diff = _read_stdin_if_piped()

@@ -14,3 +14,8 @@ bin/review --help | grep -q -- "--brainstorm"
 
 # The single-file CLI must always parse.
 python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse OK')"
+
+# Streaming runner: real-time log growth + partial-output-on-timeout (no backends
+# needed — drives a fake slow python child).
+REVIEW_LOG_DIR="$(mktemp -d)" python3 tests/test_streaming.py
+echo "streaming tests OK"
