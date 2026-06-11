@@ -21,15 +21,17 @@ DEFAULT_PROMPT = (
     "Review this uncommitted git diff for bugs, regressions, security issues, "
     "and missing tests. Return only actionable findings. Do not edit files."
 )
-DEFAULT_MODELS = ("codex", "fable5")
-# Brainstorm pulls in a third, diverse perspective when its backend is reachable
-# (gemini is API-key gated; backend_available filters it out gracefully if unset).
-BRAINSTORM_DEFAULT_MODELS = ("codex", "fable5", "gemini")
-# Friendly aliases expanded in _split_models() so `-m fable5` == `-m claude:claude-fable-5`.
+# Code default keeps a self-sufficient panel (incl. opencode). Personal model
+# preferences live in ~/.config/review-cli/config.yaml (keys: models,
+# brainstorm_models) and override this — see load_config().
+DEFAULT_MODELS = ("codex", "gemini", "oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo")
+# Friendly aliases for claude models, expanded in _split_models() and the
+# default/config paths, so `-m fable5` == `-m claude:claude-fable-5`.
 MODEL_ALIASES = {
     "fable": "claude:claude-fable-5",
     "fable5": "claude:claude-fable-5",
 }
+CONFIG_PATH = Path.home() / ".config" / "review-cli" / "config.yaml"
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
     Path("/Users/ultra/xp/ExpenseSyncBot/.env"),
@@ -130,6 +132,20 @@ def _read_stdin_if_piped() -> str | None:
 
 def _expand_alias(model: str) -> str:
     return MODEL_ALIASES.get(model.lower(), model)
+
+
+def load_config() -> dict:
+    """Read ~/.config/review-cli/config.yaml (keys: models, brainstorm_models).
+    Returns {} if absent/unparseable so the code default always applies."""
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        import yaml
+
+        data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _split_models(raw: list[str]) -> list[str]:
@@ -542,23 +558,27 @@ def main(argv: list[str] | None = None) -> int:
     panel.add_argument("--brainstorm", metavar="TOPIC", help="multi-round persona ideation with a moderator")
     args = parser.parse_args(argv)
 
+    config = load_config()
+
     if args.list_defaults:
-        print("\n".join(DEFAULT_MODELS))
+        effective = config.get("models") or DEFAULT_MODELS
+        print("\n".join(_expand_alias(m) for m in effective))
         return 0
 
     cwd = Path(args.cwd).expanduser().resolve()
     explicit_models = _split_models(args.model)
-    # Brainstorm defaults add gemini for perspective diversity, but only if its
-    # backend is actually reachable — drop unreachable defaults so a missing
-    # GEMINI_API_KEY never aborts the run. Explicit -m is always honored as-is.
+    # Precedence: explicit -m > config > code default. Brainstorm prefers
+    # config.brainstorm_models and drops unreachable backends gracefully (so a
+    # missing GEMINI_API_KEY never aborts the run). Explicit -m is honored as-is.
     if explicit_models:
         models = explicit_models
     elif args.brainstorm is not None:
-        models = [m for m in (_expand_alias(x) for x in BRAINSTORM_DEFAULT_MODELS) if backend_available(m)]
+        src = config.get("brainstorm_models") or config.get("models") or DEFAULT_MODELS
+        models = [m for m in (_expand_alias(x) for x in src) if backend_available(m)]
         if not models:
-            models = [_expand_alias(m) for m in DEFAULT_MODELS]
+            models = [_expand_alias(x) for x in (config.get("models") or DEFAULT_MODELS)]
     else:
-        models = [_expand_alias(m) for m in DEFAULT_MODELS]
+        models = [_expand_alias(x) for x in (config.get("models") or DEFAULT_MODELS)]
 
     panel_mode = args.just_ask or args.quorum or args.brainstorm
     timeout = args.timeout if args.timeout is not None else (PANEL_TIMEOUT_DEFAULT if panel_mode else 1200)
