@@ -318,6 +318,60 @@ def test_log_file_is_private():
     assert mode & 0o077 == 0, f"log file is group/other-readable (mode {oct(mode)})"
 
 
+def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
+    captured: dict[str, list[str]] = {}
+    old_which = review._which
+    old_run_streamed = review._run_streamed
+
+    def fake_which(name: str) -> str:
+        assert name == "claude-p"
+        return "/bin/claude-p"
+
+    def fake_run_streamed(argv: list[str], **_kwargs):
+        captured["argv"] = argv
+        return review.subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    try:
+        review._which = fake_which
+        review._run_streamed = fake_run_streamed
+        result = review.review_claude("claude:opus", "prompt", "diff", REPO_ROOT, 10)
+    finally:
+        review._which = old_which
+        review._run_streamed = old_run_streamed
+
+    assert result.returncode == 0
+    argv = captured["argv"]
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert "--tools" in argv
+    assert argv[argv.index("--tools") + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert "--disable-slash-commands" in argv
+    assert "--safe-mode" in argv
+    assert "--append-system-prompt" in argv
+    assert "Do not use tools" in argv[argv.index("--append-system-prompt") + 1]
+    blocked = argv[argv.index("--disallowedTools") + 1 : argv.index("--timeout-sec")]
+    for tool in (
+        "Edit",
+        "MultiEdit",
+        "Write",
+        "Bash",
+        "Read",
+        "Grep",
+        "Glob",
+        "NotebookEdit",
+        "SlashCommand",
+        "Task",
+        "TodoWrite",
+        "ExitPlanMode",
+        "WebFetch",
+        "WebSearch",
+    ):
+        assert tool in blocked
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[-2] == "-p"
+    assert argv[-1] == "prompt\n\n```diff\ndiff\n```"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

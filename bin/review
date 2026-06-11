@@ -567,11 +567,31 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
         "--cwd",
         str(cwd),
         "--permission-mode",
-        "plan",
+        "dontAsk",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--safe-mode",
+        "--append-system-prompt",
+        "You are running inside review-cli in a headless read-only diff review. "
+        "Do not use tools, inspect files, ask for permissions, or plan tool work. "
+        "Answer only from the prompt and diff supplied by the user.",
         "--disallowedTools",
         "Edit",
+        "MultiEdit",
         "Write",
         "Bash",
+        "Read",
+        "Grep",
+        "Glob",
+        "NotebookEdit",
+        "SlashCommand",
+        "Task",
+        "TodoWrite",
+        "ExitPlanMode",
+        "WebFetch",
+        "WebSearch",
         "--timeout-sec",
         str(timeout),
     ]
@@ -579,7 +599,7 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
         argv += ["--model", claude_model]
     argv += ["-p", _payload(prompt, diff)]
     proc = _run_streamed(argv, cwd=cwd, timeout=timeout + 30, backend="claude", announce=_ANNOUNCE_LOGS)
-    command = "claude-p --permission-mode plan --disallowedTools Edit Write Bash -p <prompt>"
+    command = "claude-p --permission-mode dontAsk --tools '' --strict-mcp-config --disable-slash-commands --safe-mode --append-system-prompt <read-only-review> --disallowedTools Edit MultiEdit Write Bash Read Grep Glob NotebookEdit SlashCommand Task TodoWrite ExitPlanMode WebFetch WebSearch -p <prompt>"
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
