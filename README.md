@@ -237,13 +237,11 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 
 ## Ecosystem
 
-`review` is part of a small toolkit of CLIs built for AI coding agents — call them from any shell or harness:
+Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
-| Tool | What it does |
-|------|--------------|
-| [tg](https://github.com/alex-mextner/tg-cli) | Telegram bridge — agents push status/questions to your phone, you reply back, questions & permissions arrive as inline buttons. tmux-aware, auto-brands by agent. |
-| [**review**](https://github.com/alex-mextner/review-cli) | Multi-model read-only code review across providers (codex, claude, gemini, opencode), plus quorum & brainstorm panels. |
-| [draw](https://github.com/alex-mextner/draw-cli) | Text-to-image from the CLI via Hugging Face (FLUX by default). |
-| [**HyperIDE**](https://hyperide.ai) | The AI-native IDE these tools were built for — a visual canvas where agents design, build, and edit live React UIs in real time, with the whole workspace as context. |
+- **[tg-cli](https://github.com/alex-mextner/tg-cli)** — Telegram bridge for agents: push reports, two-way control, Q→buttons
+- **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
+- **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
+- **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
 
-Each CLI installs a skill into your agent harnesses so agents know it exists — see Install. HyperIDE is the IDE they plug into.
+Each CLI registers a skill into your agent harnesses (`<tool> install-skill`) so agents know it exists — see Install.
