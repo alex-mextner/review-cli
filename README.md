@@ -236,5 +236,6 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 | [tg](https://github.com/alex-mextner/tg-cli) | Telegram bridge — agents push status/questions to your phone, you reply back, questions & permissions arrive as inline buttons. tmux-aware, auto-brands by agent. |
 | [**review**](https://github.com/alex-mextner/review-cli) | Multi-model read-only code review across providers (codex, claude, gemini, opencode), plus quorum & brainstorm panels. |
 | [draw](https://github.com/alex-mextner/draw-cli) | Text-to-image from the CLI via Hugging Face (FLUX by default). |
+| [**HyperIDE**](https://hyperide.ai) | The AI-native IDE these tools were built for — a visual canvas where agents design, build, and edit live React UIs in real time, with the whole workspace as context. |
 
-Each tool installs a skill into your agent harnesses so agents know it exists — see Install.
+Each CLI installs a skill into your agent harnesses so agents know it exists — see Install. HyperIDE is the IDE they plug into.
