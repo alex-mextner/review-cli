@@ -1,130 +1,240 @@
 # review-cli
 
-Small read-only multi-model code review runner.
+**Multi-model read-only code review from a single command.**
+
+Runs your git diff through multiple AI backends **in parallel**, collects their findings,
+and prints them side by side. Four modes let you go from a quick pre-commit sanity check
+all the way to a structured expert panel that builds consensus or explores a design space.
+Built for use from any shell or AI agent harness (Claude Code, Codex, opencode).
+
+---
 
 ## Install
 
+**One-liner** (installs deps, links `review` into PATH, registers the skill):
+
 ```bash
-ln -sfn ~/xp/review-cli/bin/review ~/.files/bin/review
+curl -fsSL https://raw.githubusercontent.com/alex-mextner/review-cli/main/install.sh | bash
 ```
 
-## Usage
+**pipx alternative:**
 
-Review the current git diff with the default reviewers:
+```bash
+pipx install git+https://github.com/alex-mextner/review-cli
+```
+
+After install, run `review install-skill` to register the tool into agent harnesses
+(`~/.agents/skills/review/`) so that Claude Code, Codex, opencode, and Gemini agents
+know `review` exists and can call it. The one-liner above runs this automatically.
+`install-skill` is idempotent — safe to re-run.
+
+---
+
+## Quick start
+
+```bash
+# Review unstaged diff with your default backends
+review
+
+# Review staged changes
+review --staged
+
+# Add backends to the defaults
+review -m codex -m fable5 -m gemini
+
+# Ask all backends a quick question (no diff needed)
+review --just-ask "Is a single-file Python CLI the right idiom for this tool?"
+
+# Settle a contested decision with cited evidence
+review --quorum "Should we cap brainstorm at 8 rounds?"
+
+# Open-ended design exploration
+review --brainstorm "How should we design the plugin system?"
+```
+
+---
+
+## Modes
+
+### Review (default)
+
+![review mode](docs/mode-review.svg)
+
+N backends review your diff in parallel — one pass, no moderator. Best for pre-commit
+checks where you want fast, independent perspectives without ceremony.
 
 ```bash
 review
+review --staged
+git show --format= --no-ext-diff HEAD | review -m gemini,codex
 ```
 
-Run several reviewers in parallel:
+---
+
+### Just Ask
+
+![just-ask mode](docs/mode-just-ask.svg)
+
+Send a plain question to all selected backends in parallel. Diff is optional — pipe
+one in or add `--staged` to attach it as context. One pass, no moderator, results
+printed side by side.
 
 ```bash
-review -m codex -m gemini -m oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo
+review --just-ask "Does this change need a migration?"
+git diff | review --just-ask "Is this safe to merge?"
 ```
 
-Comma-separated models also work:
+---
 
-```bash
-review -m codex,gemini,claude-p
-```
+### Quorum
 
-Review a supplied diff instead of calling `git diff`:
+![quorum mode](docs/mode-quorum.svg)
 
-```bash
-git show --format= --no-ext-diff HEAD | review -m gemini
-```
+Two-phase structured panel. **Phase 1:** every expert answers in parallel and must cite
+concrete evidence (file/line/fact); if they lack an evidence base they must say
+`INSUFFICIENT EVIDENCE` rather than guess. **Phase 2:** a moderator runs sequentially,
+reads all expert answers, and emits a structured summary with three sections — QUORUM
+(points of majority agreement with evidence), DISAGREEMENT / NO QUORUM, and ABSTAINED.
 
-## Panel Modes (ask / quorum / brainstorm)
-
-Three mutually-exclusive modes turn the same backends into an expert panel. The
-"experts" are the external model backends (codex / gemini / kimi via `oc:` /
-claude-p); roles are assigned purely via prompt text. A diff is optional in these
-modes — pipe one in or use `--staged` to attach it as context.
-
-These modes use a short per-call timeout (default 240s, override with `--timeout`).
-The `-m` panel override works in every mode.
-
-### `--just-ask "QUESTION"`
-
-Send a plain question (no diff required) to all selected backends in parallel and
-print each answer:
-
-```bash
-review --just-ask "Is a single-file Python CLI the right idiom for this tool?"
-git diff | review --just-ask "Does this change need a migration?"   # diff as context
-```
-
-### `--quorum "QUESTION"`
-
-Round 1: every expert answers with a recommendation, must cite concrete evidence
-(file/line/fact), and must say `INSUFFICIENT EVIDENCE` rather than guess. Then a
-moderator backend (default: first available of `codex`/`gemini`, override with
-`--moderator`) summarizes where a quorum exists, where experts disagree, and who
-abstained. Works on a question and/or a diff.
+Use when a question has real stakes and you want cited consensus, not vibes.
 
 ```bash
 review --quorum "Should we cap brainstorm at 8 rounds?"
-git diff | review --quorum "Is this diff safe to merge?" -m codex,gemini,claude-p
+git diff | review --quorum "Is this diff safe to merge?" -m codex,gemini,fable5
+review --quorum "Should we switch to a plugin architecture?" --moderator gemini
 ```
 
-### `--brainstorm "TOPIC"`
+---
 
-Multi-round ideation. Each round, at least three experts — each with a distinct
-rotating persona (pragmatic staff engineer, security-paranoid reviewer, DX
-designer, skeptical SRE, product-minded architect, cost-conscious perf engineer)
-— build on the shared transcript of prior rounds. After each round a moderator
-summarizes and decides continue/stop, but cannot stop before `--rounds` (default
-and minimum 5); `--max-rounds` (default 8) is a hard cap. Finishes with a
-moderator synthesis (best ideas, tradeoffs, recommendation).
+### Brainstorm
+
+![brainstorm mode](docs/mode-brainstorm.svg)
+
+Iterative ideation loop. Each round assigns at least three distinct **rotating personas**
+(Pragmatic Staff Engineer, Security-Paranoid Reviewer, DX Designer, Skeptical SRE,
+Product-Minded Architect, Cost-Conscious Perf Engineer) to your panel backends in
+parallel. After each round a moderator summarizes and decides STOP/CONTINUE — but
+**cannot stop before `--rounds`** (minimum and default: 5). `--max-rounds` (default 8)
+is a hard cap. Ends with a full moderator synthesis: best ideas, tradeoffs, and a
+concrete recommendation.
+
+Use for genuinely open design questions where you want the discussion to build across
+rounds rather than converge in one shot.
 
 ```bash
 review --brainstorm "How should we design the plugin system?"
-review --brainstorm "API shape for the cache layer" --rounds 5 --max-rounds 10 \
+review --brainstorm "API shape for the cache layer" \
+  --rounds 5 --max-rounds 10 \
   -m codex,gemini --moderator gemini
 ```
 
-## Model Backends
+---
 
-- `codex` or `codex:<model>` uses `codex exec -s read-only`.
-- `gemini` or `gemini:<model>` calls the Gemini API directly.
-- `claude-p` or `claude:<model>` uses `claude-p` in plan/read-only mode with mutating tools denied.
-- `oc:<model>` / `opencode:<model>` uses `opencode run`.
+### When to use which
 
-Any unknown `-m` value is treated as an opencode model id.
+| Mode | Reach for it when... |
+|------|----------------------|
+| `review` | Pre-commit diff check — fast, parallel, no overhead |
+| `--just-ask` | Quick multi-model second opinion on any question |
+| `--quorum` | A contested decision that needs cited evidence to settle |
+| `--brainstorm` | An open design space you want to explore across multiple rounds |
 
-## Gemini Auth
+---
 
-The Gemini backend reads `GEMINI_API_KEY` or `GOOGLE_API_KEY` from the environment.
-It also supports `GEMINI_ENV_FILE=/path/to/.env` with a `GEMINI_API_KEY=...` line.
-On this machine it additionally checks `/Users/ultra/xp/ExpenseSyncBot/.env`.
+## Agent workflows
 
-The Gemini CLI OAuth file (`~/.gemini/oauth_creds.json`) is not enough for the public
-Generative Language API; a direct bearer call returned `ACCESS_TOKEN_SCOPE_INSUFFICIENT`.
+`review` earns its keep when an agent hits a hard call:
 
-## opencode Read-Only Mode
+1. The agent runs `review --brainstorm "<the decision>"` — many models in rotating
+   expert roles, looping across several rounds — to surface candidate approaches a
+   single model wouldn't reach.
+2. It picks the top one or two and posts them to Telegram via
+   [`tg`](https://github.com/alex-mextner/tg-cli) as simplified options with pros/cons,
+   so you decide from your phone.
+3. For the closest calls, it builds the rival approaches in parallel **git worktrees**
+   and compares them for real before committing.
 
-Current opencode versions can create a project agent with:
+And before every commit, `review --staged` is a multi-model gate — optionally *enforced*
+with `review install-commit-hook` (a global pre-commit hook that blocks unreviewed
+staged changes; bypass with `REVIEW_SKIP=1 git commit` or `git commit --no-verify`).
 
-```bash
-opencode agent create \
-  --path . \
-  --description "Read-only code reviewer. May inspect files and diffs but must never edit, write, run shell commands, or ask questions." \
-  --mode primary \
-  --permissions read,grep,glob \
-  --model fireworks/accounts/fireworks/routers/kimi-k2p6-turbo
+---
+
+## Model backends
+
+| Specifier | What runs under the hood |
+|-----------|--------------------------|
+| `codex` / `codex:<model>` | `codex exec -s read-only --ephemeral` |
+| `claude` / `claude:<model>` | `claude-p --permission-mode plan --disallowedTools Edit Write Bash` |
+| `fable` / `fable5` | Alias for `claude:claude-fable-5` |
+| `gemini` / `gemini:<model>` | Gemini REST API (`gemini-2.5-flash` by default) |
+| `oc:<model>` / `opencode:<model>` | `opencode run --agent read-only-reviewer` in a temp repo |
+| anything else | Treated as an opencode model id |
+
+The opencode backend runs in a **temporary git repository** with the diff attached as
+`review.diff`. This keeps the source worktree out of reach — the model gets review
+context without getting an edit target.
+
+---
+
+## Flags
+
+```
+-m / --model        Backend to include; repeat or comma-separate. Stacks with defaults.
+--staged            Review staged diff (git diff --cached) instead of unstaged.
+--timeout N         Per-call timeout in seconds (default 1200 for review, 240 for panel modes).
+--moderator M       Override the auto-selected moderator for --quorum / --brainstorm.
+--rounds N          Minimum brainstorm rounds before STOP is allowed (default 5).
+--max-rounds N      Hard cap on brainstorm rounds (default 8).
+--list-defaults     Print effective default backends and exit.
+--prompt TEXT       Override the default review prompt.
+-C / --cwd DIR      Run against a different repository directory.
 ```
 
-At the time this CLI was written, `opencode run --agent read-only-reviewer` did not
-discover that local agent reliably. To keep source repositories safe, the opencode backend
-runs from a temporary git repository and attaches the source diff as `review.diff`.
-That gives the model review context without giving it the source worktree as an edit target.
+---
 
-## Public Defaults
+## Configuration
 
-Default reviewers:
+Personal defaults live in `~/.config/review-cli/config.yaml`:
 
-```text
-codex
-gemini
-oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo
+```yaml
+# Backends used by plain `review` and panel modes
+models:
+  - codex
+  - fable5
+
+# Brainstorm can use a wider panel (falls back to `models` if absent)
+brainstorm_models:
+  - codex
+  - gemini
+  - fable5
 ```
+
+Run `review --list-defaults` to see the effective defaults after config is applied.
+
+Code defaults (when no config file exists): `codex`, `gemini`,
+`oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo`.
+
+---
+
+## Auth
+
+**Gemini:** set `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the environment, or put
+`GEMINI_API_KEY=...` in `~/.config/review-cli/.env`. The env var
+`GEMINI_ENV_FILE=/path/to/.env` overrides the search path.
+
+**Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
+
+---
+
+## Ecosystem
+
+`review` is part of a small toolkit of CLIs built for AI coding agents — call them from any shell or harness:
+
+| Tool | What it does |
+|------|--------------|
+| [tg](https://github.com/alex-mextner/tg-cli) | Telegram bridge — agents push status/questions to your phone, you reply back, questions & permissions arrive as inline buttons. tmux-aware, auto-brands by agent. |
+| [**review**](https://github.com/alex-mextner/review-cli) | Multi-model read-only code review across providers (codex, claude, gemini, opencode), plus quorum & brainstorm panels. |
+| [draw](https://github.com/alex-mextner/draw-cli) | Text-to-image from the CLI via Hugging Face (FLUX by default). |
+
+Each tool installs a skill into your agent harnesses so agents know it exists — see Install.

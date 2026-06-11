@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "review-cli"
+version = "0.1.0"
+description = "Multi-model read-only code review + AI panels."
+requires-python = ">=3.9"
+dependencies = ["pyyaml"]
+
+# Script exposure rationale:
+# The tool is a single executable at bin/review (shebang #!/usr/bin/env python3,
+# no importable package). Using [project.scripts] would require a package:function
+# entry point, meaning we'd need to add a wrapper module — touching existing code.
+# script-files copies bin/review into the installed scripts directory; pipx exposes
+# it via its venv python (which satisfies pyyaml), so `review` ends up on PATH.
+# This is the pragmatic choice that keeps the repo structure unchanged.
+[tool.setuptools]
+script-files = ["bin/review"]
