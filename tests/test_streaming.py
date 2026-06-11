@@ -128,7 +128,7 @@ def test_timeout_kills_process_tree_without_hanging():
     process-group kill must reap the whole tree, so the call returns near the deadline.
     """
     # Parent prints one line, spawns a long-sleeping grandchild that INHERITS stdout,
-    # then exits — leaving the pipe open via the grandchild.
+    # then sleeps long itself — leaving the pipe open via both.
     code = (
         "import os, sys, subprocess, time\n"
         "print('parent-line', flush=True)\n"
@@ -153,6 +153,42 @@ def test_timeout_kills_process_tree_without_hanging():
     assert result.returncode == 124
     assert "parent-line" in result.stdout
     assert "TIMEOUT" in result.stdout
+
+
+def test_timeout_when_parent_exits_but_grandchild_holds_pipe():
+    """The HARD case: the parent backend EXITS immediately, leaving a grandchild in
+    the same process group still holding stdout open.
+
+    Killing only the direct child (or giving up once proc.poll() != None) leaves the
+    grandchild's open pipe, so the stdout read loop never EOFs and the call hangs
+    forever. The watchdog must enforce the deadline by signalling the whole process
+    GROUP even after the direct child has already exited.
+    """
+    code = (
+        "import sys, subprocess, time\n"
+        "print('parent-line', flush=True)\n"
+        # grandchild inherits stdout and sleeps; parent exits right away.
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "sys.exit(0)\n"
+    )
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=3,
+        backend="faketree-orphan",
+        round_no=5,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 20, (
+        f"runner hung on a grandchild after the parent exited (took {elapsed:.1f}s)"
+    )
+    assert "parent-line" in result.stdout
+    assert "TIMEOUT" in result.stdout
+    assert result.returncode == 124
 
 
 def test_log_file_is_private():

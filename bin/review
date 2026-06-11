@@ -137,39 +137,36 @@ def _open_log(backend: str, round_no: int) -> Path:
     return log_dir() / f"{stamp}-{safe_backend}-r{round_no}.log"
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
+def _kill_tree(proc: subprocess.Popen, pgid: int | None) -> None:
     """Best-effort terminate→kill of the child's whole process group.
 
     Backends (codex/claude/opencode wrappers) spawn grandchildren; killing only the
     direct child can leave a grandchild holding the stdout pipe open, so the read
     loop never sees EOF and the call hangs past its deadline. We start each child in
-    its own session (start_new_session=True) and signal the group.
+    its own session (start_new_session=True) and signal the captured GROUP — which
+    we must do even after the direct child has exited, because a grandchild in the
+    same group can still be alive and holding the pipe. `pgid` is captured at Popen
+    time precisely so it stays valid after the parent is reaped.
     """
-    if proc.poll() is not None:
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, OSError):
-        pgid = None
-    try:
-        if pgid is not None:
-            os.killpg(pgid, signal.SIGTERM)
-        else:
-            proc.terminate()
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    def _signal_group(sig: int) -> None:
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            elif sig == signal.SIGKILL:
+                proc.kill()
+            else:
+                proc.terminate()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    _signal_group(signal.SIGTERM)
     try:
         proc.wait(timeout=3)
-        return
     except subprocess.TimeoutExpired:
         pass
-    try:
-        if pgid is not None:
-            os.killpg(pgid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    # SIGKILL the group unconditionally: even if the parent is reaped, a grandchild
+    # may still hold the pipe open. Killing an already-dead group is a harmless no-op.
+    _signal_group(signal.SIGKILL)
 
 
 def _run_streamed(
@@ -207,6 +204,7 @@ def _run_streamed(
     log_lock = threading.Lock()
     timed_out = False
     proc: subprocess.Popen | None = None
+    pgid: int | None = None
 
     # Private file perms: logs persist prompts/diffs that may contain secrets.
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -229,6 +227,15 @@ def _run_streamed(
             start_new_session=True,  # own process group, so we can kill the whole tree
         )
         running = proc  # non-None alias for the nested closures
+        # Capture the group id NOW, while the child is alive. We need it later even
+        # after the direct child is reaped, because a grandchild in the same group
+        # may still be holding the stdout pipe open.
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            pgid = None
+
+        reader_done = threading.Event()
 
         def _feed_stdin() -> None:
             if input_text is None or running.stdin is None:
@@ -256,20 +263,25 @@ def _run_streamed(
         deadline = time.monotonic() + timeout
 
         # Read stdout incrementally. readline() blocks, so a silent child can't be
-        # interrupted by polling the clock between lines; a watchdog kills the process
-        # group once the deadline passes, which unblocks the read loop with EOF.
+        # interrupted by polling the clock between lines; a watchdog enforces the
+        # deadline by killing the process GROUP, which closes the pipe so the read
+        # loop unblocks with EOF. The watchdog runs until the reader finishes OR the
+        # deadline passes — crucially NOT just until the direct child exits, because a
+        # grandchild can outlive the parent and keep the pipe open.
         def _watchdog() -> None:
             nonlocal timed_out
             while True:
-                # Check exit FIRST so a process that finished just before the deadline
-                # is never mislabeled as timed out.
-                if running.poll() is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # Deadline hit and the reader is still blocked (pipe still open) —
+                    # this is a real timeout; reap the whole group.
+                    if not reader_done.is_set():
+                        timed_out = True
+                        _kill_tree(running, pgid)
                     return
-                if time.monotonic() >= deadline:
-                    timed_out = True
-                    _kill_tree(running)
+                # Wake when the reader finishes (clean exit) or after a short slice.
+                if reader_done.wait(timeout=min(remaining, 0.25)):
                     return
-                time.sleep(min(0.25, max(0.01, deadline - time.monotonic())))
 
         watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
         watchdog_thread.start()
@@ -283,10 +295,10 @@ def _run_streamed(
                     log_fh.flush()
             proc.wait()
         finally:
-            # Never raise the buffer away: even if the read loop dies, the partial
-            # accumulator is returned below. Kill the tree so stderr EOFs and the
-            # drain thread actually finishes before we read err_buf.
-            _kill_tree(proc)
+            # The read loop is done (EOF or error); tell the watchdog to stand down,
+            # then make sure nothing in the tree is left running.
+            reader_done.set()
+            _kill_tree(proc, pgid)
             watchdog_thread.join(timeout=5)
             stderr_thread.join(timeout=5)
             stdin_thread.join(timeout=1)
@@ -307,8 +319,8 @@ def _run_streamed(
     finally:
         # The log handle ALWAYS closes, even if Popen or a write raised before the
         # normal return path (the docstring's partial-output promise depends on it).
-        if proc is not None and proc.poll() is None:
-            _kill_tree(proc)
+        if proc is not None:
+            _kill_tree(proc, pgid)
         log_fh.close()
 
 
