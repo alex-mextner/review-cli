@@ -24,6 +24,15 @@ sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 import visual_fixtures as vf  # noqa: E402
 from reviewlib import cli  # noqa: E402
+from reviewlib.features.visual import compose as _cmp  # noqa: E402
+
+# These composability tests assert the Stage-1 cvGate-described context threading. The
+# Stage-2 per-mode fan-out would otherwise fire a REAL vision call here (a Gemini/
+# Anthropic key is configured on a dev box). Force the fan-out to find NO vision backend
+# so the seam degrades to the cvGate-described note (the exact behaviour these tests
+# pin) and NO API is burned. The dedicated fan-out behaviour is covered, with a mocked
+# vision call, in test_visual_fanout.py.
+_cmp.select_vision_backend = lambda models: None
 
 
 def _styled(tmp: str = "/tmp/visual-compose-styled.png") -> str:

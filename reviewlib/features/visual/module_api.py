@@ -5,8 +5,9 @@ A module is a small object declaring WHEN it activates, an optional pixel-level
 `judge` that combines its CV opinion with the model's answers into a sub-verdict.
 
 Stage 1 ships the types + the Protocol + the three built-in modules' shape. The
-per-project discovery / TOFU registry (§6) is Stage 3 — this file deliberately has no
-discovery code, only the contract every module (built-in or contributed) implements.
+per-project discovery / TOFU registry (§6) lands in Stage 2 (see `registry.py`); this
+file deliberately has no discovery code, only the contract every module (built-in or
+contributed) implements.
 """
 from __future__ import annotations
 

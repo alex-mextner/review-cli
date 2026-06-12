@@ -56,6 +56,27 @@ def main(argv: list[str] | None = None) -> int:
         return install_skill()
     if argv == ["install-commit-hook"]:
         return install_commit_hook()
+    # Per-project visual-module trust subcommands (§6). Kept as bare subcommands (like
+    # install-skill) so they don't clutter the main review argparse surface.
+    if argv and argv[0] == "trust-module":
+        from .features.visual.registry import trust_module
+
+        if len(argv) < 2:
+            print("usage: review trust-module <name> [--project DIR]", file=sys.stderr)
+            return 2
+        proj = None
+        rest = argv[2:]
+        if "--project" in rest:
+            i = rest.index("--project")
+            proj = Path(rest[i + 1]).expanduser() if i + 1 < len(rest) else None
+        return trust_module(argv[1], project=proj)
+    if argv and argv[0] == "register-module":
+        from .features.visual.registry import register_module
+
+        if len(argv) < 2:
+            print("usage: review register-module <path-to-manifest>", file=sys.stderr)
+            return 2
+        return register_module(argv[1])
     parser = argparse.ArgumentParser(description="Run read-only code reviews across multiple model backends.")
     parser.add_argument("-m", "--model", action="append", default=[], help="model/backend to run; repeat or comma-separate")
     parser.add_argument("-C", "--cwd", default=".", help="repository directory")
@@ -86,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
     parser.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
     parser.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
-    parser.add_argument("--project", default=None, help="project root for per-project visual modules (Stage 3; default --cwd)")
+    parser.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
     args = parser.parse_args(argv)
 
     config = load_config()
@@ -160,14 +181,23 @@ def main(argv: list[str] | None = None) -> int:
                 vision_timeout=args.vision_timeout,
                 as_json=args.json,
                 strict=args.strict,
+                # Per-project module discovery defaults to the CLI cwd (-C), NOT the
+                # process cwd, so `review --visual shot.png -C <repo>` finds
+                # <repo>/.review/visual-modules.json (codex P2).
+                project=args.project or str(cwd),
             )
 
         # COMPANION: a mode (or the default diff-review) runs WITH the image as context.
+        # Stage 2: the image is delivered to a vision model (the per-mode fan-out) unless
+        # --no-ai, and the grounded observation is folded into the mode prompt.
         visual_ctx = build_mode_visual_context(
             Path(args.visual).expanduser(),
             before=Path(args.before).expanduser() if args.before else None,
             expect=args.expect,
             intent=args.intent,
+            models=[] if args.no_ai else models,
+            requested_checks=list(args.check),
+            vision_timeout=args.vision_timeout,
         )
         # The cvGate pre-filter BLOCKS the companion run on an unambiguously-broken
         # render (codex P2): a blank/unreadable/error-overlay image must short-circuit

@@ -31,12 +31,27 @@ from .vision_client import (
 )
 
 
-def _active_modules(ctx: VisualContext):
-    """Built-in module selection (§4 step 2). Per-project module discovery (§6) is
-    Stage 3 — here only the trusted built-ins are considered. `--check <name>`
-    force-activates a named module; otherwise modules self-select via activates()."""
+def _candidate_modules(project: Path | None):
+    """All modules eligible for this run: the trusted built-ins (§4) PLUS the
+    per-project contributed modules the registry discovered and TOFU-trusted (§6). An
+    untrusted/quarantined contributed module is ABSENT here (never a block)."""
+    mods = list(builtin_modules())
+    try:
+        from .registry import load_modules
+
+        contributed, _quarantined = load_modules(project=project)
+        mods.extend(contributed)
+    except Exception:  # noqa: BLE001 — a registry failure must never break a verification
+        pass
+    return mods
+
+
+def _active_modules(ctx: VisualContext, project: Path | None = None):
+    """Module selection (§4 step 2): keep the candidates whose `activates(ctx)` is True.
+    `--check <name>` force-activates a named module regardless of its rule. Built-ins
+    self-activate by default; a contributed module gates on its `activates_on` tags."""
     mods = []
-    for m in builtin_modules():
+    for m in _candidate_modules(project):
         forced = m.name in ctx.requested_checks
         if forced or m.activates(ctx):
             mods.append(m)
@@ -62,6 +77,7 @@ def run_pipeline(
     models: list[str] | None = None,
     no_ai: bool = False,
     vision_timeout: int = 60,
+    project: Path | None = None,
 ) -> Verdict:
     """Run the full standalone pipeline and return a final `Verdict`.
 
@@ -102,7 +118,7 @@ def run_pipeline(
         intent=intent,
         requested_checks=requested_checks,
     )
-    modules = _active_modules(ctx)
+    modules = _active_modules(ctx, project)
 
     # Module CV phase (§4 step 3): a module `block` can short-circuit before any
     # vision call (cheap, module-scoped — like cvGate but owned by a module).

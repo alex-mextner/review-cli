@@ -129,11 +129,11 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int)
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
-def _read_env_key(env_file: Path) -> str | None:
+def _read_env_key(env_file: Path, var: str = "GEMINI_API_KEY") -> str | None:
     try:
         for line in env_file.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
-            if stripped.startswith("GEMINI_API_KEY="):
+            if stripped.startswith(f"{var}="):
                 value = stripped.split("=", 1)[1].strip().strip('"').strip("'")
                 return value or None
     except OSError:
@@ -141,18 +141,45 @@ def _read_env_key(env_file: Path) -> str | None:
     return None
 
 
-def _gemini_key() -> str:
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
+    """Resolve a provider API key from the environment, then the same fallback files
+    review already reads (GEMINI_ENV_FILE override, else GEMINI_ENV_FALLBACKS — the
+    shared `~/.config/review-cli/.env` and the personal env). Returns None if unset.
+
+    REUSE (§6.4 / CTO D9): vision providers piggyback on the SAME config surface review
+    already uses for Gemini — no new per-provider egress config is invented."""
+    for name in env_names:
         value = os.environ.get(name, "").strip()
         if value:
             return value
     env_file = os.environ.get("GEMINI_ENV_FILE")
     paths = (Path(env_file),) if env_file else GEMINI_ENV_FALLBACKS
     for path in paths:
-        key = _read_env_key(path)
+        key = _read_env_key(path, fallback_var)
         if key:
             return key
+    return None
+
+
+def _gemini_key() -> str:
+    key = _resolve_key(("GEMINI_API_KEY", "GOOGLE_API_KEY"), "GEMINI_API_KEY")
+    if key:
+        return key
     raise RuntimeError("GEMINI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
+
+
+def _anthropic_key() -> str:
+    key = _resolve_key(("ANTHROPIC_API_KEY",), "ANTHROPIC_API_KEY")
+    if key:
+        return key
+    raise RuntimeError("ANTHROPIC_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
+
+
+def _openai_key() -> str:
+    key = _resolve_key(("OPENAI_API_KEY",), "OPENAI_API_KEY")
+    if key:
+        return key
+    raise RuntimeError("OPENAI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
 
 
 def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:

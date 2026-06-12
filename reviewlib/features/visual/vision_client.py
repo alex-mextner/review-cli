@@ -76,19 +76,23 @@ class VisionCapability:
     preferred_long_side: int
     wire: str  # 'anthropic' | 'openai' | 'gemini'
     # Whether the LIVE call is wired in this build. The request builders for every
-    # provider are complete + tested, but Stage 1 only ships Gemini's live dispatch;
-    # `select_vision_backend` must not pick a provider whose live send is unwired
-    # (it would always fail closed to `unverified`). Stage 2 flips these to True.
-    live_dispatch: bool = False
+    # provider are complete + tested; Stage 2 ships the live HTTP send for ALL of them
+    # (anthropic Messages tool_use, openai chat json_schema, gemini REST), so every
+    # vision-capable backend is now selectable.
+    live_dispatch: bool = True
 
 
 # Backend route → capability. `resolve_backend` returns one of the review_* functions;
 # we map by function identity through `_route_name`.
 _CAPABILITIES: dict[str, VisionCapability] = {
-    "claude": VisionCapability(True, True, 5 * 1024 * 1024, 1568, "anthropic", live_dispatch=False),
+    "claude": VisionCapability(True, True, 5 * 1024 * 1024, 1568, "anthropic", live_dispatch=True),
     "gemini": VisionCapability(True, True, 7 * 1024 * 1024, 1568, "gemini", live_dispatch=True),
-    "codex": VisionCapability(True, True, 20 * 1024 * 1024, 1568, "openai", live_dispatch=False),
-    "opencode": VisionCapability(True, True, 20 * 1024 * 1024, 1568, "openai", live_dispatch=False),
+    "codex": VisionCapability(True, True, 20 * 1024 * 1024, 1568, "openai", live_dispatch=True),
+    # opencode is an arbitrary-provider ROUTER (oc:fireworks/…, oc:groq/…, …) with no
+    # single REST endpoint — its vision call can't be sent to api.openai.com (a
+    # `fireworks/…` model id there 404s). It stays vision-INCAPABLE here (codex P2): the
+    # selector skips it, never mis-routing an opencode model to OpenAI's REST API.
+    "opencode": VisionCapability(False, True, 20 * 1024 * 1024, 1568, "openai", live_dispatch=False),
 }
 
 
@@ -113,24 +117,44 @@ def capability_for(model: str) -> VisionCapability | None:
     return cap if (cap and cap.vision) else None
 
 
-def select_vision_backend(models: list[str]) -> str | None:
-    """Resolution order (§3.2): the first requested model that is vision-capable,
-    reachable, AND whose live dispatch is wired in this build. Reuses
-    `backend_available` so a backend with no key/binary is skipped. Returns None →
-    fail-closed `unverified`.
-
-    Stage-1 nuance (codex P1): the default model list leads with `codex`, but only
-    Gemini's live send is wired here. Picking the first merely-vision-capable backend
-    would lock onto an unwired provider and always fail closed even when a usable
-    Gemini is configured. So we require `live_dispatch` — the unwired providers are
-    skipped until Stage 2 flips their flag, and a configured Gemini is found."""
+def vision_backend_available(model: str) -> bool:
+    """Whether a model's vision REST path is reachable. The vision call goes over HTTP
+    for EVERY provider (anthropic Messages / openai chat / gemini REST), so reachability
+    is the presence of an API KEY — NOT the CLI binary that review's text path uses
+    (codex/claude-p are CLIs for text review, but their vision call is the provider REST
+    API). So this checks the key per wire, falling back to review's existing config
+    surface (§6.4 / CTO D9)."""
     from ... import backends
 
+    cap = capability_for(model)
+    if cap is None:
+        return False
+    resolver = {
+        "anthropic": backends._anthropic_key,
+        "openai": backends._openai_key,
+        "gemini": backends._gemini_key,
+    }.get(cap.wire)
+    if resolver is None:
+        return False
+    try:
+        resolver()
+        return True
+    except RuntimeError:
+        return False
+
+
+def select_vision_backend(models: list[str]) -> str | None:
+    """Resolution order (§3.2): the first requested model that is vision-capable,
+    reachable (its provider API key is present), AND whose live dispatch is wired.
+    Returns None → fail-closed `unverified`.
+
+    Stage 2: live dispatch is wired for all providers, so any vision-capable backend
+    with a configured key is selectable — the selector honors the requested order."""
     for model in models:
         cap = capability_for(model)
         if cap is None or not cap.live_dispatch:
             continue
-        if backends.backend_available(model):
+        if vision_backend_available(model):
             return model
     return None
 
@@ -240,8 +264,37 @@ def build_openai_request(model: str, system: str, blocks: list[VisionBlock], sch
         ],
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "verdict", "schema": schema, "strict": True},
+            "json_schema": {"name": "verdict", "schema": _openai_strict_schema(schema), "strict": True},
         },
+    }
+
+
+def _openai_strict_schema(schema: dict) -> dict:
+    """OpenAI strict `json_schema` is stricter than the shared schema: it REJECTS
+    `additionalProperties: true` and requires EVERY property to be in `required` (codex
+    P1). The shared `build_output_schema` intentionally leaves optional fields + open
+    objects (for the other providers / module fields); rewrite it for OpenAI strict so
+    the codex/OpenAI live path doesn't 400. Optional fields are made nullable so the
+    model can still 'omit' them by returning null."""
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        return schema
+    props = schema.get("properties", {})
+    already_required = set(schema.get("required", []))
+    strict_props: dict = {}
+    for key, prop in props.items():
+        p = dict(prop) if isinstance(prop, dict) else {"type": "string"}
+        # A property that wasn't required becomes nullable (strict requires it present;
+        # null lets the model signal 'no value').
+        if key not in already_required and "type" in p and isinstance(p["type"], str):
+            p["type"] = [p["type"], "null"]
+        if p.get("type") == "object":
+            p = _openai_strict_schema(p)
+        strict_props[key] = p
+    return {
+        "type": "object",
+        "properties": strict_props,
+        "required": list(strict_props.keys()),
+        "additionalProperties": False,
     }
 
 
@@ -398,9 +451,10 @@ def call_ai_vision(
     """Run the multimodal call. Validated OUTSIDE (the policy engine), fail-closed.
 
     `model` None / a non-vision / unreachable backend → `available=False`
-    (→ `unverified`). Stage 1 ships the Gemini live path (review owns its REST/key);
-    the request builders for every provider are complete and unit-tested, so wiring
-    the Anthropic/OpenAI live HTTP in Stage 2 is request-dispatch only."""
+    (→ `unverified`). Stage 2 ships the live HTTP send for ALL providers (anthropic
+    Messages tool_use, openai chat json_schema, gemini REST); the request builders are
+    provider-correct and unit-tested, and each `_call_*` unwraps the structured verdict
+    and fails closed on transport/HTTP/parse error."""
     if model is None:
         return VisionVerdict(available=False, verdict=None, error="no vision-capable backend configured")
     cap = capability_for(model)
@@ -413,14 +467,118 @@ def call_ai_vision(
 
     if wire == "gemini":
         return _call_gemini(model, body, timeout_s)
-    # Anthropic / OpenAI live dispatch is Stage 2 (TODO: ship the HTTP/SDK send +
-    # response unwrap; the request body `body` is already provider-correct here).
+    if wire == "anthropic":
+        return _call_anthropic(model, body, timeout_s)
+    if wire == "openai":
+        return _call_openai(model, body, timeout_s)
     return VisionVerdict(
         available=False,
         verdict=None,
-        error=f"live {wire} vision dispatch not wired in Stage 1 (request builder ready); use a Gemini backend or --no-ai",
+        error=f"unknown vision wire {wire!r} for backend {model}",
         backend=model,
     )
+
+
+def _post_json(url: str, body: dict, headers: dict, timeout_s: int, backend: str) -> tuple[dict | None, VisionVerdict | None]:
+    """POST a JSON body and return (payload, None) on success or (None, fail-closed
+    VisionVerdict) on transport/HTTP error. Shared by every provider's live path so the
+    fail-closed semantics (HTTP → available=True/verdict=None; genuine timeout →
+    timed_out=True) are identical across providers."""
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return json.loads(resp.read().decode("utf-8")), None
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:200]
+        return None, VisionVerdict(available=True, verdict=None, error=f"HTTP {exc.code}: {detail}", backend=backend)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        timed_out = _is_timeout(exc)
+        kind = "timed out" if timed_out else "failed"
+        return None, VisionVerdict(available=True, verdict=None, error=f"vision call {kind}: {exc}", backend=backend, timed_out=timed_out)
+
+
+def _call_anthropic(model: str, body: dict, timeout_s: int) -> VisionVerdict:
+    """Anthropic Messages API (REST), forced tool_use structured output. The request
+    `model` field holds the user-facing alias (e.g. `claude:claude-fable-5`); resolve it
+    to the real Anthropic model id the same way review's text path does (the bit after
+    a `:`, else a sensible default)."""
+    from ... import backends
+
+    try:
+        key = backends._anthropic_key()
+    except RuntimeError as exc:
+        return VisionVerdict(available=False, verdict=None, error=str(exc), backend=model)
+    body = {**body, "model": _anthropic_model_id(model)}
+    payload, fail = _post_json(
+        "https://api.anthropic.com/v1/messages", body,
+        {"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout_s, model,
+    )
+    if fail is not None:
+        return fail
+    return _parse_anthropic_response(payload or {}, model)
+
+
+def _anthropic_model_id(model: str) -> str:
+    # An explicit `claude:<id>` selects that model; a bare alias OR an empty suffix
+    # (`claude:`) falls back to the default vision-capable model rather than sending an
+    # empty model field to the API (which 400s).
+    import os
+
+    suffix = model.split(":", 1)[1].strip() if ":" in model else ""
+    return suffix or os.environ.get("ANTHROPIC_VISION_MODEL", "claude-sonnet-4-5")
+
+
+def _parse_anthropic_response(payload: dict, backend: str) -> VisionVerdict:
+    """Unwrap the tool_use input from a Messages response into a structured verdict."""
+    try:
+        for block in payload.get("content", []) or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
+                return parse_structured(block["input"], backend=backend)
+        # No tool_use block (model returned prose) → try a text block as JSON.
+        texts = "".join(b.get("text", "") for b in payload.get("content", []) if isinstance(b, dict) and b.get("type") == "text")
+        if texts.strip():
+            return parse_structured(json.loads(texts), backend=backend)
+    except (json.JSONDecodeError, TypeError, KeyError) as exc:
+        return VisionVerdict(available=True, verdict=None, error=f"unparseable anthropic response: {exc}", backend=backend, raw=payload)
+    return VisionVerdict(available=True, verdict=None, error="anthropic response had no tool_use/JSON verdict", backend=backend, raw=payload)
+
+
+def _call_openai(model: str, body: dict, timeout_s: int) -> VisionVerdict:
+    """OpenAI Chat Completions (REST), forced json_schema structured output. Resolves the
+    real OpenAI model id from the alias (bit after `:`, else a vision default)."""
+    from ... import backends
+
+    try:
+        key = backends._openai_key()
+    except RuntimeError as exc:
+        return VisionVerdict(available=False, verdict=None, error=str(exc), backend=model)
+    body = {**body, "model": _openai_model_id(model)}
+    payload, fail = _post_json(
+        "https://api.openai.com/v1/chat/completions", body,
+        {"Authorization": f"Bearer {key}"}, timeout_s, model,
+    )
+    if fail is not None:
+        return fail
+    return _parse_openai_response(payload or {}, model)
+
+
+def _openai_model_id(model: str) -> str:
+    import os
+
+    suffix = model.split(":", 1)[1].strip() if ":" in model else ""
+    return suffix or os.environ.get("OPENAI_VISION_MODEL", "gpt-4o")
+
+
+def _parse_openai_response(payload: dict, backend: str) -> VisionVerdict:
+    try:
+        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if isinstance(content, list):  # some models return content parts
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        data = json.loads(content)
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
+        return VisionVerdict(available=True, verdict=None, error=f"unparseable openai response: {exc}", backend=backend, raw=payload)
+    return parse_structured(data, backend=backend)
 
 
 def _call_gemini(model: str, body: dict, timeout_s: int) -> VisionVerdict:
@@ -435,7 +593,8 @@ def _call_gemini(model: str, body: dict, timeout_s: int) -> VisionVerdict:
     # Honour the SAME model resolution as review_gemini: explicit `gemini:<model>` →
     # that model; bare `gemini` → $GEMINI_MODEL else the default (codex P2), so the
     # visual path doesn't silently use a different model than the configured one.
-    gemini_model = model.split(":", 1)[1] if ":" in model else os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    _suffix = model.split(":", 1)[1].strip() if ":" in model else ""
+    gemini_model = _suffix or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(

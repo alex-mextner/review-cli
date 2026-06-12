@@ -36,6 +36,9 @@ if command -v magick >/dev/null 2>&1 && python3 -c "import PIL" >/dev/null 2>&1;
   python3 tests/test_policy_engine.py
   python3 tests/test_pipeline.py
   python3 tests/test_visual_compose.py
+  python3 tests/test_visual_registry.py
+  python3 tests/test_selection_highlight.py
+  python3 tests/test_visual_fanout.py
   echo "visual-verification tests OK"
 else
   echo "SKIP visual-verification tests: need ImageMagick (\`magick\`) + Pillow (pip install -e '.[test]')" >&2
