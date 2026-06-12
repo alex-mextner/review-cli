@@ -36,8 +36,12 @@ v2 brainstorm (`bs-visual-verify-v2.md`) talks about a `capture` module, that mo
 
 **Goals**
 
-1. `review --visual <image>` — verify a single image (or a before/after pair) and emit a
-   verdict, both human-readable and `--json`.
+1. `review --visual <image>` — a **composable flag** that (a) feeds the image(s) as
+   multimodal CONTEXT into whatever mode runs, and (b) activates the visual-verification
+   modules. On its own (no companion mode) it runs the pure verdict pipeline on a single
+   image (or before/after pair) and emits a verdict, both human-readable and `--json`;
+   combined with `--brainstorm` / `--quorum` / the default diff-review, the image and the
+   modules' visual questions are folded into that mode's model call (see §2.1).
 2. An **image-only verification pipeline**: `cvGate` (fast pixel pre-filter) → `visionClient`
    (`callAIVision`, multimodal, the primary judge) → `policyEngine` (decision outside the
    model) → verdict.
@@ -57,7 +61,8 @@ v2 brainstorm (`bs-visual-verify-v2.md`) talks about a `capture` module, that mo
 
 - No screenshot capture, no headless browser, no DOM/stylesheet inspection inside `review`.
 - No change to the four existing review modes (`review`, `--just-ask`, `--quorum`,
-  `--brainstorm`); `--visual` is a fifth, mutually-exclusive mode.
+  `--brainstorm`); `--visual` is **not** a new mode — it is an **orthogonal, composable
+  flag** that layers onto whichever mode runs (see §2.1).
 - Not building the in-product hyper-canvas verifier; that lives in `hyper-canvas-draft`.
 - No new mandatory runtime dependency in the `tg` hot path (the hook is a `stat`-guarded
   subprocess; see §7).
@@ -66,12 +71,16 @@ v2 brainstorm (`bs-visual-verify-v2.md`) talks about a `capture` module, that mo
 
 ## 2. The `review --visual` command
 
-`--visual` is a new mode in the existing argparse layer in `bin/review:main()`, mutually
-exclusive with `--just-ask` / `--quorum` / `--brainstorm` (same group). It takes one image
-argument and optional flags.
+`--visual` is an **orthogonal, composable flag** in the existing argparse layer in
+`bin/review:main()` — **not** a mode and **not** in the mutually-exclusive mode group with
+`--just-ask` / `--quorum` / `--brainstorm`. It takes one image argument (plus optional flags)
+and *combines* with whatever mode runs: it adds the image(s) as multimodal context to that
+mode's model call and activates the visual-verification modules. With no companion mode it
+degenerates to pure visual verification (the verdict pipeline). See §2.1 for the composition
+matrix.
 
 ```
-review --visual <after.png>                        # judge a single render
+review --visual <after.png>                        # visual-only: judge a single render
 review --visual <after.png> --before <before.png>  # before/after pair (diff-aware judgement)
 review --visual <after.png> --intent "style edit: bump heading size"   # edit intent → contract
 review --visual <after.png> --expect style          # expectation kind (zero-diff|move|resize|
@@ -87,7 +96,7 @@ review --visual <after.png> -m fable5                # pick the vision backend(s
 
 | Flag | Meaning |
 |------|---------|
-| `--visual <image>` | mode selector + the image to judge (the "after"/only image). |
+| `--visual <image>` | composable capability flag + the image to feed/judge (the "after"/only image). Combines with `--brainstorm`/`--quorum`/default; alone = pure visual verification. |
 | `--before <image>` | optional baseline image for diff-aware judgement. |
 | `--intent <text>` | free-text edit intent; **untrusted**, may only *tighten* the contract (§5, §6). |
 | `--expect <kind>` | expectation kind driving the contract; default inferred / `style`. |
@@ -104,6 +113,31 @@ review --visual <after.png> -m fable5                # pick the vision backend(s
 image / unreadable image. `124` = vision-call timeout (reuses `_run_streamed`'s convention,
 though vision is an in-process HTTP/SDK call, see §3).
 
+### 2.1 Composition with review modes
+
+`--visual` is **orthogonal** to the mode selectors. The mechanism is the multimodal
+`callAIVision` (§3.2): it is what delivers the image into *any* mode's model call, and the
+active `features/` modules contribute their `vision_questions` / `cv_check` into whichever
+mode is running. So one flag drives four combinations:
+
+| Invocation | What runs |
+|------------|-----------|
+| `review --visual shot.png` *(no diff, no other mode)* | **Visual-only (degenerate case).** No companion mode → the pure verdict pipeline of §3 (contract → cvGate → callAIVision → policyEngine). This is just the flag with no mode attached. |
+| `review --brainstorm "…" --visual shot.png` | The **brainstorm** panel runs, but each persona's model call is made through `callAIVision` with the image attached, so the rotating experts *see* the screenshot and reason about it alongside the prompt. The visual modules' `vision_questions` are folded into the same multimodal call. |
+| `review --quorum "…" --visual shot.png` | The **quorum** runs with the image as shared multimodal context for every voting model; the verdict-relevant visual questions ride along in the same call. |
+| `review --visual shot.png` *(with a diff present)* | The **default diff-review** runs with the image as extra multimodal context (e.g. "here is the rendered result of this diff"). |
+
+The rule throughout: when a companion mode is present, the image **and** the visual modules'
+questions are merged into **that mode's** multimodal model call — there is **no separate,
+isolated visual run** alongside it. The dedicated verdict pipeline of §3 fires as its own
+pass **only** in the degenerate, mode-less case. In all cases the multimodal delivery and the
+module contributions are the same machinery; only the *consumer* (a brainstorm persona, a
+quorum voter, the diff reviewer, or the standalone verdict pipeline) differs.
+
+`--strict`, `--json`, and the verdict exit codes (above) apply to the standalone
+visual-verification pipeline; when `--visual` rides a companion mode, that mode's normal
+output/exit conventions govern and the image is purely added context.
+
 ---
 
 ## 3. The image-only verification pipeline (capture-less)
@@ -112,6 +146,18 @@ The input is already an image, so there is no `capture` module. The pipeline is 
 plus a verdict assembler. It is a straight port of the v2 brainstorm pipeline with stage 1
 removed and stage 5 collapsed (the CLI is one-shot; there is no long-lived async queue —
 caching is optional, §3.4).
+
+**When this pipeline runs.** The pipeline below runs **whenever `--visual` is present**. In the
+**mode-less** case (`review --visual shot.png`, §2.1) it runs as its own standalone pass and
+produces the verdict. When a **companion mode** (`--brainstorm` / `--quorum` / the default
+diff-review) is *also* present, the pipeline does **not** fire as a separate isolated run;
+instead its multimodal delivery (`callAIVision`, §3.2) and the active modules' contributions
+(`cv_check` pre-filter, `vision_questions`) are **folded into that mode's** model call — the
+image becomes context for the brainstorm personas / quorum voters / diff reviewer, and the
+visual questions are appended to that call's prompt and schema. `cvGate` (§3.1) still runs as a
+cheap pixel pre-filter in either case (an unambiguously-broken image can be flagged before the
+mode's models are even invoked). The standalone stages are described below; read them as "the
+mode-less pass, and the per-stage machinery reused by a companion mode."
 
 ```
 review --visual <image> [--before <b>] [--intent …] [--expect …]
@@ -164,7 +210,12 @@ and the policy engine.
 
 The existing review backends are **text-only** (`_payload()` builds a string; Gemini sends
 `{parts:[{text}]}`; codex/claude/opencode get a string on stdin/`-p`). `--visual` needs a
-**separate** multimodal path — do **not** overload the text `review_*` functions.
+**separate** multimodal path — do **not** overload the text `review_*` functions. This
+`callAIVision` path is the single mechanism that delivers an image into a model call, and it
+is reused by *every* `--visual` combination (§2.1): the standalone verdict pipeline calls it
+directly, and a companion mode (`--brainstorm`/`--quorum`/default) routes its own model call
+through `callAIVision` instead of the text-only payload when `--visual` is present, attaching
+the image and the active modules' `vision_questions` to that call.
 
 ```python
 # features/visual/vision_client.py  (review)
@@ -677,11 +728,14 @@ memories/rule with "the `review --visual` pre-send-photo hook enforces this."
 
 ## 12. Docs / README updates (part of the build, not after)
 
-- **review README** — a new `### Visual` mode section after `### Brainstorm`, with a **cases
-  mockup** (the `frames-check`-style hero: 4 BLOCK cases — unstyled / blank / FOUC / error-
-  overlay — and 4 ALLOW cases — properly styled renders — each a thumbnail + verdict + reason),
-  the flag table additions (§2), and the `review --visual` / `install-hook tg` /
-  `register-module` usage. Add `--visual` to the **Flags** and **When to use which** tables.
+- **review README** — a new `### Visual` section after `### Brainstorm` documenting `--visual`
+  as a **composable flag** (callable standalone or alongside `--brainstorm`/`--quorum`/the
+  default diff-review — the §2.1 composition matrix), with a **cases mockup** (the
+  `frames-check`-style hero: 4 BLOCK cases — unstyled / blank / FOUC / error-overlay — and 4
+  ALLOW cases — properly styled renders — each a thumbnail + verdict + reason), the flag table
+  additions (§2), and the `review --visual` / `install-hook tg` / `register-module` usage. Add
+  `--visual` to the **Flags** table (as a flag, not a mode) and note its composability in the
+  **When to use which** table.
 - **review SKILL.md + blurb** (`install_agent_skill`) — extend the description and the always-on
   blurb to mention `review --visual <image>` (image verification + the tg-photo gate). The blurb
   is the line surfaced in every harness's CLI listing (the `<!-- skill:review -->` block in
