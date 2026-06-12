@@ -1,0 +1,253 @@
+"""install-skill / install-commit-hook / review-stamp machinery.
+
+Extracted verbatim from the original single-file `bin/review` (Stage 0
+decomposition — zero behaviour change).
+
+install-skill: make agent harnesses aware this tool exists. Writes a SKILL.md
+(Agent Skills standard, ~/.agents/skills/) read by Claude Code, Codex, opencode,
+Gemini, Cursor; a short always-on blurb into each detected harness's global
+instruction file; and an idempotent SessionStart hook that surfaces every
+installed agent-CLI at the top of each session. `install-commit-hook` adds the
+optional hard review-before-commit gate.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+SKILL_NAME = "review"
+SKILL_MD = """\
+---
+name: review
+description: >-
+  Read-only multi-model code review and AI panel. Use BEFORE committing to check a
+  diff across several models at once, to get a multi-model second opinion on a
+  question (--just-ask), to settle a contested technical decision with cited
+  evidence (--quorum), or to brainstorm an open design space across rotating expert
+  personas in a loop (--brainstorm). e.g. `review` on the current diff.
+metadata:
+  author: alex-mextner
+  repo: https://github.com/alex-mextner/review-cli
+---
+
+# review — multi-model read-only code review + panels
+
+Runs your git diff (or a question/topic) across several model backends in parallel.
+
+## Invocation
+```
+review                       # review current unstaged diff across default models
+review --staged              # review the staged diff (pre-commit)
+review -m codex -m gemini    # pick backends (repeat or comma-separate)
+review --just-ask "Q"        # multi-model answer to a question (no diff needed)
+review --quorum "Q"          # experts answer + a moderator finds consensus/disagreement
+review --brainstorm "TOPIC"  # iterative persona ideation in a loop, with a moderator
+```
+
+## When to use
+- Before committing — sanity-check a diff across multiple models in parallel.
+- For a hard decision — `--quorum` (settle with cited evidence) or `--brainstorm`
+  (explore an open design space across rotating expert roles, in a loop).
+- For a quick multi-model second opinion — `--just-ask`.
+
+Pair with `tg` to post the chosen options / pros-cons to Telegram.
+"""
+SKILL_BLURB = (
+    "`review` — multi-model read-only code review + AI panels "
+    "(codex/claude/gemini/opencode): `review` (diff), `review --quorum \"Q\"`, "
+    "`review --brainstorm \"topic\"`. Use before commits and for hard decisions."
+)
+
+_HOOK_MARKER = "# agent-tools-awareness"
+_HOOK_COMMAND = (
+    "sh -c 'd=\"$HOME/.agents/skills/.blurbs\"; ls \"$d\"/*.md >/dev/null 2>&1 && "
+    '{ printf \"Agent CLI tools installed on this machine (prefer them):\\n\"; '
+    "cat \"$d\"/*.md; }' " + _HOOK_MARKER
+)
+
+
+def _detected(cmd: str, *dirs: str) -> bool:
+    import shutil
+
+    if shutil.which(cmd):
+        return True
+    return any(os.path.isdir(os.path.expanduser(d)) for d in dirs)
+
+
+def _append_marked(path, tool: str, blurb: str) -> None:
+    import re
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    start, end = f"<!-- skill:{tool} -->", f"<!-- /skill:{tool} -->"
+    existing = p.read_text(encoding="utf-8") if p.exists() else ""
+    existing = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"\n?", "", existing, flags=re.S)
+    block = f"{start}\n{blurb}\n{end}\n"
+    p.write_text((existing.rstrip() + "\n\n" + block) if existing.strip() else block, encoding="utf-8")
+
+
+def _ensure_sessionstart_hook(home) -> bool:
+    """Idempotently add a SessionStart hook to ~/.claude/settings.json that
+    surfaces installed agent CLIs. Conservative: never removes unrelated config."""
+    settings = Path(home) / ".claude" / "settings.json"
+    if not settings.parent.is_dir():
+        return False
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        return False
+    sessionstart = hooks.setdefault("SessionStart", [])
+    if not isinstance(sessionstart, list):
+        return False
+    for group in sessionstart:
+        for h in (group or {}).get("hooks", []) if isinstance(group, dict) else []:
+            if isinstance(h, dict) and _HOOK_MARKER in str(h.get("command", "")):
+                return False
+    sessionstart.append({"hooks": [{"type": "command", "command": _HOOK_COMMAND}]})
+    if settings.exists():
+        settings.with_suffix(".json.bak").write_text(settings.read_text(encoding="utf-8"), encoding="utf-8")
+    settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
+def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
+    home = Path.home()
+    written = []
+
+    skill_dir = home / ".agents" / "skills" / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    written.append(str(skill_dir / "SKILL.md"))
+    blurbs = home / ".agents" / "skills" / ".blurbs"
+    blurbs.mkdir(parents=True, exist_ok=True)
+    (blurbs / f"{name}.md").write_text(f"- {blurb}\n", encoding="utf-8")
+
+    claude_skills = home / ".claude" / "skills"
+    if claude_skills.is_dir():
+        link = claude_skills / name
+        if not link.exists():
+            try:
+                link.symlink_to(Path("..") / ".." / ".agents" / "skills" / name)
+            except OSError:
+                pass
+
+    harness_files = [
+        ("claude", home / ".claude" / "CLAUDE.md", ("~/.claude",)),
+        ("codex", home / ".codex" / "AGENTS.md", ("~/.codex",)),
+        ("opencode", home / ".config" / "opencode" / "AGENTS.md", ("~/.config/opencode",)),
+        ("gemini", home / ".gemini" / "GEMINI.md", ("~/.gemini",)),
+    ]
+    for cmd, path, dirs in harness_files:
+        if _detected(cmd, *dirs):
+            _append_marked(path, name, blurb)
+            written.append(str(path))
+
+    if (home / ".claude").is_dir():
+        if _ensure_sessionstart_hook(home):
+            written.append("SessionStart hook -> ~/.claude/settings.json")
+
+    for w in written:
+        print(f"  ✓ {w}")
+    print(f"{name}: install-skill done ({len(written)} target(s)). Re-run anytime; idempotent.")
+    return 0
+
+
+def install_skill() -> int:
+    return install_agent_skill(SKILL_NAME, SKILL_MD, SKILL_BLURB)
+
+
+_PRECOMMIT_MARKER = "# review-before-commit-gate"
+# Hash must match exactly what `review --staged` reviews (`git diff --no-ext-diff
+# --cached`) and the stamp path must resolve via `git rev-parse --git-path` so it
+# works in worktrees and repos whose `.git` is a pointer file.
+_PRECOMMIT = """\
+#!/bin/sh
+""" + _PRECOMMIT_MARKER + """ (installed by `review install-commit-hook`)
+# Blocks a commit whose staged diff has not been reviewed. Bypass with
+# REVIEW_SKIP=1 git commit ...   or   git commit --no-verify
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+# A global core.hooksPath shadows each repo's own pre-commit, so run it
+# explicitly first — tests/formatters/secret-scanners must still gate. Resolve
+# via git-path so worktrees/submodules (where .git is a file) work too.
+local_hook="$(git rev-parse --git-path hooks/pre-commit)"
+case "$local_hook" in /*) : ;; *) local_hook="$root/$local_hook" ;; esac
+if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
+  "$local_hook" "$@" || exit $?
+fi
+
+[ -n "$REVIEW_SKIP" ] && exit 0
+[ -z "$(git diff --cached --name-only)" ] && exit 0
+h=$(git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
+stamp=$(git rev-parse --git-path review-stamp)
+if [ -f "$stamp" ] && grep -q "$h" "$stamp"; then exit 0; fi
+echo "review-before-commit: staged changes have not been reviewed." >&2
+echo "  run:  review --staged      (then commit)" >&2
+echo "  skip: REVIEW_SKIP=1 git commit ...   |   git commit --no-verify" >&2
+exit 1
+"""
+
+
+def _write_review_stamp(cwd: Path, diff: str) -> None:
+    """Record that this exact diff was reviewed, so the optional pre-commit gate
+    can verify it. Uses `git rev-parse --git-path` so worktrees / pointer-file
+    .git resolve correctly. Best-effort: never breaks a review on failure."""
+    import hashlib
+    try:
+        p = subprocess.run(
+            ["git", "rev-parse", "--git-path", "review-stamp"], cwd=cwd, capture_output=True, text=True
+        )
+        if p.returncode != 0:
+            return
+        rel = p.stdout.strip()
+        stamp = Path(rel) if os.path.isabs(rel) else Path(cwd) / rel
+        digest = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        stamp.write_text(f"{digest}\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def install_commit_hook() -> int:
+    """Install a GLOBAL git pre-commit hook enforcing review-before-commit.
+    Opt-in (not run by install-skill) because it affects every repo."""
+    home = Path.home()
+    hooks_dir = home / ".config" / "git" / "hooks"
+    # Respect an existing global hooksPath rather than hijacking it.
+    cur = subprocess.run(
+        ["git", "config", "--global", "--get", "core.hooksPath"], capture_output=True, text=True
+    )
+    existing_path = cur.stdout.strip()
+    if existing_path:
+        expanded = os.path.expanduser(existing_path)
+        if not os.path.isabs(expanded):
+            # Git resolves a relative core.hooksPath per-repo, so a single global
+            # gate can't live there. Refuse rather than silently misinstall.
+            print(f"review: global core.hooksPath is relative ('{existing_path}').")
+            print("        Git resolves it per repository, so a global gate can't be placed")
+            print("        there. Set an absolute core.hooksPath (or unset it) and re-run.")
+            return 1
+        hooks_dir = Path(expanded)
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    pre_commit = hooks_dir / "pre-commit"
+
+    if pre_commit.exists():
+        body = pre_commit.read_text(encoding="utf-8", errors="replace")
+        if _PRECOMMIT_MARKER not in body:
+            print(f"review: a pre-commit hook already exists at {pre_commit} and is NOT ours.")
+            print("        Not overwriting. Merge the gate manually or remove that hook first.")
+            return 1
+    pre_commit.write_text(_PRECOMMIT, encoding="utf-8")
+    pre_commit.chmod(0o755)
+    if not existing_path:
+        subprocess.run(["git", "config", "--global", "core.hooksPath", str(hooks_dir)], check=False)
+        print(f"  ✓ set global core.hooksPath -> {hooks_dir}")
+    print(f"  ✓ wrote {pre_commit}")
+    print("review: commit gate active. `review --staged` before committing; "
+          "bypass with REVIEW_SKIP=1 or --no-verify.")
+    return 0

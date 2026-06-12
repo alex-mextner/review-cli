@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Python package build artifacts (review-cli is now a real package — `pip`/pipx build
+# produces these from pyproject.toml; never commit them).
+build/
+dist/
+*.egg-info/
