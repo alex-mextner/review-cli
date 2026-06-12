@@ -609,7 +609,14 @@ def resolve_backend(model: str) -> Callable[[str, str, str, Path, int], ReviewRe
         return review_codex
     if lowered in ("gemini", "gemini-api") or lowered.startswith("gemini:"):
         return review_gemini
-    if lowered in ("claude", "claude-p") or lowered.startswith("claude:"):
+    # fable IS claude-p. Route any fable form to review_claude defensively, so an
+    # unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
+    # default (which would hit fireworks — the wrong provider entirely).
+    if (
+        lowered in ("claude", "claude-p", "claude-fable-5")
+        or lowered.startswith("claude:")
+        or lowered.startswith("fable")
+    ):
         return review_claude
     if lowered.startswith(("oc:", "opencode:")):
         return review_opencode

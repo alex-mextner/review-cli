@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""frames-check — deterministic selection-frame detector for HyperCanvas screenshots.
+
+WHY THIS EXISTS
+    A HyperCanvas selection frame is a 2px solid `rgb(59,130,246)` rectangle
+    outline (shared/canvas-interaction/overlay-renderer.ts SELECTION_BORDER). On
+    a full screenshot that outline is so thin a vision model routinely fails to
+    tell whether it is present at all — so "selection works" proofs slip through
+    with NO frame drawn. This tool removes the guesswork: it isolates frame
+    pixels by COLOR, keeps only the ones whose SHAPE is a hollow thin rectangle
+    (a real frame), counts them deterministically, and writes a high-contrast
+    "frames-only" image where every frame is thickened and lit up so its
+    presence/absence is unmistakable to a human or a model.
+
+HOW
+    1. Color-mask the target color (±fuzz) to white, everything else black
+       (ImageMagick -opaque / +opaque).
+    2. 8-connected components → bounding box + filled pixel area per region.
+    3. SHAPE filter: a frame is HOLLOW — fill_ratio = area / (w*h) is low
+       (an outline ring), min side >= MIN_DIM, area >= MIN_AREA. Solid blue UI
+       (buttons, icon chips) has fill_ratio near 1 and is rejected.
+    4. Emit frames-only.png (dilated, lime-on-black + bbox annotations) and a
+       JSON verdict. Exit 1 if --min-frames is set and not met (CI/review gate).
+
+USAGE
+    frames-check SHOT.png [--color 59,130,246] [--fuzz 14] [--min-dim 24]
+                 [--max-fill 0.30] [--min-area 150] [--min-frames N]
+                 [--out frames-only.png] [--json]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# ImageMagick 7 ships `magick`; fall back to legacy `convert`.
+MAGICK = "magick"
+
+# id: WxH+X+Y cx,cy area srgb(r,g,b)
+_CC_LINE = re.compile(
+    r"^\s*\d+:\s+(\d+)x(\d+)\+(-?\d+)\+(-?\d+)\s+[\d.,]+\s+(\d+)\s+s?rgba?\(([^)]+)\)"
+)
+
+
+def _magick(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([MAGICK, *args], capture_output=True, text=True)
+
+
+def detect_frames(
+    image: Path,
+    color: tuple[int, int, int],
+    fuzz: int,
+    min_dim: int,
+    max_fill: float,
+    min_area: int,
+) -> tuple[list[dict], Path]:
+    """Return (frames, mask_path). Each frame: {x,y,w,h,area,fill_ratio}."""
+    r, g, b = color
+    mask = Path(tempfile.mkstemp(suffix="-mask.png")[1])
+    # White where the pixel is within fuzz% of the target color, black elsewhere.
+    proc = _magick(
+        str(image),
+        "-fuzz", f"{fuzz}%",
+        "-fill", "white", "-opaque", f"rgb({r},{g},{b})",
+        # Reset fuzz to 0 BEFORE blackening: with the matched color now pure
+        # white, +opaque white must blacken everything that is not EXACTLY white.
+        # Leaving fuzz at 14% here would keep near-white pixels and corrupt the
+        # mask (frames merge with adjacent text → undercount).
+        "-fuzz", "0",
+        "-fill", "black", "+opaque", "white",
+        "-define", "connected-components:verbose=true",
+        "-define", f"connected-components:area-threshold={min_area}",
+        "-connected-components", "8",
+        str(mask),
+    )
+    table = proc.stdout + proc.stderr
+    frames: list[dict] = []
+    for line in table.splitlines():
+        m = _CC_LINE.match(line)
+        if not m:
+            continue
+        w, h, x, y, area = (int(m.group(i)) for i in range(1, 6))
+        mean = m.group(6)
+        # Frame pixels are the WHITE (matched-color) regions, not the black holes.
+        if not mean.replace(" ", "").startswith("255,255,255"):
+            continue
+        bbox_area = w * h
+        if bbox_area == 0:
+            continue
+        fill_ratio = area / bbox_area
+        # Shape gate: hollow (low fill), big enough to be a real frame.
+        if min(w, h) >= min_dim and area >= min_area and fill_ratio <= max_fill:
+            frames.append(
+                {"x": x, "y": y, "w": w, "h": h, "area": area, "fill_ratio": round(fill_ratio, 4)}
+            )
+    frames.sort(key=lambda f: (f["y"], f["x"]))
+    return frames, mask
+
+
+def render_frames_only(mask: Path, frames: list[dict], out: Path) -> None:
+    """High-contrast frames-only view: thicken + colorize the masked outlines on
+    black, then annotate each detected frame's bounding box."""
+    draw = []
+    for f in frames:
+        x0, y0, x1, y1 = f["x"], f["y"], f["x"] + f["w"] - 1, f["y"] + f["h"] - 1
+        draw += ["-stroke", "#ff2d55", "-strokewidth", "3", "-fill", "none",
+                 "-draw", f"rectangle {x0},{y0} {x1},{y1}"]
+    _magick(
+        str(mask),
+        # Thicken the thin outline so it reads at a glance.
+        "-morphology", "Dilate", "Disk:2.5",
+        "-fill", "#39ff14", "-opaque", "white",
+        "-background", "black", "-alpha", "remove", "-alpha", "off",
+        *draw,
+        str(out),
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="frames-check", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("image", type=Path)
+    ap.add_argument("--color", default="59,130,246", help="target RGB (default HyperCanvas selection blue)")
+    ap.add_argument("--fuzz", type=int, default=14, help="color tolerance %% (default 14)")
+    ap.add_argument("--min-dim", type=int, default=24, help="min bbox side in px (default 24)")
+    ap.add_argument("--max-fill", type=float, default=0.30, help="max fill ratio for a hollow frame (default 0.30)")
+    ap.add_argument("--min-area", type=int, default=150, help="min matched-pixel area (default 150)")
+    ap.add_argument("--min-frames", type=int, default=None, help="gate: fail (exit 1) if fewer frames detected")
+    ap.add_argument("--out", type=Path, default=None, help="frames-only PNG output path")
+    ap.add_argument("--json", action="store_true", help="emit JSON only")
+    args = ap.parse_args()
+
+    if not args.image.exists():
+        print(f"frames-check: no such file: {args.image}", file=sys.stderr)
+        return 2
+    try:
+        color = tuple(int(c) for c in args.color.split(","))
+        assert len(color) == 3
+    except (ValueError, AssertionError):
+        print(f"frames-check: bad --color {args.color!r} (want R,G,B)", file=sys.stderr)
+        return 2
+
+    frames, mask = detect_frames(args.image, color, args.fuzz, args.min_dim, args.max_fill, args.min_area)
+    out = args.out or args.image.with_name(args.image.stem + ".frames-only.png")
+    render_frames_only(mask, frames, out)
+    mask.unlink(missing_ok=True)
+
+    passed = args.min_frames is None or len(frames) >= args.min_frames
+    result = {
+        "image": str(args.image),
+        "detected": len(frames),
+        "min_frames": args.min_frames,
+        "passed": passed,
+        "frames_only": str(out),
+        "frames": frames,
+    }
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        verdict = "PASS" if passed else "FAIL"
+        gate = f" (need >= {args.min_frames})" if args.min_frames is not None else ""
+        print(f"[frames-check] {verdict}: {len(frames)} selection frame(s) detected{gate}")
+        for i, f in enumerate(frames, 1):
+            print(f"  #{i}  {f['w']}x{f['h']} at ({f['x']},{f['y']})  fill={f['fill_ratio']}")
+        print(f"  frames-only: {out}")
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
