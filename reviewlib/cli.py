@@ -75,6 +75,18 @@ def main(argv: list[str] | None = None) -> int:
     panel.add_argument("--just-ask", metavar="QUESTION", help="ask all backends a plain question, no diff required")
     panel.add_argument("--quorum", metavar="QUESTION", help="experts answer + moderator finds quorum/disagreement")
     panel.add_argument("--brainstorm", metavar="TOPIC", help="multi-round persona ideation with a moderator")
+    # --visual is a COMPOSABLE flag, NOT a mode: it is deliberately OUTSIDE the
+    # mutually-exclusive panel group so it can combine with any mode (§2.1).
+    parser.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; composable with any mode (alone = the verdict pipeline)")
+    parser.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
+    parser.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
+    parser.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
+    parser.add_argument("--check", action="append", default=[], metavar="NAME", help="force-activate a visual module by name (repeatable)")
+    parser.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
+    parser.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
+    parser.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
+    parser.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
+    parser.add_argument("--project", default=None, help="project root for per-project visual modules (Stage 3; default --cwd)")
     args = parser.parse_args(argv)
 
     config = load_config()
@@ -100,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         models = [_expand_alias(x) for x in (config.get("models") or DEFAULT_MODELS)]
 
     panel_mode = args.just_ask or args.quorum or args.brainstorm
+    visual_mode = args.visual is not None
     timeout = args.timeout if args.timeout is not None else (PANEL_TIMEOUT_DEFAULT if panel_mode else 1200)
 
     # Panel modes are interactive and long-running, so announce each streamed
@@ -107,22 +120,92 @@ def main(argv: list[str] | None = None) -> int:
     if panel_mode:
         backends._ANNOUNCE_LOGS = True
 
-    # Diff is optional in panel modes (piped/--staged used as context if present).
+    # Diff acquisition. Panel modes treat the diff as optional context. The default
+    # review (no panel mode) requires a diff. With --visual + the DEFAULT review, the
+    # diff still drives the routing (§2.1): a present diff → the diff-review companion,
+    # an absent diff → the standalone pipeline — so we MUST still try to discover it,
+    # but a missing diff / non-repo must degrade to standalone rather than abort.
     diff = _read_stdin_if_piped()
-    if diff is None and (args.staged or not panel_mode):
+    needs_diff = args.staged or (not panel_mode and not visual_mode)
+    if diff is None and needs_diff:
         diff = _git_diff(cwd, args.staged)
+    elif diff is None and visual_mode and not panel_mode:
+        # --visual riding the default review: probe the working-tree diff to decide
+        # companion-vs-standalone, but tolerate "no diff / not a git repo".
+        try:
+            diff = _git_diff(cwd, args.staged)
+        except RuntimeError:
+            diff = ""
     diff = diff or ""
 
+    # --- --visual composition (§2.1). Build the visual context ONCE; thread it into
+    # whichever consumer runs. cvGate fires here regardless of mode (a broken render
+    # is flagged before any model call). -----------------------------------------
+    visual_ctx = None
+    if visual_mode:
+        from .features.visual.compose import build_mode_visual_context
+
+        # STANDALONE: --visual with no companion mode AND no diff → the verdict pipeline.
+        if not panel_mode and not diff.strip():
+            from .features.visual.visual_cli import run_visual_standalone
+
+            return run_visual_standalone(
+                args.visual,
+                before=args.before,
+                expect=args.expect,
+                intent=args.intent,
+                requested_checks=list(args.check),
+                models=models,
+                no_ai=args.no_ai,
+                vision_timeout=args.vision_timeout,
+                as_json=args.json,
+                strict=args.strict,
+            )
+
+        # COMPANION: a mode (or the default diff-review) runs WITH the image as context.
+        visual_ctx = build_mode_visual_context(
+            Path(args.visual).expanduser(),
+            before=Path(args.before).expanduser() if args.before else None,
+            expect=args.expect,
+            intent=args.intent,
+        )
+        # The cvGate pre-filter BLOCKS the companion run on an unambiguously-broken
+        # render (codex P2): a blank/unreadable/error-overlay image must short-circuit
+        # the mode, not merely be mentioned in prompt text (else `review --staged
+        # --visual blank.png` would run the review and stamp success). Exit 10 under
+        # --strict (the gate/hook block code), else a non-zero advisory exit.
+        if visual_ctx.prefilter_verdict == "rollback":
+            print(f"[review --visual] ROLLBACK (pre-filter, mode blocked): {visual_ctx.prefilter_reason}")
+            # An unreadable/missing image is a USAGE error (exit 1), matching the
+            # standalone exit-code map — scripts/hooks rely on the distinction between
+            # "unreadable input" (1) and "blocking content verdict under --strict" (10).
+            if "unreadable" in visual_ctx.prefilter_reason:
+                return 1
+            return 10 if args.strict else 1
+
     if args.just_ask is not None:
-        return mode_just_ask(args.just_ask, models, diff, cwd, timeout)
+        return mode_just_ask(_with_visual(args.just_ask, visual_ctx), models, diff, cwd, timeout)
     if args.quorum is not None:
-        return mode_quorum(args.quorum, models, diff, cwd, timeout, pick_moderator(args.moderator, models))
+        return mode_quorum(_with_visual(args.quorum, visual_ctx), models, diff, cwd, timeout, pick_moderator(args.moderator, models))
     if args.brainstorm is not None:
         return mode_brainstorm(
-            args.brainstorm, models, cwd, timeout, pick_moderator(args.moderator, models), args.rounds, args.max_rounds
+            _with_visual(args.brainstorm, visual_ctx), models, cwd, timeout,
+            pick_moderator(args.moderator, models), args.rounds, args.max_rounds
         )
 
-    return mode_review(models, args.prompt, diff, cwd, timeout, args.staged)
+    return mode_review(models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout, args.staged)
+
+
+def _with_visual(text: str, visual_ctx) -> str:
+    """Fold the --visual composition context into a mode's prompt/question/topic.
+
+    This is the composition seam (§2.1): the image's described context (and cvGate
+    outcome) is appended so the companion mode reasons about the render. The full
+    per-call multimodal fan-out (routing each model call through call_ai_vision with
+    the image attached) is Stage 2; this is where it plugs in."""
+    if visual_ctx is None:
+        return text
+    return text + visual_ctx.context_note
 
 
 # Re-export for legacy callers that imported subprocess off the entry module.

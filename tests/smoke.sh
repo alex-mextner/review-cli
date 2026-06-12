@@ -12,6 +12,11 @@ bin/review --help | grep -q -- "--just-ask"
 bin/review --help | grep -q -- "--quorum"
 bin/review --help | grep -q -- "--brainstorm"
 
+# Stage 1: the composable --visual flag and its core sub-flags must appear in help.
+bin/review --help | grep -q -- "--visual"
+bin/review --help | grep -q -- "--no-ai"
+bin/review --help | grep -q -- "--strict"
+
 # The single-file CLI must always parse.
 python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse OK')"
 
@@ -19,3 +24,19 @@ python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse O
 # needed — drives a fake slow python child).
 REVIEW_LOG_DIR="$(mktemp -d)" python3 tests/test_streaming.py
 echo "streaming tests OK"
+
+# Stage 1 visual-verification suite (cvGate / vision_client / policy / pipeline /
+# composability). All offline: cvGate shells to magick, the vision call is mocked,
+# fixtures are generated (Pillow) — no API keys, no network. These need two non-core
+# deps: ImageMagick (`magick`, system) and Pillow (the `.[test]` extra). On a bare CI
+# without them, SKIP loudly rather than fail — they are not a runtime requirement.
+if command -v magick >/dev/null 2>&1 && python3 -c "import PIL" >/dev/null 2>&1; then
+  python3 tests/test_cv_gate.py
+  python3 tests/test_vision_client.py
+  python3 tests/test_policy_engine.py
+  python3 tests/test_pipeline.py
+  python3 tests/test_visual_compose.py
+  echo "visual-verification tests OK"
+else
+  echo "SKIP visual-verification tests: need ImageMagick (\`magick\`) + Pillow (pip install -e '.[test]')" >&2
+fi

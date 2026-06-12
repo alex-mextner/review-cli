@@ -9,6 +9,13 @@ description = "Multi-model read-only code review + AI panels."
 requires-python = ">=3.9"
 dependencies = ["pyyaml"]
 
+# The visual-verification test suite generates fixture PNGs with Pillow and shells out
+# to ImageMagick (`magick`, a SYSTEM dependency — install separately, e.g. `brew install
+# imagemagick`). Pillow is TEST-only, not a runtime dependency (cvGate uses ImageMagick,
+# never Pillow). Install with `pip install -e '.[test]'` before running tests/smoke.sh.
+[project.optional-dependencies]
+test = ["pillow"]
+
 # Stage 0 (decomposition) packaging — see docs/architecture-visual-verification.md §8.1, D8.
 # The CLI is now a real package (`reviewlib`), so it is exposed via a proper console
 # entry point instead of the deprecated distutils `script-files` shebang-rewrite. pipx
