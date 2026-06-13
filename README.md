@@ -99,12 +99,13 @@ reads all expert answers, and emits a structured summary with three sections —
 Use when a question has real stakes and you want cited consensus, not vibes.
 
 **Live logs & partial output.** Each backend call streams its output in real time
-to a per-call log under `~/.cache/review-cli/logs/` (override with `$REVIEW_LOG_DIR`;
-files are private, mode 0600). Panel modes print the log path to stderr at the start
-of each call, so you can `tail -f` it to watch a long run progress instead of staring
-at a frozen terminal. If a call hits its `--timeout`, the partial output captured so
-far is still returned (with a `[review-cli] TIMEOUT after Ns]` marker and exit 124)
-rather than being thrown away.
+to a per-call log in the OS-standard per-user log dir — **macOS** `~/Library/Logs/review-cli/`,
+**Linux** `$XDG_STATE_HOME/review-cli/logs/` (default `~/.local/state/review-cli/logs/`);
+override with `$REVIEW_LOG_DIR`; files are private, mode 0600. Panel modes print the
+log path to stderr at the start of each call, so you can `tail -f` it to watch a long
+run progress instead of staring at a frozen terminal. If a call hits its `--timeout`,
+the partial output captured so far is still returned (with a `[review-cli] TIMEOUT
+after Ns]` marker and exit 124) rather than being thrown away.
 
 ```bash
 review --quorum "Should we cap brainstorm at 8 rounds?"
@@ -128,6 +129,19 @@ concrete recommendation.
 
 Use for genuinely open design questions where you want the discussion to build across
 rounds rather than converge in one shot.
+
+The whole conversation is also written **incrementally** to a single discussion log
+(`<logdir>/<stamp>-brainstorm.md`, path printed to stderr at the start) — each round
+and moderator decision is flushed as it lands, so a timeout or interruption leaves the
+discussion-so-far on disk instead of losing everything that was only being held in
+memory for the final print.
+
+The growing transcript is fed to the **claude and codex** backends over **stdin**
+(not a `-p`/argv argument), which removes review-cli's own argv overhead. Note the
+ceiling isn't fully gone: `claude-p`'s inner `claude` exec re-argv's the prompt, and
+the **opencode** backend's CLI only takes the message as argv — so a very large
+transcript (~1 MB+) can still hit `ARG_MAX` on those paths. `_payload` prints a size
+WARNING as it approaches the limit; keep `--max-rounds` and diffs reasonable.
 
 ```bash
 review --brainstorm "How should we design the plugin system?"
