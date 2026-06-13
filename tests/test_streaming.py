@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the streaming backend runner in bin/review.
+"""Unit tests for the streaming backend runner in the reviewlib package.
 
 Proves the two properties the streaming runner must guarantee:
   (a) child stdout reaches the live LOG FILE incrementally, BEFORE the child exits;
@@ -8,33 +8,26 @@ Proves the two properties the streaming runner must guarantee:
 
 Uses a fake slow command we control (a tiny python one-liner) so the test never
 depends on codex/gemini/claude/opencode being installed.
+
+After the Stage 0 decomposition the implementation lives in the `reviewlib`
+package (the streaming runner in `reviewlib.process`, the backends in
+`reviewlib.backends`); `bin/review` is now a thin shim. These tests import the
+package directly — the RUNTIME behaviour is unchanged.
 """
 from __future__ import annotations
 
-import importlib.util
 import sys
 import threading
 import time
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BIN_REVIEW = REPO_ROOT / "bin" / "review"
 
+# Make the in-repo package importable without an install (mirrors the bin/review shim).
+sys.path.insert(0, str(REPO_ROOT))
 
-def _load_module():
-    # bin/review has no .py extension, so pin the source loader explicitly.
-    loader = SourceFileLoader("review_cli_bin", str(BIN_REVIEW))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    # Register before exec so @dataclass can resolve cls.__module__ during import.
-    sys.modules[loader.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-review = _load_module()
+import reviewlib as review  # noqa: E402  (package façade re-exports the public surface)
+from reviewlib import backends as review_backends  # noqa: E402  (backends patch target)
 
 
 # A fake backend that prints one line every 0.4s for N lines, flushing each line,
@@ -274,11 +267,8 @@ def test_no_daemon_traceback_when_escaped_writer_outlives_close():
     driver = (
         "import os, sys, time\n"
         "os.environ.setdefault('REVIEW_LOG_DIR', %r)\n"
-        "import importlib.util as u\n"
-        "from importlib.machinery import SourceFileLoader\n"
-        "loader = SourceFileLoader('rv', %r)\n"
-        "spec = u.spec_from_loader('rv', loader); rv = u.module_from_spec(spec)\n"
-        "sys.modules['rv'] = rv; loader.exec_module(rv)\n"
+        "sys.path.insert(0, %r)\n"  # repo root, so the in-repo reviewlib package imports
+        "import reviewlib as rv\n"
         "code = (\n"
         "  \"import sys, subprocess, time\\n\"\n"
         "  \"print('p', flush=True)\\n\"\n"
@@ -292,7 +282,7 @@ def test_no_daemon_traceback_when_escaped_writer_outlives_close():
         "assert r.returncode == 124 and 'p' in r.stdout\n"
         "time.sleep(2)\n"  # let any post-close daemon write surface as a traceback
         "print('DRIVER_OK')\n"
-    ) % (tempfile.mkdtemp(), str(BIN_REVIEW))
+    ) % (tempfile.mkdtemp(), str(REPO_ROOT))
 
     proc = _sp.run([sys.executable, "-c", driver], cwd=str(REPO_ROOT),
                    capture_output=True, text=True, timeout=40)
@@ -320,8 +310,10 @@ def test_log_file_is_private():
 
 def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     captured: dict[str, list[str]] = {}
-    old_which = review._which
-    old_run_streamed = review._run_streamed
+    # review_claude resolves `_which` / `_run_streamed` from the reviewlib.backends
+    # module namespace, so patch THAT module (not the façade) for the override to bite.
+    old_which = review_backends._which
+    old_run_streamed = review_backends._run_streamed
 
     def fake_which(name: str) -> str:
         assert name == "claude-p"
@@ -333,12 +325,12 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
         return review.subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
     try:
-        review._which = fake_which
-        review._run_streamed = fake_run_streamed
-        result = review.review_claude("claude:opus", "prompt", "diff", REPO_ROOT, 10)
+        review_backends._which = fake_which
+        review_backends._run_streamed = fake_run_streamed
+        result = review_backends.review_claude("claude:opus", "prompt", "diff", REPO_ROOT, 10)
     finally:
-        review._which = old_which
-        review._run_streamed = old_run_streamed
+        review_backends._which = old_which
+        review_backends._run_streamed = old_run_streamed
 
     assert result.returncode == 0
     argv = captured["argv"]
@@ -371,21 +363,20 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     assert argv[argv.index("--model") + 1] == "opus"
     # The payload is fed over STDIN, not a `-p <payload>` argv arg: a brainstorm
     # round's growing transcript (or a big diff) as a command-line argument blows
-    # past ARG_MAX → execve E2BIG → the call dies with no output. `-p` stays as
-    # the trailing print flag; the prompt arrives via input_text (stdin).
+    # past ARG_MAX → execve E2BIG → the call dies with no output. `-p` stays the
+    # trailing print flag; the prompt arrives via input_text (stdin).
     assert argv[-1] == "-p"
     assert captured["kwargs"]["input_text"] == "prompt\n\n```diff\ndiff\n```"
 
 
 def test_run_streamed_feeds_large_input_over_stdin_without_deadlock():
     """A payload bigger than the OS pipe buffer must round-trip via stdin — proving
-    stdin is written, CLOSED (so the child sees EOF and exits, not hangs to timeout),
-    and drained CONCURRENTLY with stdout (else a full pipe deadlocks). This is the
-    real contract the claude backend now relies on instead of a `-p <payload>` arg."""
+    stdin is written, CLOSED (EOF so the child exits, not hangs to timeout), and
+    drained CONCURRENTLY with stdout (else a full pipe deadlocks). The real contract
+    the claude backend now relies on instead of a `-p <payload>` arg."""
     import os
     import tempfile
 
-    review = _load_module()
     payload = "x" * 200_000 + "\nEND\n"  # > 64 KiB pipe buffer
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["REVIEW_LOG_DIR"] = tmp
@@ -398,24 +389,23 @@ def test_log_dir_uses_os_standard_locations():
     import os
     import tempfile
 
-    review = _load_module()
-    saved_platform = review.sys.platform
+    saved_platform = sys.platform
     saved = {k: os.environ.get(k) for k in ("REVIEW_LOG_DIR", "XDG_STATE_HOME", "HOME")}
     try:
         with tempfile.TemporaryDirectory() as home:
             os.environ["HOME"] = home
             os.environ.pop("REVIEW_LOG_DIR", None)
             os.environ.pop("XDG_STATE_HOME", None)
-            review.sys.platform = "darwin"
+            sys.platform = "darwin"
             assert review.log_dir() == Path(home) / "Library" / "Logs" / "review-cli"
-            review.sys.platform = "linux"
+            sys.platform = "linux"
             assert review.log_dir() == Path(home) / ".local" / "state" / "review-cli" / "logs"
             os.environ["XDG_STATE_HOME"] = str(Path(home) / "xdg")
             assert review.log_dir() == Path(home) / "xdg" / "review-cli" / "logs"
             os.environ["XDG_STATE_HOME"] = "relative-ignored"  # XDG: relative → ignored
             assert review.log_dir() == Path(home) / ".local" / "state" / "review-cli" / "logs"
     finally:
-        review.sys.platform = saved_platform
+        sys.platform = saved_platform
         for key, val in saved.items():
             if val is None:
                 os.environ.pop(key, None)

@@ -1,0 +1,12 @@
+{
+  "review_api": "review-visual/v1",
+  "modules": [
+    {
+      "name": "selection-highlight",
+      "runtime": "python",
+      "entry": "../../reviewlib/features/visual/contrib/selection_highlight.py",
+      "activates_on": ["selection"],
+      "description": "Asserts a 2px rgb(59,130,246) selection outline is drawn around exactly one element. Reuses bin/frames-check's deterministic colour+shape detector. The worked per-project contributed module (§6): a real project ships this manifest in its own repo pointing at its own module file; here the entry points at review's shipped reference impl so the fixture is self-contained."
+    }
+  ]
+}

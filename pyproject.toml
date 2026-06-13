@@ -9,12 +9,24 @@ description = "Multi-model read-only code review + AI panels."
 requires-python = ">=3.9"
 dependencies = ["pyyaml"]
 
-# Script exposure rationale:
-# The tool is a single executable at bin/review (shebang #!/usr/bin/env python3,
-# no importable package). Using [project.scripts] would require a package:function
-# entry point, meaning we'd need to add a wrapper module — touching existing code.
-# script-files copies bin/review into the installed scripts directory; pipx exposes
-# it via its venv python (which satisfies pyyaml), so `review` ends up on PATH.
-# This is the pragmatic choice that keeps the repo structure unchanged.
-[tool.setuptools]
-script-files = ["bin/review"]
+# The visual-verification test suite generates fixture PNGs with Pillow and shells out
+# to ImageMagick (`magick`, a SYSTEM dependency — install separately, e.g. `brew install
+# imagemagick`). Pillow is TEST-only, not a runtime dependency (cvGate uses ImageMagick,
+# never Pillow). Install with `pip install -e '.[test]'` before running tests/smoke.sh.
+[project.optional-dependencies]
+test = ["pillow"]
+
+# Stage 0 (decomposition) packaging — see docs/architecture-visual-verification.md §8.1, D8.
+# The CLI is now a real package (`reviewlib`), so it is exposed via a proper console
+# entry point instead of the deprecated distutils `script-files` shebang-rewrite. pipx
+# installs `review = reviewlib.cli:main` from the wheel and never touches `bin/review`.
+# The legacy install.sh SYMLINK path keeps working unchanged: `bin/review` is a thin shim
+# that resolves the symlink to the repo root and imports `reviewlib`.
+[project.scripts]
+review = "reviewlib.cli:main"
+
+# Explicit package list (NOT setuptools flat-layout autodiscovery, which would silently
+# pull stray top-level dirs into the wheel). features/ is a SUBpackage of reviewlib, so
+# `reviewlib*` captures reviewlib, reviewlib.modes, reviewlib.features, reviewlib.features.*.
+[tool.setuptools.packages.find]
+include = ["reviewlib*"]
