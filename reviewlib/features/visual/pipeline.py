@@ -8,9 +8,13 @@ pass — it threads the image + the active modules' questions into that mode's m
 (see `reviewlib.cli`). The per-stage machinery here is the same machinery a companion
 mode reuses.
 
-The Stage-2a local pre-classifier (§3.1a) slots in at the marked hook below, between
-cvGate's pass-through and the vision call. It is absent in Stage 1 (and inert by
-default thereafter): the hook is a clearly-marked extension point, not yet a stage.
+The Stage-2a local pre-classifier (§3.1a) is wired in at the marked hook below, between
+cvGate's pass-through and the vision call. The HONEST v1 (`preclassifier.py`) is a
+known-good perceptual cache (NOT a trained ML model — that is a §3.1a follow-up): a
+render that perceptually matches a previously-`keep`ed render short-circuits to `keep`
+and SKIPS the paid vision call. It is enabled by default, gated off with
+`--no-local-model` (`local_model=False`), and can NEVER auto-reject — any miss escalates
+to vision as before.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from .cv_gate import cv_gate, detect_media_type, prepare_image_for_vision
 from .module_api import ModuleVerdict, VisualContext
 from .modules.builtins import builtin_modules
 from .policy_engine import Verdict, decide_from_cv, decide_from_vision
+from .preclassifier import KnownGoodCache, modules_signature
 from .vision_client import (
     VisionBlock,
     build_output_schema,
@@ -33,8 +38,9 @@ from .vision_client import (
 
 def _candidate_modules(project: Path | None):
     """All modules eligible for this run: the trusted built-ins (§4) PLUS the
-    per-project contributed modules the registry discovered and TOFU-trusted (§6). An
-    untrusted/quarantined contributed module is ABSENT here (never a block)."""
+    per-project contributed modules the registry discovered (§6). Project modules load
+    by default (trust-by-default); under the opt-in REVIEW_UNTRUSTED_MODULES guard a
+    quarantined contributed module is ABSENT here (never a block)."""
     mods = list(builtin_modules())
     try:
         from .registry import load_modules
@@ -78,12 +84,21 @@ def run_pipeline(
     no_ai: bool = False,
     vision_timeout: int = 60,
     project: Path | None = None,
+    local_model: bool = True,
+    known_good_cache: KnownGoodCache | None = None,
 ) -> Verdict:
     """Run the full standalone pipeline and return a final `Verdict`.
 
     `no_ai=True` runs cvGate only (the §10 Stage-1 gate / `--no-ai` offline smoke):
     a cvGate reject/bypass is terminal; a pass-through becomes `human_review`
-    (CV cannot keep on its own — §3.1, no symmetric SSIM auto-keep)."""
+    (CV cannot keep on its own — §3.1, no symmetric SSIM auto-keep).
+
+    `local_model=True` (default) enables the Stage-2a known-good-cache pre-classifier
+    (§3.1a): a render that perceptually matches a previously-`keep`ed render
+    short-circuits to `keep` WITHOUT the paid vision call. `--no-local-model`
+    (`local_model=False`) disables it → flow is cvGate → vision unchanged. The cache is
+    NEVER an authority: it can only short-circuit a confident keep-match, never
+    auto-reject (that is cvGate's job)."""
     requested_checks = requested_checks or []
     expectation: VisualExpectation = derive_contract(expect, intent, has_before=before is not None)
 
@@ -133,14 +148,49 @@ def run_pipeline(
                     source="policy", module_verdicts=module_cv, cv_signals=signals,
                 )
 
-    # ----- Stage 2a HOOK POINT (§3.1a): the optional local pre-classifier slots in
-    # HERE, between cvGate pass-through and the vision call. It is ABSENT in Stage 1.
-    # When built (Stage 2a) it would: load its model artifact (unless --no-local-model);
-    # score the pass-through into smooth|minor|broken; on a CONFIDENT-CLEAR score
-    # short-circuit (return a Verdict, skipping the paid vision call); on ambiguity
-    # fall through to call_ai_vision below. It is NEVER the authority — see §3.1a.
-    # No-op in Stage 1: control flows straight to the vision stage.
+    # ----- Stage 2a (§3.1a): the local pre-classifier — HONEST v1 = a known-good
+    # perceptual cache (NOT a trained ML model; that is a §3.1a follow-up). It sits HERE,
+    # between cvGate pass-through and the vision call. If the render perceptually MATCHES
+    # a previously-`keep`ed render (within a tight tolerance), short-circuit to `keep`
+    # and SKIP the paid vision call (the cost-saver). On any MISS, fall through to
+    # call_ai_vision below — the cache NEVER auto-rejects and never resolves ambiguity.
+    # Disabled by --no-local-model (local_model=False) → flow is cvGate → vision as
+    # before. No-VLM, no language channel → injection-immune by construction (§5).
     # ---------------------------------------------------------------------------
+    cache = known_good_cache if known_good_cache is not None else KnownGoodCache()
+    # Resolve the ACTUAL selected backend ONCE, here, so it can key the cache (below) AND
+    # drive the vision call (Stage 2) without a double-resolve. Keying on the SELECTED
+    # backend — not the raw --model LIST — is what makes the cache safe across backend
+    # regimes: when availability changes (a new key added/removed) the same request can
+    # resolve to a different backend, and a keep cached under backend A must NOT
+    # short-circuit a run that now selects backend B (codex P2). `no_ai` skips vision, so
+    # only resolve when we may actually call it.
+    backend = None if no_ai else select_vision_backend(models or [])
+    # The context key MUST fold in EVERY verdict input a cached keep is conditioned on
+    # (codex P1/P2): project + intent + expect + the active --check set + the --before
+    # baseline + a signature of the ACTIVE modules (names + source hashes) + the SELECTED
+    # vision backend. A run with extra checks, a different baseline, a changed/added
+    # module, or a different selected backend is a DIFFERENT namespace, so it never reuses
+    # a keep earned under laxer conditions (which would bypass a vision-only module veto /
+    # baseline comparison / a stricter backend).
+    cache_context = cache.context_key(
+        project=project, intent=intent, expect=expect,
+        requested_checks=requested_checks, before=before,
+        modules_signature=modules_signature(modules),
+        selected_backend=backend,
+    )
+    if local_model and not no_ai:
+        try:
+            if cache.lookup(after, context=cache_context):
+                return Verdict(
+                    final="keep",
+                    reason="known-good cache hit: pixel-identical to a previously-kept render (vision call skipped)",
+                    source="local_model",
+                    module_verdicts=module_cv,
+                    cv_signals=signals,
+                )
+        except Exception:  # noqa: BLE001 — the cost-saver must never break a verification
+            pass
 
     if no_ai:
         # CV-only: pass-through with no AI cannot auto-keep (§3.1). Surface as
@@ -154,8 +204,7 @@ def run_pipeline(
             cv_signals=signals,
         )
 
-    # --- Stage 2: visionClient (the primary judge). -----------------------------
-    backend = select_vision_backend(models or [])
+    # --- Stage 2: visionClient (the primary judge). The backend was resolved above.
     questions = [q for m in modules for q in m.vision_questions(ctx)]
     schema = build_output_schema(_vision_field_names(modules))
     cap = capability_for(backend) if backend else None
@@ -167,7 +216,18 @@ def run_pipeline(
 
     # --- Stage 3: judge phase + policy decision. --------------------------------
     module_judgements = [m.judge(ctx, vision) for m in modules] if vision.available and vision.verdict else module_cv
-    return decide_from_vision(vision, signals, module_judgements)
+    verdict = decide_from_vision(vision, signals, module_judgements)
+
+    # --- Stage 2a populate: a FINAL `keep` (post-policy, not merely the model's raw
+    # keep) seeds the known-good cache so the NEXT identical render short-circuits for
+    # free. Only a final keep — a policy-downgraded/low-confidence keep must NOT be
+    # learned as known-good. Best-effort; never breaks the verification. ------------
+    if local_model and verdict.final == "keep":
+        try:
+            cache.remember(after, context=cache_context)
+        except Exception:  # noqa: BLE001
+            pass
+    return verdict
 
 
 def _build_blocks(after, before, expectation, signals, questions, cap=None) -> list[VisionBlock]:

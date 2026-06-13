@@ -16,6 +16,8 @@ bin/review --help | grep -q -- "--brainstorm"
 bin/review --help | grep -q -- "--visual"
 bin/review --help | grep -q -- "--no-ai"
 bin/review --help | grep -q -- "--strict"
+# Stage 2a: the local pre-classifier toggle must appear in help.
+bin/review --help | grep -q -- "--no-local-model"
 
 # The single-file CLI must always parse.
 python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse OK')"
@@ -35,6 +37,7 @@ if command -v magick >/dev/null 2>&1 && python3 -c "import PIL" >/dev/null 2>&1;
   python3 tests/test_vision_client.py
   python3 tests/test_policy_engine.py
   python3 tests/test_pipeline.py
+  python3 tests/test_preclassifier.py
   python3 tests/test_visual_compose.py
   python3 tests/test_visual_registry.py
   python3 tests/test_selection_highlight.py

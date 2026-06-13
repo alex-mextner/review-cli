@@ -1,4 +1,4 @@
-"""Per-project visual-module registry + TOFU trust (§6).
+"""Per-project visual-module registry (§6) — trust-by-default.
 
 A project ships a manifest at a well-known path inside its tree:
 
@@ -6,27 +6,36 @@ A project ships a manifest at a well-known path inside its tree:
 
 declaring contributed `VisualModule`s (name + entry file + `activates_on` tags). At
 run time `review --visual … --project <dir>` (default `--cwd`) discovers the manifest,
-resolves each `entry` relative to the project, and — for a TRUSTED entry — loads it and
-folds its `cv_check` / `vision_questions` / `judge` into the same pipeline the built-in
-modules use.
+resolves each `entry` relative to the project, loads it, and folds its `cv_check` /
+`vision_questions` / `judge` into the same pipeline the built-in modules use.
+
+SECURITY NOTE — a project visual-module is EXECUTABLE CODE that review will run. Only
+run `review --visual` on repos you trust (your own repos, or code you have read). The
+common case — reviewing your OWN repositories — is trusted by construction, so by
+DEFAULT a discovered module loads and runs with **zero ceremony**: no `trust-module`
+step, no quarantine.
+
+Trust model (§6.3, trust-by-default):
+  * DEFAULT: every discovered contributed module is trusted and loaded. There is no
+    quarantine in the common path. (The audit log below still records every load.)
+  * `REVIEW_UNTRUSTED_MODULES=1` — an OPT-IN, off-by-default guard for the rare
+    untrusted-repo case (reviewing an external PR / a cloned stranger's repo). Under
+    the guard the legacy TOFU quarantine + sha-pin re-engages:
+      - A newly-discovered (untrusted) module is QUARANTINED: a loud one-line banner is
+        printed and the module is treated as ABSENT — never as a block.
+      - `review trust-module <name>` pins `{entry_sha256, activates_on}` into
+        `~/.config/review-cli/modules-trust.json` (mode 0600). At load time the entry
+        is re-hashed; a mismatch → back to quarantine (`module changed, re-trust
+        required`).
+      - `REVIEW_MODULES_TRUST=auto` is the conscious escape hatch for batch/agent runs.
+  * Every load decision is appended to `~/.cache/review-cli/visual/modules-audit.jsonl`
+    (cheap, useful — kept in BOTH the default and guarded paths).
 
 Built-in modules (`modules/builtins.py`) are trusted implicitly (they ship in review's
-own source). ONLY contributed modules go through this registry's quarantine + TOFU.
-
-Trust model (mirrors the hook framework, §6.3):
-  * A newly-discovered (untrusted) module is QUARANTINED: a loud one-line banner is
-    printed and the module is treated as ABSENT — never as a block. A fresh module must
-    NOT break a verification run (it can't even silently run arbitrary code).
-  * `review trust-module <name>` pins `{entry_sha256, activates_on}` into
-    `~/.config/review-cli/modules-trust.json` (mode 0600, append-only audit). At load
-    time the entry is re-hashed; a mismatch → back to quarantine (`module changed,
-    re-trust required`). This closes the cheapest attack: a prompt-injected file telling
-    an agent to drop a module manifest = arbitrary code on every verification.
-  * `REVIEW_MODULES_TRUST=auto` is the conscious escape hatch for batch/agent runs.
-  * Every load decision is appended to `~/.cache/review-cli/visual/modules-audit.jsonl`.
+own source). ONLY contributed modules are subject to the optional guard.
 
 This module imports NOTHING heavy at import time; the entry file is loaded with
-`importlib` only for a TRUSTED, hash-matching module.
+`importlib` only for a module about to run.
 """
 from __future__ import annotations
 
@@ -44,6 +53,16 @@ from .module_api import ModuleVerdict, VisualContext, VisualModule
 
 MANIFEST_RELPATH = Path(".review") / "visual-modules.json"
 REVIEW_API = "review-visual/v1"
+
+# Opt-in, off-by-default guard. When set (truthy), the legacy TOFU quarantine + sha-pin
+# re-engages for the rare untrusted-repo case (external PR / cloned stranger's repo).
+# Unset (the default) = trust-by-default: every discovered module loads with no ceremony.
+UNTRUSTED_GUARD_ENV = "REVIEW_UNTRUSTED_MODULES"
+
+
+def _untrusted_guard_active() -> bool:
+    """True when the opt-in untrusted-repo guard is enabled (quarantine re-engaged)."""
+    return os.environ.get(UNTRUSTED_GUARD_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # --- Configurable environment (so tests isolate from the real ~/.config). ----------
@@ -204,7 +223,13 @@ def _audit(env: RegistryEnv, *, module: str, entry_sha256: str, trust_state: str
 
 def _trust_state_for(spec: ModuleSpec, store: dict) -> tuple[str, str]:
     """Return (state, reason) for a spec given the trust store. State is one of
-    'trusted' | 'untrusted' | 'changed' | 'auto'."""
+    'trusted' | 'untrusted' | 'changed' | 'auto'.
+
+    DEFAULT (guard off) = trust-by-default: every discovered module is trusted, no
+    quarantine. The TOFU quarantine/sha-pin below only runs under the opt-in
+    `REVIEW_UNTRUSTED_MODULES=1` guard (the rare untrusted-repo case)."""
+    if not _untrusted_guard_active():
+        return "trusted", "trust-by-default (no untrusted-repo guard)"
     if os.environ.get("REVIEW_MODULES_TRUST") == "auto":
         return "auto", "REVIEW_MODULES_TRUST=auto"
     pin = store.get(spec.name)
@@ -274,6 +299,9 @@ class ContributedModule:
     name: str
     activates_on: list[str]
     _impl: object
+    # The resolved entry file path, exposed so the known-good cache can fold the entry's
+    # content hash into its context key (a changed module → invalidated keeps).
+    entry_path: Path | None = None
 
     def activates(self, ctx: VisualContext) -> bool:
         # A contributed module auto-activates when one of its tags — or its own name —
@@ -366,7 +394,7 @@ def load_modules(
             _audit(env, module=spec.name, entry_sha256=sha, trust_state=state, decision="not-a-module", duration_ms=(time.time() - t0) * 1000)
             quarantined.append(Quarantined(spec.name, "loaded object does not satisfy the VisualModule protocol"))
             continue
-        loaded.append(ContributedModule(name=spec.name, activates_on=spec.activates_on, _impl=obj))
+        loaded.append(ContributedModule(name=spec.name, activates_on=spec.activates_on, _impl=obj, entry_path=spec.entry_path))
         trust_state = "trusted" if state == "trusted" else "auto"
         _audit(env, module=spec.name, entry_sha256=sha, trust_state=trust_state, decision="loaded", duration_ms=(time.time() - t0) * 1000)
     return loaded, quarantined
@@ -374,9 +402,21 @@ def load_modules(
 
 # --- Subcommands (`review trust-module` / `review register-module`). ---------------
 def trust_module(name: str, *, project: Path | None = None, env: RegistryEnv | None = None) -> int:
-    """Pin `{entry_sha256, activates_on}` for a discovered module. Re-hash the entry at
-    pin time so a later load can detect tampering. Append-only audit."""
+    """Pin `{entry_sha256, activates_on}` for a discovered module (the untrusted-repo
+    guard case). Re-hash the entry at pin time so a later load can detect tampering.
+    Append-only audit.
+
+    In the DEFAULT (trust-by-default) world this verb is a NO-OP: project modules
+    already load and run, so there is nothing to pin. It only does real pinning under
+    `REVIEW_UNTRUSTED_MODULES=1`. The verb is kept so the guarded flow still has its
+    "trust this module" affordance."""
     env = env or RegistryEnv()
+    if not _untrusted_guard_active():
+        print(
+            f"review: '{name}' already loads (trust-by-default). "
+            f"trust-module only pins under {UNTRUSTED_GUARD_ENV}=1 (untrusted-repo guard)."
+        )
+        return 0
     specs = {s.name: s for s in discover_specs(project=project, env=env)}
     spec = specs.get(name)
     if spec is None:

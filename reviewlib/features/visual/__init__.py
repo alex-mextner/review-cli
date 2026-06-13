@@ -12,9 +12,17 @@ ALL providers (anthropic/openai/gemini in vision_client), and the per-mode multi
 fan-out (compose._run_fanout delivers the image to a vision model and folds the grounded
 observation into each persona/voter prompt).
 
+Stage 2a (this build) adds the optional local pre-classifier (§3.1a) as its HONEST v1:
+the known-good perceptual cache (preclassifier.KnownGoodCache), wired at the marked hook
+in pipeline.run_pipeline between cvGate pass-through and the vision call. A render that
+perceptually matches a previously-`keep`ed render short-circuits to keep WITHOUT the paid
+vision call; toggle off with --no-local-model. This is a cache, NOT a trained ML model —
+the trained LightGBM/CNN classifier (§3.1a) remains a follow-up for when a labeled corpus
+exists.
+
 Stages NOT yet built (clear extension points left in place):
-  * Stage 2a — the optional local pre-classifier (§3.1a): the marked hook point in
-    pipeline.run_pipeline, between cvGate pass-through and the vision call.
+  * Stage 2a (trained model) — the LightGBM/tiny-CNN classifier of §3.1a, the follow-up
+    to the known-good cache shipped here; slots in behind the same --no-local-model flag.
   * Stage 3 — the `tg --photo` pre-send hook integration (§7).
 """
 from __future__ import annotations
@@ -25,6 +33,7 @@ from .cv_gate import CvError, CvGateResult, CvSignals, compute_signals, cv_gate
 from .module_api import ModuleVerdict, VisualContext, VisualModule
 from .pipeline import run_pipeline
 from .policy_engine import Verdict, decide_from_cv, decide_from_vision, exit_code_for
+from .preclassifier import KnownGoodCache, hamming, modules_signature, perceptual_ahash
 from .registry import (
     ContributedModule,
     ModuleSpec,
@@ -63,6 +72,10 @@ __all__ = [
     "decide_from_cv",
     "decide_from_vision",
     "exit_code_for",
+    "KnownGoodCache",
+    "hamming",
+    "modules_signature",
+    "perceptual_ahash",
     "ContributedModule",
     "ModuleSpec",
     "RegistryEnv",

@@ -303,6 +303,40 @@ a current one. Building this tier is a **follow-up to the core pipeline**, not a
 blocker: Stages 1–2 ship the deterministic cvGate + AI-vision authority, and this artifact slots
 in later behind its flag with zero changes to the surrounding stages.
 
+**Implemented (HONEST v1) — the known-good render cache, NOT a trained model.** A trained
+LightGBM/CNN needs a labeled corpus we do **not** have yet, so claiming a trained classifier
+exists would be a lie. The shipped v1 (`features/visual/preclassifier.py`,
+`KnownGoodCache`) is the `--before` no-effect bypass **generalized into a cache**: it keeps a
+per-context store of the **reference renders** that previously earned a **final `keep`**, under
+`~/.cache/review-cli/visual/known-good/`. At the §3.1a hook (between cvGate pass-through and the
+vision call) the pipeline checks the current render against that store; if it is
+**pixel-identical** to a cached known-good render, it short-circuits to `keep` and **skips the
+paid vision call**. Matching is **pixel identity ON PURPOSE** — a byte-hash fast path, then a
+decoded-pixel `-metric AE` compare (the same exact test the §3.1 `--before` no-effect bypass
+already trusts; an 8×8 average-hash is used only as a cheap bucket index to shortlist the exact
+compare). It deliberately does **NOT** fuzzy-match: a no-VLM perceptual metric (aHash, downscaled
+RMSE) cannot reliably tell a small-but-**semantic** change (a different label/amount in the same
+layout) from harmless re-encode noise, and a fuzzy match would risk reusing a stale keep for a
+real regression — so any non-identical render escalates to `visionClient` (the authority for that
+ambiguous middle). On a miss it escalates exactly as before; on a fresh final `keep` it adds the
+render to the cache. It is **pure pixels — no VLM, no language channel — so it is injection-immune
+by construction** (the §5 in-image-text attack has no surface). It is **NOT the authority**: it
+can only short-circuit a pixel-identical keep-match — it never auto-rejects (that is cvGate's job)
+and never resolves an ambiguous case. The cache namespaces by EVERY verdict input a cached keep is
+conditioned on — project + intent + expect + the active `--check` set + the `--before` baseline
+(an EXACT content fingerprint, not the coarse aHash, so two distinct baselines can never collide
+into one namespace) + a signature of the active modules (names + source-file hashes, covering a
+review upgrade that changes a built-in's logic) + the actually-SELECTED vision backend (resolved
+before the lookup, so a keep never short-circuits a run that now resolves to a different/stricter
+judge) — so a keep learned under a lax
+run never short-circuits a stricter run with different active checks, a different baseline, or a
+changed/added module (which would bypass a vision-only module veto / baseline comparison). The
+toggle is `--no-local-model` (or `local_model: false` in `config.yaml`); when disabled the flow is
+`cvGate → visionClient` unchanged. The trained-model end-state above remains the **follow-up** once
+a labeled corpus exists — it COULD safely score the fuzzy near-miss middle this exact-match cache
+deliberately defers to vision; it is swappable behind the same flag and hook with no change to the
+surrounding stages.
+
 ### 3.2 visionClient — `callAIVision` (the multimodal path)
 
 The existing review backends are **text-only** (`_payload()` builds a string; Gemini sends
@@ -551,23 +585,32 @@ hooks:
   project tree (e.g. when the tg hook judges a screenshot from anywhere). Idempotent, mirrors
   `review install-skill` / `install-commit-hook`.
 
-### 6.3 Trust (TOFU + quarantine — same model as the hook framework)
+### 6.3 Trust — trust-by-default (opt-in quarantine for untrusted repos)
 
-A contributed module is **arbitrary code review will execute**, so it inherits the hook
-framework's TOFU-trust model (§7, from `/tmp/detector-cli/design.md`):
+A contributed module is **arbitrary code review will execute**. But the common case is
+reviewing **your OWN repos** (a hostile module manifest would have to already be sitting in
+a repo you chose to run `review` on), so a TOFU-trust + quarantine dance on every self-owned
+repo is needless ceremony. The model is therefore **trust-by-default**:
 
-- A newly-discovered module is **quarantined**: review prints a loud one-line banner
-  (`NEW review module (not active): selection-highlight from <project>. Run 'review trust-module
-  selection-highlight' or set REVIEW_MODULES_TRUST=auto`) and treats it as **absent** (not as a
-  block — a fresh module must never break a verification run).
-- `review trust-module <name>` pins `{entry_sha256, activates_on}` into
-  `~/.config/review-cli/modules-trust.json` (mode 0600). At load time review re-hashes the
-  entry; a mismatch → back to quarantine (`module changed, re-trust required`). This closes the
-  cheapest attack: a prompt-injected file telling an agent to drop a module manifest = arbitrary
-  code on every verification.
-- `REVIEW_MODULES_TRUST=auto` is the conscious escape hatch for batch/agent runs; default off.
-- Every module load + verdict is appended to an audit log (`~/.cache/review-cli/visual/
-  modules-audit.jsonl`): `{module, entry_sha256, decision, duration_ms, trust_state}`.
+- **DEFAULT (no guard):** a discovered project module **loads and runs with zero ceremony** —
+  no `trust-module` step, no quarantine. The one-line security expectation stands: *project
+  visual-modules are executable code, so only run `review` on repos you trust.*
+- **Opt-in guard `REVIEW_UNTRUSTED_MODULES=1`** (off by default) re-engages the legacy TOFU
+  quarantine + sha-pin for the rare untrusted-repo case (reviewing an external PR / a cloned
+  stranger's repo):
+  - A newly-discovered module is **quarantined**: review prints a loud one-line banner
+    (`NEW review module (not active): selection-highlight from <project>. Run 'review
+    trust-module selection-highlight' or set REVIEW_MODULES_TRUST=auto`) and treats it as
+    **absent** (not as a block).
+  - `review trust-module <name>` pins `{entry_sha256, activates_on}` into
+    `~/.config/review-cli/modules-trust.json` (mode 0600). At load time review re-hashes the
+    entry; a mismatch → back to quarantine (`module changed, re-trust required`). (Without the
+    guard, `trust-module` is a friendly no-op — the module already loads.)
+  - `REVIEW_MODULES_TRUST=auto` is the conscious escape hatch for batch/agent runs under the
+    guard.
+- **Audit kept in both paths** (cheap, useful): every module load decision is appended to an
+  audit log (`~/.cache/review-cli/visual/modules-audit.jsonl`): `{module, entry_sha256,
+  decision, duration_ms, trust_state}`.
 
 ### 6.4 Built-in vs contributed
 

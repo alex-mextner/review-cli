@@ -56,13 +56,15 @@ def main(argv: list[str] | None = None) -> int:
         return install_skill()
     if argv == ["install-commit-hook"]:
         return install_commit_hook()
-    # Per-project visual-module trust subcommands (§6). Kept as bare subcommands (like
-    # install-skill) so they don't clutter the main review argparse surface.
+    # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
+    # install-skill) so they don't clutter the main review argparse surface. Project
+    # modules load by default (trust-by-default); trust-module only pins under the
+    # opt-in REVIEW_UNTRUSTED_MODULES=1 guard (the rare untrusted-repo case).
     if argv and argv[0] == "trust-module":
         from .features.visual.registry import trust_module
 
         if len(argv) < 2:
-            print("usage: review trust-module <name> [--project DIR]", file=sys.stderr)
+            print("usage: review trust-module <name> [--project DIR]  (only needed under REVIEW_UNTRUSTED_MODULES=1)", file=sys.stderr)
             return 2
         proj = None
         rest = argv[2:]
@@ -106,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
     parser.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
     parser.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
+    parser.add_argument("--no-local-model", action="store_true", help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)")
     parser.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
     parser.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
     args = parser.parse_args(argv)
@@ -178,6 +181,9 @@ def main(argv: list[str] | None = None) -> int:
                 requested_checks=list(args.check),
                 models=models,
                 no_ai=args.no_ai,
+                # Stage-2a cost-saver default ON; --no-local-model OR `local_model: false`
+                # in config.yaml disables it (CLI flag wins over config).
+                local_model=(not args.no_local_model) and (config.get("local_model", True) is not False),
                 vision_timeout=args.vision_timeout,
                 as_json=args.json,
                 strict=args.strict,

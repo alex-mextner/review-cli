@@ -18,9 +18,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
+import tempfile  # noqa: E402
+
 import visual_fixtures as vf  # noqa: E402
 from reviewlib.features.visual import pipeline as pl  # noqa: E402
+from reviewlib.features.visual.preclassifier import KnownGoodCache  # noqa: E402
 from reviewlib.features.visual.vision_client import VisionVerdict  # noqa: E402
+
+
+def _iso_cache() -> KnownGoodCache:
+    """A fresh, EMPTY known-good cache in an isolated tmp dir so the Stage-2a
+    pre-classifier never short-circuits these pipeline tests (and never leaks into the
+    real ~/.cache). An empty cache always misses → vision is called as the test expects.
+    The cache's own behaviour is covered by tests/test_preclassifier.py."""
+    return KnownGoodCache(root=Path(tempfile.mkdtemp(prefix="kg-cache-")))
 
 
 def _patch_vision(verdict: VisionVerdict, call_log: list):
@@ -45,7 +56,7 @@ def test_styled_passthrough_with_mock_keep():
     log: list = []
     old = _patch_vision(VisionVerdict(available=True, verdict="keep", confidence=0.95, backend="gemini"), log)
     try:
-        v = pl.run_pipeline(img, models=["gemini"])
+        v = pl.run_pipeline(img, models=["gemini"], known_good_cache=_iso_cache())
     finally:
         _restore(*old)
     assert v.final == "keep", f"high-confidence vision keep should keep, got {v.final}"
@@ -57,7 +68,7 @@ def test_mock_keep_is_still_subject_to_policy_low_confidence():
     log: list = []
     old = _patch_vision(VisionVerdict(available=True, verdict="keep", confidence=0.3, backend="gemini"), log)
     try:
-        v = pl.run_pipeline(img, models=["gemini"])
+        v = pl.run_pipeline(img, models=["gemini"], known_good_cache=_iso_cache())
     finally:
         _restore(*old)
     assert v.final == "human_review", "a low-confidence keep must be escalated by policy, not kept"
@@ -68,7 +79,7 @@ def test_cvgate_reject_skips_vision_call():
     log: list = []
     old = _patch_vision(VisionVerdict(available=True, verdict="keep", confidence=1.0), log)
     try:
-        v = pl.run_pipeline(img, models=["gemini"])
+        v = pl.run_pipeline(img, models=["gemini"], known_good_cache=_iso_cache())
     finally:
         _restore(*old)
     assert v.final == "rollback"
@@ -80,7 +91,7 @@ def test_no_ai_never_calls_vision():
     log: list = []
     old = _patch_vision(VisionVerdict(available=True, verdict="keep", confidence=1.0), log)
     try:
-        v = pl.run_pipeline(img, models=["gemini"], no_ai=True)
+        v = pl.run_pipeline(img, models=["gemini"], no_ai=True, known_good_cache=_iso_cache())
     finally:
         _restore(*old)
     assert log == [], "--no-ai must not call the vision client"
@@ -94,7 +105,7 @@ def test_zero_diff_without_before_fails_closed():
     log: list = []
     old = _patch_vision(VisionVerdict(available=True, verdict="keep", confidence=1.0), log)
     try:
-        v = pl.run_pipeline(img, expect="zero-diff", models=["gemini"])
+        v = pl.run_pipeline(img, expect="zero-diff", models=["gemini"], known_good_cache=_iso_cache())
     finally:
         _restore(*old)
     assert v.final == "human_review", f"zero-diff without --before must fail closed, got {v.final}"
@@ -107,7 +118,7 @@ def test_zero_diff_missing_image_is_deterministic_reject():
     from reviewlib.features.visual.policy_engine import exit_code_for
 
     missing = Path("/tmp/pl-does-not-exist-zd.png")
-    v = pl.run_pipeline(missing, expect="zero-diff", models=["gemini"])
+    v = pl.run_pipeline(missing, expect="zero-diff", models=["gemini"], known_good_cache=_iso_cache())
     assert v.final == "rollback", f"missing image must reject (not human_review), got {v.final}"
     assert "unreadable" in v.reason
     assert exit_code_for(v, strict=True) == 1, "unreadable input is a usage error (exit 1)"
@@ -118,7 +129,7 @@ def test_no_vision_backend_is_unverified():
     old_select = pl.select_vision_backend
     pl.select_vision_backend = lambda models: None  # no vision backend configured
     try:
-        v = pl.run_pipeline(img, models=[])
+        v = pl.run_pipeline(img, models=[], known_good_cache=_iso_cache())
     finally:
         pl.select_vision_backend = old_select
     assert v.final == "unverified", "no vision backend must fail closed to unverified"

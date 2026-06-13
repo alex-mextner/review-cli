@@ -36,6 +36,7 @@ def run_visual_standalone(
     as_json: bool,
     strict: bool,
     project: str | None = None,
+    local_model: bool = True,
 ) -> int:
     after = Path(image).expanduser()
     before_path = Path(before).expanduser() if before else None
@@ -48,6 +49,7 @@ def run_visual_standalone(
         requested_checks=requested_checks,
         models=models,
         no_ai=no_ai,
+        local_model=local_model,
         vision_timeout=vision_timeout,
         project=Path(project).expanduser() if project else None,
     )

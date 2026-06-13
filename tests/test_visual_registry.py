@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""Per-project module registry + TOFU trust tests (§6). NO real API calls.
+"""Per-project module registry tests (§6). NO real API calls.
+
+Trust model (post trust-by-default, §6.3): a project's `.review/visual-modules.json`
+is **executable code review runs**, but the common case is reviewing your OWN repos,
+so by DEFAULT a discovered module LOADS AND RUNS with no trust step and no quarantine.
+The TOFU quarantine/sha-pin only re-engages under the opt-in guard
+`REVIEW_UNTRUSTED_MODULES=1` (for the rare external-PR / cloned-stranger's-repo case).
 
 Proves:
   * Discovery: a project's `.review/visual-modules.json` is found from --project/--cwd,
     its entries parsed, each `entry` resolved relative to the project.
-  * Load + activation gating: a trusted module loads from its entry file and only
-    `activates` when one of its `activates_on` tags is requested (via --check) or
-    present in the intent/expectation; a plain run leaves it off.
-  * TOFU quarantine: a freshly-dropped (untrusted) module is INERT (absent, not a
-    block — it must never break a run); a loud banner is emitted once.
-  * trust-module: pins entry_sha256 + activates_on; a subsequent load with the SAME
-    bytes activates; a CHANGED entry → back to quarantine (re-trust required).
-  * REVIEW_MODULES_TRUST=auto bypasses quarantine.
+  * Default (no guard): a freshly-dropped module LOADS + activates with zero ceremony
+    (no trust-module step); the audit log still records the load.
+  * Activation gating: a loaded contributed module only `activates` when one of its
+    `activates_on` tags is requested (via --check) or present in the intent/expectation;
+    a plain run leaves it off.
+  * Guard REVIEW_UNTRUSTED_MODULES=1: quarantine is back — an untrusted module is INERT
+    (absent, not a block); trust-module pins entry_sha256 + activates_on; SAME bytes
+    activate; a CHANGED entry → back to quarantine (re-trust required).
+  * Under the guard, REVIEW_MODULES_TRUST=auto bypasses quarantine.
   * Audit: every load decision is appended to the JSONL audit log.
 
 Everything is isolated to a tmp HOME so the real ~/.config is never touched.
@@ -22,6 +29,7 @@ import json
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -103,6 +111,28 @@ def _env(home: Path):
     )
 
 
+@contextmanager
+def _env_var(name: str, value: str | None):
+    """Temporarily set (or, with value=None, clear) an environment variable."""
+    old = os.environ.get(name)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old
+
+
+def _untrusted_guard():
+    """Re-enable the legacy TOFU quarantine for the rare untrusted-repo case."""
+    return _env_var("REVIEW_UNTRUSTED_MODULES", "1")
+
+
 def test_discovery_finds_and_parses_manifest():
     with tempfile.TemporaryDirectory() as d:
         proj = _project_with_module(Path(d))
@@ -115,96 +145,120 @@ def test_discovery_finds_and_parses_manifest():
         assert s.runtime == "python"
 
 
-def test_untrusted_module_is_quarantined_inert():
-    """A freshly-dropped module is INERT (returns no usable module) and prints a banner,
-    but is NOT a block — load_modules just yields nothing for it."""
+def test_module_loads_and_runs_by_default_no_trust_step():
+    """DEFAULT (no guard): a freshly-dropped module LOADS and is usable with ZERO
+    ceremony — no `review trust-module` step, no quarantine. Reviewing your OWN repo
+    must be friction-free (CTO: TOFU is overkill for self-owned repos)."""
     with tempfile.TemporaryDirectory() as d:
         proj = _project_with_module(Path(d))
         home = Path(d) / "home"
-        loaded, quarantined = reg.load_modules(project=proj, env=_env(home))
-        assert loaded == [], "an untrusted module must be inert (absent), not active"
+        with _env_var("REVIEW_UNTRUSTED_MODULES", None):
+            loaded, quarantined = reg.load_modules(project=proj, env=_env(home))
+        assert [m.name for m in loaded] == ["selection-highlight"], "default must load+run with no trust step"
+        assert quarantined == [], "no quarantine in the common (trusted-repo) path"
+
+
+def test_untrusted_guard_quarantines_inert():
+    """With REVIEW_UNTRUSTED_MODULES=1 the legacy TOFU quarantine is back: a freshly-
+    dropped module is INERT (absent, not a block) until trusted."""
+    with tempfile.TemporaryDirectory() as d:
+        proj = _project_with_module(Path(d))
+        home = Path(d) / "home"
+        with _untrusted_guard():
+            loaded, quarantined = reg.load_modules(project=proj, env=_env(home))
+        assert loaded == [], "under the guard an untrusted module must be inert (absent), not active"
         assert any(q.name == "selection-highlight" for q in quarantined)
 
 
-def test_trust_module_pins_sha_and_activates():
+def test_trust_module_is_noop_without_guard():
+    """trust-module is unnecessary in the default world — it succeeds (rc 0) but pins
+    nothing (the module already loads). It only does real pinning under the guard."""
     with tempfile.TemporaryDirectory() as d:
         proj = _project_with_module(Path(d))
         home = Path(d) / "home"
         env = _env(home)
-        rc = reg.trust_module("selection-highlight", project=proj, env=env)
-        assert rc == 0
-        # Trust store pins entry_sha256 + activates_on, mode 0600.
-        store = json.loads(env.trust_path.read_text())
-        assert "selection-highlight" in store
-        assert len(store["selection-highlight"]["entry_sha256"]) == 64
-        assert store["selection-highlight"]["activates_on"] == ["selection"]
-        mode = oct(env.trust_path.stat().st_mode & 0o777)
-        assert mode == "0o600", f"trust store must be 0600, got {mode}"
-        # Now it loads.
-        loaded, quarantined = reg.load_modules(project=proj, env=env)
+        with _env_var("REVIEW_UNTRUSTED_MODULES", None):
+            rc = reg.trust_module("selection-highlight", project=proj, env=env)
+        assert rc == 0, "trust-module must succeed (no-op) in the default world"
+        assert not env.trust_path.exists(), "no trust pin is written when the guard is off"
+
+
+def test_trust_module_pins_sha_and_activates_under_guard():
+    with tempfile.TemporaryDirectory() as d:
+        proj = _project_with_module(Path(d))
+        home = Path(d) / "home"
+        env = _env(home)
+        with _untrusted_guard():
+            rc = reg.trust_module("selection-highlight", project=proj, env=env)
+            assert rc == 0
+            # Trust store pins entry_sha256 + activates_on, mode 0600.
+            store = json.loads(env.trust_path.read_text())
+            assert "selection-highlight" in store
+            assert len(store["selection-highlight"]["entry_sha256"]) == 64
+            assert store["selection-highlight"]["activates_on"] == ["selection"]
+            mode = oct(env.trust_path.stat().st_mode & 0o777)
+            assert mode == "0o600", f"trust store must be 0600, got {mode}"
+            # Now it loads.
+            loaded, quarantined = reg.load_modules(project=proj, env=env)
         assert [m.name for m in loaded] == ["selection-highlight"]
         assert quarantined == []
 
 
-def test_changed_entry_returns_to_quarantine():
+def test_changed_entry_returns_to_quarantine_under_guard():
     with tempfile.TemporaryDirectory() as d:
         proj = _project_with_module(Path(d))
         home = Path(d) / "home"
         env = _env(home)
-        reg.trust_module("selection-highlight", project=proj, env=env)
-        # Tamper with the entry AFTER trust → hash mismatch → quarantine.
-        entry = proj / ".review" / "modules" / "selection_highlight.py"
-        entry.write_text(_MODULE_SRC + "\n# tampered\n", encoding="utf-8")
-        loaded, quarantined = reg.load_modules(project=proj, env=env)
+        with _untrusted_guard():
+            reg.trust_module("selection-highlight", project=proj, env=env)
+            # Tamper with the entry AFTER trust → hash mismatch → quarantine.
+            entry = proj / ".review" / "modules" / "selection_highlight.py"
+            entry.write_text(_MODULE_SRC + "\n# tampered\n", encoding="utf-8")
+            loaded, quarantined = reg.load_modules(project=proj, env=env)
         assert loaded == [], "a changed entry must NOT load on the old trust pin"
         assert any("changed" in q.reason for q in quarantined)
 
 
-def test_activates_on_change_requires_retrust():
+def test_activates_on_change_requires_retrust_under_guard():
     """A manifest-only edit that widens `activates_on` (without touching the entry file,
     so the hash still matches) must re-quarantine the module — a module trusted for
-    'selection' can't silently start firing on other tags (codex P2)."""
+    'selection' can't silently start firing on other tags (codex P2). Guard-only."""
     with tempfile.TemporaryDirectory() as d:
         proj = _project_with_module(Path(d), activates_on=["selection"])
         home = Path(d) / "home"
         env = _env(home)
-        reg.trust_module("selection-highlight", project=proj, env=env)
-        # Widen activates_on in the manifest ONLY (entry file untouched → same hash).
-        manifest = proj / ".review" / "visual-modules.json"
-        data = json.loads(manifest.read_text())
-        data["modules"][0]["activates_on"] = ["selection", "everything"]
-        manifest.write_text(json.dumps(data), encoding="utf-8")
-        loaded, quarantined = reg.load_modules(project=proj, env=env)
+        with _untrusted_guard():
+            reg.trust_module("selection-highlight", project=proj, env=env)
+            # Widen activates_on in the manifest ONLY (entry file untouched → same hash).
+            manifest = proj / ".review" / "visual-modules.json"
+            data = json.loads(manifest.read_text())
+            data["modules"][0]["activates_on"] = ["selection", "everything"]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            loaded, quarantined = reg.load_modules(project=proj, env=env)
         assert loaded == [], "a widened activates_on must re-quarantine until re-trust"
         assert any("activates_on" in q.reason for q in quarantined)
 
 
-def test_trust_auto_env_bypasses_quarantine(monkeypatch=None):
+def test_trust_auto_env_bypasses_quarantine_under_guard():
     with tempfile.TemporaryDirectory() as d:
         proj = _project_with_module(Path(d))
         home = Path(d) / "home"
         env = _env(home)
-        old = os.environ.get("REVIEW_MODULES_TRUST")
-        os.environ["REVIEW_MODULES_TRUST"] = "auto"
-        try:
+        with _untrusted_guard(), _env_var("REVIEW_MODULES_TRUST", "auto"):
             loaded, quarantined = reg.load_modules(project=proj, env=env)
-        finally:
-            if old is None:
-                os.environ.pop("REVIEW_MODULES_TRUST", None)
-            else:
-                os.environ["REVIEW_MODULES_TRUST"] = old
         assert [m.name for m in loaded] == ["selection-highlight"], "auto-trust must load untrusted modules"
 
 
 def test_activation_gating_on_tag():
     """A loaded contributed module only activates when one of its activates_on tags is
-    requested (--check) or present in the intent; a plain run leaves it OFF."""
+    requested (--check) or present in the intent; a plain run leaves it OFF. (Default
+    world — the module loads with no trust step.)"""
     with tempfile.TemporaryDirectory() as d:
         proj = _project_with_module(Path(d))
         home = Path(d) / "home"
         env = _env(home)
-        reg.trust_module("selection-highlight", project=proj, env=env)
-        loaded, _ = reg.load_modules(project=proj, env=env)
+        with _env_var("REVIEW_UNTRUSTED_MODULES", None):
+            loaded, _ = reg.load_modules(project=proj, env=env)
         mod = loaded[0]
         # No tag requested → inactive.
         assert mod.activates(_ctx(requested_checks=[])) is False
@@ -216,31 +270,48 @@ def test_activation_gating_on_tag():
         assert mod.activates(_ctx(intent="verify the selection outline renders")) is True
 
 
-def test_audit_log_appended():
+def test_audit_log_appended_on_default_load():
+    """The audit log is kept (cheap, useful) even in the default no-ceremony path: a
+    plain default load records a loaded row for the module."""
     with tempfile.TemporaryDirectory() as d:
         proj = _project_with_module(Path(d))
         home = Path(d) / "home"
         env = _env(home)
-        # An untrusted load writes a quarantine audit row.
-        reg.load_modules(project=proj, env=env)
+        with _env_var("REVIEW_UNTRUSTED_MODULES", None):
+            reg.load_modules(project=proj, env=env)
         assert env.audit_path.exists()
         rows = [json.loads(line) for line in env.audit_path.read_text().splitlines() if line.strip()]
-        assert any(r["module"] == "selection-highlight" and r["trust_state"] == "quarantined" for r in rows)
-        # Trust + a successful load appends a trusted row (append-only — old rows kept).
-        reg.trust_module("selection-highlight", project=proj, env=env)
-        reg.load_modules(project=proj, env=env)
-        rows2 = [json.loads(line) for line in env.audit_path.read_text().splitlines() if line.strip()]
+        assert any(
+            r["module"] == "selection-highlight" and r["decision"] == "loaded" for r in rows
+        ), "a default load must be audited"
+
+
+def test_audit_log_appended_under_guard():
+    with tempfile.TemporaryDirectory() as d:
+        proj = _project_with_module(Path(d))
+        home = Path(d) / "home"
+        env = _env(home)
+        with _untrusted_guard():
+            # An untrusted load writes a quarantine audit row.
+            reg.load_modules(project=proj, env=env)
+            assert env.audit_path.exists()
+            rows = [json.loads(line) for line in env.audit_path.read_text().splitlines() if line.strip()]
+            assert any(r["module"] == "selection-highlight" and r["trust_state"] == "quarantined" for r in rows)
+            # Trust + a successful load appends a trusted row (append-only — old rows kept).
+            reg.trust_module("selection-highlight", project=proj, env=env)
+            reg.load_modules(project=proj, env=env)
+            rows2 = [json.loads(line) for line in env.audit_path.read_text().splitlines() if line.strip()]
         assert len(rows2) > len(rows), "audit is append-only"
         assert any(r["trust_state"] == "trusted" for r in rows2)
 
 
 def test_pipeline_folds_contributed_selection_module():
     """End-to-end: a project that contributes the real selection-highlight module (the
-    reference contrib impl), once trusted, has its veto folded into run_pipeline. On a
-    styled render with NO selection outline + --check selection, the module's cv_check
-    BLOCKS → the pipeline rolls back with NO vision call (the registry → pipeline path)."""
+    reference contrib impl) has its veto folded into run_pipeline BY DEFAULT (no trust
+    step). On a styled render with NO selection outline + --check selection, the
+    module's cv_check BLOCKS → the pipeline rolls back with NO vision call (the
+    registry → pipeline path)."""
     from reviewlib.features.visual import pipeline as pl
-    from reviewlib.features.visual.registry import RegistryEnv, trust_module
     from reviewlib.features.visual.vision_client import VisionVerdict
 
     with tempfile.TemporaryDirectory() as d:
@@ -275,10 +346,11 @@ def test_pipeline_folds_contributed_selection_module():
         regmod._default_trust_path = lambda: env.trust_path
         regmod._default_global_registry_path = lambda: env.global_registry_path
         regmod._default_audit_path = lambda: env.audit_path
-        # Also reset the once-per-process banner set so the quarantine path is exercised.
+        # Also reset the once-per-process banner set so the load path is clean.
         regmod._BANNERED.clear()
+        guard = _env_var("REVIEW_UNTRUSTED_MODULES", None)  # default world: no trust step
+        guard.__enter__()
         try:
-            trust_module("selection-highlight", project=proj, env=env)
             img = Path(tempfile.mkstemp(suffix="-nosel.png")[1])
             vf.styled_render(img)  # styled, but NO selection outline
 
@@ -300,6 +372,7 @@ def test_pipeline_folds_contributed_selection_module():
                 pl.call_ai_vision = old_call
                 pl.select_vision_backend = old_select
         finally:
+            guard.__exit__(None, None, None)
             regmod._default_trust_path = old_trust
             regmod._default_global_registry_path = old_glob
             regmod._default_audit_path = old_audit
