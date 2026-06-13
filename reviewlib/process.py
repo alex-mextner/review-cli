@@ -38,13 +38,26 @@ def _run(
 
 
 def log_dir() -> Path:
-    """Predictable dir for per-call live logs that an external `tail -f` can watch.
+    """Predictable dir for per-call live logs (and the brainstorm discussion log)
+    that an external `tail -f` can watch.
 
-    Honors $REVIEW_LOG_DIR (used by tests), else ~/.cache/review-cli/logs. Created
-    private (0700) because logs can contain reviewed prompts/diffs (possibly secrets).
+    Honors $REVIEW_LOG_DIR (tests), else the OS-standard per-user log location:
+      macOS → ~/Library/Logs/review-cli
+      Linux/other → $XDG_STATE_HOME/review-cli/logs  (default ~/.local/state/...)
+    Logs are state, not throwaway cache, so on Linux they live under XDG_STATE_HOME
+    rather than the cache dir. Created private (0700) because logs persist reviewed
+    prompts/diffs (possibly secrets).
     """
     override = os.environ.get("REVIEW_LOG_DIR")
-    base = Path(override) if override else (Path.home() / ".cache" / "review-cli" / "logs")
+    if override:
+        base = Path(override)
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Logs" / "review-cli"
+    else:
+        state = os.environ.get("XDG_STATE_HOME", "").strip()
+        # XDG spec: a relative $XDG_STATE_HOME must be ignored.
+        root = Path(state) if state and os.path.isabs(state) else (Path.home() / ".local" / "state")
+        base = root / "review-cli" / "logs"
     base.mkdir(parents=True, exist_ok=True)
     try:
         base.chmod(0o700)

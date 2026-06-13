@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 import textwrap
 import urllib.error
@@ -47,10 +48,23 @@ def _which(name: str) -> str:
     return path
 
 
+# Backends that re-argv the prompt cap out near ARG_MAX (~1 MB): opencode passes
+# the message as argv; claude-p reads stdin but its INNER `claude` exec re-argv's
+# it. Feeding via stdin (claude/codex) removes review-cli's own argv overhead, but
+# can't lift that inner ceiling — so warn well before it, loudly not silently.
+_PAYLOAD_WARN_BYTES = 600_000
+
+
 def _payload(prompt: str, diff: str = "") -> str:
-    if not diff.strip():
-        return prompt
-    return f"{prompt}\n\n```diff\n{diff}\n```"
+    out = prompt if not diff.strip() else f"{prompt}\n\n```diff\n{diff}\n```"
+    if len(out.encode("utf-8")) > _PAYLOAD_WARN_BYTES:
+        print(
+            f"[review-cli] WARNING: payload is {len(out)} bytes — nearing the ~1 MB "
+            "ARG_MAX ceiling; opencode (argv-only) and claude-p's inner exec may fail. "
+            "Use fewer --max-rounds or a smaller diff.",
+            file=sys.stderr, flush=True,
+        )
+    return out
 
 
 def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
@@ -240,9 +254,17 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
     ]
     if claude_model:
         argv += ["--model", claude_model]
-    argv += ["-p", _payload(prompt, diff)]
-    proc = _run_streamed(argv, cwd=cwd, timeout=timeout + 30, backend="claude", announce=_ANNOUNCE_LOGS)
-    command = "claude-p --permission-mode dontAsk --tools '' --strict-mcp-config --disable-slash-commands --safe-mode --append-system-prompt <read-only-review> --disallowedTools Edit MultiEdit Write Bash Read Grep Glob NotebookEdit SlashCommand Task TodoWrite ExitPlanMode WebFetch WebSearch -p <prompt>"
+    # Feed the payload over STDIN, not `-p <payload>` argv: a brainstorm round's
+    # prompt embeds the whole prior-round transcript (and a review's diff can be
+    # huge), which as a command-line argument blows past ARG_MAX (~1 MB) → execve
+    # E2BIG → the call dies before producing any output. `-p` stays as the print
+    # flag; claude-p reads the prompt from stdin, like the codex backend's `-`.
+    argv += ["-p"]
+    proc = _run_streamed(
+        argv, cwd=cwd, input_text=_payload(prompt, diff),
+        timeout=timeout + 30, backend="claude", announce=_ANNOUNCE_LOGS,
+    )
+    command = "claude-p --permission-mode dontAsk --tools '' --strict-mcp-config --disable-slash-commands --safe-mode --append-system-prompt <read-only-review> --disallowedTools Edit MultiEdit Write Bash Read Grep Glob NotebookEdit SlashCommand Task TodoWrite ExitPlanMode WebFetch WebSearch -p  (prompt via stdin)"
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 

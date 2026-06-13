@@ -319,8 +319,9 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
         assert name == "claude-p"
         return "/bin/claude-p"
 
-    def fake_run_streamed(argv: list[str], **_kwargs):
+    def fake_run_streamed(argv: list[str], **kwargs):
         captured["argv"] = argv
+        captured["kwargs"] = kwargs
         return review.subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
     try:
@@ -360,8 +361,56 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     ):
         assert tool in blocked
     assert argv[argv.index("--model") + 1] == "opus"
-    assert argv[-2] == "-p"
-    assert argv[-1] == "prompt\n\n```diff\ndiff\n```"
+    # The payload is fed over STDIN, not a `-p <payload>` argv arg: a brainstorm
+    # round's growing transcript (or a big diff) as a command-line argument blows
+    # past ARG_MAX → execve E2BIG → the call dies with no output. `-p` stays the
+    # trailing print flag; the prompt arrives via input_text (stdin).
+    assert argv[-1] == "-p"
+    assert captured["kwargs"]["input_text"] == "prompt\n\n```diff\ndiff\n```"
+
+
+def test_run_streamed_feeds_large_input_over_stdin_without_deadlock():
+    """A payload bigger than the OS pipe buffer must round-trip via stdin — proving
+    stdin is written, CLOSED (EOF so the child exits, not hangs to timeout), and
+    drained CONCURRENTLY with stdout (else a full pipe deadlocks). The real contract
+    the claude backend now relies on instead of a `-p <payload>` arg."""
+    import os
+    import tempfile
+
+    payload = "x" * 200_000 + "\nEND\n"  # > 64 KiB pipe buffer
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["REVIEW_LOG_DIR"] = tmp
+        proc = review._run_streamed(["cat"], cwd=Path(tmp), input_text=payload, timeout=30)
+    assert proc.returncode == 0
+    assert proc.stdout == payload
+
+
+def test_log_dir_uses_os_standard_locations():
+    import os
+    import tempfile
+
+    saved_platform = sys.platform
+    saved = {k: os.environ.get(k) for k in ("REVIEW_LOG_DIR", "XDG_STATE_HOME", "HOME")}
+    try:
+        with tempfile.TemporaryDirectory() as home:
+            os.environ["HOME"] = home
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("XDG_STATE_HOME", None)
+            sys.platform = "darwin"
+            assert review.log_dir() == Path(home) / "Library" / "Logs" / "review-cli"
+            sys.platform = "linux"
+            assert review.log_dir() == Path(home) / ".local" / "state" / "review-cli" / "logs"
+            os.environ["XDG_STATE_HOME"] = str(Path(home) / "xdg")
+            assert review.log_dir() == Path(home) / "xdg" / "review-cli" / "logs"
+            os.environ["XDG_STATE_HOME"] = "relative-ignored"  # XDG: relative → ignored
+            assert review.log_dir() == Path(home) / ".local" / "state" / "review-cli" / "logs"
+    finally:
+        sys.platform = saved_platform
+        for key, val in saved.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
 
 
 if __name__ == "__main__":
