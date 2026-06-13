@@ -117,13 +117,26 @@ def _run(
 
 
 def log_dir() -> Path:
-    """Predictable dir for per-call live logs that an external `tail -f` can watch.
+    """Predictable dir for per-call live logs (and the brainstorm discussion log)
+    that an external `tail -f` can watch.
 
-    Honors $REVIEW_LOG_DIR (used by tests), else ~/.cache/review-cli/logs. Created
-    private (0700) because logs can contain reviewed prompts/diffs (possibly secrets).
+    Honors $REVIEW_LOG_DIR (tests), else the OS-standard per-user log location:
+      macOS → ~/Library/Logs/review-cli
+      Linux/other → $XDG_STATE_HOME/review-cli/logs  (default ~/.local/state/...)
+    Logs are state, not throwaway cache, so on Linux they live under XDG_STATE_HOME
+    rather than the cache dir. Created private (0700) because logs persist reviewed
+    prompts/diffs (possibly secrets).
     """
     override = os.environ.get("REVIEW_LOG_DIR")
-    base = Path(override) if override else (Path.home() / ".cache" / "review-cli" / "logs")
+    if override:
+        base = Path(override)
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Logs" / "review-cli"
+    else:
+        state = os.environ.get("XDG_STATE_HOME", "").strip()
+        # XDG spec: a relative $XDG_STATE_HOME must be ignored.
+        root = Path(state) if state and os.path.isabs(state) else (Path.home() / ".local" / "state")
+        base = root / "review-cli" / "logs"
     base.mkdir(parents=True, exist_ok=True)
     try:
         base.chmod(0o700)
@@ -424,10 +437,23 @@ def _split_models(raw: list[str]) -> list[str]:
     return values
 
 
+# Backends that re-argv the prompt cap out near ARG_MAX (~1 MB): opencode passes
+# the message as argv; claude-p reads stdin but its INNER `claude` exec re-argv's
+# it. Feeding via stdin (claude/codex) removes review-cli's own argv overhead, but
+# can't lift that inner ceiling — so warn well before it, loudly not silently.
+_PAYLOAD_WARN_BYTES = 600_000
+
+
 def _payload(prompt: str, diff: str = "") -> str:
-    if not diff.strip():
-        return prompt
-    return f"{prompt}\n\n```diff\n{diff}\n```"
+    out = prompt if not diff.strip() else f"{prompt}\n\n```diff\n{diff}\n```"
+    if len(out.encode("utf-8")) > _PAYLOAD_WARN_BYTES:
+        print(
+            f"[review-cli] WARNING: payload is {len(out)} bytes — nearing the ~1 MB "
+            "ARG_MAX ceiling; opencode (argv-only) and claude-p's inner exec may fail. "
+            "Use fewer --max-rounds or a smaller diff.",
+            file=sys.stderr, flush=True,
+        )
+    return out
 
 
 def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
@@ -597,9 +623,18 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
     ]
     if claude_model:
         argv += ["--model", claude_model]
-    argv += ["-p", _payload(prompt, diff)]
-    proc = _run_streamed(argv, cwd=cwd, timeout=timeout + 30, backend="claude", announce=_ANNOUNCE_LOGS)
-    command = "claude-p --permission-mode dontAsk --tools '' --strict-mcp-config --disable-slash-commands --safe-mode --append-system-prompt <read-only-review> --disallowedTools Edit MultiEdit Write Bash Read Grep Glob NotebookEdit SlashCommand Task TodoWrite ExitPlanMode WebFetch WebSearch -p <prompt>"
+    # Feed the payload over STDIN, not `-p <payload>` argv: a brainstorm round's
+    # prompt embeds the whole prior-round transcript (and a review's diff can be
+    # huge), which as a command-line argument blows past ARG_MAX (~1 MB) → execve
+    # E2BIG → the call dies before producing any output (observed: claude backend
+    # silently dropping at round 2+). `-p` stays as the print flag; claude-p reads
+    # the prompt from stdin, exactly like the codex backend does with `-`.
+    argv += ["-p"]
+    proc = _run_streamed(
+        argv, cwd=cwd, input_text=_payload(prompt, diff),
+        timeout=timeout + 30, backend="claude", announce=_ANNOUNCE_LOGS,
+    )
+    command = "claude-p --permission-mode dontAsk --tools '' --strict-mcp-config --disable-slash-commands --safe-mode --append-system-prompt <read-only-review> --disallowedTools Edit MultiEdit Write Bash Read Grep Glob NotebookEdit SlashCommand Task TodoWrite ExitPlanMode WebFetch WebSearch -p  (prompt via stdin)"
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
@@ -773,63 +808,103 @@ def mode_brainstorm(
     out: list[str] = [f"# Brainstorm: {topic}", f"panel={','.join(panel)} moderator={moderator} "
                       f"rounds>={min_rounds} max={max_rounds}"]
 
+    # DISCUSSION LOG: write the conversation to one file as each round/decision
+    # lands (line-buffered, 0600). The whole brainstorm used to be accumulated in
+    # memory and printed only at the very end, so a timeout / kill / crash lost
+    # everything; now the discussion-so-far is always on disk and `tail -f`-able.
+    disc_path = log_dir() / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')}-brainstorm.md"
+    disc = None
+    try:
+        # O_EXCL: never clobber an existing log on a (sub-microsecond) stamp clash.
+        disc = os.fdopen(os.open(str(disc_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                         "w", encoding="utf-8", buffering=1)
+        print(f"[review-cli] brainstorm discussion log: {disc_path} (tail -f to follow)",
+              file=sys.stderr, flush=True)
+    except OSError as exc:
+        # A read-only log dir must NOT take down a brainstorm that worked without
+        # one — degrade to no discussion log and keep going.
+        print(f"[review-cli] discussion log unavailable ({exc}); continuing without it",
+              file=sys.stderr, flush=True)
+
+    def _disc(text: str) -> None:
+        if disc is None:
+            return
+        disc.write(text if text.endswith("\n") else text + "\n")
+        disc.flush()
+
+    _disc(f"# Brainstorm: {topic}\n\npanel={','.join(panel)} moderator={moderator} "
+          f"rounds>={min_rounds} max={max_rounds}\n")
+
     persona_index = 0
     completed = 0
-    for round_no in range(1, max_rounds + 1):
-        shared = "\n\n".join(transcript_blocks) if transcript_blocks else "(this is the first round)"
-        jobs: list[PanelJob] = []
-        # Assign >= 3 distinct personas this round, rotating across the pool.
-        slot_count = max(3, len(panel))
-        for slot in range(slot_count):
-            persona_name, persona_bg = PERSONAS[persona_index % len(PERSONAS)]
-            persona_index += 1
-            model = panel[slot % len(panel)]
-            prompt = (
-                f"You are a '{persona_name}' ({persona_bg}). You are in round {round_no} of a "
-                "multi-round brainstorm. Build on the shared transcript of prior rounds — "
-                "react, extend, challenge, or propose new angles from YOUR perspective. "
-                "Be concrete; offer ideas, not pleasantries. Do not edit files.\n\n"
-                f"TOPIC:\n{topic}\n\n=== SHARED TRANSCRIPT (prior rounds) ===\n{shared}"
+    synth: ReviewResult | None = None
+    try:
+        for round_no in range(1, max_rounds + 1):
+            shared = "\n\n".join(transcript_blocks) if transcript_blocks else "(this is the first round)"
+            jobs: list[PanelJob] = []
+            # Assign >= 3 distinct personas this round, rotating across the pool.
+            slot_count = max(3, len(panel))
+            for slot in range(slot_count):
+                persona_name, persona_bg = PERSONAS[persona_index % len(PERSONAS)]
+                persona_index += 1
+                model = panel[slot % len(panel)]
+                # The shared transcript is fed to backends over STDIN (see the
+                # claude/codex backends), NOT a `-p` argv argument — it grows each
+                # round and would blow past ARG_MAX as a command-line arg.
+                prompt = (
+                    f"You are a '{persona_name}' ({persona_bg}). You are in round {round_no} of a "
+                    "multi-round brainstorm. Build on the shared transcript of prior rounds — "
+                    "react, extend, challenge, or propose new angles from YOUR perspective. "
+                    "Be concrete; offer ideas, not pleasantries. Do not edit files.\n\n"
+                    f"TOPIC:\n{topic}\n\n=== SHARED TRANSCRIPT (prior rounds) ===\n{shared}"
+                )
+                jobs.append(PanelJob(model=model, prompt=prompt, diff="", label=f"{persona_name} ({model})"))
+
+            round_results = run_panel(jobs, cwd, timeout)
+            round_text = "\n\n".join(
+                f"#### {r.model}\n{(r.stdout.strip() or r.stderr.strip() or '(no output)')}"
+                for r in round_results
             )
-            jobs.append(PanelJob(model=model, prompt=prompt, diff="", label=f"{persona_name} ({model})"))
+            transcript_blocks.append(f"## Round {round_no}\n{round_text}")
+            out.append(f"\n# Round {round_no}\n" + "\n\n---\n\n".join(format_result(r) for r in round_results))
+            _disc(f"\n# Round {round_no}\n{round_text}\n")
+            completed = round_no
 
-        round_results = run_panel(jobs, cwd, timeout)
-        round_text = "\n\n".join(
-            f"#### {r.model}\n{(r.stdout.strip() or r.stderr.strip() or '(no output)')}"
-            for r in round_results
+            # Moderator summary + continue/stop decision (cannot stop before min_rounds).
+            mod_prompt = (
+                "You are the MODERATOR of a brainstorm. Summarize the round below in a few bullets, "
+                "then decide whether the discussion has CONVERGED / saturated (diminishing new ideas). "
+                "End your reply with a final line that is EXACTLY one of: 'DECISION: STOP' or "
+                "'DECISION: CONTINUE'.\n\n"
+                f"TOPIC:\n{topic}\n\n=== ROUND {round_no} ===\n{round_text}"
+            )
+            mod_result = run_single(moderator, mod_prompt, cwd, timeout)
+            out.append(f"\n## Moderator (round {round_no})\n" + format_result(mod_result))
+            _disc(f"\n## Moderator (round {round_no})\n"
+                  f"{(mod_result.stdout.strip() or mod_result.stderr.strip() or '(no output)')}\n")
+
+            if round_no < min_rounds:
+                continue
+            if "DECISION: STOP" in mod_result.stdout.upper():
+                break
+
+        # Final synthesis.
+        full_transcript = "\n\n".join(transcript_blocks)
+        synth_prompt = (
+            "You are the MODERATOR. The brainstorm is complete. Read the full transcript and produce a "
+            "final synthesis with: BEST IDEAS (ranked), TRADEOFFS, and a single concrete RECOMMENDATION.\n\n"
+            f"TOPIC:\n{topic}\n\n=== FULL TRANSCRIPT ({completed} rounds) ===\n{full_transcript}"
         )
-        transcript_blocks.append(f"## Round {round_no}\n{round_text}")
-        out.append(f"\n# Round {round_no}\n" + "\n\n---\n\n".join(format_result(r) for r in round_results))
-        completed = round_no
-
-        # Moderator summary + continue/stop decision (cannot stop before min_rounds).
-        mod_prompt = (
-            "You are the MODERATOR of a brainstorm. Summarize the round below in a few bullets, "
-            "then decide whether the discussion has CONVERGED / saturated (diminishing new ideas). "
-            "End your reply with a final line that is EXACTLY one of: 'DECISION: STOP' or "
-            "'DECISION: CONTINUE'.\n\n"
-            f"TOPIC:\n{topic}\n\n=== ROUND {round_no} ===\n{round_text}"
-        )
-        mod_result = run_single(moderator, mod_prompt, cwd, timeout)
-        out.append(f"\n## Moderator (round {round_no})\n" + format_result(mod_result))
-
-        if round_no < min_rounds:
-            continue
-        decision = mod_result.stdout.upper()
-        if "DECISION: STOP" in decision:
-            break
-
-    # Final synthesis.
-    full_transcript = "\n\n".join(transcript_blocks)
-    synth_prompt = (
-        "You are the MODERATOR. The brainstorm is complete. Read the full transcript and produce a "
-        "final synthesis with: BEST IDEAS (ranked), TRADEOFFS, and a single concrete RECOMMENDATION.\n\n"
-        f"TOPIC:\n{topic}\n\n=== FULL TRANSCRIPT ({completed} rounds) ===\n{full_transcript}"
-    )
-    synth = run_single(moderator, synth_prompt, cwd, timeout)
-    out.append("\n# Final synthesis\n" + format_result(synth))
+        synth = run_single(moderator, synth_prompt, cwd, timeout)
+        out.append("\n# Final synthesis\n" + format_result(synth))
+        _disc(f"\n# Final synthesis\n{(synth.stdout.strip() or synth.stderr.strip() or '(no output)')}\n")
+    finally:
+        if disc is not None:
+            disc.close()
     print("\n\n".join(out))
-    return 0 if synth.returncode == 0 else 1
+    if disc is not None:
+        print(f"[review-cli] full discussion log: {disc_path}", file=sys.stderr, flush=True)
+    return 0 if synth is not None and synth.returncode == 0 else 1
 
 
 # --- install-skill: make agent harnesses aware this tool exists ----------------
