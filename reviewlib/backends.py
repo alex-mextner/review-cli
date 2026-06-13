@@ -168,18 +168,11 @@ def _gemini_key() -> str:
     raise RuntimeError("GEMINI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
 
 
-def _anthropic_key() -> str:
-    key = _resolve_key(("ANTHROPIC_API_KEY",), "ANTHROPIC_API_KEY")
-    if key:
-        return key
-    raise RuntimeError("ANTHROPIC_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
-
-
-def _openai_key() -> str:
-    key = _resolve_key(("OPENAI_API_KEY",), "OPENAI_API_KEY")
-    if key:
-        return key
-    raise RuntimeError("OPENAI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
+# NOTE: `_anthropic_key` / `_openai_key` were added in 30163c5 ONLY for the REST vision
+# path. That path is gone (vision now invokes the agent CLIs — claude/codex — which carry
+# their own auth, exactly like review's TEXT backends). Gemini stays the one key-based
+# vision exception via `_gemini_key`. The two orphaned helpers are removed with the REST
+# adapters; `_resolve_key` stays — `_gemini_key` still uses it.
 
 
 def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:

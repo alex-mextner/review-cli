@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-"""vision_client tests — the multimodal path (§3.2). NO real API calls.
+"""vision_client tests — the multimodal path via the AGENT CLIs (§3.2). NO real CLI/API.
+
+`review` works by INVOKING the agent CLIs (codex/claude/opencode); the visual path
+mirrors that — it shells out to the SAME CLIs with an image attached and parses the
+structured verdict from the CLI's text output. Gemini is the ONE exception (its CLI is
+broken → REST key). These tests MOCK the CLI invocation (the streaming subprocess runner)
+and the Gemini REST call; no real CLI is spawned and no real API is hit.
 
 Proves:
-  * per-provider request SHAPE: Anthropic base64 image block, OpenAI image_url
-    data-URI, Gemini inline_data — asserted against the pure request builders;
-  * forced structured output is requested (tool_use / json_schema / response_schema);
-  * structured-output PARSE marshals a verdict and rejects an invalid enum;
-  * fail-closed: no vision backend configured → available=False (→ unverified);
-  * capability gating: a non-vision backend is not selectable.
-
-The live call itself is NOT exercised (Stage 2 covers recorded responses); these
-tests target the request construction + parsing seams.
+  * per-CLI IMAGE ATTACH: codex `-i <file>`, claude `@<file>` ref + Read tool, opencode
+    `-f <file>` — asserted against the captured argv + staged temp image;
+  * forced structured output is requested (codex --output-schema; claude/opencode prompt
+    instruction) and PARSED from the CLI's text output (verdict marshals; invalid enum →
+    None so policy fails closed);
+  * fail-closed: no vision backend configured → available=False (→ unverified); a CLI
+    that emits no parseable JSON → available=True/verdict=None (→ human_review);
+  * capability gating + selection: opencode is now vision-capable; a CLI binary absent →
+    not reachable; Gemini selectable iff its key resolves;
+  * Gemini stays the REST-key exception and honors $GEMINI_MODEL.
 """
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,7 +31,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib.features.visual import vision_client as vc  # noqa: E402
 
-_IMG = vc.encode_image(b"\x89PNG\r\n\x1a\nFAKEPNGBYTES")
+_IMG_BYTES = b"\x89PNG\r\n\x1a\nFAKEPNGBYTES"
+_IMG = vc.encode_image(_IMG_BYTES)
 
 
 def _blocks():
@@ -41,83 +50,191 @@ def _before_after_blocks():
     ]
 
 
-def test_before_after_labels_emitted_each_provider():
-    """Each provider request must caption the before/after images so the model knows
-    which is the baseline (codex P2)."""
+# --- A reusable fake for review's streaming CLI runner (process._run_streamed, which the
+# visual CLI dispatch calls through `_run_cli`). Captures the argv/stdin and returns a
+# canned CompletedProcess. The codex path also writes its verdict to the `-o` file, so the
+# fake honors `--output-schema`/`-o` by writing the canned JSON there. -----------------
+def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write_output_file: str | None = None):
+    """Monkeypatch reviewlib.process._run_streamed (the seam `_run_cli` uses). Returns the
+    old function so the caller can restore it."""
+    import reviewlib.process as process
+
+    def fake(argv, *, cwd, input_text=None, env=None, timeout=1200, backend="backend", round_no=0, announce=False):
+        argv = list(argv)
+        capture["argv"] = argv
+        capture["input_text"] = input_text
+        capture["cwd"] = str(cwd)
+        capture["backend"] = backend
+        capture.setdefault("calls", []).append(argv)
+        # The staged image temp dir is deleted when call_ai_vision returns, so snapshot the
+        # attached image bytes (per CLI flag) HERE, while the files still exist.
+        staged = {}
+        for flag in ("-i", "-f"):
+            if flag in argv:
+                try:
+                    staged[flag] = Path(argv[argv.index(flag) + 1]).read_bytes()
+                except OSError:
+                    pass
+        # claude references the image via @<path> in the -p prompt; snapshot it too.
+        if "-p" in argv:
+            prompt = argv[argv.index("-p") + 1]
+            for tok in prompt.split():
+                if tok.startswith("@"):
+                    try:
+                        staged["@"] = Path(tok[1:]).read_bytes()
+                    except OSError:
+                        pass
+        capture["staged"] = staged
+        # codex writes its final structured message to the file after `-o`; emulate it so
+        # the dispatch reads the verdict from there (its real behavior).
+        if write_output_file is not None and "-o" in argv:
+            out_path = Path(argv[argv.index("-o") + 1])
+            out_path.write_text(write_output_file, encoding="utf-8")
+        return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr="")
+
+    old = process._run_streamed
+    process._run_streamed = fake
+    return old
+
+
+def _restore_runner(old):
+    import reviewlib.process as process
+
+    process._run_streamed = old
+
+
+def _staged_image_bytes(cap: dict, flag: str) -> bytes | None:
+    """The image bytes the dispatch staged and passed after `flag` (snapshotted by the
+    fake runner while the temp file still existed)."""
+    return (cap.get("staged") or {}).get(flag)
+
+
+# === codex CLI vision ============================================================
+def test_codex_cli_attaches_image_and_parses_output_schema():
+    """codex vision: `codex exec -i <image> --output-schema <schema> -o <out> -`. The
+    image is attached via `-i`, the forced schema via `--output-schema`, and the verdict
+    is read from the `-o` file."""
+    cap: dict = {}
+    old = _patch_runner(
+        cap,
+        write_output_file='{"verdict":"keep","confidence":0.95,"selection_present":true}',
+    )
+    try:
+        v = vc.call_ai_vision("codex", blocks=_blocks(), output_schema=vc.build_output_schema(["selection_present"]))
+    finally:
+        _restore_runner(old)
+    argv = cap["argv"]
+    assert argv[0] == "codex" and argv[1] == "exec", argv
+    # Image attached via -i, and the staged file held the real PNG bytes.
+    assert "-i" in argv, "codex must attach the image with -i"
+    assert _staged_image_bytes(cap, "-i") == _IMG_BYTES, "the -i image was not the staged screenshot"
+    # Forced structured output via --output-schema + -o, and the verdict read from -o.
+    assert "--output-schema" in argv and "-o" in argv
+    assert v.available and v.verdict == "keep" and v.confidence == 0.95
+    assert v.module_answers.get("selection_present") is True
+    assert v.backend == "codex"
+
+
+def test_codex_cli_honors_model_suffix():
+    cap: dict = {}
+    old = _patch_runner(cap, write_output_file='{"verdict":"keep","confidence":0.9}')
+    try:
+        vc.call_ai_vision("codex:gpt-5-vision", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    argv = cap["argv"]
+    assert "-m" in argv and argv[argv.index("-m") + 1] == "gpt-5-vision"
+
+
+# === claude CLI vision ===========================================================
+def test_claude_cli_references_image_and_enables_read():
+    """claude vision: the image is referenced as `@<path>` in the prompt and the Read tool
+    is ENABLED (vision needs to load the file). `--output-format json` wraps the answer;
+    the verdict is the `result` field."""
+    cap: dict = {}
+    wrapper = json.dumps({"type": "result", "result": '{"verdict":"rollback","confidence":0.8}'})
+    old = _patch_runner(cap, stdout=wrapper)
+    try:
+        v = vc.call_ai_vision("claude:claude-fable-5", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    argv = cap["argv"]
+    assert argv[0] == "claude" and "-p" in argv
+    prompt = argv[argv.index("-p") + 1]
+    assert "@" in prompt, "claude prompt must reference the image with @<path>"
+    # Read enabled, write/exec tools denied, output-format json, add-dir for the image dir.
+    assert "--allowedTools" in argv and "Read" in argv
+    assert "--output-format" in argv and "json" in argv
+    assert "--add-dir" in argv
+    # The @<path> in the prompt pointed at a real staged image carrying the PNG bytes.
+    assert _staged_image_bytes(cap, "@") == _IMG_BYTES
+    # model suffix honored.
+    assert argv[argv.index("--model") + 1] == "claude-fable-5"
+    # parsed from the result field.
+    assert v.available and v.verdict == "rollback" and v.confidence == 0.8
+    assert v.backend == "claude:claude-fable-5"
+
+
+def test_claude_cli_parses_bare_json_when_not_wrapped():
+    """If claude returns the JSON directly (not wrapped), the parser still extracts it."""
+    cap: dict = {}
+    old = _patch_runner(cap, stdout='Here is the verdict:\n{"verdict":"keep","confidence":0.91}\nDone.')
+    try:
+        v = vc.call_ai_vision("claude:opus", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    assert v.verdict == "keep" and v.confidence == 0.91
+
+
+# === opencode CLI vision (NOW ENABLED) ===========================================
+def test_opencode_cli_attaches_image_and_parses():
+    """opencode is vision-capable now: `opencode run "<prompt>" -m <model> -f <image>`
+    attaches the file and routes to the named vision model; the verdict is parsed from
+    the text output."""
+    cap: dict = {}
+    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.88}')
+    try:
+        v = vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    argv = cap["argv"]
+    assert argv[0] == "opencode" and argv[1] == "run"
+    # Message is the positional BEFORE -m/-f (the -f array flag is greedy).
+    assert "-m" in argv and argv[argv.index("-m") + 1] == "fireworks/qwen2-vl"
+    assert "-f" in argv, "opencode must attach the image with -f"
+    assert _staged_image_bytes(cap, "-f") == _IMG_BYTES
+    # The prompt is positional (argv[2]), before the flags.
+    assert argv.index("-m") > 2 and argv.index("-f") > 2
+    assert v.available and v.verdict == "keep" and v.confidence == 0.88
+
+
+def test_opencode_is_vision_capable():
+    """opencode is no longer vision-incapable: capability_for resolves it and select can
+    pick it when reachable."""
+    cap = vc.capability_for("oc:fireworks/qwen2-vl")
+    assert cap is not None and cap.vision and cap.live_dispatch
+    assert cap.wire == "opencode-cli"
+
+
+# === routing / capability ========================================================
+def test_build_request_routes_to_cli_or_gemini():
     schema = vc.build_output_schema()
-
-    a = vc.build_anthropic_request("claude:opus", "s", _before_after_blocks(), schema)
-    texts = [c["text"] for c in a["messages"][0]["content"] if c.get("type") == "text"]
-    assert any("BEFORE image" in t for t in texts) and any("AFTER image" in t for t in texts)
-
-    o = vc.build_openai_request("codex", "s", _before_after_blocks(), schema)
-    otexts = [c["text"] for c in o["messages"][1]["content"] if c.get("type") == "text"]
-    assert any("BEFORE image" in t for t in otexts) and any("AFTER image" in t for t in otexts)
-
-    g = vc.build_gemini_request("s", _before_after_blocks(), schema)
-    gtexts = [p["text"] for p in g["contents"][0]["parts"] if "text" in p]
-    assert any("BEFORE image" in t for t in gtexts) and any("AFTER image" in t for t in gtexts)
+    route_c, _ = vc.build_request("claude:opus", "s", _blocks(), schema)
+    route_g, _ = vc.build_request("gemini", "s", _blocks(), schema)
+    route_x, _ = vc.build_request("codex", "s", _blocks(), schema)
+    route_o, _ = vc.build_request("oc:fireworks/qwen2-vl", "s", _blocks(), schema)
+    assert route_c == "claude-cli"
+    assert route_g == "gemini"
+    assert route_x == "codex-cli"
+    assert route_o == "opencode-cli"
 
 
-def test_anthropic_request_shape():
-    schema = vc.build_output_schema()
-    body = vc.build_anthropic_request("claude:claude-fable-5", "sys", _blocks(), schema)
-    content = body["messages"][0]["content"]
-    img = [c for c in content if c.get("type") == "image"]
-    assert img, "no anthropic image block built"
-    src = img[0]["source"]
-    assert src["type"] == "base64"
-    assert src["media_type"] == "image/png"
-    assert src["data"] == _IMG
-    # Forced structured output via tool_use + input_schema.
-    assert body["tool_choice"]["type"] == "tool"
-    assert body["tools"][0]["input_schema"] == schema
-
-
-def test_openai_request_shape():
-    schema = vc.build_output_schema()
-    body = vc.build_openai_request("codex", "sys", _blocks(), schema)
-    content = body["messages"][1]["content"]
-    img = [c for c in content if c.get("type") == "image_url"]
-    assert img, "no openai image_url block built"
-    url = img[0]["image_url"]["url"]
-    assert url.startswith("data:image/png;base64,"), f"not a data URI: {url[:40]}"
-    assert url.endswith(_IMG)
-    # Forced structured output via json_schema strict.
-    assert body["response_format"]["type"] == "json_schema"
-    assert body["response_format"]["json_schema"]["strict"] is True
-    # OpenAI STRICT json_schema rejects additionalProperties:true and optional props —
-    # the request must carry the strict-rewritten schema (codex P1).
-    sent = body["response_format"]["json_schema"]["schema"]
-    assert sent["additionalProperties"] is False, "strict schema must close additionalProperties"
-    assert set(sent["required"]) == set(sent["properties"].keys()), "strict requires every property listed"
-
-
-def test_gemini_request_shape():
-    schema = vc.build_output_schema()
-    body = vc.build_gemini_request("sys", _blocks(), schema)
-    parts = body["contents"][0]["parts"]
-    img = [p for p in parts if "inline_data" in p]
-    assert img, "no gemini inline_data part built"
-    assert img[0]["inline_data"]["mime_type"] == "image/png"
-    assert img[0]["inline_data"]["data"] == _IMG
-    # Structured output via response_schema, sanitized to Gemini's OpenAPI subset:
-    # the verdict enum survives, but JSON-schema-only keys (additionalProperties) are
-    # stripped so Gemini accepts it.
-    rs = body["generationConfig"]["response_schema"]
-    assert rs["properties"]["verdict"]["enum"] == list(vc.VISION_VERDICTS)
-    assert "additionalProperties" not in rs
-    assert "maxLength" not in rs["properties"]["note"]
-
-
-def test_build_request_routes_by_provider():
-    schema = vc.build_output_schema()
-    wire_a, _ = vc.build_request("claude:opus", "s", _blocks(), schema)
-    wire_g, _ = vc.build_request("gemini", "s", _blocks(), schema)
-    wire_o, _ = vc.build_request("codex", "s", _blocks(), schema)
-    assert wire_a == "anthropic"
-    assert wire_g == "gemini"
-    assert wire_o == "openai"
+def test_all_four_routes_live_dispatch_wired():
+    """All four routes are live: three agent CLIs + Gemini REST. opencode is INCLUDED
+    now (the CTO correction — it routes to vision models via the CLI)."""
+    for route in ("claude", "codex", "opencode", "gemini"):
+        cap = vc._CAPABILITIES[route]
+        assert cap.vision and cap.live_dispatch is True, f"{route} live dispatch must be wired"
 
 
 def test_schema_includes_module_fields():
@@ -131,22 +248,20 @@ def test_schema_includes_module_fields():
     assert "unstyled" in schema["required"]
 
 
-def test_openai_strict_schema_makes_optional_fields_nullable():
-    """A field that wasn't required (e.g. `note`) becomes nullable under OpenAI strict so
-    the model can still 'omit' it (codex P1)."""
+def test_schema_instruction_lists_keys_and_verdict_enum():
+    """The CLI path delivers the forced schema as a TEXT instruction (the CLIs return
+    text). It must name the allowed keys + the verdict enum."""
     schema = vc.build_output_schema(["selection_present"])
-    strict = vc._openai_strict_schema(schema)
-    assert strict["additionalProperties"] is False
-    assert set(strict["required"]) == set(strict["properties"].keys())
-    # `note` was optional → now [type, null]; the required module field stays non-null.
-    assert "null" in strict["properties"]["note"]["type"]
-    assert strict["properties"]["selection_present"]["type"] == "boolean"
+    instr = vc._schema_instruction(schema)
+    assert "verdict" in instr and "selection_present" in instr
+    assert all(v in instr for v in vc.VISION_VERDICTS)
 
 
+# === structured-output parse (shared by all routes) ==============================
 def test_parse_structured_valid():
     v = vc.parse_structured(
         {"verdict": "keep", "confidence": 0.9, "note": "looks fine", "selection_present": True},
-        backend="gemini",
+        backend="codex",
     )
     assert v.available and v.verdict == "keep"
     assert v.confidence == 0.9
@@ -159,15 +274,21 @@ def test_parse_structured_invalid_enum_yields_none():
     assert v.verdict is None, "an invalid verdict enum must marshal to None so policy fails closed"
 
 
-def test_call_ai_vision_fail_closed_when_no_backend():
-    v = vc.call_ai_vision(None, blocks=_blocks())
-    assert v.available is False
-    assert v.verdict is None
+def test_extract_first_json_object_from_prose_and_fences():
+    """The CLI output parser must find the JSON verdict whether it is bare, wrapped in
+    prose, or inside a ```json fence."""
+    bare = vc._extract_first_json_object('{"verdict":"keep","confidence":0.9}')
+    assert bare and bare["verdict"] == "keep"
+    prose = vc._extract_first_json_object('Sure! Here:\n{"verdict":"rollback","confidence":0.5} — done')
+    assert prose and prose["verdict"] == "rollback"
+    fenced = vc._extract_first_json_object('```json\n{"verdict":"repair","confidence":0.4}\n```')
+    assert fenced and fenced["verdict"] == "repair"
+    nested = vc._extract_first_json_object('{"verdict":"keep","confidence":0.9,"defects":[{"x":1}]}')
+    assert nested and nested["defects"] == [{"x": 1}]
+    assert vc._extract_first_json_object("no json at all here") is None
 
 
 def test_safe_confidence_fails_closed():
-    """Untrusted confidence: non-numeric must not crash, out-of-range/NaN must collapse
-    to 0.0 (so it can't slip a keep past the low-confidence escalation) — codex P2."""
     assert vc._safe_confidence("high") == 0.0  # non-numeric → 0.0, no crash
     assert vc._safe_confidence(2.0) == 0.0  # out of range → 0.0
     assert vc._safe_confidence(-1.0) == 0.0
@@ -175,15 +296,203 @@ def test_safe_confidence_fails_closed():
     assert vc._safe_confidence(True) == 0.0  # bool (int subclass) must NOT become 1.0
     assert vc._safe_confidence(False) == 0.0
     assert vc._safe_confidence(0.85) == 0.85  # valid value preserved
-    # And the full parse path must not crash on a string confidence.
     parsed = vc.parse_structured({"verdict": "keep", "confidence": "totally"})
     assert parsed.verdict == "keep" and parsed.confidence == 0.0
 
 
-def test_gemini_honors_env_model_and_uppercases_schema():
-    """The visual Gemini call must honor $GEMINI_MODEL (like review_gemini) and send an
-    uppercased response_schema type (codex P1/P2). We capture the request without a
-    real network call by faking urlopen + the key."""
+def test_parse_structured_malformed_list_fields_fail_closed():
+    v = vc.parse_structured({"verdict": "keep", "confidence": 0.9, "defects": 1, "observed_change_regions": "nope"})
+    assert v.verdict == "keep"
+    assert v.defects == []
+    assert v.observed_change_regions == []
+
+
+# === fail-closed ==================================================================
+def test_call_ai_vision_fail_closed_when_no_backend():
+    v = vc.call_ai_vision(None, blocks=_blocks())
+    assert v.available is False
+    assert v.verdict is None
+
+
+def test_cli_no_parseable_json_fails_closed_to_human_review():
+    """A CLI that returns prose with no JSON verdict → available=True/verdict=None so the
+    policy engine fails closed to human_review (never a silent keep)."""
+    cap: dict = {}
+    old = _patch_runner(cap, stdout="I could not determine a verdict from the image.", returncode=0)
+    try:
+        v = vc.call_ai_vision("codex", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    assert v.available is True and v.verdict is None
+    assert "no parseable JSON" in (v.error or "")
+
+
+def test_cli_nonzero_exit_fails_closed_even_with_keep_in_stdout():
+    """A CLI that exits NON-ZERO must fail closed BEFORE parsing — a failed/auth-erroring
+    CLI can still print a parseable `{"verdict":"keep"}` to stdout, which must never be
+    trusted (codex high finding)."""
+    cap: dict = {}
+    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.99}', returncode=1)
+    try:
+        v = vc.call_ai_vision("claude:opus", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    assert v.available is True and v.verdict is None, "non-zero exit must not trust a keep in stdout"
+    assert "non-zero" in (v.error or "")
+
+
+def test_opencode_uses_readonly_reviewer_agent():
+    """opencode vision must run the READ-ONLY reviewer agent (untrusted screenshot prompt
+    must not gain tool powers) — codex high finding."""
+    cap: dict = {}
+    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9}')
+    try:
+        vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    argv = cap["argv"]
+    assert "--agent" in argv and argv[argv.index("--agent") + 1] == "read-only-reviewer"
+
+
+def test_text_opencode_model_not_selected_for_vision():
+    """The DEFAULT config's TEXT opencode model must NOT be picked for --visual: a text
+    model can't verify an image (codex high finding). A vision-looking model still is."""
+    old = vc.vision_backend_available
+    # Restore real reachability logic but pretend the binary exists.
+    import shutil
+
+    old_which = shutil.which
+    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    vc.vision_backend_available = old  # use the real function under test
+    try:
+        text_default = "oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo"
+        assert vc.vision_backend_available(text_default) is False, "text opencode model must be unreachable for vision"
+        assert vc.select_vision_backend([text_default]) is None
+        # A vision-looking opencode model IS reachable.
+        assert vc.vision_backend_available("oc:fireworks/qwen2-vl") is True
+    finally:
+        shutil.which = old_which
+
+
+def test_opencode_vision_allowlist_env_override():
+    """$REVIEW_OPENCODE_VISION_MODELS lets a user opt a non-obvious model id into vision."""
+    import os
+    import shutil
+
+    old_which = shutil.which
+    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    old_env = os.environ.get("REVIEW_OPENCODE_VISION_MODELS")
+    os.environ["REVIEW_OPENCODE_VISION_MODELS"] = "kimi-k2p6-turbo"
+    try:
+        assert vc.vision_backend_available("oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo") is True
+    finally:
+        shutil.which = old_which
+        if old_env is None:
+            os.environ.pop("REVIEW_OPENCODE_VISION_MODELS", None)
+        else:
+            os.environ["REVIEW_OPENCODE_VISION_MODELS"] = old_env
+
+
+def test_codex_strict_schema_closes_additional_properties():
+    """codex --output-schema enforces OpenAI strict: additionalProperties:false + every
+    property required + free-form object array items downgraded to strings."""
+    strict = vc._strict_output_schema(vc.build_output_schema(["unstyled"]))
+    assert strict["additionalProperties"] is False
+    assert set(strict["required"]) == set(strict["properties"].keys())
+    # free-form object arrays became string arrays (OpenAI strict can't take open objects).
+    assert strict["properties"]["defects"]["items"]["type"] == "string"
+    assert strict["properties"]["observed_change_regions"]["items"]["type"] == "string"
+    # optional field made nullable; required module field stays a plain boolean.
+    assert "null" in strict["properties"]["note"]["type"]
+    assert strict["properties"]["unstyled"]["type"] == "boolean"
+
+
+def test_cli_missing_required_module_field_fails_closed():
+    """A CLI (claude/opencode return free text) that omits a REQUIRED module field must
+    fail closed — NOT silently produce empty module_answers that let a module judge fall
+    back to a CV pass (codex P2). codex enforces the field server-side via --output-schema;
+    claude/opencode only get the prompt instruction, so we validate OUTSIDE the model."""
+    cap: dict = {}
+    # claude returns a keep but OMITS the required `unstyled` module field.
+    wrapper = json.dumps({"type": "result", "result": '{"verdict":"keep","confidence":0.99}'})
+    old = _patch_runner(cap, stdout=wrapper)
+    try:
+        v = vc.call_ai_vision("claude:opus", blocks=_blocks(), output_schema=vc.build_output_schema(["unstyled"]))
+    finally:
+        _restore_runner(old)
+    assert v.available is True and v.verdict is None, "missing required module field must fail closed"
+    assert "required schema" in (v.error or "") and "unstyled" in (v.error or "")
+
+
+def test_cli_nonboolean_required_module_field_fails_closed():
+    """A required boolean module field returned as a non-boolean (e.g. "yes") fails closed:
+    a truthy string must NOT be coerced into a module pass."""
+    cap: dict = {}
+    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9,"unstyled":"false"}')
+    try:
+        v = vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks(), output_schema=vc.build_output_schema(["unstyled"]))
+    finally:
+        _restore_runner(old)
+    assert v.available is True and v.verdict is None
+    assert "must be a boolean" in (v.error or "")
+
+
+def test_cli_valid_required_module_field_passes_validation():
+    """When the required module field IS present and correctly typed, the verdict parses."""
+    cap: dict = {}
+    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9,"unstyled":false}')
+    try:
+        v = vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks(), output_schema=vc.build_output_schema(["unstyled"]))
+    finally:
+        _restore_runner(old)
+    assert v.available is True and v.verdict == "keep"
+    assert v.module_answers.get("unstyled") is False
+
+
+def test_cli_timeout_sets_timed_out_flag():
+    """A CLI timeout (returncode 124 from the streaming runner) sets timed_out → exit 124."""
+    cap: dict = {}
+    old = _patch_runner(cap, stdout="partial...", returncode=124)
+    try:
+        v = vc.call_ai_vision("claude:opus", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    assert v.available is True and v.verdict is None and v.timed_out is True
+
+
+def test_cli_backend_unreachable_when_binary_missing():
+    """vision_backend_available is the CLI BINARY check (NOT a REST key) for the agent
+    CLIs — a missing binary makes the backend unreachable so the selector skips it."""
+    import shutil
+
+    old_which = shutil.which
+    shutil.which = lambda name: None if name in ("codex", "claude", "opencode") else old_which(name)
+    try:
+        assert vc.vision_backend_available("codex") is False
+        assert vc.vision_backend_available("claude:opus") is False
+        assert vc.vision_backend_available("oc:fireworks/qwen2-vl") is False
+        assert vc.select_vision_backend(["codex", "claude:opus"]) is None
+    finally:
+        shutil.which = old_which
+
+
+def test_selection_prefers_first_reachable_cli():
+    """select_vision_backend honors the requested order, returning the first reachable
+    vision backend (CLI binary present / Gemini key present)."""
+    old = vc.vision_backend_available
+    vc.vision_backend_available = lambda m: True  # pretend everything reachable
+    try:
+        assert vc.select_vision_backend(["codex", "gemini"]) == "codex"
+        assert vc.select_vision_backend(["oc:fireworks/qwen2-vl", "codex"]) == "oc:fireworks/qwen2-vl"
+    finally:
+        vc.vision_backend_available = old
+    assert vc.select_vision_backend([]) is None
+
+
+# === Gemini: the ONE REST-key exception (CLI broken) =============================
+def test_gemini_stays_rest_key_and_honors_env_model():
+    """Gemini's vision call goes over the REST API key (its CLI is broken), honoring
+    $GEMINI_MODEL exactly like review_gemini. urlopen + key faked — NO real network."""
     import os
     import urllib.request
 
@@ -203,6 +512,7 @@ def test_gemini_honors_env_model_and_uppercases_schema():
 
     def fake_urlopen(req, timeout=None):
         captured["url"] = req.full_url
+        captured["headers"] = {k.lower(): v for k, v in req.headers.items()}
         return _FakeResp()
 
     old_open = urllib.request.urlopen
@@ -212,13 +522,13 @@ def test_gemini_honors_env_model_and_uppercases_schema():
     backends._gemini_key = lambda: "fake-key"
     os.environ["GEMINI_MODEL"] = "gemini-3.0-pro"
     try:
-        # Uppercased schema type:
         body = vc.build_gemini_request("sys", _blocks(), vc.build_output_schema())
         assert body["generationConfig"]["response_schema"]["type"] == "OBJECT"
-        # Env-model honored on a bare `gemini` backend:
         v = vc.call_ai_vision("gemini", blocks=_blocks())
         assert v.verdict == "keep"
         assert "gemini-3.0-pro:generateContent" in captured["url"], captured.get("url")
+        # REST key path: x-goog-api-key header present (NOT a CLI invocation).
+        assert captured["headers"].get("x-goog-api-key") == "fake-key"
     finally:
         urllib.request.urlopen = old_open
         backends._gemini_key = old_key
@@ -228,196 +538,58 @@ def test_gemini_honors_env_model_and_uppercases_schema():
             os.environ["GEMINI_MODEL"] = old_env
 
 
-def test_parse_structured_malformed_list_fields_fail_closed():
-    """A schema-invalid scalar where a list is expected (`defects: 1`) must NOT crash
-    the parse (codex P2) — it degrades to an empty list."""
-    v = vc.parse_structured({"verdict": "keep", "confidence": 0.9, "defects": 1, "observed_change_regions": "nope"})
-    assert v.verdict == "keep"
-    assert v.defects == []
-    assert v.observed_change_regions == []
-
-
-def test_capability_gating_and_selection():
-    # codex resolves to a vision-capable backend in the table.
-    cap = vc.capability_for("codex")
-    assert cap is not None and cap.vision
-    # select_vision_backend returns None when no model resolves to a reachable vision
-    # backend (empty list → None, the fail-closed path).
-    assert vc.select_vision_backend([]) is None
-
-
-def test_stage2_direct_providers_live_dispatch_wired():
-    """Stage 2: the three DIRECT REST providers (anthropic/openai/gemini) are live now,
-    not only Gemini. opencode is an arbitrary-provider ROUTER with no single REST
-    endpoint, so it stays vision-incapable (the selector must never mis-route an
-    oc:fireworks/… model to api.openai.com) — codex P2."""
-    for route in ("claude", "gemini", "codex"):
-        cap = vc._CAPABILITIES[route]
-        assert cap.vision and cap.live_dispatch is True, f"{route} live dispatch must be wired in Stage 2"
-    oc = vc._CAPABILITIES["opencode"]
-    assert oc.vision is False and oc.live_dispatch is False, "opencode must NOT be a live REST vision backend"
-    assert vc.capability_for("oc:fireworks/llama") is None, "opencode models are not vision-routable"
-
-
-def test_selection_picks_first_available_vision_backend():
-    """Stage 2: with all providers wired, the selector picks the FIRST requested model
-    that is vision-capable AND reachable (key/binary present)."""
-    old = vc.vision_backend_available
-    vc.vision_backend_available = lambda m: True  # pretend everything is reachable
-    try:
-        assert vc.select_vision_backend(["codex", "gemini"]) == "codex"
-        assert vc.select_vision_backend(["claude:opus", "gemini"]) == "claude:opus"
-    finally:
-        vc.vision_backend_available = old
-    # Empty list → None (fail-closed).
-    assert vc.select_vision_backend([]) is None
-
-
-def test_anthropic_live_dispatch_sends_image_and_parses(monkeypatch=None):
-    """The Anthropic live path must POST a base64 image block to the Messages API and
-    parse the tool_use structured verdict. urlopen + key are faked — NO real API."""
-    import urllib.request
-
+def test_gemini_unreachable_without_key():
+    """No Gemini key → available=False (fail-closed → unverified), never a crash."""
     import reviewlib.backends as backends
 
-    captured = {}
-
-    class _FakeResp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            # Anthropic Messages tool_use response shape.
-            return (
-                b'{"content":[{"type":"tool_use","name":"report_verdict",'
-                b'"input":{"verdict":"keep","confidence":0.92,"selection_present":true}}]}'
-            )
-
-    def fake_urlopen(req, timeout=None):
-        captured["url"] = req.full_url
-        captured["headers"] = {k.lower(): v for k, v in req.headers.items()}
-        captured["body"] = json.loads(req.data.decode("utf-8"))
-        return _FakeResp()
-
-    old_open = urllib.request.urlopen
-    old_key = backends._anthropic_key
-    urllib.request.urlopen = fake_urlopen
-    backends._anthropic_key = lambda: "fake-anthropic-key"
-    try:
-        v = vc.call_ai_vision(
-            "claude:claude-fable-5",
-            blocks=_blocks(),
-            output_schema=vc.build_output_schema(["selection_present"]),
-        )
-    finally:
-        urllib.request.urlopen = old_open
-        backends._anthropic_key = old_key
-
-    assert "api.anthropic.com" in captured["url"], captured.get("url")
-    # The request carries a real base64 image block.
-    content = captured["body"]["messages"][0]["content"]
-    imgs = [c for c in content if c.get("type") == "image"]
-    assert imgs and imgs[0]["source"]["data"] == _IMG, "no base64 image block sent"
-    # Forced structured output via the report_verdict tool.
-    assert captured["body"]["tool_choice"]["name"] == "report_verdict"
-    # Parsed structured verdict.
-    assert v.available and v.verdict == "keep" and v.confidence == 0.92
-    assert v.module_answers.get("selection_present") is True
-    assert v.backend == "claude:claude-fable-5"
-
-
-def test_openai_live_dispatch_sends_image_url_and_parses():
-    """The OpenAI live path must POST an image_url data-URI to chat/completions and
-    parse the json_schema structured verdict. urlopen + key faked — NO real API."""
-    import urllib.request
-
-    import reviewlib.backends as backends
-
-    captured = {}
-
-    class _FakeResp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return (
-                b'{"choices":[{"message":{"content":'
-                b'"{\\"verdict\\":\\"rollback\\",\\"confidence\\":0.8}"}}]}'
-            )
-
-    def fake_urlopen(req, timeout=None):
-        captured["url"] = req.full_url
-        captured["headers"] = {k.lower(): v for k, v in req.headers.items()}
-        captured["body"] = json.loads(req.data.decode("utf-8"))
-        return _FakeResp()
-
-    old_open = urllib.request.urlopen
-    old_key = backends._openai_key
-    urllib.request.urlopen = fake_urlopen
-    backends._openai_key = lambda: "fake-openai-key"
-    try:
-        v = vc.call_ai_vision("codex", blocks=_blocks(), output_schema=vc.build_output_schema())
-    finally:
-        urllib.request.urlopen = old_open
-        backends._openai_key = old_key
-
-    assert "api.openai.com" in captured["url"], captured.get("url")
-    assert captured["headers"].get("authorization") == "Bearer fake-openai-key"
-    # The request carries an image_url data-URI.
-    content = captured["body"]["messages"][1]["content"]
-    urls = [c for c in content if c.get("type") == "image_url"]
-    assert urls and urls[0]["image_url"]["url"].startswith("data:image/png;base64,")
-    # Forced structured output (json_schema strict).
-    assert captured["body"]["response_format"]["type"] == "json_schema"
-    # Parsed verdict.
-    assert v.available and v.verdict == "rollback" and v.confidence == 0.8
-
-
-def test_anthropic_dispatch_fails_closed_without_key():
-    """No Anthropic key → available=False (fail-closed → unverified), never a crash."""
-    import reviewlib.backends as backends
-
-    old = backends._anthropic_key
+    old = backends._gemini_key
 
     def _raise():
-        raise RuntimeError("ANTHROPIC_API_KEY not found")
+        raise RuntimeError("GEMINI_API_KEY not found")
 
-    backends._anthropic_key = _raise
+    backends._gemini_key = _raise
     try:
-        v = vc.call_ai_vision("claude:opus", blocks=_blocks())
+        assert vc.vision_backend_available("gemini") is False
+        v = vc.call_ai_vision("gemini", blocks=_blocks())
     finally:
-        backends._anthropic_key = old
+        backends._gemini_key = old
     assert v.available is False and v.verdict is None
 
 
-def test_openai_http_error_fails_closed():
-    """An OpenAI HTTP error must yield available=True/verdict=None (policy fails closed
-    to human_review), never crash."""
-    import urllib.error
-    import urllib.request
+def test_gemini_request_shape_unchanged():
+    """Gemini request shape (inline_data image part + sanitized response_schema) is
+    unchanged — it is still the REST exception."""
+    schema = vc.build_output_schema()
+    body = vc.build_gemini_request("sys", _blocks(), schema)
+    parts = body["contents"][0]["parts"]
+    img = [p for p in parts if "inline_data" in p]
+    assert img and img[0]["inline_data"]["mime_type"] == "image/png"
+    assert img[0]["inline_data"]["data"] == _IMG
+    rs = body["generationConfig"]["response_schema"]
+    assert rs["properties"]["verdict"]["enum"] == list(vc.VISION_VERDICTS)
+    assert "additionalProperties" not in rs
+    assert "maxLength" not in rs["properties"]["note"]
 
-    import reviewlib.backends as backends
 
-    def fake_urlopen(req, timeout=None):
-        raise urllib.error.HTTPError(req.full_url, 429, "rate limited", {}, None)
+def test_before_after_labels_emitted_in_cli_prompt():
+    """A before/after pair must be captioned in the CLI prompt so the model knows which is
+    the baseline (the images are attached as files; the labels go in the text)."""
+    schema = vc.build_output_schema()
+    prompt = vc._prompt_text(_before_after_blocks(), schema)
+    assert "BEFORE image" in prompt and "AFTER image" in prompt
 
-    old_open = urllib.request.urlopen
-    old_key = backends._openai_key
-    urllib.request.urlopen = fake_urlopen
-    backends._openai_key = lambda: "k"
-    try:
-        v = vc.call_ai_vision("codex", blocks=_blocks())
-    finally:
-        urllib.request.urlopen = old_open
-        backends._openai_key = old_key
-    assert v.available is True and v.verdict is None
-    assert "429" in (v.error or "")
+
+def test_stage_images_writes_real_files_with_right_suffix():
+    """Image staging decodes the base64 blocks to temp files with the correct extension
+    so the CLI's content sniffing picks the media type."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        jpg_block = vc.VisionBlock(kind="image", label="after", media_type="image/jpeg", data_base64=_IMG)
+        paths = vc._stage_images([vc.VisionBlock(kind="text", text="x"), jpg_block], Path(d))
+        assert len(paths) == 1
+        assert paths[0].suffix == ".jpg"
+        assert paths[0].read_bytes() == _IMG_BYTES
 
 
 if __name__ == "__main__":
