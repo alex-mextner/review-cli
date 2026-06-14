@@ -184,6 +184,32 @@ def test_compute_stats_against_fixtures():
         assert stats["by_mode"]["brainstorm"] == 1
 
 
+def test_footerless_clean_log_is_running_not_success():
+    """(codex P2) A footerless, error-free log = a call still streaming or whose writer
+    died before the EXIT footer. It must NOT be counted as a success: completed is False,
+    it lands in running_calls, and success_rate is computed over COMPLETED calls only."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # An in-flight call: header + partial body, NO EXIT footer, no error markers.
+        running = _write_call_log(ld, "20260601T100000_000000", "codex", 0,
+                                  "still working on the review...\n", exit_code=None)
+        c = p.parse_call_log(running)
+        assert c.exit_code is None
+        assert c.completed is False, "a footerless clean log is not finished"
+        assert c.has_error is False, "and it is not (yet) an error either"
+        # One finished OK call alongside it, so we can check the rate denominator.
+        _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "looks good\n", exit_code=0)
+        stats = p.compute_stats(p.load_sessions(ld, gap_seconds=90))
+        assert stats["call_count"] == 2
+        assert stats["running_calls"] == 1, stats
+        assert stats["ok_calls"] == 1, stats
+        assert stats["error_calls"] == 0, stats
+        # 1 ok / (1 ok + 0 error) = 1.0 — the running call does not drag the rate.
+        assert stats["success_rate"] == 1.0, stats
+
+
 def test_empty_log_dir_is_graceful():
     from reviewlib.dashboard import parser as p
 

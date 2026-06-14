@@ -211,6 +211,7 @@ PANELS.metrics = () => {
     <tr><td>OK calls</td><td>${esc(s.ok_calls)}</td></tr>
     <tr><td>Error calls</td><td>${esc(s.error_calls)}</td></tr>
     <tr><td>Timeout calls</td><td>${esc(s.timeout_calls)}</td></tr>
+    <tr><td>Running / unknown</td><td>${esc(s.running_calls != null ? s.running_calls : 0)}</td></tr>
     <tr><td>Success rate</td><td>${s.success_rate != null ? Math.round(s.success_rate * 100) + '%' : '—'}</td></tr>
     <tr><td>Duration min</td><td>${fmtDur(d.min)}</td></tr>
     <tr><td>Duration p50</td><td>${fmtDur(d.p50)}</td></tr>

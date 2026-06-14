@@ -119,6 +119,19 @@ class CallLog:
         return self.mtime
 
     @property
+    def completed(self) -> bool:
+        """Did this call FINISH (so its success/failure is known)?
+
+        Every writer stamps a terminal `EXIT {code}` footer (and a timeout also gets the
+        marker). A log with NEITHER an exit code NOR a timeout marker is NOT finished — it
+        is either a long call still streaming, or a call whose writer died before the footer
+        (e.g. a Popen / E2BIG failure). Such a log must NOT be counted as a success (codex
+        P2); it is `running`/unknown. (A truncated old log with a body error marker is still
+        surfaced as an error by has_error — only the clean, footerless case is `running`.)
+        """
+        return self.exit_code is not None or self.timed_out or bool(self.stderr_lines) or _looks_like_error(self.body)
+
+    @property
     def has_error(self) -> bool:
         """Did this call FAIL?
 
@@ -131,6 +144,8 @@ class CallLog:
         truncated before the footer can still carry the TIMEOUT marker — honor it either
         way). Only when NO explicit code was recorded do we fall back to the legacy
         heuristic (stderr present / error-marker grep) so pre-footer logs still surface.
+        A clean footerless log is neither an error NOR a success — it is `running` (see
+        `completed`); has_error stays False there but stats must not bucket it as OK.
         """
         if self.timed_out:
             return True
@@ -576,6 +591,7 @@ def compute_stats(sessions: list[Session]) -> dict:
     error_calls = 0
     timeout_calls = 0
     ok_calls = 0
+    running_calls = 0
     for s in sessions:
         by_mode[s.mode] = by_mode.get(s.mode, 0) + 1
         by_day[s.started.date().isoformat()] = by_day.get(s.started.date().isoformat(), 0) + 1
@@ -590,7 +606,12 @@ def compute_stats(sessions: list[Session]) -> dict:
                 durations.append(d)
             if c.timed_out:
                 timeout_calls += 1
-            if c.has_error:
+            if not c.completed:
+                # A footerless, error-free log = a call still streaming or whose writer died
+                # before the footer. It is neither success nor failure — don't inflate the
+                # OK count (codex P2); track it separately so success_rate stays honest.
+                running_calls += 1
+            elif c.has_error:
                 error_calls += 1
             else:
                 ok_calls += 1
@@ -607,7 +628,10 @@ def compute_stats(sessions: list[Session]) -> dict:
         "ok_calls": ok_calls,
         "error_calls": error_calls,
         "timeout_calls": timeout_calls,
-        "success_rate": round(ok_calls / call_total, 4) if call_total else None,
+        "running_calls": running_calls,
+        # success_rate is over COMPLETED calls only (ok + error) — an in-flight / aborted
+        # footerless call has no known outcome and must not drag the rate either way.
+        "success_rate": round(ok_calls / (ok_calls + error_calls), 4) if (ok_calls + error_calls) else None,
         "by_mode": by_mode,
         "by_model": by_model,
         "by_role": by_role,
