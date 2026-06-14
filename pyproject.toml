@@ -34,5 +34,8 @@ include = ["reviewlib*"]
 
 # The dashboard ships a vanilla-JS SPA (no npm build); its HTML/JS/CSS assets must land in
 # the wheel alongside the package so `review dashboard` can serve them from an installed copy.
+# The spec-web frontend (HTML/CSS/JS) is likewise served by the stdlib HTTP server (not
+# importable Python), so packages.find alone would drop it — ship it as package data too.
 [tool.setuptools.package-data]
 "reviewlib.dashboard" = ["assets/*.html", "assets/*.js", "assets/*.css"]
+"reviewlib.specweb" = ["static/*.html", "static/*.css", "static/*.js"]

@@ -1,0 +1,24 @@
+{
+  "comments": [
+    {
+      "quote": "uniquely-selectable sentence about the cascade winner",
+      "body": "Which DOM candidate wins the cascade here?",
+      "section_id": "1-overview",
+      "section_title": "1. Overview",
+      "author": "alex",
+      "status": "submitted",
+      "batch": "2026-06-14T10:00:00+00:00",
+      "replies": [
+        { "author": "claude", "body": "The off-screen probe answers that — see the color-probe section." }
+      ]
+    },
+    {
+      "quote": "this quote does not exist in the spec anywhere at all",
+      "body": "This one cannot re-anchor and should appear as unanchored in the sidebar.",
+      "section_id": "3-open-questions",
+      "section_title": "3. Open questions",
+      "author": "alex",
+      "status": "pending"
+    }
+  ]
+}
