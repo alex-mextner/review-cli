@@ -16,6 +16,77 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Registry of LIVE backend subprocesses, so the run backstop (reviewlib.backstop) can
+# reap them before its hard `os._exit`. Each backend child is started in its OWN session
+# (`start_new_session=True`), so it is NOT in the CLI's process group and survives a plain
+# process exit; without this registry a backstop fire would orphan a hung/expensive
+# backend and fail to actually bound the work (codex P2). `_run_streamed` registers its
+# `(proc, pgid)` while the child is alive and unregisters in its `finally`; the backstop
+# drains the registry and `_kill_tree`s each. Holds ONLY backend children's own session
+# groups — never the CLI's group or its caller's — so draining it can't take down the
+# caller. Lock-guarded because backends run in parallel panel threads.
+_LIVE_CHILDREN_LOCK = threading.Lock()
+_LIVE_CHILDREN: set[tuple[subprocess.Popen, int | None]] = set()
+
+
+def _register_child(proc: subprocess.Popen, pgid: int | None) -> tuple[subprocess.Popen, int | None]:
+    """Track a live backend child so the backstop can reap it. Returns the handle to
+    pass back to `_unregister_child` in a finally."""
+    handle = (proc, pgid)
+    with _LIVE_CHILDREN_LOCK:
+        _LIVE_CHILDREN.add(handle)
+    return handle
+
+
+def _unregister_child(handle: tuple[subprocess.Popen, int | None]) -> None:
+    """Drop a child from the live registry once its own cleanup has run (idempotent)."""
+    with _LIVE_CHILDREN_LOCK:
+        _LIVE_CHILDREN.discard(handle)
+
+
+def _reregister_child(
+    old: tuple[subprocess.Popen, int | None], proc: subprocess.Popen, pgid: int | None
+) -> tuple[subprocess.Popen, int | None]:
+    """Swap a child handle (e.g. once its pgid is known) WITHOUT ever leaving the child
+    unregistered. Add the new handle BEFORE discarding the old, both under one lock hold,
+    so a concurrent `kill_live_children` snapshot always sees at least one handle for this
+    proc — never a gap in which a backstop fire could orphan it."""
+    new = (proc, pgid)
+    with _LIVE_CHILDREN_LOCK:
+        _LIVE_CHILDREN.add(new)
+        _LIVE_CHILDREN.discard(old)
+    return new
+
+
+def kill_live_children() -> None:
+    """Reap every still-registered backend child's process group. Best-effort, never
+    raises — called from the backstop's `_fire` right before its hard exit so a wedged
+    run's backend subprocesses don't outlive the force-terminated CLI. Each child is in
+    its own session, so this kills the backends WITHOUT touching the CLI's/caller's
+    group.
+
+    KILL-FIRST, never blocking. Unlike `_kill_tree` (the per-call path, which politely
+    SIGTERMs then waits up to 3s before SIGKILL — the right etiquette for a normal
+    timeout), this last-resort path sends SIGKILL straight away to EVERY child group with
+    NO wait in between. That is deliberate: the backstop's deadman force-exits the process
+    after a short grace, so a per-child `proc.wait(timeout=3)` here could be preempted
+    before later children are reached or before SIGKILL even lands, leaving a wedged
+    backend alive (codex P2). SIGKILL is uncatchable, so no grace is needed anyway — the
+    whole reap is a handful of non-blocking signals that complete in microseconds and
+    cannot be preempted."""
+    with _LIVE_CHILDREN_LOCK:
+        snapshot = list(_LIVE_CHILDREN)
+    for proc, pgid in snapshot:
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        except Exception:  # noqa: BLE001 — best-effort; reaping must never block the exit
+            pass
+
 
 def _run(
     argv: list[str],
@@ -218,6 +289,7 @@ def _run_streamed(
     timed_out = False
     proc: subprocess.Popen | None = None
     pgid: int | None = None
+    child_handle: tuple[subprocess.Popen, int | None] | None = None
     # Last char written to the log, so the trailing `EXIT {code}` footer can be put on
     # its own line even when the subprocess flushed stdout without a trailing newline
     # (codex P2: an unanchored footer is unparsable). The header ends with "\n".
@@ -245,6 +317,11 @@ def _run_streamed(
             start_new_session=True,  # own process group, so we can kill the whole tree
         )
         running = proc  # non-None alias for the nested closures
+        # Register IMMEDIATELY — before resolving the pgid — so a backstop fire can never
+        # orphan a just-Popen'd backend in the window before `os.getpgid` returns. At this
+        # instant the child has no descendants yet, so the pgid=None handle (which reaps
+        # via `proc.kill()` on its own pid) is sufficient cover for that window.
+        child_handle = _register_child(proc, None)
         # Capture the group id NOW, while the child is alive. We need it later even
         # after the direct child is reaped, because a grandchild in the same group
         # may still be holding the stdout pipe open.
@@ -252,6 +329,12 @@ def _run_streamed(
             pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, OSError):
             pgid = None
+        # Once the pgid is known, swap to a group-bearing handle so a later reap kills the
+        # WHOLE tree (grandchildren included), not just the direct child. The swap is
+        # gap-free (`_reregister_child` adds before it discards), so the child is reapable
+        # throughout. Unregistered in the finally, after the normal `_kill_tree` cleanup.
+        if pgid is not None:
+            child_handle = _reregister_child(child_handle, proc, pgid)
 
         def _feed_stdin() -> None:
             if input_text is None or running.stdin is None:
@@ -395,5 +478,9 @@ def _run_streamed(
         stopping.set()
         if proc is not None:
             _kill_tree(proc, pgid)
+        # Drop from the backstop's live-children registry: this child's own cleanup just
+        # ran, so the backstop must not try to re-reap a (possibly recycled) pid.
+        if child_handle is not None:
+            _unregister_child(child_handle)
         with log_lock:
             log_fh.close()

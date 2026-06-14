@@ -7,11 +7,58 @@ from __future__ import annotations
 
 import concurrent.futures
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 from .backends import ReviewResult, backend_available, resolve_backend
 from .config import MODERATOR_CANDIDATES, BoardReviewer
+
+# Optional per-call success/fail tally for the run-stats record. The CLI installs a
+# collector (`begin_call_tally`) before a run and reads it after, so every mode that
+# funnels its backend calls through `run_panel` / `run_single` / `run_moderator`
+# contributes real per-call counts WITHOUT changing any mode's signature. None means
+# "no run is being tallied" (the default — e.g. tests calling run_panel directly), so
+# the hook is a zero-cost no-op outside a CLI-driven run.
+_TALLY_LOCK = threading.Lock()
+_call_tally: dict[str, int] | None = None
+# When True, run_panel's auto-tally is suppressed: run_moderator owns the count for its
+# candidate loop and tallies exactly ONE outcome with the moderator success criterion
+# (rc 0 AND non-empty stdout), so an empty-but-rc0 candidate the mode REJECTS is not
+# miscounted as ok and failed fallbacks aren't over-counted (codex P2).
+_suppress_autotally = False
+
+
+def begin_call_tally() -> None:
+    """Start counting per-call ok/fail for the current run. CLI-only; idempotent."""
+    global _call_tally
+    with _TALLY_LOCK:
+        _call_tally = {"ok": 0, "fail": 0}
+
+
+def end_call_tally() -> dict[str, int]:
+    """Stop counting and return ``{"ok": n, "fail": n}`` for the run just finished."""
+    global _call_tally
+    with _TALLY_LOCK:
+        tally = _call_tally or {"ok": 0, "fail": 0}
+        _call_tally = None
+        return dict(tally)
+
+
+def _tally_ok(success: bool) -> None:
+    """Record one call outcome against the active tally (no-op outside a CLI run)."""
+    with _TALLY_LOCK:
+        if _call_tally is None:
+            return
+        _call_tally["ok" if success else "fail"] += 1
+
+
+def _tally_result(returncode: int) -> None:
+    """Auto-tally a panel call by exit code, unless suppressed (moderator path)."""
+    with _TALLY_LOCK:
+        if _call_tally is None or _suppress_autotally:
+            return
+        _call_tally["ok" if returncode == 0 else "fail"] += 1
 
 
 def format_result(result: ReviewResult) -> str:
@@ -70,6 +117,26 @@ def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, d
     """
     if isinstance(candidates, str):  # tolerate a single-model string from older callers
         candidates = [candidates]
+
+    # A moderator turn is ONE logical call in the run-stats, no matter how many
+    # candidates it falls through. Suppress run_panel's per-candidate auto-tally and
+    # tally exactly one outcome below, judged by the SAME success criterion this
+    # function uses (rc 0 AND non-empty output) — so an empty-but-rc0 candidate the
+    # mode rejects is counted as a fail, not an ok (codex P2).
+    global _suppress_autotally
+    with _TALLY_LOCK:
+        prev_suppress = _suppress_autotally
+        _suppress_autotally = True
+    try:
+        result = _run_moderator_inner(candidates, prompt, cwd, timeout, diff, round_no)
+    finally:
+        with _TALLY_LOCK:
+            _suppress_autotally = prev_suppress
+    _tally_ok(result.returncode == 0 and bool(result.stdout.strip()))
+    return result
+
+
+def _run_moderator_inner(candidates: list[str], prompt: str, cwd: Path, timeout: int, diff: str, round_no: int = 0) -> ReviewResult:
     last: ReviewResult | None = None
     for index, model in enumerate(candidates):
         result = run_single(model, prompt, cwd, timeout, diff=diff, round_no=round_no)
@@ -163,6 +230,7 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
                 )
             except Exception as exc:  # noqa: BLE001 - report, never crash the panel
                 results[index] = ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc))
+            _tally_result(results[index].returncode)
     return [r for r in results if r is not None]
 
 

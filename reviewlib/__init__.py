@@ -52,13 +52,37 @@ from .config import (
 )
 from .panel import (
     PanelJob,
+    begin_call_tally,
     build_board_jobs,
+    end_call_tally,
     format_result,
     pick_moderator,
     run_panel,
     run_single,
 )
-from .process import _kill_tree, _open_log, _run, _run_streamed, log_dir, write_sidecar_log
+from .backstop import (
+    BACKSTOP_EXIT_CODE,
+    MAX_BACKSTOP_SECONDS,
+    backstop_seconds,
+    run_backstop,
+)
+from .process import (
+    _kill_tree,
+    _open_log,
+    _run,
+    _run_streamed,
+    kill_live_children,
+    log_dir,
+    write_sidecar_log,
+)
+from .stats import (
+    announce_eta,
+    estimate_eta,
+    eta_line,
+    fmt_duration,
+    record_run,
+    stats_path,
+)
 
 __all__ = [
     "subprocess",
@@ -90,7 +114,20 @@ __all__ = [
     "pick_moderator",
     "run_panel",
     "run_single",
+    "begin_call_tally",
+    "end_call_tally",
     "build_board_jobs",
+    "record_run",
+    "estimate_eta",
+    "eta_line",
+    "announce_eta",
+    "fmt_duration",
+    "stats_path",
+    "run_backstop",
+    "backstop_seconds",
+    "kill_live_children",
+    "MAX_BACKSTOP_SECONDS",
+    "BACKSTOP_EXIT_CODE",
     "load_config",
     "load_board",
     "_split_models",

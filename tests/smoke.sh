@@ -4,6 +4,11 @@ set -euo pipefail
 # Guarded smoke test: no API keys or backends required. Only --help, --list-defaults,
 # and a syntax check, so CI stays green without secrets.
 
+# Redirect the run-stats store to a throwaway temp file for the WHOLE suite, so no
+# test that invokes the real CLI (e.g. the --visual fan-out) appends to the user's
+# real ~/.config/review-cli/run-stats.jsonl. Exported so every child python3 sees it.
+export REVIEW_STATS_FILE="$(mktemp -d)/run-stats.jsonl"
+
 bin/review --list-defaults | grep -q codex
 bin/review --help >/dev/null
 
@@ -89,6 +94,20 @@ echo "provider-keys tests OK"
 # offline (backends monkeypatched / forced unavailable; no keys, no network).
 python3 tests/test_reviewer_board.py
 echo "reviewer-board tests OK"
+
+# Run-stats store + startup ETA: record shape (mode/pool/duration/ok/fail), the
+# (mode,pool_size) -> pool-only -> no-history ETA fallbacks, real wall-clock on a
+# CLI run, and the no-timeout advertising warning. All offline (backends stubbed;
+# store + log dir redirected to temp; no keys, no network).
+REVIEW_LOG_DIR="$(mktemp -d)" python3 tests/test_run_stats.py
+echo "run-stats tests OK"
+
+# Internal run backstop: the clamped 4h ceiling (env can only LOWER it), the watchdog
+# cancelling on a fast block, an ACTUAL fire (exit 124 + loud line) for a wedged run
+# in a child process, and main() arming the backstop around dispatch. All offline (no
+# backend, no network — the wedged-run children just sleep).
+python3 tests/test_backstop.py
+echo "backstop tests OK"
 
 # Stage 1 visual-verification suite (cvGate / vision_client / policy / pipeline /
 # composability). All offline: cvGate shells to magick, the vision call is mocked,

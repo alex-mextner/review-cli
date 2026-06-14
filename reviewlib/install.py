@@ -36,6 +36,38 @@ metadata:
 
 Runs your git diff (or a question/topic) across several model backends in parallel.
 
+## NEVER wrap `review` in a short timeout — it takes MINUTES
+`review`, `review --quorum`, and `review --brainstorm` are multi-model and/or
+multi-round: they fan out to several model backends in parallel, and the panel
+modes run several rounds plus a final moderator synthesis. A plain diff review of a
+full board is typically a few minutes; a `--brainstorm` is commonly 10–20 minutes
+(min 5 / max 8 rounds + a final synthesis pass). Wrapping the command in
+`timeout 60` / `timeout 300` (or any short cap) KILLS the run before it finishes —
+a brainstorm only emits its synthesis at the very end, so a short timeout produces
+NOTHING usable, not a partial result. So:
+
+- Do NOT put `review` behind a short shell `timeout`, and do NOT set a short
+  per-call deadline expecting a quick return. Let it run.
+- At dispatch, `review` prints a one-line ETA to stderr for YOUR pool size and
+  mode, e.g. `[review] pool=4 (brainstorm) — typically ~6m12s based on 12 past
+  runs of this size; do NOT timeout.` Read that line and wait at least that long.
+  With no history yet it still warns it's multi-round and to expect minutes.
+- Use NO external timeout at all — not even a generous one. You do NOT need to bound
+  `review` yourself: it carries its own internal <=4h backstop (next section), so just
+  let it run (background it and poll if you want progress). Any external cap only risks
+  killing a good run before its synthesis and adds nothing the backstop doesn't already
+  guarantee.
+
+## No external timeout — `review` carries its OWN internal <=4h backstop
+Do NOT put ANY external timeout on `review`. It is designed to run unbounded from
+the outside; the ONLY time bound is an INTERNAL last-resort backstop of <=4h that the
+binary arms itself (a watchdog that force-terminates a genuinely wedged run with exit
+124). So a healthy run never needs an external cap — it finishes in minutes, far under
+the ceiling — and a stuck run can't run forever either. An external `timeout` only
+ever does harm here: it kills good runs before their synthesis and adds nothing the
+internal backstop doesn't already guarantee. `$REVIEW_BACKSTOP_SECONDS` can only LOWER
+the internal ceiling, never raise it past 4h.
+
 ## Invocation
 ```
 review -C <repo>             # review current unstaged diff across default models
@@ -112,7 +144,11 @@ SKILL_BLURB = (
     "`review` — multi-model read-only code review + AI panels "
     "(codex/claude/gemini/opencode): `review -C <repo>` (diff), "
     "`review -C <repo> --quorum \"Q\"`, `review -C <repo> --brainstorm \"topic\"`. "
-    "Always pass -C <project-root>. Use before commits and for hard decisions."
+    "Always pass -C <project-root>. Use before commits and for hard decisions. "
+    "NEVER wrap it in a short timeout — it is multi-model / multi-round and takes "
+    "MINUTES (brainstorm 10–20m); it prints the expected duration for your pool "
+    "size at startup, so wait for that, don't short-timeout it. Use NO external "
+    "timeout at all — review carries its own internal <=4h backstop."
 )
 
 _HOOK_MARKER = "# agent-tools-awareness"

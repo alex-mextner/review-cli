@@ -8,3 +8,7 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# uv writes a lockfile when the suite is run via `uv run` (the CI / dev path is
+# pip + `.[test]`, not uv), so the lock is a local artifact — never commit it.
+uv.lock
