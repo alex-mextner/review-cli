@@ -182,18 +182,32 @@ def _display_name(model: str) -> str:
     return tail.rsplit("/", 1)[-1]
 
 
+class BoardConfigError(ValueError):
+    """A `board:` key was present and non-empty in config.yaml but contained NO
+    usable reviewer (every entry malformed). Raised instead of silently falling
+    back to the paid DEFAULT_BOARD — a user who deliberately configured a board
+    must get a clear error, not an unexpected 8-model paid run (cost-safety)."""
+
+
 def load_board(config: dict | None = None) -> list[BoardReviewer]:
     """Resolve the active reviewer board.
 
     A `board:` key in config.yaml (a list of `{model, role[, name]}` mappings)
-    overrides the built-in DEFAULT_BOARD. Validation never crashes the run:
-      * a non-list / empty `board:`  -> fall back to DEFAULT_BOARD;
+    overrides the built-in DEFAULT_BOARD. Validation degrades gracefully but is
+    cost-safe — it never silently substitutes the paid default board for a board
+    the user explicitly configured:
+      * an ABSENT / non-list / empty `board:`  -> fall back to DEFAULT_BOARD
+        (no preference expressed, the default is intended);
+      * a PRESENT non-empty `board:` with SOME valid entries -> keep the valid
+        ones; each bad entry is skipped with a warning;
       * an entry without a usable `model` -> skipped with a warning;
       * an unknown `role` -> kept, but the reviewer uses the generic prompt
-        (role_lens == "") and a warning is logged — the board degrades, it does
-        not abort.
-    With no `board:` configured at all, returns DEFAULT_BOARD (zero regression:
-    the caller decides whether to use the board or the legacy models list)."""
+        (role_lens == "") and a warning is logged — the board degrades;
+      * a PRESENT non-empty `board:` whose entries are ALL malformed (no usable
+        reviewer survives) -> raise BoardConfigError. This is NOT a silent
+        fall-back to DEFAULT_BOARD: the user asked for a specific board and got
+        nothing parseable, so erroring loudly beats secretly running the paid
+        8-model panel."""
     config = load_config() if config is None else config
     raw = config.get("board")
     if not isinstance(raw, list) or not raw:
@@ -219,7 +233,16 @@ def load_board(config: dict | None = None) -> list[BoardReviewer]:
         name = entry.get("name")
         display = name.strip() if isinstance(name, str) and name.strip() else _display_name(model)
         board.append(BoardReviewer(model=model, role=role, display=display))
-    return board or list(DEFAULT_BOARD)
+    if not board:
+        # `board:` was present and non-empty but nothing parsed. Do NOT fall back
+        # to the paid DEFAULT_BOARD — error loudly so the user fixes the config.
+        raise BoardConfigError(
+            f"config.yaml `board:` has {len(raw)} entr"
+            f"{'y' if len(raw) == 1 else 'ies'} but none is usable (every entry "
+            "is malformed — not a mapping, or missing a 'model'). Fix the board "
+            "entries, or remove the `board:` key to use the default reviewer board."
+        )
+    return board
 
 
 def _split_models(raw: list[str]) -> list[str]:

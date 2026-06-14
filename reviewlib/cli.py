@@ -19,6 +19,7 @@ from .config import (
     DEFAULT_MODELS,
     DEFAULT_PROMPT,
     PANEL_TIMEOUT_DEFAULT,
+    BoardConfigError,
     _expand_alias,
     _split_models,
     load_board,
@@ -139,9 +140,17 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config()
 
+    # `models:` from config, stripped + alias-expanded + blanks dropped (same rule as
+    # _split_models for -m). An "effectively empty" list — absent, or only
+    # blank/whitespace entries — is NOT a real preference: it must NOT count as a
+    # configured models list (else it would disable the board AND feed blank model
+    # names to the panel). Computed up-front so --list-defaults reports the SAME
+    # effective, normalized list the review path actually uses.
+    config_models = _split_models(config.get("models") or [])
+
     if args.list_defaults:
-        effective = config.get("models") or DEFAULT_MODELS
-        print("\n".join(_expand_alias(m) for m in effective))
+        effective = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        print("\n".join(effective))
         return 0
 
     if args.show_board:
@@ -155,16 +164,48 @@ def main(argv: list[str] | None = None) -> int:
     if explicit_models:
         models = explicit_models
     elif args.brainstorm is not None:
-        src = config.get("brainstorm_models") or config.get("models") or DEFAULT_MODELS
-        models = [m for m in (_expand_alias(x) for x in src) if backends.backend_available(m)]
+        src = _split_models(config.get("brainstorm_models") or []) or config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        models = [m for m in src if backends.backend_available(m)]
         if not models:
-            models = [_expand_alias(x) for x in (config.get("models") or DEFAULT_MODELS)]
+            models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
     else:
-        models = [_expand_alias(x) for x in (config.get("models") or DEFAULT_MODELS)]
+        models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
 
     panel_mode = args.just_ask or args.quorum or args.brainstorm
     visual_mode = args.visual is not None
     timeout = args.timeout if args.timeout is not None else (PANEL_TIMEOUT_DEFAULT if panel_mode else 1200)
+
+    # Reviewer board (HYP-741): the default plain-review panel assigns each model its
+    # own role/lens. Precedence is COST-SAFETY first — the paid 8-model board runs only
+    # when the user expressed NO model preference at all:
+    #   explicit -m  >  explicit `models:` in config.yaml  >  default board.
+    # So a configured `models:` gets exactly those (the flat panel), NOT the paid board;
+    # --no-board also forces the flat path. The board applies only on the DEFAULT diff
+    # review (no panel mode) with neither -m nor config models. `use_board` is a cheap
+    # boolean gate computed now; the actual load_board + cost-safety validation runs
+    # LATER (validate_board, below) — after the standalone-visual path has had its chance
+    # to short-circuit, so a malformed `board:` never blocks the board-unrelated
+    # standalone `review --visual` pipeline (codex P2). It still fires BEFORE the COMPANION
+    # visual fan-out, so a doomed config never spends a paid vision call.
+    has_config_models = bool(config_models)  # filtered above: blanks-only counts as none
+    use_board = not panel_mode and not explicit_models and not has_config_models and not args.no_board
+    board: list | None = None
+    board_validated = False
+
+    def validate_board() -> int | None:
+        """Resolve + validate the reviewer board for the default review path, once.
+        Returns an exit code (2) on an all-malformed `board:` config, else None. No-op
+        when the board does not apply (panel mode / -m / config models / --no-board)."""
+        nonlocal board, board_validated
+        if board_validated or not use_board:
+            return None
+        board_validated = True
+        try:
+            board = load_board(config)
+        except BoardConfigError as exc:
+            print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
+            return 2
+        return None
 
     # Panel modes are interactive and long-running, so announce each streamed
     # backend's live-log path to stderr; the plain review path stays quiet.
@@ -221,6 +262,13 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         # COMPANION: a mode (or the default diff-review) runs WITH the image as context.
+        # Validate the board BEFORE the (potentially paid) vision fan-out so an
+        # all-malformed `board:` fails fast and never spends a vision call on a config
+        # that is going to error anyway (codex P2). Standalone visual already returned
+        # above, so this never touches the board-unrelated standalone path.
+        rc = validate_board()
+        if rc is not None:
+            return rc
         # Stage 2: the image is delivered to a vision model (the per-mode fan-out) unless
         # --no-ai, and the grounded observation is folded into the mode prompt.
         visual_ctx = build_mode_visual_context(
@@ -256,14 +304,12 @@ def main(argv: list[str] | None = None) -> int:
             pick_moderators(args.moderator, models), args.rounds, args.max_rounds
         )
 
-    # Reviewer board (HYP-741): the default plain-review panel assigns each model
-    # its own role/lens. It is the DEFAULT when the user did not pin explicit -m
-    # models and did not pass --no-board; an explicit -m always wins (the user
-    # picked exact models, honor them as the legacy flat panel). --visual companion
-    # context still folds into the per-reviewer prompt via args.prompt.
-    board = None
-    if not explicit_models and not args.no_board:
-        board = load_board(config)
+    # Default plain review. Validate the board now if it wasn't already (the no-visual
+    # path); an all-malformed `board:` exits 2 before the panel runs. The --visual
+    # companion context folds into each per-reviewer prompt via args.prompt.
+    rc = validate_board()
+    if rc is not None:
+        return rc
     return mode_review(
         models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout, args.staged, board=board,
     )
@@ -274,7 +320,11 @@ def _show_board(config: dict) -> int:
     and whether its backend is currently available (key/CLI present). Sourced from
     config.yaml `board:` if set, else the built-in DEFAULT_BOARD. Read-only — no
     model is called, no key is printed."""
-    board = load_board(config)
+    try:
+        board = load_board(config)
+    except BoardConfigError as exc:
+        print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
+        return 2
     source = "config.yaml (board:)" if isinstance(config.get("board"), list) and config.get("board") else "default"
     print(f"Reviewer board ({len(board)} seats, source: {source}):\n")
     name_w = max((len(r.display) for r in board), default=0)

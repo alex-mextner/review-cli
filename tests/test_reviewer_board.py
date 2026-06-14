@@ -31,6 +31,7 @@ from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.config import (  # noqa: E402
     DEFAULT_BOARD,
     REVIEW_ROLES,
+    BoardConfigError,
     BoardReviewer,
     load_board,
 )
@@ -147,6 +148,45 @@ def test_role_omitted_is_general_with_generic_prompt():
     board = load_board({"board": [{"model": "codex"}]})
     assert board[0].role == ""
     assert board[0].role_lens == ""
+
+
+# === cost-safety: PRESENT-but-all-malformed `board:` ERRORS (does not silently
+# fall back to the paid DEFAULT_BOARD). Absent -> default; partial -> keep valid. ==
+def test_present_board_all_malformed_raises_not_silent_default():
+    """A non-empty `board:` whose entries are ALL malformed must ERROR, NOT
+    silently run the paid 8-model DEFAULT_BOARD."""
+    cfgs = [
+        {"board": ["not-a-mapping", "still-not"]},   # no mappings at all
+        {"board": [{"role": "correctness"}, {"role": "security"}]},  # all missing model
+        {"board": [{"model": "   "}, {"model": ""}]},  # all blank models
+        {"board": [{"model": 42}, "x", {"no": "model"}]},  # mixed garbage, none usable
+    ]
+    for cfg in cfgs:
+        try:
+            load_board(cfg)
+        except BoardConfigError:
+            pass  # expected
+        else:
+            raise AssertionError(f"expected BoardConfigError for {cfg!r}")
+
+
+def test_absent_board_key_uses_default_not_error():
+    """Absent `board:` -> DEFAULT_BOARD (no error): no preference was expressed."""
+    assert [r.model for r in load_board({})] == [r.model for r in DEFAULT_BOARD]
+    # An explicitly empty list is "no preference" too -> default, not an error.
+    assert [r.model for r in load_board({"board": []})] == [r.model for r in DEFAULT_BOARD]
+
+
+def test_partial_malformed_board_keeps_valid_entries_no_error():
+    """SOME valid + SOME malformed -> keep the valid ones, warn on bad (no error)."""
+    cfg = {"board": [
+        "not-a-mapping",
+        {"role": "correctness"},          # missing model -> skipped
+        {"model": "codex", "role": "correctness"},   # valid
+        {"model": "gemini", "role": "security"},     # valid
+    ]}
+    board = load_board(cfg)
+    assert [r.model for r in board] == ["codex", "gemini"], [r.model for r in board]
 
 
 # === role-lens injection into PanelJobs =========================================
@@ -320,6 +360,183 @@ def test_cli_explicit_models_disable_board():
         sys.stdin = old_stdin
 
 
+def test_cli_config_models_beat_board():
+    """An explicit `models:` in config.yaml OVERRIDES the default board: the user
+    configured exact models, so the paid board must NOT run (cost-safety). The
+    precedence is explicit -m > config `models:` > default board."""
+    from reviewlib import cli
+
+    captured: dict = {}
+
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None):
+        captured["models"] = models
+        captured["board"] = board
+        return 0
+
+    old = cli.mode_review
+    cli.mode_review = _fake_mode_review
+    # Inject a config with an explicit `models:` list (and a `board:` too, to prove
+    # the board is ignored when models: is configured). load_board must NOT be hit.
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {"models": ["codex", "gemini"], "board": list(DEFAULT_BOARD)}
+    old_load_board = cli.load_board
+
+    def _boom(_cfg):
+        raise AssertionError("load_board must not be called when config models: is set")
+
+    cli.load_board = _boom
+    old_stdin = sys.stdin
+    try:
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        cli.main(["-C", str(REPO_ROOT)])
+        assert captured["board"] is None, captured["board"]
+        # The configured models flow through (alias-expanded, here identity).
+        assert captured["models"] == ["codex", "gemini"], captured["models"]
+    finally:
+        cli.mode_review = old
+        cli.load_config = old_load_config
+        cli.load_board = old_load_board
+        sys.stdin = old_stdin
+
+
+def test_cli_empty_config_models_does_not_disable_board():
+    """An "effectively empty" `models:` — absent, [], or only blank/whitespace
+    entries — is NOT a real preference, so it must NOT disable the board NOR feed
+    blank model names to the panel (codex P2). The board still runs in every case."""
+    from reviewlib import cli
+
+    for empty_models in ([], ["", "  ", "\t"]):
+        captured: dict = {}
+
+        def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None):
+            captured["board"] = board
+            captured["models"] = models
+            return 0
+
+        old = cli.mode_review
+        cli.mode_review = _fake_mode_review
+        old_load_config = cli.load_config
+        cli.load_config = lambda em=empty_models: {"models": em}
+        old_load_board = cli.load_board
+        cli.load_board = lambda _cfg: list(DEFAULT_BOARD)
+        old_stdin = sys.stdin
+        try:
+            os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+            import io
+
+            sys.stdin = io.StringIO("+added line\n")
+            cli.main(["-C", str(REPO_ROOT)])
+            assert captured["board"] is not None, f"{empty_models!r} must not disable the board"
+            # And no blank model name leaked into the (unused) flat models list.
+            assert all(m.strip() for m in captured["models"]), captured["models"]
+        finally:
+            cli.mode_review = old
+            cli.load_config = old_load_config
+            cli.load_board = old_load_board
+            sys.stdin = old_stdin
+
+
+def test_cli_all_malformed_board_errors_nonzero():
+    """A present-but-all-malformed `board:` makes the CLI exit non-zero with a
+    message, not silently run the paid default board."""
+    from reviewlib import cli
+
+    called = {"mode_review": False}
+
+    def _fake_mode_review(*_a, **_k):
+        called["mode_review"] = True
+        return 0
+
+    old = cli.mode_review
+    cli.mode_review = _fake_mode_review
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {"board": ["not-a-mapping", {"role": "x"}]}
+    old_stdin = sys.stdin
+    try:
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        rc = cli.main(["-C", str(REPO_ROOT)])
+        assert rc != 0, rc
+        assert called["mode_review"] is False, "must not run the panel on a bad board"
+    finally:
+        cli.mode_review = old
+        cli.load_config = old_load_config
+        sys.stdin = old_stdin
+
+
+def test_cli_standalone_visual_ignores_malformed_board():
+    """(codex P2) Standalone `review --visual image` (no diff) does NOT use the reviewer
+    board, so a present-but-malformed `board:` must NOT block it — board validation runs
+    only on the board path, after the standalone pipeline has had its chance."""
+    from reviewlib import cli
+    import reviewlib.features.visual.visual_cli as visual_cli
+
+    reached = {"standalone": False}
+
+    def _fake_standalone(*_a, **_k):
+        reached["standalone"] = True
+        return 0
+
+    old_standalone = visual_cli.run_visual_standalone
+    visual_cli.run_visual_standalone = _fake_standalone
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {"board": ["not-a-mapping"]}  # malformed board, irrelevant here
+    old_stdin = sys.stdin
+    try:
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        import io
+
+        # No piped diff and the cwd is not inside a diff-producing repo path we control;
+        # _git_diff degrades to "" for --visual, so this routes to the standalone pipeline.
+        sys.stdin = io.StringIO("")
+        rc = cli.main(["--visual", "/tmp/does-not-exist-zzz.png", "-C", "/tmp"])
+        assert rc == 0, rc
+        assert reached["standalone"] is True, "standalone visual must run despite the malformed board"
+    finally:
+        visual_cli.run_visual_standalone = old_standalone
+        cli.load_config = old_load_config
+        sys.stdin = old_stdin
+
+
+def test_cli_all_malformed_board_fails_before_visual_fanout():
+    """(codex P2) On the default-review path, an all-malformed `board:` must error
+    BEFORE the --visual fan-out, so a doomed config never spends a paid vision call."""
+    from reviewlib import cli
+    import reviewlib.features.visual.compose as compose
+
+    fanout_calls = {"n": 0}
+
+    def _fake_build(*_a, **_k):
+        fanout_calls["n"] += 1
+        raise AssertionError("visual fan-out must not run when the board config is invalid")
+
+    old_mode_review = cli.mode_review
+    cli.mode_review = lambda *_a, **_k: 0
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {"board": ["not-a-mapping"]}
+    old_build = compose.build_mode_visual_context
+    compose.build_mode_visual_context = _fake_build
+    old_stdin = sys.stdin
+    try:
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        rc = cli.main(["--visual", "/tmp/does-not-exist-zzz.png", "-C", str(REPO_ROOT)])
+        assert rc == 2, rc
+        assert fanout_calls["n"] == 0, "fan-out ran before the board was validated"
+    finally:
+        cli.mode_review = old_mode_review
+        cli.load_config = old_load_config
+        compose.build_mode_visual_context = old_build
+        sys.stdin = old_stdin
+
+
 def test_cli_default_path_activates_board():
     """No -m, no --no-board -> the board is passed into mode_review."""
     from reviewlib import cli
@@ -332,10 +549,14 @@ def test_cli_default_path_activates_board():
 
     old = cli.mode_review
     cli.mode_review = _fake_mode_review
-    # Pin the board to DEFAULT_BOARD so the test is independent of the dev
-    # machine's ~/.config/review-cli/config.yaml.
+    # Pin the board to DEFAULT_BOARD AND stub load_config to an empty dict so the
+    # test is independent of the dev machine's ~/.config/review-cli/config.yaml —
+    # which DOES set `models:`, and a configured `models:` now (correctly) disables
+    # the board. The true default path has neither -m nor config models nor board.
     old_load_board = cli.load_board
     cli.load_board = lambda _cfg: list(DEFAULT_BOARD)
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {}
     old_stdin = sys.stdin
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -348,7 +569,50 @@ def test_cli_default_path_activates_board():
     finally:
         cli.mode_review = old
         cli.load_board = old_load_board
+        cli.load_config = old_load_config
         sys.stdin = old_stdin
+
+
+def test_cli_list_defaults_reports_normalized_config_models(capfd=None):
+    """(codex P3) `--list-defaults` must report the SAME normalized models the review
+    path uses: comma-joined entries split, blanks dropped, aliases expanded."""
+    import io
+    import contextlib
+
+    from reviewlib import cli
+
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {"models": ["codex, fable5", "  ", ""]}
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["--list-defaults"])
+        out = buf.getvalue().strip().splitlines()
+    finally:
+        cli.load_config = old_load_config
+    assert rc == 0, rc
+    # "codex, fable5" splits into two; blanks dropped; fable5 -> claude:claude-fable-5.
+    assert out == ["codex", "claude:claude-fable-5"], out
+
+
+def test_cli_list_defaults_empty_config_uses_code_defaults():
+    """An effectively-empty config `models:` -> --list-defaults shows the code DEFAULT_MODELS."""
+    import io
+    import contextlib
+
+    from reviewlib import cli
+    from reviewlib.config import DEFAULT_MODELS, _expand_alias
+
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {"models": ["", "  "]}
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.main(["--list-defaults"])
+        out = buf.getvalue().strip().splitlines()
+    finally:
+        cli.load_config = old_load_config
+    assert out == [_expand_alias(m) for m in DEFAULT_MODELS], out
 
 
 if __name__ == "__main__":

@@ -294,14 +294,25 @@ staged changes; bypass with `REVIEW_SKIP=1 git commit` or `git commit --no-verif
 
 ## Model backends
 
-| Specifier | What runs under the hood |
-|-----------|--------------------------|
-| `codex` / `codex:<model>` | `codex exec -s read-only --ephemeral` |
-| `claude` / `claude:<model>` | `claude-p --permission-mode plan --disallowedTools Edit Write Bash` |
-| `fable` / `fable5` | Alias for `claude:claude-fable-5` |
-| `gemini` / `gemini:<model>` | Gemini REST API (`gemini-2.5-flash` by default) |
-| `oc:<model>` / `opencode:<model>` | `opencode run --agent read-only-reviewer` in a temp repo |
-| anything else | Treated as an opencode model id |
+Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
+
+| Specifier | Transport | What runs under the hood |
+|-----------|-----------|--------------------------|
+| `codex` / `codex:<model>` | cli | `codex exec -s read-only --ephemeral` |
+| `claude` / `claude:<model>` | api \| cli | `claude-p` CLI, or the Anthropic-compatible Messages API |
+| `fable` / `fable5` | api \| cli | Alias for `claude:claude-fable-5` |
+| `gemini` / `gemini:<model>` | api | Gemini REST API (`gemini-2.5-flash` by default) |
+| `zai:<model>` / `glm` / `glm52` … | api | z.ai (GLM) OpenAI-compatible REST API — needs `ZAI_API_KEY` |
+| `commandcode:<model>` / `cc` | api | Command Code OpenAI-compatible Provider API — needs `COMMANDCODE_API_KEY` |
+| `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer` in a temp repo |
+| anything else | cli | Treated as an opencode model id |
+
+**Transport split.** codex and opencode are **cli-only** (no REST API). gemini, z.ai,
+and commandcode are **api-only** keyed HTTP backends (no CLI on PATH). claude supports
+**both** — `REVIEW_CLAUDE_MODE=api|cli` forces one, else it auto-picks (CLI if the
+binary is present, API when it isn't and a key is set). Each backend's mode can be
+forced with `REVIEW_<NAME>_MODE`; forcing an unsupported mode (e.g.
+`REVIEW_COMMANDCODE_MODE=cli`) is a hard error, never a silent fall-through.
 
 The opencode backend runs in a **temporary git repository** with the diff attached as
 `review.diff`. This keeps the source worktree out of reach — the model gets review
@@ -332,7 +343,8 @@ context without getting an edit target.
 Personal defaults live in `~/.config/review-cli/config.yaml`:
 
 ```yaml
-# Backends used by plain `review` and panel modes
+# Backends used by plain `review` and panel modes. Setting `models:` OVERRIDES the
+# default reviewer board (see "Board vs. models precedence") — you get exactly these.
 models:
   - codex
   - fable5
@@ -344,7 +356,8 @@ brainstorm_models:
   - fable5
 ```
 
-Run `review --list-defaults` to see the effective defaults after config is applied.
+Run `review --list-defaults` to see the effective (normalized) models after config is
+applied.
 
 Code defaults (when no config file exists): `codex`, `gemini`,
 `oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo`.
@@ -383,10 +396,29 @@ review --no-board     # disable the board; use the plain `models` list instead
 review -m codex -m gemini   # an explicit -m also bypasses the board (exact models)
 ```
 
-Override the board in `config.yaml` with a `board:` list — each entry is a
+### Board vs. models precedence
+
+The board is the default **only when you have not expressed a model preference**.
+Precedence (cost-safety first — the paid 8-model board never runs against your wishes):
+
+```
+explicit -m on the CLI   >   `models:` in config.yaml   >   default board
+```
+
+- A `models:` list in `config.yaml` **overrides the board**: you configured exact
+  models, so `review` runs exactly those (the flat panel), not the paid board.
+- `--no-board` forces the flat `models`/default list even with no `-m` and no `models:`.
+- The board runs only when there is **no** `-m`, **no** `models:`, and no `--no-board`.
+- An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
+  preference — the board still applies.
+
+Override the board itself in `config.yaml` with a `board:` list — each entry is a
 `{model, role}` mapping (optional `name:` for the label). An unknown `role` keeps
-the reviewer but falls back to the generic prompt (with a warning); a malformed
-entry is skipped. With no `board:` configured, the built-in 8-seat board above applies.
+the reviewer but falls back to the generic prompt (with a warning); a single malformed
+entry is skipped (the valid ones are kept). With **no** `board:` configured, the
+built-in 8-seat board above applies. A `board:` that is **present but has no usable
+entry at all** is a hard error (non-zero exit) — it never silently falls back to the
+paid default board.
 
 ```yaml
 board:
