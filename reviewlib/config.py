@@ -26,8 +26,12 @@ MODEL_ALIASES = {
     "glm46": "zai:glm-4.6",
     "glm45": "zai:glm-4.5",
     "glm": "zai:glm-4.6",
-    # common-code (commandcode / DeepSeek family) — OpenAI-compatible keyed HTTP.
-    "commoncode": "common-code",
+    # commandcode — Command Code's OpenAI-compatible Provider API (keyed HTTP).
+    # `cc` is a short hand; the legacy `commoncode`/`common-code` spellings still
+    # resolve via resolve_backend, so old configs keep working.
+    "commandcode": "commandcode",
+    "commoncode": "commandcode",
+    "cc": "commandcode",
 }
 CONFIG_PATH = Path.home() / ".config" / "review-cli" / "config.yaml"
 

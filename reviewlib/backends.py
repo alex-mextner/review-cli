@@ -162,7 +162,7 @@ def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
 
     Precedence is KEY-NAME-FIRST, not path-first: env var beats every file, and among
     the files the canonical/primary key name wins over an alias REGARDLESS of which
-    .env file each lives in. So `COMMON_CODE_API_KEY` in a later fallback file beats
+    .env file each lives in. So `COMMANDCODE_API_KEY` in a later fallback file beats
     `DEEPSEEK_API_KEY` in an earlier one — the precedence a caller reading the env-var
     order would expect. (A path-first loop would let an earlier file's alias shadow a
     later file's primary key, a surprising and non-deterministic ordering.)
@@ -231,12 +231,56 @@ def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
         return ReviewResult(model=model, command=f"Gemini API {gemini_model}", returncode=exc.code, stdout="", stderr=body_text)
 
 
-# --- OpenAI-compatible keyed HTTP backends (z.ai / common-code) -----------------
-# Both z.ai (Zhipu / GLM) and common-code expose an OpenAI-compatible
+# --- Backend transport mode (api | cli) ----------------------------------------
+# A backend can run as a REST `api` call, a `cli` subprocess, or both. The claude
+# backend (PR #8) established the selector: a per-backend `REVIEW_<NAME>_MODE` env
+# var forces one variant (else the backend auto-picks). This generalises that ONE
+# mechanism so every backend declares its supported modes and resolves the forced
+# mode the same way — no second, parallel selector. commandcode and z.ai are
+# api-only (no commandcode/z.ai CLI exists); claude supports both; codex/opencode
+# are cli-only. `resolve_backend_mode` is the single entry point: it reads
+# `REVIEW_<NAME>_MODE`, validates it against the backend's `supported` modes, and
+# returns the chosen mode (or `default` when unset). A forced mode the backend does
+# NOT support is a hard, explicit error — never a silent fall-through to the wrong
+# transport (e.g. forcing `cli` on commandcode must fail loudly, not POST anyway).
+
+
+def _mode_env_var(name: str) -> str:
+    """The env var that forces a backend's transport mode, e.g. commandcode ->
+    REVIEW_COMMANDCODE_MODE. Mirrors PR #8's REVIEW_CLAUDE_MODE naming so the
+    whole family is discoverable from one rule."""
+    sanitized = "".join(ch if ch.isalnum() else "_" for ch in name.upper())
+    return f"REVIEW_{sanitized}_MODE"
+
+
+def resolve_backend_mode(name: str, supported: tuple[str, ...], default: str) -> str:
+    """Resolve a backend's transport mode from REVIEW_<NAME>_MODE, validated against
+    `supported`. Returns the forced mode if set and supported, else `default`.
+
+    Raises RuntimeError on an explicitly-forced mode the backend does not support —
+    that is a user configuration error (e.g. REVIEW_COMMANDCODE_MODE=cli when no
+    commandcode CLI exists) and must surface loudly, not silently run the api path.
+    An empty/unset value selects `default` (the backend's own auto-pick)."""
+    forced = os.environ.get(_mode_env_var(name), "").strip().lower()
+    if not forced:
+        return default
+    if forced not in supported:
+        raise RuntimeError(
+            f"{_mode_env_var(name)}={forced!r} is not a supported mode for the "
+            f"'{name}' backend (supported: {', '.join(supported)})"
+        )
+    return forced
+
+
+# --- OpenAI-compatible keyed HTTP backends (z.ai / commandcode) -----------------
+# Both z.ai (Zhipu / GLM) and commandcode expose an OpenAI-compatible
 # /chat/completions API. Unlike review_gemini's bespoke `contents`/`parts` shape,
 # these speak the standard OpenAI request body ({"model", "messages":[{role,content}]}
 # + Authorization: Bearer). The two backends share one request builder so the wire
 # shape stays identical; only the endpoint, key, and default model differ.
+#
+# Both are API-ONLY: no z.ai or commandcode CLI exists on PATH, so a forced
+# `cli` mode is rejected by resolve_backend_mode rather than silently POSTing.
 
 
 def _parse_openai_choice(payload: object) -> str:
@@ -277,14 +321,14 @@ def _openai_compatible_request(
 ) -> ReviewResult:
     """POST an OpenAI-compatible chat/completions request and return a ReviewResult.
 
-    `model` is the REQUESTED backend string (e.g. `zai`, `common-code:deepseek-chat`)
+    `model` is the REQUESTED backend string (e.g. `zai`, `commandcode:deepseek/deepseek-v4-flash`)
     and is preserved in ReviewResult.model — mode_review keys results by the requested
     string, so substituting the resolved provider id here would KeyError. `api_model`
-    is the resolved provider model id sent on the wire (e.g. glm-4.6, deepseek-chat).
+    is the resolved provider model id sent on the wire (e.g. glm-4.6, deepseek/deepseek-v4-flash).
 
-    `extra_body` merges provider-specific request fields into the body (e.g. DeepSeek's
-    `thinking` toggle) while keeping the shared OpenAI wire shape generic — z.ai passes
-    None, common-code passes the non-thinking flag for the V4 default.
+    `extra_body` merges provider-specific request fields into the body while keeping the
+    shared OpenAI wire shape generic. Both current callers (z.ai, commandcode) pass None;
+    the hook stays for any future provider that needs a non-standard field.
 
     `base_url` is the endpoint root (e.g. https://api.z.ai/api/paas/v4); the
     /chat/completions suffix is appended here so callers pass the same value users
@@ -362,7 +406,16 @@ def _zai_key() -> str:
     raise RuntimeError("ZAI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
 
 
+ZAI_SUPPORTED_MODES = ("api",)  # z.ai is REST-only; no z.ai CLI exists.
+
+
 def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+    # api-only: a forced REVIEW_ZAI_MODE=cli is a config error, surfaced as a
+    # dead-backend result instead of silently running the api path.
+    try:
+        resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
+    except RuntimeError as exc:
+        return ReviewResult(model=model, command="z.ai", returncode=1, stdout="", stderr=str(exc))
     zai_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ZAI_MODEL", ZAI_DEFAULT_MODEL)
     base_url = os.environ.get("ZAI_BASE_URL", ZAI_DEFAULT_BASE_URL)
     key = _zai_key()
@@ -372,74 +425,66 @@ def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> R
     )
 
 
-# common-code — a keyed OpenAI-compatible HTTP API (commandcode / DeepSeek family).
-# No `common-code` CLI exists on PATH or in the user's config, and the closest match
-# is the OpenAI-compatible DeepSeek/commandcode API — so it is modelled as a keyed
-# HTTP backend (same wire shape as z.ai), NOT a CLI. The base URL + model default to
-# DeepSeek's OpenAI-compatible endpoint and are overridable via env so this is not
-# nailed to a single guess. See HYP-741.
-COMMON_CODE_DEFAULT_BASE_URL = "https://api.deepseek.com"
-# `deepseek-chat` is a LEGACY alias DeepSeek discontinues on 2026-07-24 (it currently
-# maps to the non-thinking mode of deepseek-v4-flash). Default to the live model id so
-# users picking the bare `common-code` backend don't silently break after that date.
-# Override with COMMON_CODE_MODEL. See DeepSeek API change log + HYP-741.
-COMMON_CODE_DEFAULT_MODEL = "deepseek-v4-flash"
+# commandcode — Command Code's OpenAI-compatible Provider API (API-only).
+# The CTO confirmed: "Command code cli нет, есть api key" — there is no commandcode
+# CLI, only an API key (format `user_...`). So commandcode is a keyed HTTP backend
+# (same OpenAI wire shape as z.ai), NOT a subprocess. Endpoint verified from the
+# Command Code Provider API docs (https://commandcode.ai/docs/provider-api):
+#   base  https://api.commandcode.ai/provider/v1
+#   POST  /chat/completions   (OpenAI/OSS models — what this backend speaks)
+#   POST  /messages           (Anthropic models — use review_claude_api instead)
+#   auth  Authorization: Bearer $COMMANDCODE_API_KEY   (the same CLI key)
+# On /chat/completions the model id is provider-prefixed (e.g. deepseek/deepseek-v4-
+# flash); a Claude id there 400s and is directed to /messages, so Anthropic models
+# must go through the claude backend (REVIEW_CLAUDE_MODE=api), not here.
+# Base URL + model are overridable via COMMANDCODE_BASE_URL / COMMANDCODE_MODEL.
+COMMANDCODE_DEFAULT_BASE_URL = "https://api.commandcode.ai/provider/v1"
+# Default to an OpenAI-shape (provider-prefixed) model the /chat/completions path
+# serves. DeepSeek V4 Flash is a cheap, capable default for diff review; override
+# with COMMANDCODE_MODEL or a `commandcode:<model>` suffix for anything else.
+COMMANDCODE_DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+COMMANDCODE_SUPPORTED_MODES = ("api",)  # API-only — no commandcode CLI exists.
+
+# NOTE (HYP-741): the earlier `common-code` placeholder injected DeepSeek's
+# `{"thinking":{"type":"disabled"}}` field to reproduce the legacy non-thinking
+# `deepseek-chat` default. That field is DeepSeek-API-specific and is NOT sent here:
+# the default transport is the Command Code GATEWAY (api.commandcode.ai), which need
+# not accept an unknown body field — sending it risks a 400. A user who points
+# COMMANDCODE_BASE_URL at the raw DeepSeek endpoint and wants the non-thinking mode
+# can pass it explicitly via the model id; we don't inject a provider-specific field
+# behind their back onto a gateway. `_openai_compatible_request`'s generic
+# `extra_body` hook stays available for any future provider that needs it.
 
 
-def _common_code_key() -> str:
-    key = _resolve_key(
-        ("COMMON_CODE_API_KEY", "COMMANDCODE_API_KEY", "DEEPSEEK_API_KEY"),
-        "COMMON_CODE_API_KEY",
-    )
+def _commandcode_key() -> str:
+    # ONLY COMMANDCODE_API_KEY. The key is a Command Code `user_...` token, NOT a
+    # DeepSeek key — accepting DEEPSEEK_API_KEY here would silently POST a DeepSeek
+    # credential to api.commandcode.ai (a different host), which both fails to auth
+    # AND leaks the key cross-provider. So no alias key names: the canonical name is
+    # the only one that resolves. (Codex P1, HYP-741.)
+    key = _resolve_key(("COMMANDCODE_API_KEY",), "COMMANDCODE_API_KEY")
     if key:
         return key
     raise RuntimeError(
-        "COMMON_CODE_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
+        "COMMANDCODE_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
     )
 
 
-def _deepseek_thinking_extra_body(api_model: str, *, is_default_model: bool, is_default_base_url: bool) -> dict | None:
-    """Pin thinking OFF, but ONLY on the BARE DeepSeek compatibility default path.
-
-    `deepseek-chat` (the old default) mapped to the NON-thinking mode of
-    deepseek-v4-flash; the V4 model ids default thinking ON, which would silently
-    change latency/cost/output for existing common-code users who never picked a model.
-    So for the BARE default — no `:` suffix, no COMMON_CODE_MODEL override, AND the
-    default DeepSeek base URL — we send `{"thinking": {"type": "disabled"}}` to keep it
-    a drop-in replacement.
-
-    Three guards, ALL required, so the DeepSeek-specific `thinking` field never leaks
-    onto an endpoint that can't read it (such a field can 400 a foreign gateway):
-      - is_default_model: an EXPLICIT model (`common-code:deepseek-v4-pro`, or
-        COMMON_CODE_MODEL=...) is the user's choice — respect its provider default.
-      - is_default_base_url: a COMMON_CODE_BASE_URL override points at a non-DeepSeek
-        gateway — never inject a DeepSeek field there.
-      - deepseek-v4* id: belt-and-suspenders on the model family."""
-    if is_default_model and is_default_base_url and api_model.startswith("deepseek-v4"):
-        return {"thinking": {"type": "disabled"}}
-    return None
-
-
-def review_common_code(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+    # API-only: a forced REVIEW_COMMANDCODE_MODE=cli is a config error (there is no
+    # commandcode CLI), surfaced as a dead-backend result, never a silent api POST.
+    try:
+        resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
+    except RuntimeError as exc:
+        return ReviewResult(model=model, command="commandcode", returncode=1, stdout="", stderr=str(exc))
     has_suffix = ":" in model
-    env_model = os.environ.get("COMMON_CODE_MODEL")
-    cc_model = model.split(":", 1)[1] if has_suffix else (env_model or COMMON_CODE_DEFAULT_MODEL)
-    # The default path is the bare backend with no explicit model anywhere — only then
-    # do we pin thinking off to preserve the prior deepseek-chat (non-thinking) default.
-    is_default_model = not has_suffix and not env_model
-    env_base_url = os.environ.get("COMMON_CODE_BASE_URL")
-    base_url = env_base_url or COMMON_CODE_DEFAULT_BASE_URL
-    # Compare the NORMALISED base URL to the default, not just "was it overridden":
-    # an explicit COMMON_CODE_BASE_URL=https://api.deepseek.com/ is still DeepSeek and
-    # must keep the non-thinking default. Only a genuinely different host suppresses it.
-    is_default_base_url = base_url.rstrip("/").lower() == COMMON_CODE_DEFAULT_BASE_URL.rstrip("/").lower()
-    key = _common_code_key()
+    env_model = os.environ.get("COMMANDCODE_MODEL")
+    cc_model = model.split(":", 1)[1] if has_suffix else (env_model or COMMANDCODE_DEFAULT_MODEL)
+    base_url = os.environ.get("COMMANDCODE_BASE_URL") or COMMANDCODE_DEFAULT_BASE_URL
+    key = _commandcode_key()
     return _openai_compatible_request(
-        model=model, api_model=cc_model, label="common-code", base_url=base_url, key=key,
+        model=model, api_model=cc_model, label="commandcode", base_url=base_url, key=key,
         prompt=prompt, diff=diff, timeout=timeout,
-        extra_body=_deepseek_thinking_extra_body(
-            cc_model, is_default_model=is_default_model, is_default_base_url=is_default_base_url,
-        ),
     )
 
 
@@ -723,11 +768,17 @@ def resolve_backend(model: str) -> Callable[[str, str, str, Path, int], ReviewRe
         or lowered.startswith(("zai:", "z.ai:", "glm:", "zhipu:"))
     ):
         return review_zai
-    # common-code (commandcode / DeepSeek family) — OpenAI-compatible keyed HTTP.
-    if lowered in ("common-code", "commoncode", "common_code") or lowered.startswith(
-        ("common-code:", "commoncode:", "common_code:")
+    # commandcode — Command Code's OpenAI-compatible Provider API (keyed HTTP).
+    # The legacy `common-code`/`common_code` spellings still route here as aliases so
+    # any pre-rename config keeps working.
+    if lowered in (
+        "commandcode", "command-code", "command_code",
+        "common-code", "commoncode", "common_code",
+    ) or lowered.startswith(
+        ("commandcode:", "command-code:", "command_code:",
+         "common-code:", "commoncode:", "common_code:")
     ):
-        return review_common_code
+        return review_commandcode
     # fable IS claude-p. Route any fable form to review_claude defensively, so an
     # unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
     # default (which would hit fireworks — the wrong provider entirely).
@@ -750,10 +801,17 @@ def backend_available(model: str) -> bool:
             _gemini_key()
             return True
         if backend is review_zai:
+            # Honor a forced mode: REVIEW_ZAI_MODE=cli makes review_zai a dead
+            # backend, so it must NOT report available (resolve_backend_mode raises
+            # on the unsupported mode → caught below → False). Codex P2.
+            resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
             _zai_key()
             return True
-        if backend is review_common_code:
-            _common_code_key()
+        if backend is review_commandcode:
+            # Same as z.ai: a forced REVIEW_COMMANDCODE_MODE=cli is unrunnable, so the
+            # probe must reflect that instead of selecting a backend that only fails.
+            resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
+            _commandcode_key()
             return True
         if backend is review_codex:
             _which("codex")

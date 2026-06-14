@@ -69,6 +69,33 @@ The `claude:` / opus backend runs two ways, so it works whether or not the
   API only when there's no binary but a key is set. Set `REVIEW_CLAUDE_MODE=api`
   to force the API even on a host that has the CLI.
 
+## Transport mode (api | cli) per backend
+Every backend declares which transports it supports and reads the SAME selector
+shape `REVIEW_<BACKEND>_MODE` (the one PR #8 introduced for claude):
+- **claude** — both `api` and `cli` (auto-picks; see above).
+- **codex / opencode** — `cli` only (agent CLIs that carry their own auth).
+- **z.ai, commandcode** — `api` only (no such CLI exists). Forcing `cli` on an
+  api-only backend (`REVIEW_COMMANDCODE_MODE=cli`) is a hard error, not a silent
+  fall-through to the API.
+
+## Keyed HTTP backends: z.ai (GLM) and commandcode
+OpenAI-compatible `POST /chat/completions` REST backends — no CLI, just a key:
+- **z.ai (Zhipu / GLM)**: `-m zai` / `-m glm` (or `-m glm46`/`-m glm45` for a pinned
+  GLM id; `-m zai:<model>` for an explicit one). Key: `ZAI_API_KEY` (or
+  `ZHIPU_API_KEY`). Base/model override: `ZAI_BASE_URL` / `ZAI_MODEL`
+  (default `https://api.z.ai/api/paas/v4`, `glm-4.6`).
+- **commandcode**: `-m commandcode` (alias `-m cc`; `-m commandcode:<model>` for an
+  explicit model). Hits Command Code's Provider API
+  (`https://api.commandcode.ai/provider/v1/chat/completions`). Key:
+  `COMMANDCODE_API_KEY` ONLY — a `user_...` token. (No alias key names: a DeepSeek key
+  is NOT a commandcode key, so accepting it would leak that credential to the wrong
+  host.) Base/model override: `COMMANDCODE_BASE_URL` / `COMMANDCODE_MODEL`
+  (default model `deepseek/deepseek-v4-flash`). NOTE: that endpoint serves OpenAI/OSS
+  models; Anthropic (Claude) models on Command Code go through the claude backend
+  (`REVIEW_CLAUDE_MODE=api`, `ANTHROPIC_BASE_URL=https://api.commandcode.ai/provider`).
+All three resolve their key from the env first, then the shared
+`~/.config/review-cli/.env` (the same file the gemini key uses).
+
 ## When to use
 - Before committing — sanity-check a diff across multiple models in parallel.
 - For a hard decision — `--quorum` (settle with cited evidence) or `--brainstorm`

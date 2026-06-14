@@ -4,12 +4,15 @@
 Covers the two new backends added to reviewlib.backends:
   * z.ai (Zhipu / GLM) — OpenAI-compatible /chat/completions, keyed via
     ZAI_API_KEY / ZHIPU_API_KEY.
-  * common-code (commandcode / DeepSeek family) — same OpenAI-compatible wire
-    shape, keyed via COMMON_CODE_API_KEY / COMMANDCODE_API_KEY / DEEPSEEK_API_KEY.
+  * commandcode — Command Code's OpenAI-compatible Provider API
+    (https://api.commandcode.ai/provider/v1/chat/completions), keyed via
+    COMMANDCODE_API_KEY ONLY (a `user_...` token; a DeepSeek/legacy key must NOT
+    resolve here — it would leak that credential to the wrong host).
 
 Proven here, all offline (urllib.request.urlopen faked — NO real network):
   (a) resolve_backend routes zai/glm/z.ai/zhipu + zai:<model> + glm: → review_zai,
-      and common-code/common_code + common-code:<model> → review_common_code;
+      and commandcode (+ legacy common-code/common_code) + commandcode:<model> →
+      review_commandcode;
   (b) the request body is the OpenAI shape ({"model","messages":[{role,content}]})
       with an Authorization: Bearer header — NOT the gemini contents/parts shape;
   (c) the key resolves from a temp .env via GEMINI_ENV_FILE (the shared
@@ -39,13 +42,15 @@ from reviewlib.config import _expand_alias  # noqa: E402
 _KEY_ENV_NAMES = (
     "ZAI_API_KEY",
     "ZHIPU_API_KEY",
-    "COMMON_CODE_API_KEY",
     "COMMANDCODE_API_KEY",
+    "COMMON_CODE_API_KEY",
     "DEEPSEEK_API_KEY",
     "ZAI_MODEL",
     "ZAI_BASE_URL",
-    "COMMON_CODE_MODEL",
-    "COMMON_CODE_BASE_URL",
+    "COMMANDCODE_MODEL",
+    "COMMANDCODE_BASE_URL",
+    "REVIEW_COMMANDCODE_MODE",
+    "REVIEW_ZAI_MODE",
     "GEMINI_ENV_FILE",
 )
 
@@ -109,11 +114,14 @@ def test_resolve_backend_routes_zai():
     assert backends.resolve_backend("zhipu:glm-4.6") is backends.review_zai
 
 
-def test_resolve_backend_routes_common_code():
-    for name in ("common-code", "common_code", "commoncode", "Common-Code"):
-        assert backends.resolve_backend(name) is backends.review_common_code, name
-    assert backends.resolve_backend("common-code:deepseek-coder") is backends.review_common_code
-    assert backends.resolve_backend("common_code:deepseek-chat") is backends.review_common_code
+def test_resolve_backend_routes_commandcode():
+    for name in ("commandcode", "command-code", "command_code", "CommandCode"):
+        assert backends.resolve_backend(name) is backends.review_commandcode, name
+    assert backends.resolve_backend("commandcode:deepseek/deepseek-coder") is backends.review_commandcode
+    # Legacy common-code spellings still resolve (back-compat alias on resolve_backend).
+    for legacy in ("common-code", "common_code", "commoncode", "Common-Code"):
+        assert backends.resolve_backend(legacy) is backends.review_commandcode, legacy
+    assert backends.resolve_backend("common-code:deepseek-coder") is backends.review_commandcode
 
 
 def test_existing_routes_unchanged():
@@ -130,7 +138,10 @@ def test_aliases_expand():
     assert _expand_alias("glm46") == "zai:glm-4.6"
     assert _expand_alias("glm45") == "zai:glm-4.5"
     assert _expand_alias("glm") == "zai:glm-4.6"
-    assert _expand_alias("commoncode") == "common-code"
+    # commandcode aliases (incl. the short `cc` and the legacy `commoncode`).
+    assert _expand_alias("commandcode") == "commandcode"
+    assert _expand_alias("commoncode") == "commandcode"
+    assert _expand_alias("cc") == "commandcode"
     # Pre-existing aliases survive.
     assert _expand_alias("fable5") == "claude:claude-fable-5"
 
@@ -225,7 +236,7 @@ def test_zai_result_model_is_requested_string_not_provider_id():
 
 
 def test_mode_review_keys_by_requested_model_without_keyerror():
-    """End-to-end (codex P1): the plain diff-review mode must format z.ai/common-code
+    """End-to-end (codex P1): the plain diff-review mode must format z.ai/commandcode
     results without KeyError — proves ReviewResult.model matches the request string."""
     from reviewlib.modes.review import mode_review
 
@@ -234,17 +245,17 @@ def test_mode_review_keys_by_requested_model_without_keyerror():
     urllib.request.urlopen = _fake_urlopen({}, payload)
     with _EnvSandbox():
         os.environ["ZAI_API_KEY"] = "k"
-        os.environ["DEEPSEEK_API_KEY"] = "k"
+        os.environ["COMMANDCODE_API_KEY"] = "k"
         try:
             # staged=False so it doesn't write a review stamp; returns 0 on success.
-            rc = mode_review(["zai", "common-code"], "review", "+added", REPO_ROOT, 10, False)
+            rc = mode_review(["zai", "commandcode"], "review", "+added", REPO_ROOT, 10, False)
         finally:
             urllib.request.urlopen = old_open
     assert rc == 0, rc
 
 
-# === common-code request shape ==================================================
-def test_common_code_request_is_openai_shape():
+# === commandcode request shape ==================================================
+def test_commandcode_request_is_openai_shape():
     captured: dict = {}
     payload = {
         "choices": [{"message": {"content": "cc says hi"}}],
@@ -253,62 +264,164 @@ def test_common_code_request_is_openai_shape():
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _fake_urlopen(captured, payload)
     with _EnvSandbox():
-        os.environ["COMMON_CODE_API_KEY"] = "cc-secret"
+        os.environ["COMMANDCODE_API_KEY"] = "cc-secret"
         try:
-            res = backends.review_common_code("common-code", "hello", "", REPO_ROOT, 30)
+            res = backends.review_commandcode("commandcode", "hello", "", REPO_ROOT, 30)
         finally:
             urllib.request.urlopen = old_open
-    assert captured["url"] == "https://api.deepseek.com/chat/completions", captured["url"]
+    # Default endpoint = the verified Command Code Provider API + /chat/completions.
+    assert captured["url"] == "https://api.commandcode.ai/provider/v1/chat/completions", captured["url"]
     body = captured["body"]
     assert "messages" in body and "contents" not in body
-    # Bare `common-code` → COMMON_CODE_DEFAULT_MODEL. `deepseek-chat` is a LEGACY alias
-    # DeepSeek discontinues on 2026-07-24; the default must be the live model id.
-    assert body["model"] == "deepseek-v4-flash", body
+    # Bare `commandcode` → COMMANDCODE_DEFAULT_MODEL (an OpenAI-shape, provider-prefixed id).
+    assert body["model"] == "deepseek/deepseek-v4-flash", body
     assert body["messages"][0]["content"] == "hello"
     assert captured["headers"].get("authorization") == "Bearer cc-secret"
+    # The default gateway path must NOT carry the raw-DeepSeek `thinking` field.
+    assert "thinking" not in body, body
     assert res.returncode == 0 and "cc says hi" in res.stdout
     assert "prompt_tokens=5 output_tokens=2" in res.stdout
 
 
-def test_common_code_base_url_and_model_override():
+def test_commandcode_key_is_not_a_deepseek_or_legacy_key():
+    """SECURITY (codex P1): commandcode must require COMMANDCODE_API_KEY ONLY. A
+    DEEPSEEK_API_KEY / legacy COMMON_CODE_API_KEY must NOT resolve here — otherwise a
+    DeepSeek credential would be POSTed to api.commandcode.ai (wrong host, key leak)."""
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen({}, payload)
+    with _EnvSandbox():
+        # Only the foreign/legacy names present → unavailable, must NOT auth.
+        os.environ["DEEPSEEK_API_KEY"] = "deepseek-secret"
+        os.environ["COMMON_CODE_API_KEY"] = "legacy-secret"
+        try:
+            assert backends.backend_available("commandcode") is False
+            raised = False
+            try:
+                backends._commandcode_key()
+            except RuntimeError:
+                raised = True
+            assert raised, "commandcode must not resolve a DeepSeek/legacy key"
+        finally:
+            urllib.request.urlopen = old_open
+
+
+def test_commandcode_base_url_and_model_override():
     captured: dict = {}
     payload = {"choices": [{"message": {"content": "x"}}], "usage": {}}
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _fake_urlopen(captured, payload)
     with _EnvSandbox():
-        os.environ["DEEPSEEK_API_KEY"] = "dk"  # third fallback key name resolves
-        os.environ["COMMON_CODE_BASE_URL"] = "https://example.test/v1"
-        os.environ["COMMON_CODE_MODEL"] = "deepseek-coder"
+        os.environ["COMMANDCODE_API_KEY"] = "user_secret"
+        os.environ["COMMANDCODE_BASE_URL"] = "https://example.test/v1"
+        os.environ["COMMANDCODE_MODEL"] = "deepseek/deepseek-coder"
         try:
-            backends.review_common_code("common-code", "q", "", REPO_ROOT, 10)
+            backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
     assert captured["url"] == "https://example.test/v1/chat/completions", captured["url"]
-    assert captured["body"]["model"] == "deepseek-coder"
+    assert captured["body"]["model"] == "deepseek/deepseek-coder"
 
 
-# === thinking-mode default preserves prior deepseek-chat (non-thinking) behaviour ===
-def test_common_code_default_pins_thinking_off():
-    """The bare `common-code` default (deepseek-v4-flash) must send thinking DISABLED,
-    so it stays a drop-in replacement for the old non-thinking `deepseek-chat` default
-    rather than silently switching cost/latency to thinking-on."""
+# === API-only mode contract (a forced cli mode is a hard error) =================
+def test_commandcode_forced_cli_mode_is_a_dead_backend_not_a_silent_post():
+    """REVIEW_COMMANDCODE_MODE=cli is a config error (no commandcode CLI exists). It
+    must surface as a non-zero ReviewResult and must NOT fall through to the api POST."""
+    posted = {"called": False}
+
+    def _should_not_be_called(req, timeout=None):  # pragma: no cover - asserted unreached
+        posted["called"] = True
+        raise AssertionError("api path POSTed despite a forced cli mode")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _should_not_be_called
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "k"
+        os.environ["REVIEW_COMMANDCODE_MODE"] = "cli"
+        try:
+            res = backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert posted["called"] is False
+    assert res.returncode == 1, res
+    assert "cli" in res.stderr and "commandcode" in res.stderr
+
+
+def test_commandcode_forced_api_mode_is_accepted():
+    """An explicit REVIEW_COMMANDCODE_MODE=api is the supported mode — it runs normally."""
     captured: dict = {}
     payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _fake_urlopen(captured, payload)
     with _EnvSandbox():
-        os.environ["COMMON_CODE_API_KEY"] = "k"
+        os.environ["COMMANDCODE_API_KEY"] = "k"
+        os.environ["REVIEW_COMMANDCODE_MODE"] = "api"
         try:
-            backends.review_common_code("common-code", "q", "", REPO_ROOT, 10)
+            res = backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
-    assert captured["body"]["model"] == "deepseek-v4-flash", captured["body"]
-    assert captured["body"].get("thinking") == {"type": "disabled"}, captured["body"]
+    assert res.returncode == 0, res
+    assert captured["url"].endswith("/chat/completions")
 
 
-def test_zai_does_not_send_deepseek_thinking_field():
-    """z.ai (GLM) shares the request builder but must NOT carry the DeepSeek-specific
-    `thinking` field — it would be a wire-shape leak into an unrelated provider."""
+def test_zai_forced_cli_mode_is_a_dead_backend():
+    """z.ai is api-only too: REVIEW_ZAI_MODE=cli must fail loudly, not POST."""
+    def _should_not_be_called(req, timeout=None):  # pragma: no cover - asserted unreached
+        raise AssertionError("api path POSTed despite a forced cli mode")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _should_not_be_called
+    with _EnvSandbox():
+        os.environ["ZAI_API_KEY"] = "k"
+        os.environ["REVIEW_ZAI_MODE"] = "cli"
+        try:
+            res = backends.review_zai("zai", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 1, res
+    assert "cli" in res.stderr
+
+
+def test_resolve_backend_mode_helper():
+    """The shared mode resolver: unset -> default, supported -> the forced value,
+    unsupported -> RuntimeError (used by the api-only guards above)."""
+    with _EnvSandbox():
+        assert backends.resolve_backend_mode("commandcode", ("api",), "api") == "api"
+        os.environ["REVIEW_COMMANDCODE_MODE"] = "api"
+        assert backends.resolve_backend_mode("commandcode", ("api",), "api") == "api"
+        os.environ["REVIEW_COMMANDCODE_MODE"] = "cli"
+        raised = False
+        try:
+            backends.resolve_backend_mode("commandcode", ("api",), "api")
+        except RuntimeError:
+            raised = True
+        assert raised
+        # A both-modes backend resolves either forced value.
+        os.environ["REVIEW_CLAUDE_MODE"] = "cli"
+        assert backends.resolve_backend_mode("claude", ("api", "cli"), "api") == "cli"
+
+
+# === thinking-mode default: only the RAW DeepSeek base injects `thinking` ========
+def test_commandcode_default_gateway_omits_thinking():
+    """The bare `commandcode` default goes through the Command Code gateway, which must
+    NOT receive the raw-DeepSeek `thinking` field (an unknown body field can 400 it)."""
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "k"
+        try:
+            backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured["body"]["model"] == "deepseek/deepseek-v4-flash", captured["body"]
+    assert "thinking" not in captured["body"], captured["body"]
+
+
+def test_zai_does_not_send_thinking_field():
+    """z.ai (GLM) shares the request builder but must NOT carry any extra body field —
+    the OpenAI wire shape stays generic (model + messages + stream only)."""
     captured: dict = {}
     payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
     old_open = urllib.request.urlopen
@@ -322,96 +435,34 @@ def test_zai_does_not_send_deepseek_thinking_field():
     assert "thinking" not in captured["body"], captured["body"]
 
 
-def test_common_code_non_deepseek_model_omits_thinking():
-    """Pointed at a non-DeepSeek OpenAI-compatible endpoint/model, common-code must not
-    inject the DeepSeek `thinking` field (the target wouldn't understand it)."""
-    captured: dict = {}
-    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
-    old_open = urllib.request.urlopen
-    urllib.request.urlopen = _fake_urlopen(captured, payload)
-    with _EnvSandbox():
-        os.environ["COMMON_CODE_API_KEY"] = "k"
-        os.environ["COMMON_CODE_BASE_URL"] = "https://example.test/v1"
-        os.environ["COMMON_CODE_MODEL"] = "some-other-model"
-        try:
-            backends.review_common_code("common-code", "q", "", REPO_ROOT, 10)
-        finally:
-            urllib.request.urlopen = old_open
-    assert "thinking" not in captured["body"], captured["body"]
-
-
-def test_common_code_explicit_v4_model_omits_thinking():
-    """An EXPLICIT V4 selection (`common-code:deepseek-v4-pro`, or COMMON_CODE_MODEL=...)
-    is the user asking for that exact model — its provider default (thinking ON) must be
-    respected. Only the BARE default path pins thinking off. So no thinking field here."""
-    # via :suffix
-    captured: dict = {}
-    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
-    old_open = urllib.request.urlopen
-    urllib.request.urlopen = _fake_urlopen(captured, payload)
-    with _EnvSandbox():
-        os.environ["COMMON_CODE_API_KEY"] = "k"
-        try:
-            backends.review_common_code("common-code:deepseek-v4-pro", "q", "", REPO_ROOT, 10)
-        finally:
-            urllib.request.urlopen = old_open
-    assert captured["body"]["model"] == "deepseek-v4-pro", captured["body"]
-    assert "thinking" not in captured["body"], captured["body"]
-    # via COMMON_CODE_MODEL override (still explicit, even if it names a V4 model).
-    captured2: dict = {}
-    urllib.request.urlopen = _fake_urlopen(captured2, payload)
-    with _EnvSandbox():
-        os.environ["COMMON_CODE_API_KEY"] = "k"
-        os.environ["COMMON_CODE_MODEL"] = "deepseek-v4-flash"
-        try:
-            backends.review_common_code("common-code", "q", "", REPO_ROOT, 10)
-        finally:
-            urllib.request.urlopen = old_open
-    assert "thinking" not in captured2["body"], captured2["body"]
-
-
-def test_common_code_base_url_override_omits_thinking_even_on_default_model():
-    """A COMMON_CODE_BASE_URL override with NO model override points the bare default at
-    a custom (non-DeepSeek) gateway. The DeepSeek-specific `thinking` field must NOT be
-    sent there — a foreign gateway can 400 on an unknown body field."""
-    captured: dict = {}
-    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
-    old_open = urllib.request.urlopen
-    urllib.request.urlopen = _fake_urlopen(captured, payload)
-    with _EnvSandbox():
-        os.environ["COMMON_CODE_API_KEY"] = "k"
-        os.environ["COMMON_CODE_BASE_URL"] = "https://some-openai-gateway.test/v1"
-        try:
-            backends.review_common_code("common-code", "q", "", REPO_ROOT, 10)
-        finally:
-            urllib.request.urlopen = old_open
-    # Bare default model is still resolved (deepseek-v4-flash) but NO thinking field.
-    assert captured["body"]["model"] == "deepseek-v4-flash", captured["body"]
-    assert "thinking" not in captured["body"], captured["body"]
-    assert captured["url"] == "https://some-openai-gateway.test/v1/chat/completions"
-
-
-def test_common_code_explicit_official_base_url_keeps_thinking_off():
-    """Setting COMMON_CODE_BASE_URL to the OFFICIAL DeepSeek URL (possibly with a
-    trailing slash) is still DeepSeek — the bare default must keep the non-thinking
-    flag. Only a genuinely different host suppresses it (normalised comparison)."""
-    for url in ("https://api.deepseek.com", "https://api.deepseek.com/", "https://API.DeepSeek.com"):
+def test_commandcode_never_injects_thinking_field():
+    """The commandcode backend speaks the generic OpenAI shape and never injects the
+    DeepSeek-specific `thinking` field — not on the default gateway, an explicit model,
+    nor a custom base URL. (The old `common-code` placeholder injected it; the real
+    Command Code gateway need not accept an unknown body field, so it is never sent.)"""
+    cases = (
+        {},  # bare default
+        {"COMMANDCODE_MODEL": "deepseek/deepseek-v4-pro"},  # explicit model
+        {"COMMANDCODE_BASE_URL": "https://api.deepseek.com"},  # raw DeepSeek base
+        {"COMMANDCODE_BASE_URL": "https://some-gateway.test/v1"},  # foreign gateway
+    )
+    for extra_env in cases:
         captured: dict = {}
         payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
         old_open = urllib.request.urlopen
         urllib.request.urlopen = _fake_urlopen(captured, payload)
         with _EnvSandbox():
-            os.environ["COMMON_CODE_API_KEY"] = "k"
-            os.environ["COMMON_CODE_BASE_URL"] = url
+            os.environ["COMMANDCODE_API_KEY"] = "k"
+            os.environ.update(extra_env)
             try:
-                backends.review_common_code("common-code", "q", "", REPO_ROOT, 10)
+                backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
             finally:
                 urllib.request.urlopen = old_open
-        assert captured["body"].get("thinking") == {"type": "disabled"}, (url, captured["body"])
+        assert "thinking" not in captured["body"], (extra_env, captured["body"])
 
 
 # === valid-but-wrong-shape JSON must not crash AND must fail-closed ==============
-def test_common_code_no_content_2xx_fails_closed():
+def test_commandcode_no_content_2xx_fails_closed():
     """A 2xx response with NO assistant content — whether wrong-shaped JSON
     (`{"choices":[null]}`, `usage` a list), an HTTP-200 error envelope, or an empty
     completion — must (a) NOT crash the type-guarded parse, and (b) map to a NON-zero
@@ -431,9 +482,9 @@ def test_common_code_no_content_2xx_fails_closed():
         old_open = urllib.request.urlopen
         urllib.request.urlopen = _fake_urlopen(captured, payload)
         with _EnvSandbox():
-            os.environ["COMMON_CODE_API_KEY"] = "k"
+            os.environ["COMMANDCODE_API_KEY"] = "k"
             try:
-                res = backends.review_common_code("common-code", "q", "", REPO_ROOT, 10)
+                res = backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
             finally:
                 urllib.request.urlopen = old_open
         assert res.returncode == 1, (payload, res)
@@ -441,7 +492,7 @@ def test_common_code_no_content_2xx_fails_closed():
         assert "no assistant content" in res.stderr, (payload, res.stderr)
 
 
-def test_common_code_usage_wrong_shape_does_not_crash_on_valid_content():
+def test_commandcode_usage_wrong_shape_does_not_crash_on_valid_content():
     """When there IS content but `usage` is the wrong type, the token parse must still
     degrade to 0/0 (rc=0, content preserved) rather than raising."""
     captured: dict = {}
@@ -449,9 +500,9 @@ def test_common_code_usage_wrong_shape_does_not_crash_on_valid_content():
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _fake_urlopen(captured, payload)
     with _EnvSandbox():
-        os.environ["COMMON_CODE_API_KEY"] = "k"
+        os.environ["COMMANDCODE_API_KEY"] = "k"
         try:
-            res = backends.review_common_code("common-code", "q", "", REPO_ROOT, 10)
+            res = backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
     assert res.returncode == 0, res
@@ -471,16 +522,16 @@ def test_zai_key_resolves_from_temp_env_file():
             assert backends._zai_key() == "from-env-file"
 
 
-def test_common_code_key_resolves_from_temp_env_file():
+def test_commandcode_key_resolves_from_temp_env_file():
     import tempfile
 
     with _EnvSandbox():
         with tempfile.TemporaryDirectory() as d:
             env_path = Path(d) / ".env"
-            # COMMANDCODE_API_KEY is one of the accepted fallback var names.
+            # COMMANDCODE_API_KEY is the primary fallback var name.
             env_path.write_text("COMMANDCODE_API_KEY=cc-from-file\n", encoding="utf-8")
             os.environ["GEMINI_ENV_FILE"] = str(env_path)
-            assert backends._common_code_key() == "cc-from-file"
+            assert backends._commandcode_key() == "cc-from-file"
 
 
 def test_env_var_takes_precedence_over_file():
@@ -499,22 +550,26 @@ def test_key_name_precedence_beats_file_order():
     """REGRESSION (codex P2): key-name precedence must be DETERMINISTIC across .env
     files. The canonical/primary key name (fallback_var) must win over an alias even
     when the alias lives in an EARLIER fallback file. A path-first loop would let the
-    earlier file's alias shadow the later file's primary key — surprising precedence."""
+    earlier file's alias shadow the later file's primary key — surprising precedence.
+
+    Exercised via z.ai (ZAI_API_KEY primary / ZHIPU_API_KEY alias) — commandcode now
+    has NO alias key names (codex P1: a foreign key must not resolve), so the multi-name
+    _resolve_key path is covered through the provider that legitimately has aliases."""
     import tempfile
 
     with _EnvSandbox():
         with tempfile.TemporaryDirectory() as d:
             early = Path(d) / "early.env"  # holds only an ALIAS key
             late = Path(d) / "late.env"  # holds the PRIMARY key
-            early.write_text("DEEPSEEK_API_KEY=alias-in-early-file\n", encoding="utf-8")
-            late.write_text("COMMON_CODE_API_KEY=primary-in-late-file\n", encoding="utf-8")
+            early.write_text("ZHIPU_API_KEY=alias-in-early-file\n", encoding="utf-8")
+            late.write_text("ZAI_API_KEY=primary-in-late-file\n", encoding="utf-8")
             old_fallbacks = backends.GEMINI_ENV_FALLBACKS
             backends.GEMINI_ENV_FALLBACKS = (early, late)
             os.environ.pop("GEMINI_ENV_FILE", None)  # use GEMINI_ENV_FALLBACKS, not override
             try:
-                # Primary name (COMMON_CODE_API_KEY) in the LATER file must beat the
-                # alias (DEEPSEEK_API_KEY) in the EARLIER file.
-                assert backends._common_code_key() == "primary-in-late-file"
+                # Primary name (ZAI_API_KEY) in the LATER file must beat the
+                # alias (ZHIPU_API_KEY) in the EARLIER file.
+                assert backends._zai_key() == "primary-in-late-file"
             finally:
                 backends.GEMINI_ENV_FALLBACKS = old_fallbacks
 
@@ -529,12 +584,12 @@ def test_alias_resolves_when_primary_absent():
             early = Path(d) / "early.env"
             late = Path(d) / "late.env"
             early.write_text("# nothing useful here\n", encoding="utf-8")
-            late.write_text("DEEPSEEK_API_KEY=only-alias\n", encoding="utf-8")
+            late.write_text("ZHIPU_API_KEY=only-alias\n", encoding="utf-8")
             old_fallbacks = backends.GEMINI_ENV_FALLBACKS
             backends.GEMINI_ENV_FALLBACKS = (early, late)
             os.environ.pop("GEMINI_ENV_FILE", None)
             try:
-                assert backends._common_code_key() == "only-alias"
+                assert backends._zai_key() == "only-alias"
             finally:
                 backends.GEMINI_ENV_FALLBACKS = old_fallbacks
 
@@ -550,12 +605,30 @@ def test_backend_available_reflects_zai_key():
         assert backends.backend_available("zai:glm-4.6") is True
 
 
-def test_backend_available_reflects_common_code_key():
+def test_backend_available_reflects_commandcode_key():
     with _EnvSandbox():
-        assert backends.backend_available("common-code") is False
-        os.environ["DEEPSEEK_API_KEY"] = "present"
+        assert backends.backend_available("commandcode") is False
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        assert backends.backend_available("commandcode") is True
+        assert backends.backend_available("commandcode:deepseek/deepseek-coder") is True
+        # The legacy model-name spelling routes to the same backend (key present).
         assert backends.backend_available("common-code") is True
-        assert backends.backend_available("common_code:deepseek-coder") is True
+
+
+def test_backend_available_false_for_forced_api_only_cli_mode():
+    """Codex P2: with REVIEW_COMMANDCODE_MODE=cli (an unrunnable forced mode), the
+    availability probe must report False so the moderator/brainstorm filter never
+    selects a backend that can only return a dead-backend result — even with a key."""
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        assert backends.backend_available("commandcode") is True
+        os.environ["REVIEW_COMMANDCODE_MODE"] = "cli"
+        assert backends.backend_available("commandcode") is False
+        # z.ai is api-only too: a forced cli mode makes it unavailable.
+        os.environ["ZAI_API_KEY"] = "k"
+        assert backends.backend_available("zai") is True
+        os.environ["REVIEW_ZAI_MODE"] = "cli"
+        assert backends.backend_available("zai") is False
 
 
 def test_zai_key_missing_raises():
@@ -612,7 +685,7 @@ def test_zai_connection_refused_maps_to_returncode():
     assert "Connection refused" in res.stderr
 
 
-def test_common_code_socket_timeout_maps_to_returncode():
+def test_commandcode_socket_timeout_maps_to_returncode():
     """A socket timeout (TimeoutError, an OSError subclass) must be caught too."""
 
     def _raise(req, timeout=None):
@@ -621,9 +694,9 @@ def test_common_code_socket_timeout_maps_to_returncode():
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _raise
     with _EnvSandbox():
-        os.environ["DEEPSEEK_API_KEY"] = "k"
+        os.environ["COMMANDCODE_API_KEY"] = "k"
         try:
-            res = backends.review_common_code("common-code", "q", "", REPO_ROOT, 10)
+            res = backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
     assert res.returncode == 1, res.returncode
