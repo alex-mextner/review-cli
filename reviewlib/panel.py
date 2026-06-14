@@ -128,7 +128,7 @@ def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, d
         prev_suppress = _suppress_autotally
         _suppress_autotally = True
     try:
-        result = _run_moderator_inner(candidates, prompt, cwd, timeout, diff)
+        result = _run_moderator_inner(candidates, prompt, cwd, timeout, diff, round_no)
     finally:
         with _TALLY_LOCK:
             _suppress_autotally = prev_suppress
@@ -136,7 +136,7 @@ def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, d
     return result
 
 
-def _run_moderator_inner(candidates: list[str], prompt: str, cwd: Path, timeout: int, diff: str) -> ReviewResult:
+def _run_moderator_inner(candidates: list[str], prompt: str, cwd: Path, timeout: int, diff: str, round_no: int = 0) -> ReviewResult:
     last: ReviewResult | None = None
     for index, model in enumerate(candidates):
         result = run_single(model, prompt, cwd, timeout, diff=diff, round_no=round_no)

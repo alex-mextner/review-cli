@@ -25,11 +25,26 @@ semantic versioning.
   back to pool-size-only, then a "no history yet, expect minutes" line. Distinct
   from the dashboard's per-call log reader (whose mode is inferred and whose
   duration is a mtime proxy); this store records the ground truth the run knows.
+- **No external timeout — internal ≤4h backstop** — `review` now advertises and
+  behaves as having NO external time bound: agents must not wrap it in a shell
+  `timeout`. The only bound is an INTERNAL last-resort backstop of ≤4h
+  (`reviewlib.backstop`), a watchdog `main()` arms itself that force-terminates a
+  genuinely wedged run (exit 124) so "no external timeout" can never mean "runs
+  forever". A healthy run finishes in minutes, far under the ceiling, and the
+  watchdog is cancelled cleanly on return. On a fire it KILL-FIRST reaps the live
+  backend subprocesses (SIGKILL straight to each one's own session group, no
+  blocking SIGTERM grace, so even a SIGTERM-ignoring backend is bound and the reap
+  can't be preempted) before the hard exit — without ever signalling the CLI's own
+  / the caller's process group — and a deadman timer guarantees the `os._exit` even
+  if the stderr announce blocks on a full pipe. The persistent server subcommands
+  (`dashboard`, `spec-web`) are exempt (they run until Ctrl-C).
+  `$REVIEW_BACKSTOP_SECONDS` can only LOWER the ceiling, never raise it past 4h.
 - **Advertising: never short-timeout `review`** — the installed SKILL.md and the
   always-on blurb now state plainly that `review` / `--quorum` / `--brainstorm`
   are multi-model / multi-round and take MINUTES, that a short shell `timeout`
-  kills the run before its synthesis, and that the startup ETA line is what to
-  wait for. Re-run `review install-skill` to regenerate.
+  kills the run before its synthesis, that the startup ETA line is what to wait
+  for, and that there is NO external timeout (only the internal ≤4h backstop).
+  Re-run `review install-skill` to regenerate.
 
 ## 0.2.0
 

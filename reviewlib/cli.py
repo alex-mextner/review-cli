@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import backends
 from .backends import _which  # re-export for tests/compat  # noqa: F401
+from .backstop import run_backstop
 from .config import (
     DEFAULT_MODELS,
     DEFAULT_PROMPT,
@@ -183,7 +184,38 @@ def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch) -> int:
             )
 
 
+# Subcommands that run a PERSISTENT server until Ctrl-C (`review dashboard`,
+# `review spec-web`) — these are intentionally long-lived and must NOT be bounded by
+# the run backstop, which would otherwise kill the server after the ceiling (or almost
+# immediately under a lowered $REVIEW_BACKSTOP_SECONDS). The backstop is for the
+# bounded review/model RUN paths only.
+_SERVER_SUBCOMMANDS = frozenset({"dashboard", "spec-web"})
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Entry point: arm the internal run backstop around a review run, then dispatch.
+
+    `review` advertises NO external timeout — agents must not wrap it in a short
+    shell `timeout` (the panel/brainstorm modes only emit their synthesis at the very
+    end). The ONLY time bound is this INTERNAL last-resort backstop, capped at <=4h
+    (`reviewlib.backstop`): a watchdog that force-terminates a genuinely wedged run so
+    "no external timeout" can never mean "runs forever". A healthy run finishes in
+    minutes, far under the ceiling, and the watchdog is cancelled cleanly on return.
+
+    The persistent SERVER subcommands (`dashboard`, `spec-web`) are deliberately
+    long-lived (they run until Ctrl-C), so they bypass the backstop entirely — bounding
+    them would kill the server at the ceiling, and a lowered env var would kill it almost
+    at once (codex P2). Every other path (the review/panel run and the instant
+    subcommands) is wrapped.
+    """
+    effective = sys.argv[1:] if argv is None else argv
+    if effective and effective[0] in _SERVER_SUBCOMMANDS:
+        return _dispatch(argv)
+    with run_backstop():
+        return _dispatch(argv)
+
+
+def _dispatch(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     if argv == ["install-skill"]:

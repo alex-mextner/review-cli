@@ -102,6 +102,13 @@ echo "reviewer-board tests OK"
 REVIEW_LOG_DIR="$(mktemp -d)" python3 tests/test_run_stats.py
 echo "run-stats tests OK"
 
+# Internal run backstop: the clamped 4h ceiling (env can only LOWER it), the watchdog
+# cancelling on a fast block, an ACTUAL fire (exit 124 + loud line) for a wedged run
+# in a child process, and main() arming the backstop around dispatch. All offline (no
+# backend, no network — the wedged-run children just sleep).
+python3 tests/test_backstop.py
+echo "backstop tests OK"
+
 # Stage 1 visual-verification suite (cvGate / vision_client / policy / pipeline /
 # composability). All offline: cvGate shells to magick, the vision call is mocked,
 # fixtures are generated (Pillow) — no API keys, no network. These need two non-core

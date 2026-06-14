@@ -406,7 +406,7 @@ def test_moderator_empty_output_tallies_as_fail_not_ok():
 
     # Stub run_single so the only candidate returns rc 0 but empty stdout.
     saved = p.run_single
-    p.run_single = lambda model, prompt, cwd, timeout, diff="": ReviewResult(
+    p.run_single = lambda model, prompt, cwd, timeout, diff="", round_no=0: ReviewResult(
         model=model, command="stub", returncode=0, stdout="", stderr="")
     p.begin_call_tally()
     try:
@@ -431,7 +431,7 @@ def test_moderator_success_tallies_one_ok_despite_fallback():
     saved = p.run_single
     calls = {"n": 0}
 
-    def runner(model, prompt, cwd, timeout, diff=""):
+    def runner(model, prompt, cwd, timeout, diff="", round_no=0):
         calls["n"] += 1
         if model == "bad":
             return ReviewResult(model=model, command="stub", returncode=1, stdout="", stderr="boom")

@@ -125,11 +125,18 @@ on `(mode, pool_size)`:
 ```
 
 With no exact history it falls back to pool-size-only across modes, then to a
-`no history yet … expect MINUTES` line. Read that line and wait at least that long;
-if you must bound the run, give it **minutes**, never a cap below the printed ETA.
+`no history yet … expect MINUTES` line. Read that line and wait at least that long.
 (This store is separate from the dashboard's per-call log reader, whose mode is
 *inferred* and whose duration is an mtime proxy — this one records the run's ground
 truth.)
+
+**No external timeout — `review` carries its own internal ≤4h backstop.** Do not
+put *any* external `timeout` on `review`: it is designed to run unbounded from the
+outside. The only time bound is an **internal**, last-resort backstop of **≤4h** that
+the binary arms itself (`reviewlib.backstop`) — a watchdog that force-terminates a
+genuinely wedged run (exit `124`). So a healthy run never needs an external cap (it
+finishes in minutes, far under the ceiling) and a stuck run can't run forever either.
+`$REVIEW_BACKSTOP_SECONDS` can only **lower** that ceiling, never raise it past 4h.
 
 ```bash
 review --quorum "Should we cap brainstorm at 8 rounds?"
