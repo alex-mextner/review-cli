@@ -309,6 +309,95 @@ Add `--no-ai` to run cvGate only (fast CI smoke / offline), `--json` for the mac
 
 ---
 
+## `review spec-web <spec.md>` — interactive spec reviewer
+
+**Render any markdown spec server-side and review it like a GitHub PR.** Select any text in
+the rendered spec → ask a question / leave a comment anchored to that selection; comments
+accumulate in a **pending batch**; one **Submit review** finalizes them; answers thread
+inline under each comment. Reusable for *any* spec markdown file. Serve it over Tailscale to
+review from your phone.
+
+```sh
+# local, ephemeral port, opens a browser
+review spec-web docs/specs/my-spec.md --open
+
+# expose over Tailscale (reachable from a phone on the tailnet)
+review spec-web docs/specs/my-spec.md --host 0.0.0.0 --port 8787
+
+# pre-load an existing Q&A thread
+review spec-web docs/specs/my-spec.md --seed thread.json
+
+# dump the whole review (quotes + questions + threaded answers) as markdown
+review spec-web docs/specs/my-spec.md --export > review.md
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--host` | bind host (default `127.0.0.1`; `0.0.0.0` exposes over Tailscale) |
+| `--port` | bind port (default: a free ephemeral port) |
+| `--seed FILE` | import an initial review thread from a JSON file before serving |
+| `--export` | print the persisted review as markdown and exit (no server) |
+| `--open` | open the URL in a browser on startup |
+
+**Layout.** Desktop (≥900px) = two panes side-by-side (spec left, comments right, a
+draggable divider). Mobile (<900px) = comments as a bottom sheet under the spec. Both panes
+collapse/expand from the topbar.
+
+**Rendering.** Markdown → HTML is rendered server-side with the GitHub heading-slug scheme,
+so the spec's own internal links (`[§9.4](#94-…)`) resolve. Figures referenced as
+`./assets/fig-*.svg|png` are served as real HTTP resources at `/asset/<name>` (never
+inlined).
+
+**Comments.** A comment stores the selected quote, the containing section id, char offsets,
+the body, author, created-at, a status (`pending`/`submitted`/`answered`/`resolved`), and a
+thread of replies. On reload, each comment re-anchors by locating its quote within its
+section and highlighting it; a quote that can't be re-found shows in the sidebar as
+**unanchored** (never a crash).
+
+**Persistence.** One JSON file per spec at `~/.config/review-cli/spec-web/<sha1-of-abspath>.json`
+(mode `0600`), surviving restarts. Override the directory with `$REVIEW_SPECWEB_DIR`.
+
+**Security.** Reads (spec, assets, comments) are open; only figures the markdown
+*references* are served (an unrelated file in the assets dir 404s), SVGs are served with a
+`sandbox` CSP so a directly-opened one can't run script, and symlinked assets that escape
+the assets dir are refused. Writes (post comment / reply / submit / import) are
+origin-guarded against both CSRF and DNS rebinding: a write requires (1) the request's
+**Host** to be in the allowlist — **loopback + this machine's Tailscale identity
+(discovered at runtime via `tailscale status`, never hardcoded) + `$REVIEW_SPECWEB_ALLOWED_HOSTS`**
+(comma-separated) — and (2) the **Origin/Referer** to match that Host (classic CSRF check),
+plus `Content-Type: application/json` and a body-size cap. The Host allowlist is what stops
+a rebound attacker hostname from posting same-origin. So to accept writes from a phone over
+Tailscale, the Tailscale name/IP must be discovered or listed in
+`$REVIEW_SPECWEB_ALLOWED_HOSTS` (e.g. `REVIEW_SPECWEB_ALLOWED_HOSTS=ultras-mbp.tailbfe8ea.ts.net,100.123.113.82`).
+
+**Seed / import JSON shape** (`comments` is the only required key):
+
+```json
+{
+  "comments": [
+    {
+      "quote": "the selected text",
+      "body": "the question or comment",
+      "section_id": "94-...",
+      "section_title": "§9.4 ...",
+      "author": "alex",
+      "status": "submitted",
+      "batch": "2026-06-14T10:00:00+00:00",
+      "replies": [ { "author": "claude", "body": "the answer" } ]
+    }
+  ]
+}
+```
+
+Missing `id`/`created` are generated; unknown keys are ignored. Add `"replace": true` at the
+top level to discard existing comments before importing.
+
+Routes: `GET /` (SPA shell), `GET /static/<app.css|app.js>`, `GET /asset/<name>`,
+`GET /api/spec`, `GET /api/comments`, `GET /api/export`, `POST /api/comments`,
+`POST /api/comments/<id>/{reply,status,delete}`, `POST /api/submit`, `POST /api/import`.
+
+---
+
 ## Agent workflows
 
 `review` earns its keep when an agent hits a hard call:

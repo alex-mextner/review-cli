@@ -33,6 +33,10 @@ bin/review --show-board | grep -q "commandcode:gpt-5.5"
 bin/review --show-board | grep -q "contracts"
 bin/review --show-board | grep -q "8 seats"
 
+# spec-web subcommand: dispatches + advertises its flags (no server started here).
+bin/review spec-web --help | grep -q -- "--seed"
+bin/review spec-web --help | grep -q -- "--host"
+bin/review spec-web --help | grep -q -- "--export"
 # The single-file CLI must always parse.
 python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse OK')"
 
@@ -62,6 +66,12 @@ echo "moderator tests OK"
 # cwd resolution: git-toplevel detection + non-repo warning (real temp git repos).
 python3 tests/test_cwd.py
 echo "cwd tests OK"
+
+# spec-web reviewer: render (slugs/figures), store (CRUD/submit/seed/export, 0600),
+# server routes + origin guard (loopback + Tailscale allowed, foreign rejected). All
+# offline on a loopback ephemeral port; store isolated to a temp dir.
+python3 tests/test_specweb.py
+echo "spec-web tests OK"
 
 # claude backend api/cli dispatch + Anthropic Messages API path (urlopen stubbed;
 # no network, no claude binary, no real key).

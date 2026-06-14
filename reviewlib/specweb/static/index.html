@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Spec review — {{SPEC_TITLE}}</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-spec-title="{{SPEC_TITLE}}">
+<header class="topbar">
+  <button class="icon-btn" id="toggleSpec" title="Collapse / expand spec" aria-label="Toggle spec pane">📄</button>
+  <div class="topbar-title">Spec review · <span id="specTitle">{{SPEC_TITLE}}</span></div>
+  <div class="topbar-actions">
+    <label class="author-field">
+      <span>you</span>
+      <input type="text" id="authorInput" placeholder="reviewer" autocomplete="off" spellcheck="false">
+    </label>
+    <button class="icon-btn" id="toggleComments" title="Collapse / expand comments" aria-label="Toggle comments pane">💬</button>
+  </div>
+</header>
+
+<div class="layout" id="layout">
+  <main class="spec-pane" id="specPane">
+    <div class="spec-body" id="specBody">
+      <div class="loading">Loading spec…</div>
+    </div>
+  </main>
+
+  <div class="divider" id="divider" title="Drag to resize" aria-hidden="true"></div>
+
+  <aside class="comments-pane" id="commentsPane">
+    <div class="comments-header">
+      <div class="filters" id="filters">
+        <button data-filter="all" class="active">All</button>
+        <button data-filter="pending">Pending</button>
+        <button data-filter="submitted">Submitted</button>
+        <button data-filter="answered">Answered</button>
+        <button data-filter="resolved">Resolved</button>
+      </div>
+      <button class="mobile-collapse" id="commentsCollapse" aria-label="Collapse comments">▾</button>
+    </div>
+    <div class="pending-tray" id="pendingTray" hidden>
+      <span id="pendingLabel">Pending review (0)</span>
+      <button id="submitReview" class="primary">Submit review</button>
+    </div>
+    <div class="comments-list" id="commentsList"></div>
+    <div class="comments-empty" id="commentsEmpty">
+      Select any text in the spec to ask a question or leave a comment.
+    </div>
+    <div class="export-row">
+      <a href="/api/export" id="exportLink" download>Export review as markdown</a>
+    </div>
+  </aside>
+</div>
+
+<!-- Selection popup -->
+<div class="sel-popup" id="selPopup" hidden>
+  <button id="selComment">💬 Add comment</button>
+  <button id="selQuestion">❓ Ask question</button>
+</div>
+
+<!-- New-comment composer -->
+<div class="composer-backdrop" id="composerBackdrop" hidden>
+  <div class="composer" id="composer" role="dialog" aria-modal="true" aria-label="New comment">
+    <div class="composer-head" id="composerHead">New comment</div>
+    <blockquote class="composer-quote" id="composerQuote"></blockquote>
+    <textarea id="composerBody" placeholder="Write a comment or a question…" rows="4"></textarea>
+    <div class="composer-actions">
+      <button id="composerCancel">Cancel</button>
+      <button id="composerSubmit" class="primary">Add to review</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

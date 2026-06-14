@@ -87,6 +87,57 @@ def _dashboard_subcommand(rest: list[str]) -> int:
     return run_dashboard(port=ns.port, open_browser=not ns.no_open, verbose=ns.verbose)
 
 
+def _spec_web(argv: list[str]) -> int:
+    """`review spec-web <spec.md> [--host H] [--port N] [--seed f.json] [--export] [--open]`.
+
+    Interactive web server to review a markdown spec: select text -> ask a question /
+    comment, accumulate a pending batch, submit the review, answer inline. Reusable for
+    ANY spec. See reviewlib.specweb for the full design.
+    """
+    parser = argparse.ArgumentParser(prog="review spec-web", description="Interactive web reviewer for a markdown spec.")
+    parser.add_argument("spec", help="path to the spec markdown file")
+    parser.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1; use 0.0.0.0 to expose over Tailscale)")
+    parser.add_argument("--port", type=int, default=None, help="bind port (default: a free ephemeral port)")
+    parser.add_argument("--seed", metavar="FILE", default=None, help="import an initial review thread from a JSON file before serving")
+    parser.add_argument("--export", action="store_true", help="print the review as markdown to stdout and exit (no server)")
+    parser.add_argument("--open", dest="open_browser", action="store_true", help="open the URL in a browser on startup")
+    parser.add_argument("--verbose", action="store_true", help="verbose request logging")
+    ns = parser.parse_args(argv)
+
+    from .specweb.server import run_specweb
+    from .specweb.store import SpecStore
+
+    spec = Path(ns.spec).expanduser()
+    if not spec.is_file():
+        print(f"[review spec-web] spec not found: {spec}", file=sys.stderr)
+        return 1
+
+    if ns.export:
+        # --export dumps the persisted review as markdown and exits (after an optional
+        # seed import), so it doubles as the CLI export path.
+        if ns.seed:
+            import json as _json
+
+            try:
+                payload = _json.loads(Path(ns.seed).expanduser().read_text(encoding="utf-8"))
+                replace = bool(payload.get("replace")) if isinstance(payload, dict) else False
+                SpecStore(spec).import_thread(payload, replace=replace)
+            except (OSError, ValueError) as exc:
+                print(f"[review spec-web] bad seed: {exc}", file=sys.stderr)
+                return 1
+        sys.stdout.write(SpecStore(spec).export_markdown())
+        return 0
+
+    return run_specweb(
+        spec,
+        host=ns.host,
+        port=ns.port,
+        open_browser=ns.open_browser,
+        seed=ns.seed,
+        verbose=ns.verbose,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -122,6 +173,11 @@ def main(argv: list[str] | None = None) -> int:
             print("usage: review register-module <path-to-manifest>", file=sys.stderr)
             return 2
         return register_module(argv[1])
+    # `review spec-web <spec.md>` — interactive web reviewer for ANY markdown spec.
+    # Kept as a bare subcommand (like install-skill / register-module) so it stays off
+    # the main review argparse surface; it has its own small flag parser.
+    if argv and argv[0] == "spec-web":
+        return _spec_web(argv[1:])
     parser = argparse.ArgumentParser(description="Run read-only code reviews across multiple model backends.")
     parser.add_argument("-m", "--model", action="append", default=[], help="model/backend to run; repeat or comma-separate")
     parser.add_argument("-C", "--cwd", default=".", help="repository directory")
