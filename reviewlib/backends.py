@@ -299,7 +299,12 @@ def _emit_rest_log(
             backend, round_no=round_no, argv0=argv0, returncode=returncode, stdout=stdout,
             stderr=stderr, started=started, timed_out=timed_out, timeout_secs=timeout_secs,
         )
-    except OSError:
+    except Exception:  # noqa: BLE001 - logging is best-effort; it must NEVER change the
+        # review outcome. Beyond OSError (read-only / full log dir), a provider can return
+        # text with an unpaired surrogate that makes write_sidecar_log raise
+        # UnicodeEncodeError (a ValueError) — and since this is called on the SUCCESS path
+        # of the REST backends, an unswallowed error would flip a successful ReviewResult
+        # into a failure (codex P3). Swallow everything; a missing sidecar only loses a log.
         pass
 
 

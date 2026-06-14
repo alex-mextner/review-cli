@@ -88,11 +88,14 @@ class CallLog:
         """Wall time from start (filename stamp) to last write (mtime).
 
         review-cli does not record an explicit duration, so this is the best honest
-        proxy: file creation -> last flush. None if mtime is unavailable.
+        proxy: file creation -> last flush. None if mtime is unavailable. Uses the SAME
+        capped end as ``ended_at`` — an mtime beyond the per-call timeout window (a copied /
+        restored / touched log) is untrustworthy, so the Metrics panel must not report a
+        multi-day call duration for it (codex P3); it falls back to 0 there.
         """
         if self.mtime is None:
             return None
-        d = (self.mtime - self.started).total_seconds()
+        d = (self.ended_at - self.started).total_seconds()
         return d if d >= 0 else None
 
     @property
@@ -357,6 +360,11 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
     rounds: list[dict] = []
     cur_round: dict | None = None
     cur_persona: dict | None = None
+    # True while inside a moderator / final-synthesis CONTROL section (between such a
+    # marker and the next `# Round N` / EOF). No personas are captured there — the
+    # moderator's own text can contain a `#### Name (model)` heading that must NOT be
+    # parsed as a new persona of the previous round (codex P2).
+    in_control = False
     for line in raw.splitlines():
         if line.startswith("# Brainstorm:"):
             topic = line[len("# Brainstorm:"):].strip()
@@ -371,29 +379,30 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
             cur_round = {"round": int(rm.group(1)), "personas": []}
             rounds.append(cur_round)
             cur_persona = None
+            in_control = False  # a new round ends any control section
             continue
         # The moderator summary (`## Moderator (round N)`) and the final synthesis
-        # (`# Final synthesis`) are written AFTER a round's persona blocks. Without
-        # stopping capture here, that text would bleed into the last persona's transcript
-        # and the dashboard would misattribute the moderator's decision / the synthesis to
-        # a persona (codex P2). A persona heading is always `#### …`, so any `#`/`##`
-        # section heading ends the current persona's capture. (We don't model the
-        # moderator/synthesis as personas — they have no `(model)` label — they're just
-        # excluded from persona text.)
+        # (`# Final synthesis`) are written AFTER a round's persona blocks. Entering one
+        # ends the current persona's capture AND opens a control section: until the next
+        # `# Round N` / EOF, no `####` heading is treated as a persona, so the moderator's
+        # / synthesis's own text (which can contain a `#### Name (model)` line) is never
+        # misattributed as an extra persona of the previous round (codex P2).
         if _BS_SECTION_RE.match(line):
             cur_persona = None
+            in_control = True
             continue
         pm = _BS_PERSONA_RE.match(line)
         # A real persona heading is `#### {name} ({model})` where {model} is one of the
         # panel backends (see modes/brainstorm.py: label=f"{persona} ({model})"). Model
         # OUTPUT itself can contain `#### (a) ... (`SOME_MAP`...)` lines, so we ONLY accept
         # a heading whose parenthesized tail is a known panel model — otherwise it's body
-        # text and belongs to the current persona's transcript.
-        if pm and cur_round is not None and (not panel or pm.group("model") in panel):
+        # text and belongs to the current persona's transcript. Inside a control section we
+        # accept no personas at all.
+        if pm and cur_round is not None and not in_control and (not panel or pm.group("model") in panel):
             cur_persona = {"name": pm.group("name"), "model": pm.group("model"), "text": ""}
             cur_round["personas"].append(cur_persona)
             continue
-        if cur_persona is not None:
+        if cur_persona is not None and not in_control:
             cur_persona["text"] += line + "\n"
     for rnd in rounds:
         for p in rnd["personas"]:

@@ -223,6 +223,120 @@ def test_brainstorm_persona_markdown_headings_stay_in_transcript():
         assert "(round 1)" not in prag["text"]
 
 
+def test_persona_heading_inside_moderator_section_is_not_a_persona():
+    """(codex P2) A `#### Name (model)` heading that appears INSIDE the moderator summary
+    or final synthesis must NOT be parsed as an extra persona of the previous round — the
+    control section suppresses persona capture until the next `# Round N`."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        md = ld / "20260601T120000_000000Z-brainstorm.md"
+        md.write_text(
+            "# Brainstorm: t\n\n"
+            "panel=codex,gemini moderator=codex rounds>=5 max=5\n\n"
+            "# Round 1\n"
+            "#### Pragmatic engineer (codex)\nLRU.\n\n"
+            "## Moderator (round 1)\n"
+            "Summary of the panel. The strongest take was:\n"
+            "#### Security reviewer (gemini)\n"  # quoted inside the moderator text
+            "(the moderator is recapping gemini's point, not a new persona)\n\n"
+            "# Final synthesis\n"
+            "#### Pragmatic engineer (codex)\nThis recap must not become a persona.\n",
+            encoding="utf-8",
+        )
+        bs = p.parse_brainstorm_log(md)
+        r1 = next(r for r in bs.rounds if r["round"] == 1)
+        # Exactly ONE persona in round 1 — the moderator's quoted `#### …` is not counted.
+        assert [pp["model"] for pp in r1["personas"]] == ["codex"], r1["personas"]
+        assert r1["personas"][0]["text"].strip() == "LRU.", r1["personas"][0]["text"]
+
+
+def test_emit_rest_log_swallows_encoding_errors_best_effort():
+    """(codex P3) _emit_rest_log is best-effort: if write_sidecar_log raises on un-encodable
+    text (an unpaired surrogate → UnicodeEncodeError, NOT an OSError), it must be swallowed,
+    NOT propagated — else it would flip a successful REST ReviewResult into a failure since
+    _emit_rest_log is called on the backends' success path."""
+    from reviewlib import backends
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        try:
+            # stdout carries a lone surrogate; write_sidecar_log's utf-8 write raises
+            # UnicodeEncodeError. _emit_rest_log must swallow it and return normally.
+            backends._emit_rest_log(
+                "z.ai", "z.ai API glm-5.2", round_no=0, returncode=0,
+                stdout="finding: \ud800 broken char", stderr="",
+            )
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        # Reaching here (no exception) is the assertion: the encoding error was swallowed.
+
+
+def test_review_succeeds_even_if_sidecar_write_raises():
+    """End-to-end: a successful REST response whose sidecar write raises must still return
+    a successful ReviewResult (best-effort logging never changes the outcome)."""
+    import urllib.request
+
+    from reviewlib import backends
+
+    class _FakeResp:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    payload = json.dumps({"choices": [{"message": {"content": "a real finding"}}], "usage": {}}).encode("utf-8")
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["ZAI_API_KEY"] = "k"
+        old_urlopen = urllib.request.urlopen
+        old_write = backends.write_sidecar_log
+        try:
+            urllib.request.urlopen = lambda req, timeout=None: _FakeResp(payload)
+            # Force the sidecar write to raise a non-OSError (UnicodeEncodeError class).
+            def _boom(*a, **k):
+                raise UnicodeEncodeError("utf-8", "x", 0, 1, "forced")
+
+            backends.write_sidecar_log = _boom
+            result = backends.review_zai("zai", "q", "", Path(logd), 10, round_no=0)
+        finally:
+            urllib.request.urlopen = old_urlopen
+            backends.write_sidecar_log = old_write
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("ZAI_API_KEY", None)
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert "real finding" in result.stdout
+
+
+def test_duration_capped_for_untrustworthy_mtime():
+    """(codex P3) A log whose mtime is far beyond the per-call timeout window (copied /
+    restored long after its filename stamp) must not report a multi-day duration; the
+    duration uses the same cap/fallback as ended_at."""
+    import os as _os
+    import time as _time
+
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # Filename stamp far in the past; mtime = now (days later) → untrustworthy.
+        path = _write_call_log(ld, "20200101T000000_000000", "codex", 0, "old\n", exit_code=0)
+        now = _time.time()
+        _os.utime(path, (now, now))
+        c = p.parse_call_log(path)
+        # ended_at fell back to start, so duration is capped (0), not multi-day.
+        assert c.duration_seconds == 0.0, c.duration_seconds
+
+
 def test_brainstorm_model_attribution_is_stable_across_log_aging():
     """(codex P2) For a brainstorm, the `panel=` line is authoritative — model attribution
     must be the SAME whether the per-call logs still exist or have aged out, and must keep
