@@ -20,7 +20,6 @@ The handler is intentionally thin: parsing lives in ``parser``, persistence in `
 from __future__ import annotations
 
 import json
-import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -365,21 +364,17 @@ def make_server(port: int = 0, *, host: str = "127.0.0.1", verbose: bool = False
     return httpd
 
 
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 def run_dashboard(port: int | None = None, *, open_browser: bool = True, verbose: bool = False) -> int:
     """Blocking entry for ``review dashboard``. Returns a process exit code."""
-    chosen = port if port else _free_port()
+    # Pass 0 straight to the server so the OS picks AND binds a free ephemeral port in one
+    # step, reporting it via server_address — instead of probe-bind-close-then-rebind,
+    # which leaves a TOCTOU window for another local process to claim the port (codex P3).
+    chosen = port or 0
     try:
         httpd = make_server(chosen, verbose=verbose)
     except OSError as exc:
-        print(f"[review dashboard] cannot bind 127.0.0.1:{chosen}: {exc}", flush=True)
+        target = f"127.0.0.1:{chosen}" if chosen else "127.0.0.1 (ephemeral port)"
+        print(f"[review dashboard] cannot bind {target}: {exc}", flush=True)
         return 1
     bound = httpd.server_address[1]
     url = f"http://127.0.0.1:{bound}/"

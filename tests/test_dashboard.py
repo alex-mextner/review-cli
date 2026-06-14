@@ -243,6 +243,147 @@ def test_quoted_exit_line_in_body_is_not_treated_as_status():
         assert c.body.count("[review-cli] EXIT") == 1
 
 
+def test_quoted_timeout_marker_in_body_is_not_treated_as_a_timeout():
+    """(codex P2) Like the EXIT footer, the TIMEOUT marker is authoritative only in its
+    written position (just before the footer). A successful review that QUOTES a
+    `[review-cli] TIMEOUT after Ns` line mid-body must NOT be flagged as a timeout, and
+    the quote must stay visible — else valid successful calls corrupt the timeout metric."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = (
+            "While reviewing the logs I noticed a marker:\n"
+            "[review-cli] TIMEOUT after 12s — partial output above]\n"  # quoted, not real
+            "The handling looks fine. Overall the change is correct.\n"
+        )
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body, exit_code=0)
+        c = p.parse_call_log(path)
+        assert c.exit_code == 0
+        assert c.timed_out is False, "a quoted TIMEOUT marker mid-body must not flag a timeout"
+        assert c.has_error is False
+        assert "TIMEOUT after 12s" in c.body, "the quoted marker stays in the body"
+
+
+def test_real_timeout_marker_before_footer_is_still_detected():
+    """The genuine timeout marker (written by the runner immediately before the EXIT
+    footer, with rc 124) is still recognised — the anchoring fix must not lose real ones."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.process import write_sidecar_log
+
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["REVIEW_LOG_DIR"] = d
+        try:
+            path = write_sidecar_log(
+                "gemini", round_no=0, argv0="Gemini API", returncode=124,
+                stdout="partial output before the timeout\n", stderr="",
+                timed_out=True, timeout_secs=240,
+            )
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        c = p.parse_call_log(path)
+        assert c.timed_out is True, "the authoritative pre-footer TIMEOUT marker must be detected"
+        assert c.timeout_secs == 240
+        assert c.exit_code == 124
+        assert "TIMEOUT" not in c.body, "the real marker is stripped from the body"
+
+
+def test_orphan_brainstorm_keeps_model_attribution_from_markdown():
+    """(codex P2) When a brainstorm's per-call logs have aged out but the `*-brainstorm.md`
+    survives, the session has no calls but the markdown still records the panel models.
+    Session.models must fall back to brainstorm.panel so by_model stats keep attribution."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # Only the brainstorm md — no per-call -r{n}.log files (they aged out).
+        _write_brainstorm(ld, "20260601T120000_000000", "How to shard the cache",
+                          panel="codex,gemini", moderator="codex")
+        sessions = p.load_sessions(ld)
+        assert len(sessions) == 1, sessions
+        s = sessions[0]
+        assert s.calls == [], "the orphan session has no per-call logs"
+        assert s.brainstorm is not None
+        assert s.models == ["codex", "gemini"], s.models
+        # And the by_model stats reflect the panel even with no calls.
+        stats = p.compute_stats(sessions)
+        assert "codex" in stats["by_model"] and "gemini" in stats["by_model"], stats["by_model"]
+
+
+def test_claude_api_mode_emits_a_sidecar_log():
+    """(codex P2) A claude API-mode run is a REST call with no subprocess sidecar, so it
+    must emit its own `*-claude-r{n}.log` (like gemini/z.ai/commandcode) — else successful
+    or failed claude API calls are invisible to the dashboard and missing from stats."""
+    import urllib.request
+
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    class _FakeResp:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    fake_payload = json.dumps({
+        "content": [{"type": "text", "text": "A finding: guard the None branch."}],
+        "usage": {"input_tokens": 12, "output_tokens": 6},
+    }).encode("utf-8")
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["ANTHROPIC_API_KEY"] = "fake-key"
+        old_urlopen = urllib.request.urlopen
+        try:
+            urllib.request.urlopen = lambda req, timeout=None: _FakeResp(fake_payload)
+            result = backends.review_claude_api("claude:claude-opus-4-8", "review", "", Path(logd), 30, round_no=2)
+        finally:
+            urllib.request.urlopen = old_urlopen
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+
+        assert result.returncode == 0, result.stderr
+        logs = list(Path(logd).glob("*-claude-r2.log"))
+        assert len(logs) == 1, [x.name for x in Path(logd).glob("*")]
+        c = p.parse_call_log(logs[0])
+        assert c is not None and c.backend == "claude"
+        assert c.round == 2 and c.exit_code == 0
+        assert "finding" in c.body.lower()
+        stats = p.compute_stats(p.load_sessions(Path(logd)))
+        assert "claude" in stats["by_model"], stats["by_model"]
+
+
+def test_claude_api_missing_key_still_emits_a_sidecar():
+    """A claude API-mode call with no key configured must also emit a per-backend failure
+    sidecar (rc 1) — a failed run stays visible in the dashboard."""
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            os.environ.pop(k, None)
+        old_cfg = backends._anthropic_api_config
+        try:
+            backends._anthropic_api_config = lambda: None
+            result = backends.review_claude_api("claude:claude-opus-4-8", "review", "", Path(logd), 30, round_no=0)
+        finally:
+            backends._anthropic_api_config = old_cfg
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        assert result.returncode == 1
+        logs = list(Path(logd).glob("*-claude-r0.log"))
+        assert len(logs) == 1, [x.name for x in Path(logd).glob("*")]
+        c = p.parse_call_log(logs[0])
+        assert c.exit_code == 1 and c.has_error is True
+
+
 def test_explicit_nonzero_exit_is_an_error_even_with_clean_body():
     """(finding 4) The inverse: a non-zero EXIT is a failure even when the body looks
     clean and has no error markers — the return code is authoritative."""

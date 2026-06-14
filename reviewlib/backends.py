@@ -645,18 +645,26 @@ def _anthropic_api_config() -> dict | None:
     return {"base": base, "auth": auth}
 
 
-def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     """Anthropic Messages API backend — works WITHOUT the claude CLI (needs only a
     key). POSTs to ``{ANTHROPIC_BASE_URL}/v1/messages``; the default base is
     Anthropic, but any Anthropic-compatible gateway works (e.g. CommandCode via
     ANTHROPIC_BASE_URL). ``cwd`` is unused — the API has no workspace, which is
-    exactly why this variant runs where the CLI cannot."""
+    exactly why this variant runs where the CLI cannot.
+
+    Like the other REST backends, this never goes through `_run_streamed`, so it emits
+    its own dashboard sidecar log (under the canonical ``claude`` backend name, same as
+    the CLI variant) on EVERY return path with ``round_no`` threaded — else a claude
+    API-mode run would be invisible to the dashboard and missing from stats / brainstorm
+    round attribution (codex P2)."""
     claude_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
     cfg = _anthropic_api_config()
     command = f"Anthropic API {claude_model}"
+    started = datetime.now(timezone.utc)
     if cfg is None:
-        return ReviewResult(model=model, command=command, returncode=1, stdout="",
-                            stderr="claude API mode: no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN configured")
+        stderr = "claude API mode: no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN configured"
+        _emit_rest_log("claude", command, round_no=round_no, returncode=1, stdout="", stderr=stderr, started=started)
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=stderr)
     try:
         max_tokens = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000"))
     except ValueError:
@@ -692,19 +700,34 @@ def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: in
             f"output_tokens={usage.get('output_tokens', 0)}\n"
         )
         # Empty success is a failure for the panel/moderator fallback path.
-        return ReviewResult(model=model, command=command,
-                            returncode=0 if text.strip() else 1, stdout=stdout, stderr="")
+        rc = 0 if text.strip() else 1
+        _emit_rest_log("claude", command, round_no=round_no, returncode=rc, stdout=stdout, stderr="", started=started)
+        return ReviewResult(model=model, command=command, returncode=rc, stdout=stdout, stderr="")
     except urllib.error.HTTPError as exc:
-        return ReviewResult(model=model, command=command, returncode=exc.code, stdout="",
-                            stderr=exc.read().decode("utf-8", "replace"))
+        body_text = exc.read().decode("utf-8", "replace")
+        rc = exc.code or 1
+        _emit_rest_log("claude", command, round_no=round_no, returncode=rc, stdout="", stderr=body_text, started=started)
+        return ReviewResult(model=model, command=command, returncode=rc, stdout="", stderr=body_text)
     except urllib.error.URLError as exc:
-        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
+        err = str(exc)
+        if _is_timeout_error(exc):
+            _emit_rest_log("claude", command, round_no=round_no, returncode=124, stdout="", stderr=err,
+                           started=started, timed_out=True, timeout_secs=timeout)
+            return ReviewResult(model=model, command=command, returncode=124, stdout="", stderr=err)
+        _emit_rest_log("claude", command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
     except (ValueError, OSError) as exc:
         # malformed / non-JSON 2xx body, or a read/decode/timeout failure — surface
         # as a normal backend result, not an uncaught exception. (URLError, a
         # subclass of OSError, is handled above; this catches the rest.)
-        return ReviewResult(model=model, command=command, returncode=1, stdout="",
-                            stderr=f"claude API: malformed or unreadable response: {exc}")
+        if _is_timeout_error(exc):
+            err = str(exc)
+            _emit_rest_log("claude", command, round_no=round_no, returncode=124, stdout="", stderr=err,
+                           started=started, timed_out=True, timeout_secs=timeout)
+            return ReviewResult(model=model, command=command, returncode=124, stdout="", stderr=err)
+        err = f"claude API: malformed or unreadable response: {exc}"
+        _emit_rest_log("claude", command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
 
 
 def _have_claude_cli() -> bool:
@@ -726,14 +749,14 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int, r
     silently switch a working CLI host to the paid API just because a key happens
     to be in the environment. Set REVIEW_CLAUDE_MODE=api to force the API.
 
-    ``round_no`` is threaded from the panel so the CLI variant's sidecar log lands
-    in the right brainstorm round (the dashboard parser keys on it). The API
-    variant has no subprocess sidecar, so it does not take the parameter."""
+    ``round_no`` is threaded from the panel into BOTH variants so the per-call sidecar
+    log lands in the right brainstorm round (the dashboard parser keys on it) — the CLI
+    variant via _run_streamed, the API variant via its own _emit_rest_log sidecar."""
     mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
     if mode == "api":
-        return review_claude_api(model, prompt, diff, cwd, timeout)
+        return review_claude_api(model, prompt, diff, cwd, timeout, round_no)
     if mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None:
-        return review_claude_api(model, prompt, diff, cwd, timeout)
+        return review_claude_api(model, prompt, diff, cwd, timeout, round_no)
     return review_claude_cli(model, prompt, diff, cwd, timeout, round_no)
 
 

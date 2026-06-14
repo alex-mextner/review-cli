@@ -255,6 +255,22 @@ def parse_call_log(path: Path) -> CallLog | None:
             exit_code = int(em.group("code"))
             exit_line_idx = j
         break  # the last non-empty line is decisive either way
+    # The TIMEOUT marker, like the EXIT footer, is authoritative ONLY in the position the
+    # logger writes it: the last non-empty line BEFORE the exit footer. A model's review
+    # output can legitimately QUOTE a `[review-cli] TIMEOUT after Ns` line mid-body (e.g.
+    # while reviewing review-cli's own logs); honoring that would mis-flag a successful
+    # call as a timeout and corrupt the dashboard's timeout/error metrics (codex P2). So
+    # we find the one authoritative timeout-marker index (if any) and recognise only it.
+    # Scan upward from just before the footer (or the file end for a legacy footer-less
+    # log): the real marker is the last non-empty line that is not the footer itself.
+    timeout_line_idx: int | None = None
+    scan_start = (exit_line_idx - 1) if exit_line_idx is not None else (len(lines) - 1)
+    for j in range(scan_start, -1, -1):
+        if not lines[j].strip():
+            continue  # skip blank lines between body and footer
+        if _TIMEOUT_RE.match(lines[j]):
+            timeout_line_idx = j
+        break  # only the trailing-most non-body line is decisive
     for i, line in enumerate(lines):
         if i == exit_line_idx:
             continue  # the authoritative trailing status footer — kept out of the body
@@ -264,11 +280,11 @@ def parse_call_log(path: Path) -> CallLog | None:
                 # filename backend wins (header backend can be the same), but keep argv0.
                 argv0 = hm.group("argv0")
                 continue
-        tm = _TIMEOUT_RE.match(line)
-        if tm:
+        if i == timeout_line_idx:
+            tm = _TIMEOUT_RE.match(line)
             timed_out = True
             timeout_secs = int(tm.group("secs"))
-            continue
+            continue  # the authoritative timeout marker — kept out of the body
         if line.startswith(_STDERR_PREFIX):
             stderr_lines.append(line[len(_STDERR_PREFIX):])
         body_lines.append(line)
@@ -379,6 +395,15 @@ class Session:
         for c in self.calls:
             if c.backend not in seen:
                 seen.append(c.backend)
+        # Orphan brainstorm: when the per-call logs have aged out but the sibling
+        # `*-brainstorm.md` remains, `calls` is empty yet the markdown still records the
+        # panel models (`panel=codex,gemini ...`). Fall back to those so /api/runs and the
+        # by_model stats keep their attribution exactly in the aged-out case the dashboard
+        # is meant to preserve (codex P2) — instead of returning an empty model list.
+        if not seen and self.brainstorm is not None:
+            for model in self.brainstorm.panel:
+                if model not in seen:
+                    seen.append(model)
         return seen
 
     @property
