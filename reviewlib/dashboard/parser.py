@@ -184,6 +184,7 @@ class CallLog:
             "timed_out": self.timed_out,
             "timeout_secs": self.timeout_secs,
             "exit_code": self.exit_code,
+            "completed": self.completed,
             "has_error": self.has_error,
             "error_summary": self.error_summary,
             "size_bytes": self.size_bytes,
@@ -452,6 +453,13 @@ class Session:
         return any(c.has_error for c in self.calls)
 
     @property
+    def running(self) -> bool:
+        """True if the session has no errors but at least one call has not FINISHED
+        (a footerless in-flight / aborted call). The UI shows these as running/unknown
+        rather than a green OK badge (codex P2)."""
+        return not self.has_error and any(not c.completed for c in self.calls)
+
+    @property
     def errors(self) -> list[dict]:
         out = []
         for c in self.calls:
@@ -470,6 +478,7 @@ class Session:
             "call_count": len(self.calls),
             "error_count": len(self.errors),
             "has_error": self.has_error,
+            "running": self.running,
             "has_brainstorm": self.brainstorm is not None,
             "topic": self.brainstorm.topic if self.brainstorm else None,
         }

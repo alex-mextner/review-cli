@@ -129,7 +129,11 @@ PANELS.overview = () => {
 function runRow(r) {
   const badges = [
     modeBadge(r.mode),
-    r.has_error ? `<span class="badge err">${r.error_count} err</span>` : `<span class="badge ok">ok</span>`,
+    r.has_error
+      ? `<span class="badge err">${r.error_count} err</span>`
+      : r.running
+        ? `<span class="badge running">running</span>`
+        : `<span class="badge ok">ok</span>`,
     r.conscious ? `<span class="badge conscious">★ conscious</span>` : '',
     ((r.links && r.links.prs) || []).map((p) => `<span class="badge pr">${esc(p)}</span>`).join(''),
     ((r.links && r.links.tickets) || []).map((t) => `<span class="badge ticket">${esc(t)}</span>`).join(''),
@@ -446,7 +450,9 @@ function renderDetail(d) {
       ? `<span class="badge err">timeout ${c.timeout_secs}s</span>`
       : c.has_error
         ? `<span class="badge err">error</span>`
-        : `<span class="badge ok">ok</span>`;
+        : c.completed === false
+          ? `<span class="badge running">running</span>`
+          : `<span class="badge ok">ok</span>`;
     html += `<div class="call">
       <div class="call-head" data-call="${i}">
         <span class="tag">${esc(c.backend)}</span>

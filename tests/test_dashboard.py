@@ -210,6 +210,29 @@ def test_footerless_clean_log_is_running_not_success():
         assert stats["success_rate"] == 1.0, stats
 
 
+def test_running_session_surfaces_running_flag_for_the_ui():
+    """(codex P2) A footerless in-flight session must be exposed as `running` (not OK) in
+    the run summary AND `completed: False` per call, so the UI badges it running/unknown
+    instead of a green OK."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0,
+                        "still streaming the review...\n", exit_code=None)  # no footer
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        assert len(sessions) == 1
+        summary = sessions[0].to_summary()
+        assert summary["has_error"] is False
+        assert summary["running"] is True, "footerless in-flight session must surface running"
+        detail = sessions[0].to_detail()
+        assert detail["calls"][0]["completed"] is False, "per-call completed must be exposed for the UI badge"
+        # A finished OK session is NOT running.
+        _write_call_log(ld, "20260602T100000_000000", "codex", 0, "done\n", exit_code=0)
+        done = [s for s in p.load_sessions(Path(d), gap_seconds=90) if not s.running and not s.has_error]
+        assert any(s.to_detail()["calls"][0]["completed"] is True for s in done)
+
+
 def test_empty_log_dir_is_graceful():
     from reviewlib.dashboard import parser as p
 

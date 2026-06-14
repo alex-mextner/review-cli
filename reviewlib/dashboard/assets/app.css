@@ -105,6 +105,7 @@ body {
 .badge.mode-panel { color: var(--green); border-color: var(--green); }
 .badge.err { color: var(--red); border-color: var(--red); }
 .badge.ok { color: var(--green); border-color: var(--green); }
+.badge.running { color: var(--muted); border-color: var(--muted); }
 .badge.conscious { color: var(--amber); border-color: var(--amber); }
 .badge.pr { color: var(--green); }
 .badge.ticket { color: var(--accent); }
