@@ -27,6 +27,12 @@ review = "reviewlib.cli:main"
 
 # Explicit package list (NOT setuptools flat-layout autodiscovery, which would silently
 # pull stray top-level dirs into the wheel). features/ is a SUBpackage of reviewlib, so
-# `reviewlib*` captures reviewlib, reviewlib.modes, reviewlib.features, reviewlib.features.*.
+# `reviewlib*` captures reviewlib, reviewlib.modes, reviewlib.features, reviewlib.features.*,
+# reviewlib.dashboard.
 [tool.setuptools.packages.find]
 include = ["reviewlib*"]
+
+# The dashboard ships a vanilla-JS SPA (no npm build); its HTML/JS/CSS assets must land in
+# the wheel alongside the package so `review dashboard` can serve them from an installed copy.
+[tool.setuptools.package-data]
+"reviewlib.dashboard" = ["assets/*.html", "assets/*.js", "assets/*.css"]

@@ -36,6 +36,15 @@ bin/review --show-board | grep -q "8 seats"
 # The single-file CLI must always parse.
 python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse OK')"
 
+# HYP-742: the local web dashboard subcommand must be wired and its help must parse.
+bin/review dashboard --help | grep -q -- "--no-open"
+bin/review dashboard --help | grep -q -- "--port"
+
+# Dashboard parser / store / JSON endpoints (no backends, no network beyond a local
+# 127.0.0.1 socket the test binds itself; log dir + store are redirected to temp dirs).
+python3 tests/test_dashboard.py
+echo "dashboard tests OK"
+
 # Streaming runner: real-time log growth + partial-output-on-timeout (no backends
 # needed — drives a fake slow python child).
 REVIEW_LOG_DIR="$(mktemp -d)" python3 tests/test_streaming.py

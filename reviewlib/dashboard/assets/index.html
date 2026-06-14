@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <title>review-cli dashboard</title>
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <h1>review-cli <span class="muted">dashboard</span></h1>
+    </div>
+    <div class="topbar-right">
+      <span id="health" class="health" title="server health">connecting…</span>
+      <button id="refresh" class="btn" title="reload data">↻ refresh</button>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button data-panel="overview" class="tab active">Overview</button>
+    <button data-panel="chat" class="tab">Chat logs</button>
+    <button data-panel="stats" class="tab">Stats</button>
+    <button data-panel="models" class="tab">Models &amp; roles</button>
+    <button data-panel="metrics" class="tab">Metrics</button>
+    <button data-panel="feedback" class="tab">Overseer feedback</button>
+    <button data-panel="modes" class="tab">Modes</button>
+    <button data-panel="errors" class="tab">Errors</button>
+    <button data-panel="tasks" class="tab">Tasks</button>
+    <button data-panel="prompts" class="tab">Prompts</button>
+    <button data-panel="links" class="tab">PRs &amp; tickets</button>
+  </nav>
+
+  <main id="main">
+    <section id="panel" class="panel"><div class="loading">Loading…</div></section>
+  </main>
+
+  <footer class="footer">
+    <span id="footer-paths" class="muted"></span>
+  </footer>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
