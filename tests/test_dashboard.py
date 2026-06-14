@@ -196,6 +196,10 @@ def test_brainstorm_persona_markdown_headings_stay_in_transcript():
             "Here is my analysis.\n\n"
             "## Risks\nRace conditions on the cache.\n\n"
             "### Plan\nStep 1: add a lock. Step 2: ship.\n\n"
+            # Headings that START with reserved marker words but are the persona's OWN —
+            # they must NOT be treated as control sections (codex P3).
+            "## Moderator notes\nMy own aside about the moderator.\n\n"
+            "# Final synthesis plan\nHow I'd structure a synthesis.\n\n"
             "#### Security reviewer (gemini)\n"
             "Looks fine to me.\n\n"
             "## Moderator (round 1)\nSTOP.\n",
@@ -209,9 +213,14 @@ def test_brainstorm_persona_markdown_headings_stay_in_transcript():
         assert "Race conditions" in prag["text"]
         assert "### Plan" in prag["text"]
         assert "Step 1: add a lock" in prag["text"]
-        # But the moderator section is still excluded.
+        # Reserved-word-PREFIX headings authored by the persona stay in its transcript.
+        assert "## Moderator notes" in prag["text"], prag["text"]
+        assert "My own aside about the moderator" in prag["text"]
+        assert "# Final synthesis plan" in prag["text"]
+        assert "How I'd structure a synthesis" in prag["text"]
+        # But the EXACT control sections (`## Moderator (round N)`) are still excluded.
         assert "STOP" not in prag["text"]
-        assert "Moderator" not in prag["text"]
+        assert "(round 1)" not in prag["text"]
 
 
 def test_brainstorm_model_attribution_is_stable_across_log_aging():

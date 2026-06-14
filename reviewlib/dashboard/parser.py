@@ -332,13 +332,14 @@ def parse_call_log(path: Path) -> CallLog | None:
 
 _BS_HEADER_RE = re.compile(r"panel=(?P<panel>[^ ]*) moderator=(?P<mod>[^ ]*)")
 _BS_PERSONA_RE = re.compile(r"^#### (?P<name>.+?) \((?P<model>[^)]+)\)\s*$")
-# The SPECIFIC dashboard section markers the brainstorm WRITER emits after a round's
-# persona blocks (modes/brainstorm.py): `## Moderator (round N)` and `# Final synthesis`.
-# Reaching one ends the current persona's capture. It is deliberately TIGHT: a persona's
-# own Markdown headings (`## Risks`, `### Plan`) must NOT terminate capture and drop the
-# rest of that model's transcript (codex P2) — only these exact dashboard markers do.
-# (`# Round N` is matched separately above; `#### …` persona headings never match here.)
-_BS_SECTION_RE = re.compile(r"^(?:## Moderator\b|# Final synthesis\b)")
+# The EXACT dashboard section markers the brainstorm WRITER emits after a round's persona
+# blocks (modes/brainstorm.py): `## Moderator (round N)` and `# Final synthesis` (each on
+# its own line). Reaching one ends the current persona's capture. The match is exact —
+# anchored to end-of-line — so a persona's OWN Markdown headings, even ones that merely
+# START with these words (`## Moderator notes`, `# Final synthesis plan`, `## Risks`,
+# `### Plan`), do NOT terminate capture and drop the rest of that model's transcript
+# (codex P3). (`# Round N` is matched separately above; `#### …` personas never match here.)
+_BS_SECTION_RE = re.compile(r"^(?:## Moderator \(round \d+\)|# Final synthesis)\s*$")
 
 
 def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
