@@ -178,9 +178,11 @@ secrets, so the dashboard is never exposed on the network.
 **Data sources (read-only):** review-cli does not emit a structured run record, so the
 dashboard reads the real on-disk artifacts in `log_dir()` — the per-call streamed logs
 (`{stamp}-{backend}-r{n}.log`) and the brainstorm discussion logs (`{stamp}-brainstorm.md`).
-Calls are time-clustered into **sessions** (review-cli emits no run id; a session = a burst
-of calls separated by a gap), and the mode (review / panel / brainstorm) is inferred from
-the call/round shape.
+Subprocess backends (codex/claude/opencode) write these live; REST backends (gemini, z.ai,
+commandcode) emit an equivalent sidecar log on every call — each under its OWN backend name,
+so every backend is counted and attributed correctly. Calls are time-clustered into
+**sessions** (review-cli emits no run id; a session = a burst of calls separated by a gap),
+and the mode (review / panel / brainstorm) is inferred from the call/round shape.
 
 **Panels:** Chat logs (per-run transcripts), Stats (runs over time, by mode/model/role),
 Models & roles, Metrics (durations, success/fail rates), Overseer feedback, Modes, Errors,

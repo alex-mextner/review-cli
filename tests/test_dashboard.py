@@ -352,6 +352,96 @@ def test_gemini_rest_run_emits_parseable_sidecar_log():
         assert stats["call_count"] == 1
 
 
+def test_openai_compatible_rest_runs_emit_per_backend_sidecar_logs():
+    """(HYP-742 logging gap) Each OpenAI-compatible REST backend (z.ai, commandcode)
+    must emit its dashboard sidecar UNDER ITS OWN backend name, not lumped under a
+    hardcoded "gemini". Before the fix _emit_rest_log hardcoded "gemini" and
+    _openai_compatible_request emitted nothing, so z.ai/commandcode runs were invisible.
+    Assert each backend writes a correctly-named `*-{backend}-r{n}.log` the parser reads
+    and the dashboard attributes the run to that backend."""
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    class _FakeResp:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    fake_payload = json.dumps({
+        "choices": [{"message": {"content": "One finding: handle the empty list."}}],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+    }).encode("utf-8")
+
+    # (backend entry function, model string, expected sidecar backend name, env key)
+    cases = [
+        (backends.review_zai, "zai", "z.ai", "ZAI_API_KEY"),
+        (backends.review_commandcode, "commandcode", "commandcode", "COMMANDCODE_API_KEY"),
+    ]
+    for entry, model, expected_backend, env_key in cases:
+        with tempfile.TemporaryDirectory() as logd:
+            os.environ["REVIEW_LOG_DIR"] = logd
+            os.environ[env_key] = "fake-key"
+            old_urlopen = urllib.request.urlopen
+            try:
+                urllib.request.urlopen = lambda req, timeout=None: _FakeResp(fake_payload)
+                result = entry(model, "review this", "", Path(logd), 30, round_no=4)
+            finally:
+                urllib.request.urlopen = old_urlopen
+                os.environ.pop("REVIEW_LOG_DIR", None)
+                os.environ.pop(env_key, None)
+
+            assert result.returncode == 0, (expected_backend, result.stderr)
+            # The sidecar is named for THIS backend (not "gemini"), with the round we passed.
+            logs = list(Path(logd).glob(f"*-{expected_backend}-r4.log"))
+            assert len(logs) == 1, (expected_backend, [x.name for x in Path(logd).glob("*")])
+            # And NOT misfiled under gemini.
+            assert not list(Path(logd).glob("*-gemini-*.log")), expected_backend
+            c = p.parse_call_log(logs[0])
+            assert c is not None and c.backend == expected_backend, (expected_backend, c)
+            assert c.round == 4
+            assert c.exit_code == 0
+            assert "finding" in c.body.lower()
+            # The dashboard counts it under the per-backend name, so the run is visible.
+            stats = p.compute_stats(p.load_sessions(Path(logd)))
+            assert expected_backend in stats["by_model"], (expected_backend, stats["by_model"])
+            assert stats["call_count"] == 1
+
+
+def test_openai_compatible_failure_emits_per_backend_sidecar():
+    """A FAILED z.ai/commandcode call (HTTP error / missing key) must also emit a sidecar
+    under its own backend name — a failed run stays visible, never an invisible 127."""
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    # Missing key: the backend must log a failure sidecar (not raise out of run_panel).
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        # Ensure no key is present.
+        for k in ("ZAI_API_KEY", "ZHIPU_API_KEY", "GEMINI_ENV_FILE"):
+            os.environ.pop(k, None)
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        try:
+            result = backends.review_zai("zai", "q", "", Path(logd), 10, round_no=0)
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("GEMINI_ENV_FILE", None)
+        assert result.returncode != 0
+        logs = list(Path(logd).glob("*-z.ai-r0.log"))
+        assert len(logs) == 1, [x.name for x in Path(logd).glob("*")]
+        c = p.parse_call_log(logs[0])
+        assert c is not None and c.backend == "z.ai"
+        assert c.exit_code == 1
+        assert c.has_error is True
+
+
 def test_gemini_network_failure_still_emits_a_sidecar_log():
     """(codex P2) A non-HTTP Gemini failure (network/DNS/socket timeout, malformed JSON)
     must still produce a `.log` and a non-zero ReviewResult — not raise out of run_panel

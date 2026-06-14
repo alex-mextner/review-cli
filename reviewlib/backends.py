@@ -240,12 +240,12 @@ def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int, r
         text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
         usage = payload.get("usageMetadata", {})
         stdout = text.strip() + f"\n\nprompt_tokens={usage.get('promptTokenCount', 0)} output_tokens={usage.get('candidatesTokenCount', 0)}\n"
-        _emit_rest_log(command, round_no=round_no, returncode=0, stdout=stdout, stderr="", started=started)
+        _emit_rest_log("gemini", command, round_no=round_no, returncode=0, stdout=stdout, stderr="", started=started)
         return ReviewResult(model=model, command=command, returncode=0, stdout=stdout, stderr="")
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
         rc = exc.code or 1
-        _emit_rest_log(command, round_no=round_no, returncode=rc, stdout="", stderr=body_text, started=started)
+        _emit_rest_log("gemini", command, round_no=round_no, returncode=rc, stdout="", stderr=body_text, started=started)
         return ReviewResult(model=model, command=command, returncode=rc, stdout="", stderr=body_text)
     except Exception as exc:  # noqa: BLE001
         # Anything other than an HTTPError: a missing API key (RuntimeError from
@@ -260,11 +260,11 @@ def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int, r
         # consistent with the subprocess backends (codex P2). rc 124 = the timeout code.
         if _is_timeout_error(exc):
             _emit_rest_log(
-                command, round_no=round_no, returncode=124, stdout="", stderr=err,
+                "gemini", command, round_no=round_no, returncode=124, stdout="", stderr=err,
                 started=started, timed_out=True, timeout_secs=timeout,
             )
             return ReviewResult(model=model, command=command, returncode=124, stdout="", stderr=err)
-        _emit_rest_log(command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
+        _emit_rest_log("gemini", command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
         return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
 
 
@@ -280,19 +280,23 @@ def _is_timeout_error(exc: BaseException) -> bool:
 
 
 def _emit_rest_log(
-    argv0: str, *, round_no: int, returncode: int, stdout: str, stderr: str,
+    backend: str, argv0: str, *, round_no: int, returncode: int, stdout: str, stderr: str,
     started: datetime | None = None, timed_out: bool = False, timeout_secs: int | None = None,
 ) -> None:
     """Best-effort sidecar log for a NON-subprocess (REST) backend run.
 
     Mirrors what `_run_streamed` writes for subprocess backends so the dashboard parser
-    counts the run. Logging must never take down a review: a read-only log dir or write
-    error is swallowed (the backend already produced its result). ``started`` is the
-    call's START time so the dashboard reports an honest duration (codex P2); ``timed_out``
+    counts the run. ``backend`` is the canonical backend name (gemini, z.ai, commandcode)
+    — it becomes the `{stamp}-{backend}-r{n}.log` filename segment the parser reads, so
+    EACH REST backend is attributed to itself in the dashboard, not lumped under a single
+    hardcoded name (HYP-742: z.ai/commandcode runs were invisible because this hardcoded
+    "gemini"). Logging must never take down a review: a read-only log dir or write error
+    is swallowed (the backend already produced its result). ``started`` is the call's
+    START time so the dashboard reports an honest duration (codex P2); ``timed_out``
     records a TIMEOUT marker so a REST timeout counts as a timeout, not a generic error."""
     try:
         write_sidecar_log(
-            "gemini", round_no=round_no, argv0=argv0, returncode=returncode, stdout=stdout,
+            backend, round_no=round_no, argv0=argv0, returncode=returncode, stdout=stdout,
             stderr=stderr, started=started, timed_out=timed_out, timeout_secs=timeout_secs,
         )
     except OSError:
@@ -399,7 +403,8 @@ def _parse_openai_usage(payload: object) -> tuple[int, int]:
 
 def _openai_compatible_request(
     *, model: str, api_model: str, label: str, base_url: str, key: str,
-    prompt: str, diff: str, timeout: int, extra_body: dict | None = None,
+    prompt: str, diff: str, timeout: int, backend: str, round_no: int = 0,
+    extra_body: dict | None = None,
 ) -> ReviewResult:
     """POST an OpenAI-compatible chat/completions request and return a ReviewResult.
 
@@ -407,6 +412,15 @@ def _openai_compatible_request(
     and is preserved in ReviewResult.model — mode_review keys results by the requested
     string, so substituting the resolved provider id here would KeyError. `api_model`
     is the resolved provider model id sent on the wire (e.g. glm-4.6, deepseek/deepseek-v4-flash).
+
+    `backend` is the canonical sidecar name (e.g. `z.ai`, `commandcode`) used for the
+    dashboard `.log` file, and `round_no` is threaded from the panel. Like review_gemini,
+    these REST backends never go through `_run_streamed`, so they MUST emit their own
+    sidecar log on EVERY return path or the dashboard parser (which reads only `.log`
+    files) never sees the run — z.ai/commandcode runs were invisible and models were
+    undercounted (HYP-742). The sidecar is stamped with the call START time so a slow
+    call's duration and session clustering stay correct (codex P2); a socket timeout is
+    recorded as a TIMEOUT, not a generic error, keeping the timeout metric consistent.
 
     `extra_body` merges provider-specific request fields into the body while keeping the
     shared OpenAI wire shape generic. Both current callers (z.ai, commandcode) pass None;
@@ -421,6 +435,7 @@ def _openai_compatible_request(
     panel treats a failed call as a dead backend rather than crashing the whole run."""
     url = base_url.rstrip("/") + "/chat/completions"
     command = f"{label} API {api_model}"
+    started = datetime.now(timezone.utc)
     body = {
         "model": api_model,
         "messages": [{"role": "user", "content": _payload(prompt, diff)}],
@@ -446,33 +461,40 @@ def _openai_compatible_request(
             # review — it has nothing to review with. Returning rc=0 here would let
             # mode_review write a "reviewed" stamp and satisfy the commit gate with an
             # empty result. Fail-closed: map it to a non-zero dead-backend result.
-            return ReviewResult(
-                model=model, command=command, returncode=1, stdout="",
-                stderr=f"{label} API returned no assistant content: {raw[:500]}",
-            )
+            stderr = f"{label} API returned no assistant content: {raw[:500]}"
+            _emit_rest_log(backend, command, round_no=round_no, returncode=1, stdout="", stderr=stderr, started=started)
+            return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=stderr)
         prompt_tokens, output_tokens = _parse_openai_usage(payload)
         stdout = text.strip() + (
             f"\n\nprompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
         )
+        _emit_rest_log(backend, command, round_no=round_no, returncode=0, stdout=stdout, stderr="", started=started)
         return ReviewResult(model=model, command=command, returncode=0, stdout=stdout, stderr="")
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
-        return ReviewResult(model=model, command=command, returncode=exc.code, stdout="", stderr=body_text)
+        rc = exc.code or 1
+        _emit_rest_log(backend, command, round_no=round_no, returncode=rc, stdout="", stderr=body_text, started=started)
+        return ReviewResult(model=model, command=command, returncode=rc, stdout="", stderr=body_text)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # Connection refused / DNS failure / socket timeout — no HTTP status. URLError
         # and TimeoutError are both OSError subclasses; the wide catch normalises any
-        # transport-level failure to a dead-backend result instead of crashing.
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="",
-            stderr=f"{label} API request failed: {exc}",
-        )
+        # transport-level failure to a dead-backend result instead of crashing. A socket
+        # timeout is logged as a TIMEOUT (rc 124) to match the subprocess + gemini metric.
+        err = f"{label} API request failed: {exc}"
+        if _is_timeout_error(exc):
+            _emit_rest_log(
+                backend, command, round_no=round_no, returncode=124, stdout="", stderr=err,
+                started=started, timed_out=True, timeout_secs=timeout,
+            )
+            return ReviewResult(model=model, command=command, returncode=124, stdout="", stderr=err)
+        _emit_rest_log(backend, command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
     except (json.JSONDecodeError, ValueError) as exc:
         # 2xx with a non-JSON / truncated body — the provider returned garbage. Treat
         # it as a failed call rather than letting the decode error escape.
-        return ReviewResult(
-            model=model, command=command, returncode=1, stdout="",
-            stderr=f"{label} API returned a malformed response: {exc}",
-        )
+        err = f"{label} API returned a malformed response: {exc}"
+        _emit_rest_log(backend, command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
 
 
 # z.ai (Zhipu / GLM) — OpenAI-compatible /chat/completions, Bearer-keyed.
@@ -505,16 +527,20 @@ def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int, roun
     # (panel.py: backend(model, prompt, diff, cwd, timeout, round_no)) does not raise
     # for these post-HYP-741 REST backends and the dashboard attributes the run to the
     # right brainstorm round.
+    # A forced-mode config error or a missing key both produce a NON-zero result AND a
+    # sidecar log — like review_gemini, these are real (failed) run attempts and must be
+    # visible in the dashboard, never raise out of run_panel as an invisible internal 127.
     try:
         resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
+        key = _zai_key()
     except RuntimeError as exc:
+        _emit_rest_log("z.ai", "z.ai", round_no=round_no, returncode=1, stdout="", stderr=str(exc))
         return ReviewResult(model=model, command="z.ai", returncode=1, stdout="", stderr=str(exc))
     zai_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ZAI_MODEL", ZAI_DEFAULT_MODEL)
     base_url = os.environ.get("ZAI_BASE_URL", ZAI_DEFAULT_BASE_URL)
-    key = _zai_key()
     return _openai_compatible_request(
         model=model, api_model=zai_model, label="z.ai", base_url=base_url, key=key,
-        prompt=prompt, diff=diff, timeout=timeout,
+        prompt=prompt, diff=diff, timeout=timeout, backend="z.ai", round_no=round_no,
     )
 
 
@@ -568,18 +594,22 @@ def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: i
     # commandcode CLI), surfaced as a dead-backend result, never a silent api POST.
     # `round_no` is accepted so the panel's uniform 6-arg dispatch does not raise for
     # this post-HYP-741 REST backend (see review_zai for the rationale).
+    # A forced-mode config error or a missing key both produce a NON-zero result AND a
+    # sidecar log (see review_zai) — a failed run must be visible in the dashboard, never
+    # an invisible internal 127 raised out of run_panel.
     try:
         resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
+        key = _commandcode_key()
     except RuntimeError as exc:
+        _emit_rest_log("commandcode", "commandcode", round_no=round_no, returncode=1, stdout="", stderr=str(exc))
         return ReviewResult(model=model, command="commandcode", returncode=1, stdout="", stderr=str(exc))
     has_suffix = ":" in model
     env_model = os.environ.get("COMMANDCODE_MODEL")
     cc_model = model.split(":", 1)[1] if has_suffix else (env_model or COMMANDCODE_DEFAULT_MODEL)
     base_url = os.environ.get("COMMANDCODE_BASE_URL") or COMMANDCODE_DEFAULT_BASE_URL
-    key = _commandcode_key()
     return _openai_compatible_request(
         model=model, api_model=cc_model, label="commandcode", base_url=base_url, key=key,
-        prompt=prompt, diff=diff, timeout=timeout,
+        prompt=prompt, diff=diff, timeout=timeout, backend="commandcode", round_no=round_no,
     )
 
 

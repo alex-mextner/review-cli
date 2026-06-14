@@ -7,9 +7,11 @@ semantic versioning.
 
 - **Local web dashboard (`review dashboard`)** — serves logs, per-model stats,
   timeout/error metrics, and a moderator/overseer view over the sidecar `.log`
-  files. REST backends (gemini and the keyed OpenAI-compatible providers) now
-  emit the same sidecar logs as subprocess backends, with `round_no` threaded
-  from the panel so brainstorm rounds are attributed correctly. CSRF-guarded
+  files. Every REST backend now emits the same sidecar logs as the subprocess
+  backends, each under its OWN backend name (gemini, z.ai, commandcode) — so
+  z.ai / commandcode runs are no longer invisible or misattributed — with
+  `round_no` threaded from the panel so brainstorm rounds are attributed
+  correctly and a REST socket timeout is counted as a timeout. CSRF-guarded
   write endpoints.
 
 ## 0.2.0
