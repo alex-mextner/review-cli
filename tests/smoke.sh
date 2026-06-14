@@ -19,6 +19,15 @@ bin/review --help | grep -q -- "--strict"
 # Stage 2a: the local pre-classifier toggle must appear in help.
 bin/review --help | grep -q -- "--no-local-model"
 
+# Reviewer board (HYP-741): the board flags must appear in help, and --show-board
+# must list the out-of-the-box DEFAULT_BOARD (no config file needed) with roles and
+# byte-exact commandcode model ids. Availability depends on the env, but the LISTING
+# is always complete.
+bin/review --help | grep -q -- "--show-board"
+bin/review --help | grep -q -- "--no-board"
+bin/review --show-board | grep -q "architect"
+bin/review --show-board | grep -q "commandcode:deepseek/deepseek-v4-pro"
+
 # The single-file CLI must always parse.
 python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse OK')"
 
@@ -50,6 +59,12 @@ echo "claude-api tests OK"
 # no keys/network needed).
 python3 tests/test_provider_keys.py
 echo "provider-keys tests OK"
+
+# Reviewer board (HYP-741): default-board shape, config.yaml `board:` parsing,
+# role-lens injection, graceful skip of unavailable reviewers, CLI wiring. All
+# offline (backends monkeypatched / forced unavailable; no keys, no network).
+python3 tests/test_reviewer_board.py
+echo "reviewer-board tests OK"
 
 # Stage 1 visual-verification suite (cvGate / vision_client / policy / pipeline /
 # composability). All offline: cvGate shells to magick, the vision call is mocked,

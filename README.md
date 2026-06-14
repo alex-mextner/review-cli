@@ -319,6 +319,8 @@ context without getting an edit target.
 --rounds N          Minimum brainstorm rounds before STOP is allowed (default 5).
 --max-rounds N      Hard cap on brainstorm rounds (default 8).
 --list-defaults     Print effective default backends and exit.
+--show-board        Print the active reviewer board (model -> role + availability) and exit.
+--no-board          Disable the reviewer board; use the plain models list instead.
 --prompt TEXT       Override the default review prompt.
 -C / --cwd DIR      Run against a different repository directory.
 ```
@@ -349,6 +351,49 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 
 ---
 
+## Reviewer board
+
+The default `review` (plain diff review) runs a **reviewer board**: a panel where
+each model is given its OWN review role/lens, so the panel covers the diff broadly
+instead of every model doing the same generic pass. The board is the default panel
+out of the box — no config file required. Reviewers whose backend isn't available
+(no key / not on PATH) are skipped and logged; the board degrades gracefully.
+
+The built-in board:
+
+| Reviewer | Backend | Role | Lens focus |
+|---|---|---|---|
+| Opus | `claude:claude-opus-4-8` | `architect` | architecture, design coherence, API shape, abstraction boundaries (also the moderator) |
+| Codex | `codex` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one |
+| Gemini | `gemini` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| DeepSeek | `commandcode:deepseek/deepseek-v4-pro` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
+| Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
+| Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| GLM | `commandcode:zai-org/GLM-5.1` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+
+```bash
+review --show-board   # list the active board (model -> role) + availability
+review --no-board     # disable the board; use the plain `models` list instead
+review -m codex -m gemini   # an explicit -m also bypasses the board (exact models)
+```
+
+Override the board in `config.yaml` with a `board:` list — each entry is a
+`{model, role}` mapping (optional `name:` for the label). An unknown `role` keeps
+the reviewer but falls back to the generic prompt (with a warning); a malformed
+entry is skipped. With no `board:` configured, the built-in board above applies.
+
+```yaml
+board:
+  - { model: "claude:claude-opus-4-8", role: architect }
+  - { model: "codex",                  role: correctness }
+  - { model: "commandcode:Qwen/Qwen3.7-Max", role: security, name: Qwen }
+```
+
+Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`,
+`security`, `tests`.
+
+---
+
 ## Auth
 
 **Gemini:** set `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the environment, or put
@@ -356,6 +401,12 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 `GEMINI_ENV_FILE=/path/to/.env` overrides the search path.
 
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
+
+**commandcode (DeepSeek / Kimi / Qwen / GLM board reviewers):** set
+`COMMANDCODE_API_KEY` (a Command Code `user_...` token) in the environment or in
+`~/.config/review-cli/.env`. Without it, those four board reviewers are skipped and
+the board runs with whatever remains (Opus / Codex / Gemini). No key is ever written
+to disk by review — it is only read.
 
 ---
 

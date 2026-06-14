@@ -174,9 +174,10 @@ def test_default_review_with_diff_threads_visual():
     with the image as context — not the standalone pipeline."""
     captured = {}
 
-    def fake_review(models, prompt, diff, cwd, timeout, staged):
+    def fake_review(models, prompt, diff, cwd, timeout, staged, board=None):
         captured["prompt"] = prompt
         captured["diff"] = diff
+        captured["board"] = board
         return 0
 
     old = cli.mode_review

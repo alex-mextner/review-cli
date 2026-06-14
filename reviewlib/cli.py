@@ -21,6 +21,7 @@ from .config import (
     PANEL_TIMEOUT_DEFAULT,
     _expand_alias,
     _split_models,
+    load_board,
     load_config,
 )
 from .install import install_commit_hook, install_skill
@@ -112,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
         help="per-call timeout seconds (default 1200 for review, 240 for panel modes)",
     )
     parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
+    parser.add_argument("--show-board", action="store_true", help="print the active reviewer board (model -> role, availability) and exit")
+    parser.add_argument("--no-board", action="store_true", help="disable the reviewer board; use the plain models list instead")
     parser.add_argument("--moderator", default=None, help="moderator backend for --quorum/--brainstorm")
     parser.add_argument("--rounds", type=int, default=5, help="brainstorm minimum rounds (min & default 5)")
     parser.add_argument("--max-rounds", type=int, default=8, help="brainstorm hard cap on rounds")
@@ -140,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
         effective = config.get("models") or DEFAULT_MODELS
         print("\n".join(_expand_alias(m) for m in effective))
         return 0
+
+    if args.show_board:
+        return _show_board(config)
 
     cwd = _effective_cwd(args.cwd)
     explicit_models = _split_models(args.model)
@@ -250,7 +256,39 @@ def main(argv: list[str] | None = None) -> int:
             pick_moderators(args.moderator, models), args.rounds, args.max_rounds
         )
 
-    return mode_review(models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout, args.staged)
+    # Reviewer board (HYP-741): the default plain-review panel assigns each model
+    # its own role/lens. It is the DEFAULT when the user did not pin explicit -m
+    # models and did not pass --no-board; an explicit -m always wins (the user
+    # picked exact models, honor them as the legacy flat panel). --visual companion
+    # context still folds into the per-reviewer prompt via args.prompt.
+    board = None
+    if not explicit_models and not args.no_board:
+        board = load_board(config)
+    return mode_review(
+        models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout, args.staged, board=board,
+    )
+
+
+def _show_board(config: dict) -> int:
+    """Print the active reviewer board: each reviewer's display name, role, model,
+    and whether its backend is currently available (key/CLI present). Sourced from
+    config.yaml `board:` if set, else the built-in DEFAULT_BOARD. Read-only — no
+    model is called, no key is printed."""
+    board = load_board(config)
+    source = "config.yaml (board:)" if isinstance(config.get("board"), list) and config.get("board") else "default"
+    print(f"Reviewer board ({len(board)} seats, source: {source}):\n")
+    name_w = max((len(r.display) for r in board), default=0)
+    role_w = max((len(r.role or "general") for r in board), default=0)
+    for reviewer in board:
+        available = backends.backend_available(reviewer.model)
+        status = "available" if available else "SKIPPED (no key/CLI)"
+        role = (reviewer.role or "general").ljust(role_w)
+        print(f"  {reviewer.display.ljust(name_w)}  {role}  {reviewer.model}  [{status}]")
+    if any(not backends.backend_available(r.model) for r in board):
+        print("\nSkipped reviewers drop out of the panel at run time; the board degrades "
+              "gracefully. commandcode reviewers need COMMANDCODE_API_KEY, gemini needs "
+              "GEMINI_API_KEY, codex/claude need their CLI on PATH.")
+    return 0
 
 
 def _with_visual(text: str, visual_ctx) -> str:

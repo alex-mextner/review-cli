@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .backends import ReviewResult, backend_available, resolve_backend
-from .config import MODERATOR_CANDIDATES
+from .config import MODERATOR_CANDIDATES, BoardReviewer
 
 
 def format_result(result: ReviewResult) -> str:
@@ -99,6 +99,36 @@ class PanelJob:
     prompt: str
     diff: str = ""
     label: str | None = None
+
+
+def build_board_jobs(
+    board: list[BoardReviewer], base_prompt: str, diff: str,
+) -> tuple[list[PanelJob], list[BoardReviewer]]:
+    """Turn a reviewer board into PanelJobs, skipping unavailable reviewers.
+
+    Each reachable reviewer becomes one PanelJob whose prompt is
+    `base_prompt + "\\n\\n" + role_lens` (the generic prompt alone when the role is
+    unknown / blank) and whose label is `"<display> [<role>]"` so the result block
+    shows who reviewed with which lens. A reviewer whose backend isn't available
+    (no key / no CLI) is SKIPPED — `backend_available` is the same cheap probe the
+    moderator selection uses — and returned in the second tuple element so the
+    caller can log the degradation. The board never crashes on a dead backend; it
+    just shrinks. Returns ([] , skipped) when nothing is reachable; the caller
+    decides how to surface that."""
+    jobs: list[PanelJob] = []
+    skipped: list[BoardReviewer] = []
+    for reviewer in board:
+        if not backend_available(reviewer.model):
+            skipped.append(reviewer)
+            continue
+        lens = reviewer.role_lens
+        prompt = f"{base_prompt}\n\n{lens}" if lens else base_prompt
+        role_tag = reviewer.role or "general"
+        jobs.append(PanelJob(
+            model=reviewer.model, prompt=prompt, diff=diff,
+            label=f"{reviewer.display} [{role_tag}]",
+        ))
+    return jobs, skipped
 
 
 def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResult]:
