@@ -255,22 +255,24 @@ def parse_call_log(path: Path) -> CallLog | None:
             exit_code = int(em.group("code"))
             exit_line_idx = j
         break  # the last non-empty line is decisive either way
-    # The TIMEOUT marker, like the EXIT footer, is authoritative ONLY in the position the
-    # logger writes it: the last non-empty line BEFORE the exit footer. A model's review
-    # output can legitimately QUOTE a `[review-cli] TIMEOUT after Ns` line mid-body (e.g.
-    # while reviewing review-cli's own logs); honoring that would mis-flag a successful
-    # call as a timeout and corrupt the dashboard's timeout/error metrics (codex P2). So
-    # we find the one authoritative timeout-marker index (if any) and recognise only it.
-    # Scan upward from just before the footer (or the file end for a legacy footer-less
-    # log): the real marker is the last non-empty line that is not the footer itself.
+    # The TIMEOUT marker must be tied to a real timeout. The writers ALWAYS emit it
+    # together with the timeout return code 124 (process.py / write_sidecar_log), so a
+    # marker is genuine only when the authoritative exit code is 124 — or absent (a legacy
+    # footer-less log, where we fall back to position). A successful `EXIT 0` review whose
+    # output merely QUOTES `[review-cli] TIMEOUT after Ns` (e.g. while reviewing review-cli's
+    # own logs) must NOT be flagged as a timeout — that would corrupt the dashboard's
+    # timeout/error metrics (codex P2). Even within an honored exit code, recognise the
+    # marker only in the position the logger writes it: the last non-empty line before the
+    # footer (or file end for a legacy log), never an arbitrary quoted line earlier in the body.
     timeout_line_idx: int | None = None
-    scan_start = (exit_line_idx - 1) if exit_line_idx is not None else (len(lines) - 1)
-    for j in range(scan_start, -1, -1):
-        if not lines[j].strip():
-            continue  # skip blank lines between body and footer
-        if _TIMEOUT_RE.match(lines[j]):
-            timeout_line_idx = j
-        break  # only the trailing-most non-body line is decisive
+    if exit_code == 124 or exit_code is None:
+        scan_start = (exit_line_idx - 1) if exit_line_idx is not None else (len(lines) - 1)
+        for j in range(scan_start, -1, -1):
+            if not lines[j].strip():
+                continue  # skip blank lines between body and footer
+            if _TIMEOUT_RE.match(lines[j]):
+                timeout_line_idx = j
+            break  # only the trailing-most non-body line is decisive
     for i, line in enumerate(lines):
         if i == exit_line_idx:
             continue  # the authoritative trailing status footer — kept out of the body

@@ -244,25 +244,35 @@ def test_quoted_exit_line_in_body_is_not_treated_as_status():
 
 
 def test_quoted_timeout_marker_in_body_is_not_treated_as_a_timeout():
-    """(codex P2) Like the EXIT footer, the TIMEOUT marker is authoritative only in its
-    written position (just before the footer). A successful review that QUOTES a
-    `[review-cli] TIMEOUT after Ns` line mid-body must NOT be flagged as a timeout, and
-    the quote must stay visible — else valid successful calls corrupt the timeout metric."""
+    """(codex P2) A TIMEOUT marker is genuine only when the call actually timed out
+    (exit code 124 — the writers always pair them). A successful `EXIT 0` review that
+    QUOTES `[review-cli] TIMEOUT after Ns` must NOT be flagged as a timeout, and the
+    quote must stay visible — even when the quote is the very last body line (the exact
+    residual case codex flagged) — else valid successful calls corrupt the timeout metric."""
     from reviewlib.dashboard import parser as p
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        body = (
+        # (a) quoted mid-body
+        body_mid = (
             "While reviewing the logs I noticed a marker:\n"
-            "[review-cli] TIMEOUT after 12s — partial output above]\n"  # quoted, not real
+            "[review-cli] TIMEOUT after 12s — partial output above]\n"
             "The handling looks fine. Overall the change is correct.\n"
         )
-        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body, exit_code=0)
-        c = p.parse_call_log(path)
-        assert c.exit_code == 0
-        assert c.timed_out is False, "a quoted TIMEOUT marker mid-body must not flag a timeout"
-        assert c.has_error is False
-        assert "TIMEOUT after 12s" in c.body, "the quoted marker stays in the body"
+        c_mid = p.parse_call_log(_write_call_log(ld, "20260601T100000_000000", "codex", 0, body_mid, exit_code=0))
+        assert c_mid.timed_out is False and c_mid.has_error is False
+        assert "TIMEOUT after 12s" in c_mid.body
+        # (b) quoted as the LAST body line, with EXIT 0 (codex's residual case): position
+        # alone would mis-detect it; the exit-code gate (124) keeps it a non-timeout.
+        body_last = (
+            "Reviewing the timeout handling; the log ends with:\n"
+            "[review-cli] TIMEOUT after 12s — partial output above]\n"
+        )
+        c_last = p.parse_call_log(_write_call_log(ld, "20260601T100010_000000", "codex", 0, body_last, exit_code=0))
+        assert c_last.exit_code == 0
+        assert c_last.timed_out is False, "EXIT 0 means no timeout even if the last line quotes the marker"
+        assert c_last.has_error is False
+        assert "TIMEOUT after 12s" in c_last.body, "the quoted marker stays in the body"
 
 
 def test_real_timeout_marker_before_footer_is_still_detected():
