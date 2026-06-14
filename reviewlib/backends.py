@@ -160,22 +160,29 @@ def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
     review already reads (GEMINI_ENV_FILE override, else GEMINI_ENV_FALLBACKS — the
     shared `~/.config/review-cli/.env` and the personal env). Returns None if unset.
 
+    Precedence is KEY-NAME-FIRST, not path-first: env var beats every file, and among
+    the files the canonical/primary key name wins over an alias REGARDLESS of which
+    .env file each lives in. So `COMMON_CODE_API_KEY` in a later fallback file beats
+    `DEEPSEEK_API_KEY` in an earlier one — the precedence a caller reading the env-var
+    order would expect. (A path-first loop would let an earlier file's alias shadow a
+    later file's primary key, a surprising and non-deterministic ordering.)
+
     REUSE (§6.4 / CTO D9): vision providers piggyback on the SAME config surface review
     already uses for Gemini — no new per-provider egress config is invented."""
+    # env var wins over any file, in declared order (primary name first).
     for name in env_names:
         value = os.environ.get(name, "").strip()
         if value:
             return value
     env_file = os.environ.get("GEMINI_ENV_FILE")
     paths = (Path(env_file),) if env_file else GEMINI_ENV_FALLBACKS
-    # Try EVERY accepted var name against each .env file (fallback_var first to
-    # preserve the original single-name behaviour for callers that pass it), so a
-    # provider with several accepted key names (e.g. common-code →
-    # COMMON_CODE_API_KEY / COMMANDCODE_API_KEY / DEEPSEEK_API_KEY) resolves from the
-    # file under any of them, mirroring the env-var lookup above.
+    # File lookup is name-priority-first: fallback_var (the canonical/primary name),
+    # then the remaining accepted aliases, each checked across ALL .env files before
+    # moving to the next name. This keeps key-name precedence deterministic and
+    # independent of file ordering, mirroring the env-var lookup above.
     file_vars = (fallback_var, *(n for n in env_names if n != fallback_var))
-    for path in paths:
-        for var in file_vars:
+    for var in file_vars:
+        for path in paths:
             key = _read_env_key(path, var)
             if key:
                 return key
@@ -232,9 +239,41 @@ def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
 # shape stays identical; only the endpoint, key, and default model differ.
 
 
+def _parse_openai_choice(payload: object) -> str:
+    """Pull assistant text out of an OpenAI-compatible response, tolerating any shape.
+
+    A provider can return a 2xx body that is valid JSON but NOT the expected object
+    (e.g. `[]`, `{"choices":[null]}`, `{"choices":[{"message":[]}]}`). Each access is
+    type-guarded so a wrong shape yields "" instead of raising AttributeError/
+    TypeError/IndexError out of the backend (those would crash the whole run)."""
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    return content if isinstance(content, str) else ""
+
+
+def _parse_openai_usage(payload: object) -> tuple[int, int]:
+    """Return (prompt_tokens, output_tokens) from a response, 0/0 on any wrong shape."""
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return 0, 0
+    prompt = usage.get("prompt_tokens", 0)
+    output = usage.get("completion_tokens", 0)
+    return (prompt if isinstance(prompt, int) else 0, output if isinstance(output, int) else 0)
+
+
 def _openai_compatible_request(
     *, model: str, api_model: str, label: str, base_url: str, key: str,
-    prompt: str, diff: str, timeout: int,
+    prompt: str, diff: str, timeout: int, extra_body: dict | None = None,
 ) -> ReviewResult:
     """POST an OpenAI-compatible chat/completions request and return a ReviewResult.
 
@@ -243,17 +282,26 @@ def _openai_compatible_request(
     string, so substituting the resolved provider id here would KeyError. `api_model`
     is the resolved provider model id sent on the wire (e.g. glm-4.6, deepseek-chat).
 
+    `extra_body` merges provider-specific request fields into the body (e.g. DeepSeek's
+    `thinking` toggle) while keeping the shared OpenAI wire shape generic — z.ai passes
+    None, common-code passes the non-thinking flag for the V4 default.
+
     `base_url` is the endpoint root (e.g. https://api.z.ai/api/paas/v4); the
     /chat/completions suffix is appended here so callers pass the same value users
-    would set in any OpenAI-compatible client. Network errors map to a non-zero
-    returncode with the body on stderr — exactly like review_gemini, so the panel
-    treats a failed call as a dead backend rather than crashing the run."""
+    would set in any OpenAI-compatible client. EVERY failure mode maps to a non-zero
+    returncode with the error on stderr — HTTP status errors, connection refused /
+    DNS / socket timeouts (URLError, OSError, TimeoutError), malformed JSON
+    (JSONDecodeError), and valid-but-wrong-shape JSON (type-guarded parse) — so the
+    panel treats a failed call as a dead backend rather than crashing the whole run."""
     url = base_url.rstrip("/") + "/chat/completions"
+    command = f"{label} API {api_model}"
     body = {
         "model": api_model,
         "messages": [{"role": "user", "content": _payload(prompt, diff)}],
         "stream": False,
     }
+    if extra_body:
+        body.update(extra_body)
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -263,20 +311,42 @@ def _openai_compatible_request(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        choices = payload.get("choices", [])
-        text = ""
-        if choices:
-            text = (choices[0].get("message", {}) or {}).get("content", "") or ""
-        usage = payload.get("usage", {})
+            raw = response.read().decode("utf-8")
+        payload = json.loads(raw)
+        text = _parse_openai_choice(payload)
+        if not text.strip():
+            # A 2xx whose body carries NO assistant content (`[]`, `{"choices":[null]}`,
+            # `{"error":...}` with HTTP 200, an empty completion) is NOT a successful
+            # review — it has nothing to review with. Returning rc=0 here would let
+            # mode_review write a "reviewed" stamp and satisfy the commit gate with an
+            # empty result. Fail-closed: map it to a non-zero dead-backend result.
+            return ReviewResult(
+                model=model, command=command, returncode=1, stdout="",
+                stderr=f"{label} API returned no assistant content: {raw[:500]}",
+            )
+        prompt_tokens, output_tokens = _parse_openai_usage(payload)
         stdout = text.strip() + (
-            f"\n\nprompt_tokens={usage.get('prompt_tokens', 0)} "
-            f"output_tokens={usage.get('completion_tokens', 0)}\n"
+            f"\n\nprompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
         )
-        return ReviewResult(model=model, command=f"{label} API {api_model}", returncode=0, stdout=stdout, stderr="")
+        return ReviewResult(model=model, command=command, returncode=0, stdout=stdout, stderr="")
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
-        return ReviewResult(model=model, command=f"{label} API {api_model}", returncode=exc.code, stdout="", stderr=body_text)
+        return ReviewResult(model=model, command=command, returncode=exc.code, stdout="", stderr=body_text)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # Connection refused / DNS failure / socket timeout — no HTTP status. URLError
+        # and TimeoutError are both OSError subclasses; the wide catch normalises any
+        # transport-level failure to a dead-backend result instead of crashing.
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="",
+            stderr=f"{label} API request failed: {exc}",
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        # 2xx with a non-JSON / truncated body — the provider returned garbage. Treat
+        # it as a failed call rather than letting the decode error escape.
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="",
+            stderr=f"{label} API returned a malformed response: {exc}",
+        )
 
 
 # z.ai (Zhipu / GLM) — OpenAI-compatible. General API base; the /coding/paas/v4
@@ -309,7 +379,11 @@ def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> R
 # DeepSeek's OpenAI-compatible endpoint and are overridable via env so this is not
 # nailed to a single guess. See HYP-741.
 COMMON_CODE_DEFAULT_BASE_URL = "https://api.deepseek.com"
-COMMON_CODE_DEFAULT_MODEL = "deepseek-chat"
+# `deepseek-chat` is a LEGACY alias DeepSeek discontinues on 2026-07-24 (it currently
+# maps to the non-thinking mode of deepseek-v4-flash). Default to the live model id so
+# users picking the bare `common-code` backend don't silently break after that date.
+# Override with COMMON_CODE_MODEL. See DeepSeek API change log + HYP-741.
+COMMON_CODE_DEFAULT_MODEL = "deepseek-v4-flash"
 
 
 def _common_code_key() -> str:
@@ -324,13 +398,48 @@ def _common_code_key() -> str:
     )
 
 
+def _deepseek_thinking_extra_body(api_model: str, *, is_default_model: bool, is_default_base_url: bool) -> dict | None:
+    """Pin thinking OFF, but ONLY on the BARE DeepSeek compatibility default path.
+
+    `deepseek-chat` (the old default) mapped to the NON-thinking mode of
+    deepseek-v4-flash; the V4 model ids default thinking ON, which would silently
+    change latency/cost/output for existing common-code users who never picked a model.
+    So for the BARE default — no `:` suffix, no COMMON_CODE_MODEL override, AND the
+    default DeepSeek base URL — we send `{"thinking": {"type": "disabled"}}` to keep it
+    a drop-in replacement.
+
+    Three guards, ALL required, so the DeepSeek-specific `thinking` field never leaks
+    onto an endpoint that can't read it (such a field can 400 a foreign gateway):
+      - is_default_model: an EXPLICIT model (`common-code:deepseek-v4-pro`, or
+        COMMON_CODE_MODEL=...) is the user's choice — respect its provider default.
+      - is_default_base_url: a COMMON_CODE_BASE_URL override points at a non-DeepSeek
+        gateway — never inject a DeepSeek field there.
+      - deepseek-v4* id: belt-and-suspenders on the model family."""
+    if is_default_model and is_default_base_url and api_model.startswith("deepseek-v4"):
+        return {"thinking": {"type": "disabled"}}
+    return None
+
+
 def review_common_code(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
-    cc_model = model.split(":", 1)[1] if ":" in model else os.environ.get("COMMON_CODE_MODEL", COMMON_CODE_DEFAULT_MODEL)
-    base_url = os.environ.get("COMMON_CODE_BASE_URL", COMMON_CODE_DEFAULT_BASE_URL)
+    has_suffix = ":" in model
+    env_model = os.environ.get("COMMON_CODE_MODEL")
+    cc_model = model.split(":", 1)[1] if has_suffix else (env_model or COMMON_CODE_DEFAULT_MODEL)
+    # The default path is the bare backend with no explicit model anywhere — only then
+    # do we pin thinking off to preserve the prior deepseek-chat (non-thinking) default.
+    is_default_model = not has_suffix and not env_model
+    env_base_url = os.environ.get("COMMON_CODE_BASE_URL")
+    base_url = env_base_url or COMMON_CODE_DEFAULT_BASE_URL
+    # Compare the NORMALISED base URL to the default, not just "was it overridden":
+    # an explicit COMMON_CODE_BASE_URL=https://api.deepseek.com/ is still DeepSeek and
+    # must keep the non-thinking default. Only a genuinely different host suppresses it.
+    is_default_base_url = base_url.rstrip("/").lower() == COMMON_CODE_DEFAULT_BASE_URL.rstrip("/").lower()
     key = _common_code_key()
     return _openai_compatible_request(
         model=model, api_model=cc_model, label="common-code", base_url=base_url, key=key,
         prompt=prompt, diff=diff, timeout=timeout,
+        extra_body=_deepseek_thinking_extra_body(
+            cc_model, is_default_model=is_default_model, is_default_base_url=is_default_base_url,
+        ),
     )
 
 
