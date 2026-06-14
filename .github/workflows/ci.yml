@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # ImageMagick + Pillow gate the visual-verification tests. apt ships
+      # ImageMagick 6 (`convert`), while the cvGate needs the v7 `magick` command —
+      # so on the stock runner the visual suite self-skips (loudly) and the core
+      # suite still runs. Install both anyway so a v7 runner picks them up.
+      - name: Install ImageMagick
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+      - name: Install package + test deps
+        run: pip install -e '.[test]'
+      - name: Smoke + unit tests
+        run: bash tests/smoke.sh
