@@ -217,10 +217,108 @@ def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
         return ReviewResult(model=model, command=f"Gemini API {gemini_model}", returncode=exc.code, stdout="", stderr=body_text)
 
 
+def _ensure_workspace_trusted(cwd: Path) -> None:
+    """Pre-accept Claude Code's workspace trust for ``cwd`` in ~/.claude.json.
+
+    The headless claude-p backend drives the interactive claude TUI under a PTY;
+    in an untrusted directory (a fresh git worktree, a not-yet-opened repo) it
+    blocks on claude's "Quick safety check / Do you trust this folder?" gate.
+    claude-p's PTY auto-accept of that gate is non-deterministic (it sometimes
+    reaches the answer, sometimes reports ``workspace_trust_blocked``), and the
+    bypass routes are worse: ``--permission-mode bypassPermissions`` and
+    ``--dangerously-skip-permissions`` each raise their own safety gate the PTY
+    layer cannot dismiss. Seeding the trust flag directly makes the gate never
+    appear, so the deterministic ``dontAsk`` path just works.
+
+    This is a DELIBERATE, persistent edit to the user's global config (review is
+    configured to auto-trust the directory it reviews): a later interactive
+    claude session in the same dir inherits the trust. It is scoped to the trust
+    flag (+ onboarding) only — no permissions or tools are granted.
+
+    Best-effort and conservative: skips the write when already trusted (the
+    common case → no write at all), only touches the one project entry, writes
+    via a same-dir temp + atomic ``os.replace`` (a concurrent reader never sees a
+    half-write), and serialises review's own writers with an flock. Any error
+    (missing / locked / non-JSON config) silently degrades to the old behaviour.
+    """
+    cfg = Path.home() / ".claude.json"
+    if not cfg.exists():
+        return  # best-effort: never fabricate a config the user didn't have
+    # claude keys workspace trust by the RESOLVED real path (it canonicalises
+    # cwd — e.g. /tmp -> /private/tmp, symlinked worktrees), so a raw-path key
+    # would silently miss and the prompt would still fire.
+    key = os.path.realpath(str(cwd))
+    # Serialise the read-modify-write against other review processes with an
+    # advisory flock on a sidecar lock file (the data file itself is swapped by
+    # os.replace, so a lock held on it wouldn't survive the swap). This can't
+    # synchronise against `claude` — it doesn't lock — but the skip-when-already-
+    # trusted guard means we only ever write on the FIRST review in a fresh dir,
+    # keeping that residual window tiny.
+    lock = None
+    flock_mod = None
+    try:
+        try:
+            import fcntl as flock_mod
+        except ImportError:
+            flock_mod = None  # non-POSIX (e.g. Windows) → unsynchronised, best-effort
+        if flock_mod is not None:
+            try:
+                lock = open(cfg.with_name(".claude.json.review-trust.lock"), "w")
+                flock_mod.flock(lock.fileno(), flock_mod.LOCK_EX)
+            except OSError:
+                if lock is not None:
+                    lock.close()
+                lock = None  # lock unavailable → proceed unsynchronised, best-effort
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        projects = data.get("projects")
+        if not isinstance(projects, dict):
+            projects = {}
+            data["projects"] = projects
+        entry = projects.get(key)
+        if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True:
+            return  # already trusted — leave the shared config untouched
+        entry = entry if isinstance(entry, dict) else {}
+        entry["hasTrustDialogAccepted"] = True
+        # Force (not setdefault): a prior blocked/headless attempt can leave a
+        # partial entry with hasCompletedProjectOnboarding=false, which would
+        # still let claude block on the onboarding gate. Seed both to true.
+        entry["hasCompletedProjectOnboarding"] = True
+        projects[key] = entry
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=str(cfg.parent), prefix=".claude.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, cfg)  # atomic: a concurrent reader never sees a half-write
+        except Exception:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    except Exception:
+        return  # malformed / unreadable config → degrade to the old behaviour
+    finally:
+        if lock is not None:
+            try:
+                if flock_mod is not None:
+                    flock_mod.flock(lock.fileno(), flock_mod.LOCK_UN)
+            finally:
+                lock.close()
+
+
 def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
     claude_model = model.split(":", 1)[1] if ":" in model else None
+    # Resolve the binary BEFORE touching trust: a missing claude-p must raise
+    # here, not after _ensure_workspace_trusted has already mutated ~/.claude.json.
+    claude_p = _which("claude-p")
+    # Pre-accept workspace trust for cwd: the headless run cannot answer the
+    # interactive "Do you trust this folder?" gate (see _ensure_workspace_trusted).
+    _ensure_workspace_trusted(cwd)
     argv = [
-        _which("claude-p"),
+        claude_p,
         "--cwd",
         str(cwd),
         "--permission-mode",
