@@ -289,7 +289,15 @@ def _parse_openai_choice(payload: object) -> str:
     A provider can return a 2xx body that is valid JSON but NOT the expected object
     (e.g. `[]`, `{"choices":[null]}`, `{"choices":[{"message":[]}]}`). Each access is
     type-guarded so a wrong shape yields "" instead of raising AttributeError/
-    TypeError/IndexError out of the backend (those would crash the whole run)."""
+    TypeError/IndexError out of the backend (those would crash the whole run).
+
+    REASONING MODELS (e.g. z.ai glm-5.2) return `message.content` (the final answer)
+    PLUS `message.reasoning_content` (the chain of thought). We read `content` for the
+    review text. When `content` is empty/missing but `reasoning_content` is present —
+    a reasoning model with a low output-token budget can spend it all on reasoning and
+    emit no final answer — we fall back to the reasoning text (prefixed so the reader
+    knows what they're getting) rather than fail-closed as "empty output". A non-string
+    reasoning field is ignored (type-guarded), never a crash."""
     if not isinstance(payload, dict):
         return ""
     choices = payload.get("choices")
@@ -302,6 +310,11 @@ def _parse_openai_choice(payload: object) -> str:
     if not isinstance(message, dict):
         return ""
     content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return "[reasoning_content — no final answer returned]\n\n" + reasoning
     return content if isinstance(content, str) else ""
 
 
@@ -393,10 +406,17 @@ def _openai_compatible_request(
         )
 
 
-# z.ai (Zhipu / GLM) — OpenAI-compatible. General API base; the /coding/paas/v4
-# variant is for the coding-plan subscription only. Override with ZAI_BASE_URL.
-ZAI_DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4"
-ZAI_DEFAULT_MODEL = "glm-4.6"
+# z.ai (Zhipu / GLM) — OpenAI-compatible /chat/completions, Bearer-keyed.
+# DEFAULT base is the GLM Coding Plan endpoint (/api/coding/paas/v4): only that
+# endpoint serves the flagship glm-5.2 (the STANDARD /api/paas/v4 endpoint tops out
+# at glm-5.1 on its /models catalog). So a Coding-Plan key gets glm-5.2 out of the
+# box; a standard-plan user overrides the base via ZAI_BASE_URL=https://api.z.ai/api/paas/v4
+# (and picks a model their plan serves, e.g. ZAI_MODEL=glm-5.1). glm-5.2 is a
+# REASONING model — it returns message.reasoning_content alongside message.content;
+# _parse_openai_choice reads content and falls back to reasoning_content if content
+# is empty (a low output budget can leave only the reasoning).
+ZAI_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+ZAI_DEFAULT_MODEL = "glm-5.2"
 
 
 def _zai_key() -> str:
@@ -762,7 +782,7 @@ def resolve_backend(model: str) -> Callable[[str, str, str, Path, int], ReviewRe
     if lowered in ("gemini", "gemini-api") or lowered.startswith("gemini:"):
         return review_gemini
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP. `zai`/`glm` plus `zai:<model>`
-    # (e.g. zai:glm-4.6). `glm:` prefix also routes here.
+    # (e.g. zai:glm-5.2). `glm:` prefix also routes here.
     if (
         lowered in ("zai", "z.ai", "zhipu", "glm")
         or lowered.startswith(("zai:", "z.ai:", "glm:", "zhipu:"))

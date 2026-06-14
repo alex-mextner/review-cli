@@ -369,7 +369,13 @@ The built-in board:
 | DeepSeek | `commandcode:deepseek/deepseek-v4-pro` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
 | Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
 | Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| GLM | `commandcode:zai-org/GLM-5.1` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| GLM | `zai:glm-5.2` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| GPT-5.5 | `commandcode:gpt-5.5` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+
+The `tests` seat goes **direct to z.ai** (`zai:glm-5.2`, the newest GLM, reachable on
+the GLM Coding-Plan endpoint) via the z.ai backend — not through the commandcode
+gateway. It needs a z.ai key (see Auth). All other commandcode seats need
+`COMMANDCODE_API_KEY`.
 
 ```bash
 review --show-board   # list the active board (model -> role) + availability
@@ -380,17 +386,30 @@ review -m codex -m gemini   # an explicit -m also bypasses the board (exact mode
 Override the board in `config.yaml` with a `board:` list — each entry is a
 `{model, role}` mapping (optional `name:` for the label). An unknown `role` keeps
 the reviewer but falls back to the generic prompt (with a warning); a malformed
-entry is skipped. With no `board:` configured, the built-in board above applies.
+entry is skipped. With no `board:` configured, the built-in 8-seat board above applies.
 
 ```yaml
 board:
   - { model: "claude:claude-opus-4-8", role: architect }
   - { model: "codex",                  role: correctness }
   - { model: "commandcode:Qwen/Qwen3.7-Max", role: security, name: Qwen }
+  - { model: "zai:glm-5.2",            role: tests }
+  - { model: "commandcode:gpt-5.5",    role: contracts, name: GPT-5.5 }
+```
+
+**Optional heavyweight seats** (NOT enabled by default — the board stays at 8). Add
+either to your `board:` list for an extra 1M-context resilience / holistic-senior
+pass; both run through commandcode (need `COMMANDCODE_API_KEY`):
+
+```yaml
+board:
+  # ... the 8 default seats ...
+  - { model: "commandcode:MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
+  - { model: "commandcode:nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
 ```
 
 Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`,
-`security`, `tests`.
+`security`, `tests`, `contracts`.
 
 ---
 
@@ -402,11 +421,27 @@ Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`
 
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
 
-**commandcode (DeepSeek / Kimi / Qwen / GLM board reviewers):** set
+**commandcode (DeepSeek / Kimi / Qwen / GPT-5.5 board reviewers):** set
 `COMMANDCODE_API_KEY` (a Command Code `user_...` token) in the environment or in
-`~/.config/review-cli/.env`. Without it, those four board reviewers are skipped and
-the board runs with whatever remains (Opus / Codex / Gemini). No key is ever written
-to disk by review — it is only read.
+`~/.config/review-cli/.env`. Without it, those commandcode board reviewers are
+skipped and the board runs with whatever remains. No key is ever written to disk by
+review — it is only read.
+
+**z.ai / GLM (the `tests` board seat = `zai:glm-5.2`):** set `ZAI_API_KEY` (or
+`ZHIPU_API_KEY`) in the environment or `~/.config/review-cli/.env`. The default base
+URL is the **GLM Coding-Plan endpoint** `https://api.z.ai/api/coding/paas/v4` — only
+that endpoint serves the flagship `glm-5.2`; the standard `https://api.z.ai/api/paas/v4`
+endpoint tops out at `glm-5.1`. A Coding-Plan key gets `glm-5.2` out of the box; a
+standard-plan user overrides with `ZAI_BASE_URL=https://api.z.ai/api/paas/v4`. Note
+that the default `tests` board seat pins the model explicitly (`zai:glm-5.2`), and an
+explicit `zai:<model>` suffix wins over `ZAI_MODEL` — so a standard-plan user must
+also override that seat in a `config.yaml` `board:` list (e.g. `{ model: "zai:glm-5.1",
+role: tests }`); `ZAI_MODEL` alone only affects a bare `-m zai` invocation, not the
+suffix-pinned board seat. `glm-5.2` is a reasoning model: it returns a final
+answer plus a `reasoning_content` field; review reads the answer and falls back to the
+reasoning text when the answer is empty (e.g. a low output-token budget). Without a
+z.ai key the `tests` seat is skipped; the rest of the board still runs. The key is
+only read, never written.
 
 ---
 

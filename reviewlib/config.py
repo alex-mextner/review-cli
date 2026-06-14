@@ -24,12 +24,16 @@ DEFAULT_MODELS = ("codex", "gemini", "oc:fireworks/accounts/fireworks/routers/ki
 MODEL_ALIASES = {
     "fable": "claude:claude-fable-5",
     "fable5": "claude:claude-fable-5",
-    # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai`/`glm`
-    # resolve directly in resolve_backend (env ZAI_MODEL / glm-4.6 default); these
-    # aliases pin specific GLM model ids for `-m glm46`/`-m glm45`.
+    # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
+    # directly in resolve_backend (env ZAI_MODEL / glm-5.2 default — the newest GLM,
+    # reachable on the Coding-Plan endpoint). These aliases pin specific GLM model ids;
+    # `glm`/`glm52` point at the newest (glm-5.2), the rest pin older releases.
+    "glm": "zai:glm-5.2",
+    "glm52": "zai:glm-5.2",
+    "glm51": "zai:glm-5.1",
+    "glm47": "zai:glm-4.7",
     "glm46": "zai:glm-4.6",
     "glm45": "zai:glm-4.5",
-    "glm": "zai:glm-4.6",
     # commandcode — Command Code's OpenAI-compatible Provider API (keyed HTTP).
     # `cc` is a short hand; the legacy `commoncode`/`common-code` spellings still
     # resolve via resolve_backend, so old configs keep working.
@@ -113,6 +117,12 @@ REVIEW_ROLES = {
         "boundary conditions, and error-path coverage. Point at the exact cases that "
         "should be tested but aren't."
     ),
+    "contracts": (
+        "Focus specifically on PUBLIC API SHAPE and CONTRACTS: exported function/type "
+        "signatures, interface design, backward compatibility, breaking changes to "
+        "callers, and whether new types/return values are coherent and future-proof. "
+        "Skip internal-only refactors with no external surface."
+    ),
 }
 
 
@@ -135,10 +145,22 @@ class BoardReviewer:
         return REVIEW_ROLES.get(self.role, "")
 
 
-# DEFAULT_BOARD: the out-of-the-box panel, so the board works WITHOUT a config
-# file. Model ids are byte-exact against the commandcode gateway /models catalog
-# (HYP-741) — do not alter the strings. Reviewers whose backend isn't available
-# (no key / no CLI) are skipped at run time by the caller, not here.
+# DEFAULT_BOARD: the out-of-the-box 8-seat panel, so the board works WITHOUT a
+# config file. Model ids are byte-exact against the provider catalogs (commandcode
+# gateway /models, z.ai Coding-Plan) — do not alter the strings. Reviewers whose
+# backend isn't available (no key / no CLI) are skipped at run time by the caller,
+# not here.
+#
+# The `tests` seat goes DIRECT to z.ai (`zai:glm-5.2`, the newest GLM reachable on
+# the Coding-Plan endpoint) via the z.ai backend / the user's GLM subscription —
+# not through the commandcode gateway. The `contracts` seat is gpt-5.5 via
+# commandcode, focused on public API shape / backward-compat.
+#
+# OPTIONAL HEAVYWEIGHTS (NOT enabled by default — the board stays at 8): add them
+# to a config.yaml `board:` list if you want a 1M-context resilience / holistic pass:
+#   - { model: "commandcode:MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx
+#   - { model: "commandcode:nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx
+# (any role works; see REVIEW_ROLES — e.g. resilience-flavored via `architect`/`consistency`.)
 DEFAULT_BOARD = (
     BoardReviewer("claude:claude-opus-4-8", "architect", "Opus"),
     BoardReviewer("codex", "correctness", "Codex"),
@@ -146,7 +168,8 @@ DEFAULT_BOARD = (
     BoardReviewer("commandcode:deepseek/deepseek-v4-pro", "performance", "DeepSeek"),
     BoardReviewer("commandcode:moonshotai/Kimi-K2.7-Code", "quality", "Kimi"),
     BoardReviewer("commandcode:Qwen/Qwen3.7-Max", "security", "Qwen"),
-    BoardReviewer("commandcode:zai-org/GLM-5.1", "tests", "GLM"),
+    BoardReviewer("zai:glm-5.2", "tests", "GLM"),
+    BoardReviewer("commandcode:gpt-5.5", "contracts", "GPT-5.5"),
 )
 
 

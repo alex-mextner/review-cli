@@ -20,13 +20,18 @@ bin/review --help | grep -q -- "--strict"
 bin/review --help | grep -q -- "--no-local-model"
 
 # Reviewer board (HYP-741): the board flags must appear in help, and --show-board
-# must list the out-of-the-box DEFAULT_BOARD (no config file needed) with roles and
-# byte-exact commandcode model ids. Availability depends on the env, but the LISTING
+# must list the out-of-the-box 8-seat DEFAULT_BOARD (no config file needed) with
+# roles and byte-exact model ids — incl. the z.ai-direct tests seat (zai:glm-5.2)
+# and the gpt-5.5 contracts seat. Availability depends on the env, but the LISTING
 # is always complete.
 bin/review --help | grep -q -- "--show-board"
 bin/review --help | grep -q -- "--no-board"
 bin/review --show-board | grep -q "architect"
 bin/review --show-board | grep -q "commandcode:deepseek/deepseek-v4-pro"
+bin/review --show-board | grep -q "zai:glm-5.2"
+bin/review --show-board | grep -q "commandcode:gpt-5.5"
+bin/review --show-board | grep -q "contracts"
+bin/review --show-board | grep -q "8 seats"
 
 # The single-file CLI must always parse.
 python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse OK')"

@@ -48,10 +48,37 @@ def test_default_board_matches_directive_table():
         ("commandcode:deepseek/deepseek-v4-pro", "performance", "DeepSeek"),
         ("commandcode:moonshotai/Kimi-K2.7-Code", "quality", "Kimi"),
         ("commandcode:Qwen/Qwen3.7-Max", "security", "Qwen"),
-        ("commandcode:zai-org/GLM-5.1", "tests", "GLM"),
+        # The tests seat goes DIRECT to z.ai (his GLM subscription), not commandcode.
+        ("zai:glm-5.2", "tests", "GLM"),
+        # 8th seat: gpt-5.5 on a tight public-API/contracts lens.
+        ("commandcode:gpt-5.5", "contracts", "GPT-5.5"),
     ]
     got = [(r.model, r.role, r.display) for r in DEFAULT_BOARD]
     assert got == expected, got
+
+
+def test_default_board_has_eight_seats():
+    assert len(DEFAULT_BOARD) == 8, len(DEFAULT_BOARD)
+
+
+def test_tests_seat_routes_to_zai_backend_with_glm52():
+    """The tests seat must route to the z.ai backend (his subscription), model glm-5.2 —
+    NOT the commandcode gateway. resolve_backend(zai:glm-5.2) -> review_zai."""
+    seat = next(r for r in DEFAULT_BOARD if r.role == "tests")
+    assert seat.model == "zai:glm-5.2", seat.model
+    assert backends.resolve_backend(seat.model) is backends.review_zai
+    # The backend sends model id glm-5.2 on the wire (suffix after `zai:`).
+    assert seat.model.split(":", 1)[1] == "glm-5.2"
+
+
+def test_contracts_seat_has_a_lens():
+    seat = next(r for r in DEFAULT_BOARD if r.role == "contracts")
+    assert seat.model == "commandcode:gpt-5.5", seat.model
+    assert seat.display == "GPT-5.5"
+    assert "contracts" in REVIEW_ROLES
+    lens = REVIEW_ROLES["contracts"].lower()
+    assert "public api" in lens or "api shape" in lens, lens
+    assert "backward" in lens or "compat" in lens, lens
 
 
 def test_every_default_role_has_a_lens():
