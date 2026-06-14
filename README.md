@@ -294,14 +294,25 @@ staged changes; bypass with `REVIEW_SKIP=1 git commit` or `git commit --no-verif
 
 ## Model backends
 
-| Specifier | What runs under the hood |
-|-----------|--------------------------|
-| `codex` / `codex:<model>` | `codex exec -s read-only --ephemeral` |
-| `claude` / `claude:<model>` | `claude-p --permission-mode plan --disallowedTools Edit Write Bash` |
-| `fable` / `fable5` | Alias for `claude:claude-fable-5` |
-| `gemini` / `gemini:<model>` | Gemini REST API (`gemini-2.5-flash` by default) |
-| `oc:<model>` / `opencode:<model>` | `opencode run --agent read-only-reviewer` in a temp repo |
-| anything else | Treated as an opencode model id |
+Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
+
+| Specifier | Transport | What runs under the hood |
+|-----------|-----------|--------------------------|
+| `codex` / `codex:<model>` | cli | `codex exec -s read-only --ephemeral` |
+| `claude` / `claude:<model>` | api \| cli | `claude-p` CLI, or the Anthropic-compatible Messages API |
+| `fable` / `fable5` | api \| cli | Alias for `claude:claude-fable-5` |
+| `gemini` / `gemini:<model>` | api | Gemini REST API (`gemini-2.5-flash` by default) |
+| `zai:<model>` / `glm` / `glm52` … | api | z.ai (GLM) OpenAI-compatible REST API — needs `ZAI_API_KEY` |
+| `commandcode:<model>` / `cc` | api | Command Code OpenAI-compatible Provider API — needs `COMMANDCODE_API_KEY` |
+| `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer` in a temp repo |
+| anything else | cli | Treated as an opencode model id |
+
+**Transport split.** codex and opencode are **cli-only** (no REST API). gemini, z.ai,
+and commandcode are **api-only** keyed HTTP backends (no CLI on PATH). claude supports
+**both** — `REVIEW_CLAUDE_MODE=api|cli` forces one, else it auto-picks (CLI if the
+binary is present, API when it isn't and a key is set). Each backend's mode can be
+forced with `REVIEW_<NAME>_MODE`; forcing an unsupported mode (e.g.
+`REVIEW_COMMANDCODE_MODE=cli`) is a hard error, never a silent fall-through.
 
 The opencode backend runs in a **temporary git repository** with the diff attached as
 `review.diff`. This keeps the source worktree out of reach — the model gets review
@@ -319,6 +330,8 @@ context without getting an edit target.
 --rounds N          Minimum brainstorm rounds before STOP is allowed (default 5).
 --max-rounds N      Hard cap on brainstorm rounds (default 8).
 --list-defaults     Print effective default backends and exit.
+--show-board        Print the active reviewer board (model -> role + availability) and exit.
+--no-board          Disable the reviewer board; use the plain models list instead.
 --prompt TEXT       Override the default review prompt.
 -C / --cwd DIR      Run against a different repository directory.
 ```
@@ -330,7 +343,8 @@ context without getting an edit target.
 Personal defaults live in `~/.config/review-cli/config.yaml`:
 
 ```yaml
-# Backends used by plain `review` and panel modes
+# Backends used by plain `review` and panel modes. Setting `models:` OVERRIDES the
+# default reviewer board (see "Board vs. models precedence") — you get exactly these.
 models:
   - codex
   - fable5
@@ -342,10 +356,92 @@ brainstorm_models:
   - fable5
 ```
 
-Run `review --list-defaults` to see the effective defaults after config is applied.
+Run `review --list-defaults` to see the effective (normalized) models after config is
+applied.
 
 Code defaults (when no config file exists): `codex`, `gemini`,
 `oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo`.
+
+---
+
+## Reviewer board
+
+The default `review` (plain diff review) runs a **reviewer board**: a panel where
+each model is given its OWN review role/lens, so the panel covers the diff broadly
+instead of every model doing the same generic pass. The board is the default panel
+out of the box — no config file required. Reviewers whose backend isn't available
+(no key / not on PATH) are skipped and logged; the board degrades gracefully.
+
+The built-in board:
+
+| Reviewer | Backend | Role | Lens focus |
+|---|---|---|---|
+| Opus | `claude:claude-opus-4-8` | `architect` | architecture, design coherence, API shape, abstraction boundaries (also the moderator) |
+| Codex | `codex` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one |
+| Gemini | `gemini` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| DeepSeek | `commandcode:deepseek/deepseek-v4-pro` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
+| Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
+| Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| GLM | `zai:glm-5.2` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| GPT-5.5 | `commandcode:gpt-5.5` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+
+The `tests` seat goes **direct to z.ai** (`zai:glm-5.2`, the newest GLM, reachable on
+the GLM Coding-Plan endpoint) via the z.ai backend — not through the commandcode
+gateway. It needs a z.ai key (see Auth). All other commandcode seats need
+`COMMANDCODE_API_KEY`.
+
+```bash
+review --show-board   # list the active board (model -> role) + availability
+review --no-board     # disable the board; use the plain `models` list instead
+review -m codex -m gemini   # an explicit -m also bypasses the board (exact models)
+```
+
+### Board vs. models precedence
+
+The board is the default **only when you have not expressed a model preference**.
+Precedence (cost-safety first — the paid 8-model board never runs against your wishes):
+
+```
+explicit -m on the CLI   >   `models:` in config.yaml   >   default board
+```
+
+- A `models:` list in `config.yaml` **overrides the board**: you configured exact
+  models, so `review` runs exactly those (the flat panel), not the paid board.
+- `--no-board` forces the flat `models`/default list even with no `-m` and no `models:`.
+- The board runs only when there is **no** `-m`, **no** `models:`, and no `--no-board`.
+- An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
+  preference — the board still applies.
+
+Override the board itself in `config.yaml` with a `board:` list — each entry is a
+`{model, role}` mapping (optional `name:` for the label). An unknown `role` keeps
+the reviewer but falls back to the generic prompt (with a warning); a single malformed
+entry is skipped (the valid ones are kept). With **no** `board:` configured, the
+built-in 8-seat board above applies. A `board:` that is **present but has no usable
+entry at all** is a hard error (non-zero exit) — it never silently falls back to the
+paid default board.
+
+```yaml
+board:
+  - { model: "claude:claude-opus-4-8", role: architect }
+  - { model: "codex",                  role: correctness }
+  - { model: "commandcode:Qwen/Qwen3.7-Max", role: security, name: Qwen }
+  - { model: "zai:glm-5.2",            role: tests }
+  - { model: "commandcode:gpt-5.5",    role: contracts, name: GPT-5.5 }
+```
+
+**Optional heavyweight seats** (NOT enabled by default — the board stays at 8). Add
+either to your `board:` list for an extra 1M-context resilience / holistic-senior
+pass; both run through commandcode (need `COMMANDCODE_API_KEY`):
+
+```yaml
+board:
+  # ... the 8 default seats ...
+  - { model: "commandcode:MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
+  - { model: "commandcode:nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
+```
+
+Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`,
+`security`, `tests`, `contracts`.
 
 ---
 
@@ -356,6 +452,28 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 `GEMINI_ENV_FILE=/path/to/.env` overrides the search path.
 
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
+
+**commandcode (DeepSeek / Kimi / Qwen / GPT-5.5 board reviewers):** set
+`COMMANDCODE_API_KEY` (a Command Code `user_...` token) in the environment or in
+`~/.config/review-cli/.env`. Without it, those commandcode board reviewers are
+skipped and the board runs with whatever remains. No key is ever written to disk by
+review — it is only read.
+
+**z.ai / GLM (the `tests` board seat = `zai:glm-5.2`):** set `ZAI_API_KEY` (or
+`ZHIPU_API_KEY`) in the environment or `~/.config/review-cli/.env`. The default base
+URL is the **GLM Coding-Plan endpoint** `https://api.z.ai/api/coding/paas/v4` — only
+that endpoint serves the flagship `glm-5.2`; the standard `https://api.z.ai/api/paas/v4`
+endpoint tops out at `glm-5.1`. A Coding-Plan key gets `glm-5.2` out of the box; a
+standard-plan user overrides with `ZAI_BASE_URL=https://api.z.ai/api/paas/v4`. Note
+that the default `tests` board seat pins the model explicitly (`zai:glm-5.2`), and an
+explicit `zai:<model>` suffix wins over `ZAI_MODEL` — so a standard-plan user must
+also override that seat in a `config.yaml` `board:` list (e.g. `{ model: "zai:glm-5.1",
+role: tests }`); `ZAI_MODEL` alone only affects a bare `-m zai` invocation, not the
+suffix-pinned board seat. `glm-5.2` is a reasoning model: it returns a final
+answer plus a `reasoning_content` field; review reads the answer and falls back to the
+reasoning text when the answer is empty (e.g. a low output-token budget). Without a
+z.ai key the `tests` seat is skipped; the rest of the board still runs. The key is
+only read, never written.
 
 ---
 

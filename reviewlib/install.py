@@ -80,10 +80,13 @@ shape `REVIEW_<BACKEND>_MODE` (the one PR #8 introduced for claude):
 
 ## Keyed HTTP backends: z.ai (GLM) and commandcode
 OpenAI-compatible `POST /chat/completions` REST backends — no CLI, just a key:
-- **z.ai (Zhipu / GLM)**: `-m zai` / `-m glm` (or `-m glm46`/`-m glm45` for a pinned
-  GLM id; `-m zai:<model>` for an explicit one). Key: `ZAI_API_KEY` (or
-  `ZHIPU_API_KEY`). Base/model override: `ZAI_BASE_URL` / `ZAI_MODEL`
-  (default `https://api.z.ai/api/paas/v4`, `glm-4.6`).
+- **z.ai (Zhipu / GLM)**: `-m zai` / `-m glm` (newest, glm-5.2) — or a pinned id
+  `-m glm52`/`-m glm51`/`-m glm47`/`-m glm46`; `-m zai:<model>` for an explicit one.
+  Key: `ZAI_API_KEY` (or `ZHIPU_API_KEY`). Base/model override: `ZAI_BASE_URL` /
+  `ZAI_MODEL`. DEFAULT base is the GLM Coding-Plan endpoint
+  `https://api.z.ai/api/coding/paas/v4` (the only one that serves glm-5.2; the
+  standard `…/api/paas/v4` tops out at glm-5.1), default model `glm-5.2`. Standard-plan
+  users set `ZAI_BASE_URL=https://api.z.ai/api/paas/v4` and a model their plan serves.
 - **commandcode**: `-m commandcode` (alias `-m cc`; `-m commandcode:<model>` for an
   explicit model). Hits Command Code's Provider API
   (`https://api.commandcode.ai/provider/v1/chat/completions`). Key:

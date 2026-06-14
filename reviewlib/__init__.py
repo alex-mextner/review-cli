@@ -37,16 +37,27 @@ from .backends import (
 )
 from .config import (
     CONFIG_PATH,
+    DEFAULT_BOARD,
     DEFAULT_MODELS,
     DEFAULT_PROMPT,
     MODEL_ALIASES,
     MODERATOR_CANDIDATES,
     PANEL_TIMEOUT_DEFAULT,
+    REVIEW_ROLES,
+    BoardReviewer,
     _expand_alias,
     _split_models,
+    load_board,
     load_config,
 )
-from .panel import PanelJob, format_result, pick_moderator, run_panel, run_single
+from .panel import (
+    PanelJob,
+    build_board_jobs,
+    format_result,
+    pick_moderator,
+    run_panel,
+    run_single,
+)
 from .process import _kill_tree, _open_log, _run, _run_streamed, log_dir
 
 __all__ = [
@@ -78,9 +89,14 @@ __all__ = [
     "pick_moderator",
     "run_panel",
     "run_single",
+    "build_board_jobs",
     "load_config",
+    "load_board",
     "_split_models",
     "_expand_alias",
+    "BoardReviewer",
+    "DEFAULT_BOARD",
+    "REVIEW_ROLES",
     "DEFAULT_MODELS",
     "DEFAULT_PROMPT",
     "MODEL_ALIASES",

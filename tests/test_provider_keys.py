@@ -135,9 +135,14 @@ def test_existing_routes_unchanged():
 
 
 def test_aliases_expand():
+    # `glm` and `glm52` point at the NEWEST GLM (glm-5.2, reachable on the Coding-Plan
+    # endpoint); the rest pin specific older releases.
+    assert _expand_alias("glm") == "zai:glm-5.2"
+    assert _expand_alias("glm52") == "zai:glm-5.2"
+    assert _expand_alias("glm51") == "zai:glm-5.1"
+    assert _expand_alias("glm47") == "zai:glm-4.7"
     assert _expand_alias("glm46") == "zai:glm-4.6"
     assert _expand_alias("glm45") == "zai:glm-4.5"
-    assert _expand_alias("glm") == "zai:glm-4.6"
     # commandcode aliases (incl. the short `cc` and the legacy `commoncode`).
     assert _expand_alias("commandcode") == "commandcode"
     assert _expand_alias("commoncode") == "commandcode"
@@ -161,13 +166,13 @@ def test_zai_request_is_openai_shape():
             res = backends.review_zai("zai", "say hi", "", REPO_ROOT, 30)
         finally:
             urllib.request.urlopen = old_open
-    # Default endpoint = general OpenAI-compatible base + /chat/completions.
-    assert captured["url"] == "https://api.z.ai/api/paas/v4/chat/completions", captured["url"]
+    # Default endpoint = the GLM Coding-Plan base (serves glm-5.2) + /chat/completions.
+    assert captured["url"] == "https://api.z.ai/api/coding/paas/v4/chat/completions", captured["url"]
     assert captured["method"] == "POST"
     # OpenAI request shape — NOT the gemini contents/parts shape.
     body = captured["body"]
     assert "messages" in body and "contents" not in body, body
-    assert body["model"] == "glm-4.6", body  # bare `zai` → ZAI_DEFAULT_MODEL
+    assert body["model"] == "glm-5.2", body  # bare `zai` → ZAI_DEFAULT_MODEL (newest GLM)
     assert body["messages"][0]["role"] == "user"
     assert body["messages"][0]["content"] == "say hi"
     assert body["stream"] is False
@@ -231,7 +236,7 @@ def test_zai_result_model_is_requested_string_not_provider_id():
     assert res.model == "zai", res.model
     assert res2.model == "zai:glm-4.5", res2.model
     # The api_model still appears in the command label (the resolved id).
-    assert "glm-4.6" in res.command
+    assert "glm-5.2" in res.command  # bare `zai` → ZAI_DEFAULT_MODEL (newest GLM)
     assert "glm-4.5" in res2.command
 
 
@@ -433,6 +438,112 @@ def test_zai_does_not_send_thinking_field():
         finally:
             urllib.request.urlopen = old_open
     assert "thinking" not in captured["body"], captured["body"]
+
+
+# === coding-endpoint default + reasoning-model handling (glm-5.2) ================
+def test_zai_default_base_url_is_the_coding_plan_endpoint():
+    """The DEFAULT z.ai base must be the GLM Coding-Plan endpoint (the only one that
+    serves the flagship glm-5.2). A standard-plan user overrides via ZAI_BASE_URL."""
+    assert backends.ZAI_DEFAULT_BASE_URL == "https://api.z.ai/api/coding/paas/v4", \
+        backends.ZAI_DEFAULT_BASE_URL
+    assert backends.ZAI_DEFAULT_MODEL == "glm-5.2", backends.ZAI_DEFAULT_MODEL
+    # End-to-end: bare `zai` with no overrides hits the coding endpoint.
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["ZAI_API_KEY"] = "k"
+        try:
+            backends.review_zai("zai", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured["url"] == "https://api.z.ai/api/coding/paas/v4/chat/completions", captured["url"]
+
+
+def test_zai_base_url_env_overrides_to_standard_endpoint():
+    """A standard-plan user points ZAI_BASE_URL at the general /api/paas/v4 endpoint."""
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["ZAI_API_KEY"] = "k"
+        os.environ["ZAI_BASE_URL"] = "https://api.z.ai/api/paas/v4"
+        os.environ["ZAI_MODEL"] = "glm-5.1"
+        try:
+            backends.review_zai("zai", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured["url"] == "https://api.z.ai/api/paas/v4/chat/completions", captured["url"]
+    assert captured["body"]["model"] == "glm-5.1", captured["body"]
+
+
+def test_zai_reasoning_content_fallback_when_content_empty():
+    """REASONING MODEL (glm-5.2): a 2xx whose message.content is empty/missing but
+    carries message.reasoning_content must NOT fail-closed as "no assistant content".
+    Surface the reasoning text (rc=0) so a low-output-budget reasoning reply is usable."""
+    cases = (
+        {"choices": [{"message": {"content": "", "reasoning_content": "I think the diff is fine."}}], "usage": {}},
+        {"choices": [{"message": {"reasoning_content": "Only reasoning here, no content key."}}], "usage": {}},
+        {"choices": [{"message": {"content": None, "reasoning_content": "null content, reasoning present."}}], "usage": {}},
+        {"choices": [{"message": {"content": "   ", "reasoning_content": "whitespace content, reasoning present."}}], "usage": {}},
+    )
+    for payload in cases:
+        captured: dict = {}
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen(captured, payload)
+        with _EnvSandbox():
+            os.environ["ZAI_API_KEY"] = "k"
+            try:
+                res = backends.review_zai("zai", "q", "+x", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert res.returncode == 0, (payload, res)
+        assert "reasoning" in res.stdout.lower(), (payload, res.stdout)
+
+
+def test_zai_prefers_content_over_reasoning_when_both_present():
+    """When BOTH content and reasoning_content are present, the final answer (content)
+    wins — the reasoning is the chain of thought, not the review."""
+    captured: dict = {}
+    payload = {"choices": [{"message": {
+        "content": "FINAL: the change looks correct.",
+        "reasoning_content": "step 1 ... step 2 ...",
+    }}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["ZAI_API_KEY"] = "k"
+        try:
+            res = backends.review_zai("zai", "q", "+x", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 0, res
+    assert "FINAL: the change looks correct." in res.stdout
+    assert "step 1" not in res.stdout  # reasoning not surfaced when a final answer exists
+
+
+def test_zai_empty_with_no_reasoning_still_fails_closed():
+    """The fallback must not weaken the empty-output guard: NO content AND NO usable
+    reasoning_content must still map to a non-zero dead-backend result."""
+    cases = (
+        {"choices": [{"message": {"content": ""}}], "usage": {}},
+        {"choices": [{"message": {"content": "", "reasoning_content": ""}}], "usage": {}},
+        {"choices": [{"message": {"content": "", "reasoning_content": "   "}}], "usage": {}},
+        {"choices": [{"message": {"content": "", "reasoning_content": 42}}], "usage": {}},
+    )
+    for payload in cases:
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen({}, payload)
+        with _EnvSandbox():
+            os.environ["ZAI_API_KEY"] = "k"
+            try:
+                res = backends.review_zai("zai", "q", "+x", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert res.returncode == 1, (payload, res)
+        assert "no assistant content" in res.stderr, (payload, res.stderr)
 
 
 def test_commandcode_never_injects_thinking_field():
