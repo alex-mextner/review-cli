@@ -25,7 +25,13 @@ CONFIG_PATH = Path.home() / ".config" / "review-cli" / "config.yaml"
 
 # Short default for the interactive multi-call modes; classic review keeps 1200s.
 PANEL_TIMEOUT_DEFAULT = 240
-MODERATOR_CANDIDATES = ("codex", "gemini")
+# Moderator priority for --quorum/--brainstorm. opus first now that the headless
+# claude backend works reliably (deterministic workspace auto-trust); codex and
+# gemini are the fallbacks. pick_moderators() filters this to available backends
+# and run_moderator() walks it at run time, so a candidate that passes the cheap
+# availability probe but dies at run time (e.g. an Anthropic-disabled model like
+# fable) never leaves the panel without a synthesis.
+MODERATOR_CANDIDATES = ("claude:claude-opus-4-8", "codex", "gemini")
 
 
 def _expand_alias(model: str) -> str:

@@ -7,11 +7,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..panel import PanelJob, format_result, run_panel, run_single
+from ..panel import PanelJob, format_result, run_moderator, run_panel
 from . import _diff_context_block
 
 
-def mode_quorum(question: str, models: list[str], diff: str, cwd: Path, timeout: int, moderator: str) -> int:
+def mode_quorum(question: str, models: list[str], diff: str, cwd: Path, timeout: int, moderators: list[str]) -> int:
     expert_prompt = (
         "You are one expert on a panel. Give a clear RECOMMENDATION on the question below. "
         "Cite concrete evidence for every claim (file path, line number, command output, "
@@ -38,7 +38,7 @@ def mode_quorum(question: str, models: list[str], diff: str, cwd: Path, timeout:
         "Do not invent agreement. Do not edit files.\n\n"
         f"QUESTION:\n{question}\n\n=== EXPERT ANSWERS ===\n{transcript}"
     )
-    mod_result = run_single(moderator, mod_prompt, cwd, timeout)
+    mod_result = run_moderator(moderators, mod_prompt, cwd, timeout)
 
     out = ["# Expert answers", "\n\n---\n\n".join(format_result(r) for r in expert_results)]
     out += ["\n# Moderator summary", format_result(mod_result)]

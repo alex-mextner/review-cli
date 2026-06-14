@@ -38,26 +38,38 @@ Runs your git diff (or a question/topic) across several model backends in parall
 
 ## Invocation
 ```
-review                       # review current unstaged diff across default models
-review --staged              # review the staged diff (pre-commit)
-review -m codex -m gemini    # pick backends (repeat or comma-separate)
-review --just-ask "Q"        # multi-model answer to a question (no diff needed)
-review --quorum "Q"          # experts answer + a moderator finds consensus/disagreement
-review --brainstorm "TOPIC"  # iterative persona ideation in a loop, with a moderator
+review -C <repo>             # review current unstaged diff across default models
+review -C <repo> --staged    # review the staged diff (pre-commit)
+review -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate)
+review -C <repo> --just-ask "Q"        # multi-model answer to a question (no diff needed)
+review -C <repo> --quorum "Q"          # experts answer + a moderator finds consensus/disagreement
+review -C <repo> --brainstorm "TOPIC"  # iterative persona ideation in a loop, with a moderator
 ```
+
+## ALWAYS pass `-C <project-root>`
+`review` runs the diff and the claude/opus workspace in `-C` (default: the current
+directory). Agents often invoke `review` from a scratch or temp dir, so WITHOUT
+`-C` it silently reviews the wrong place (commonly /tmp) and returns an empty or
+irrelevant result. Always pass `-C <absolute repo path>`. If `-C` is not inside a
+git repo, review resolves to the repo root when it can and otherwise prints a
+loud warning — heed it. When piping into review non-interactively, also redirect
+stdin (`review -C <repo> --just-ask "Q" < /dev/null`); review reads stdin for an
+optional piped diff and will hang waiting for EOF if stdin is an open pipe.
 
 ## When to use
 - Before committing — sanity-check a diff across multiple models in parallel.
 - For a hard decision — `--quorum` (settle with cited evidence) or `--brainstorm`
-  (explore an open design space across rotating expert roles, in a loop).
+  (explore an open design space across rotating expert roles, in a loop). The
+  moderator defaults to opus and falls back to codex/gemini automatically.
 - For a quick multi-model second opinion — `--just-ask`.
 
 Pair with `tg` to post the chosen options / pros-cons to Telegram.
 """
 SKILL_BLURB = (
     "`review` — multi-model read-only code review + AI panels "
-    "(codex/claude/gemini/opencode): `review` (diff), `review --quorum \"Q\"`, "
-    "`review --brainstorm \"topic\"`. Use before commits and for hard decisions."
+    "(codex/claude/gemini/opencode): `review -C <repo>` (diff), "
+    "`review -C <repo> --quorum \"Q\"`, `review -C <repo> --brainstorm \"topic\"`. "
+    "Always pass -C <project-root>. Use before commits and for hard decisions."
 )
 
 _HOOK_MARKER = "# agent-tools-awareness"
