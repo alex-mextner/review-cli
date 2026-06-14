@@ -266,7 +266,10 @@ def test_mode_review_board_runs_and_succeeds():
 
     calls: list[tuple[str, str]] = []
 
-    def _fake_backend(model, prompt, diff, cwd, timeout):
+    # round_no is the 6th positional arg run_panel passes to every backend (HYP-742
+    # dashboard threading); a board reviewer fake must accept it or run_panel turns the
+    # TypeError into an internal 127.
+    def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0):
         calls.append((model, prompt))
         return ReviewResult(model=model, command="fake", returncode=0, stdout="ok", stderr="")
 
@@ -297,7 +300,7 @@ def test_mode_review_board_runs_and_succeeds():
 def test_mode_review_board_fails_when_a_reviewer_fails():
     from reviewlib.modes import review as review_mod
 
-    def _fake_backend(model, prompt, diff, cwd, timeout):
+    def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0):
         rc = 0 if model == "codex" else 1
         return ReviewResult(model=model, command="fake", returncode=rc, stdout="x", stderr="boom")
 
