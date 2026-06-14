@@ -40,6 +40,11 @@ echo "moderator tests OK"
 python3 tests/test_cwd.py
 echo "cwd tests OK"
 
+# claude backend api/cli dispatch + Anthropic Messages API path (urlopen stubbed;
+# no network, no claude binary, no real key).
+python3 tests/test_claude_api.py
+echo "claude-api tests OK"
+
 # Stage 1 visual-verification suite (cvGate / vision_client / policy / pipeline /
 # composability). All offline: cvGate shells to magick, the vision call is mocked,
 # fixtures are generated (Pillow) — no API keys, no network. These need two non-core

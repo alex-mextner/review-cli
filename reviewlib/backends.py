@@ -217,6 +217,126 @@ def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
         return ReviewResult(model=model, command=f"Gemini API {gemini_model}", returncode=exc.code, stdout="", stderr=body_text)
 
 
+# A non-default User-Agent: some Anthropic-compatible gateways (e.g. CommandCode,
+# behind Cloudflare) 403 the bare urllib UA with "error code: 1010".
+_ANTHROPIC_UA = "review-cli (anthropic-compatible client)"
+_CLAUDE_REVIEW_SYSTEM = (
+    "You are running inside review-cli in a headless read-only diff review. "
+    "Do not use tools, inspect files, ask for permissions, or plan tool work. "
+    "Answer only from the prompt and diff supplied by the user."
+)
+
+
+def _anthropic_api_config() -> dict | None:
+    """Resolve Anthropic-compatible API config (auth header + base url), or None.
+
+    Mirrors the Anthropic SDK / claude CLI env surface so the SAME vars drive
+    both review's API backend and any local claude CLI: ANTHROPIC_API_KEY (sent
+    as ``x-api-key``) or ANTHROPIC_AUTH_TOKEN (sent as ``Authorization: Bearer``,
+    for gateways / OAuth), plus ANTHROPIC_BASE_URL (default api.anthropic.com,
+    point it at e.g. CommandCode). Keys also fall back to review's shared env
+    files via _resolve_key. Returns None when no key is set, so the dispatcher
+    can fall back to the CLI backend."""
+    apikey = _resolve_key(("ANTHROPIC_API_KEY",), "ANTHROPIC_API_KEY")
+    if apikey:
+        auth = ("x-api-key", apikey)
+    else:
+        token = _resolve_key(("ANTHROPIC_AUTH_TOKEN",), "ANTHROPIC_AUTH_TOKEN")
+        if not token:
+            return None
+        auth = ("Authorization", f"Bearer {token}")
+    base = (os.environ.get("ANTHROPIC_BASE_URL", "").strip() or "https://api.anthropic.com").rstrip("/")
+    return {"base": base, "auth": auth}
+
+
+def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+    """Anthropic Messages API backend — works WITHOUT the claude CLI (needs only a
+    key). POSTs to ``{ANTHROPIC_BASE_URL}/v1/messages``; the default base is
+    Anthropic, but any Anthropic-compatible gateway works (e.g. CommandCode via
+    ANTHROPIC_BASE_URL). ``cwd`` is unused — the API has no workspace, which is
+    exactly why this variant runs where the CLI cannot."""
+    claude_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
+    cfg = _anthropic_api_config()
+    command = f"Anthropic API {claude_model}"
+    if cfg is None:
+        return ReviewResult(model=model, command=command, returncode=1, stdout="",
+                            stderr="claude API mode: no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN configured")
+    try:
+        max_tokens = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16000"))
+    except ValueError:
+        max_tokens = 16000
+    body = {
+        "model": claude_model,
+        "max_tokens": max_tokens,
+        "system": _CLAUDE_REVIEW_SYSTEM,
+        "messages": [{"role": "user", "content": _payload(prompt, diff)}],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "User-Agent": _ANTHROPIC_UA,
+        cfg["auth"][0]: cfg["auth"][1],
+    }
+    data = json.dumps(body).encode("utf-8")
+    url = cfg["base"] + "/v1/messages"
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+    command = f"Anthropic API {claude_model} @ {cfg['base']}"
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        parts = payload.get("content", []) if isinstance(payload, dict) else []
+        text = "".join(
+            p.get("text", "") for p in parts
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        stdout = text.strip() + (
+            f"\n\ninput_tokens={usage.get('input_tokens', 0)} "
+            f"output_tokens={usage.get('output_tokens', 0)}\n"
+        )
+        # Empty success is a failure for the panel/moderator fallback path.
+        return ReviewResult(model=model, command=command,
+                            returncode=0 if text.strip() else 1, stdout=stdout, stderr="")
+    except urllib.error.HTTPError as exc:
+        return ReviewResult(model=model, command=command, returncode=exc.code, stdout="",
+                            stderr=exc.read().decode("utf-8", "replace"))
+    except urllib.error.URLError as exc:
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
+    except (ValueError, OSError) as exc:
+        # malformed / non-JSON 2xx body, or a read/decode/timeout failure — surface
+        # as a normal backend result, not an uncaught exception. (URLError, a
+        # subclass of OSError, is handled above; this catches the rest.)
+        return ReviewResult(model=model, command=command, returncode=1, stdout="",
+                            stderr=f"claude API: malformed or unreadable response: {exc}")
+
+
+def _have_claude_cli() -> bool:
+    try:
+        _which("claude-p")
+        return True
+    except RuntimeError:
+        return False
+
+
+def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+    """Dispatch the claude/opus backend between the API and CLI variants.
+
+    REVIEW_CLAUDE_MODE forces it: ``api`` (HTTP, no claude binary needed) or
+    ``cli`` (claude-p). With no override the choice is automatic and conservative:
+    prefer the CLI when the claude binary is present (subscription, no API cost,
+    and reliable now that workspace trust is deterministic), and fall back to the
+    API only when there is no claude binary but a key IS configured — i.e. don't
+    silently switch a working CLI host to the paid API just because a key happens
+    to be in the environment. Set REVIEW_CLAUDE_MODE=api to force the API."""
+    mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
+    if mode == "api":
+        return review_claude_api(model, prompt, diff, cwd, timeout)
+    if mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None:
+        return review_claude_api(model, prompt, diff, cwd, timeout)
+    return review_claude_cli(model, prompt, diff, cwd, timeout)
+
+
 def _ensure_workspace_trusted(cwd: Path) -> None:
     """Pre-accept Claude Code's workspace trust for ``cwd`` in ~/.claude.json.
 
@@ -309,7 +429,7 @@ def _ensure_workspace_trusted(cwd: Path) -> None:
                 lock.close()
 
 
-def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
     claude_model = model.split(":", 1)[1] if ":" in model else None
     # Resolve the binary BEFORE touching trust: a missing claude-p must raise
     # here, not after _ensure_workspace_trusted has already mutated ~/.claude.json.
@@ -329,9 +449,7 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
         "--disable-slash-commands",
         "--safe-mode",
         "--append-system-prompt",
-        "You are running inside review-cli in a headless read-only diff review. "
-        "Do not use tools, inspect files, ask for permissions, or plan tool work. "
-        "Answer only from the prompt and diff supplied by the user.",
+        _CLAUDE_REVIEW_SYSTEM,
         "--disallowedTools",
         "Edit",
         "MultiEdit",
@@ -397,6 +515,17 @@ def backend_available(model: str) -> bool:
             _which("codex")
             return True
         if backend is review_claude:
+            # Mirror the dispatcher so availability matches what would actually run:
+            # a forced mode is available only via that one variant; otherwise it's
+            # available via EITHER the API key or the claude-p CLI.
+            mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
+            if mode == "api":
+                return _anthropic_api_config() is not None
+            if mode == "cli":
+                _which("claude-p")
+                return True
+            if _anthropic_api_config() is not None:
+                return True
             _which("claude-p")
             return True
         if backend is review_opencode:

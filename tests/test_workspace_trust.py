@@ -173,10 +173,13 @@ def test_review_claude_does_not_trust_when_claude_p_is_missing():
             try:
                 raised = False
                 try:
-                    _backends.review_claude("claude:opus", "p", "", proj, 5)
+                    # CLI variant specifically: review_claude() is now a dispatcher
+                    # that can route to the API backend; the claude-p CLI path is
+                    # the one that must resolve the binary before touching trust.
+                    _backends.review_claude_cli("claude:opus", "p", "", proj, 5)
                 except RuntimeError:
                     raised = True
-                assert raised, "review_claude must raise when claude-p is missing"
+                assert raised, "review_claude_cli must raise when claude-p is missing"
             finally:
                 _backends._which = old_which
             # No trust granted on a run that never launched claude-p.

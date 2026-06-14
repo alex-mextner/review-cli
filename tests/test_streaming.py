@@ -331,7 +331,10 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
         # Stub the auto-trust helper: it writes ~/.claude.json, and this unit
         # test must not touch the real developer/CI config (cwd here is REPO_ROOT).
         review_backends._ensure_workspace_trusted = lambda _cwd: None
-        result = review_backends.review_claude("claude:opus", "prompt", "diff", REPO_ROOT, 10)
+        # Target the CLI variant directly: review_claude() is now a dispatcher that
+        # routes to the API backend when a key is configured, so calling it here
+        # would be env-dependent. This test pins the claude-p argv specifically.
+        result = review_backends.review_claude_cli("claude:opus", "prompt", "diff", REPO_ROOT, 10)
     finally:
         review_backends._which = old_which
         review_backends._run_streamed = old_run_streamed
