@@ -168,10 +168,17 @@ def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
             return value
     env_file = os.environ.get("GEMINI_ENV_FILE")
     paths = (Path(env_file),) if env_file else GEMINI_ENV_FALLBACKS
+    # Try EVERY accepted var name against each .env file (fallback_var first to
+    # preserve the original single-name behaviour for callers that pass it), so a
+    # provider with several accepted key names (e.g. common-code →
+    # COMMON_CODE_API_KEY / COMMANDCODE_API_KEY / DEEPSEEK_API_KEY) resolves from the
+    # file under any of them, mirroring the env-var lookup above.
+    file_vars = (fallback_var, *(n for n in env_names if n != fallback_var))
     for path in paths:
-        key = _read_env_key(path, fallback_var)
-        if key:
-            return key
+        for var in file_vars:
+            key = _read_env_key(path, var)
+            if key:
+                return key
     return None
 
 
@@ -215,6 +222,116 @@ def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
         return ReviewResult(model=model, command=f"Gemini API {gemini_model}", returncode=exc.code, stdout="", stderr=body_text)
+
+
+# --- OpenAI-compatible keyed HTTP backends (z.ai / common-code) -----------------
+# Both z.ai (Zhipu / GLM) and common-code expose an OpenAI-compatible
+# /chat/completions API. Unlike review_gemini's bespoke `contents`/`parts` shape,
+# these speak the standard OpenAI request body ({"model", "messages":[{role,content}]}
+# + Authorization: Bearer). The two backends share one request builder so the wire
+# shape stays identical; only the endpoint, key, and default model differ.
+
+
+def _openai_compatible_request(
+    *, model: str, api_model: str, label: str, base_url: str, key: str,
+    prompt: str, diff: str, timeout: int,
+) -> ReviewResult:
+    """POST an OpenAI-compatible chat/completions request and return a ReviewResult.
+
+    `model` is the REQUESTED backend string (e.g. `zai`, `common-code:deepseek-chat`)
+    and is preserved in ReviewResult.model — mode_review keys results by the requested
+    string, so substituting the resolved provider id here would KeyError. `api_model`
+    is the resolved provider model id sent on the wire (e.g. glm-4.6, deepseek-chat).
+
+    `base_url` is the endpoint root (e.g. https://api.z.ai/api/paas/v4); the
+    /chat/completions suffix is appended here so callers pass the same value users
+    would set in any OpenAI-compatible client. Network errors map to a non-zero
+    returncode with the body on stderr — exactly like review_gemini, so the panel
+    treats a failed call as a dead backend rather than crashing the run."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    body = {
+        "model": api_model,
+        "messages": [{"role": "user", "content": _payload(prompt, diff)}],
+        "stream": False,
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        choices = payload.get("choices", [])
+        text = ""
+        if choices:
+            text = (choices[0].get("message", {}) or {}).get("content", "") or ""
+        usage = payload.get("usage", {})
+        stdout = text.strip() + (
+            f"\n\nprompt_tokens={usage.get('prompt_tokens', 0)} "
+            f"output_tokens={usage.get('completion_tokens', 0)}\n"
+        )
+        return ReviewResult(model=model, command=f"{label} API {api_model}", returncode=0, stdout=stdout, stderr="")
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", "replace")
+        return ReviewResult(model=model, command=f"{label} API {api_model}", returncode=exc.code, stdout="", stderr=body_text)
+
+
+# z.ai (Zhipu / GLM) — OpenAI-compatible. General API base; the /coding/paas/v4
+# variant is for the coding-plan subscription only. Override with ZAI_BASE_URL.
+ZAI_DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4"
+ZAI_DEFAULT_MODEL = "glm-4.6"
+
+
+def _zai_key() -> str:
+    key = _resolve_key(("ZAI_API_KEY", "ZHIPU_API_KEY"), "ZAI_API_KEY")
+    if key:
+        return key
+    raise RuntimeError("ZAI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
+
+
+def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+    zai_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ZAI_MODEL", ZAI_DEFAULT_MODEL)
+    base_url = os.environ.get("ZAI_BASE_URL", ZAI_DEFAULT_BASE_URL)
+    key = _zai_key()
+    return _openai_compatible_request(
+        model=model, api_model=zai_model, label="z.ai", base_url=base_url, key=key,
+        prompt=prompt, diff=diff, timeout=timeout,
+    )
+
+
+# common-code — a keyed OpenAI-compatible HTTP API (commandcode / DeepSeek family).
+# No `common-code` CLI exists on PATH or in the user's config, and the closest match
+# is the OpenAI-compatible DeepSeek/commandcode API — so it is modelled as a keyed
+# HTTP backend (same wire shape as z.ai), NOT a CLI. The base URL + model default to
+# DeepSeek's OpenAI-compatible endpoint and are overridable via env so this is not
+# nailed to a single guess. See HYP-741.
+COMMON_CODE_DEFAULT_BASE_URL = "https://api.deepseek.com"
+COMMON_CODE_DEFAULT_MODEL = "deepseek-chat"
+
+
+def _common_code_key() -> str:
+    key = _resolve_key(
+        ("COMMON_CODE_API_KEY", "COMMANDCODE_API_KEY", "DEEPSEEK_API_KEY"),
+        "COMMON_CODE_API_KEY",
+    )
+    if key:
+        return key
+    raise RuntimeError(
+        "COMMON_CODE_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
+    )
+
+
+def review_common_code(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+    cc_model = model.split(":", 1)[1] if ":" in model else os.environ.get("COMMON_CODE_MODEL", COMMON_CODE_DEFAULT_MODEL)
+    base_url = os.environ.get("COMMON_CODE_BASE_URL", COMMON_CODE_DEFAULT_BASE_URL)
+    key = _common_code_key()
+    return _openai_compatible_request(
+        model=model, api_model=cc_model, label="common-code", base_url=base_url, key=key,
+        prompt=prompt, diff=diff, timeout=timeout,
+    )
 
 
 # A non-default User-Agent: some Anthropic-compatible gateways (e.g. CommandCode,
@@ -490,6 +607,18 @@ def resolve_backend(model: str) -> Callable[[str, str, str, Path, int], ReviewRe
         return review_codex
     if lowered in ("gemini", "gemini-api") or lowered.startswith("gemini:"):
         return review_gemini
+    # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP. `zai`/`glm` plus `zai:<model>`
+    # (e.g. zai:glm-4.6). `glm:` prefix also routes here.
+    if (
+        lowered in ("zai", "z.ai", "zhipu", "glm")
+        or lowered.startswith(("zai:", "z.ai:", "glm:", "zhipu:"))
+    ):
+        return review_zai
+    # common-code (commandcode / DeepSeek family) — OpenAI-compatible keyed HTTP.
+    if lowered in ("common-code", "commoncode", "common_code") or lowered.startswith(
+        ("common-code:", "commoncode:", "common_code:")
+    ):
+        return review_common_code
     # fable IS claude-p. Route any fable form to review_claude defensively, so an
     # unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
     # default (which would hit fireworks — the wrong provider entirely).
@@ -510,6 +639,12 @@ def backend_available(model: str) -> bool:
     try:
         if backend is review_gemini:
             _gemini_key()
+            return True
+        if backend is review_zai:
+            _zai_key()
+            return True
+        if backend is review_common_code:
+            _common_code_key()
             return True
         if backend is review_codex:
             _which("codex")

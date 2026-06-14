@@ -45,6 +45,12 @@ echo "cwd tests OK"
 python3 tests/test_claude_api.py
 echo "claude-api tests OK"
 
+# Keyed OpenAI-compatible provider backends (z.ai / commandcode, HYP-741): backend
+# routing, request shape, key resolution, availability — all offline (urlopen mocked,
+# no keys/network needed).
+python3 tests/test_provider_keys.py
+echo "provider-keys tests OK"
+
 # Stage 1 visual-verification suite (cvGate / vision_client / policy / pipeline /
 # composability). All offline: cvGate shells to magick, the vision call is mocked,
 # fixtures are generated (Pillow) — no API keys, no network. These need two non-core
