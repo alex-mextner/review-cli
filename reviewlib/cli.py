@@ -72,6 +72,21 @@ def _effective_cwd(raw: str) -> Path:
     return resolved
 
 
+def _dashboard_subcommand(rest: list[str]) -> int:
+    """Parse `dashboard [--port N] [--no-open]` and start the local-only web server.
+
+    Imported lazily so the dashboard's stdlib HTTP stack never loads on the hot review
+    path (and a stray import error in dashboard code can't break `review`)."""
+    sub = argparse.ArgumentParser(prog="review dashboard", description="Local-only web dashboard for review-cli runs.")
+    sub.add_argument("--port", type=int, default=None, help="port to bind on 127.0.0.1 (default: a free ephemeral port)")
+    sub.add_argument("--no-open", action="store_true", help="do not open a browser window")
+    sub.add_argument("--verbose", action="store_true", help="log every HTTP request to stderr")
+    ns = sub.parse_args(rest)
+    from .dashboard import run_dashboard
+
+    return run_dashboard(port=ns.port, open_browser=not ns.no_open, verbose=ns.verbose)
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -79,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
         return install_skill()
     if argv == ["install-commit-hook"]:
         return install_commit_hook()
+    # `review dashboard [--port N] [--no-open]` — local-only web dashboard over the
+    # review-cli logs + overseer annotations. Kept as a bare subcommand (like
+    # install-skill) so it doesn't bloat the main review argparse surface.
+    if argv and argv[0] == "dashboard":
+        return _dashboard_subcommand(argv[1:])
     # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
     # install-skill) so they don't clutter the main review argparse surface. Project
     # modules load by default (trust-by-default); trust-module only pins under the

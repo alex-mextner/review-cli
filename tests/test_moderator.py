@@ -88,7 +88,7 @@ def test_dedup_preserves_order():
 def test_run_moderator_returns_first_success_without_fallback():
     calls = []
 
-    def runner(model, prompt, cwd, timeout, diff=""):
+    def runner(model, prompt, cwd, timeout, diff="", round_no=0):
         calls.append(model)
         return _result(model, rc=0, out="good")
 
@@ -102,7 +102,7 @@ def test_run_moderator_returns_first_success_without_fallback():
 
 
 def test_run_moderator_falls_back_on_nonzero_exit():
-    def runner(model, prompt, cwd, timeout, diff=""):
+    def runner(model, prompt, cwd, timeout, diff="", round_no=0):
         if model == "claude:claude-opus-4-8":
             return _result(model, rc=124, out="")  # timeout-like failure (dead moderator)
         return _result(model, rc=0, out="recovered")
@@ -117,7 +117,7 @@ def test_run_moderator_falls_back_on_nonzero_exit():
 
 
 def test_run_moderator_falls_back_on_empty_output():
-    def runner(model, prompt, cwd, timeout, diff=""):
+    def runner(model, prompt, cwd, timeout, diff="", round_no=0):
         if model == "codex":
             return _result(model, rc=0, out="   ")  # exit 0 but no real content
         return _result(model, rc=0, out="real answer")
@@ -131,7 +131,7 @@ def test_run_moderator_falls_back_on_empty_output():
 
 
 def test_run_moderator_returns_last_when_all_fail():
-    def runner(model, prompt, cwd, timeout, diff=""):
+    def runner(model, prompt, cwd, timeout, diff="", round_no=0):
         return _result(model, rc=1, out="")
 
     restore = _with_stubs(runner=runner)
@@ -146,7 +146,7 @@ def test_run_moderator_returns_last_when_all_fail():
 def test_run_moderator_all_empty_success_is_reported_as_failure():
     # every candidate exits 0 but with whitespace-only output: must NOT be
     # reported as success, or quorum/brainstorm claim a synthesis that isn't there
-    def runner(model, prompt, cwd, timeout, diff=""):
+    def runner(model, prompt, cwd, timeout, diff="", round_no=0):
         return _result(model, rc=0, out="   ")
 
     restore = _with_stubs(runner=runner)
@@ -161,7 +161,7 @@ def test_run_moderator_accepts_single_string():
     # a lone moderator string must be treated as one candidate, not iterated char-by-char
     calls = []
 
-    def runner(model, prompt, cwd, timeout, diff=""):
+    def runner(model, prompt, cwd, timeout, diff="", round_no=0):
         calls.append(model)
         return _result(model, rc=0, out="ok")
 

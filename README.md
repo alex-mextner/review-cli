@@ -163,6 +163,42 @@ review --brainstorm "API shape for the cache layer" \
 
 ---
 
+## `review dashboard` — local web dashboard
+
+```bash
+review dashboard            # start the dashboard, open a browser at http://127.0.0.1:<port>/
+review dashboard --port 8765 --no-open   # fixed port, no auto-open (for remote/tmux use)
+```
+
+A single-page web app over every review-cli run, built on the Python **stdlib** HTTP
+server (no extra deps) and a **vanilla-JS SPA** (no npm/build step — assets ship in the
+package). It binds **127.0.0.1 only**: the logs persist prompts/diffs that may carry
+secrets, so the dashboard is never exposed on the network.
+
+**Data sources (read-only):** review-cli does not emit a structured run record, so the
+dashboard reads the real on-disk artifacts in `log_dir()` — the per-call streamed logs
+(`{stamp}-{backend}-r{n}.log`) and the brainstorm discussion logs (`{stamp}-brainstorm.md`).
+Subprocess backends (codex/claude/opencode) write these live; REST backends (gemini, z.ai,
+commandcode) emit an equivalent sidecar log on every call — each under its OWN backend name,
+so every backend is counted and attributed correctly. Calls are time-clustered into
+**sessions** (review-cli emits no run id; a session = a burst of calls separated by a gap),
+and the mode (review / panel / brainstorm) is inferred from the call/round shape.
+
+**Panels:** Chat logs (per-run transcripts), Stats (runs over time, by mode/model/role),
+Models & roles, Metrics (durations, success/fail rates), Overseer feedback, Modes, Errors,
+Tasks (mark a session **conscious**), Prompts, and PR + ticket links.
+
+**The overseer's annotations** — free-text feedback, the per-session **conscious** flag,
+and PR/ticket associations — are the only NEW persistence: a small atomic JSON store at
+`~/.config/review-cli/dashboard.json` (override with `$REVIEW_DASHBOARD_STORE`), keyed by
+the deterministic session id so annotations stay pinned as logs age out. The server exposes
+small local-only JSON endpoints (`GET /api/runs|stats|runs/<id>`, `POST .../feedback|conscious|links`).
+
+> Token/cost and an explicit run id are **not recorded** by review-core today; those panels
+> show a graceful empty-state noting what review-core would need to log, rather than faking data.
+
+---
+
 ## `review --visual` — visual verification
 
 **Give it a screenshot; it judges keep / rollback / repair.** `--visual` is image-only

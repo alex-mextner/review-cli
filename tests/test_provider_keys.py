@@ -797,7 +797,9 @@ def test_zai_connection_refused_maps_to_returncode():
 
 
 def test_commandcode_socket_timeout_maps_to_returncode():
-    """A socket timeout (TimeoutError, an OSError subclass) must be caught too."""
+    """A socket timeout (TimeoutError, an OSError subclass) must be caught and mapped to
+    the TIMEOUT code 124 — not a generic rc=1 — so the dashboard counts it as a timeout,
+    consistent with review_gemini and the subprocess backends (HYP-742)."""
 
     def _raise(req, timeout=None):
         raise TimeoutError("timed out")
@@ -810,7 +812,7 @@ def test_commandcode_socket_timeout_maps_to_returncode():
             res = backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
-    assert res.returncode == 1, res.returncode
+    assert res.returncode == 124, res.returncode
     assert res.stdout == ""
     assert "timed out" in res.stderr
 

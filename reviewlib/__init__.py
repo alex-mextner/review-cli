@@ -58,7 +58,7 @@ from .panel import (
     run_panel,
     run_single,
 )
-from .process import _kill_tree, _open_log, _run, _run_streamed, log_dir
+from .process import _kill_tree, _open_log, _run, _run_streamed, log_dir, write_sidecar_log
 
 __all__ = [
     "subprocess",
@@ -70,6 +70,7 @@ __all__ = [
     "_kill_tree",
     "_open_log",
     "log_dir",
+    "write_sidecar_log",
     "_which",
     "_payload",
     "_gemini_key",

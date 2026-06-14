@@ -3,6 +3,19 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## Unreleased
+
+- **Local web dashboard (`review dashboard`)** — serves logs, per-model stats,
+  timeout/error metrics, and a moderator/overseer view over the sidecar `.log`
+  files. Every REST backend now emits the same sidecar logs as the subprocess
+  backends, each under its OWN backend name (gemini, z.ai, commandcode, and
+  claude in API mode) — so those runs are no longer invisible or misattributed —
+  with `round_no` threaded from the panel so brainstorm rounds are attributed
+  correctly and a REST socket timeout is counted as a timeout. Footerless
+  (in-flight / aborted) calls are tracked as running, not faked as successes,
+  and a quoted timeout/exit marker in review prose never mis-flags a call.
+  CSRF-guarded write endpoints.
+
 ## 0.2.0
 
 First versioned cut. Everything below is already on `main`.

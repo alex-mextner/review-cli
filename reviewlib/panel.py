@@ -54,7 +54,7 @@ def pick_moderator(explicit: str | None, panel: list[str]) -> str:
     return pick_moderators(explicit, panel)[0]
 
 
-def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, diff: str = "") -> ReviewResult:
+def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, diff: str = "", round_no: int = 0) -> ReviewResult:
     """Run the moderator `prompt` against `candidates` in priority order.
 
     Returns the first result that succeeds (exit 0 with non-empty output). On a
@@ -72,7 +72,7 @@ def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, d
         candidates = [candidates]
     last: ReviewResult | None = None
     for index, model in enumerate(candidates):
-        result = run_single(model, prompt, cwd, timeout, diff=diff)
+        result = run_single(model, prompt, cwd, timeout, diff=diff, round_no=round_no)
         if result.returncode == 0 and result.stdout.strip():
             if index > 0:
                 print(f"[review-cli] moderator fell back to {model} "
@@ -99,6 +99,11 @@ class PanelJob:
     prompt: str
     diff: str = ""
     label: str | None = None
+    # The brainstorm round this job belongs to (1-based). Threaded into the backend so
+    # the per-call log is stamped `-r{N}` instead of always `-r0` — the dashboard parser
+    # infers brainstorm mode from round>=1 (HYP-742 finding 3). 0 = single-shot
+    # review/just-ask/quorum (no rounds).
+    round_no: int = 0
 
 
 def build_board_jobs(
@@ -138,7 +143,10 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
         return []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         futures = {
-            pool.submit(resolve_backend(job.model), job.model, job.prompt, job.diff, cwd, timeout): index
+            pool.submit(
+                resolve_backend(job.model), job.model, job.prompt, job.diff, cwd, timeout,
+                job.round_no,
+            ): index
             for index, job in enumerate(jobs)
         }
         for future in concurrent.futures.as_completed(futures):
@@ -158,5 +166,5 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
     return [r for r in results if r is not None]
 
 
-def run_single(model: str, prompt: str, cwd: Path, timeout: int, diff: str = "") -> ReviewResult:
-    return run_panel([PanelJob(model=model, prompt=prompt, diff=diff)], cwd, timeout)[0]
+def run_single(model: str, prompt: str, cwd: Path, timeout: int, diff: str = "", round_no: int = 0) -> ReviewResult:
+    return run_panel([PanelJob(model=model, prompt=prompt, diff=diff, round_no=round_no)], cwd, timeout)[0]

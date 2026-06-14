@@ -66,10 +66,85 @@ def log_dir() -> Path:
     return base
 
 
+def _safe_backend(backend: str) -> str:
+    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in backend) or "backend"
+
+
 def _open_log(backend: str, round_no: int) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-    safe_backend = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in backend) or "backend"
-    return log_dir() / f"{stamp}-{safe_backend}-r{round_no}.log"
+    return log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
+
+
+# Explicit status footer the dashboard parser reads to decide success/failure. The
+# parser must NOT infer failure from substrings like `error:` in the body — a review's
+# OUTPUT legitimately contains those (it is literally describing errors in the code).
+# The return code is the only authoritative signal, so EVERY log writer (the streamed
+# subprocess runner below AND the non-subprocess sidecar writer) stamps it as a final
+# `[review-cli] EXIT {code}` line. (HYP-742: explicit status, no body grep.)
+_EXIT_PREFIX = "[review-cli] EXIT "
+
+
+def _exit_line(returncode: int, *, preceding_text: str = "") -> str:
+    """The `[review-cli] EXIT {code}` footer, guaranteed to start on its OWN line.
+
+    The parser only recognises the footer when it is the first thing on a line, so if
+    the preceding logged output did not end with a newline (a subprocess that flushed
+    stdout WITHOUT a trailing `\\n`) we prepend one — otherwise `...lastlineEXIT 1` is
+    unparsable and the call is misclassified (codex P2)."""
+    lead = "" if (not preceding_text or preceding_text.endswith("\n")) else "\n"
+    return f"{lead}{_EXIT_PREFIX}{returncode}\n"
+
+
+def write_sidecar_log(
+    backend: str,
+    *,
+    round_no: int,
+    argv0: str,
+    returncode: int,
+    stdout: str,
+    stderr: str = "",
+    started: datetime | None = None,
+    timed_out: bool = False,
+    timeout_secs: int | None = None,
+) -> Path:
+    """Emit a per-call ``{stamp}-{backend}-r{n}.log`` for a NON-subprocess backend.
+
+    The streamed subprocess runner (`_run_streamed`) writes a live log for every
+    subprocess-based backend (codex/claude/opencode), but REST backends (gemini, and
+    any future HTTP backend) return without ever touching the log dir. The dashboard
+    parser reads ONLY those `.log` files, so a Gemini-only run was invisible — it
+    undercounted models and made Gemini-only sessions vanish (HYP-742 finding 2).
+
+    This writes the SAME on-disk format the parser already understands: the redacted
+    header line, the body, stderr lines tagged ``[stderr] ``, and the explicit
+    ``[review-cli] EXIT {code}`` status footer (finding 4 — success/failure comes from
+    the return code, never a body substring). File perms are 0600: logs persist
+    reviewed prompts/diffs that may carry secrets.
+
+    ``started`` is the call's START time and becomes the filename stamp. The parser
+    treats the filename stamp as the call start and the file mtime as the end, so the
+    caller MUST pass the time the call BEGAN — not "now" at write time — or a slow REST
+    call would show a near-zero duration and could fall into the wrong session cluster
+    (codex P2). Defaults to now() only when the caller has no better anchor.
+
+    ``timed_out`` writes the same ``[review-cli] TIMEOUT after {N}s`` marker the
+    subprocess runner uses, so the dashboard counts a REST timeout as a TIMEOUT (not a
+    generic error) — keeping the timeout metric consistent across backends (codex P2).
+    """
+    stamp = (started or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%fZ")
+    path = log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(f"[review-cli] {backend}: {argv0 or '?'} (args redacted)\n")
+        if stdout:
+            fh.write(stdout if stdout.endswith("\n") else stdout + "\n")
+        for line in stderr.splitlines():
+            fh.write("[stderr] " + line + "\n")
+        if timed_out:
+            secs = timeout_secs if timeout_secs is not None else 0
+            fh.write(f"[review-cli] TIMEOUT after {secs}s — partial output above]\n")
+        fh.write(_exit_line(returncode))
+    return path
 
 
 def _kill_tree(proc: subprocess.Popen, pgid: int | None) -> None:
@@ -143,6 +218,10 @@ def _run_streamed(
     timed_out = False
     proc: subprocess.Popen | None = None
     pgid: int | None = None
+    # Last char written to the log, so the trailing `EXIT {code}` footer can be put on
+    # its own line even when the subprocess flushed stdout without a trailing newline
+    # (codex P2: an unanchored footer is unparsable). The header ends with "\n".
+    log_tail = {"nl": True}
 
     # Private file perms: logs persist prompts/diffs that may contain secrets.
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -195,6 +274,8 @@ def _run_streamed(
             try:
                 log_fh.write(text)
                 log_fh.flush()
+                if text:
+                    log_tail["nl"] = text.endswith("\n")
             except (ValueError, OSError):  # closed handle / write error
                 pass
 
@@ -291,8 +372,20 @@ def _run_streamed(
                 try:
                     log_fh.write(marker)
                     log_fh.flush()
+                    log_tail["nl"] = True  # marker ends with "\n"
                 except (ValueError, OSError):
                     pass
+            # Explicit status footer so the dashboard parser decides success/failure
+            # from the RETURN CODE, not a body substring (HYP-742 finding 4). Written
+            # last, under the lock, after `stopping` is set so no drain thread races it.
+            # Anchored on its own line (codex P2) even if the child's last stdout flush
+            # had no trailing newline.
+            try:
+                lead = "" if log_tail["nl"] else "\n"
+                log_fh.write(lead + _exit_line(returncode))
+                log_fh.flush()
+            except (ValueError, OSError):
+                pass
         return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
     finally:
         # The log handle ALWAYS closes, even if Popen or a write raised before the
