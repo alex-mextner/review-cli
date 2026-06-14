@@ -145,6 +145,65 @@ def test_parse_brainstorm_personas_not_polluted_by_model_headings():
         assert "must stay in the persona body" in prag["text"]
 
 
+def test_brainstorm_moderator_and_synthesis_not_attributed_to_a_persona():
+    """(codex P2) `## Moderator (round N)` and `# Final synthesis` are written after a
+    round's persona blocks; they must NOT bleed into the last persona's transcript, or the
+    dashboard misattributes the moderator's decision / the synthesis to a persona."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        md = ld / "20260601T120000_000000Z-brainstorm.md"
+        md.write_text(
+            "# Brainstorm: cache design\n\n"
+            "panel=codex,gemini moderator=codex rounds>=5 max=5\n\n"
+            "# Round 1\n"
+            "#### Pragmatic engineer (codex)\nKeep it simple, use an LRU.\n\n"
+            "#### Security reviewer (gemini)\nWatch for cache poisoning.\n\n"
+            "## Moderator (round 1)\nCONTINUE. Panel agrees on LRU.\n\n"
+            "# Round 2\n"
+            "#### Pragmatic engineer (codex)\nAdd a TTL.\n\n"
+            "## Moderator (round 2)\nSTOP. Converged on LRU+TTL.\n\n"
+            "# Final synthesis\nBEST IDEAS: LRU + TTL. RECOMMENDATION: ship it.\n",
+            encoding="utf-8",
+        )
+        bs = p.parse_brainstorm_log(md)
+        for rnd in bs.rounds:
+            for persona in rnd["personas"]:
+                assert "Moderator" not in persona["text"], persona
+                assert "CONTINUE" not in persona["text"], persona
+                assert "STOP. Converged" not in persona["text"], persona
+                assert "BEST IDEAS" not in persona["text"], persona
+        r1 = next(r for r in bs.rounds if r["round"] == 1)
+        assert [pp["model"] for pp in r1["personas"]] == ["codex", "gemini"]
+        assert "use an LRU" in r1["personas"][0]["text"]
+
+
+def test_brainstorm_model_attribution_is_stable_across_log_aging():
+    """(codex P2) For a brainstorm, the `panel=` line is authoritative — model attribution
+    must be the SAME whether the per-call logs still exist or have aged out, and must keep
+    aliased / suffixed variants (`codex:gpt-5`, `zai`) that the resolved log filenames lose."""
+    from reviewlib.dashboard import parser as p
+
+    # (a) logs aged out: only the brainstorm md survives.
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_brainstorm(ld, "20260601T120000_000000", "T", "codex:gpt-5,zai", "codex")
+        aged = p.load_sessions(ld)[0]
+        assert aged.calls == []
+        assert aged.models == ["codex:gpt-5", "zai"], aged.models
+
+    # (b) logs still present (resolved backend names) — attribution stays the panel form.
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_brainstorm(ld, "20260601T120000_000000", "T", "codex:gpt-5,zai", "codex")
+        _write_call_log(ld, "20260601T120001_000000", "codex", 1, "round one\n", exit_code=0)
+        _write_call_log(ld, "20260601T120002_000000", "z.ai", 1, "round one\n", exit_code=0)
+        live = next(s for s in p.load_sessions(ld) if s.brainstorm is not None)
+        # The panel variants lead and are preserved (stable vs the aged-out case).
+        assert live.models[:2] == ["codex:gpt-5", "zai"], live.models
+
+
 def test_cluster_sessions_and_modes():
     from reviewlib.dashboard import parser as p
 

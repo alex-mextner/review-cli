@@ -332,6 +332,10 @@ def parse_call_log(path: Path) -> CallLog | None:
 
 _BS_HEADER_RE = re.compile(r"panel=(?P<panel>[^ ]*) moderator=(?P<mod>[^ ]*)")
 _BS_PERSONA_RE = re.compile(r"^#### (?P<name>.+?) \((?P<model>[^)]+)\)\s*$")
+# A `#`/`##`/`###` section heading (1–3 hashes + space) — e.g. `## Moderator (round N)`,
+# `# Final synthesis`. NOT a persona heading (always `#### `, 4 hashes) and NOT a round
+# heading (`# Round N`, handled earlier). Reaching one ends the current persona's capture.
+_BS_SECTION_RE = re.compile(r"^#{1,3} \S")
 
 
 def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
@@ -362,6 +366,17 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
         if rm:
             cur_round = {"round": int(rm.group(1)), "personas": []}
             rounds.append(cur_round)
+            cur_persona = None
+            continue
+        # The moderator summary (`## Moderator (round N)`) and the final synthesis
+        # (`# Final synthesis`) are written AFTER a round's persona blocks. Without
+        # stopping capture here, that text would bleed into the last persona's transcript
+        # and the dashboard would misattribute the moderator's decision / the synthesis to
+        # a persona (codex P2). A persona heading is always `#### …`, so any `#`/`##`
+        # section heading ends the current persona's capture. (We don't model the
+        # moderator/synthesis as personas — they have no `(model)` label — they're just
+        # excluded from persona text.)
+        if _BS_SECTION_RE.match(line):
             cur_persona = None
             continue
         pm = _BS_PERSONA_RE.match(line)
@@ -410,18 +425,20 @@ class Session:
     @property
     def models(self) -> list[str]:
         seen: list[str] = []
-        for c in self.calls:
-            if c.backend not in seen:
-                seen.append(c.backend)
-        # Orphan brainstorm: when the per-call logs have aged out but the sibling
-        # `*-brainstorm.md` remains, `calls` is empty yet the markdown still records the
-        # panel models (`panel=codex,gemini ...`). Fall back to those so /api/runs and the
-        # by_model stats keep their attribution exactly in the aged-out case the dashboard
-        # is meant to preserve (codex P2) — instead of returning an empty model list.
-        if not seen and self.brainstorm is not None:
+        # For a brainstorm, the `*-brainstorm.md` `panel=` line is AUTHORITATIVE: it
+        # records the user's exact model selection — including aliases / suffixed ids like
+        # `codex:gpt-5` or `zai` that the per-call log FILENAMES lose to the resolved
+        # backend name (`codex`, `z.ai`). Preferring it makes attribution STABLE whether or
+        # not the per-call logs have aged out (codex P2) — otherwise the same session's
+        # model list would silently change once logs expire and the variants would vanish
+        # from current stats. Any call-only backend not already covered is still appended.
+        if self.brainstorm is not None:
             for model in self.brainstorm.panel:
                 if model not in seen:
                     seen.append(model)
+        for c in self.calls:
+            if c.backend not in seen:
+                seen.append(c.backend)
         return seen
 
     @property
