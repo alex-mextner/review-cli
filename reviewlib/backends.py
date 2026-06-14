@@ -160,18 +160,32 @@ def _resolve_key(env_names: tuple, fallback_var: str) -> str | None:
     review already reads (GEMINI_ENV_FILE override, else GEMINI_ENV_FALLBACKS — the
     shared `~/.config/review-cli/.env` and the personal env). Returns None if unset.
 
+    Precedence is KEY-NAME-FIRST, not path-first: env var beats every file, and among
+    the files the canonical/primary key name wins over an alias REGARDLESS of which
+    .env file each lives in. So `COMMANDCODE_API_KEY` in a later fallback file beats
+    `DEEPSEEK_API_KEY` in an earlier one — the precedence a caller reading the env-var
+    order would expect. (A path-first loop would let an earlier file's alias shadow a
+    later file's primary key, a surprising and non-deterministic ordering.)
+
     REUSE (§6.4 / CTO D9): vision providers piggyback on the SAME config surface review
     already uses for Gemini — no new per-provider egress config is invented."""
+    # env var wins over any file, in declared order (primary name first).
     for name in env_names:
         value = os.environ.get(name, "").strip()
         if value:
             return value
     env_file = os.environ.get("GEMINI_ENV_FILE")
     paths = (Path(env_file),) if env_file else GEMINI_ENV_FALLBACKS
-    for path in paths:
-        key = _read_env_key(path, fallback_var)
-        if key:
-            return key
+    # File lookup is name-priority-first: fallback_var (the canonical/primary name),
+    # then the remaining accepted aliases, each checked across ALL .env files before
+    # moving to the next name. This keeps key-name precedence deterministic and
+    # independent of file ordering, mirroring the env-var lookup above.
+    file_vars = (fallback_var, *(n for n in env_names if n != fallback_var))
+    for var in file_vars:
+        for path in paths:
+            key = _read_env_key(path, var)
+            if key:
+                return key
     return None
 
 
@@ -215,6 +229,263 @@ def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
         return ReviewResult(model=model, command=f"Gemini API {gemini_model}", returncode=exc.code, stdout="", stderr=body_text)
+
+
+# --- Backend transport mode (api | cli) ----------------------------------------
+# A backend can run as a REST `api` call, a `cli` subprocess, or both. The claude
+# backend (PR #8) established the selector: a per-backend `REVIEW_<NAME>_MODE` env
+# var forces one variant (else the backend auto-picks). This generalises that ONE
+# mechanism so every backend declares its supported modes and resolves the forced
+# mode the same way — no second, parallel selector. commandcode and z.ai are
+# api-only (no commandcode/z.ai CLI exists); claude supports both; codex/opencode
+# are cli-only. `resolve_backend_mode` is the single entry point: it reads
+# `REVIEW_<NAME>_MODE`, validates it against the backend's `supported` modes, and
+# returns the chosen mode (or `default` when unset). A forced mode the backend does
+# NOT support is a hard, explicit error — never a silent fall-through to the wrong
+# transport (e.g. forcing `cli` on commandcode must fail loudly, not POST anyway).
+
+
+def _mode_env_var(name: str) -> str:
+    """The env var that forces a backend's transport mode, e.g. commandcode ->
+    REVIEW_COMMANDCODE_MODE. Mirrors PR #8's REVIEW_CLAUDE_MODE naming so the
+    whole family is discoverable from one rule."""
+    sanitized = "".join(ch if ch.isalnum() else "_" for ch in name.upper())
+    return f"REVIEW_{sanitized}_MODE"
+
+
+def resolve_backend_mode(name: str, supported: tuple[str, ...], default: str) -> str:
+    """Resolve a backend's transport mode from REVIEW_<NAME>_MODE, validated against
+    `supported`. Returns the forced mode if set and supported, else `default`.
+
+    Raises RuntimeError on an explicitly-forced mode the backend does not support —
+    that is a user configuration error (e.g. REVIEW_COMMANDCODE_MODE=cli when no
+    commandcode CLI exists) and must surface loudly, not silently run the api path.
+    An empty/unset value selects `default` (the backend's own auto-pick)."""
+    forced = os.environ.get(_mode_env_var(name), "").strip().lower()
+    if not forced:
+        return default
+    if forced not in supported:
+        raise RuntimeError(
+            f"{_mode_env_var(name)}={forced!r} is not a supported mode for the "
+            f"'{name}' backend (supported: {', '.join(supported)})"
+        )
+    return forced
+
+
+# --- OpenAI-compatible keyed HTTP backends (z.ai / commandcode) -----------------
+# Both z.ai (Zhipu / GLM) and commandcode expose an OpenAI-compatible
+# /chat/completions API. Unlike review_gemini's bespoke `contents`/`parts` shape,
+# these speak the standard OpenAI request body ({"model", "messages":[{role,content}]}
+# + Authorization: Bearer). The two backends share one request builder so the wire
+# shape stays identical; only the endpoint, key, and default model differ.
+#
+# Both are API-ONLY: no z.ai or commandcode CLI exists on PATH, so a forced
+# `cli` mode is rejected by resolve_backend_mode rather than silently POSTing.
+
+
+def _parse_openai_choice(payload: object) -> str:
+    """Pull assistant text out of an OpenAI-compatible response, tolerating any shape.
+
+    A provider can return a 2xx body that is valid JSON but NOT the expected object
+    (e.g. `[]`, `{"choices":[null]}`, `{"choices":[{"message":[]}]}`). Each access is
+    type-guarded so a wrong shape yields "" instead of raising AttributeError/
+    TypeError/IndexError out of the backend (those would crash the whole run)."""
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    return content if isinstance(content, str) else ""
+
+
+def _parse_openai_usage(payload: object) -> tuple[int, int]:
+    """Return (prompt_tokens, output_tokens) from a response, 0/0 on any wrong shape."""
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return 0, 0
+    prompt = usage.get("prompt_tokens", 0)
+    output = usage.get("completion_tokens", 0)
+    return (prompt if isinstance(prompt, int) else 0, output if isinstance(output, int) else 0)
+
+
+def _openai_compatible_request(
+    *, model: str, api_model: str, label: str, base_url: str, key: str,
+    prompt: str, diff: str, timeout: int, extra_body: dict | None = None,
+) -> ReviewResult:
+    """POST an OpenAI-compatible chat/completions request and return a ReviewResult.
+
+    `model` is the REQUESTED backend string (e.g. `zai`, `commandcode:deepseek/deepseek-v4-flash`)
+    and is preserved in ReviewResult.model — mode_review keys results by the requested
+    string, so substituting the resolved provider id here would KeyError. `api_model`
+    is the resolved provider model id sent on the wire (e.g. glm-4.6, deepseek/deepseek-v4-flash).
+
+    `extra_body` merges provider-specific request fields into the body while keeping the
+    shared OpenAI wire shape generic. Both current callers (z.ai, commandcode) pass None;
+    the hook stays for any future provider that needs a non-standard field.
+
+    `base_url` is the endpoint root (e.g. https://api.z.ai/api/paas/v4); the
+    /chat/completions suffix is appended here so callers pass the same value users
+    would set in any OpenAI-compatible client. EVERY failure mode maps to a non-zero
+    returncode with the error on stderr — HTTP status errors, connection refused /
+    DNS / socket timeouts (URLError, OSError, TimeoutError), malformed JSON
+    (JSONDecodeError), and valid-but-wrong-shape JSON (type-guarded parse) — so the
+    panel treats a failed call as a dead backend rather than crashing the whole run."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    command = f"{label} API {api_model}"
+    body = {
+        "model": api_model,
+        "messages": [{"role": "user", "content": _payload(prompt, diff)}],
+        "stream": False,
+    }
+    if extra_body:
+        body.update(extra_body)
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+        payload = json.loads(raw)
+        text = _parse_openai_choice(payload)
+        if not text.strip():
+            # A 2xx whose body carries NO assistant content (`[]`, `{"choices":[null]}`,
+            # `{"error":...}` with HTTP 200, an empty completion) is NOT a successful
+            # review — it has nothing to review with. Returning rc=0 here would let
+            # mode_review write a "reviewed" stamp and satisfy the commit gate with an
+            # empty result. Fail-closed: map it to a non-zero dead-backend result.
+            return ReviewResult(
+                model=model, command=command, returncode=1, stdout="",
+                stderr=f"{label} API returned no assistant content: {raw[:500]}",
+            )
+        prompt_tokens, output_tokens = _parse_openai_usage(payload)
+        stdout = text.strip() + (
+            f"\n\nprompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+        )
+        return ReviewResult(model=model, command=command, returncode=0, stdout=stdout, stderr="")
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", "replace")
+        return ReviewResult(model=model, command=command, returncode=exc.code, stdout="", stderr=body_text)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # Connection refused / DNS failure / socket timeout — no HTTP status. URLError
+        # and TimeoutError are both OSError subclasses; the wide catch normalises any
+        # transport-level failure to a dead-backend result instead of crashing.
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="",
+            stderr=f"{label} API request failed: {exc}",
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        # 2xx with a non-JSON / truncated body — the provider returned garbage. Treat
+        # it as a failed call rather than letting the decode error escape.
+        return ReviewResult(
+            model=model, command=command, returncode=1, stdout="",
+            stderr=f"{label} API returned a malformed response: {exc}",
+        )
+
+
+# z.ai (Zhipu / GLM) — OpenAI-compatible. General API base; the /coding/paas/v4
+# variant is for the coding-plan subscription only. Override with ZAI_BASE_URL.
+ZAI_DEFAULT_BASE_URL = "https://api.z.ai/api/paas/v4"
+ZAI_DEFAULT_MODEL = "glm-4.6"
+
+
+def _zai_key() -> str:
+    key = _resolve_key(("ZAI_API_KEY", "ZHIPU_API_KEY"), "ZAI_API_KEY")
+    if key:
+        return key
+    raise RuntimeError("ZAI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
+
+
+ZAI_SUPPORTED_MODES = ("api",)  # z.ai is REST-only; no z.ai CLI exists.
+
+
+def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+    # api-only: a forced REVIEW_ZAI_MODE=cli is a config error, surfaced as a
+    # dead-backend result instead of silently running the api path.
+    try:
+        resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
+    except RuntimeError as exc:
+        return ReviewResult(model=model, command="z.ai", returncode=1, stdout="", stderr=str(exc))
+    zai_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ZAI_MODEL", ZAI_DEFAULT_MODEL)
+    base_url = os.environ.get("ZAI_BASE_URL", ZAI_DEFAULT_BASE_URL)
+    key = _zai_key()
+    return _openai_compatible_request(
+        model=model, api_model=zai_model, label="z.ai", base_url=base_url, key=key,
+        prompt=prompt, diff=diff, timeout=timeout,
+    )
+
+
+# commandcode — Command Code's OpenAI-compatible Provider API (API-only).
+# The CTO confirmed: "Command code cli нет, есть api key" — there is no commandcode
+# CLI, only an API key (format `user_...`). So commandcode is a keyed HTTP backend
+# (same OpenAI wire shape as z.ai), NOT a subprocess. Endpoint verified from the
+# Command Code Provider API docs (https://commandcode.ai/docs/provider-api):
+#   base  https://api.commandcode.ai/provider/v1
+#   POST  /chat/completions   (OpenAI/OSS models — what this backend speaks)
+#   POST  /messages           (Anthropic models — use review_claude_api instead)
+#   auth  Authorization: Bearer $COMMANDCODE_API_KEY   (the same CLI key)
+# On /chat/completions the model id is provider-prefixed (e.g. deepseek/deepseek-v4-
+# flash); a Claude id there 400s and is directed to /messages, so Anthropic models
+# must go through the claude backend (REVIEW_CLAUDE_MODE=api), not here.
+# Base URL + model are overridable via COMMANDCODE_BASE_URL / COMMANDCODE_MODEL.
+COMMANDCODE_DEFAULT_BASE_URL = "https://api.commandcode.ai/provider/v1"
+# Default to an OpenAI-shape (provider-prefixed) model the /chat/completions path
+# serves. DeepSeek V4 Flash is a cheap, capable default for diff review; override
+# with COMMANDCODE_MODEL or a `commandcode:<model>` suffix for anything else.
+COMMANDCODE_DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+COMMANDCODE_SUPPORTED_MODES = ("api",)  # API-only — no commandcode CLI exists.
+
+# NOTE (HYP-741): the earlier `common-code` placeholder injected DeepSeek's
+# `{"thinking":{"type":"disabled"}}` field to reproduce the legacy non-thinking
+# `deepseek-chat` default. That field is DeepSeek-API-specific and is NOT sent here:
+# the default transport is the Command Code GATEWAY (api.commandcode.ai), which need
+# not accept an unknown body field — sending it risks a 400. A user who points
+# COMMANDCODE_BASE_URL at the raw DeepSeek endpoint and wants the non-thinking mode
+# can pass it explicitly via the model id; we don't inject a provider-specific field
+# behind their back onto a gateway. `_openai_compatible_request`'s generic
+# `extra_body` hook stays available for any future provider that needs it.
+
+
+def _commandcode_key() -> str:
+    # ONLY COMMANDCODE_API_KEY. The key is a Command Code `user_...` token, NOT a
+    # DeepSeek key — accepting DEEPSEEK_API_KEY here would silently POST a DeepSeek
+    # credential to api.commandcode.ai (a different host), which both fails to auth
+    # AND leaks the key cross-provider. So no alias key names: the canonical name is
+    # the only one that resolves. (Codex P1, HYP-741.)
+    key = _resolve_key(("COMMANDCODE_API_KEY",), "COMMANDCODE_API_KEY")
+    if key:
+        return key
+    raise RuntimeError(
+        "COMMANDCODE_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
+    )
+
+
+def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+    # API-only: a forced REVIEW_COMMANDCODE_MODE=cli is a config error (there is no
+    # commandcode CLI), surfaced as a dead-backend result, never a silent api POST.
+    try:
+        resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
+    except RuntimeError as exc:
+        return ReviewResult(model=model, command="commandcode", returncode=1, stdout="", stderr=str(exc))
+    has_suffix = ":" in model
+    env_model = os.environ.get("COMMANDCODE_MODEL")
+    cc_model = model.split(":", 1)[1] if has_suffix else (env_model or COMMANDCODE_DEFAULT_MODEL)
+    base_url = os.environ.get("COMMANDCODE_BASE_URL") or COMMANDCODE_DEFAULT_BASE_URL
+    key = _commandcode_key()
+    return _openai_compatible_request(
+        model=model, api_model=cc_model, label="commandcode", base_url=base_url, key=key,
+        prompt=prompt, diff=diff, timeout=timeout,
+    )
 
 
 # A non-default User-Agent: some Anthropic-compatible gateways (e.g. CommandCode,
@@ -490,6 +761,24 @@ def resolve_backend(model: str) -> Callable[[str, str, str, Path, int], ReviewRe
         return review_codex
     if lowered in ("gemini", "gemini-api") or lowered.startswith("gemini:"):
         return review_gemini
+    # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP. `zai`/`glm` plus `zai:<model>`
+    # (e.g. zai:glm-4.6). `glm:` prefix also routes here.
+    if (
+        lowered in ("zai", "z.ai", "zhipu", "glm")
+        or lowered.startswith(("zai:", "z.ai:", "glm:", "zhipu:"))
+    ):
+        return review_zai
+    # commandcode — Command Code's OpenAI-compatible Provider API (keyed HTTP).
+    # The legacy `common-code`/`common_code` spellings still route here as aliases so
+    # any pre-rename config keeps working.
+    if lowered in (
+        "commandcode", "command-code", "command_code",
+        "common-code", "commoncode", "common_code",
+    ) or lowered.startswith(
+        ("commandcode:", "command-code:", "command_code:",
+         "common-code:", "commoncode:", "common_code:")
+    ):
+        return review_commandcode
     # fable IS claude-p. Route any fable form to review_claude defensively, so an
     # unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
     # default (which would hit fireworks — the wrong provider entirely).
@@ -510,6 +799,19 @@ def backend_available(model: str) -> bool:
     try:
         if backend is review_gemini:
             _gemini_key()
+            return True
+        if backend is review_zai:
+            # Honor a forced mode: REVIEW_ZAI_MODE=cli makes review_zai a dead
+            # backend, so it must NOT report available (resolve_backend_mode raises
+            # on the unsupported mode → caught below → False). Codex P2.
+            resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
+            _zai_key()
+            return True
+        if backend is review_commandcode:
+            # Same as z.ai: a forced REVIEW_COMMANDCODE_MODE=cli is unrunnable, so the
+            # probe must reflect that instead of selecting a backend that only fails.
+            resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
+            _commandcode_key()
             return True
         if backend is review_codex:
             _which("codex")

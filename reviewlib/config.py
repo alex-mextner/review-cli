@@ -20,6 +20,18 @@ DEFAULT_MODELS = ("codex", "gemini", "oc:fireworks/accounts/fireworks/routers/ki
 MODEL_ALIASES = {
     "fable": "claude:claude-fable-5",
     "fable5": "claude:claude-fable-5",
+    # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai`/`glm`
+    # resolve directly in resolve_backend (env ZAI_MODEL / glm-4.6 default); these
+    # aliases pin specific GLM model ids for `-m glm46`/`-m glm45`.
+    "glm46": "zai:glm-4.6",
+    "glm45": "zai:glm-4.5",
+    "glm": "zai:glm-4.6",
+    # commandcode — Command Code's OpenAI-compatible Provider API (keyed HTTP).
+    # `cc` is a short hand; the legacy `commoncode`/`common-code` spellings still
+    # resolve via resolve_backend, so old configs keep working.
+    "commandcode": "commandcode",
+    "commoncode": "commandcode",
+    "cc": "commandcode",
 }
 CONFIG_PATH = Path.home() / ".config" / "review-cli" / "config.yaml"
 
