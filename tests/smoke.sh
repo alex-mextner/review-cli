@@ -36,6 +36,10 @@ echo "workspace-trust tests OK"
 python3 tests/test_moderator.py
 echo "moderator tests OK"
 
+# cwd resolution: git-toplevel detection + non-repo warning (real temp git repos).
+python3 tests/test_cwd.py
+echo "cwd tests OK"
+
 # Stage 1 visual-verification suite (cvGate / vision_client / policy / pipeline /
 # composability). All offline: cvGate shells to magick, the vision call is mocked,
 # fixtures are generated (Pillow) — no API keys, no network. These need two non-core

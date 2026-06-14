@@ -49,6 +49,27 @@ def _read_stdin_if_piped() -> str | None:
     return data if data else None
 
 
+def _effective_cwd(raw: str) -> Path:
+    """Resolve the review cwd, preferring the enclosing git repository root.
+
+    Agents commonly invoke `review` from a scratch / temp directory and forget
+    -C, so the diff and the claude-p workspace silently point at the wrong place
+    (often /tmp) and the review is empty or about the wrong code. Resolve to the
+    git toplevel when inside a repo (also robust to being run from a subdir), and
+    warn loudly when the cwd is not a git repo at all so the mistake is visible
+    instead of producing a misleading review. Pass -C <project-root> to be exact.
+    """
+    resolved = Path(raw).expanduser().resolve()
+    if resolved.is_dir():
+        proc = _run(["git", "rev-parse", "--show-toplevel"], cwd=resolved, timeout=10)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return Path(proc.stdout.strip())
+    print(f"[review-cli] warning: {resolved} is not inside a git repository; "
+          "reviewing it as-is — pass -C <project-root> to point review at your repo.",
+          file=sys.stderr, flush=True)
+    return resolved
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -120,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(_expand_alias(m) for m in effective))
         return 0
 
-    cwd = Path(args.cwd).expanduser().resolve()
+    cwd = _effective_cwd(args.cwd)
     explicit_models = _split_models(args.model)
     # Precedence: explicit -m > config > code default. Brainstorm prefers
     # config.brainstorm_models and drops unreachable backends gracefully (so a
