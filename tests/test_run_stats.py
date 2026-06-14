@@ -63,7 +63,12 @@ def _stub_resolve_backend(rc_by_model: dict[str, int] | int = 0):
     cwd, timeout) so it drops into panel.run_panel unchanged.
     """
     def resolver(model: str):
-        def backend(m, prompt, diff, cwd, timeout):
+        # round_no is the 6th arg panel.run_panel threads through (added with the
+        # round-aware board/brainstorm path). Default it so the stub matches BOTH the
+        # 5-arg `-m`/quorum callers and the 6-arg panel caller — otherwise a 6-arg call
+        # raises TypeError, run_panel catches it, and the success path silently tallies
+        # as a failure (codex: success path left under-tested).
+        def backend(m, prompt, diff, cwd, timeout, round_no=0):
             rc = rc_by_model if isinstance(rc_by_model, int) else rc_by_model.get(m, 0)
             return ReviewResult(model=m, command=f"stub {m}", returncode=rc,
                                 stdout=f"output from {m}", stderr="")
@@ -135,6 +140,20 @@ def test_record_run_file_is_0600():
                           ok_count=1, fail_count=0)
         mode = store.path.stat().st_mode & 0o777
         assert mode == 0o600, oct(mode)
+
+
+def test_record_run_tightens_preexisting_permissive_file():
+    """A run-stats file that already exists world/group-readable must be tightened to
+    0600 on the next write — O_CREAT's mode only applies on creation, so without an
+    explicit fchmod a pre-existing 0644 file would keep leaking (codex P2)."""
+    with _TmpStore() as store:
+        store.path.write_text("")  # pre-create
+        os.chmod(store.path, 0o644)
+        assert store.path.stat().st_mode & 0o777 == 0o644
+        _stats.record_run(mode="review", models=["codex"], duration_seconds=1.0,
+                          ok_count=1, fail_count=0)
+        assert store.path.stat().st_mode & 0o777 == 0o600, oct(store.path.stat().st_mode & 0o777)
+        assert len(store.records()) == 1
 
 
 def test_record_run_appends_not_truncates():
@@ -391,6 +410,12 @@ def test_cli_brainstorm_records_persona_slot_pool_not_raw_models():
             r = recs[0]
             assert r["mode"] == "brainstorm"
             assert r["pool_size"] == 3, r  # 2 models -> 3 persona slots
+            # Every stubbed backend (personas + moderator) returns rc=0, so a healthy
+            # run must tally ZERO failures and a positive ok_count. This guards the
+            # success path: before the stub accepted round_no, the 6-arg panel call
+            # raised TypeError and these would have been ok=0 / fail>0 unnoticed.
+            assert r["fail_count"] == 0, r
+            assert r["ok_count"] >= 1, r
         finally:
             restore()
             os.environ.pop("REVIEW_LOG_DIR", None)

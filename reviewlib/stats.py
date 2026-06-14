@@ -109,6 +109,11 @@ def record_run(
         # whole line). 0600 because we mirror the per-call-log privacy posture.
         fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
+            # O_CREAT's 0600 only applies when WE create the file; a run-stats.jsonl that
+            # already exists (or a $REVIEW_STATS_FILE the user pre-created) could carry
+            # broader perms and keep them forever. fchmod on every write so the 0600
+            # privacy guarantee holds for pre-existing files too.
+            os.fchmod(fd, 0o600)
             os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8"))
         finally:
             os.close(fd)

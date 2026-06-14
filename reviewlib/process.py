@@ -44,6 +44,20 @@ def _unregister_child(handle: tuple[subprocess.Popen, int | None]) -> None:
         _LIVE_CHILDREN.discard(handle)
 
 
+def _reregister_child(
+    old: tuple[subprocess.Popen, int | None], proc: subprocess.Popen, pgid: int | None
+) -> tuple[subprocess.Popen, int | None]:
+    """Swap a child handle (e.g. once its pgid is known) WITHOUT ever leaving the child
+    unregistered. Add the new handle BEFORE discarding the old, both under one lock hold,
+    so a concurrent `kill_live_children` snapshot always sees at least one handle for this
+    proc — never a gap in which a backstop fire could orphan it."""
+    new = (proc, pgid)
+    with _LIVE_CHILDREN_LOCK:
+        _LIVE_CHILDREN.add(new)
+        _LIVE_CHILDREN.discard(old)
+    return new
+
+
 def kill_live_children() -> None:
     """Reap every still-registered backend child's process group. Best-effort, never
     raises — called from the backstop's `_fire` right before its hard exit so a wedged
@@ -303,6 +317,11 @@ def _run_streamed(
             start_new_session=True,  # own process group, so we can kill the whole tree
         )
         running = proc  # non-None alias for the nested closures
+        # Register IMMEDIATELY — before resolving the pgid — so a backstop fire can never
+        # orphan a just-Popen'd backend in the window before `os.getpgid` returns. At this
+        # instant the child has no descendants yet, so the pgid=None handle (which reaps
+        # via `proc.kill()` on its own pid) is sufficient cover for that window.
+        child_handle = _register_child(proc, None)
         # Capture the group id NOW, while the child is alive. We need it later even
         # after the direct child is reaped, because a grandchild in the same group
         # may still be holding the stdout pipe open.
@@ -310,11 +329,12 @@ def _run_streamed(
             pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, OSError):
             pgid = None
-        # Track this live child so a run-backstop fire reaps it before its hard exit
-        # (its own-session group survives a plain process exit otherwise). Unregistered
-        # in the finally, after the normal `_kill_tree` cleanup. (nonlocal-free: the
-        # finally reads the same `child_handle` declared before the try.)
-        child_handle = _register_child(proc, pgid)
+        # Once the pgid is known, swap to a group-bearing handle so a later reap kills the
+        # WHOLE tree (grandchildren included), not just the direct child. The swap is
+        # gap-free (`_reregister_child` adds before it discards), so the child is reapable
+        # throughout. Unregistered in the finally, after the normal `_kill_tree` cleanup.
+        if pgid is not None:
+            child_handle = _reregister_child(child_handle, proc, pgid)
 
         def _feed_stdin() -> None:
             if input_text is None or running.stdin is None:
