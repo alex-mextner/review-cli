@@ -115,7 +115,7 @@ def mode_brainstorm(
                     "Be concrete; offer ideas, not pleasantries. Do not edit files.\n\n"
                     f"TOPIC:\n{topic}\n\n=== SHARED TRANSCRIPT (prior rounds) ===\n{shared}"
                 )
-                jobs.append(PanelJob(model=model, prompt=prompt, diff="", label=f"{persona_name} ({model})"))
+                jobs.append(PanelJob(model=model, prompt=prompt, diff="", label=f"{persona_name} ({model})", round_no=round_no))
 
             round_results = run_panel(jobs, cwd, timeout)
             round_text = "\n\n".join(
@@ -135,7 +135,7 @@ def mode_brainstorm(
                 "'DECISION: CONTINUE'.\n\n"
                 f"TOPIC:\n{topic}\n\n=== ROUND {round_no} ===\n{round_text}"
             )
-            mod_result = run_moderator(moderators, mod_prompt, cwd, timeout)
+            mod_result = run_moderator(moderators, mod_prompt, cwd, timeout, round_no=round_no)
             out.append(f"\n## Moderator (round {round_no})\n" + format_result(mod_result))
             _disc(f"\n## Moderator (round {round_no})\n"
                   f"{(mod_result.stdout.strip() or mod_result.stderr.strip() or '(no output)')}\n")
@@ -157,7 +157,10 @@ def mode_brainstorm(
             "final synthesis with: BEST IDEAS (ranked), TRADEOFFS, and a single concrete RECOMMENDATION.\n\n"
             f"TOPIC:\n{topic}\n\n=== FULL TRANSCRIPT ({completed} rounds) ===\n{full_transcript}"
         )
-        synth = run_moderator(moderators, synth_prompt, cwd, timeout)
+        # Final synthesis is part of the brainstorm: stamp it with the completed round
+        # count so it logs as `-r{N}` (>=1), keeping the whole invocation off `-r0` and
+        # the parser's brainstorm inference correct (HYP-742 finding 3).
+        synth = run_moderator(moderators, synth_prompt, cwd, timeout, round_no=max(completed, 1))
         out.append("\n# Final synthesis\n" + format_result(synth))
         _disc(f"\n# Final synthesis\n{(synth.stdout.strip() or synth.stderr.strip() or '(no output)')}\n")
     finally:

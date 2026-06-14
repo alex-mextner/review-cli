@@ -38,6 +38,9 @@ _CALL_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-(.+)-r(\d+)\.log$")
 _BRAINSTORM_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-brainstorm\.md$")
 _HEADER_RE = re.compile(r"^\[review-cli\] (?P<backend>.+?): (?P<argv0>.*?) \(args redacted\)\s*$")
 _TIMEOUT_RE = re.compile(r"^\[review-cli\] TIMEOUT after (?P<secs>\d+)s")
+# Explicit status footer written by every log writer (process._run_streamed and
+# backends' REST sidecar). This is the authoritative success/failure signal (finding 4).
+_EXIT_RE = re.compile(r"^\[review-cli\] EXIT (?P<code>-?\d+)\s*$")
 _STDERR_PREFIX = "[stderr] "
 
 # Default gap (seconds) that separates one session-burst from the next. Real logs show
@@ -72,6 +75,13 @@ class CallLog:
     timeout_secs: int | None = None
     size_bytes: int = 0
     mtime: datetime | None = None
+    # The explicit return code recorded by the writer as a trailing
+    # `[review-cli] EXIT {code}` line. None when the log predates this footer or was
+    # truncated before it (killed mid-write). This is the AUTHORITATIVE success signal —
+    # the body is NOT grepped for `error:`/`permission denied`, because a review's
+    # output legitimately contains those strings while describing the code it reviewed
+    # (HYP-742 finding 4: that grep inflated the Errors panel and tanked the success rate).
+    exit_code: int | None = None
 
     @property
     def duration_seconds(self) -> float | None:
@@ -110,12 +120,37 @@ class CallLog:
 
     @property
     def has_error(self) -> bool:
-        return self.timed_out or bool(self.stderr_lines) or _looks_like_error(self.body)
+        """Did this call FAIL?
+
+        Success/failure is decided by the EXPLICIT return code (the `EXIT {code}` footer),
+        never by grepping the body for `error:` — a review's own output legitimately
+        contains those strings (HYP-742 finding 4). When the explicit code exists it is
+        authoritative: rc 0 = success (even if the prose mentions errors), rc != 0 = fail.
+
+        A timeout is always a failure (the writer records it as EXIT 124, but a log
+        truncated before the footer can still carry the TIMEOUT marker — honor it either
+        way). Only when NO explicit code was recorded do we fall back to the legacy
+        heuristic (stderr present / error-marker grep) so pre-footer logs still surface.
+        """
+        if self.timed_out:
+            return True
+        if self.exit_code is not None:
+            return self.exit_code != 0
+        # Legacy fallback: log predates the EXIT footer (or was truncated before it).
+        return bool(self.stderr_lines) or _looks_like_error(self.body)
 
     @property
     def error_summary(self) -> str | None:
+        if not self.has_error:
+            return None
         if self.timed_out:
             return f"TIMEOUT after {self.timeout_secs}s"
+        if self.exit_code is not None and self.exit_code != 0:
+            # Prefer a concrete stderr line; fall back to the explicit exit code so the
+            # Errors panel always has a reason even when stderr is empty.
+            if self.stderr_lines:
+                return self.stderr_lines[0].strip()[:300]
+            return f"exit code {self.exit_code}"
         if self.stderr_lines:
             return self.stderr_lines[0].strip()[:300]
         if _looks_like_error(self.body):
@@ -133,6 +168,7 @@ class CallLog:
             "duration_seconds": self.duration_seconds,
             "timed_out": self.timed_out,
             "timeout_secs": self.timeout_secs,
+            "exit_code": self.exit_code,
             "has_error": self.has_error,
             "error_summary": self.error_summary,
             "size_bytes": self.size_bytes,
@@ -176,6 +212,12 @@ _ERROR_MARKERS = (
 
 
 def _looks_like_error(text: str) -> bool:
+    """LEGACY heuristic, used ONLY for logs that have no explicit `EXIT {code}` footer.
+
+    A substring grep over the body is unreliable — review output legitimately contains
+    `error:` / `permission denied` while describing the code under review (HYP-742
+    finding 4). The authoritative signal is the recorded return code; this fallback only
+    applies to pre-footer / truncated logs where no return code was captured."""
     low = text.lower()
     return any(m in low for m in _ERROR_MARKERS)
 
@@ -198,7 +240,24 @@ def parse_call_log(path: Path) -> CallLog | None:
     stderr_lines: list[str] = []
     timed_out = False
     timeout_secs: int | None = None
+    exit_code: int | None = None
+    # The status footer is ALWAYS the final non-empty line the logger writes. Consume it
+    # ONLY in that position — a model's review output can legitimately QUOTE an exact
+    # `[review-cli] EXIT 1` line mid-body (e.g. while reviewing review-cli's own logs);
+    # treating that as the status would mis-flag the call and strip real content (codex
+    # P2). So we find the index of the trailing footer (if any) and skip just that line.
+    exit_line_idx: int | None = None
+    for j in range(len(lines) - 1, -1, -1):
+        if not lines[j].strip():
+            continue  # ignore trailing blank lines
+        em = _EXIT_RE.match(lines[j])
+        if em:
+            exit_code = int(em.group("code"))
+            exit_line_idx = j
+        break  # the last non-empty line is decisive either way
     for i, line in enumerate(lines):
+        if i == exit_line_idx:
+            continue  # the authoritative trailing status footer — kept out of the body
         if i == 0:
             hm = _HEADER_RE.match(line)
             if hm:
@@ -231,6 +290,7 @@ def parse_call_log(path: Path) -> CallLog | None:
         stderr_lines=stderr_lines,
         timed_out=timed_out,
         timeout_secs=timeout_secs,
+        exit_code=exit_code,
         size_bytes=size,
         mtime=mtime,
     )

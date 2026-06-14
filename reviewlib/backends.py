@@ -10,16 +10,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import textwrap
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .process import _run, _run_streamed
+from .process import _run, _run_streamed, write_sidecar_log
 
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
@@ -67,7 +69,7 @@ def _payload(prompt: str, diff: str = "") -> str:
     return out
 
 
-def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     codex_model = model.split(":", 1)[1] if ":" in model else None
     argv = [_which("codex"), "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
     if codex_model:
@@ -76,7 +78,7 @@ def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int) ->
     command = " ".join(argv[:-1]) + " -"
     proc = _run_streamed(
         argv, cwd=cwd, input_text=_payload(prompt, diff), timeout=timeout,
-        backend="codex", announce=_ANNOUNCE_LOGS,
+        backend="codex", round_no=round_no, announce=_ANNOUNCE_LOGS,
     )
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
@@ -111,7 +113,7 @@ def _ensure_opencode_readonly_agent(_project: Path, _oc_model: str) -> None:
     )
 
 
-def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     oc_model = model.split(":", 1)[1] if ":" in model else model
     with tempfile.TemporaryDirectory(prefix="review-cli-opencode-") as tmp_raw:
         tmp = Path(tmp_raw)
@@ -138,7 +140,7 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int)
             oc_model,
             message,
         ]
-        proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", announce=_ANNOUNCE_LOGS)
+        proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", round_no=round_no, announce=_ANNOUNCE_LOGS)
     command = f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
@@ -203,32 +205,99 @@ def _gemini_key() -> str:
 # adapters; `_resolve_key` stays — `_gemini_key` still uses it.
 
 
-def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     gemini_model = model.split(":", 1)[1] if ":" in model else os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    key = _gemini_key()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
-    body = {
-        "contents": [{"parts": [{"text": _payload(prompt, diff)}]}],
-        "toolConfig": {"functionCallingConfig": {"mode": "NONE"}},
-    }
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/json", "x-goog-api-key": key},
-    )
+    command = f"Gemini API {gemini_model}"
+    # Gemini is a REST backend — it never goes through `_run_streamed`, so it must emit
+    # its own per-call sidecar log or the dashboard parser (which reads ONLY `.log`
+    # files) would not see it at all: models undercounted, Gemini-only runs invisible
+    # (HYP-742 finding 2). The sidecar carries the explicit EXIT status (finding 4) and
+    # is stamped with the call's START time (captured now), so a slow call's duration
+    # and session clustering stay correct (codex P2).
+    #
+    # KEY RESOLUTION IS INSIDE the try: a missing GEMINI_API_KEY is the COMMON failure
+    # (gemini is in DEFAULT_MODELS), and `_gemini_key()` raising before the logged path
+    # would leave that auth failure invisible — `run_panel` would turn it into an
+    # internal 127 with no `.log` (codex P2). Now the auth failure emits a sidecar too.
+    started = datetime.now(timezone.utc)
     try:
+        key = _gemini_key()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
+        body = {
+            "contents": [{"parts": [{"text": _payload(prompt, diff)}]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "NONE"}},
+        }
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", "x-goog-api-key": key},
+        )
         with urllib.request.urlopen(req, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
         parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
         text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
         usage = payload.get("usageMetadata", {})
         stdout = text.strip() + f"\n\nprompt_tokens={usage.get('promptTokenCount', 0)} output_tokens={usage.get('candidatesTokenCount', 0)}\n"
-        return ReviewResult(model=model, command=f"Gemini API {gemini_model}", returncode=0, stdout=stdout, stderr="")
+        _emit_rest_log(command, round_no=round_no, returncode=0, stdout=stdout, stderr="", started=started)
+        return ReviewResult(model=model, command=command, returncode=0, stdout=stdout, stderr="")
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
-        return ReviewResult(model=model, command=f"Gemini API {gemini_model}", returncode=exc.code, stdout="", stderr=body_text)
+        rc = exc.code or 1
+        _emit_rest_log(command, round_no=round_no, returncode=rc, stdout="", stderr=body_text, started=started)
+        return ReviewResult(model=model, command=command, returncode=rc, stdout="", stderr=body_text)
+    except Exception as exc:  # noqa: BLE001
+        # Anything other than an HTTPError: a missing API key (RuntimeError from
+        # `_gemini_key()`), a network/DNS/socket-timeout error (URLError), or a malformed
+        # JSON response (ValueError). Without this the call would raise out of run_panel
+        # as an "internal" 127 with NO `.log`, so a failed Gemini run would stay invisible
+        # to the dashboard (codex P2). Emit a failure sidecar and return a normal non-zero
+        # ReviewResult instead of raising.
+        err = f"{type(exc).__name__}: {exc}"
+        # A urlopen timeout (socket timeout, or a URLError wrapping one) must be recorded
+        # as a TIMEOUT, not a generic error, so the dashboard's timeout metric stays
+        # consistent with the subprocess backends (codex P2). rc 124 = the timeout code.
+        if _is_timeout_error(exc):
+            _emit_rest_log(
+                command, round_no=round_no, returncode=124, stdout="", stderr=err,
+                started=started, timed_out=True, timeout_secs=timeout,
+            )
+            return ReviewResult(model=model, command=command, returncode=124, stdout="", stderr=err)
+        _emit_rest_log(command, round_no=round_no, returncode=1, stdout="", stderr=err, started=started)
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=err)
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """True if ``exc`` is (or wraps) a socket/network timeout.
+
+    `urlopen(..., timeout=N)` surfaces a timeout as `socket.timeout` (== `TimeoutError`
+    on 3.10+) directly, or as a `urllib.error.URLError` whose `.reason` is that timeout."""
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, (socket.timeout, TimeoutError))
+
+
+def _emit_rest_log(
+    argv0: str, *, round_no: int, returncode: int, stdout: str, stderr: str,
+    started: datetime | None = None, timed_out: bool = False, timeout_secs: int | None = None,
+) -> None:
+    """Best-effort sidecar log for a NON-subprocess (REST) backend run.
+
+    Mirrors what `_run_streamed` writes for subprocess backends so the dashboard parser
+    counts the run. Logging must never take down a review: a read-only log dir or write
+    error is swallowed (the backend already produced its result). ``started`` is the
+    call's START time so the dashboard reports an honest duration (codex P2); ``timed_out``
+    records a TIMEOUT marker so a REST timeout counts as a timeout, not a generic error."""
+    try:
+        write_sidecar_log(
+            "gemini", round_no=round_no, argv0=argv0, returncode=returncode, stdout=stdout,
+            stderr=stderr, started=started, timed_out=timed_out, timeout_secs=timeout_secs,
+        )
+    except OSError:
+        pass
+
 
 
 # --- Backend transport mode (api | cli) ----------------------------------------
@@ -429,9 +498,13 @@ def _zai_key() -> str:
 ZAI_SUPPORTED_MODES = ("api",)  # z.ai is REST-only; no z.ai CLI exists.
 
 
-def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     # api-only: a forced REVIEW_ZAI_MODE=cli is a config error, surfaced as a
     # dead-backend result instead of silently running the api path.
+    # `round_no` is accepted (and forwarded) so the panel's uniform 6-arg dispatch
+    # (panel.py: backend(model, prompt, diff, cwd, timeout, round_no)) does not raise
+    # for these post-HYP-741 REST backends and the dashboard attributes the run to the
+    # right brainstorm round.
     try:
         resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
     except RuntimeError as exc:
@@ -490,9 +563,11 @@ def _commandcode_key() -> str:
     )
 
 
-def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     # API-only: a forced REVIEW_COMMANDCODE_MODE=cli is a config error (there is no
     # commandcode CLI), surfaced as a dead-backend result, never a silent api POST.
+    # `round_no` is accepted so the panel's uniform 6-arg dispatch does not raise for
+    # this post-HYP-741 REST backend (see review_zai for the rationale).
     try:
         resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
     except RuntimeError as exc:
@@ -610,7 +685,7 @@ def _have_claude_cli() -> bool:
         return False
 
 
-def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     """Dispatch the claude/opus backend between the API and CLI variants.
 
     REVIEW_CLAUDE_MODE forces it: ``api`` (HTTP, no claude binary needed) or
@@ -619,13 +694,19 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -
     and reliable now that workspace trust is deterministic), and fall back to the
     API only when there is no claude binary but a key IS configured — i.e. don't
     silently switch a working CLI host to the paid API just because a key happens
-    to be in the environment. Set REVIEW_CLAUDE_MODE=api to force the API."""
+    to be in the environment. Set REVIEW_CLAUDE_MODE=api to force the API.
+
+    ``round_no`` is threaded from the panel so the CLI variant's sidecar log lands
+    in the right brainstorm round (the dashboard parser keys on it). The API
+    variant has no subprocess sidecar, so it does not take the parameter."""
     mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
     if mode == "api":
         return review_claude_api(model, prompt, diff, cwd, timeout)
     if mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None:
         return review_claude_api(model, prompt, diff, cwd, timeout)
-    return review_claude_cli(model, prompt, diff, cwd, timeout)
+    return review_claude_cli(model, prompt, diff, cwd, timeout, round_no)
+
+
 
 
 def _ensure_workspace_trusted(cwd: Path) -> None:
@@ -720,7 +801,7 @@ def _ensure_workspace_trusted(cwd: Path) -> None:
                 lock.close()
 
 
-def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: int) -> ReviewResult:
+def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     claude_model = model.split(":", 1)[1] if ":" in model else None
     # Resolve the binary BEFORE touching trust: a missing claude-p must raise
     # here, not after _ensure_workspace_trusted has already mutated ~/.claude.json.
@@ -769,13 +850,13 @@ def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     argv += ["-p"]
     proc = _run_streamed(
         argv, cwd=cwd, input_text=_payload(prompt, diff),
-        timeout=timeout + 30, backend="claude", announce=_ANNOUNCE_LOGS,
+        timeout=timeout + 30, backend="claude", round_no=round_no, announce=_ANNOUNCE_LOGS,
     )
     command = "claude-p --permission-mode dontAsk --tools '' --strict-mcp-config --disable-slash-commands --safe-mode --append-system-prompt <read-only-review> --disallowedTools Edit MultiEdit Write Bash Read Grep Glob NotebookEdit SlashCommand Task TodoWrite ExitPlanMode WebFetch WebSearch -p  (prompt via stdin)"
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
-def resolve_backend(model: str) -> Callable[[str, str, str, Path, int], ReviewResult]:
+def resolve_backend(model: str) -> Callable[..., ReviewResult]:
     lowered = model.lower()
     if lowered == "codex" or lowered.startswith("codex:"):
         return review_codex

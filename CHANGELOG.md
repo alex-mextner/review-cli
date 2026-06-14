@@ -3,6 +3,15 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## Unreleased
+
+- **Local web dashboard (`review dashboard`)** — serves logs, per-model stats,
+  timeout/error metrics, and a moderator/overseer view over the sidecar `.log`
+  files. REST backends (gemini and the keyed OpenAI-compatible providers) now
+  emit the same sidecar logs as subprocess backends, with `round_no` threaded
+  from the panel so brainstorm rounds are attributed correctly. CSRF-guarded
+  write endpoints.
+
 ## 0.2.0
 
 First versioned cut. Everything below is already on `main`.

@@ -34,6 +34,12 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 _ALLOWED_ASSETS = {"app.js", "app.css"}
 _CONTENT_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
 
+# Max request body for a write (feedback/conscious/links). Feedback is free text but a
+# few KB is generous; this caps a malicious/runaway POST before we read it into memory.
+_MAX_WRITE_BODY_BYTES = 64 * 1024
+# Loopback host names an Origin/Referer may carry for a same-machine browser request.
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
 
 def _session_index(gap: float) -> dict[str, dparser.Session]:
     sessions = dparser.load_sessions(log_dir(), gap_seconds=gap)
@@ -108,17 +114,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _error(self, status: int, msg: str) -> None:
         self._send_json({"error": msg}, status=status)
 
-    def _read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return {}
-        return data if isinstance(data, dict) else {}
-
     def _gap(self, qs: dict) -> float:
         try:
             return float(qs.get("gap", [dparser.DEFAULT_SESSION_GAP_SECONDS])[0])
@@ -152,6 +147,48 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return False
         self._error(403, "forbidden: dashboard is local-only (loopback Host required)")
         return True
+
+    @staticmethod
+    def _origin_hostname(value: str) -> str | None:
+        """Extract the hostname from an Origin/Referer URL (scheme://host[:port]/...).
+
+        Returns the bare hostname (port stripped, IPv6 brackets kept as-is in the
+        loopback set). None if the value is not a parseable absolute URL."""
+        try:
+            parsed = urlparse(value.strip())
+        except ValueError:
+            return None
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        host = parsed.hostname  # urlparse drops the port and unwraps IPv6 brackets
+        return host.lower() if host else None
+
+    def _origin_is_loopback(self) -> bool:
+        """CSRF defence for WRITES: a cross-site page that fetch()es our loopback port
+        carries ITS OWN site in the Origin header. We require the Origin (or, if absent,
+        the Referer) to be a loopback origin. A request with NEITHER header is treated as
+        same-origin/non-browser (the dashboard's own fetch is same-origin and browsers
+        DO send Origin on POST; curl/tests legitimately omit both) and allowed.
+
+        Combined with the Host allowlist + the Content-Type guard, a foreign web page
+        cannot mutate the annotation store: a simple-request form post can't set
+        Content-Type: application/json, and an XHR/fetch that does will carry a foreign
+        Origin that fails here."""
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin:
+            # "null" (sandboxed/file: origins) is explicitly NOT loopback.
+            host = self._origin_hostname(origin)
+            return host in _LOOPBACK_HOSTS
+        referer = (self.headers.get("Referer") or "").strip()
+        if referer:
+            host = self._origin_hostname(referer)
+            return host in _LOOPBACK_HOSTS
+        # No Origin and no Referer: not a cross-site browser write. Allow.
+        return True
+
+    def _content_type_is_json(self) -> bool:
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        return ctype == "application/json"
 
     # ---- routing -------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
@@ -206,9 +243,57 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 - never crash the server thread
             self._error(500, f"{type(exc).__name__}: {exc}")
 
+    def _read_write_body(self) -> dict | None:
+        """Read + parse the JSON body of a WRITE, enforcing the size cap.
+
+        Returns the dict on success, or None after having already sent an error response
+        (413 too large / 400 bad JSON) — the caller must just return when it gets None.
+        Reading the declared length and capping it BEFORE we pull bytes keeps a malicious
+        oversized POST from being slurped into memory (HYP-742 finding 1)."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (ValueError, TypeError):
+            length = 0
+        if length > _MAX_WRITE_BODY_BYTES:
+            self._error(413, f"request body too large (max {_MAX_WRITE_BODY_BYTES} bytes)")
+            return None
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        if len(raw) > _MAX_WRITE_BODY_BYTES:  # defence in depth vs a lying Content-Length
+            self._error(413, f"request body too large (max {_MAX_WRITE_BODY_BYTES} bytes)")
+            return None
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._error(400, "invalid JSON body")
+            return None
+        if not isinstance(data, dict):
+            self._error(400, "JSON body must be an object")
+            return None
+        return data
+
+    def _session_exists(self, sid: str) -> bool:
+        """True if ``sid`` is a session present in the parsed runs.
+
+        Writes are only allowed against a session that actually exists (HYP-742
+        finding 1): annotating an arbitrary attacker-chosen id would let a CSRF write
+        seed junk records into the store. The default gap is used (POSTs carry no
+        ?gap=), matching how the UI clusters."""
+        return sid in _session_index(dparser.DEFAULT_SESSION_GAP_SECONDS)
+
     def do_POST(self) -> None:  # noqa: N802
         if self._reject_foreign_host():
             return
+        # CSRF guards for state-changing writes (HYP-742 finding 1):
+        #   1. a cross-site browser fetch carries a foreign Origin -> 403;
+        #   2. a foreign form/simple-request can't set application/json -> 415;
+        # together with the Host allowlist this stops a malicious page from mutating
+        # the local annotation store via the loopback port.
+        if not self._origin_is_loopback():
+            return self._error(403, "forbidden: cross-origin write blocked (loopback Origin required)")
+        if not self._content_type_is_json():
+            return self._error(415, "unsupported media type: Content-Type must be application/json")
         parsed = urlparse(self.path)
         path = parsed.path
         try:
@@ -218,23 +303,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if "/" not in rest:
                 return self._error(404, "expected /api/runs/<id>/<action>")
             sid, action = rest.split("/", 1)
-            body = self._read_json_body()
+            if action not in ("feedback", "conscious", "links"):
+                return self._error(404, f"unknown action: {action}")
+            # Only annotate a session that exists in the parsed runs — reject writes to an
+            # UNKNOWN id (404) so a forged/arbitrary id can't plant a store record.
+            if not self._session_exists(sid):
+                return self._error(404, f"unknown session {sid}")
+            body = self._read_write_body()
+            if body is None:
+                return  # _read_write_body already sent a 413/400
             if action == "feedback":
                 rec = dstore.set_feedback(sid, body.get("feedback"))
                 return self._send_json({"ok": True, "session_id": sid, "annotation": rec})
             if action == "conscious":
                 rec = dstore.set_conscious(sid, bool(body.get("conscious")))
                 return self._send_json({"ok": True, "session_id": sid, "annotation": rec})
-            if action == "links":
-                try:
-                    if body.get("remove"):
-                        rec = dstore.remove_link(sid, pr=body.get("pr"), ticket=body.get("ticket"))
-                    else:
-                        rec = dstore.add_link(sid, pr=body.get("pr"), ticket=body.get("ticket"))
-                except ValueError as exc:
-                    return self._error(400, str(exc))
-                return self._send_json({"ok": True, "session_id": sid, "annotation": rec})
-            return self._error(404, f"unknown action: {action}")
+            # action == "links"
+            try:
+                if body.get("remove"):
+                    rec = dstore.remove_link(sid, pr=body.get("pr"), ticket=body.get("ticket"))
+                else:
+                    rec = dstore.add_link(sid, pr=body.get("pr"), ticket=body.get("ticket"))
+            except ValueError as exc:
+                return self._error(400, str(exc))
+            return self._send_json({"ok": True, "session_id": sid, "annotation": rec})
         except BrokenPipeError:
             pass
         except Exception as exc:  # noqa: BLE001

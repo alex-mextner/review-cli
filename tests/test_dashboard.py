@@ -30,11 +30,21 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 # --- fixtures: write logs in the real on-disk format ------------------------
-def _write_call_log(log_dir: Path, stamp: str, backend: str, round_no: int, body: str, *, argv0: str = "/usr/bin/fake") -> Path:
+def _write_call_log(
+    log_dir: Path,
+    stamp: str,
+    backend: str,
+    round_no: int,
+    body: str,
+    *,
+    argv0: str = "/usr/bin/fake",
+    exit_code: int | None = None,
+) -> Path:
     name = f"{stamp}Z-{backend}-r{round_no}.log"
     p = log_dir / name
     header = f"[review-cli] {backend}: {argv0} (args redacted)\n"
-    p.write_text(header + body, encoding="utf-8")
+    footer = f"[review-cli] EXIT {exit_code}\n" if exit_code is not None else ""
+    p.write_text(header + body + footer, encoding="utf-8")
     return p
 
 
@@ -185,6 +195,411 @@ def test_empty_log_dir_is_graceful():
         assert stats["success_rate"] is None
 
 
+def test_explicit_exit0_with_error_text_is_not_an_error():
+    """(HYP-742 finding 4) A SUCCESSFUL call (EXIT 0) whose body mentions 'error:' /
+    'permission denied' must NOT be counted as a failure — review output legitimately
+    describes errors in the code it reviews. The explicit return code wins over the body."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = (
+            "Finding: this function can raise error: ValueError on bad input.\n"
+            "Also the script prints 'permission denied' and 'command not found' in its help.\n"
+        )
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body, exit_code=0)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert c.exit_code == 0
+        assert c.has_error is False, "EXIT 0 must be a success even with error words in the body"
+        assert c.error_summary is None
+        # The EXIT footer must be stripped from the displayed body.
+        assert "EXIT" not in c.body
+        # And the error text itself stays in the body (it's real review content).
+        assert "error:" in c.body
+
+
+def test_quoted_exit_line_in_body_is_not_treated_as_status():
+    """(codex P2) Only the TRAILING footer is the status. A review output that quotes an
+    exact `[review-cli] EXIT 1` line mid-body must NOT be consumed as the status, and must
+    stay visible in the body. The real trailing footer still decides success/failure."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = (
+            "Reviewing the dashboard logs, I see a line like:\n"
+            "[review-cli] EXIT 1\n"  # quoted in the review prose, NOT the real footer
+            "which the parser handles. Overall the change looks correct.\n"
+        )
+        # The real footer (EXIT 0 = success) is appended last by the writer.
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body, exit_code=0)
+        c = p.parse_call_log(path)
+        assert c.exit_code == 0, "the TRAILING footer (EXIT 0) is authoritative"
+        assert c.has_error is False, "a quoted EXIT 1 mid-body must not mark the call failed"
+        # The quoted line stays in the displayed body.
+        assert "[review-cli] EXIT 1" in c.body
+        # But the real trailing footer is stripped (it appears exactly once — the quote).
+        assert c.body.count("[review-cli] EXIT") == 1
+
+
+def test_explicit_nonzero_exit_is_an_error_even_with_clean_body():
+    """(finding 4) The inverse: a non-zero EXIT is a failure even when the body looks
+    clean and has no error markers — the return code is authoritative."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(ld, "20260601T100000_000000", "gemini", 0,
+                               "all good, nothing to report\n", exit_code=1)
+        c = p.parse_call_log(path)
+        assert c.exit_code == 1
+        assert c.has_error is True
+        assert "exit code 1" in (c.error_summary or "")
+
+
+def test_legacy_log_without_exit_footer_falls_back_to_heuristic():
+    """(finding 4) Logs that predate the EXIT footer (exit_code None) keep the old
+    body-grep behaviour, so historical runs still surface their errors."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        ok = _write_call_log(ld, "20260601T100000_000000", "codex", 0, "looks fine\n")
+        bad = _write_call_log(ld, "20260601T100100_000000", "codex", 0, "error: not available\n")
+        assert p.parse_call_log(ok).exit_code is None
+        assert p.parse_call_log(ok).has_error is False
+        assert p.parse_call_log(bad).has_error is True  # legacy grep still flags it
+
+
+def test_success_rate_not_corrupted_by_error_text_in_successful_runs():
+    """(finding 4 end-to-end) A panel of successful calls whose output mentions errors
+    must report a 100% success rate — the bug inflated errors and tanked success%."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # Three successful reviews, each with error words in the prose.
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0,
+                        "error: the diff has a bug on line 5\n", exit_code=0)
+        _write_call_log(ld, "20260601T100003_000000", "gemini", 0,
+                        "permission denied is logged but handled fine\n", exit_code=0)
+        _write_call_log(ld, "20260601T100006_000000", "claude", 0,
+                        "traceback (most recent call last) appears in a test fixture\n", exit_code=0)
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["call_count"] == 3
+        assert stats["error_calls"] == 0, "successful runs with error text wrongly counted as errors"
+        assert stats["ok_calls"] == 3
+        assert stats["success_rate"] == 1.0
+
+
+def test_gemini_rest_run_emits_parseable_sidecar_log():
+    """(HYP-742 finding 2) The Gemini REST backend writes no subprocess log, so it must
+    emit a sidecar `.log` the parser can read — else Gemini-only runs are invisible and
+    models are undercounted. The sidecar carries the explicit EXIT status (finding 4)."""
+    import urllib.request
+
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    class _FakeResp:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    fake_payload = json.dumps({
+        "candidates": [{"content": {"parts": [{"text": "One nit: error: handle the None case."}]}}],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+    }).encode("utf-8")
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        old_urlopen = urllib.request.urlopen
+        old_key = backends._gemini_key
+        try:
+            backends._gemini_key = lambda: "fake-key"
+            urllib.request.urlopen = lambda req, timeout=None: _FakeResp(fake_payload)
+            result = backends.review_gemini("gemini", "review this", "", Path(logd), 30, round_no=2)
+        finally:
+            urllib.request.urlopen = old_urlopen
+            backends._gemini_key = old_key
+            os.environ.pop("REVIEW_LOG_DIR", None)
+
+        assert result.returncode == 0
+        # The sidecar log exists, is named with the round we passed, and parses.
+        logs = list(Path(logd).glob("*-gemini-r2.log"))
+        assert len(logs) == 1, [x.name for x in Path(logd).glob('*')]
+        c = p.parse_call_log(logs[0])
+        assert c is not None
+        assert c.backend == "gemini"
+        assert c.round == 2
+        assert c.exit_code == 0
+        assert c.has_error is False  # EXIT 0 wins over the 'error:' in the body text
+        assert "error:" in c.body  # the review content is preserved
+        # And the parser counts it as a real (gemini) run, not invisible.
+        sessions = p.load_sessions(Path(logd))
+        stats = p.compute_stats(sessions)
+        assert "gemini" in stats["by_model"]
+        assert stats["call_count"] == 1
+
+
+def test_gemini_network_failure_still_emits_a_sidecar_log():
+    """(codex P2) A non-HTTP Gemini failure (network/DNS/socket timeout, malformed JSON)
+    must still produce a `.log` and a non-zero ReviewResult — not raise out of run_panel
+    leaving the failed call invisible to the dashboard."""
+    import urllib.request
+
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        old_urlopen = urllib.request.urlopen
+        old_key = backends._gemini_key
+        try:
+            backends._gemini_key = lambda: "fake-key"
+
+            def boom(req, timeout=None):
+                raise urllib.error.URLError("name resolution failed")
+
+            urllib.request.urlopen = boom
+            result = backends.review_gemini("gemini", "review this", "", Path(logd), 5, round_no=0)
+        finally:
+            urllib.request.urlopen = old_urlopen
+            backends._gemini_key = old_key
+            os.environ.pop("REVIEW_LOG_DIR", None)
+
+        # Returned a normal non-zero result, did NOT raise.
+        assert result.returncode != 0
+        assert "URLError" in result.stderr
+        logs = list(Path(logd).glob("*-gemini-r0.log"))
+        assert len(logs) == 1, "network failure must still write a sidecar"
+        c = p.parse_call_log(logs[0])
+        assert c.exit_code == 1
+        assert c.has_error is True
+        assert c.stderr_lines and "URLError" in c.stderr_lines[0]
+
+
+def test_streamed_exit_footer_anchored_when_stdout_has_no_trailing_newline():
+    """(codex P2) A subprocess that flushes stdout WITHOUT a trailing newline must still
+    get a parseable `EXIT {code}` footer on its own line — else the footer fuses onto the
+    last output line and exit_code stays None (the call is misclassified)."""
+    import sys as _sys
+
+    from reviewlib import process
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        try:
+            # writes 'no-newline-here' with NO trailing \n, then exits 1
+            argv = [_sys.executable, "-c", "import sys; sys.stdout.write('no-newline-here'); sys.exit(1)"]
+            r = process._run_streamed(argv, cwd=Path(logd), timeout=30, backend="anchortest", round_no=0)
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        assert r.returncode == 1
+        logs = list(Path(logd).glob("*-anchortest-*.log"))
+        assert len(logs) == 1
+        text = logs[0].read_text()
+        # The footer is on its own line, NOT fused onto the output.
+        assert "no-newline-hereEXIT" not in text
+        assert "\n[review-cli] EXIT 1" in text or "\nEXIT 1" in text or text.endswith("[review-cli] EXIT 1\n")
+        c = p.parse_call_log(logs[0])
+        assert c.exit_code == 1, "footer must be parseable even with no trailing newline in stdout"
+        assert c.has_error is True
+        assert "no-newline-here" in c.body
+
+
+def test_gemini_sidecar_stamps_call_start_not_write_time():
+    """(codex P2) The sidecar filename stamp must be the call START time, so a slow REST
+    call shows an honest duration and clusters with its panel peers — not a near-zero
+    duration anchored at write time."""
+    import time as _time
+
+    from reviewlib import process
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        try:
+            started = datetime.now(timezone.utc)
+            _time.sleep(0.05)  # simulate the call taking time before we write the log
+            path = process.write_sidecar_log(
+                "gemini", round_no=0, argv0="Gemini API gemini-2.5-flash",
+                returncode=0, stdout="ok\n", stderr="", started=started,
+            )
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        c = p.parse_call_log(path)
+        # The parsed start equals the START stamp we passed (to the second), not "now".
+        assert c.started.strftime("%Y%m%dT%H%M%S") == started.strftime("%Y%m%dT%H%M%S")
+        # Duration is start->mtime (>= the sleep), i.e. NOT near-zero anchored at write.
+        assert c.duration_seconds is not None and c.duration_seconds >= 0
+
+
+def test_gemini_missing_api_key_still_emits_a_sidecar_log():
+    """(codex P2) A missing GEMINI_API_KEY (the COMMON failure — gemini is a default
+    model) must still produce a `.log` and a non-zero result, not a `_gemini_key()`
+    raise that run_panel turns into an internal 127 with no log (invisible run)."""
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        old_key = backends._gemini_key
+
+        def no_key():
+            raise RuntimeError("GEMINI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
+
+        try:
+            backends._gemini_key = no_key
+            result = backends.review_gemini("gemini", "review this", "", Path(logd), 5, round_no=0)
+        finally:
+            backends._gemini_key = old_key
+            os.environ.pop("REVIEW_LOG_DIR", None)
+
+        assert result.returncode != 0
+        assert "GEMINI_API_KEY" in result.stderr
+        logs = list(Path(logd).glob("*-gemini-r0.log"))
+        assert len(logs) == 1, "missing-key auth failure must still write a sidecar"
+        c = p.parse_call_log(logs[0])
+        assert c.exit_code == 1
+        assert c.has_error is True
+        assert c.stderr_lines and "GEMINI_API_KEY" in c.stderr_lines[0]
+
+
+def test_gemini_rest_timeout_is_recorded_as_a_timeout():
+    """(codex P2) A Gemini REST timeout must be counted as a TIMEOUT (timeout_calls),
+    not a generic error — keeping the dashboard timeout metric consistent with the
+    subprocess backends."""
+    import socket as _socket
+    import urllib.request
+
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        old_urlopen = urllib.request.urlopen
+        old_key = backends._gemini_key
+        try:
+            backends._gemini_key = lambda: "fake-key"
+
+            def slow(req, timeout=None):
+                raise _socket.timeout("timed out")
+
+            urllib.request.urlopen = slow
+            result = backends.review_gemini("gemini", "review this", "", Path(logd), 7, round_no=0)
+        finally:
+            urllib.request.urlopen = old_urlopen
+            backends._gemini_key = old_key
+            os.environ.pop("REVIEW_LOG_DIR", None)
+
+        assert result.returncode == 124, "a REST timeout uses the 124 timeout code"
+        logs = list(Path(logd).glob("*-gemini-r0.log"))
+        assert len(logs) == 1
+        c = p.parse_call_log(logs[0])
+        assert c.timed_out is True, "the TIMEOUT marker must be written for a REST timeout"
+        assert c.timeout_secs == 7
+        assert c.has_error is True
+        # And it shows up in the dashboard's timeout_calls, not just error_calls.
+        sessions = p.load_sessions(Path(logd))
+        stats = p.compute_stats(sessions)
+        assert stats["timeout_calls"] == 1
+
+
+def test_gemini_sidecar_is_private_0600():
+    """The Gemini sidecar may carry reviewed prompts/diffs -> owner-only perms."""
+    import stat
+
+    from reviewlib import process
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        try:
+            path = process.write_sidecar_log(
+                "gemini", round_no=0, argv0="Gemini API gemini-2.5-flash",
+                returncode=0, stdout="ok\n", stderr="",
+            )
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode & 0o077 == 0, f"sidecar is group/other-readable (mode {oct(mode)})"
+
+
+def test_panel_threads_round_no_into_backend_logs():
+    """(HYP-742 finding 3) The real round number must reach the backend so its log is
+    `-r{N}` (N>=1), not always `-r0`. A brainstorm round-1 PanelJob must produce an
+    `-r1` log, which makes the parser infer 'brainstorm' mode correctly."""
+    from reviewlib import panel
+    from reviewlib.dashboard import parser as p
+
+    captured: dict[str, int] = {}
+
+    def fake_backend(model, prompt, diff, cwd, timeout, round_no=0):
+        captured["round_no"] = round_no
+        return panel.ReviewResult(model=model, command="fake", returncode=0, stdout="ok", stderr="")
+
+    old_resolve = panel.resolve_backend
+    try:
+        panel.resolve_backend = lambda model: fake_backend
+        with tempfile.TemporaryDirectory() as d:
+            results = panel.run_panel(
+                [panel.PanelJob(model="codex", prompt="p", diff="", round_no=3)],
+                Path(d), 30,
+            )
+    finally:
+        panel.resolve_backend = old_resolve
+
+    assert results[0].returncode == 0
+    assert captured["round_no"] == 3, "PanelJob.round_no was not threaded into the backend call"
+
+    # And a brainstorm-shaped log set (round>=1) is inferred as brainstorm by the parser.
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T120000_000000", "codex", 1, "round one\n", exit_code=0)
+        _write_call_log(ld, "20260601T120010_000000", "gemini", 1, "round one\n", exit_code=0)
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        assert len(sessions) == 1
+        assert sessions[0].mode == "brainstorm", "round>=1 logs must infer brainstorm mode"
+
+
+def test_every_resolvable_backend_accepts_panel_round_no_dispatch():
+    """(HYP-742 rebase regression) run_panel dispatches EVERY backend uniformly as
+    ``backend(model, prompt, diff, cwd, timeout, round_no)`` (panel.py). After rebasing
+    the dashboard onto post-HYP-741 main, the new keyed REST backends (review_zai,
+    review_commandcode) and the split claude dispatcher must all accept that 6th
+    positional ``round_no`` arg — otherwise the panel raises TypeError the moment a
+    board includes a z.ai / commandcode seat. Guard the whole resolvable surface by
+    signature so a future backend that forgets round_no fails here, not at runtime."""
+    import inspect
+
+    from reviewlib import backends as b
+
+    # Every backend resolve_backend() can return, plus the claude-cli leaf the dispatcher
+    # forwards to. review_claude_api is intentionally excluded: it is internal-only
+    # (called by the review_claude dispatcher), never returned by resolve_backend.
+    resolvable = [
+        b.review_codex, b.review_gemini, b.review_zai, b.review_commandcode,
+        b.review_claude, b.review_claude_cli, b.review_opencode,
+    ]
+    for fn in resolvable:
+        params = list(inspect.signature(fn).parameters)
+        assert "round_no" in params, f"{fn.__name__} is missing the round_no parameter"
+        # round_no must be reachable as the 6th positional arg the panel passes.
+        assert len(params) >= 6, f"{fn.__name__} cannot take round_no positionally: {params}"
+        assert params[5] == "round_no", f"{fn.__name__} 6th param is {params[5]!r}, not 'round_no'"
+
+
 def test_cluster_uses_call_end_time_not_start():
     """A call that runs longer than the gap must NOT split one invocation into sessions.
 
@@ -329,11 +744,12 @@ def _get(base, path):
         return r.status, json.loads(r.read().decode("utf-8"))
 
 
-def _post(base, path, obj):
-    req = urllib.request.Request(
-        base + path, data=json.dumps(obj).encode("utf-8"),
-        headers={"Content-Type": "application/json"}, method="POST",
-    )
+def _post(base, path, obj, *, headers=None, raw=None):
+    data = raw if raw is not None else json.dumps(obj).encode("utf-8")
+    hdrs = {"Content-Type": "application/json"}
+    if headers is not None:
+        hdrs = dict(headers)
+    req = urllib.request.Request(base + path, data=data, headers=hdrs, method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
         return r.status, json.loads(r.read().decode("utf-8"))
 
@@ -368,6 +784,74 @@ def test_host_header_guard_blocks_dns_rebinding():
                 req3 = urllib.request.Request(base + "/api/health", headers={"Host": f"localhost:{port}"})
                 with urllib.request.urlopen(req3, timeout=10) as r:
                     assert r.status == 200
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_write_endpoints_reject_csrf_and_bad_input():
+    """(HYP-742 finding 1) Writes are hardened against a malicious web page fetching the
+    loopback port: foreign Origin -> 403, non-JSON Content-Type -> 415, oversized body ->
+    413, unknown session id -> 404. A same-origin (loopback Origin) JSON write to a real
+    session still succeeds."""
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        try:
+            _seed_logs(Path(logd))
+            from reviewlib.dashboard import server
+
+            httpd = server.make_server(0)
+            port = httpd.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                # a real session id to target
+                _, runs = _get(base, "/api/runs")
+                sid = runs[0]["session_id"]
+
+                def expect_status(headers, obj, want, *, raw=None, sid_override=None):
+                    target = sid_override if sid_override is not None else sid
+                    try:
+                        _post(base, f"/api/runs/{target}/feedback", obj, headers=headers, raw=raw)
+                        raise AssertionError(f"expected {want}")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == want, f"got {e.code}, want {want}"
+
+                # 1. Foreign Origin -> 403 (cross-site CSRF write).
+                expect_status(
+                    {"Content-Type": "application/json", "Origin": "https://evil.example.com"},
+                    {"feedback": "pwned"}, 403,
+                )
+                # 2. Non-JSON Content-Type -> 415 (a simple-request form post).
+                expect_status(
+                    {"Content-Type": "text/plain"},
+                    {"feedback": "pwned"}, 415,
+                )
+                # 3. Oversized body -> 413.
+                big = json.dumps({"feedback": "x" * (70 * 1024)}).encode("utf-8")
+                expect_status(
+                    {"Content-Type": "application/json"},
+                    None, 413, raw=big,
+                )
+                # 4. Unknown session id -> 404 (can't plant a record for an arbitrary id).
+                expect_status(
+                    {"Content-Type": "application/json"},
+                    {"feedback": "x"}, 404, sid_override="sess-does-not-exist",
+                )
+                # 5. Loopback Origin + JSON + real session -> success.
+                st, r = _post(
+                    base, f"/api/runs/{sid}/feedback", {"feedback": "legit same-origin"},
+                    headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                )
+                assert st == 200 and r["annotation"]["feedback"] == "legit same-origin"
+                # 6. No Origin / no Referer (curl, the dashboard's own fetch) -> allowed.
+                st, r = _post(base, f"/api/runs/{sid}/conscious", {"conscious": True})
+                assert st == 200 and r["annotation"]["conscious"] is True
             finally:
                 httpd.shutdown()
                 httpd.server_close()
