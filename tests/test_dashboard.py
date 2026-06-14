@@ -179,6 +179,41 @@ def test_brainstorm_moderator_and_synthesis_not_attributed_to_a_persona():
         assert "use an LRU" in r1["personas"][0]["text"]
 
 
+def test_brainstorm_persona_markdown_headings_stay_in_transcript():
+    """(codex P2) A persona's OWN Markdown headings (`## Risks`, `### Plan`) must NOT be
+    treated as dashboard section boundaries — only `## Moderator` / `# Final synthesis`
+    end persona capture. Otherwise the rest of that model's transcript is dropped."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        md = ld / "20260601T120000_000000Z-brainstorm.md"
+        md.write_text(
+            "# Brainstorm: api shape\n\n"
+            "panel=codex,gemini moderator=codex rounds>=5 max=5\n\n"
+            "# Round 1\n"
+            "#### Pragmatic engineer (codex)\n"
+            "Here is my analysis.\n\n"
+            "## Risks\nRace conditions on the cache.\n\n"
+            "### Plan\nStep 1: add a lock. Step 2: ship.\n\n"
+            "#### Security reviewer (gemini)\n"
+            "Looks fine to me.\n\n"
+            "## Moderator (round 1)\nSTOP.\n",
+            encoding="utf-8",
+        )
+        bs = p.parse_brainstorm_log(md)
+        r1 = next(r for r in bs.rounds if r["round"] == 1)
+        prag = r1["personas"][0]
+        # The persona's own headings + their content are part of its transcript.
+        assert "## Risks" in prag["text"], prag["text"]
+        assert "Race conditions" in prag["text"]
+        assert "### Plan" in prag["text"]
+        assert "Step 1: add a lock" in prag["text"]
+        # But the moderator section is still excluded.
+        assert "STOP" not in prag["text"]
+        assert "Moderator" not in prag["text"]
+
+
 def test_brainstorm_model_attribution_is_stable_across_log_aging():
     """(codex P2) For a brainstorm, the `panel=` line is authoritative — model attribution
     must be the SAME whether the per-call logs still exist or have aged out, and must keep
@@ -193,15 +228,16 @@ def test_brainstorm_model_attribution_is_stable_across_log_aging():
         assert aged.calls == []
         assert aged.models == ["codex:gpt-5", "zai"], aged.models
 
-    # (b) logs still present (resolved backend names) — attribution stays the panel form.
+    # (b) logs still present (resolved backend names) — attribution is EXACTLY the panel,
+    # NOT double-counted with the resolved per-call backends (`codex`, `z.ai`).
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         _write_brainstorm(ld, "20260601T120000_000000", "T", "codex:gpt-5,zai", "codex")
         _write_call_log(ld, "20260601T120001_000000", "codex", 1, "round one\n", exit_code=0)
         _write_call_log(ld, "20260601T120002_000000", "z.ai", 1, "round one\n", exit_code=0)
         live = next(s for s in p.load_sessions(ld) if s.brainstorm is not None)
-        # The panel variants lead and are preserved (stable vs the aged-out case).
-        assert live.models[:2] == ["codex:gpt-5", "zai"], live.models
+        # Identical to the aged-out case (a) — stable, no resolved backends appended.
+        assert live.models == ["codex:gpt-5", "zai"], live.models
 
 
 def test_cluster_sessions_and_modes():

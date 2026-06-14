@@ -332,10 +332,13 @@ def parse_call_log(path: Path) -> CallLog | None:
 
 _BS_HEADER_RE = re.compile(r"panel=(?P<panel>[^ ]*) moderator=(?P<mod>[^ ]*)")
 _BS_PERSONA_RE = re.compile(r"^#### (?P<name>.+?) \((?P<model>[^)]+)\)\s*$")
-# A `#`/`##`/`###` section heading (1–3 hashes + space) — e.g. `## Moderator (round N)`,
-# `# Final synthesis`. NOT a persona heading (always `#### `, 4 hashes) and NOT a round
-# heading (`# Round N`, handled earlier). Reaching one ends the current persona's capture.
-_BS_SECTION_RE = re.compile(r"^#{1,3} \S")
+# The SPECIFIC dashboard section markers the brainstorm WRITER emits after a round's
+# persona blocks (modes/brainstorm.py): `## Moderator (round N)` and `# Final synthesis`.
+# Reaching one ends the current persona's capture. It is deliberately TIGHT: a persona's
+# own Markdown headings (`## Risks`, `### Plan`) must NOT terminate capture and drop the
+# rest of that model's transcript (codex P2) — only these exact dashboard markers do.
+# (`# Round N` is matched separately above; `#### …` persona headings never match here.)
+_BS_SECTION_RE = re.compile(r"^(?:## Moderator\b|# Final synthesis\b)")
 
 
 def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
@@ -425,17 +428,19 @@ class Session:
     @property
     def models(self) -> list[str]:
         seen: list[str] = []
-        # For a brainstorm, the `*-brainstorm.md` `panel=` line is AUTHORITATIVE: it
-        # records the user's exact model selection — including aliases / suffixed ids like
-        # `codex:gpt-5` or `zai` that the per-call log FILENAMES lose to the resolved
-        # backend name (`codex`, `z.ai`). Preferring it makes attribution STABLE whether or
-        # not the per-call logs have aged out (codex P2) — otherwise the same session's
-        # model list would silently change once logs expire and the variants would vanish
-        # from current stats. Any call-only backend not already covered is still appended.
-        if self.brainstorm is not None:
+        # For a brainstorm, the `*-brainstorm.md` `panel=` line is the SOLE authoritative
+        # model list: it records the user's exact selection — including aliases / suffixed
+        # ids like `codex:gpt-5` or `zai` that the per-call log FILENAMES lose to the
+        # resolved backend name (`codex`, `z.ai`). Use ONLY it (when present), so attribution
+        # is STABLE whether or not the per-call logs have aged out, and the same session is
+        # NOT counted under both the requested model AND its resolved backend (codex P2 —
+        # appending the resolved call backends double-counted while logs existed and then
+        # dropped them once logs aged out). Non-brainstorm sessions use the call backends.
+        if self.brainstorm is not None and self.brainstorm.panel:
             for model in self.brainstorm.panel:
                 if model not in seen:
                     seen.append(model)
+            return seen
         for c in self.calls:
             if c.backend not in seen:
                 seen.append(c.backend)
