@@ -11,7 +11,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..panel import PanelJob, format_result, run_panel, run_single
+from ..panel import PanelJob, format_result, run_moderator, run_panel
 from ..process import log_dir
 
 # Distinct expert personas for brainstorm rotation (pool >= 5). Each round assigns
@@ -55,7 +55,7 @@ def mode_brainstorm(
     models: list[str],
     cwd: Path,
     timeout: int,
-    moderator: str,
+    moderators: list[str],
     rounds: int,
     max_rounds: int,
 ) -> int:
@@ -63,7 +63,8 @@ def mode_brainstorm(
     max_rounds = max(max_rounds, min_rounds)
     panel = models  # run-as-is; personas always fill >= 3 slots even if panel < 3
     transcript_blocks: list[str] = []
-    out: list[str] = [f"# Brainstorm: {topic}", f"panel={','.join(panel)} moderator={moderator} "
+    moderator_label = ">".join(moderators)
+    out: list[str] = [f"# Brainstorm: {topic}", f"panel={','.join(panel)} moderator={moderator_label} "
                       f"rounds>={min_rounds} max={max_rounds}"]
 
     # DISCUSSION LOG: write the conversation to one file as each round/decision
@@ -88,7 +89,7 @@ def mode_brainstorm(
         disc.write(text if text.endswith("\n") else text + "\n")
         disc.flush()
 
-    _disc(f"# Brainstorm: {topic}\n\npanel={','.join(panel)} moderator={moderator} "
+    _disc(f"# Brainstorm: {topic}\n\npanel={','.join(panel)} moderator={moderator_label} "
           f"rounds>={min_rounds} max={max_rounds}\n")
 
     persona_index = 0
@@ -134,10 +135,15 @@ def mode_brainstorm(
                 "'DECISION: CONTINUE'.\n\n"
                 f"TOPIC:\n{topic}\n\n=== ROUND {round_no} ===\n{round_text}"
             )
-            mod_result = run_single(moderator, mod_prompt, cwd, timeout)
+            mod_result = run_moderator(moderators, mod_prompt, cwd, timeout)
             out.append(f"\n## Moderator (round {round_no})\n" + format_result(mod_result))
             _disc(f"\n## Moderator (round {round_no})\n"
                   f"{(mod_result.stdout.strip() or mod_result.stderr.strip() or '(no output)')}\n")
+            # Promote the candidate that actually worked to the front so a dead
+            # top moderator (e.g. a timing-out model) is paid once, not re-tried
+            # at the head of every subsequent round + the final synthesis.
+            if mod_result.returncode == 0:
+                moderators = [mod_result.model] + [m for m in moderators if m != mod_result.model]
 
             if round_no < min_rounds:
                 continue
@@ -151,7 +157,7 @@ def mode_brainstorm(
             "final synthesis with: BEST IDEAS (ranked), TRADEOFFS, and a single concrete RECOMMENDATION.\n\n"
             f"TOPIC:\n{topic}\n\n=== FULL TRANSCRIPT ({completed} rounds) ===\n{full_transcript}"
         )
-        synth = run_single(moderator, synth_prompt, cwd, timeout)
+        synth = run_moderator(moderators, synth_prompt, cwd, timeout)
         out.append("\n# Final synthesis\n" + format_result(synth))
         _disc(f"\n# Final synthesis\n{(synth.stdout.strip() or synth.stderr.strip() or '(no output)')}\n")
     finally:

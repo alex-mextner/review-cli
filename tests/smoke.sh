@@ -32,6 +32,10 @@ echo "streaming tests OK"
 python3 tests/test_workspace_trust.py
 echo "workspace-trust tests OK"
 
+# Moderator priority selection + runtime fallback (backends stubbed; no API keys).
+python3 tests/test_moderator.py
+echo "moderator tests OK"
+
 # Stage 1 visual-verification suite (cvGate / vision_client / policy / pipeline /
 # composability). All offline: cvGate shells to magick, the vision call is mocked,
 # fixtures are generated (Pillow) — no API keys, no network. These need two non-core

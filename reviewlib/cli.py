@@ -28,7 +28,7 @@ from .modes.brainstorm import mode_brainstorm
 from .modes.just_ask import mode_just_ask
 from .modes.quorum import mode_quorum
 from .modes.review import mode_review
-from .panel import pick_moderator
+from .panel import pick_moderators
 from .process import _run
 
 
@@ -222,11 +222,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.just_ask is not None:
         return mode_just_ask(_with_visual(args.just_ask, visual_ctx), models, diff, cwd, timeout)
     if args.quorum is not None:
-        return mode_quorum(_with_visual(args.quorum, visual_ctx), models, diff, cwd, timeout, pick_moderator(args.moderator, models))
+        return mode_quorum(_with_visual(args.quorum, visual_ctx), models, diff, cwd, timeout, pick_moderators(args.moderator, models))
     if args.brainstorm is not None:
         return mode_brainstorm(
             _with_visual(args.brainstorm, visual_ctx), models, cwd, timeout,
-            pick_moderator(args.moderator, models), args.rounds, args.max_rounds
+            pick_moderators(args.moderator, models), args.rounds, args.max_rounds
         )
 
     return mode_review(models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout, args.staged)
