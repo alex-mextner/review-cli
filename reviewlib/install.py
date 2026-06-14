@@ -56,6 +56,19 @@ loud warning — heed it. When piping into review non-interactively, also redire
 stdin (`review -C <repo> --just-ask "Q" < /dev/null`); review reads stdin for an
 optional piped diff and will hang waiting for EOF if stdin is an open pipe.
 
+## claude / opus backend: API or CLI
+The `claude:` / opus backend runs two ways, so it works whether or not the
+`claude` CLI is installed:
+- **API** (no CLI needed): set `ANTHROPIC_API_KEY` (sent as `x-api-key`) or
+  `ANTHROPIC_AUTH_TOKEN` (sent as `Authorization: Bearer`), and optionally
+  `ANTHROPIC_BASE_URL` for an Anthropic-compatible gateway (default
+  `https://api.anthropic.com`). Same vars the Anthropic SDK / claude CLI read.
+- **CLI**: the `claude-p` wrapper (needs the `claude` binary; subscription).
+- **Selection**: `REVIEW_CLAUDE_MODE=api|cli` forces it; otherwise it auto-picks
+  the CLI when the `claude` binary is present (subscription, no API cost) and the
+  API only when there's no binary but a key is set. Set `REVIEW_CLAUDE_MODE=api`
+  to force the API even on a host that has the CLI.
+
 ## When to use
 - Before committing — sanity-check a diff across multiple models in parallel.
 - For a hard decision — `--quorum` (settle with cited evidence) or `--brainstorm`
