@@ -14,7 +14,7 @@ from pathlib import Path
 from ..backends import ReviewResult, resolve_backend
 from ..config import BoardReviewer
 from ..install import _write_review_stamp
-from ..panel import build_board_jobs, format_result, run_panel
+from ..panel import _tally_result, build_board_jobs, format_result, run_panel
 
 
 def mode_review(
@@ -40,6 +40,10 @@ def mode_review(
                 results.append(future.result())
             except Exception as exc:
                 results.append(ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc)))
+            # Feed the run-stats per-call tally (no-op outside a CLI-driven run). This
+            # plain `-m` path runs its own executor instead of run_panel, so it must
+            # tally here for the recorded ok/fail counts to be accurate.
+            _tally_result(results[-1].returncode)
 
     by_model = {result.model: result for result in results}
     print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))

@@ -36,6 +36,25 @@ metadata:
 
 Runs your git diff (or a question/topic) across several model backends in parallel.
 
+## NEVER wrap `review` in a short timeout — it takes MINUTES
+`review`, `review --quorum`, and `review --brainstorm` are multi-model and/or
+multi-round: they fan out to several model backends in parallel, and the panel
+modes run several rounds plus a final moderator synthesis. A plain diff review of a
+full board is typically a few minutes; a `--brainstorm` is commonly 10–20 minutes
+(min 5 / max 8 rounds + a final synthesis pass). Wrapping the command in
+`timeout 60` / `timeout 300` (or any short cap) KILLS the run before it finishes —
+a brainstorm only emits its synthesis at the very end, so a short timeout produces
+NOTHING usable, not a partial result. So:
+
+- Do NOT put `review` behind a short shell `timeout`, and do NOT set a short
+  per-call deadline expecting a quick return. Let it run.
+- At dispatch, `review` prints a one-line ETA to stderr for YOUR pool size and
+  mode, e.g. `[review] pool=4 (brainstorm) — typically ~6m12s based on 12 past
+  runs of this size; do NOT timeout.` Read that line and wait at least that long.
+  With no history yet it still warns it's multi-round and to expect minutes.
+- If you must bound it, give it MINUTES, not seconds (e.g. background it and poll),
+  and never a cap below the printed ETA.
+
 ## Invocation
 ```
 review -C <repo>             # review current unstaged diff across default models
@@ -112,7 +131,10 @@ SKILL_BLURB = (
     "`review` — multi-model read-only code review + AI panels "
     "(codex/claude/gemini/opencode): `review -C <repo>` (diff), "
     "`review -C <repo> --quorum \"Q\"`, `review -C <repo> --brainstorm \"topic\"`. "
-    "Always pass -C <project-root>. Use before commits and for hard decisions."
+    "Always pass -C <project-root>. Use before commits and for hard decisions. "
+    "NEVER wrap it in a short timeout — it is multi-model / multi-round and takes "
+    "MINUTES (brainstorm 10–20m); it prints the expected duration for your pool "
+    "size at startup, so wait for that, don't short-timeout it."
 )
 
 _HOOK_MARKER = "# agent-tools-awareness"

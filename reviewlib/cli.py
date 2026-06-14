@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import backends
@@ -30,8 +31,9 @@ from .modes.brainstorm import mode_brainstorm
 from .modes.just_ask import mode_just_ask
 from .modes.quorum import mode_quorum
 from .modes.review import mode_review
-from .panel import pick_moderators
+from .panel import begin_call_tally, end_call_tally, pick_moderators
 from .process import _run
+from .stats import announce_eta, record_run
 
 
 def _git_diff(cwd: Path, staged: bool) -> str:
@@ -136,6 +138,49 @@ def _spec_web(argv: list[str]) -> int:
         seed=ns.seed,
         verbose=ns.verbose,
     )
+
+
+def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch) -> int:
+    """Announce the ETA, time the run on a monotonic clock, and append a stat record.
+
+    `mode` is the EXACT mode (review/just-ask/quorum/brainstorm) and `pool_models` is
+    the list of backends actually DISPATCHED (so `pool_size` is ground truth — for
+    brainstorm that is the per-round persona slot count, which can exceed len(models)),
+    not the dashboard parser's inferred/proxy values. `dispatch` is a zero-arg callable
+    that runs the mode and returns its exit code. The per-call ok/fail tally is collected
+    via panel.begin/end_call_tally so success/fail counts are real per backend call.
+
+    A run that dispatched ZERO backend calls (a clean-tree review with no diff, an
+    early usage error) is NOT recorded: it has no real wall-clock to contribute and a
+    ~0s record would drag every future ETA for that pool toward zero — defeating the
+    whole point. The ETA line is still printed (it costs nothing and warns the agent),
+    but only real runs land in the history. Stats failures NEVER affect the run.
+    """
+    import time
+
+    pool_size = len(pool_models)
+    announce_eta(mode, pool_size)
+    begin_call_tally()
+    started = datetime.now(timezone.utc)
+    start = time.monotonic()
+    try:
+        return dispatch()
+    finally:
+        elapsed = time.monotonic() - start
+        tally = end_call_tally()
+        ok_count, fail_count = tally["ok"], tally["fail"]
+        # Only record a run that actually dispatched at least one backend call. No
+        # dispatch -> nothing real to time -> skip, so no-op invocations never poison
+        # the ETA average.
+        if ok_count or fail_count:
+            record_run(
+                mode=mode,
+                models=pool_models,
+                duration_seconds=elapsed,
+                ok_count=ok_count,
+                fail_count=fail_count,
+                started=started,
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -314,6 +359,12 @@ def main(argv: list[str] | None = None) -> int:
         from .features.visual.compose import build_mode_visual_context
 
         # STANDALONE: --visual with no companion mode AND no diff → the verdict pipeline.
+        # NOT recorded in run-stats / no ETA: this is a single-backend vision pipeline
+        # (select_vision_backend picks ONE model, and run_pipeline can return before any
+        # vision call), not a multi-model / multi-round text panel — recording the whole
+        # candidate list as the "pool" would mis-key its history with a bogus pool_size
+        # and duration. The ETA store deliberately covers only the slow text panel modes
+        # an agent might wrongly short-timeout (codex P2).
         if not panel_mode and not diff.strip():
             from .features.visual.visual_cli import run_visual_standalone
 
@@ -370,14 +421,40 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             return 10 if args.strict else 1
 
+    # The recorded mode is the EXACT mode (a brainstorm of 4 is nothing like a plain
+    # review of 4), and `pool_models` is what is ACTUALLY DISPATCHED so pool_size is
+    # ground truth. A --visual companion is recorded under its base text mode: the
+    # vision context above already ran (cvGate + the bounded <=--vision-timeout call),
+    # and the multi-minute cost an agent might wrongly short-timeout is the text panel
+    # that follows — which IS inside the wrapper below — so the base-mode key is the
+    # honest one (codex P2: don't split history on a tag whose timing we exclude).
     if args.just_ask is not None:
-        return mode_just_ask(_with_visual(args.just_ask, visual_ctx), models, diff, cwd, timeout)
+        return _run_mode_with_stats(
+            "just-ask", models,
+            lambda: mode_just_ask(_with_visual(args.just_ask, visual_ctx), models, diff, cwd, timeout),
+        )
     if args.quorum is not None:
-        return mode_quorum(_with_visual(args.quorum, visual_ctx), models, diff, cwd, timeout, pick_moderators(args.moderator, models))
+        return _run_mode_with_stats(
+            "quorum", models,
+            lambda: mode_quorum(_with_visual(args.quorum, visual_ctx), models, diff, cwd, timeout, pick_moderators(args.moderator, models)),
+        )
     if args.brainstorm is not None:
-        return mode_brainstorm(
-            _with_visual(args.brainstorm, visual_ctx), models, cwd, timeout,
-            pick_moderators(args.moderator, models), args.rounds, args.max_rounds
+        # Brainstorm dispatches max(3, len(panel)) persona slots PER ROUND (mode_brainstorm
+        # fills <3-model panels by repeating models: panel[slot % len(panel)]), so the
+        # real per-round pool — and the ETA key — is the slot count, not len(models).
+        # Recording the raw models list would undercount a 1-2 model panel and mis-key
+        # its history (codex P2). Mirror that exact slot assignment so pool_size matches.
+        if models:
+            slot_count = max(3, len(models))
+            brainstorm_pool = [models[slot % len(models)] for slot in range(slot_count)]
+        else:
+            brainstorm_pool = models
+        return _run_mode_with_stats(
+            "brainstorm", brainstorm_pool,
+            lambda: mode_brainstorm(
+                _with_visual(args.brainstorm, visual_ctx), models, cwd, timeout,
+                pick_moderators(args.moderator, models), args.rounds, args.max_rounds
+            ),
         )
 
     # Default plain review. Validate the board now if it wasn't already (the no-visual
@@ -386,8 +463,16 @@ def main(argv: list[str] | None = None) -> int:
     rc = validate_board()
     if rc is not None:
         return rc
-    return mode_review(
-        models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout, args.staged, board=board,
+    # pool_size = backends actually dispatched. On the board path that is the number of
+    # AVAILABLE board reviewers (unavailable ones are skipped), not len(models); compute
+    # it from the same cheap availability probe build_board_jobs uses so the stat record
+    # and the ETA reflect what really ran.
+    run_models = [r.model for r in board if backends.backend_available(r.model)] if board else models
+    return _run_mode_with_stats(
+        "review", run_models,
+        lambda: mode_review(
+            models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout, args.staged, board=board,
+        ),
     )
 
 

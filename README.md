@@ -107,6 +107,30 @@ run progress instead of staring at a frozen terminal. If a call hits its `--time
 the partial output captured so far is still returned (with a `[review-cli] TIMEOUT
 after Ns]` marker and exit 124) rather than being thrown away.
 
+**Run stats & a startup ETA — never short-timeout `review`.** `review` is
+multi-model and (for the panel modes) multi-round, so it takes **minutes**, and a
+short shell `timeout` around it kills the run before its synthesis — a `--brainstorm`
+only emits its final answer at the very end, so a short cap yields *nothing* usable.
+To make the expected duration visible up front, every run that actually dispatches a
+backend appends a structured stat record — mode, pool size (backends actually
+dispatched; for a small-panel brainstorm that is the per-round persona slot count),
+model **names** (never keys or prompts), the real monotonic wall-clock, and ok/fail
+counts — to an append-only
+JSONL store at `~/.config/review-cli/run-stats.jsonl` (mode 0600; override with
+`$REVIEW_STATS_FILE`). At dispatch it then prints a one-line ETA to **stderr** keyed
+on `(mode, pool_size)`:
+
+```
+[review] pool=4 (brainstorm) — typically ~6m12s based on 12 past runs of this size; do NOT timeout.
+```
+
+With no exact history it falls back to pool-size-only across modes, then to a
+`no history yet … expect MINUTES` line. Read that line and wait at least that long;
+if you must bound the run, give it **minutes**, never a cap below the printed ETA.
+(This store is separate from the dashboard's per-call log reader, whose mode is
+*inferred* and whose duration is an mtime proxy — this one records the run's ground
+truth.)
+
 ```bash
 review --quorum "Should we cap brainstorm at 8 rounds?"
 git diff | review --quorum "Is this diff safe to merge?" -m codex,gemini,fable5
