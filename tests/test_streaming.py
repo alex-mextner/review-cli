@@ -314,6 +314,7 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     # module namespace, so patch THAT module (not the façade) for the override to bite.
     old_which = review_backends._which
     old_run_streamed = review_backends._run_streamed
+    old_trust = review_backends._ensure_workspace_trusted
 
     def fake_which(name: str) -> str:
         assert name == "claude-p"
@@ -327,10 +328,14 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     try:
         review_backends._which = fake_which
         review_backends._run_streamed = fake_run_streamed
+        # Stub the auto-trust helper: it writes ~/.claude.json, and this unit
+        # test must not touch the real developer/CI config (cwd here is REPO_ROOT).
+        review_backends._ensure_workspace_trusted = lambda _cwd: None
         result = review_backends.review_claude("claude:opus", "prompt", "diff", REPO_ROOT, 10)
     finally:
         review_backends._which = old_which
         review_backends._run_streamed = old_run_streamed
+        review_backends._ensure_workspace_trusted = old_trust
 
     assert result.returncode == 0
     argv = captured["argv"]

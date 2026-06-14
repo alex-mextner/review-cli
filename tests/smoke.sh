@@ -27,6 +27,11 @@ python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse O
 REVIEW_LOG_DIR="$(mktemp -d)" python3 tests/test_streaming.py
 echo "streaming tests OK"
 
+# Workspace-trust auto-seed for the headless claude/opus backend (the test
+# isolates HOME to a temp dir internally — never touches the real ~/.claude.json).
+python3 tests/test_workspace_trust.py
+echo "workspace-trust tests OK"
+
 # Stage 1 visual-verification suite (cvGate / vision_client / policy / pipeline /
 # composability). All offline: cvGate shells to magick, the vision call is mocked,
 # fixtures are generated (Pillow) — no API keys, no network. These need two non-core
