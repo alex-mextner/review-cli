@@ -1458,6 +1458,183 @@ def test_endpoints_end_to_end():
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
 
 
+def test_host_allowlist_includes_configured_extra_host():
+    """(--host / Tailscale exposure) With $REVIEW_DASHBOARD_ALLOWED_HOSTS set (the Tailscale
+    host), a request carrying that Host is served (not 403'd) while an unrelated foreign Host
+    is still rejected — the rebinding guard stays ON, it just admits the explicit host."""
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        os.environ["REVIEW_DASHBOARD_ALLOWED_HOSTS"] = "ultras-mbp.tailbfe8ea.ts.net"
+        try:
+            from reviewlib.dashboard import server
+
+            # allowed_hosts() reads the env live; only the Tailscale lookup is cached. Force
+            # it empty so the test never shells out to `tailscale` and is deterministic.
+            server._tailscale_cache = set()
+            httpd = server.make_server(0, host="0.0.0.0")
+            port = httpd.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                # The configured Tailscale host -> served.
+                req = urllib.request.Request(
+                    base + "/api/health",
+                    headers={"Host": "ultras-mbp.tailbfe8ea.ts.net"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    assert r.status == 200
+                    payload = json.loads(r.read().decode("utf-8"))
+                    assert "ultras-mbp.tailbfe8ea.ts.net" in payload["allowed_origins"]
+                # An unrelated foreign Host is STILL rejected (rebinding guard intact).
+                bad = urllib.request.Request(base + "/api/health", headers={"Host": "evil.example.com"})
+                try:
+                    urllib.request.urlopen(bad, timeout=10)
+                    raise AssertionError("expected 403 for foreign Host")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 403, e.code
+                # Loopback still served.
+                ok = urllib.request.Request(base + "/api/health", headers={"Host": f"127.0.0.1:{port}"})
+                with urllib.request.urlopen(ok, timeout=10) as r:
+                    assert r.status == 200
+            finally:
+                httpd._sse_stop = True
+                httpd.shutdown()
+                httpd.server_close()
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+            os.environ.pop("REVIEW_DASHBOARD_ALLOWED_HOSTS", None)
+            server._tailscale_cache = None  # let real discovery resume for other code
+
+
+def test_write_allowed_from_tailscale_origin_rejected_from_foreign():
+    """(--host / Tailscale exposure — the new WRITE vector) When exposed with the Tailscale
+    host allowlisted, a POST whose Origin is that Tailscale host succeeds (a remote reviewer
+    can leave feedback), while a foreign Origin is still 403'd (CSRF intact)."""
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        os.environ["REVIEW_DASHBOARD_ALLOWED_HOSTS"] = "ultras-mbp.tailbfe8ea.ts.net"
+        try:
+            _seed_logs(Path(logd))
+            from reviewlib.dashboard import server
+
+            server._tailscale_cache = set()
+            httpd = server.make_server(0, host="0.0.0.0")
+            port = httpd.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            ts = "ultras-mbp.tailbfe8ea.ts.net"
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                # a real session id (reached via the Tailscale Host, like a phone would)
+                req = urllib.request.Request(base + "/api/runs", headers={"Host": ts})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    sid = json.loads(r.read().decode("utf-8"))[0]["session_id"]
+                # write from the Tailscale Origin + matching Host -> allowed.
+                st, body = _post(
+                    base, f"/api/runs/{sid}/feedback", {"feedback": "from the phone"},
+                    headers={"Content-Type": "application/json", "Origin": f"http://{ts}", "Host": ts},
+                )
+                assert st == 200 and body["annotation"]["feedback"] == "from the phone"
+                # write from a FOREIGN Origin -> 403 (CSRF), even with an allowed Host.
+                try:
+                    _post(
+                        base, f"/api/runs/{sid}/feedback", {"feedback": "pwned"},
+                        headers={"Content-Type": "application/json",
+                                 "Origin": "https://evil.example.com", "Host": ts},
+                    )
+                    raise AssertionError("expected 403 for foreign Origin")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 403, e.code
+            finally:
+                httpd._sse_stop = True
+                httpd.shutdown()
+                httpd.server_close()
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+            os.environ.pop("REVIEW_DASHBOARD_ALLOWED_HOSTS", None)
+            server._tailscale_cache = None
+
+
+def test_sse_events_stream_content_type_and_live_event():
+    """(SSE live stream) GET /events is an event-stream, and when a NEW call log appears in
+    the log dir AFTER the stream connects, a `run` (and `log`) event is pushed to the client
+    without any polling — proving live activity reaches the browser."""
+    import http.client
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        try:
+            from reviewlib.dashboard import server
+
+            httpd = server.make_server(0)
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                # /events inherits the Host allowlist (do_GET rejects a foreign Host before
+                # routing) — a rebound page can't open the live stream and exfiltrate logs.
+                bad = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/events", headers={"Host": "evil.example.com"})
+                try:
+                    urllib.request.urlopen(bad, timeout=10)
+                    raise AssertionError("expected 403 for foreign Host on /events")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 403, e.code
+
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+                conn.request("GET", "/events", headers={"Host": f"127.0.0.1:{port}"})
+                resp = conn.getresponse()
+                assert resp.status == 200, resp.status
+                ctype = resp.getheader("Content-Type") or ""
+                assert ctype.startswith("text/event-stream"), ctype
+                # Read the initial framing (retry: + : connected) so the baseline tick has run.
+                resp.read(1)  # block until at least one byte is flushed
+                # Now write a NEW call log — the watcher must pick it up and stream an event.
+                _write_call_log(Path(logd), "20260601T100000_000000", "codex", 0,
+                                "live run output\n", exit_code=0)
+                # Accumulate the stream until we see BOTH a `log` and a `run` event, or time out.
+                buf = b""
+                saw_run = saw_log = False
+                import time as _t
+
+                deadline = _t.monotonic() + 12
+                while _t.monotonic() < deadline and not (saw_run and saw_log):
+                    chunk = resp.read1(64)  # documented incremental read, no fixed-size block
+                    if not chunk:
+                        break
+                    buf += chunk
+                    saw_log = saw_log or b"event: log" in buf
+                    saw_run = saw_run or b"event: run" in buf
+                assert saw_run, f"no run event streamed; got: {buf[:400]!r}"
+                assert saw_log, f"no log event streamed; got: {buf[:400]!r}"
+                # The run event must carry a JSON data line with a session summary.
+                assert b'"session_id"' in buf, buf[:400]
+                # The log event payload contract: filename + grew + the parsed call fields.
+                text = buf.decode("utf-8", "replace")
+                log_block = next(b for b in text.split("\n\n") if "event: log" in b)
+                data_line = next(ln for ln in log_block.splitlines() if ln.startswith("data: "))
+                log_payload = json.loads(data_line[len("data: "):])
+                assert log_payload["filename"].endswith("-codex-r0.log"), log_payload
+                assert log_payload["kind"] == "call", log_payload
+                assert log_payload["backend"] == "codex", log_payload
+                assert log_payload["completed"] is True, log_payload
+                assert log_payload["grew"] is False, log_payload  # brand-new file, not a grow
+                conn.close()
+            finally:
+                httpd._sse_stop = True
+                httpd.shutdown()
+                httpd.server_close()
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
