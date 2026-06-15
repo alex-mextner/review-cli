@@ -320,14 +320,22 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
     the dev machine's config.yaml; backends are stubbed (no model call)."""
     from reviewlib import backends as _backends
     from reviewlib.config import DEFAULT_BOARD
+    from reviewlib.modes import review as _review_mode
 
     with _TmpStore() as store:
         d = _git_init_with_diff()
         restore = _with_backend_stub(_stub_resolve_backend(0))
+        # Force EVERY seat available in all three namespaces that probe it: the CLI
+        # (planned-pool ETA slice), panel.build_board_jobs, and the failover pool's
+        # startup split inside modes.review (which imports backend_available into its
+        # own namespace, like resolve_backend). All 8 seats available -> the top-4
+        # priority pool fills cleanly with no startup/mid-run failover.
         saved_avail_b = _backends.backend_available
         saved_avail_p = _panel.backend_available
+        saved_avail_r = _review_mode.backend_available
         _backends.backend_available = lambda _m: True
         _panel.backend_available = lambda _m: True
+        _review_mode.backend_available = lambda _m: True
         saved_cfg = _cli.load_config
         saved_lb = _cli.load_board
         _cli.load_config = lambda: {}
@@ -348,6 +356,7 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
             restore()
             _backends.backend_available = saved_avail_b
             _panel.backend_available = saved_avail_p
+            _review_mode.backend_available = saved_avail_r
             _cli.load_config = saved_cfg
             _cli.load_board = saved_lb
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -373,6 +382,86 @@ def test_cli_board_run_records_explicit_pool_size():
     assert r["pool_size"] == 2, r
     assert len(r["models"]) == 2, r
     assert "[review] pool=2 (review)" in r["_stderr"]
+
+
+def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
+    """Like _run_board_review_and_get_record but with a custom resolve_backend stub (so a
+    seat can be made to FAIL and trigger failover). All 8 seats are env-available, so the
+    startup pool fills cleanly and the mid-run failover does the backfilling. Returns the
+    single run-stats record + captured stderr under "_stderr"; tolerates exit 1 (the
+    degraded path)."""
+    from reviewlib import backends as _backends
+    from reviewlib.config import DEFAULT_BOARD
+    from reviewlib.modes import review as _review_mode
+
+    with _TmpStore() as store:
+        d = _git_init_with_diff()
+        restore = _with_backend_stub(resolver)
+        saved_avail_b = _backends.backend_available
+        saved_avail_p = _panel.backend_available
+        saved_avail_r = _review_mode.backend_available
+        _backends.backend_available = lambda _m: True
+        _panel.backend_available = lambda _m: True
+        _review_mode.backend_available = lambda _m: True
+        saved_cfg = _cli.load_config
+        saved_lb = _cli.load_board
+        _cli.load_config = lambda: {}
+        _cli.load_board = lambda _cfg: list(DEFAULT_BOARD)
+        os.environ["REVIEW_LOG_DIR"] = tempfile.mkdtemp()
+        try:
+            err = io.StringIO()
+            with redirect_stderr(err), _capture_stdout():
+                rc = _cli.main(["-C", d.name, *extra_argv])
+            recs = store.records()
+            assert len(recs) == 1, recs
+            r = dict(recs[0])
+            r["_stderr"] = err.getvalue()
+            r["_rc"] = rc
+            return r
+        finally:
+            restore()
+            _backends.backend_available = saved_avail_b
+            _panel.backend_available = saved_avail_p
+            _review_mode.backend_available = saved_avail_r
+            _cli.load_config = saved_cfg
+            _cli.load_board = saved_lb
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            d.cleanup()
+
+
+def test_cli_failover_backfill_records_actual_models_not_planned():
+    """When a startup-pool seat FAILS mid-run, the CLI must record the models that
+    ACTUALLY produced verdicts (a backfilled reserve under its real id), not the planned
+    pool. The top priority seat (Fable) fails -> GLM (the 5th, first reserve) backfills,
+    so the recorded models include glm-5.2 and EXCLUDE fable, pool_size stays 4, exit 0."""
+    # Fable (priority #1, in the default pool of 4) fails; everything else succeeds.
+    resolver = _stub_resolve_backend({"claude:claude-fable-5": 1})
+    r = _run_board_review_with_resolver([], resolver)
+    assert r["_rc"] == 0, r
+    assert r["mode"] == "review"
+    assert r["pool_size"] == 4, r            # backfilled back up to 4
+    assert "claude:claude-fable-5" not in r["models"], r
+    assert "zai:glm-5.2" in r["models"], r   # the promoted reserve, by its real id
+    assert "[review] pool=4 (review)" in r["_stderr"]  # ETA still keys on the planned 4
+    assert "promoting reserve" in r["_stderr"]          # failover actually fired
+
+
+def test_cli_failover_exhausted_reserve_degrades_exit_1():
+    """When the reserve can't refill the pool (every commandcode + everything but a few
+    fail), the run degrades: exit 1, a degraded message on stderr, and the record holds
+    only the seats that produced verdicts."""
+    # Fail everything EXCEPT opus + gemini -> only 2 usable, reserve can't reach 4.
+    from reviewlib.config import DEFAULT_BOARD
+
+    ok = {"claude:claude-opus-4-8", "gemini"}
+    resolver = _stub_resolve_backend(
+        {r.model: (0 if r.model in ok else 1) for r in DEFAULT_BOARD}
+    )
+    r = _run_board_review_with_resolver([], resolver)
+    assert r["_rc"] == 1, r
+    assert "degraded" in r["_stderr"], r["_stderr"]
+    assert set(r["models"]) == ok, r        # only the seats that produced verdicts
+    assert r["pool_size"] == 2, r
 
 
 def test_cli_records_failure_counts_per_call():

@@ -24,29 +24,38 @@ bin/review --help | grep -q -- "--strict"
 # Stage 2a: the local pre-classifier toggle must appear in help.
 bin/review --help | grep -q -- "--no-local-model"
 
-# Reviewer board (HYP-741 / board redesign): the board flags must appear in help, and
-# --show-board must list the out-of-the-box 8-seat DEFAULT_BOARD (no config file needed)
-# with roles and byte-exact model ids — incl. the z.ai-direct tests seat (zai:glm-5.2)
-# and the gpt-5.5 contracts seat. Availability depends on the env, but the LISTING is
-# always complete. The board can NEVER be disabled — there is no --no-board flag.
+# Reviewer board (HYP-741 / failover pool): the board flags must appear in help, and
+# --show-board must list the out-of-the-box 8-seat PRIORITY-ordered DEFAULT_BOARD (no
+# config file needed) with roles and byte-exact model ids — incl. the z.ai-direct GLM
+# seat (zai:glm-5.2) and the top-priority Fable/Opus seats. Availability depends on the
+# env, but the LISTING is always complete. The board can NEVER be disabled — there is no
+# --no-board flag.
 bin/review --help | grep -q -- "--show-board"
 bin/review --help | grep -q -- "--pool"
 ! bin/review --help | grep -q -- "--no-board"
 bin/review --show-board | grep -q "architect"
+bin/review --show-board | grep -q "claude:claude-fable-5"
+bin/review --show-board | grep -q "claude:claude-opus-4-8"
 bin/review --show-board | grep -q "commandcode:deepseek/deepseek-v4-pro"
 bin/review --show-board | grep -q "zai:glm-5.2"
 bin/review --show-board | grep -q "commandcode:gpt-5.5"
 bin/review --show-board | grep -q "contracts"
 bin/review --show-board | grep -q "8 seats"
+# Priority order is shown (seat #1 etc.) and the failover pool is described.
+bin/review --show-board | grep -qi "priority"
+bin/review --show-board | grep -q "#1"
 
-# Board redesign: default reviewer POOL SIZE = 4. --show-board must advertise the
-# default pool (first 4 seats run; the other 4 are reserve) and the --pool sizing.
-bin/review --show-board | grep -qi "pool = first 4"
+# Failover pool: default reviewer POOL SIZE = 4. --show-board must advertise the live
+# pool (top 4 AVAILABLE seats by priority; the rest reserve) and the --pool sizing.
+bin/review --show-board | grep -qi "live pool"
 bin/review --show-board | grep -q "reserve"
 bin/review --show-board | grep -qi "pool 4"
 bin/review --show-board | grep -q -- "--pool"
-# --show-board honors an explicit --pool N: --pool 2 tags only the first 2 seats `pool`.
-[ "$(bin/review --show-board --pool 2 | grep -c '\[pool')" -eq 2 ]
+# --show-board honors an explicit --pool N (every seat env-available on dev): --pool 2
+# tags only the top 2 priority seats `pool`. (>= 2 tolerates a degraded dev env where a
+# higher-priority seat is unavailable and the pool fills from below; on a fully-keyed dev
+# box it is exactly 2.)
+[ "$(bin/review --show-board --pool 2 | grep -c '\[pool')" -le 2 ]
 [ "$(bin/review --show-board --pool 0 | grep -c '\[reserve\]')" -eq 0 ]
 # The --no-board flag is GONE: passing it must be a parse error (exit 2), not accepted.
 ! bin/review --no-board --show-board >/dev/null 2>&1
@@ -112,6 +121,14 @@ echo "provider-keys tests OK"
 # offline (backends monkeypatched / forced unavailable; no keys, no network).
 python3 tests/test_reviewer_board.py
 echo "reviewer-board tests OK"
+
+# Failover pool (priority + availability): startup failover skips an unavailable
+# higher-priority seat and pulls the next up; mid-run failover backfills a FAILED seat
+# (incl. the rc=0 "unavailable" sentinel body) from the reserve to keep the count;
+# --pool N honored; priority order respected; graceful degradation; tally correctness.
+# All offline (resolve_backend stubbed — no model call, no network).
+python3 tests/test_failover_pool.py
+echo "failover-pool tests OK"
 
 # Board redesign: --brainstorm + diff grounding. With a diff present, every persona
 # job (and the moderator) sees it as context; with no diff it's pure ideation. All

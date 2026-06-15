@@ -541,40 +541,59 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 The default `review` (plain diff review) runs a **reviewer board**: a panel where
 each model is given its OWN review role/lens, so the panel covers the diff broadly
 instead of every model doing the same generic pass. The board is the default panel
-out of the box — no config file required. Reviewers whose backend isn't available
-(no key / not on PATH) are skipped and logged; the board degrades gracefully.
+out of the box — no config file required.
 
-The built-in board is an **8-seat panel**, but by default a plain `review` runs only
-the **first 4 seats** (the **default pool**); the other 4 are a **reserve**. Size the
-pool with `--pool N` — `--pool 8` (or `--pool 0`) runs all eight, `--pool 2` runs the
-first two. The board is **never disabled**; `--pool` only chooses how many of its seats
-participate. The first four seats — `architect`, `correctness`, `consistency`,
-`performance` — are the default pool; `quality`, `security`, `tests`, `contracts` are
-the reserve.
+### Priority-ordered failover pool
 
-The built-in board (the `pool`/`reserve` column shows which seats run by default):
+The board is a **priority-ordered** list of 8 models — strongest first — and a plain
+`review` runs a **pool of 4**. The pool is chosen by **priority + availability**, with
+two layers of failover so the run keeps **4 working reviewers** even when models drop:
 
-| Seat | Reviewer | Backend | Role | Lens focus |
-|---|---|---|---|---|
-| pool | Opus | `claude:claude-opus-4-8` | `architect` | architecture, design coherence, API shape, abstraction boundaries (also the moderator) |
-| pool | Codex | `codex` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one |
-| pool | Gemini | `gemini` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
-| pool | DeepSeek | `commandcode:deepseek/deepseek-v4-pro` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
-| reserve | Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
-| reserve | Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| reserve | GLM | `zai:glm-5.2` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
-| reserve | GPT-5.5 | `commandcode:gpt-5.5` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+- **Startup failover** — the active pool is the **top 4 AVAILABLE** seats by priority.
+  A higher-priority seat whose backend isn't reachable (no key / not on PATH) is
+  **skipped** and the next-priority seat is pulled up, so you still start with 4 working
+  models. (E.g. if Fable 5 is paywalled/unavailable, the pool starts at Opus.)
+- **Mid-run failover** — if an active seat **fails during the review** (backend error,
+  timeout, empty output, or an "unavailable" reply such as a paywalled model returning
+  *"… is currently unavailable"*), the next-priority **reserve** model is promoted and
+  run in its place, repeating until **4 working verdicts** are produced or the reserve is
+  exhausted (then the run degrades gracefully and says so on stderr, exiting non-zero).
 
-The `tests` seat goes **direct to z.ai** (`zai:glm-5.2`, the newest GLM, reachable on
-the GLM Coding-Plan endpoint) via the z.ai backend — not through the commandcode
-gateway. It needs a z.ai key (see Auth). All other commandcode seats need
-`COMMANDCODE_API_KEY`.
+The role/lens **travels with the seat**: priority decides *who* sits in the pool, the
+role decides *with what lens* they review. A promoted reserve brings its own lens, so
+the panel still covers a broad set of facets.
+
+`--pool N` overrides the default 4 (the top-N available, with the same failover); `--pool
+0` runs **all available** seats. The board is **never disabled** — `--pool` only sizes
+the pool.
+
+The built-in board, in **priority order** (the `tier` column shows the live split on a
+fully-keyed environment):
+
+| # | Tier | Reviewer | Backend | Role | Lens focus |
+|---|---|---|---|---|---|
+| 1 | pool | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries |
+| 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
+| 3 | pool | GPT-5.5 | `commandcode:gpt-5.5` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| 4 | pool | Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
+| 5 | reserve | GLM | `zai:glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom |
+| 6 | reserve | Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| 7 | reserve | DeepSeek | `commandcode:deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| 8 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+
+**To re-rank** the board, reorder the priority list (`DEFAULT_BOARD` in
+`reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the
+highest priority. The role lens you attach to each model is independent of its priority.
+
+The GLM seat goes **direct to z.ai** (`zai:glm-5.2`, the newest GLM, reachable on the
+GLM Coding-Plan endpoint) via the z.ai backend — not through the commandcode gateway.
+It needs a z.ai key (see Auth). All other commandcode seats need `COMMANDCODE_API_KEY`.
 
 ```bash
-review --show-board   # list the active board (model -> role) + pool/reserve + availability
-review                # default pool: the first 4 board seats
-review --pool 8       # run all 8 seats (--pool 0 also means "all")
-review --pool 2       # run only the first 2 seats
+review --show-board   # priority order + which 4 are the live pool + reserve + availability
+review                # default failover pool: the top 4 AVAILABLE seats by priority
+review --pool 8       # run all 8 available seats (--pool 0 also means "all available")
+review --pool 2       # run the top 2 available seats (with failover)
 review -m codex -m gemini   # an explicit -m bypasses the board entirely (exact models)
 ```
 
@@ -584,32 +603,36 @@ The board is the default **only when you have not expressed a model preference**
 Precedence (cost-safety first — the board never runs against your wishes):
 
 ```
-explicit -m on the CLI   >   `models:` in config.yaml   >   default board (pool seats)
+explicit -m on the CLI   >   `models:` in config.yaml   >   default board (failover pool)
 ```
 
 - A `models:` list in `config.yaml` **overrides the board**: you configured exact
-  models, so `review` runs exactly those (the flat panel), not the board.
+  models, so `review` runs exactly those (the flat panel, no failover), not the board.
 - The board runs whenever there is **no** `-m` and **no** `models:`. It can **never**
-  be disabled — there is no `--no-board` flag. Use `--pool N` to size it (default 4;
-  `--pool 0`/`--pool 8` runs all seats).
+  be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover pool
+  (default 4; `--pool 0`/`--pool 8` runs all available seats).
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
   preference — the board still applies.
 
 Override the board itself in `config.yaml` with a `board:` list — each entry is a
-`{model, role}` mapping (optional `name:` for the label). An unknown `role` keeps
-the reviewer but falls back to the generic prompt (with a warning); a single malformed
-entry is skipped (the valid ones are kept). With **no** `board:` configured, the
-built-in 8-seat board above applies. A `board:` that is **present but has no usable
-entry at all** is a hard error (non-zero exit) — it never silently falls back to the
-paid default board.
+`{model, role}` mapping (optional `name:` for the label). **List the models in priority
+order** (the first entry is the highest priority); the failover pool fills from the top.
+An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
+warning); a single malformed entry is skipped (the valid ones are kept). With **no**
+`board:` configured, the built-in 8-seat priority board above applies. A `board:` that is
+**present but has no usable entry at all** is a hard error (non-zero exit) — it never
+silently falls back to the paid default board.
 
 ```yaml
+# Priority order: the first 4 reachable models are the live pool; the rest are the
+# reserve that backfills a skipped/failed seat.
 board:
-  - { model: "claude:claude-opus-4-8", role: architect }
-  - { model: "codex",                  role: correctness }
+  - { model: "claude:claude-fable-5",  role: architect }
+  - { model: "claude:claude-opus-4-8", role: correctness }
+  - { model: "commandcode:gpt-5.5",    role: consistency, name: GPT-5.5 }
+  - { model: "commandcode:moonshotai/Kimi-K2.7-Code", role: performance, name: Kimi }
+  - { model: "zai:glm-5.2",            role: quality }
   - { model: "commandcode:Qwen/Qwen3.7-Max", role: security, name: Qwen }
-  - { model: "zai:glm-5.2",            role: tests }
-  - { model: "commandcode:gpt-5.5",    role: contracts, name: GPT-5.5 }
 ```
 
 **Optional heavyweight seats** (NOT enabled by default — the board stays at 8). Add

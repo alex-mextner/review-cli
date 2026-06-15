@@ -42,22 +42,38 @@ from reviewlib.panel import build_board_jobs  # noqa: E402
 DEFAULT_PROMPT = "Review this diff."
 
 
-# === DEFAULT_BOARD shape (byte-exact model ids from the directive) ==============
+# === DEFAULT_BOARD shape (byte-exact model ids, PRIORITY order from the directive) ==
 def test_default_board_matches_directive_table():
+    # Priority order (failover pool): strongest model first. Each seat keeps a role/lens,
+    # but selection is by PRIORITY + availability, not role order.
     expected = [
-        ("claude:claude-opus-4-8", "architect", "Opus"),
-        ("codex", "correctness", "Codex"),
-        ("gemini", "consistency", "Gemini"),
-        ("commandcode:deepseek/deepseek-v4-pro", "performance", "DeepSeek"),
-        ("commandcode:moonshotai/Kimi-K2.7-Code", "quality", "Kimi"),
+        ("claude:claude-fable-5", "architect", "Fable"),
+        ("claude:claude-opus-4-8", "correctness", "Opus"),
+        ("commandcode:gpt-5.5", "consistency", "GPT-5.5"),
+        ("commandcode:moonshotai/Kimi-K2.7-Code", "performance", "Kimi"),
+        # GLM goes DIRECT to z.ai (his GLM subscription), not commandcode.
+        ("zai:glm-5.2", "quality", "GLM"),
         ("commandcode:Qwen/Qwen3.7-Max", "security", "Qwen"),
-        # The tests seat goes DIRECT to z.ai (his GLM subscription), not commandcode.
-        ("zai:glm-5.2", "tests", "GLM"),
-        # 8th seat: gpt-5.5 on a tight public-API/contracts lens.
-        ("commandcode:gpt-5.5", "contracts", "GPT-5.5"),
+        ("commandcode:deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
+        ("gemini", "contracts", "Gemini"),
     ]
     got = [(r.model, r.role, r.display) for r in DEFAULT_BOARD]
     assert got == expected, got
+
+
+def test_default_board_is_priority_ordered():
+    """The CTO's priority sketch (strongest first): Fable, Opus, GPT-5.5, Kimi, GLM-5.2,
+    Qwen, DeepSeek, Gemini. Re-ranking = reordering DEFAULT_BOARD; this pins the order."""
+    assert [r.model for r in DEFAULT_BOARD] == [
+        "claude:claude-fable-5",
+        "claude:claude-opus-4-8",
+        "commandcode:gpt-5.5",
+        "commandcode:moonshotai/Kimi-K2.7-Code",
+        "zai:glm-5.2",
+        "commandcode:Qwen/Qwen3.7-Max",
+        "commandcode:deepseek/deepseek-v4-pro",
+        "gemini",
+    ]
 
 
 def test_default_board_has_eight_seats():
@@ -70,14 +86,15 @@ def test_default_pool_size_is_four():
 
 
 def test_select_pool_default_picks_first_four_seats():
-    """Default pool = the FIRST 4 seats of the 8-seat board (the rest are reserve)."""
+    """Default pool (no availability predicate) = the FIRST 4 seats by priority of the
+    8-seat board (the rest are reserve)."""
     pool = select_pool(list(DEFAULT_BOARD), DEFAULT_POOL_SIZE)
     assert len(pool) == 4
     assert [r.model for r in pool] == [r.model for r in DEFAULT_BOARD[:4]]
-    # The reserve is exactly the remainder.
+    # The reserve is exactly the remainder (priority order).
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
-    assert reserve == ["commandcode:moonshotai/Kimi-K2.7-Code",
-                       "commandcode:Qwen/Qwen3.7-Max", "zai:glm-5.2", "commandcode:gpt-5.5"]
+    assert reserve == ["zai:glm-5.2", "commandcode:Qwen/Qwen3.7-Max",
+                       "commandcode:deepseek/deepseek-v4-pro", "gemini"]
 
 
 def test_select_pool_zero_or_negative_means_all_seats():
@@ -118,24 +135,25 @@ def test_select_pool_does_not_mutate_input(  ):
     assert select_pool(src, 0) is not src
 
 
-def test_tests_seat_routes_to_zai_backend_with_glm52():
-    """The tests seat must route to the z.ai backend (his subscription), model glm-5.2 —
+def test_glm_seat_routes_to_zai_backend_with_glm52():
+    """The GLM seat must route to the z.ai backend (his subscription), model glm-5.2 —
     NOT the commandcode gateway. resolve_backend(zai:glm-5.2) -> review_zai."""
-    seat = next(r for r in DEFAULT_BOARD if r.role == "tests")
-    assert seat.model == "zai:glm-5.2", seat.model
+    seat = next(r for r in DEFAULT_BOARD if r.model == "zai:glm-5.2")
+    assert seat.display == "GLM"
     assert backends.resolve_backend(seat.model) is backends.review_zai
     # The backend sends model id glm-5.2 on the wire (suffix after `zai:`).
     assert seat.model.split(":", 1)[1] == "glm-5.2"
 
 
-def test_contracts_seat_has_a_lens():
-    seat = next(r for r in DEFAULT_BOARD if r.role == "contracts")
-    assert seat.model == "commandcode:gpt-5.5", seat.model
-    assert seat.display == "GPT-5.5"
+def test_contracts_role_has_a_lens():
+    """The contracts lens still exists and is non-overlapping (public-API/backward-compat),
+    regardless of which priority seat carries it now."""
     assert "contracts" in REVIEW_ROLES
     lens = REVIEW_ROLES["contracts"].lower()
     assert "public api" in lens or "api shape" in lens, lens
     assert "backward" in lens or "compat" in lens, lens
+    # Some default seat carries the contracts lens.
+    assert any(r.role == "contracts" for r in DEFAULT_BOARD)
 
 
 def test_every_default_role_has_a_lens():
@@ -300,11 +318,12 @@ def test_build_board_jobs_unknown_role_uses_generic_prompt():
 # === graceful skip of unavailable reviewers =====================================
 def test_unavailable_reviewers_are_skipped_not_crashed():
     board = list(DEFAULT_BOARD)
-    with _AvailabilityPatch({"codex", "gemini"}):  # only two reachable
+    reachable = {"gemini", "zai:glm-5.2"}  # only two reachable
+    with _AvailabilityPatch(reachable):
         jobs, skipped = build_board_jobs(board, DEFAULT_PROMPT, "+x")
-    assert {j.model for j in jobs} == {"codex", "gemini"}
+    assert {j.model for j in jobs} == reachable
     assert {r.model for r in skipped} == {
-        r.model for r in board if r.model not in {"codex", "gemini"}
+        r.model for r in board if r.model not in reachable
     }
     assert len(jobs) + len(skipped) == len(board)
 
@@ -486,7 +505,7 @@ def test_cli_empty_config_models_does_not_disable_board():
     for empty_models in ([], ["", "  ", "\t"]):
         captured: dict = {}
 
-        def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None):
+        def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
             captured["board"] = board
             captured["models"] = models
             return 0
@@ -614,14 +633,17 @@ def test_cli_all_malformed_board_fails_before_visual_fanout():
 
 def _capture_default_review_board(argv: list[str]) -> dict:
     """Run `cli.main(argv)` on the default-review path with the board pinned to
-    DEFAULT_BOARD and an empty config, capturing the board passed into mode_review.
+    DEFAULT_BOARD and an empty config, capturing the (full) board and pool_size passed
+    into mode_review. All seats forced AVAILABLE so the test is offline + deterministic.
     Shared by the default-pool and --pool wiring tests."""
     from reviewlib import cli
 
     captured: dict = {}
 
-    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None):
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None,
+                          pool_size=DEFAULT_POOL_SIZE, outcome_sink=None):
         captured["board"] = board
+        captured["pool_size"] = pool_size
         return 0
 
     old = cli.mode_review
@@ -634,6 +656,10 @@ def _capture_default_review_board(argv: list[str]) -> dict:
     cli.load_board = lambda _cfg: list(DEFAULT_BOARD)
     old_load_config = cli.load_config
     cli.load_config = lambda: {}
+    # Force every seat available so the CLI's ETA planned_pool slice is deterministic
+    # and never probes a real key/CLI (offline).
+    old_avail = backends.backend_available
+    backends.backend_available = lambda _m: True
     old_stdin = sys.stdin
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -645,32 +671,40 @@ def _capture_default_review_board(argv: list[str]) -> dict:
         cli.mode_review = old
         cli.load_board = old_load_board
         cli.load_config = old_load_config
+        backends.backend_available = old_avail
         sys.stdin = old_stdin
     return captured
 
 
-def test_cli_default_path_activates_board_at_default_pool():
-    """No -m -> the board is passed into mode_review, sized to the DEFAULT pool (4)."""
+def test_cli_default_path_passes_full_board_and_default_pool():
+    """No -m -> the FULL priority board is passed into mode_review (so it has the reserve
+    for failover) with pool_size = the DEFAULT (4). The startup-failover slice to the top
+    pool_size AVAILABLE seats happens INSIDE mode_review, not in the CLI."""
     captured = _capture_default_review_board(["-C", str(REPO_ROOT)])
     assert captured["board"] is not None, "board should be active by default"
-    # Board redesign: the default plain review runs only the FIRST 4 of the 8 seats.
-    assert len(captured["board"]) == DEFAULT_POOL_SIZE, len(captured["board"])
-    assert [r.model for r in captured["board"]] == [r.model for r in DEFAULT_BOARD[:DEFAULT_POOL_SIZE]]
+    assert len(captured["board"]) == len(DEFAULT_BOARD), "full board passed (reserve incl.)"
+    assert [r.model for r in captured["board"]] == [r.model for r in DEFAULT_BOARD]
+    assert captured["pool_size"] == DEFAULT_POOL_SIZE, captured["pool_size"]
 
 
-def test_cli_pool_flag_sizes_the_board():
-    """--pool N runs the first N seats; --pool 0 runs all 8 (the full reserve)."""
+def test_cli_pool_flag_threads_pool_size():
+    """--pool N threads N as pool_size into mode_review (the full board still flows so
+    the reserve is available); --pool 0 = all seats."""
     cap2 = _capture_default_review_board(["--pool", "2", "-C", str(REPO_ROOT)])
-    assert [r.model for r in cap2["board"]] == [r.model for r in DEFAULT_BOARD[:2]]
+    assert cap2["pool_size"] == 2, cap2["pool_size"]
+    assert len(cap2["board"]) == len(DEFAULT_BOARD), "full board still passed"
     cap_all = _capture_default_review_board(["--pool", "0", "-C", str(REPO_ROOT)])
-    assert len(cap_all["board"]) == len(DEFAULT_BOARD)
-    cap8 = _capture_default_review_board(["--pool", "8", "-C", str(REPO_ROOT)])
-    assert len(cap8["board"]) == len(DEFAULT_BOARD)
+    assert cap_all["pool_size"] == 0, cap_all["pool_size"]
 
 
-def _show_board_lines(pool_size: int, board_models: list[str] | None = None) -> list[str]:
+def _show_board_lines(
+    pool_size: int, board_models: list[str] | None = None,
+    available: set[str] | None = None,
+) -> list[str]:
     """Run cli._show_board(config, pool_size) and return its stdout lines. When
-    board_models is given, a config `board:` of those models is used (each role tests)."""
+    board_models is given, a config `board:` of those models is used (each role tests).
+    `available` forces the availability probe to a fixed set (None = all available) so
+    the tag split is deterministic + offline."""
     import contextlib
     import io
 
@@ -679,25 +713,49 @@ def _show_board_lines(pool_size: int, board_models: list[str] | None = None) -> 
     cfg: dict = {}
     if board_models is not None:
         cfg = {"board": [{"model": m, "role": "tests"} for m in board_models]}
+    old_avail = backends.backend_available
+    backends.backend_available = lambda m: True if available is None else (m in available)
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = cli._show_board(cfg, pool_size)
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = cli._show_board(cfg, pool_size)
+    finally:
+        backends.backend_available = old_avail
     assert rc == 0, rc
     return buf.getvalue().splitlines()
 
 
 def test_show_board_honors_pool_flag_tagging():
-    """`--show-board --pool N` must tag the FIRST N seats `pool`, the rest `reserve`
-    (codex P2: previously it ignored N and always marked the default 4)."""
+    """`--show-board --pool N` (all seats available) must tag the top N priority seats
+    `pool`, the rest `reserve`."""
     seat_lines = [ln for ln in _show_board_lines(2) if "[pool" in ln or "[reserve]" in ln]
     assert len(seat_lines) == len(DEFAULT_BOARD)
     pool_lines = [ln for ln in seat_lines if "[pool" in ln]
     reserve_lines = [ln for ln in seat_lines if "[reserve]" in ln]
     assert len(pool_lines) == 2, pool_lines
     assert len(reserve_lines) == len(DEFAULT_BOARD) - 2, reserve_lines
-    # The first two displayed seats (Opus, Codex) are the pool.
-    assert "Opus" in pool_lines[0]
-    assert "Codex" in pool_lines[1]
+    # The first two displayed seats by priority (Fable, Opus) are the pool.
+    assert "Fable" in pool_lines[0]
+    assert "Opus" in pool_lines[1]
+
+
+def test_show_board_startup_failover_skips_unavailable_top_seat():
+    """The live pool is the top-N AVAILABLE seats by priority: an unavailable higher
+    priority seat is tagged `unavail` and the next available seat fills the pool."""
+    # Fable (#1) unavailable -> the pool of 2 is Opus (#2) + GPT-5.5 (#3); Fable is unavail.
+    avail = {r.model for r in DEFAULT_BOARD if r.model != "claude:claude-fable-5"}
+    seat_lines = [ln for ln in _show_board_lines(2, available=avail)
+                  if "[pool" in ln or "[reserve]" in ln or "[unavail]" in ln]
+    by_tier = {"pool": [], "reserve": [], "unavail": []}
+    for ln in seat_lines:
+        for tier in by_tier:
+            if f"[{tier}" in ln:
+                by_tier[tier].append(ln)
+                break
+    assert len(by_tier["pool"]) == 2, by_tier["pool"]
+    assert "Fable" in by_tier["unavail"][0], by_tier["unavail"]
+    assert "Opus" in by_tier["pool"][0]
+    assert "GPT-5.5" in by_tier["pool"][1]
 
 
 def test_show_board_pool_zero_marks_all_seats_pool():
@@ -706,14 +764,15 @@ def test_show_board_pool_zero_marks_all_seats_pool():
     assert not any("[reserve]" in ln for ln in seat_lines)
 
 
-def test_show_board_tags_by_index_not_model_for_duplicate_models():
-    """A board with the SAME model in two seats must tag each by INDEX, so a duplicate
-    model in the reserve isn't mislabeled `pool` (codex P2)."""
+def test_show_board_tags_by_seat_not_model_for_duplicate_models():
+    """A board with the SAME model in two seats must tag each per-SEAT (by object
+    identity / priority position), so a duplicate model in the reserve isn't mislabeled
+    `pool`. Pool of 1 (all available) -> seat #1 pool, the rest reserve."""
     lines = _show_board_lines(1, board_models=["codex", "codex", "gemini"])
     seat_lines = [ln for ln in lines if "[pool" in ln or "[reserve]" in ln]
     assert len(seat_lines) == 3
     assert "[pool" in seat_lines[0]
-    assert "[reserve]" in seat_lines[1], seat_lines[1]  # the duplicate codex, by index
+    assert "[reserve]" in seat_lines[1], seat_lines[1]  # the duplicate codex, by seat
     assert "[reserve]" in seat_lines[2]
 
 

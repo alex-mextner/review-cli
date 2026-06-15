@@ -14,6 +14,30 @@ from pathlib import Path
 from .backends import ReviewResult, backend_available, resolve_backend
 from .config import MODERATOR_CANDIDATES, BoardReviewer
 
+# A backend can report rc=0 with a NON-empty body that is actually an "unavailable"
+# notice rather than a real answer (e.g. the paywalled Fable returns rc=0 with
+# "Claude Fable 5 is currently unavailable. Learn more: …"). The cheap availability
+# probe (key/CLI present) cannot see that, so mid-run failover must treat such a body
+# as a failed seat and backfill it.
+#
+# HEURISTIC, intentionally CONSERVATIVE — a false positive is costly (it brands a real
+# verdict as failed, spends an extra reserve call, and can flip a clean `review --staged`
+# to a non-zero exit that blocks a commit). So the markers match only the SPECIFIC
+# "<model> is currently/temporarily unavailable" notice shape, NOT generic phrases a real
+# review uses ("`X` is not available before py3.11"). The check fires only when the WHOLE
+# body is short (a one-liner notice, see `_UNAVAILABLE_MAX_LEN`). These shapes may need
+# updating if a provider changes its unavailability wording.
+_UNAVAILABLE_MARKERS = (
+    "is currently unavailable",
+    "is temporarily unavailable",
+    "model is unavailable",
+    "currently not available",
+)
+# Only treat an "unavailable" marker as a sentinel when the whole body is short — a real
+# review is long and may legitimately mention availability; the sentinel notice is a
+# one-liner. 400 chars comfortably covers the notice + its "Learn more" URL.
+_UNAVAILABLE_MAX_LEN = 400
+
 # Optional per-call success/fail tally for the run-stats record. The CLI installs a
 # collector (`begin_call_tally`) before a run and reads it after, so every mode that
 # funnels its backend calls through `run_panel` / `run_single` / `run_moderator`
@@ -59,6 +83,28 @@ def _tally_result(returncode: int) -> None:
         if _call_tally is None or _suppress_autotally:
             return
         _call_tally["ok" if returncode == 0 else "fail"] += 1
+
+
+def result_is_usable(result: ReviewResult) -> bool:
+    """Did this reviewer produce a REAL verdict (vs a failed/empty/unavailable seat)?
+
+    Mid-run failover backfills a seat when this returns False. Three failure shapes:
+      * non-zero exit (backend error / timeout / internal crash);
+      * empty output (a silently-disabled model often returns rc=0 with nothing);
+      * an "unavailable" SENTINEL body — rc=0 with a short notice like "Claude Fable 5
+        is currently unavailable" instead of a review (the paywalled-but-keyed case the
+        cheap probe can't detect). Only a SHORT body is checked for the markers so a
+        genuine long review that mentions availability isn't misclassified."""
+    if result.returncode != 0:
+        return False
+    body = result.stdout.strip()
+    if not body:
+        return False
+    if len(body) <= _UNAVAILABLE_MAX_LEN:
+        low = body.lower()
+        if any(marker in low for marker in _UNAVAILABLE_MARKERS):
+            return False
+    return True
 
 
 def format_result(result: ReviewResult) -> str:
@@ -173,34 +219,137 @@ class PanelJob:
     round_no: int = 0
 
 
+def build_board_job(reviewer: BoardReviewer, base_prompt: str, diff: str) -> PanelJob:
+    """One role-lensed PanelJob for a reviewer (no availability check).
+
+    The prompt is `base_prompt + "\\n\\n" + role_lens` (the generic prompt alone when
+    the role is unknown / blank) and the label is `"<display> [<role>]"` so the result
+    block shows who reviewed with which lens."""
+    lens = reviewer.role_lens
+    prompt = f"{base_prompt}\n\n{lens}" if lens else base_prompt
+    role_tag = reviewer.role or "general"
+    return PanelJob(
+        model=reviewer.model, prompt=prompt, diff=diff,
+        label=f"{reviewer.display} [{role_tag}]",
+    )
+
+
 def build_board_jobs(
     board: list[BoardReviewer], base_prompt: str, diff: str,
 ) -> tuple[list[PanelJob], list[BoardReviewer]]:
     """Turn a reviewer board into PanelJobs, skipping unavailable reviewers.
 
-    Each reachable reviewer becomes one PanelJob whose prompt is
-    `base_prompt + "\\n\\n" + role_lens` (the generic prompt alone when the role is
-    unknown / blank) and whose label is `"<display> [<role>]"` so the result block
-    shows who reviewed with which lens. A reviewer whose backend isn't available
-    (no key / no CLI) is SKIPPED — `backend_available` is the same cheap probe the
-    moderator selection uses — and returned in the second tuple element so the
-    caller can log the degradation. The board never crashes on a dead backend; it
-    just shrinks. Returns ([] , skipped) when nothing is reachable; the caller
-    decides how to surface that."""
+    Each reachable reviewer becomes one PanelJob (see build_board_job). A reviewer
+    whose backend isn't available (no key / no CLI) is SKIPPED — `backend_available`
+    is the same cheap probe the moderator selection uses — and returned in the second
+    tuple element so the caller can log the degradation. The board never crashes on a
+    dead backend; it just shrinks. Returns ([], skipped) when nothing is reachable;
+    the caller decides how to surface that."""
     jobs: list[PanelJob] = []
     skipped: list[BoardReviewer] = []
     for reviewer in board:
         if not backend_available(reviewer.model):
             skipped.append(reviewer)
             continue
-        lens = reviewer.role_lens
-        prompt = f"{base_prompt}\n\n{lens}" if lens else base_prompt
-        role_tag = reviewer.role or "general"
-        jobs.append(PanelJob(
-            model=reviewer.model, prompt=prompt, diff=diff,
-            label=f"{reviewer.display} [{role_tag}]",
-        ))
+        jobs.append(build_board_job(reviewer, base_prompt, diff))
     return jobs, skipped
+
+
+@dataclass(frozen=True)
+class FailoverOutcome:
+    """The result of a failover board run.
+
+    `results` are the per-seat ReviewResults in run order (every seat that actually
+    ran — successes AND the failed seats that triggered a backfill, so the user sees
+    the whole story). `usable` is the subset that produced a real verdict (see
+    result_is_usable) — its length is the honest pool_size for run-stats. `degraded`
+    is True when fewer than `target` usable verdicts were produced (the reserve was
+    exhausted before the pool refilled)."""
+
+    results: list[ReviewResult]
+    usable: list[ReviewResult]
+    target: int
+    degraded: bool
+    # The BARE model ids (e.g. `zai:glm-5.2`, not the `"GLM [quality]"` label) of the
+    # seats that produced a usable verdict, in the order they completed. This is the
+    # honest run-stats pool: a backfilled reserve appears here under its real model id,
+    # so record_run keys the ETA/history on what actually ran, never a display label.
+    usable_models: list[str]
+
+
+def run_board_with_failover(
+    pool: list[BoardReviewer],
+    reserve: list[BoardReviewer],
+    base_prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+) -> FailoverOutcome:
+    """Run the priority `pool` and backfill failed seats from `reserve` (mid-run failover).
+
+    The pool runs in parallel (run_panel). Any seat whose result is NOT usable
+    (result_is_usable: non-zero exit, empty output, or an "unavailable" sentinel body)
+    is a failed seat; for each, the next-priority RESERVE reviewer is promoted and run,
+    repeating until `len(pool)` usable verdicts are collected or the reserve is exhausted
+    (then it degrades gracefully — `FailoverOutcome.degraded` is True). The target count
+    is the number of pool seats handed in (already sized to --pool and to availability by
+    the caller's startup failover).
+
+    Each LOGICAL seat is tallied exactly once against the run-stats (its FINAL outcome),
+    so the per-call ok/fail counts and pool_size reflect the models that actually produced
+    verdicts — not the failed attempts the failover replaced. Backfill rounds run
+    sequentially (one reserve promotion per failed seat per round); the common path (the
+    whole pool succeeds) costs a single parallel round."""
+    target = len(pool)
+    all_results: list[ReviewResult] = []
+    usable: list[ReviewResult] = []
+    usable_models: list[str] = []
+    reserve_queue = list(reserve)
+
+    # The failover loop owns the run-stats tally: suppress run_panel's per-call auto-tally
+    # so a failed-then-replaced seat isn't double-counted, and record exactly one outcome
+    # per logical seat below (its final usable/unusable verdict).
+    global _suppress_autotally
+    with _TALLY_LOCK:
+        prev_suppress = _suppress_autotally
+        _suppress_autotally = True
+    try:
+        current = list(pool)
+        while current:
+            jobs = [build_board_job(r, base_prompt, diff) for r in current]
+            round_results = run_panel(jobs, cwd, timeout)
+            # run_panel preserves job order, so each result lines up with its reviewer —
+            # zip recovers the BoardReviewer (and its bare model id) behind a labelled
+            # result. `strict=True` is a real guard (NOT a stripped-under-`-O` assert): if
+            # run_panel ever returned a short list, this raises instead of silently
+            # dropping a seat.
+            next_round: list[BoardReviewer] = []
+            for reviewer, result in zip(current, round_results, strict=True):
+                all_results.append(result)
+                if result_is_usable(result):
+                    usable.append(result)
+                    usable_models.append(reviewer.model)
+                    _tally_ok(True)
+                else:
+                    # This seat failed — count it as a fail and try to backfill it from
+                    # the next-priority reserve. The replacement runs in the NEXT round.
+                    _tally_ok(False)
+                    if reserve_queue:
+                        promoted = reserve_queue.pop(0)
+                        print(f"[review-cli] board: {result.model} failed — promoting "
+                              f"reserve {promoted.display} [{promoted.role or 'general'}] "
+                              f"({promoted.model})", file=sys.stderr, flush=True)
+                        next_round.append(promoted)
+            current = next_round
+    finally:
+        with _TALLY_LOCK:
+            _suppress_autotally = prev_suppress
+
+    degraded = len(usable) < target
+    return FailoverOutcome(
+        results=all_results, usable=usable, target=target, degraded=degraded,
+        usable_models=usable_models,
+    )
 
 
 def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResult]:

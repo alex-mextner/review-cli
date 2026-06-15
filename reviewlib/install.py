@@ -70,9 +70,9 @@ the internal ceiling, never raise it past 4h.
 
 ## Invocation
 ```
-review -C <repo>             # review current unstaged diff across the default board pool (4 seats)
+review -C <repo>             # review current unstaged diff across the failover pool (top 4 available)
 review -C <repo> --staged    # review the staged diff (pre-commit)
-review -C <repo> --pool 8    # run all 8 board seats (--pool 0 also = all); default pool is the first 4
+review -C <repo> --pool 8    # run all 8 available board seats (--pool 0 also = all); default pool is 4
 review -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); bypasses the board
 review -C <repo> --just-ask "Q"        # multi-model answer to a question (no diff needed)
 review -C <repo> --quorum "Q"          # experts answer + a moderator finds consensus/disagreement
@@ -80,15 +80,20 @@ review -C <repo> --brainstorm "TOPIC"  # iterative persona ideation in a loop, w
 review -C <repo> --brainstorm "TOPIC"  # …+ an uncommitted/--staged diff -> brainstorm ABOUT that change
 ```
 
-## Reviewer board + `--pool` (default review)
-A plain `review` runs the built-in **reviewer board** — a panel where each model gets
-its own role/lens (architecture, correctness, consistency, performance, quality,
-security, tests, contracts). The board is an **8-seat panel**, but by default only the
-**first 4 seats** run (the **default pool**); the other 4 are a **reserve**. Size it
-with `--pool N` (run the first N seats); `--pool 8` or `--pool 0` runs all eight. The
-board is **never disabled** — `--pool` only sizes it, and there is **no `--no-board`
-flag**. An explicit `-m` (or a `models:` list in config.yaml) bypasses the board and
-runs exactly those models. `review --show-board` lists the seats with their pool/reserve
+## Reviewer board + `--pool` (priority-ordered failover pool)
+A plain `review` runs the built-in **reviewer board** — a **priority-ordered** panel of 8
+models (strongest first) where each model also gets its own role/lens (architecture,
+correctness, consistency, performance, quality, security, tests, contracts). The active
+**pool is 4**, chosen by **priority + availability** with two failovers so the run keeps
+4 working reviewers: **startup failover** picks the top 4 AVAILABLE seats by priority (a
+higher-priority but unavailable seat is skipped, the next pulled up); **mid-run failover**
+replaces a seat that fails DURING the run (backend error, timeout, empty output, or an
+"unavailable" reply such as a paywalled model) with the next-priority **reserve**, until 4
+working verdicts are produced or the reserve is exhausted (then it degrades and says so).
+`--pool N` sizes the pool (top-N available, same failover); `--pool 0`/`--pool 8` runs all
+available. The board is **never disabled** — there is **no `--no-board` flag**. An explicit
+`-m` (or a `models:` list in config.yaml) bypasses the board and runs exactly those models.
+`review --show-board` lists the seats in priority order with their pool/reserve/unavail
 tier and availability.
 
 ## `--brainstorm` can take a diff

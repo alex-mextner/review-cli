@@ -5,17 +5,39 @@ semantic versioning.
 
 ## Unreleased
 
-- **Board redesign (`--pool`, no `--no-board`, brainstorm + diff)** — the built-in
-  reviewer board is now an **8-seat panel kept as a reserve**: a plain `review` runs
-  only the **first 4 seats** by default (the default **pool**). New `--pool N` flag
-  sizes how many of the board's seats run (default 4; first N seats; `--pool 0`/`--pool 8`
-  runs all eight). The board can **never be disabled** — the `--no-board` flag is
-  **removed** (an explicit `-m` or a config `models:` list still bypasses the board).
-  `--show-board` now marks each seat `pool`/`reserve`. **`--brainstorm` can now take a
-  diff into account:** when there is an uncommitted working-tree diff under `-C`, a
-  `--staged` diff, or a piped diff, every persona (and the moderator) sees it as
-  grounding context so you can brainstorm ABOUT a specific change; with no diff it stays
-  pure ideation.
+- **Priority-ordered failover reviewer pool** — the reviewer board is now a
+  **priority-ordered** list of 8 models (strongest first), and a plain `review` runs a
+  **pool of 4** chosen by **priority + availability** with two layers of failover so the
+  run keeps **4 working reviewers**:
+  - **Startup failover** — the active pool is the **top 4 AVAILABLE** seats by priority;
+    a higher-priority but unavailable seat (no key / not on PATH) is skipped and the
+    next-priority one is pulled up, so you still start with 4 working models.
+  - **Mid-run failover** — a seat that fails **during** the review (backend error,
+    timeout, empty output, or an "unavailable" reply like a paywalled model returning
+    *"… is currently unavailable"*) is replaced by the next-priority **reserve**,
+    repeating until 4 working verdicts are produced or the reserve is exhausted (then the
+    run degrades gracefully, logs it, and exits non-zero).
+
+  Each seat keeps its own role/lens (priority decides *who* sits; the role decides the
+  *lens*) — a promoted reserve brings its own lens. `--pool N` overrides the default 4
+  (top-N available, same failover); `--pool 0` runs all available. `--show-board` now
+  lists the board in priority order (with a `#` rank), tags each seat `pool`/`reserve`/
+  `unavail`, and shows the live pool. Run-stats `pool_size` reflects the models that
+  actually produced verdicts (a backfilled reserve under its real model id), not the
+  planned ones. Re-rank by reordering `DEFAULT_BOARD` (or a config `board:` list). The
+  default priority order is Fable 5, Opus 4.8, GPT-5.5, Kimi K2.7, GLM-5.2, Qwen3.7-Max,
+  DeepSeek-V4-Pro, Gemini. The board can **never be disabled** (an explicit `-m` or a
+  config `models:` list still bypasses it; the `--no-board` flag stays removed).
+
+  **Migration note for existing `config.yaml` `board:` lists:** the ORDER of your
+  `board:` entries is now interpreted as **priority** (first = highest), since that order
+  drives both the startup pool and the failover backfill. A board you previously ordered
+  by role (or arbitrarily) will still work, but to get the failover you want, reorder it
+  by model strength. `review --show-board` shows the resulting priority + pool/reserve.
+- **`--brainstorm` can take a diff into account** — when there is an uncommitted
+  working-tree diff under `-C`, a `--staged` diff, or a piped diff, every persona (and
+  the moderator) sees it as grounding context so you can brainstorm ABOUT a specific
+  change; with no diff it stays pure ideation.
 - **Local web dashboard (`review dashboard`)** — serves logs, per-model stats,
   timeout/error metrics, and a moderator/overseer view over the sidecar `.log`
   files. Every REST backend now emits the same sidecar logs as the subprocess

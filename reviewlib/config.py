@@ -8,6 +8,7 @@ DEFAULT_MODELS panel is untouched.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -145,54 +146,113 @@ class BoardReviewer:
         return REVIEW_ROLES.get(self.role, "")
 
 
-# DEFAULT_BOARD: the out-of-the-box 8-seat panel, so the board works WITHOUT a
-# config file. Model ids are byte-exact against the provider catalogs (commandcode
-# gateway /models, z.ai Coding-Plan) — do not alter the strings. Reviewers whose
-# backend isn't available (no key / no CLI) are skipped at run time by the caller,
-# not here.
+# DEFAULT_BOARD: the out-of-the-box 8-seat board, so the board works WITHOUT a config
+# file. The board is ordered by *priority* — strongest model first, weakest last — NOT
+# by role. Priority drives the FAILOVER pool: a plain `review` runs the top-N AVAILABLE
+# seats (default 4), skipping a higher-priority seat whose backend isn't reachable and
+# promoting the next-priority reserve to keep a full pool (startup failover); a seat that
+# fails *during* the run is likewise replaced by the next reserve (mid-run failover). See
+# select_pool() / panel.run_board_with_failover().
 #
-# The `tests` seat goes DIRECT to z.ai (`zai:glm-5.2`, the newest GLM reachable on
-# the Coding-Plan endpoint) via the z.ai backend / the user's GLM subscription —
-# not through the commandcode gateway. The `contracts` seat is gpt-5.5 via
-# commandcode, focused on public API shape / backward-compat.
+# Each seat still carries its OWN role/lens — the lens is what makes a multi-model panel
+# cover the diff broadly instead of N duplicate passes. Priority decides WHO sits; the
+# role decides WITH WHAT LENS they review. So the lens travels with the seat: when a
+# higher-priority seat is skipped/replaced, the promoted reserve brings its own lens.
 #
-# OPTIONAL HEAVYWEIGHTS (NOT enabled by default — the board stays at 8): add them
-# to a config.yaml `board:` list if you want a 1M-context resilience / holistic pass:
+# To RE-RANK the board, just reorder this tuple (top = highest priority). Model ids are
+# byte-exact against the provider catalogs (commandcode gateway /models, z.ai Coding-Plan)
+# — do not alter the strings. Each is the TOP available version of its model family
+# (fable-5, opus-4-8, gpt-5.5, Kimi-K2.7, glm-5.2, Qwen3.7-Max, deepseek-v4-pro).
+#
+# The `tests` seat goes DIRECT to z.ai (`zai:glm-5.2`, the newest GLM reachable on the
+# Coding-Plan endpoint) via the user's GLM subscription — not the commandcode gateway.
+#
+# OPTIONAL HEAVYWEIGHTS (NOT in the default board): add them to a config.yaml `board:`
+# list if you want a 1M-context resilience / holistic pass:
 #   - { model: "commandcode:MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx
 #   - { model: "commandcode:nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx
-# (any role works; see REVIEW_ROLES — e.g. resilience-flavored via `architect`/`consistency`.)
 DEFAULT_BOARD = (
-    BoardReviewer("claude:claude-opus-4-8", "architect", "Opus"),
-    BoardReviewer("codex", "correctness", "Codex"),
-    BoardReviewer("gemini", "consistency", "Gemini"),
-    BoardReviewer("commandcode:deepseek/deepseek-v4-pro", "performance", "DeepSeek"),
-    BoardReviewer("commandcode:moonshotai/Kimi-K2.7-Code", "quality", "Kimi"),
+    # priority 1 — Fable 5 (Anthropic flagship). Currently paywalled/"unavailable", so
+    # the failover skips it at startup (the cheap probe can't see the paywall, but its
+    # run-time "currently unavailable" body is treated as a failure and backfilled).
+    BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+    # priority 2 — Opus 4.8. Also the moderator (MODERATOR_CANDIDATES[0]).
+    BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
+    # priority 3 — GPT-5.5 via commandcode.
+    BoardReviewer("commandcode:gpt-5.5", "consistency", "GPT-5.5"),
+    # priority 4 — Kimi K2.7 via commandcode.
+    BoardReviewer("commandcode:moonshotai/Kimi-K2.7-Code", "performance", "Kimi"),
+    # priority 5 — GLM-5.2 DIRECT to z.ai (his GLM subscription), the newest GLM.
+    BoardReviewer("zai:glm-5.2", "quality", "GLM"),
+    # priority 6 — Qwen3.7-Max via commandcode.
     BoardReviewer("commandcode:Qwen/Qwen3.7-Max", "security", "Qwen"),
-    BoardReviewer("zai:glm-5.2", "tests", "GLM"),
-    BoardReviewer("commandcode:gpt-5.5", "contracts", "GPT-5.5"),
+    # priority 7 — DeepSeek-V4-Pro via commandcode.
+    BoardReviewer("commandcode:deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
+    # priority 8 — Gemini.
+    BoardReviewer("gemini", "contracts", "Gemini"),
 )
 
 
 # DEFAULT_POOL_SIZE: how many of the board's seats a plain `review` runs by default.
-# The board (DEFAULT_BOARD or a config `board:`) is an 8-seat panel kept as a RESERVE;
-# by default only the FIRST 4 seats participate (architect/correctness/consistency/
-# performance on the default board), and the remaining seats are the reserve you opt
-# into with `--pool N` (or `--pool 0` for all of them). The board is NEVER disabled —
-# `--pool` only sizes how many seats run. See select_pool().
+# The board (DEFAULT_BOARD or a config `board:`) is a priority-ordered list; by default
+# the top 4 AVAILABLE seats participate and the remaining (lower-priority) seats are the
+# RESERVE that backfills a skipped/failed seat. The board is NEVER disabled — `--pool`
+# only sizes how many seats run. See select_pool() / panel.run_board_with_failover().
 DEFAULT_POOL_SIZE = 4
 
 
-def select_pool(board: list[BoardReviewer], pool: int) -> list[BoardReviewer]:
-    """Pick the first `pool` seats of the board; the rest are the reserve.
+def _always_available(_reviewer: BoardReviewer) -> bool:
+    """Default availability predicate: every seat counts as available (the legacy
+    'no failover here, availability is checked downstream' behaviour)."""
+    return True
 
-    The board is always on — this only sizes how many of its seats participate in a
-    run. The selection is deterministic (the FIRST `pool` seats, in board order) so
-    the reserve is simply the remainder. `pool <= 0` means "all seats" (the full
-    reserve), and a `pool` larger than the board is clamped to the whole board — a
-    caller can never ask for more seats than exist. An empty board stays empty."""
-    if pool <= 0 or pool >= len(board):
-        return list(board)
-    return list(board[:pool])
+
+def _effective_pool_size(seat_count: int, pool: int) -> int:
+    """How many seats a `--pool N` request actually selects from `seat_count` available
+    seats: `pool <= 0` means ALL, a `pool` larger than the count is clamped to the count,
+    otherwise exactly `pool`. The single source of truth for select_pool +
+    split_pool_reserve so the two can never drift."""
+    if pool <= 0 or pool >= seat_count:
+        return seat_count
+    return pool
+
+
+def select_pool(
+    board: list[BoardReviewer],
+    pool: int,
+    available: Callable[[BoardReviewer], bool] = _always_available,
+) -> list[BoardReviewer]:
+    """Pick the top `pool` AVAILABLE seats by priority; the rest are the reserve.
+
+    The board is EXPECTED to be priority-ordered (strongest first) — that order IS the
+    priority. Startup failover: a higher-priority seat whose backend is NOT reachable
+    (per `available`) is SKIPPED and the next-priority seat pulled up, so the run still
+    starts with `pool` WORKING seats when enough reachable seats exist. The default
+    `available` treats every seat as reachable, so callers that check availability
+    downstream get "the first `pool` seats in priority order".
+
+    The selection is deterministic. `pool <= 0` means "all (available) seats", and a
+    `pool` larger than the available count is clamped — a caller can never ask for more
+    seats than exist. An empty board stays empty. Returns a NEW list, never a view."""
+    seats = [r for r in board if available(r)]
+    return list(seats[: _effective_pool_size(len(seats), pool)])
+
+
+def split_pool_reserve(
+    board: list[BoardReviewer],
+    pool: int,
+    available: Callable[[BoardReviewer], bool] = _always_available,
+) -> tuple[list[BoardReviewer], list[BoardReviewer]]:
+    """Split the AVAILABLE board into (pool, reserve) by priority, for failover.
+
+    `pool` = the top-N available seats (startup failover — same slice select_pool makes).
+    `reserve` = the remaining available seats, in priority order, which back-fill a pool
+    seat that fails mid-run. Unavailable seats are in NEITHER list (they can't run). The
+    two lists are disjoint and together hold every available seat, in priority order. The
+    `board` is EXPECTED to be priority-ordered (its order is the priority)."""
+    seats = [r for r in board if available(r)]
+    n = _effective_pool_size(len(seats), pool)
+    return list(seats[:n]), list(seats[n:])
 
 
 def _display_name(model: str) -> str:
