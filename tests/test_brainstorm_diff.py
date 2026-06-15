@@ -181,6 +181,7 @@ def _capture_cli_brainstorm_diff(argv: list[str], *, stdin_text: str | None,
     import os
 
     from reviewlib import cli
+    from reviewlib.modes import brainstorm as brainstorm_mod
 
     captured: dict = {"git_called": False}
 
@@ -192,11 +193,14 @@ def _capture_cli_brainstorm_diff(argv: list[str], *, stdin_text: str | None,
         captured["git_called"] = True
         return git_diff(cwd, staged)
 
-    old_mb = cli.mode_brainstorm
+    # The mode handler calls the module-level mode_brainstorm, so patch it WHERE IT IS
+    # DEFINED (the subcommand redesign dispatches through modes/registry, not a
+    # cli.mode_brainstorm attribute).
+    old_mb = brainstorm_mod.mode_brainstorm
     old_git = cli._git_diff
     old_load_config = cli.load_config
     old_env = os.environ.get("GEMINI_ENV_FILE")
-    cli.mode_brainstorm = _fake_brainstorm
+    brainstorm_mod.mode_brainstorm = _fake_brainstorm
     cli._git_diff = _wrapped_git_diff
     cli.load_config = lambda: {}  # no config models, deterministic
     old_stdin = sys.stdin
@@ -212,7 +216,7 @@ def _capture_cli_brainstorm_diff(argv: list[str], *, stdin_text: str | None,
             sys.stdin = io.StringIO(stdin_text)  # StringIO.isatty() -> False (a pipe)
         cli.main(argv)
     finally:
-        cli.mode_brainstorm = old_mb
+        brainstorm_mod.mode_brainstorm = old_mb
         cli._git_diff = old_git
         cli.load_config = old_load_config
         sys.stdin = old_stdin
@@ -236,7 +240,7 @@ def test_cli_brainstorm_picks_up_working_tree_diff():
     """--brainstorm (no pipe) feeds the working-tree diff into mode_brainstorm — the
     happy path (GLM finding 3), proven via a sentinel _git_diff, not tree dirtiness."""
     cap = _capture_cli_brainstorm_diff(
-        ["--brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text=None, git_diff=_git_ok,
+        ["brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text=None, git_diff=_git_ok,
     )
     assert cap["git_called"] is True
     assert cap["diff"] == _git_ok(None, None), repr(cap["diff"])
@@ -251,7 +255,7 @@ def test_cli_brainstorm_staged_picks_up_staged_diff():
         return "diff --git a/s b/s\n@@\n+staged\n"
 
     cap = _capture_cli_brainstorm_diff(
-        ["--brainstorm", "topic", "--staged", "-C", str(REPO_ROOT)], stdin_text=None, git_diff=_git,
+        ["brainstorm", "topic", "--staged", "-C", str(REPO_ROOT)], stdin_text=None, git_diff=_git,
     )
     assert seen["staged"] is True, "staged flag not forwarded to git diff"
     assert cap["diff"] == "diff --git a/s b/s\n@@\n+staged\n", repr(cap["diff"])
@@ -261,7 +265,7 @@ def test_cli_brainstorm_staged_nonrepo_degrades_to_ideation():
     """--staged --brainstorm against a NON-repo (git diff raises) must degrade to pure
     ideation (diff == ""), NOT raise — the docs promise graceful degradation (codex P2)."""
     cap = _capture_cli_brainstorm_diff(
-        ["--staged", "--brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text=None, git_diff=_git_raises,
+        ["brainstorm", "topic", "--staged", "-C", str(REPO_ROOT)], stdin_text=None, git_diff=_git_raises,
     )
     assert cap["git_called"] is True
     assert cap["diff"] == "", repr(cap["diff"])
@@ -271,7 +275,7 @@ def test_cli_brainstorm_nonempty_pipe_takes_precedence_over_worktree():
     """A non-empty piped diff is used as-is and git diff is NOT consulted (precedence)."""
     piped = "diff --git a/z b/z\n@@\n+zzz\n"
     cap = _capture_cli_brainstorm_diff(
-        ["--brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text=piped, git_diff=_git_ok,
+        ["brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text=piped, git_diff=_git_ok,
     )
     assert cap["git_called"] is False, "non-empty pipe must win without probing the tree"
     assert cap["diff"] == piped, repr(cap["diff"])
@@ -284,7 +288,7 @@ def test_cli_brainstorm_empty_pipe_falls_back_to_worktree():
     grounding). The 2nd-pass board review (codex) flagged the opposite gating as a
     regression for non-interactive runners; this pins the chosen behaviour."""
     cap = _capture_cli_brainstorm_diff(
-        ["--brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text="", git_diff=_git_ok,
+        ["brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text="", git_diff=_git_ok,
     )
     assert cap["git_called"] is True, "empty pipe must fall back to the working-tree diff"
     assert cap["diff"] == _git_ok(None, None), repr(cap["diff"])
@@ -298,14 +302,15 @@ def test_cli_default_review_staged_nonrepo_still_hard_fails():
     import os
 
     from reviewlib import cli
+    from reviewlib.modes import review as review_mod
 
     old_git = cli._git_diff
     old_load_config = cli.load_config
-    old_mr = cli.mode_review
+    old_mr = review_mod.mode_review
     old_env = os.environ.get("GEMINI_ENV_FILE")
     cli._git_diff = _git_raises
     cli.load_config = lambda: {}
-    cli.mode_review = lambda *_a, **_k: 0  # must never be reached
+    review_mod.mode_review = lambda *_a, **_k: 0  # must never be reached
     old_stdin = sys.stdin
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -324,7 +329,7 @@ def test_cli_default_review_staged_nonrepo_still_hard_fails():
     finally:
         cli._git_diff = old_git
         cli.load_config = old_load_config
-        cli.mode_review = old_mr
+        review_mod.mode_review = old_mr
         sys.stdin = old_stdin
         if old_env is None:
             os.environ.pop("GEMINI_ENV_FILE", None)

@@ -1,11 +1,15 @@
-"""--brainstorm: multi-round persona ideation with a moderator.
+"""brainstorm: multi-round persona ideation with a moderator.
 
-Extracted verbatim from the original single-file `bin/review` (Stage 0
-decomposition — zero behaviour change). PERSONAS lives here because it is only
+`review brainstorm "<topic>"` — iterative persona ideation in a loop. Composable with
+`--diff`/`--staged` (or a piped diff) so the personas can brainstorm ABOUT a specific
+change as optional grounding. Originally the `--brainstorm` flag (Stage 0
+decomposition); now a first-class SUBCOMMAND backed by the `MODE` descriptor at the
+bottom of this file (see `modes/contract.py`). PERSONAS lives here because it is only
 used by this mode.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from datetime import datetime, timezone
@@ -13,6 +17,7 @@ from pathlib import Path
 
 from ..panel import PanelJob, format_result, run_moderator, run_panel
 from ..process import log_dir
+from .contract import ModeContext, ModeSpec
 
 # Distinct expert personas for brainstorm rotation (pool >= 5). Each round assigns
 # >= 3 of these, rotating so backends see a fresh role each round.
@@ -191,3 +196,54 @@ def mode_brainstorm(
     if disc is not None:
         print(f"[review-cli] full discussion log: {disc_path}", file=sys.stderr, flush=True)
     return 0 if synth is not None and synth.returncode == 0 else 1
+
+
+def brainstorm_pool(models: list[str]) -> list[str]:
+    """The per-round persona-slot pool for a given panel — the GROUND-TRUTH dispatch
+    size that keys the run-stats ETA (NOT len(models)).
+
+    `mode_brainstorm` fills `max(3, len(panel))` persona slots per round, repeating
+    models (`panel[slot % len(panel)]`) when the panel has < 3 backends. So a 1-2 model
+    brainstorm still dispatches 3 slots; recording the raw models list would undercount
+    a small panel and mis-key its history (codex P2). This mirrors that exact slot
+    assignment so the recorded `pool_size`/`models` match what really runs. An empty
+    panel returns [] (there is nothing to dispatch)."""
+    if not models:
+        return models
+    slot_count = max(3, len(models))
+    return [models[slot % len(models)] for slot in range(slot_count)]
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("topic", help="the open design topic to brainstorm")
+    # Brainstorm-only: how many rounds the loop runs (min and hard cap). Added here (not
+    # in the CLI's shared options) so they appear ONLY on `review brainstorm --help` and
+    # `review just-ask --rounds 5` errors instead of silently parsing.
+    parser.add_argument("--rounds", type=int, default=5, help="minimum rounds before STOP is allowed (min & default 5)")
+    parser.add_argument("--max-rounds", type=int, default=8, help="hard cap on rounds (default 8)")
+
+
+def _handler(ctx: ModeContext) -> int:
+    return mode_brainstorm(
+        ctx.with_visual(ctx.args.topic), ctx.models, ctx.cwd, ctx.timeout,
+        ctx.moderators, ctx.args.rounds, ctx.args.max_rounds,
+        # When there IS a diff (working-tree, --staged/--diff, or piped) the personas
+        # see it as grounding context so they brainstorm ABOUT a specific change. No
+        # diff -> pure ideation, exactly as before.
+        diff=ctx.diff,
+    )
+
+
+# Brainstorm keys its run-stats ETA on the per-round persona-SLOT count (brainstorm_pool),
+# not on len(models) — so the descriptor advertises that override and the CLI uses it.
+MODE = ModeSpec(
+    name="brainstorm",
+    subcommand="brainstorm",
+    diff_policy="optional",
+    stats_mode="brainstorm",
+    summary="multi-round persona ideation (composable with --diff/--staged grounding)",
+    handler=_handler,
+    add_arguments=_add_arguments,
+    announce_logs=True,
+)
+

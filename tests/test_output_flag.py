@@ -80,26 +80,27 @@ def test_extract_stops_at_double_dash():
 
 
 def test_extract_double_dash_with_no_output_flag():
-    out, rest = _extract_output_path(["--just-ask", "--", "-o-topic"])
+    out, rest = _extract_output_path(["--prompt", "--", "-o-topic"])
     assert out is None, out
-    assert rest == ["--just-ask", "--", "-o-topic"], rest
+    assert rest == ["--prompt", "--", "-o-topic"], rest
 
 
 def test_extract_does_not_steal_value_of_value_taking_flag():
-    # `review --just-ask --output FILE` — here `--output` is the QUESTION (just-ask's
-    # value), NOT the output flag. The pre-scan must NOT intercept it, or argparse would
-    # then error "--just-ask: expected one argument".
-    out, rest = _extract_output_path(["--just-ask", "--output", "FILE.md"])
+    # `review review --prompt --output` — here `--output` is the PROMPT value (a
+    # value-taking option's argument), NOT the output flag. The pre-scan must NOT
+    # intercept it, or argparse would then error "--prompt: expected one argument".
+    # (The mode flags moved to subcommands, so --prompt is the canonical value-taker now.)
+    out, rest = _extract_output_path(["--prompt", "--output", "FILE.md"])
     assert out is None, out
-    assert rest == ["--just-ask", "--output", "FILE.md"], rest
-    # Same for --prompt consuming a value that looks like the glued short form.
-    out, rest = _extract_output_path(["--prompt", "-otext"])
+    assert rest == ["--prompt", "--output", "FILE.md"], rest
+    # Same for --moderator consuming a value that looks like the glued short form.
+    out, rest = _extract_output_path(["--moderator", "-otext"])
     assert out is None, out
-    assert rest == ["--prompt", "-otext"], rest
+    assert rest == ["--moderator", "-otext"], rest
     # But a REAL -o after the value-taking option's value still works.
-    out, rest = _extract_output_path(["--just-ask", "Q", "-o", "real.md"])
+    out, rest = _extract_output_path(["--prompt", "Q", "-o", "real.md"])
     assert out == Path("real.md"), out
-    assert rest == ["--just-ask", "Q"], rest
+    assert rest == ["--prompt", "Q"], rest
 
 
 def test_extract_absent_returns_none_and_unchanged():
@@ -317,14 +318,21 @@ def test_value_taking_opts_are_all_value_taking():
 
     # Each listed opt errors "expected one argument" when given no value. We pass a
     # leading no-op value-taking flag with a value so the parser reaches the bare opt
-    # without triggering a real review (it errors during parse).
+    # without triggering a real review (it errors during parse). Brainstorm-only flags
+    # (--rounds/--max-rounds) live ONLY on the `brainstorm` subcommand parser now, so
+    # route them through that subcommand (with a topic) to reach a parser that has them.
+    brainstorm_only = {"--rounds", "--max-rounds"}
     for opt in sorted(_VALUE_TAKING_OPTS):
         if opt in ("-o", "--output"):
             continue  # handled by the pre-scan, covered by other tests
+        argv = (
+            ["brainstorm", "topic", opt] if opt in brainstorm_only
+            else ["--prompt", "p", opt]  # bare opt at the end -> needs a value
+        )
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             try:
-                main(["--prompt", "p", opt])  # bare opt at the end -> needs a value
+                main(argv)
             except SystemExit:
                 pass
         msg = err.getvalue()

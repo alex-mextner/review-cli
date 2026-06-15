@@ -7,6 +7,10 @@ and prints them side by side. Four modes let you go from a quick pre-commit sani
 all the way to a structured expert panel that builds consensus or explores a design space.
 Built for use from any shell or AI agent harness (Claude Code, Codex, opencode).
 
+Beyond the diff modes it also does **visual review** — attach a rendered screenshot to
+any review with the composable `--visual` flag for a keep / rollback / repair verdict — and
+ships **interactive spec-review tooling** so a markdown spec can be reviewed like a PR.
+
 ---
 
 ## Install
@@ -32,8 +36,12 @@ know `review` exists and can call it. The one-liner above runs this automaticall
 
 ## Quick start
 
+Modes are **subcommands**: `review <mode> …`. The first verb selects the mode; a bare
+`review …` (no subcommand) defaults to the `review` diff-review, so the most common
+invocation is unchanged.
+
 ```bash
-# Review unstaged diff with your default backends
+# Review unstaged diff with your default backends (bare `review` == `review review`)
 review
 
 # Review staged changes
@@ -43,17 +51,27 @@ review --staged
 review -m codex -m fable5 -m gemini
 
 # Ask all backends a quick question (no diff needed)
-review --just-ask "Is a single-file Python CLI the right idiom for this tool?"
+review just-ask "Is a single-file Python CLI the right idiom for this tool?"
 
 # Settle a contested decision with cited evidence
-review --quorum "Should we cap brainstorm at 8 rounds?"
+review quorum "Should we cap brainstorm at 8 rounds?"
 
 # Open-ended design exploration
-review --brainstorm "How should we design the plugin system?"
+review brainstorm "How should we design the plugin system?"
+
+# Brainstorm ABOUT the current change (grounded in the working-tree / staged diff)
+review brainstorm "Alternatives before I commit?" --diff
+review brainstorm "Risks in this design?" --staged
 
 # Save the result to a file — use -o, NOT `> file` (zsh noclobber-safe)
 review -o review.md
 ```
+
+> **Modes moved from flags to subcommands.** The old `--brainstorm` / `--quorum` /
+> `--just-ask` flags are gone — use the `brainstorm` / `quorum` / `just-ask`
+> subcommands. The flags now print a one-line pointer and exit non-zero. A bare
+> `review …` (and an explicit `review review …`) still runs the diff review exactly as
+> before. `--visual` stays a **composable flag** (not a mode): it rides any subcommand.
 
 > **Write to a file with `-o file.md`, not `review … > file.md`.** Under zsh
 > `noclobber` (a common default), `> file.md` refuses to overwrite an existing file
@@ -70,11 +88,14 @@ review -o review.md
 ![review mode](docs/mode-review.svg)
 
 N backends review your diff in parallel — one pass, no moderator. Best for pre-commit
-checks where you want fast, independent perspectives without ceremony.
+checks where you want fast, independent perspectives without ceremony. `review` (a bare
+invocation) and the explicit `review review` are the same diff-review path; **a diff is
+required** (the default).
 
 ```bash
 review
 review --staged
+review review --staged          # explicit subcommand form (identical)
 git show --format= --no-ext-diff HEAD | review -m gemini,codex
 ```
 
@@ -89,8 +110,8 @@ one in or add `--staged` to attach it as context. One pass, no moderator, result
 printed side by side.
 
 ```bash
-review --just-ask "Does this change need a migration?"
-git diff | review --just-ask "Is this safe to merge?"
+review just-ask "Does this change need a migration?"
+git diff | review just-ask "Is this safe to merge?"
 ```
 
 ---
@@ -118,7 +139,7 @@ after Ns]` marker and exit 124) rather than being thrown away.
 
 **Run stats & a startup ETA — never short-timeout `review`.** `review` is
 multi-model and (for the panel modes) multi-round, so it takes **minutes**, and a
-short shell `timeout` around it kills the run before its synthesis — a `--brainstorm`
+short shell `timeout` around it kills the run before its synthesis — a `brainstorm`
 only emits its final answer at the very end, so a short cap yields *nothing* usable.
 To make the expected duration visible up front, every run that actually dispatches a
 backend appends a structured stat record — mode, pool size (backends actually
@@ -148,9 +169,9 @@ finishes in minutes, far under the ceiling) and a stuck run can't run forever ei
 `$REVIEW_BACKSTOP_SECONDS` can only **lower** that ceiling, never raise it past 4h.
 
 ```bash
-review --quorum "Should we cap brainstorm at 8 rounds?"
-git diff | review --quorum "Is this diff safe to merge?" -m codex,gemini,fable5
-review --quorum "Should we switch to a plugin architecture?" --moderator gemini
+review quorum "Should we cap brainstorm at 8 rounds?"
+git diff | review quorum "Is this diff safe to merge?" -m codex,gemini,fable5
+review quorum "Should we switch to a plugin architecture?" --moderator gemini
 ```
 
 ---
@@ -170,18 +191,19 @@ concrete recommendation.
 Use for genuinely open design questions where you want the discussion to build across
 rounds rather than converge in one shot.
 
-**Brainstorm about a specific change (`--brainstorm` + a diff).** When there IS a diff
-— an uncommitted working-tree diff in `-C`, a `--staged` diff, or a piped diff — every
-persona (and the moderator) sees it as constant **grounding context**, so you can
-brainstorm concretely ABOUT a change instead of in the abstract. With **no** diff
-present it stays pure ideation, exactly as before. The diff is optional: an absent diff
-or a non-repo `-C` degrades silently to ideation.
+**Brainstorm about a specific change (`brainstorm` + a diff).** brainstorm is composable
+with the diff. When there IS a diff — an uncommitted working-tree diff in `-C` (pass
+`--diff`), a `--staged` diff, or a piped diff — every persona (and the moderator) sees it
+as constant **grounding context**, so you can brainstorm concretely ABOUT a change
+instead of in the abstract. With **no** diff present it stays pure ideation, exactly as
+before. The diff is optional: an absent diff or a non-repo `-C` degrades silently to
+ideation.
 
 ```bash
 # brainstorm grounded in the current uncommitted working-tree diff
-review -C <repo> --brainstorm "Is this caching approach sound? What are the risks?"
-review -C <repo> --staged --brainstorm "Alternatives to this design before I commit?"
-git diff main... | review -C <repo> --brainstorm "How else could we structure this?"
+review -C <repo> brainstorm "Is this caching approach sound? What are the risks?" --diff
+review -C <repo> brainstorm "Alternatives to this design before I commit?" --staged
+git diff main... | review -C <repo> brainstorm "How else could we structure this?"
 ```
 
 The whole conversation is also written **incrementally** to a single discussion log
@@ -198,8 +220,8 @@ transcript (~1 MB+) can still hit `ARG_MAX` on those paths. `_payload` prints a 
 WARNING as it approaches the limit; keep `--max-rounds` and diffs reasonable.
 
 ```bash
-review --brainstorm "How should we design the plugin system?"
-review --brainstorm "API shape for the cache layer" \
+review brainstorm "How should we design the plugin system?"
+review brainstorm "API shape for the cache layer" \
   --rounds 5 --max-rounds 10 \
   -m codex,gemini --moderator gemini
 ```
@@ -208,12 +230,12 @@ review --brainstorm "API shape for the cache layer" \
 
 ### When to use which
 
-| Mode | Reach for it when... |
-|------|----------------------|
-| `review` | Pre-commit diff check — fast, parallel, no overhead |
-| `--just-ask` | Quick multi-model second opinion on any question |
-| `--quorum` | A contested decision that needs cited evidence to settle |
-| `--brainstorm` | An open design space you want to explore across multiple rounds (optionally grounded in a diff — pass `--staged` or have an uncommitted diff to brainstorm about a specific change) |
+| Subcommand | Reach for it when... |
+|------------|----------------------|
+| `review` (default) | Pre-commit diff check — fast, parallel, no overhead |
+| `just-ask` | Quick multi-model second opinion on any question |
+| `quorum` | A contested decision that needs cited evidence to settle |
+| `brainstorm` | An open design space you want to explore across multiple rounds (optionally grounded in a diff — pass `--diff` / `--staged` or have an uncommitted diff to brainstorm about a specific change) |
 
 ---
 
@@ -284,22 +306,23 @@ name "styleprobe" in older copies — it is the `review --visual` detector.)*
 
 ### Composable flag, not a mode
 
-`--visual` is **orthogonal** to the four review modes — it combines with `--brainstorm`,
-`--quorum`, or the default diff-review (the personas / voters / reviewer literally **see** the
-image as multimodal context), or runs standalone:
+`--visual` is **orthogonal** to the four review modes — it is a **composable flag** on
+any subcommand (`brainstorm` / `quorum` / `just-ask` / `review`), so the personas /
+voters / reviewer literally **see** the image as multimodal context, or it runs
+standalone:
 
 ```bash
 # Standalone — pure verdict pipeline on one render
 review --visual after.png
 
 # The brainstorm personas see the screenshot and reason about it
-review --brainstorm "is this layout good?" --visual after.png
+review brainstorm "is this layout good?" --visual after.png
 
 # Every quorum voter gets the image as shared context
-review --quorum "ship this UI?" --visual after.png
+review quorum "ship this UI?" --visual after.png
 
 # Default diff-review with the rendered result attached as evidence
-review --visual after.png        # (with a diff present)
+review --visual after.png        # (bare `review` with a diff present)
 ```
 
 When a companion mode is present the image and the active modules' visual questions are folded
@@ -457,7 +480,7 @@ Routes: `GET /` (SPA shell), `GET /static/<app.css|app.js>`, `GET /asset/<name>`
 
 `review` earns its keep when an agent hits a hard call:
 
-1. The agent runs `review --brainstorm "<the decision>"` — many models in rotating
+1. The agent runs `review brainstorm "<the decision>"` — many models in rotating
    expert roles, looping across several rounds — to surface candidate approaches a
    single model wouldn't reach.
 2. It picks the top one or two and posts them to Telegram via
@@ -501,7 +524,7 @@ enforced by the `read-only-reviewer` agent, which **denies** `edit`/`write`/`bas
 or hit the network.
 
 It falls back to an isolated temp dir (diff-only) in two cases:
-- `-C` is **not a git repo** (e.g. a `--just-ask` from a scratch dir) — nothing to read;
+- `-C` is **not a git repo** (e.g. a `just-ask` from a scratch dir) — nothing to read;
 - the repo **ships its own opencode config** (`.opencode/` or `opencode.json`/`.jsonc`).
   A repo-local agent definition can **override** the global `read-only-reviewer` and
   re-enable `write`/`bash` (verified: project config wins, and no opencode env flag
@@ -518,13 +541,29 @@ It falls back to an isolated temp dir (diff-only) in two cases:
 
 ---
 
-## Flags
+## Subcommands & flags
+
+The mode is a **subcommand** (`review <mode> …`); the flags below are shared options
+available to the relevant subcommands. A bare `review …` (no subcommand) defaults to the
+`review` diff-review.
 
 ```
+SUBCOMMANDS
+review              Diff review across the reviewer board (the DEFAULT; requires a diff).
+brainstorm TOPIC    Multi-round persona ideation; composable with --diff/--staged grounding.
+just-ask QUESTION   Single-shot multi-model answer to a question (diff optional).
+quorum QUESTION     Experts cite evidence + a moderator finds quorum/disagreement.
+dashboard           Local web dashboard over review-cli runs.
+spec-web SPEC.md    Interactive web reviewer for a markdown spec.
+install-skill | install-commit-hook | register-module
+
+SHARED FLAGS
 -m / --model        Backend to include; repeat or comma-separate. Stacks with defaults.
---staged            Review staged diff (git diff --cached) instead of unstaged.
+--diff              Use the working-tree diff (default for review; optional grounding for brainstorm).
+--staged            Use the staged diff (git diff --cached) instead of the working-tree diff.
+--visual IMAGE      Composable flag (NOT a mode): attach/verify a render; rides any subcommand.
 --timeout N         Per-call timeout in seconds (default 1200 for review, 240 for panel modes).
---moderator M       Override the auto-selected moderator for --quorum / --brainstorm.
+--moderator M       Override the auto-selected moderator for quorum / brainstorm.
 --rounds N          Minimum brainstorm rounds before STOP is allowed (default 5).
 --max-rounds N      Hard cap on brainstorm rounds (default 8).
 --list-defaults     Print effective default backends and exit.
@@ -538,6 +577,11 @@ It falls back to an isolated temp dir (diff-only) in two cases:
                     overwrites) while still printing to stdout. Use this instead of
                     `review … > FILE`, which fails silently under zsh noclobber.
 ```
+
+> **Modes are subcommands, not flags.** `--brainstorm` / `--quorum` / `--just-ask` were
+> removed; use `review brainstorm …` / `review quorum …` / `review just-ask …`. The old
+> flags print a one-line pointer and exit non-zero. `review …` (no subcommand) still runs
+> the diff review.
 
 ---
 
@@ -715,6 +759,45 @@ only read, never written.
 
 ---
 
+## Architecture — `lib | cli | mcp` + the mode registry
+
+review-cli is layered so the same panel engine is reusable beyond the CLI:
+
+- **lib** — `reviewlib/` is the engine: `panel.py` (parallel fan-out, moderator,
+  failover board), `backends.py` (the model transports), `config.py` (board/defaults).
+  It has no argparse dependency and is callable directly.
+- **cli** — `reviewlib/cli.py` is a **thin** argparse front-end. It resolves the diff,
+  models, and `--visual` context, then dispatches to a mode handler. It owns no review
+  logic of its own.
+- **mcp** — *not built yet*, but the seam is kept clean: an MCP wrapper (or another CLI
+  — a future research-cli / task-cli `just-ask`) can call the lib + a mode handler
+  directly without dragging the argparse surface along. Each mode handler is thin over
+  the lib for exactly this reason.
+
+**Modes are plugin-directory modules** (generalized from the per-project
+`features/visual` MODULE registry):
+
+```
+reviewlib/modes/
+  contract.py     # ModeSpec descriptor + ModeContext (mirrors features/visual/contract.py + module_api.py)
+  registry.py     # MODES list, get_mode / known_subcommands / default_mode (mirrors features/visual/registry.py)
+  review.py       # MODE = ModeSpec(subcommand="review", diff_policy="require", handler=…)
+  brainstorm.py   # MODE = ModeSpec(subcommand="brainstorm", diff_policy="optional", …)
+  just_ask.py     # MODE = ModeSpec(subcommand="just-ask", diff_policy="none", …)
+  quorum.py       # MODE = ModeSpec(subcommand="quorum", diff_policy="none", …)
+```
+
+Each mode is a **self-describing module** that exposes a top-level `MODE = ModeSpec(…)`
+declaring the subcommand it registers, its default diff policy, the CLI arguments it
+adds, and its thin handler — exactly how a visual module exposes a top-level `MODULE`.
+The CLI looks the subcommand up in the registry and dispatches; **adding a mode = drop a
+`modes/<name>.py` and list it in `registry.MODES` — no `cli.py` surgery.** A bare
+`review …` (no recognized subcommand) routes to the default `review` mode, so the common
+diff-review ergonomics are preserved; `--visual` is a composable flag orthogonal to the
+mode, so it rides any subcommand.
+
+---
+
 ## How review compares
 
 AI code review tools cluster into three camps. **PR-bots** (Qodo PR-Agent, CodeRabbit,
@@ -727,10 +810,12 @@ output as one fused, opinionated pipeline (see [review vs ralphex](#review-vs-ra
 
 `review` is neither: it runs **several models in parallel on the local working-tree diff**
 before you ever push, then goes further — a cited **quorum** (consensus with evidence) and
-a multi-round **brainstorm** panel for open design questions. It is **read-only** (never
-edits your code), **CLI-first** (no PR, no hosted service — it shells out to model CLIs you
-already have), and **harness-agnostic** (callable from Claude Code, Codex, opencode, or a
-plain shell).
+a multi-round **brainstorm** panel for open design questions. It adds **visual review**
+(attach a render with `--visual` for a keep / rollback / repair verdict) and **interactive
+spec-review tooling** (review a markdown spec like a PR), all from the same binary. It is
+**read-only** (never edits your code), **CLI-first** (no PR, no hosted service — it shells
+out to model CLIs you already have), and **harness-agnostic** (callable from Claude Code,
+Codex, opencode, or a plain shell).
 
 | Tool | Multi-model in parallel | Local pre-PR diff | Consensus / quorum | Design brainstorm | Read-only | No hosted service | Generates code |
 |---|---|---|---|---|---|---|---|
@@ -761,30 +846,15 @@ ralphex is for, and `review` is `—` on code-gen on purpose.
 plugs into a loop it controls itself**. You (or your agent) drive the loop and call `review`
 only for the critique step — which is the step agents do *worst* on their own. The two shapes:
 
-```
-ralphex  — all-in-one encapsulated loop (opinionated, black-box):
+**ralphex** — one opaque binary that encapsulates *both* code-generation and review in a single
+autonomous loop:
 
-  ┌─────────────────────────────────────────────────────────────┐
-  │  ralphex (one binary owns the whole loop)                    │
-  │                                                              │
-  │   plan ──▶ code-gen agent ──▶ built-in review ──▶ commit ─┐  │
-  │              ▲                  (5 agents + codex)         │  │
-  │              └───────────────── repeat until plan done ◀──┘  │
-  └─────────────────────────────────────────────────────────────┘
+![ralphex — all-in-one encapsulated loop: one binary drives a code-gen agent, runs its own built-in review, and commits, repeating until the plan is done](docs/compare-ralphex.svg)
 
+**`review`** — does *only* the review part (the part agents do badly), transparently and
+controllably, driven by the agent that keeps code-gen and every decision:
 
-agent + review — composable primitive the AGENT orchestrates (transparent, controllable):
-
-   ┌── the AGENT drives its own loop ───────────────────────────────┐
-   │                                                                │
-   │  agent writes code ──▶  review  ──▶ agent reads verdict ──▶ ┐  │
-   │       ▲                 │ multi-model board                 │  │
-   │       │                 │ cited quorum / brainstorm         │  │
-   │       │                 │ (read-only — never edits)         │  │
-   │       └───────── agent decides: fix / ship / re-loop ◀──────┘  │
-   └────────────────────────────────────────────────────────────────┘
-              ▲ code-gen stays with the agent — review owns only the critique
-```
+![review — a critique primitive the agent orchestrates: the agent writes code, calls review (multi-model, read-only, never edits) for the critique step, then decides fix / ship / re-loop](docs/compare-review.svg)
 
 In one sentence: **ralphex's strength is that it is all-in-one** — code-gen and review
 fused into one walk-away binary; **`review`'s strength is that it is focused and

@@ -1,6 +1,11 @@
-"""Plain diff review: run the diff across every selected backend in parallel.
+"""review (default): run the diff across every selected backend in parallel.
 
-Originally extracted verbatim from `bin/review:main()` (Stage 0 decomposition).
+`review review …` (or a bare `review …`, which defaults to this mode) — the diff
+review. **--diff/diff is the default** (the mode REQUIRES a diff, as the pre-commit
+path always has). Originally the flag-less default of `bin/review:main()` (Stage 0
+decomposition); now a first-class SUBCOMMAND backed by the `MODE` descriptor at the
+bottom of this file (see `modes/contract.py`).
+
 The reviewer-board path (HYP-741) is layered on top: when a board is passed, each
 reviewer gets its own role-lens prompt + label, but the parallel run, result
 formatting, and staged-stamp behaviour are otherwise identical.
@@ -12,6 +17,7 @@ reserve (mid-run failover) so the run still yields N working verdicts when possi
 """
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
 import sys
 from pathlib import Path
@@ -25,6 +31,7 @@ from ..panel import (
     format_result,
     run_board_with_failover,
 )
+from .contract import ModeContext, ModeSpec
 
 
 def mode_review(
@@ -116,3 +123,43 @@ def _mode_review_board(
     if ok and staged:
         _write_review_stamp(cwd, diff)
     return 0 if ok else 1
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    """The review mode adds NO unique positional/option arguments — it reviews the diff
+    using only the shared options (-m / -C / --pool / --prompt / --staged / --visual …),
+    which the CLI adds to every mode's parser."""
+
+
+def _handler(ctx: ModeContext) -> int:
+    """Thin over `mode_review`: the CLI resolves the board / pool / outcome_sink and
+    passes them through `ctx.extra` (only the failover-board path needs them).
+
+    The board path passes `board` + `pool_size` + `outcome_sink`; the flat path
+    (explicit -m / configured models) passes board=None and NOTHING else — the call
+    shape there is identical to the pre-redesign default review (a board=None call with
+    no pool_size/outcome_sink), so consumers/stubs of the flat path stay compatible."""
+    board = ctx.extra.get("board")
+    base = (
+        ctx.models, ctx.with_visual(ctx.args.prompt), ctx.diff, ctx.cwd, ctx.timeout,
+        ctx.args.staged,
+    )
+    if board is None:
+        return mode_review(*base, board=None)
+    return mode_review(
+        *base, board=board,
+        pool_size=ctx.extra.get("pool_size", DEFAULT_POOL_SIZE),
+        outcome_sink=ctx.extra.get("outcome_sink"),
+    )
+
+
+MODE = ModeSpec(
+    name="review",
+    subcommand="review",
+    diff_policy="require",
+    stats_mode="review",
+    summary="diff review across the reviewer board (the default; requires a diff)",
+    handler=_handler,
+    add_arguments=_add_arguments,
+    announce_logs=False,
+)

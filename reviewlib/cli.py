@@ -37,12 +37,29 @@ from .config import (
 )
 from .install import install_commit_hook, install_skill
 from .modes.brainstorm import mode_brainstorm
+from .modes.contract import ModeContext, ModeSpec
 from .modes.just_ask import mode_just_ask
 from .modes.quorum import mode_quorum
+from .modes.registry import (
+    REMOVED_MODE_FLAGS,
+    brainstorm_pool,
+    default_mode,
+    get_mode,
+    iter_modes,
+    known_subcommands,
+)
 from .modes.review import mode_review
 from .panel import begin_call_tally, end_call_tally, pick_moderators
 from .process import _run
 from .stats import announce_eta, record_run
+
+# Keep the mode-handler names imported off `cli` for legacy import compatibility ONLY
+# (some external/legacy callers `from reviewlib.cli import mode_review`). Dispatch goes
+# through `modes/registry`, so rebinding `cli.mode_*` has NO effect on the running mode.
+# NEW tests/code must patch the handler in its OWN module (e.g.
+# `reviewlib.modes.review.mode_review`) or configure the `ModeSpec`, never via `cli`.
+# This tuple just keeps the names referenced so the imports aren't flagged unused.
+__mode_fns__ = (mode_brainstorm, mode_just_ask, mode_quorum, mode_review)
 
 
 def _git_diff(cwd: Path, staged: bool) -> str:
@@ -254,8 +271,8 @@ class _Tee(io.TextIOBase):
 # `--prompt -o…`). This keeps the light pre-scan from stealing another flag's value.
 _VALUE_TAKING_OPTS = frozenset({
     "-m", "--model", "-C", "--cwd", "-o", "--output", "--prompt", "--timeout",
-    "--pool", "--moderator", "--rounds", "--max-rounds", "--just-ask", "--quorum",
-    "--brainstorm", "--visual", "--before", "--intent", "--expect", "--check",
+    "--pool", "--moderator", "--rounds", "--max-rounds",
+    "--visual", "--before", "--intent", "--expect", "--check",
     "--vision-timeout", "--project",
 })
 
@@ -415,6 +432,145 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if write_error is not None else rc
 
 
+# A bare `review` (no recognized subcommand) defaults to the `review` diff-review mode
+# (§4) — the single most common invocation. We print a ONE-LINE migration hint to stderr
+# the first time per process, then run the diff review unchanged. Never a hard error.
+_DEFAULT_HINT_SHOWN = False
+
+
+def _hint_default_mode() -> None:
+    global _DEFAULT_HINT_SHOWN
+    if _DEFAULT_HINT_SHOWN:
+        return
+    _DEFAULT_HINT_SHOWN = True
+    print(
+        "tip: this is now `review review …`; modes are subcommands: "
+        "brainstorm / just-ask / quorum (run `review --help`).",
+        file=sys.stderr, flush=True,
+    )
+
+
+def _add_shared_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
+    """Add the SHARED options every mode subcommand understands. `--list-defaults` /
+    `--show-board` / `--pool` are review/board meta-flags that stay available on the
+    default (review) parser; the panel/brainstorm/visual-only flags are available to the
+    relevant modes too (a flag a mode ignores is harmless). Mode-UNIQUE arguments (the
+    positional question/topic) are added by the mode's own `add_arguments`."""
+    parser.add_argument("-m", "--model", action="append", default=[], help="model/backend to run; repeat or comma-separate")
+    parser.add_argument("-C", "--cwd", default=".", help="repository directory")
+    parser.add_argument(
+        "-o", "--output", metavar="FILE", default=None,
+        help=(
+            "write the result to FILE via Python (creates parent dirs, overwrites) "
+            "while still printing to stdout. Use this instead of `review … > FILE`, "
+            "which fails under zsh noclobber."
+        ),
+    )
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="review prompt (review mode)")
+    # --diff is an explicit, composable alias for the working-tree diff. It is the
+    # DEFAULT for the review mode (which always reviews the diff) and an OPTIONAL
+    # grounding source for brainstorm — `review brainstorm "…" --diff` reads the
+    # working-tree diff as context. --staged is its staged counterpart.
+    parser.add_argument("--diff", action="store_true", help="use the working-tree diff (default for review; optional grounding for brainstorm)")
+    parser.add_argument("--staged", action="store_true", help="use the staged diff (git diff --cached) instead of the working-tree diff")
+    parser.add_argument(
+        "--timeout", type=int, default=None,
+        help="per-call timeout seconds (default 1200 for review, 240 for panel modes)",
+    )
+    parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
+    parser.add_argument("--show-board", action="store_true", help="print the active reviewer board (model -> role, availability) and exit")
+    parser.add_argument(
+        "--pool", type=int, default=DEFAULT_POOL_SIZE, metavar="N",
+        help=(
+            f"how many of the board's seats to run (default {DEFAULT_POOL_SIZE}); the "
+            "first N seats participate, the rest are kept in reserve. The board is "
+            "never off — --pool only sizes it. N<=0 means all seats."
+        ),
+    )
+    parser.add_argument("--moderator", default=None, help="moderator backend for quorum / brainstorm")
+    # --rounds / --max-rounds are brainstorm-only and added by the brainstorm mode's own
+    # add_arguments (so `review just-ask --rounds 5` correctly errors). They are still in
+    # _VALUE_TAKING_OPTS so the mode-agnostic `-o` pre-scan treats them as value-taking.
+    # --visual is a COMPOSABLE flag, NOT a mode: it combines with any mode (review /
+    # brainstorm / just-ask / quorum), or runs the standalone verdict pipeline (§3).
+    parser.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; composable with any mode (alone = the verdict pipeline)")
+    parser.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
+    parser.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
+    parser.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
+    parser.add_argument("--check", action="append", default=[], metavar="NAME", help="force-activate a visual module by name (repeatable)")
+    parser.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
+    parser.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
+    parser.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
+    parser.add_argument("--no-local-model", action="store_true", help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)")
+    parser.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
+    parser.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
+    if mode is not None and mode.add_arguments is not None:
+        mode.add_arguments(parser)
+
+
+def _subcommand_epilog() -> str:
+    return "subcommands:\n" + "\n".join(
+        f"  {m.subcommand:<11} {m.summary}" for m in iter_modes()
+    ) + (
+        "\n  dashboard   local web dashboard over review-cli runs"
+        "\n  spec-web    interactive web reviewer for a markdown spec"
+        "\n  install-skill / install-commit-hook / register-module"
+    )
+
+
+def _build_mode_parser(mode: ModeSpec, *, top_level: bool = False) -> argparse.ArgumentParser:
+    """Build the argparse surface for a mode subcommand.
+
+    `top_level=True` is the BARE `review …` invocation (no explicit subcommand): it
+    routes to the default (review) mode but the help/usage advertises the SUBCOMMAND
+    list (so `review --help` is the overview) and the prog stays `review` rather than
+    `review review`. An explicit `review <mode> …` uses the per-mode surface."""
+    if top_level:
+        prog = "review"
+        desc = (
+            "Run read-only code reviews / AI panels across multiple model backends. "
+            "Modes are SUBCOMMANDS: review (default), brainstorm, just-ask, quorum. "
+            "A bare `review …` defaults to `review review …` (a diff review)."
+        )
+        epilog: str | None = _subcommand_epilog()
+    else:
+        prog = f"review {mode.subcommand}"
+        desc = mode.summary
+        epilog = None
+    parser = argparse.ArgumentParser(
+        prog=prog, description=desc, epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # The bare/top-level parser does NOT add the default mode's positional (review has
+    # none anyway); an explicit subcommand adds its own. Shared options are always added.
+    _add_shared_options(parser, mode=None if top_level else mode)
+    return parser
+
+
+def _reject_removed_flags(argv: list[str]) -> int | None:
+    """The mode flags (`--brainstorm`/`--quorum`/`--just-ask`) were REPLACED by the
+    subcommands (§2). Reject them with a helpful "use the subcommand" message instead of
+    silently mis-parsing. Returns an exit code (2) when a removed flag is present, else
+    None. Scans only up to the first `--` (end-of-options), so the same string appearing
+    as a positional value (e.g. a quote that literally contains '--quorum') is untouched."""
+    for tok in argv:
+        if tok == "--":
+            break
+        # `--brainstorm=foo` form too.
+        bare = tok.split("=", 1)[0]
+        sub = REMOVED_MODE_FLAGS.get(bare)
+        if sub is not None:
+            print(
+                f"review: `{bare}` is no longer a flag — it is now the `{sub}` subcommand.\n"
+                f"  use:  review {sub} \"<your text>\" [options]\n"
+                f"  (modes are subcommands now: brainstorm / just-ask / quorum; "
+                f"run `review --help`)",
+                file=sys.stderr, flush=True,
+            )
+            return 2
+    return None
+
+
 def _dispatch(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -455,59 +611,31 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # the main review argparse surface; it has its own small flag parser.
     if argv and argv[0] == "spec-web":
         return _spec_web(argv[1:])
-    parser = argparse.ArgumentParser(description="Run read-only code reviews across multiple model backends.")
-    parser.add_argument("-m", "--model", action="append", default=[], help="model/backend to run; repeat or comma-separate")
-    parser.add_argument("-C", "--cwd", default=".", help="repository directory")
-    parser.add_argument(
-        "-o", "--output", metavar="FILE", default=None,
-        help=(
-            "write the review result to FILE via Python (creates parent dirs, "
-            "overwrites) while still printing to stdout. Use this instead of "
-            "`review … > FILE`, which fails under zsh noclobber."
-        ),
-    )
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="review prompt")
-    parser.add_argument("--staged", action="store_true", help="review staged diff instead of unstaged diff")
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=None,
-        help="per-call timeout seconds (default 1200 for review, 240 for panel modes)",
-    )
-    parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
-    parser.add_argument("--show-board", action="store_true", help="print the active reviewer board (model -> role, availability) and exit")
-    parser.add_argument(
-        "--pool",
-        type=int,
-        default=DEFAULT_POOL_SIZE,
-        metavar="N",
-        help=(
-            f"how many of the board's seats to run (default {DEFAULT_POOL_SIZE}); the "
-            "first N seats participate, the rest are kept in reserve. The board is "
-            "never off — --pool only sizes it. N<=0 means all seats."
-        ),
-    )
-    parser.add_argument("--moderator", default=None, help="moderator backend for --quorum/--brainstorm")
-    parser.add_argument("--rounds", type=int, default=5, help="brainstorm minimum rounds (min & default 5)")
-    parser.add_argument("--max-rounds", type=int, default=8, help="brainstorm hard cap on rounds")
-    panel = parser.add_mutually_exclusive_group()
-    panel.add_argument("--just-ask", metavar="QUESTION", help="ask all backends a plain question, no diff required")
-    panel.add_argument("--quorum", metavar="QUESTION", help="experts answer + moderator finds quorum/disagreement")
-    panel.add_argument("--brainstorm", metavar="TOPIC", help="multi-round persona ideation with a moderator")
-    # --visual is a COMPOSABLE flag, NOT a mode: it is deliberately OUTSIDE the
-    # mutually-exclusive panel group so it can combine with any mode (§2.1).
-    parser.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; composable with any mode (alone = the verdict pipeline)")
-    parser.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
-    parser.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
-    parser.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
-    parser.add_argument("--check", action="append", default=[], metavar="NAME", help="force-activate a visual module by name (repeatable)")
-    parser.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
-    parser.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
-    parser.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
-    parser.add_argument("--no-local-model", action="store_true", help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)")
-    parser.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
-    parser.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
-    args = parser.parse_args(argv)
+
+    # The removed mode flags (--brainstorm/--quorum/--just-ask) are now subcommands —
+    # reject them with a helpful pointer rather than mis-parsing the value (§2).
+    rc = _reject_removed_flags(argv)
+    if rc is not None:
+        return rc
+
+    # --- Mode SUBCOMMAND resolution (§2/§4). The first token selects a mode; an
+    # unrecognized first token (a flag, or a positional that is not a known verb) routes
+    # to the DEFAULT review mode so `review -C <repo>` keeps working unchanged. -------
+    rest = argv
+    top_level = False
+    if argv and not argv[0].startswith("-") and argv[0] in known_subcommands():
+        mode = get_mode(argv[0])
+        assert mode is not None  # known_subcommands() guarantees it
+        rest = argv[1:]
+    else:
+        # Bare `review …` (no recognized subcommand) -> default mode. Print the one-line
+        # migration hint (once) ONLY when there is something to review — a bare `--help`
+        # or no-args run should NOT nag (the hint is for the diff-review default path).
+        mode = default_mode()
+        top_level = True
+
+    parser = _build_mode_parser(mode, top_level=top_level)
+    args = parser.parse_args(rest)
 
     config = load_config()
 
@@ -529,14 +657,26 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # would actually run in a real repo for THIS -C (it's diff-only outside a repo).
         return _show_board(config, args.pool, _effective_cwd(args.cwd))
 
+    # Bare `review …` that will actually DISPATCH a review (not a meta query like
+    # --list-defaults / --show-board, already returned above): print the one-line
+    # migration hint once, then run the diff review unchanged (§4). An explicit
+    # `review review …` (top_level=False) is already on the new syntax — no hint.
+    if top_level:
+        _hint_default_mode()
+
     cwd = _effective_cwd(args.cwd)
     explicit_models = _split_models(args.model)
+    is_brainstorm = mode.name == "brainstorm"
+    # A "panel mode" is any non-review mode (brainstorm / just-ask / quorum): the diff is
+    # OPTIONAL context for it, its calls are long-running (announce live-log paths), and
+    # its per-call timeout default is the shorter PANEL_TIMEOUT_DEFAULT.
+    panel_mode = mode.name != "review"
     # Precedence: explicit -m > config > code default. Brainstorm prefers
     # config.brainstorm_models and drops unreachable backends gracefully (so a
     # missing GEMINI_API_KEY never aborts the run). Explicit -m is honored as-is.
     if explicit_models:
         models = explicit_models
-    elif args.brainstorm is not None:
+    elif is_brainstorm:
         src = _split_models(config.get("brainstorm_models") or []) or config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
         models = [m for m in src if backends.backend_available(m)]
         if not models:
@@ -544,7 +684,6 @@ def _dispatch(argv: list[str] | None = None) -> int:
     else:
         models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
 
-    panel_mode = args.just_ask or args.quorum or args.brainstorm
     visual_mode = args.visual is not None
     timeout = args.timeout if args.timeout is not None else (PANEL_TIMEOUT_DEFAULT if panel_mode else 1200)
 
@@ -587,41 +726,51 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return None
 
     # Panel modes are interactive and long-running, so announce each streamed
-    # backend's live-log path to stderr; the plain review path stays quiet.
-    if panel_mode:
+    # backend's live-log path to stderr; the plain review path stays quiet. The mode
+    # descriptor declares this (announce_logs); brainstorm/just-ask/quorum opt in.
+    if mode.announce_logs:
         backends._ANNOUNCE_LOGS = True
 
-    # Diff acquisition. Panel modes treat the diff as optional context. The default
-    # review (no panel mode) requires a diff. With --visual + the DEFAULT review, the
-    # diff still drives the routing (§2.1): a present diff → the diff-review companion,
-    # an absent diff → the standalone pipeline — so we MUST still try to discover it,
-    # but a missing diff / non-repo must degrade to standalone rather than abort.
+    # Diff acquisition. Panel modes treat the diff as optional context. The review mode
+    # REQUIRES a diff. With --visual + the review mode, the diff still drives the routing
+    # (§3): a present diff → the diff-review companion, an absent diff → the standalone
+    # pipeline — so we MUST still try to discover it, but a missing diff / non-repo must
+    # degrade to standalone rather than abort.
     diff = _read_stdin_if_piped()
-    # --brainstorm treats the diff as OPTIONAL grounding context even with --staged, so
-    # it must NOT take the hard-fail `needs_diff` path: a non-repo `-C` or a failing
-    # `git diff [--cached]` degrades to pure ideation (diff == ""), not an abort. Only a
-    # default review (no panel mode, no --visual) genuinely REQUIRES a diff; --staged on
-    # such a review still hard-requires it (the pre-commit gate). So brainstorm is
-    # excluded from needs_diff and routed through the caught/optional probe below.
-    needs_diff = (args.staged or (not panel_mode and not visual_mode)) and args.brainstorm is None
+    # brainstorm treats the diff as OPTIONAL grounding context even with --staged/--diff,
+    # so it must NOT take the hard-fail `needs_diff` path: a non-repo `-C` or a failing
+    # `git diff [--cached]` degrades to pure ideation (diff == ""), not an abort. Only the
+    # review mode (no --visual) genuinely REQUIRES a diff; --staged on a review still
+    # hard-requires it (the pre-commit gate). So brainstorm is excluded from needs_diff
+    # and routed through the caught/optional probe below.
+    needs_diff = (args.staged or (not panel_mode and not visual_mode)) and not is_brainstorm
     if diff is None and needs_diff:
         diff = _git_diff(cwd, args.staged)
     elif diff is None and visual_mode and not panel_mode:
-        # --visual riding the default review: probe the working-tree diff to decide
+        # --visual riding the review mode: probe the working-tree diff to decide
         # companion-vs-standalone, but tolerate "no diff / not a git repo".
         try:
             diff = _git_diff(cwd, args.staged)
         except RuntimeError:
             diff = ""
-    elif diff is None and args.brainstorm is not None:
-        # --brainstorm picks up the staged (--staged) or working-tree diff as OPTIONAL
+    elif diff is None and is_brainstorm:
+        # brainstorm picks up the staged (--staged) or working-tree diff as OPTIONAL
         # grounding context so you can brainstorm ABOUT a specific change. The diff is
         # never required: an absent diff / non-repo / git failure degrades to pure
         # ideation (diff == ""). `_read_stdin_if_piped` already returns the diff for a
         # NON-EMPTY pipe (precedence); empty/`/dev/null` stdin reads as None here, so we
         # still probe the working tree — matching every other mode and the documented
-        # `… --brainstorm "Q" < /dev/null` convention (an empty redirect must NOT suppress
-        # grounding).
+        # `review brainstorm "Q" < /dev/null` convention (an empty redirect must NOT
+        # suppress grounding). `--diff` is the explicit opt-in spelling of the same probe.
+        try:
+            diff = _git_diff(cwd, args.staged)
+        except RuntimeError:
+            diff = ""
+    elif diff is None and panel_mode and args.diff:
+        # just-ask / quorum: the diff is "none" policy (a question, not a change), so it
+        # is NOT auto-grabbed. `--diff` is the explicit OPT-IN to attach the working-tree
+        # diff as context (the staged counterpart is the `needs_diff` path above). It
+        # degrades gracefully to no-context on a non-repo / git failure.
         try:
             diff = _git_diff(cwd, args.staged)
         except RuntimeError:
@@ -698,6 +847,19 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 return 1
             return 10 if args.strict else 1
 
+    # Build the resolved ModeContext handed to the mode's handler (thin over the lib).
+    # `with_visual` folds the --visual companion context into the mode's prompt/topic
+    # (identity when there is none). Moderators are resolved for the panel/brainstorm
+    # modes; the review handler ignores them.
+    def _with_visual_text(text: str) -> str:
+        return _with_visual(text, visual_ctx)
+
+    moderators = pick_moderators(args.moderator, models) if panel_mode else []
+    ctx = ModeContext(
+        args=args, models=models, diff=diff, cwd=cwd, timeout=timeout,
+        with_visual=_with_visual_text, visual_ctx=visual_ctx, moderators=moderators,
+    )
+
     # The recorded mode is the EXACT mode (a brainstorm of 4 is nothing like a plain
     # review of 4), and `pool_models` is what is ACTUALLY DISPATCHED so pool_size is
     # ground truth. A --visual companion is recorded under its base text mode: the
@@ -705,42 +867,24 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # and the multi-minute cost an agent might wrongly short-timeout is the text panel
     # that follows — which IS inside the wrapper below — so the base-mode key is the
     # honest one (codex P2: don't split history on a tag whose timing we exclude).
-    if args.just_ask is not None:
+    if is_brainstorm:
+        # Brainstorm dispatches max(3, len(panel)) persona slots PER ROUND, so the real
+        # per-round pool — and the ETA key — is the slot count, not len(models) (codex
+        # P2: don't undercount a 1-2 model panel). brainstorm_pool mirrors that.
         return _run_mode_with_stats(
-            "just-ask", models,
-            lambda: mode_just_ask(_with_visual(args.just_ask, visual_ctx), models, diff, cwd, timeout),
-        )
-    if args.quorum is not None:
-        return _run_mode_with_stats(
-            "quorum", models,
-            lambda: mode_quorum(_with_visual(args.quorum, visual_ctx), models, diff, cwd, timeout, pick_moderators(args.moderator, models)),
-        )
-    if args.brainstorm is not None:
-        # Brainstorm dispatches max(3, len(panel)) persona slots PER ROUND (mode_brainstorm
-        # fills <3-model panels by repeating models: panel[slot % len(panel)]), so the
-        # real per-round pool — and the ETA key — is the slot count, not len(models).
-        # Recording the raw models list would undercount a 1-2 model panel and mis-key
-        # its history (codex P2). Mirror that exact slot assignment so pool_size matches.
-        if models:
-            slot_count = max(3, len(models))
-            brainstorm_pool = [models[slot % len(models)] for slot in range(slot_count)]
-        else:
-            brainstorm_pool = models
-        return _run_mode_with_stats(
-            "brainstorm", brainstorm_pool,
-            lambda: mode_brainstorm(
-                _with_visual(args.brainstorm, visual_ctx), models, cwd, timeout,
-                pick_moderators(args.moderator, models), args.rounds, args.max_rounds,
-                # When there IS a diff (working-tree, --staged, or piped), the personas
-                # see it as grounding context so you can brainstorm ABOUT a specific
-                # change. No diff -> pure ideation, exactly as before.
-                diff=diff,
-            ),
+            mode.stats_mode, brainstorm_pool(models),
+            lambda: mode.handler(ctx),
         )
 
-    # Default plain review. Validate the board now if it wasn't already (the no-visual
-    # path); an all-malformed `board:` exits 2 before the panel runs. The --visual
-    # companion context folds into each per-reviewer prompt via args.prompt.
+    if mode.name != "review":
+        # just-ask / quorum: a flat multi-model panel; pool_size == len(models).
+        return _run_mode_with_stats(
+            mode.stats_mode, models, lambda: mode.handler(ctx),
+        )
+
+    # The review mode. Validate the board now if it wasn't already (the no-visual path);
+    # an all-malformed `board:` exits 2 before the panel runs. The --visual companion
+    # context folds into each per-reviewer prompt via args.prompt (handler's with_visual).
     rc = validate_board()
     if rc is not None:
         return rc
@@ -754,6 +898,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         )
         eta_models = [r.model for r in planned_pool]
         outcome_sink: list = []
+        ctx.extra.update(board=board, pool_size=args.pool, outcome_sink=outcome_sink)
 
         def _ran_models() -> list[str]:
             # The BARE model ids that produced verdicts (a backfilled reserve under its
@@ -761,18 +906,13 @@ def _dispatch(argv: list[str] | None = None) -> int:
             return outcome_sink[0].usable_models if outcome_sink else []
 
         return _run_mode_with_stats(
-            "review", eta_models,
-            lambda: mode_review(
-                models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout,
-                args.staged, board=board, pool_size=args.pool, outcome_sink=outcome_sink,
-            ),
+            mode.stats_mode, eta_models, lambda: mode.handler(ctx),
             models_after=_ran_models,
         )
+    # Flat review path (no board): ctx.extra has no "board" key, so the handler reads
+    # board=None and takes the legacy flat call shape.
     return _run_mode_with_stats(
-        "review", models,
-        lambda: mode_review(
-            models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout, args.staged, board=board,
-        ),
+        mode.stats_mode, models, lambda: mode.handler(ctx),
     )
 
 
