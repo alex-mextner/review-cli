@@ -84,18 +84,22 @@ def _effective_cwd(raw: str) -> Path:
 
 
 def _dashboard_subcommand(rest: list[str]) -> int:
-    """Parse `dashboard [--port N] [--no-open]` and start the local-only web server.
+    """Parse `dashboard [--host H] [--port N] [--no-open]` and start the web server.
 
-    Imported lazily so the dashboard's stdlib HTTP stack never loads on the hot review
-    path (and a stray import error in dashboard code can't break `review`)."""
-    sub = argparse.ArgumentParser(prog="review dashboard", description="Local-only web dashboard for review-cli runs.")
-    sub.add_argument("--port", type=int, default=None, help="port to bind on 127.0.0.1 (default: a free ephemeral port)")
+    Binds 127.0.0.1 by default; ``--host 0.0.0.0`` exposes it over Tailscale (mirrors
+    ``review spec-web``). Imported lazily so the dashboard's stdlib HTTP stack never loads
+    on the hot review path (and a stray import error in dashboard code can't break
+    `review`)."""
+    sub = argparse.ArgumentParser(prog="review dashboard", description="Web dashboard for review-cli runs.")
+    sub.add_argument("--host", default="127.0.0.1",
+                     help="interface to bind (default: 127.0.0.1 loopback-only; 0.0.0.0 exposes over Tailscale)")
+    sub.add_argument("--port", type=int, default=None, help="port to bind (default: a free ephemeral port)")
     sub.add_argument("--no-open", action="store_true", help="do not open a browser window")
     sub.add_argument("--verbose", action="store_true", help="log every HTTP request to stderr")
     ns = sub.parse_args(rest)
     from .dashboard import run_dashboard
 
-    return run_dashboard(port=ns.port, open_browser=not ns.no_open, verbose=ns.verbose)
+    return run_dashboard(port=ns.port, host=ns.host, open_browser=not ns.no_open, verbose=ns.verbose)
 
 
 def _spec_web(argv: list[str]) -> int:

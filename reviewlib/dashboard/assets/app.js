@@ -560,6 +560,71 @@ function invalidate() {
   loadAll();
 }
 
+// ---- live activity (Server-Sent Events) ------------------------------------
+// Subscribe to /events: the server tails the log dir and pushes a `run` summary (and a
+// per-file `log` event) whenever a review writes/appends an artifact. We coalesce a burst
+// of events into one reload so a streaming brainstorm doesn't hammer the API, and flash a
+// "live" indicator so it's visible the stream is connected.
+let _liveReload = null;
+function setLive(text, cls) {
+  const el = $('live');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'live' + (cls ? ' ' + cls : '');
+}
+function liveStream() {
+  if (typeof EventSource === 'undefined') {
+    setLive('○ unavailable'); // very old browser: stays on manual refresh
+    return;
+  }
+  let es;
+  try {
+    es = new EventSource(`/events?gap=${state.gap}`);
+  } catch {
+    setLive('○ unavailable');
+    return;
+  }
+  let flashTimer = null;
+  const flash = (label) => {
+    setLive(label, 'on');
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => setLive('● live'), 1200);
+  };
+  const scheduleReload = () => {
+    if (_liveReload) return; // already coalescing this burst
+    _liveReload = setTimeout(() => {
+      _liveReload = null;
+      // Don't yank a session detail the user is reading; refresh list-y panels only.
+      if (!(state.panel === 'chat' && state.detail)) {
+        state.runs = null;
+        loadAll();
+      }
+    }, 600);
+  };
+  es.addEventListener('open', () => setLive('● live'));
+  es.addEventListener('run', () => {
+    flash('● activity');
+    scheduleReload();
+  });
+  es.addEventListener('log', (e) => {
+    let d = {};
+    try {
+      d = JSON.parse(e.data);
+    } catch {
+      console.warn('live: bad log payload', e.data);
+    }
+    flash(d.backend ? `● ${d.backend}` : '● activity');
+    // A brainstorm streams `log` events for a long time before its session window closes
+    // (so no `run` lands until the end). Reload on `log` too — coalesced — so the list
+    // reflects an in-progress run, not just the indicator flash.
+    scheduleReload();
+  });
+  es.onerror = () => {
+    setLive('○ reconnecting', 'bad');
+    // EventSource auto-reconnects (honoring the server's `retry:`); nothing else to do.
+  };
+}
+
 // ---- shell -----------------------------------------------------------------
 function setActiveTab(name) {
   state.panel = name;
@@ -636,6 +701,8 @@ function boot() {
   // Load data first, then apply the initial hash so a deep-linked panel/session renders.
   loadAll().then(applyHash);
   setInterval(health, 15000);
+  // Live stream: push updates as reviews run, so the dashboard updates without a refresh.
+  liveStream();
 }
 
 document.addEventListener('DOMContentLoaded', boot);

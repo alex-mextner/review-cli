@@ -1,10 +1,12 @@
-"""reviewlib.dashboard — a local-only web dashboard for review-cli runs.
+"""reviewlib.dashboard — a web dashboard for review-cli runs.
 
-`review dashboard [--port N] [--no-open]` starts a stdlib HTTP server (127.0.0.1 only)
-serving a vanilla-JS single-page app that browses review-cli's real on-disk log
-artifacts (per-call streamed logs + brainstorm discussion logs in ``log_dir()``) and
-the overseer's annotations (feedback / conscious flag / PR+ticket links) persisted in
-``~/.config/review-cli/dashboard.json``.
+`review dashboard [--host H] [--port N] [--no-open]` starts a stdlib HTTP server (bound to
+127.0.0.1 by default; ``--host 0.0.0.0`` exposes it over Tailscale) serving a vanilla-JS
+single-page app that browses review-cli's real on-disk log artifacts (per-call streamed
+logs + brainstorm discussion logs in ``log_dir()``) and the overseer's annotations
+(feedback / conscious flag / PR+ticket links) persisted in
+``~/.config/review-cli/dashboard.json``. A ``/events`` Server-Sent Events stream pushes
+live review activity to the page so it updates without a manual refresh.
 
 Public surface:
   * ``run_dashboard`` — the blocking CLI entry (used by ``reviewlib.cli``);

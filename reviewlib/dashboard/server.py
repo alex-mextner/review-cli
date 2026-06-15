@@ -1,12 +1,14 @@
-"""Local-only HTTP server for the review-cli dashboard (stdlib, no deps).
+"""HTTP server for the review-cli dashboard (stdlib, no deps).
 
-`review dashboard [--port N] [--no-open]` binds 127.0.0.1 ONLY (never 0.0.0.0 — the
-logs persist prompts/diffs that may carry secrets, so the dashboard must not be exposed
-on the network) and serves:
+`review dashboard [--host H] [--port N] [--no-open]` binds 127.0.0.1 by default (the logs
+persist prompts/diffs that may carry secrets, so the dashboard is loopback-only unless you
+opt in); ``--host 0.0.0.0`` exposes it over Tailscale (mirrors ``review spec-web``). It
+serves:
 
   GET  /                         -> the SPA shell (assets/index.html)
   GET  /assets/<file>            -> static JS/CSS (from assets/, allowlisted)
-  GET  /api/health              -> {ok, log_dir, store_path, ...}
+  GET  /events                  -> Server-Sent Events: live review activity stream
+  GET  /api/health              -> {ok, log_dir, store_path, allowed_origins, ...}
   GET  /api/runs[?gap=N]        -> [session summaries], newest first
   GET  /api/runs/<id>           -> full session detail (calls/brainstorm/roles + annotation)
   GET  /api/stats[?gap=N]       -> aggregate stats (modes/models/roles/days/durations)
@@ -16,11 +18,20 @@ on the network) and serves:
   POST /api/runs/<id>/links     -> {pr?: "#123", ticket?: "HYP-742", remove?: bool}
 
 The handler is intentionally thin: parsing lives in ``parser``, persistence in ``store``.
+
+Security: READS are open to anyone who can reach the port (the dashboard's own logs are
+the only data — there are no per-user secrets in the API), but a Host-header allowlist
+(loopback + the discovered Tailscale host + ``$REVIEW_DASHBOARD_ALLOWED_HOSTS``) defends
+against DNS rebinding, and WRITES additionally require the Origin/Referer to be an allowed
+host (CSRF). This is the spec-web pattern, ported so the dashboard can be exposed over
+Tailscale without dropping the rebinding protection.
 """
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -37,7 +48,63 @@ _CONTENT_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; ch
 # few KB is generous; this caps a malicious/runaway POST before we read it into memory.
 _MAX_WRITE_BODY_BYTES = 64 * 1024
 # Loopback host names an Origin/Referer may carry for a same-machine browser request.
-_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
+
+# SSE tuning. The watcher polls the log dir for appended/changed artifacts and pushes a
+# delta to every connected browser; a heartbeat comment keeps proxies/Tailscale from
+# closing an idle stream.
+_SSE_POLL_SECONDS = 1.0
+_SSE_HEARTBEAT_SECONDS = 15.0
+# How many of the newest sessions to (re-)push as `run` events on each activity tick. The
+# changed files are almost always the newest session, so a small window keeps the payload
+# tiny while still covering a multi-call invocation that spans the cluster gap.
+_SSE_RECENT_RUNS = 8
+
+# Tailscale identity is DISCOVERED at runtime (this is a packaged CLI used on many
+# machines — a personal host must never be compiled in). Mirrors specweb: best-effort,
+# cached `tailscale status --json` -> this node's DNSName + TailscaleIPs. Falls back to
+# nothing if tailscale isn't installed/up. Add hosts explicitly via the env var.
+_tailscale_cache: set[str] | None = None
+
+
+def _discover_tailscale_hosts() -> set[str]:
+    """Best-effort: this machine's own Tailscale DNS name + IPs (cached). Empty if absent."""
+    global _tailscale_cache
+    if _tailscale_cache is not None:
+        return _tailscale_cache
+    hosts: set[str] = set()
+    try:
+        import shutil
+        import subprocess
+
+        exe = shutil.which("tailscale")
+        if exe:
+            out = subprocess.run([exe, "status", "--json"], capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and out.stdout.strip():
+                data = json.loads(out.stdout)
+                me = (data or {}).get("Self") or {}
+                dns = (me.get("DNSName") or "").strip(".").lower()
+                if dns:
+                    hosts.add(dns)
+                for ip in me.get("TailscaleIPs") or []:
+                    if isinstance(ip, str) and ip.strip():
+                        hosts.add(ip.strip().lower())
+    except Exception:  # noqa: BLE001 — discovery must never break serving
+        hosts = set()
+    _tailscale_cache = hosts
+    return hosts
+
+
+def _extra_allowed_hosts() -> set[str]:
+    raw = os.environ.get("REVIEW_DASHBOARD_ALLOWED_HOSTS", "")
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
+def allowed_hosts() -> set[str]:
+    """The full allowed-host set for the Host allowlist (anti-rebinding) and write-origin
+    checks: loopback + discovered Tailscale + configured extras. Binding 127.0.0.1 keeps
+    this loopback-only; binding 0.0.0.0 lets the discovered Tailscale host through too."""
+    return _LOOPBACK_HOSTS | _discover_tailscale_hosts() | _extra_allowed_hosts()
 
 
 def _session_index(gap: float) -> dict[str, dparser.Session]:
@@ -119,27 +186,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             return dparser.DEFAULT_SESSION_GAP_SECONDS
 
+    def _host_hostname(self) -> str | None:
+        """The bare hostname from this request's Host header (port + IPv6 brackets stripped)."""
+        host = (self.headers.get("Host") or "").strip()
+        if not host:
+            return None
+        # strip an optional :port (handle bracketed IPv6 [::1]:port too)
+        if host.startswith("["):
+            return host[1:].split("]", 1)[0].lower()
+        return (host.rsplit(":", 1)[0] if host.count(":") == 1 else host).lower()
+
     def _host_allowed(self) -> bool:
         """Anti-DNS-rebinding guard.
 
         Binding to 127.0.0.1 stops the network from reaching us, but NOT a victim's own
-        browser: a malicious page can DNS-rebind its own hostname to 127.0.0.1 and then
-        fetch our endpoints same-origin, exfiltrating the local log JSON (prompts/diffs).
-        The defence is a Host-header allowlist — a rebound request still carries the
-        ATTACKER's hostname in Host, which won't be loopback. We only ever serve requests
-        whose Host is localhost / 127.0.0.1 / [::1] (any port).
+        browser: a malicious page can DNS-rebind its own hostname to 127.0.0.1 / the
+        Tailscale IP and then fetch our endpoints same-origin, exfiltrating the local log
+        JSON (prompts/diffs). The defence is a Host-header allowlist — a rebound request
+        still carries the ATTACKER's hostname in Host, which won't be in the allowlist. We
+        only ever serve requests whose Host is loopback, the DISCOVERED Tailscale host, or
+        an explicitly configured extra (``$REVIEW_DASHBOARD_ALLOWED_HOSTS``). Binding
+        0.0.0.0 widens the allowlist to include the Tailscale host (so the phone/remote can
+        reach it) WITHOUT disabling the guard — an arbitrary rebound hostname is still
+        rejected.
         """
-        host = (self.headers.get("Host") or "").strip()
-        if not host:
+        hostname = self._host_hostname()
+        if hostname is None:
             # HTTP/1.0 clients (and our own curl smoke without -H) may omit Host; a browser
             # rebinding attack ALWAYS sends one, so a missing Host is not the attack vector.
             return True
-        # strip an optional :port (handle bracketed IPv6 [::1]:port too)
-        if host.startswith("["):
-            hostname = host[1:].split("]", 1)[0]
-        else:
-            hostname = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-        return hostname in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+        return hostname in allowed_hosts()
 
     def _reject_foreign_host(self) -> bool:
         if self._host_allowed():
@@ -162,26 +238,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         host = parsed.hostname  # urlparse drops the port and unwraps IPv6 brackets
         return host.lower() if host else None
 
-    def _origin_is_loopback(self) -> bool:
-        """CSRF defence for WRITES: a cross-site page that fetch()es our loopback port
-        carries ITS OWN site in the Origin header. We require the Origin (or, if absent,
-        the Referer) to be a loopback origin. A request with NEITHER header is treated as
-        same-origin/non-browser (the dashboard's own fetch is same-origin and browsers
-        DO send Origin on POST; curl/tests legitimately omit both) and allowed.
+    def _origin_is_allowed(self) -> bool:
+        """CSRF defence for WRITES: a cross-site page that fetch()es our port carries ITS
+        OWN site in the Origin header. We require the Origin (or, if absent, the Referer) to
+        be an ALLOWED host (loopback + the discovered Tailscale host + configured extras) —
+        so a remote reviewer on the Tailscale host can still leave feedback/links while a
+        foreign site (or a "null" sandboxed origin) cannot. A request with NEITHER header is
+        treated as same-origin/non-browser (the dashboard's own fetch is same-origin and
+        browsers DO send Origin on POST; curl/tests legitimately omit both) and allowed.
 
         Combined with the Host allowlist + the Content-Type guard, a foreign web page
         cannot mutate the annotation store: a simple-request form post can't set
         Content-Type: application/json, and an XHR/fetch that does will carry a foreign
-        Origin that fails here."""
+        Origin that fails here. (The allowed set is loopback + Tailscale, matching the Host
+        allowlist — same as spec-web's ``_origin_allowed``.)"""
+        allowed = allowed_hosts()
         origin = (self.headers.get("Origin") or "").strip()
         if origin:
-            # "null" (sandboxed/file: origins) is explicitly NOT loopback.
+            # "null" (sandboxed/file: origins) parses to no host -> rejected.
             host = self._origin_hostname(origin)
-            return host in _LOOPBACK_HOSTS
+            return host is not None and host in allowed
         referer = (self.headers.get("Referer") or "").strip()
         if referer:
             host = self._origin_hostname(referer)
-            return host in _LOOPBACK_HOSTS
+            return host is not None and host in allowed
         # No Origin and no Referer: not a cross-site browser write. Allow.
         return True
 
@@ -201,11 +281,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return self._serve_index()
             if path.startswith("/assets/"):
                 return self._serve_asset(path[len("/assets/"):])
+            if path == "/events":
+                return self._serve_events(self._gap(qs))
             if path == "/api/health":
                 return self._send_json({
                     "ok": True,
                     "log_dir": str(log_dir()),
                     "store_path": str(dstore.store_path()),
+                    "allowed_origins": sorted(allowed_hosts()),
                     "version": self.server_version,
                 })
             if path == "/api/runs":
@@ -289,7 +372,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         #   2. a foreign form/simple-request can't set application/json -> 415;
         # together with the Host allowlist this stops a malicious page from mutating
         # the local annotation store via the loopback port.
-        if not self._origin_is_loopback():
+        if not self._origin_is_allowed():
             return self._error(403, "forbidden: cross-origin write blocked (loopback Origin required)")
         if not self._content_type_is_json():
             return self._error(415, "unsupported media type: Content-Type must be application/json")
@@ -351,43 +434,201 @@ class DashboardHandler(BaseHTTPRequestHandler):
         ctype = _CONTENT_TYPES.get(p.suffix, "application/octet-stream")
         self._send_bytes(body, ctype)
 
+    # ---- SSE live stream -----------------------------------------------------
+    def _sse_write(self, payload: bytes) -> bool:
+        """Write one already-framed SSE chunk; return False if the client went away."""
+        try:
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
+
+    def _serve_events(self, gap: float) -> None:
+        """Server-Sent Events stream of LIVE review activity (CTO #3627).
+
+        review-cli has no event bus — the only durable trace of a run is the per-call
+        ``.log`` / brainstorm ``.md`` files it appends to ``log_dir()`` as a review streams.
+        So this watches that directory: every poll it snapshots each artifact's (mtime,
+        size), diffs against the previous snapshot, and for any NEW or GROWN file re-parses
+        the affected sessions and pushes them to the browser as an SSE ``run`` event (the
+        same summary shape ``/api/runs`` returns, so the front-end can update a row in
+        place). A trailing per-file ``log`` event carries the changed filename + backend +
+        whether it finished, so an in-progress call is visible the moment its log appears.
+
+        The connection is long-lived; ThreadingHTTPServer gives each one its own thread so
+        it never blocks the JSON endpoints. A heartbeat comment keeps idle proxies /
+        Tailscale from dropping the stream. The loop ends when the client disconnects.
+        """
+        ld = log_dir()
+        # Establish the baseline snapshot SYNCHRONOUSLY, before flushing the first byte.
+        # A client (or test) treats "first byte received" as "the stream is watching",
+        # then performs an action that writes a new log. If the baseline were taken lazily
+        # on the loop's first tick (up to _SSE_POLL_SECONDS later, on a separate thread that
+        # may not have been scheduled yet), a file written in that window would be folded
+        # into the baseline and NEVER reported as a live event. Snapshotting here guarantees
+        # any artifact that appears after the ": connected" flush is seen as a true delta.
+        last = self._snapshot_logs(ld)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        # Defeat proxy buffering (nginx/Tailscale Funnel) so events arrive promptly.
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        # Tell EventSource to back off a bit before reconnecting after a drop.
+        if not self._sse_write(b"retry: 3000\n\n"):
+            return
+        if not self._sse_write(b": connected\n\n"):
+            return
+
+        last_beat = time.monotonic()
+        # The handler runs on its own daemon thread; loop until the client disconnects
+        # (write fails) or the server is torn down.
+        while not getattr(self.server, "_sse_stop", False):
+            snapshot = self._snapshot_logs(ld)
+            changed = [name for name, sig in snapshot.items() if last.get(name) != sig]
+            removed = [name for name in last if name not in snapshot]
+            if changed or removed:
+                # Baseline was taken before the first byte was flushed, so any delta here is
+                # genuinely new activity since connect — emit it (no silent first-tick).
+                if not self._emit_activity(snapshot, last, gap):
+                    return
+                last = snapshot
+            now = time.monotonic()
+            if now - last_beat >= _SSE_HEARTBEAT_SECONDS:
+                if not self._sse_write(b": heartbeat\n\n"):
+                    return
+                last_beat = now
+            time.sleep(_SSE_POLL_SECONDS)
+
+    @staticmethod
+    def _snapshot_logs(ld: Path) -> dict[str, tuple[float, int]]:
+        """{filename: (mtime, size)} for the run artifacts in the log dir (cheap stat-only)."""
+        snap: dict[str, tuple[float, int]] = {}
+        try:
+            entries = list(ld.iterdir())
+        except OSError:
+            return snap
+        for entry in entries:
+            if entry.suffix not in (".log", ".md"):
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            snap[entry.name] = (st.st_mtime, st.st_size)
+        return snap
+
+    def _emit_activity(
+        self,
+        snapshot: dict[str, tuple[float, int]],
+        last: dict[str, tuple[float, int]],
+        gap: float,
+    ) -> bool:
+        """Push SSE events for the artifacts that changed since ``last``. False on disconnect."""
+        ld = log_dir()
+        changed_files = sorted(name for name, sig in snapshot.items() if last.get(name) != sig)
+        # Per-file `log` events: cheapest, most immediate signal that a call is streaming.
+        for name in changed_files:
+            grew = name in last
+            payload = {"filename": name, "grew": grew}
+            c = dparser.parse_call_log(ld / name)
+            if c is not None:
+                payload.update({
+                    "kind": "call",
+                    "backend": c.backend,
+                    "round": c.round,
+                    "completed": c.completed,
+                    "has_error": c.has_error,
+                })
+            elif name.endswith(".md"):
+                payload["kind"] = "brainstorm"
+            if not self._send_sse_event("log", payload):
+                return False
+        # Session-level `run` events: the affected sessions, summary shape == /api/runs so
+        # the front-end can refresh a row (or the whole list) in place.
+        sessions = dparser.load_sessions(ld, gap_seconds=gap)
+        # Only the sessions whose window overlaps a changed file are "live"; cheap heuristic
+        # = re-emit the newest few summaries (the changed files are almost always the newest).
+        for s in sessions[:_SSE_RECENT_RUNS]:
+            summ = _merge_annotation(s.to_summary(), s.session_id)
+            if not self._send_sse_event("run", summ):
+                return False
+        return True
+
+    def _send_sse_event(self, event: str, data: dict) -> bool:
+        """Frame + write one named SSE event. False if the client disconnected."""
+        body = json.dumps(data, separators=(",", ":"))
+        chunk = f"event: {event}\ndata: {body}\n\n".encode("utf-8")
+        return self._sse_write(chunk)
+
 
 def make_server(port: int = 0, *, host: str = "127.0.0.1", verbose: bool = False) -> ThreadingHTTPServer:
-    """Create (but do not serve) the dashboard server bound to 127.0.0.1.
+    """Create (but do not serve) the dashboard server bound to ``host:port``.
 
+    Default host is loopback (127.0.0.1); pass ``host="0.0.0.0"`` to expose over Tailscale.
     port=0 picks a free ephemeral port (used by tests). The bound port is on
     ``server.server_address[1]``.
     """
     httpd = ThreadingHTTPServer((host, port), DashboardHandler)
     httpd.verbose = verbose  # type: ignore[attr-defined]
+    # SSE handlers loop on their own threads; this flag lets shutdown end them promptly so
+    # the process can exit instead of hanging on a daemon thread mid-poll.
+    httpd._sse_stop = False  # type: ignore[attr-defined]
     httpd.daemon_threads = True
     return httpd
 
 
-def run_dashboard(port: int | None = None, *, open_browser: bool = True, verbose: bool = False) -> int:
+def _reachable_urls(host: str, port: int) -> list[str]:
+    """Best-effort list of URLs the server is reachable at (for the startup banner)."""
+    urls: list[str] = []
+    if host in ("0.0.0.0", "::"):
+        urls.append(f"http://127.0.0.1:{port}/")
+        # Surface THIS machine's discovered Tailscale name/IPs (if any) so the printed URL
+        # is tappable from the phone — discovered at runtime, never hardcoded.
+        for h in sorted(_discover_tailscale_hosts()):
+            urls.append(f"http://{h}:{port}/")
+    else:
+        urls.append(f"http://{host}:{port}/")
+    return urls
+
+
+def run_dashboard(
+    port: int | None = None,
+    *,
+    host: str = "127.0.0.1",
+    open_browser: bool = True,
+    verbose: bool = False,
+) -> int:
     """Blocking entry for ``review dashboard``. Returns a process exit code."""
     # Pass 0 straight to the server so the OS picks AND binds a free ephemeral port in one
     # step, reporting it via server_address — instead of probe-bind-close-then-rebind,
     # which leaves a TOCTOU window for another local process to claim the port (codex P3).
     chosen = port or 0
     try:
-        httpd = make_server(chosen, verbose=verbose)
+        httpd = make_server(chosen, host=host, verbose=verbose)
     except OSError as exc:
-        target = f"127.0.0.1:{chosen}" if chosen else "127.0.0.1 (ephemeral port)"
+        target = f"{host}:{chosen}" if chosen else f"{host} (ephemeral port)"
         print(f"[review dashboard] cannot bind {target}: {exc}", flush=True)
         return 1
     bound = httpd.server_address[1]
-    url = f"http://127.0.0.1:{bound}/"
-    print(f"[review dashboard] serving {url}", flush=True)
+    urls = _reachable_urls(host, bound)
+    for url in urls:
+        print(f"[review dashboard] serving {url}", flush=True)
     print(f"[review dashboard] logs: {log_dir()}", flush=True)
     print(f"[review dashboard] store: {dstore.store_path()}", flush=True)
-    print("[review dashboard] local-only (127.0.0.1). Ctrl-C to stop.", flush=True)
+    if host in ("0.0.0.0", "::"):
+        print("[review dashboard] bound to all interfaces — reachable over Tailscale. "
+              "Reads open; writes allowed from loopback + the Tailscale host. Ctrl-C to stop.", flush=True)
+    else:
+        print("[review dashboard] loopback-only. Pass --host 0.0.0.0 to expose over Tailscale. Ctrl-C to stop.", flush=True)
     if open_browser:
         def _open() -> None:
             import webbrowser
 
             try:
-                webbrowser.open(url)
+                webbrowser.open(urls[0])
             except Exception:  # noqa: BLE001
                 pass
         threading.Timer(0.4, _open).start()
@@ -396,6 +637,7 @@ def run_dashboard(port: int | None = None, *, open_browser: bool = True, verbose
     except KeyboardInterrupt:
         print("\n[review dashboard] stopped.", flush=True)
     finally:
+        httpd._sse_stop = True  # type: ignore[attr-defined] — end any live SSE loops
         httpd.shutdown()
         httpd.server_close()
     return 0
