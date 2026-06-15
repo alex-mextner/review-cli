@@ -1593,7 +1593,9 @@ def test_sse_events_stream_content_type_and_live_event():
                 assert resp.status == 200, resp.status
                 ctype = resp.getheader("Content-Type") or ""
                 assert ctype.startswith("text/event-stream"), ctype
-                # Read the initial framing (retry: + : connected) so the baseline tick has run.
+                # Read the initial framing (retry: + : connected). The handler snapshots its
+                # baseline BEFORE flushing the first byte, so once a byte arrives the baseline
+                # is already established and a log written now is guaranteed to read as a delta.
                 resp.read(1)  # block until at least one byte is flushed
                 # Now write a NEW call log — the watcher must pick it up and stream an event.
                 _write_call_log(Path(logd), "20260601T100000_000000", "codex", 0,
@@ -1631,6 +1633,73 @@ def test_sse_events_stream_content_type_and_live_event():
                 httpd.shutdown()
                 httpd.server_close()
         finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_sse_baseline_snapshot_is_taken_before_first_byte_no_lost_event():
+    """(SSE race regression) A log written AFTER the client sees the first byte but BEFORE
+    the watcher thread reaches its first poll must STILL be reported — never folded into a
+    silent baseline. We force exactly that ordering (the CI thread-scheduling that made the
+    live-event test time out): the very first ``_snapshot_logs`` call (the connect-time
+    baseline) is delayed, and the test writes the new log during that delay. With the
+    baseline taken synchronously before the first byte is flushed, the file is guaranteed to
+    be a delta; under the old lazy-first-tick baseline it would be absorbed and lost."""
+    import http.client
+    import time as _t
+
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        orig_snapshot = server.DashboardHandler._snapshot_logs
+        state = {"delayed": False}
+
+        def slow_first_snapshot(ld):
+            # Delay ONLY the first snapshot (the connect-time baseline) so the test's write
+            # reliably lands before it — reproducing the CI ordering that lost the event.
+            if not state["delayed"]:
+                state["delayed"] = True
+                _t.sleep(1.5)
+            return orig_snapshot(ld)
+
+        server.DashboardHandler._snapshot_logs = staticmethod(slow_first_snapshot)
+        try:
+            httpd = server.make_server(0)
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+                conn.request("GET", "/events", headers={"Host": f"127.0.0.1:{port}"})
+                resp = conn.getresponse()
+                assert resp.status == 200, resp.status
+                # Block until the first byte. Because the baseline snapshot is taken BEFORE
+                # this byte is flushed, the slow_first_snapshot delay has already elapsed by
+                # the time read(1) returns — so our write below is strictly after the baseline.
+                resp.read(1)
+                _write_call_log(Path(logd), "20260601T100000_000000", "codex", 0,
+                                "live run output\n", exit_code=0)
+                buf = b""
+                saw_run = saw_log = False
+                deadline = _t.monotonic() + 12
+                while _t.monotonic() < deadline and not (saw_run and saw_log):
+                    chunk = resp.read1(64)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    saw_log = saw_log or b"event: log" in buf
+                    saw_run = saw_run or b"event: run" in buf
+                assert saw_log, f"baseline race: log event lost; got: {buf[:400]!r}"
+                assert saw_run, f"baseline race: run event lost; got: {buf[:400]!r}"
+                conn.close()
+            finally:
+                httpd._sse_stop = True
+                httpd.shutdown()
+                httpd.server_close()
+        finally:
+            server.DashboardHandler._snapshot_logs = staticmethod(orig_snapshot)
             os.environ.pop("REVIEW_LOG_DIR", None)
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
 

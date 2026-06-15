@@ -461,6 +461,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         Tailscale from dropping the stream. The loop ends when the client disconnects.
         """
         ld = log_dir()
+        # Establish the baseline snapshot SYNCHRONOUSLY, before flushing the first byte.
+        # A client (or test) treats "first byte received" as "the stream is watching",
+        # then performs an action that writes a new log. If the baseline were taken lazily
+        # on the loop's first tick (up to _SSE_POLL_SECONDS later, on a separate thread that
+        # may not have been scheduled yet), a file written in that window would be folded
+        # into the baseline and NEVER reported as a live event. Snapshotting here guarantees
+        # any artifact that appears after the ": connected" flush is seen as a true delta.
+        last = self._snapshot_logs(ld)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -474,8 +482,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self._sse_write(b": connected\n\n"):
             return
 
-        last: dict[str, tuple[float, int]] = {}
-        first = True
         last_beat = time.monotonic()
         # The handler runs on its own daemon thread; loop until the client disconnects
         # (write fails) or the server is torn down.
@@ -484,14 +490,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             changed = [name for name, sig in snapshot.items() if last.get(name) != sig]
             removed = [name for name in last if name not in snapshot]
             if changed or removed:
-                # Re-parse once and push the affected sessions. On the FIRST tick we only
-                # establish the baseline silently (the page already loaded /api/runs); after
-                # that, any delta is a live event.
-                if not first:
-                    if not self._emit_activity(snapshot, last, gap):
-                        return
+                # Baseline was taken before the first byte was flushed, so any delta here is
+                # genuinely new activity since connect — emit it (no silent first-tick).
+                if not self._emit_activity(snapshot, last, gap):
+                    return
                 last = snapshot
-            first = False
             now = time.monotonic()
             if now - last_beat >= _SSE_HEARTBEAT_SECONDS:
                 if not self._sse_write(b": heartbeat\n\n"):
