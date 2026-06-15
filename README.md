@@ -390,10 +390,11 @@ Add `--no-ai` to run cvGate only (fast CI smoke / offline), `--json` for the mac
 ## `review spec-web <spec.md>` — interactive spec reviewer
 
 **Render any markdown spec server-side and review it like a GitHub PR.** Select any text in
-the rendered spec → ask a question / leave a comment anchored to that selection; comments
-accumulate in a **pending batch**; one **Submit review** finalizes them; answers thread
-inline under each comment. Reusable for *any* spec markdown file. Serve it over Tailscale to
-review from your phone.
+the rendered spec → leave a **question** (expects an answer from the spec author) or a
+**remark** (feedback that doesn't), anchored to that selection; notes accumulate in a
+**pending batch**; one **Submit review** finalizes them; answers thread inline under each
+note, and any note can be **edited** in place. Single implicit reviewer (no author field).
+Reusable for *any* spec markdown file. Serve it over Tailscale to review from your phone.
 
 ```sh
 # local, ephemeral port, opens a browser
@@ -418,19 +419,24 @@ review spec-web docs/specs/my-spec.md --export > review.md
 | `--open` | open the URL in a browser on startup |
 
 **Layout.** Desktop (≥900px) = two panes side-by-side (spec left, comments right, a
-draggable divider). Mobile (<900px) = comments as a bottom sheet under the spec. Both panes
-collapse/expand from the topbar.
+draggable divider). Mobile (<900px) = comments as a bottom sheet under the spec. The
+comments panel collapses to just its header bar (which carries a **count badge** so added
+notes are visible while collapsed) and re-expands from that same bar. Following an internal
+cross-reference link shows a **← Back** control that returns to the prior scroll position.
 
 **Rendering.** Markdown → HTML is rendered server-side with the GitHub heading-slug scheme,
 so the spec's own internal links (`[§9.4](#94-…)`) resolve. Figures referenced as
 `./assets/fig-*.svg|png` are served as real HTTP resources at `/asset/<name>` (never
-inlined).
+inlined). Tables size columns to their content and scroll horizontally on narrow screens
+rather than crushing columns.
 
-**Comments.** A comment stores the selected quote, the containing section id, char offsets,
-the body, author, created-at, a status (`pending`/`submitted`/`answered`/`resolved`), and a
-thread of replies. On reload, each comment re-anchors by locating its quote within its
-section and highlighting it; a quote that can't be re-found shows in the sidebar as
-**unanchored** (never a crash).
+**Comments.** A note stores the selected quote, the containing section id, char offsets, its
+**kind** (`question` | `remark`, default `remark`), the body, created-at, a status
+(`pending`/`submitted`/`answered`/`resolved`), and a thread of replies. (An `author` field
+is still persisted for import/export round-tripping but is not shown in the UI.) The kind is
+surfaced with a coloured chip + icon; each note can be edited (`/api/comments/<id>/edit`). On
+reload, each note re-anchors by locating its quote within its section and highlighting it; a
+quote that can't be re-found shows in the sidebar as **unanchored** (never a crash).
 
 **Persistence.** One JSON file per spec at `~/.config/review-cli/spec-web/<sha1-of-abspath>.json`
 (mode `0600`), surviving restarts. Override the directory with `$REVIEW_SPECWEB_DIR`.
@@ -458,6 +464,7 @@ Tailscale, the Tailscale name/IP must be discovered or listed in
       "body": "the question or comment",
       "section_id": "94-...",
       "section_title": "§9.4 ...",
+      "kind": "question",
       "author": "alex",
       "status": "submitted",
       "batch": "2026-06-14T10:00:00+00:00",
@@ -472,7 +479,7 @@ top level to discard existing comments before importing.
 
 Routes: `GET /` (SPA shell), `GET /static/<app.css|app.js>`, `GET /asset/<name>`,
 `GET /api/spec`, `GET /api/comments`, `GET /api/export`, `POST /api/comments`,
-`POST /api/comments/<id>/{reply,status,delete}`, `POST /api/submit`, `POST /api/import`.
+`POST /api/comments/<id>/{reply,edit,status,delete}`, `POST /api/submit`, `POST /api/import`.
 
 ---
 

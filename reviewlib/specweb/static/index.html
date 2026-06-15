@@ -8,15 +8,8 @@
 </head>
 <body data-spec-title="{{SPEC_TITLE}}">
 <header class="topbar">
-  <button class="icon-btn" id="toggleSpec" title="Collapse / expand spec" aria-label="Toggle spec pane">📄</button>
   <div class="topbar-title">Spec review · <span id="specTitle">{{SPEC_TITLE}}</span></div>
-  <div class="topbar-actions">
-    <label class="author-field">
-      <span>you</span>
-      <input type="text" id="authorInput" placeholder="reviewer" autocomplete="off" spellcheck="false">
-    </label>
-    <button class="icon-btn" id="toggleComments" title="Collapse / expand comments" aria-label="Toggle comments pane">💬</button>
-  </div>
+  <button class="back-btn" id="navBack" hidden title="Back to previous position" aria-label="Back to previous position">← Back</button>
 </header>
 
 <div class="layout" id="layout">
@@ -30,14 +23,21 @@
 
   <aside class="comments-pane" id="commentsPane">
     <div class="comments-header">
-      <div class="filters" id="filters">
-        <button data-filter="all" class="active">All</button>
-        <button data-filter="pending">Pending</button>
-        <button data-filter="submitted">Submitted</button>
-        <button data-filter="answered">Answered</button>
-        <button data-filter="resolved">Resolved</button>
-      </div>
-      <button class="mobile-collapse" id="commentsCollapse" aria-label="Collapse comments">▾</button>
+      <button class="comments-collapse" id="commentsCollapse" aria-label="Collapse comments" aria-expanded="true">
+        <span class="collapse-caret" aria-hidden="true">▾</span>
+        <span class="collapse-label">Comments</span>
+        <span class="comments-count" id="commentsCount" hidden>0</span>
+      </button>
+      <label class="filter-select-label">
+        <span class="sr-only">Filter comments</span>
+        <select id="filterSelect">
+          <option value="all">All</option>
+          <option value="pending">Pending</option>
+          <option value="submitted">Submitted</option>
+          <option value="answered">Answered</option>
+          <option value="resolved">Resolved</option>
+        </select>
+      </label>
     </div>
     <div class="pending-tray" id="pendingTray" hidden>
       <span id="pendingLabel">Pending review (0)</span>
@@ -45,7 +45,7 @@
     </div>
     <div class="comments-list" id="commentsList"></div>
     <div class="comments-empty" id="commentsEmpty">
-      Select any text in the spec to ask a question or leave a comment.
+      Select any text in the spec to ask a question or leave a remark.
     </div>
     <div class="export-row">
       <a href="/api/export" id="exportLink" download>Export review as markdown</a>
@@ -53,18 +53,25 @@
   </aside>
 </div>
 
-<!-- Selection popup -->
+<!-- Selection popup: the two kinds are framed distinctly (question expects an answer,
+     remark is feedback that does not). The button titles are injected from KINDS at boot
+     so the framing text has one source of truth (app.js). -->
 <div class="sel-popup" id="selPopup" hidden>
-  <button id="selComment">💬 Add comment</button>
-  <button id="selQuestion">❓ Ask question</button>
+  <button id="selQuestion" class="sel-kind sel-kind-question">
+    <span class="kind-icon" aria-hidden="true">❓</span> Ask a question
+  </button>
+  <button id="selRemark" class="sel-kind sel-kind-remark">
+    <span class="kind-icon" aria-hidden="true">💬</span> Leave a remark
+  </button>
 </div>
 
-<!-- New-comment composer -->
+<!-- New-comment / question composer -->
 <div class="composer-backdrop" id="composerBackdrop" hidden>
-  <div class="composer" id="composer" role="dialog" aria-modal="true" aria-label="New comment">
-    <div class="composer-head" id="composerHead">New comment</div>
+  <div class="composer" id="composer" role="dialog" aria-modal="true" aria-labelledby="composerHead">
+    <div class="composer-head" id="composerHead">New remark</div>
+    <div class="composer-hint" id="composerHint"></div>
     <blockquote class="composer-quote" id="composerQuote"></blockquote>
-    <textarea id="composerBody" placeholder="Write a comment or a question…" rows="4"></textarea>
+    <textarea id="composerBody" placeholder="Write a remark or a question…" rows="4"></textarea>
     <div class="composer-actions">
       <button id="composerCancel">Cancel</button>
       <button id="composerSubmit" class="primary">Add to review</button>
