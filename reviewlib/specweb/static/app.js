@@ -169,14 +169,30 @@
     return text;
   }
 
+  // A selection lives inside the spec body when BOTH endpoints are within it. Checking only
+  // anchorNode misses a selection dragged from outside in, and (on touch) iOS sometimes
+  // reports the anchor on a boundary node; require focusNode too so we never act on a
+  // selection that is only partly in the spec.
+  function selectionInSpec(sel) {
+    if (!sel || sel.rangeCount === 0) return false;
+    return els.specBody.contains(sel.anchorNode) && els.specBody.contains(sel.focusNode);
+  }
+
+  // Single input-agnostic entry point. Called from BOTH pointerup (immediate, desktop-
+  // friendly) and a debounced selectionchange (the signal iOS Safari actually delivers when
+  // the native selection finalizes — it does not emit a clean pointerup over the text). One
+  // code path for mouse, touch and pen: no per-device branching.
   function onSelection() {
+    // While the composer modal is open the pendingSelection is already captured; a late
+    // selectionchange/pointerup must not re-show the popup behind the dialog.
+    if (!els.composerBackdrop.hidden) return;
     var sel = window.getSelection();
-    if (!sel || sel.isCollapsed) {
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
       hidePopup();
       return;
     }
     var text = (sel.toString() || '').trim();
-    if (!text || !els.specBody.contains(sel.anchorNode)) {
+    if (!text || !selectionInSpec(sel)) {
       hidePopup();
       return;
     }
@@ -186,6 +202,10 @@
     // indexOf match) so a quote that repeats in the section re-anchors to the occurrence
     // the user actually selected, not the first one.
     var start = selectionOffsetInSection(sec.id, range);
+    // CAPTURE the selected text + anchor/offsets NOW, at show time, and stash it. iOS clears
+    // the live selection the instant the user taps the popup (the native callout dismisses
+    // it), so reading window.getSelection() at button-tap time returns empty — every later
+    // read (openComposer, submit) must come from this stash, never from getSelection().
     state.pendingSelection = {
       quote: text,
       section_id: sec.id,
@@ -195,6 +215,29 @@
     };
     var rect = range.getBoundingClientRect();
     showPopup(rect);
+  }
+
+  // selectionchange fires continuously while a selection is being dragged/extended; debounce
+  // so we only act once the selection has SETTLED (this many ms of quiet). This is the
+  // reliable iOS finalize signal; on desktop pointerup already fired, so it is a harmless
+  // re-confirm.
+  var SELECTION_SETTLE_MS = 200;
+  // A real pointer emits pointerup THEN a synthetic click a few hundred ms later; suppress
+  // the trailing click within this window so the popup button does not fire twice.
+  var POINTER_CLICK_ECHO_MS = 700;
+  var selectionChangeTimer = null;
+  function cancelPendingSelectionCheck() {
+    if (selectionChangeTimer) {
+      clearTimeout(selectionChangeTimer);
+      selectionChangeTimer = null;
+    }
+  }
+  function scheduleSelectionCheck() {
+    cancelPendingSelectionCheck();
+    selectionChangeTimer = setTimeout(function () {
+      selectionChangeTimer = null;
+      onSelection();
+    }, SELECTION_SETTLE_MS);
   }
 
   // Char offset of a range's start within the concatenated text of its section. Measures
@@ -756,20 +799,54 @@
 
   // ---- wire ---------------------------------------------------------------
   function wire() {
-    document.addEventListener('mouseup', function (e) {
+    // UNIVERSAL pointer path: pointerup covers mouse, touch and pen in one handler — no
+    // separate mouse-vs-touch branches. It is the immediate, desktop-friendly trigger.
+    document.addEventListener('pointerup', function (e) {
+      // A tap inside the popup itself is a button press, not a new selection — ignore it so
+      // showing/using the popup never re-evaluates (and clears) the selection underneath.
       if (els.selPopup.contains(e.target)) return;
+      // Defer one tick so the browser has committed the final selection for this pointerup.
       setTimeout(onSelection, 0);
     });
+    // selectionchange is the signal iOS Safari DOES deliver when the native selection
+    // finalizes (pointerup over selected text is swallowed by the callout). Debounced so it
+    // only fires once the selection settles. When the selection collapses, hide immediately.
     document.addEventListener('selectionchange', function () {
       var sel = window.getSelection();
-      if (!sel || sel.isCollapsed) hidePopup();
+      if (!sel || sel.isCollapsed) {
+        cancelPendingSelectionCheck();
+        hidePopup();
+        return;
+      }
+      scheduleSelectionCheck();
     });
-    els.selComment.addEventListener('click', function () {
-      openComposer('comment');
-    });
-    els.selQuestion.addEventListener('click', function () {
-      openComposer('question');
-    });
+    // Popup buttons: pointerdown (preventDefault) keeps the selection alive — a bare click is
+    // flaky after a touch selection on iOS and can fire after the selection has been cleared.
+    // pointerup then opens the composer using the ALREADY-STASHED selection.
+    function wirePopupButton(btn, kind) {
+      // A real pointer emits pointerup THEN a synthetic click. We act on pointerup and stamp
+      // the time; the trailing click within this window is the pointer's own echo and is
+      // ignored. A keyboard/assistive activation (Enter/Space) produces a click with NO
+      // recent pointerup, so it still opens — and because the guard is a timestamp, not a
+      // boolean, it self-heals (a missed click never leaves a future interaction suppressed).
+      var lastPointerAt = 0;
+      btn.addEventListener('pointerdown', function (e) {
+        // Stop the browser from collapsing the selection / focusing away before we read it.
+        e.preventDefault();
+      });
+      btn.addEventListener('pointerup', function (e) {
+        e.preventDefault();
+        lastPointerAt = Date.now();
+        openComposer(kind);
+      });
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        if (Date.now() - lastPointerAt < POINTER_CLICK_ECHO_MS) return; // pointer's own echo
+        openComposer(kind);
+      });
+    }
+    wirePopupButton(els.selComment, 'comment');
+    wirePopupButton(els.selQuestion, 'question');
     els.composerCancel.addEventListener('click', closeComposer);
     els.composerSubmit.addEventListener('click', submitComposer);
     els.composerBackdrop.addEventListener('click', function (e) {
