@@ -33,6 +33,23 @@ bin/review --help | grep -q -- "--no-local-model"
 bin/review --help | grep -q -- "--show-board"
 bin/review --help | grep -q -- "--pool"
 ! bin/review --help | grep -q -- "--no-board"
+
+# -o / --output: documented in help, steers away from `> file` (zsh noclobber), and
+# actually writes a file (bypassing the shell redirect) while still printing to stdout.
+bin/review --help | grep -q -- "-o FILE"
+bin/review --help | grep -qi "noclobber"
+OUT_SMOKE="$(mktemp -d)/sub/out.txt"   # parent dir does NOT exist yet -> must be created
+bin/review -o "$OUT_SMOKE" --list-defaults | grep -q codex   # still prints to stdout
+grep -q codex "$OUT_SMOKE"                                    # AND wrote the file (parent dir made)
+# Overwrite must work even under noclobber (the bug `-o` fixes); shell `>` would refuse.
+set -o noclobber
+bin/review -o "$OUT_SMOKE" --show-board >/dev/null
+grep -q "architect" "$OUT_SMOKE"
+set +o noclobber
+
+# Board scope labels: agentic (codex/opencode/claude-CLI read the repo) vs diff-only.
+bin/review --show-board | grep -qi "agentic"
+bin/review --show-board | grep -qi "diff-only"
 bin/review --show-board | grep -q "architect"
 bin/review --show-board | grep -q "claude:claude-fable-5"
 bin/review --show-board | grep -q "claude:claude-opus-4-8"
@@ -98,6 +115,18 @@ echo "moderator tests OK"
 # cwd resolution: git-toplevel detection + non-repo warning (real temp git repos).
 python3 tests/test_cwd.py
 echo "cwd tests OK"
+
+# -o / --output: argv extraction (all flag forms), tee-to-stdout + file write, overwrite
+# (the noclobber fix), parent-dir creation, bad-path error, file written even on a
+# non-zero review. All offline (uses --list-defaults; no backends needed).
+python3 tests/test_output_flag.py
+echo "output-flag tests OK"
+
+# opencode real-repo (read-only agentic): the oc: backend runs in the real -C repo with
+# --dir (reads any file), falls back to a temp dir outside a repo, and never writes to
+# the repo. _run_streamed is mocked so no live opencode is needed.
+python3 tests/test_opencode_realrepo.py
+echo "opencode-realrepo tests OK"
 
 # spec-web reviewer: render (slugs/figures), store (CRUD/submit/seed/export, 0600),
 # server routes + origin guard (loopback + Tailscale allowed, foreign rejected). All

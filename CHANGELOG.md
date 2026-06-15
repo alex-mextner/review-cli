@@ -5,6 +5,32 @@ semantic versioning.
 
 ## Unreleased
 
+- **`-o FILE` / `--output FILE`** — write the review result to a file via Python
+  (`open(...,"w")`), which **bypasses the shell redirect** and therefore zsh
+  `noclobber`. Agents that ran `review … > out.md` hit a silent failure under
+  `noclobber` (the `>` refuses to overwrite an existing file and the command dies
+  with no review and no error); `-o out.md` fixes that — it creates parent dirs,
+  overwrites, and **still prints to stdout** so the result streams live. The file is
+  written on any completed run (including a non-zero one like "No diff to review"), but
+  NOT on an early `SystemExit` — an argparse usage error or `--help` never truncates a
+  pre-existing `-o` target. Use `review -o out.md`, not `review … > out.md`.
+- **opencode backend is now agentic (reads the real repo, read-only)** — the `oc:` /
+  `opencode:` backend used to run in an empty temp `git init` dir, so it only ever saw
+  the diff in the prompt (the same blindness as the raw-API seats). It now runs in the
+  **real `-C` repository** (`opencode run --dir <repo>`), exactly like the codex
+  backend, so an `oc:` seat can **read any project file**, not just the diff. Safety is
+  enforced by the `read-only-reviewer` agent (denies `edit`/`write`/`bash`/`webfetch`):
+  opencode may open files but never mutates the worktree, runs a command, or hits the
+  network. It falls back to an isolated temp dir (diff-only) when `-C` is not a git repo
+  (e.g. `--just-ask` from a scratch dir) **or when the repo ships its own opencode config**
+  (`.opencode/` or `opencode.json`/`.jsonc`) — a repo-local agent definition can override
+  the global read-only agent and re-enable write/bash, so review refuses to run agentically
+  there and reviews the diff in a clean dir instead (sandbox-trust safety). **The api-only board seats (commandcode, z.ai) stay raw** and are
+  NOT routed through opencode: opencode's `@ai-sdk/openai-compatible` adapter does not
+  reliably drive the Command Code gateway (it hangs / returns empty while the same
+  models answer over raw HTTP), and z.ai/GLM is not an opencode-native provider — so
+  the agentic real-repo treatment applies to opencode-native models (`oc:deepseek/…`,
+  `oc:fireworks/…`, the free `oc:opencode/…` gateway).
 - **Priority-ordered failover reviewer pool** — the reviewer board is now a
   **priority-ordered** list of 8 models (strongest first), and a plain `review` runs a
   **pool of 4** chosen by **priority + availability** with two layers of failover so the

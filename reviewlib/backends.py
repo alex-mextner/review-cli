@@ -113,15 +113,102 @@ def _ensure_opencode_readonly_agent(_project: Path, _oc_model: str) -> None:
     )
 
 
+# Project-local opencode config paths that opencode merges when run with `--dir <cwd>`.
+# A reviewed repo that ships ANY of these can REDEFINE the `read-only-reviewer` agent
+# (or the global permission rules) and FLIP its deny→allow — verified: a repo-local
+# `.opencode/agent/read-only-reviewer.md` with `permission: { write: allow, … }` (or an
+# `agent:` block in a root opencode.json/jsonc) wins over our global agent, and neither
+# OPENCODE_DISABLE_PROJECT_CONFIG nor OPENCODE_PERMISSION nor an inline OPENCODE_CONFIG
+# agent suppresses it. So the read-only guarantee would depend on the repo under review.
+# We refuse to run agentically in such a repo and fall back to the isolated temp-dir
+# (diff-only) posture instead — the safe default for a potentially adversarial repo.
+_OPENCODE_PROJECT_CONFIG_NAMES = (".opencode", "opencode.json", "opencode.jsonc")
+
+
+def _opencode_has_project_config(cwd: Path) -> bool:
+    """True if `cwd` ships its OWN opencode config that could redefine the read-only
+    agent / weaken its permissions (see _OPENCODE_PROJECT_CONFIG_NAMES). When True we do
+    NOT run opencode agentically there — the sandbox can't be trusted."""
+    return any((cwd / name).exists() for name in _OPENCODE_PROJECT_CONFIG_NAMES)
+
+
+def _opencode_runs_in_repo(cwd: Path) -> bool:
+    """True iff `cwd` is a git repo we can let opencode read AGENTICALLY AND SAFELY.
+
+    Mirrors review's own cwd resolution: the panel/agentic backends (codex/claude)
+    run in the REAL repo read-only and read the whole tree; opencode now does the
+    same so the api-only seats routed through it (deepseek/kimi/qwen/glm via `oc:`)
+    are AGENTIC too — they can open any project file, not just the diff in the prompt.
+
+    Two gates, both required:
+      * it must be a git work tree (a non-repo `cwd` — e.g. `--just-ask` from /tmp —
+        has nothing to read, so we fall back rather than roam a scratch dir);
+      * it must NOT ship its own opencode project config (.opencode/ or opencode.json
+        /jsonc), which could OVERRIDE our read-only agent and re-enable write/bash —
+        a real privilege-escalation path on an untrusted repo. Such a repo falls back
+        to the isolated temp-dir posture (read-only is enforced by the global agent in
+        a clean dir, where no project config can touch it)."""
+    if not cwd.is_dir():
+        return False
+    proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd, timeout=10)
+    if not (proc.returncode == 0 and proc.stdout.strip() == "true"):
+        return False
+    if _opencode_has_project_config(cwd):
+        print(
+            f"[review-cli] opencode: {cwd} ships its own opencode config "
+            "(.opencode/ or opencode.json) which could override the read-only agent; "
+            "running diff-only in an isolated dir for safety.",
+            file=sys.stderr, flush=True,
+        )
+        return False
+    return True
+
+
 def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     oc_model = model.split(":", 1)[1] if ":" in model else model
+    _ensure_opencode_readonly_agent(cwd, oc_model)
+
+    if _opencode_runs_in_repo(cwd):
+        command = f"opencode run --agent read-only-reviewer --dir {cwd} -m {oc_model} <prompt-with-diff>"
+        # AGENTIC, read-only: run opencode in the REAL repo (like review_codex's
+        # `codex exec -s read-only -C <cwd>`), so it can READ any project file — not
+        # just the diff embedded in the prompt. SAFETY is enforced by the
+        # read-only-reviewer agent: it DENIES bash/edit/write/webfetch/etc, so opencode
+        # may open files but can NEVER mutate the user's repo, run a command, or hit the
+        # network. The diff is still handed in the message as the review FOCUS; the repo
+        # is the surrounding context the model can pull in on demand.
+        message = (
+            f"{prompt}\n\nYou are reviewing a real git repository in READ-ONLY mode: "
+            "read any project file you need with your read tools, but do not edit, "
+            "write, or run commands. "
+            + (
+                f"Focus on this diff:\n\n```diff\n{diff}\n```"
+                if diff.strip()
+                else "Answer based on the repository and the prompt."
+            )
+        )
+        argv = [
+            _which("opencode"),
+            "run",
+            "--agent",
+            "read-only-reviewer",
+            "--dir",
+            str(cwd),
+            "-m",
+            oc_model,
+            message,
+        ]
+        proc = _run_streamed(argv, cwd=cwd, timeout=timeout, backend="opencode", round_no=round_no, announce=_ANNOUNCE_LOGS)
+        return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+    # FALLBACK: cwd is not a git repo (e.g. a panel `--just-ask` run from a scratch
+    # dir) — there is nothing to read, so keep the old isolated empty-temp-dir posture
+    # and review the diff/prompt alone.
+    command = f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
     with tempfile.TemporaryDirectory(prefix="review-cli-opencode-") as tmp_raw:
         tmp = Path(tmp_raw)
         _run(["git", "init", "-q"], cwd=tmp, timeout=30)
-        _ensure_opencode_readonly_agent(tmp, oc_model)
         if diff.strip():
-            context = tmp / "review.diff"
-            context.write_text(diff, encoding="utf-8")
             message = (
                 f"{prompt}\n\nYou are running outside the source repo; do not edit files. "
                 f"Review this diff:\n\n```diff\n{diff}\n```"
@@ -141,7 +228,6 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
             message,
         ]
         proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", round_no=round_no, announce=_ANNOUNCE_LOGS)
-    command = f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
