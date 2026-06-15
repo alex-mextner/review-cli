@@ -30,10 +30,12 @@ import reviewlib.backends as backends  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.config import (  # noqa: E402
     DEFAULT_BOARD,
+    DEFAULT_POOL_SIZE,
     REVIEW_ROLES,
     BoardConfigError,
     BoardReviewer,
     load_board,
+    select_pool,
 )
 from reviewlib.panel import build_board_jobs  # noqa: E402
 
@@ -60,6 +62,60 @@ def test_default_board_matches_directive_table():
 
 def test_default_board_has_eight_seats():
     assert len(DEFAULT_BOARD) == 8, len(DEFAULT_BOARD)
+
+
+# === --pool seat selection (board redesign): default 4, first-N, reserve = rest ==
+def test_default_pool_size_is_four():
+    assert DEFAULT_POOL_SIZE == 4, DEFAULT_POOL_SIZE
+
+
+def test_select_pool_default_picks_first_four_seats():
+    """Default pool = the FIRST 4 seats of the 8-seat board (the rest are reserve)."""
+    pool = select_pool(list(DEFAULT_BOARD), DEFAULT_POOL_SIZE)
+    assert len(pool) == 4
+    assert [r.model for r in pool] == [r.model for r in DEFAULT_BOARD[:4]]
+    # The reserve is exactly the remainder.
+    reserve = [r.model for r in DEFAULT_BOARD[4:]]
+    assert reserve == ["commandcode:moonshotai/Kimi-K2.7-Code",
+                       "commandcode:Qwen/Qwen3.7-Max", "zai:glm-5.2", "commandcode:gpt-5.5"]
+
+
+def test_select_pool_zero_or_negative_means_all_seats():
+    for n in (0, -1, -8):
+        assert [r.model for r in select_pool(list(DEFAULT_BOARD), n)] == [r.model for r in DEFAULT_BOARD]
+
+
+def test_select_pool_larger_than_board_is_clamped():
+    assert len(select_pool(list(DEFAULT_BOARD), 99)) == len(DEFAULT_BOARD)
+
+
+def test_select_pool_boundary_at_and_below_full_size():
+    """Exact boundary: pool == len(board) -> all (the `pool >= len` short-circuit);
+    pool == len(board) - 1 -> all but the last seat (GLM finding 11)."""
+    n = len(DEFAULT_BOARD)
+    assert [r.model for r in select_pool(list(DEFAULT_BOARD), n)] == [r.model for r in DEFAULT_BOARD]
+    assert [r.model for r in select_pool(list(DEFAULT_BOARD), n - 1)] == [r.model for r in DEFAULT_BOARD[:n - 1]]
+
+
+def test_select_pool_picks_first_n_in_order():
+    assert [r.model for r in select_pool(list(DEFAULT_BOARD), 2)] == [r.model for r in DEFAULT_BOARD[:2]]
+    assert [r.model for r in select_pool(list(DEFAULT_BOARD), 1)] == [DEFAULT_BOARD[0].model]
+
+
+def test_select_pool_empty_board_stays_empty():
+    assert select_pool([], 4) == []
+
+
+def test_select_pool_does_not_mutate_input(  ):
+    """select_pool must return a NEW list, leaving the caller's board untouched — a
+    future refactor returning a slice-view would silently mutate it (GLM finding 1)."""
+    src = list(DEFAULT_BOARD)
+    src_snapshot = list(src)
+    out = select_pool(src, 4)
+    out.append(BoardReviewer("x", "tests", "X"))  # mutate the result
+    assert src == src_snapshot, "select_pool mutated its input board"
+    # And the "all" branch (pool<=0) is a copy too, not the same object.
+    assert select_pool(src, 0) is not src
 
 
 def test_tests_seat_routes_to_zai_backend_with_glm52():
@@ -328,7 +384,7 @@ def test_mode_review_board_with_no_available_reviewers_returns_1():
     assert rc == 1, rc
 
 
-# === CLI wiring: explicit -m disables the board, --no-board too =================
+# === CLI wiring: explicit -m disables the board (no --no-board flag exists) ======
 def test_cli_explicit_models_disable_board():
     """An explicit -m must run the flat legacy panel (board=None), NOT the board."""
     from reviewlib import cli
@@ -354,12 +410,28 @@ def test_cli_explicit_models_disable_board():
         cli.main(["-m", "codex", "-C", str(REPO_ROOT)])
         assert captured["board"] is None, captured["board"]
         assert captured["models"] == ["codex"], captured["models"]
-        # --no-board with no -m -> still None, models = the legacy default/config list
-        sys.stdin = io.StringIO("+added line\n")
-        cli.main(["--no-board", "-C", str(REPO_ROOT)])
-        assert captured["board"] is None, captured["board"]
     finally:
         cli.mode_review = old
+        sys.stdin = old_stdin
+
+
+def test_cli_no_board_flag_is_gone():
+    """The board can NEVER be disabled: --no-board was removed, so argparse must
+    reject it (SystemExit) rather than silently accepting + disabling the board."""
+    from reviewlib import cli
+
+    old_stdin = sys.stdin
+    try:
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        raised = False
+        try:
+            cli.main(["--no-board", "-C", str(REPO_ROOT)])
+        except SystemExit:
+            raised = True  # argparse rejects the unknown flag
+        assert raised, "--no-board must be an unknown flag now (removed)"
+    finally:
         sys.stdin = old_stdin
 
 
@@ -540,8 +612,10 @@ def test_cli_all_malformed_board_fails_before_visual_fanout():
         sys.stdin = old_stdin
 
 
-def test_cli_default_path_activates_board():
-    """No -m, no --no-board -> the board is passed into mode_review."""
+def _capture_default_review_board(argv: list[str]) -> dict:
+    """Run `cli.main(argv)` on the default-review path with the board pinned to
+    DEFAULT_BOARD and an empty config, capturing the board passed into mode_review.
+    Shared by the default-pool and --pool wiring tests."""
     from reviewlib import cli
 
     captured: dict = {}
@@ -555,7 +629,7 @@ def test_cli_default_path_activates_board():
     # Pin the board to DEFAULT_BOARD AND stub load_config to an empty dict so the
     # test is independent of the dev machine's ~/.config/review-cli/config.yaml —
     # which DOES set `models:`, and a configured `models:` now (correctly) disables
-    # the board. The true default path has neither -m nor config models nor board.
+    # the board. The true default path has neither -m nor config models.
     old_load_board = cli.load_board
     cli.load_board = lambda _cfg: list(DEFAULT_BOARD)
     old_load_config = cli.load_config
@@ -566,14 +640,81 @@ def test_cli_default_path_activates_board():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        cli.main(["-C", str(REPO_ROOT)])
-        assert captured["board"] is not None, "board should be active by default"
-        assert len(captured["board"]) == len(DEFAULT_BOARD)
+        cli.main(argv)
     finally:
         cli.mode_review = old
         cli.load_board = old_load_board
         cli.load_config = old_load_config
         sys.stdin = old_stdin
+    return captured
+
+
+def test_cli_default_path_activates_board_at_default_pool():
+    """No -m -> the board is passed into mode_review, sized to the DEFAULT pool (4)."""
+    captured = _capture_default_review_board(["-C", str(REPO_ROOT)])
+    assert captured["board"] is not None, "board should be active by default"
+    # Board redesign: the default plain review runs only the FIRST 4 of the 8 seats.
+    assert len(captured["board"]) == DEFAULT_POOL_SIZE, len(captured["board"])
+    assert [r.model for r in captured["board"]] == [r.model for r in DEFAULT_BOARD[:DEFAULT_POOL_SIZE]]
+
+
+def test_cli_pool_flag_sizes_the_board():
+    """--pool N runs the first N seats; --pool 0 runs all 8 (the full reserve)."""
+    cap2 = _capture_default_review_board(["--pool", "2", "-C", str(REPO_ROOT)])
+    assert [r.model for r in cap2["board"]] == [r.model for r in DEFAULT_BOARD[:2]]
+    cap_all = _capture_default_review_board(["--pool", "0", "-C", str(REPO_ROOT)])
+    assert len(cap_all["board"]) == len(DEFAULT_BOARD)
+    cap8 = _capture_default_review_board(["--pool", "8", "-C", str(REPO_ROOT)])
+    assert len(cap8["board"]) == len(DEFAULT_BOARD)
+
+
+def _show_board_lines(pool_size: int, board_models: list[str] | None = None) -> list[str]:
+    """Run cli._show_board(config, pool_size) and return its stdout lines. When
+    board_models is given, a config `board:` of those models is used (each role tests)."""
+    import contextlib
+    import io
+
+    from reviewlib import cli
+
+    cfg: dict = {}
+    if board_models is not None:
+        cfg = {"board": [{"model": m, "role": "tests"} for m in board_models]}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli._show_board(cfg, pool_size)
+    assert rc == 0, rc
+    return buf.getvalue().splitlines()
+
+
+def test_show_board_honors_pool_flag_tagging():
+    """`--show-board --pool N` must tag the FIRST N seats `pool`, the rest `reserve`
+    (codex P2: previously it ignored N and always marked the default 4)."""
+    seat_lines = [ln for ln in _show_board_lines(2) if "[pool" in ln or "[reserve]" in ln]
+    assert len(seat_lines) == len(DEFAULT_BOARD)
+    pool_lines = [ln for ln in seat_lines if "[pool" in ln]
+    reserve_lines = [ln for ln in seat_lines if "[reserve]" in ln]
+    assert len(pool_lines) == 2, pool_lines
+    assert len(reserve_lines) == len(DEFAULT_BOARD) - 2, reserve_lines
+    # The first two displayed seats (Opus, Codex) are the pool.
+    assert "Opus" in pool_lines[0]
+    assert "Codex" in pool_lines[1]
+
+
+def test_show_board_pool_zero_marks_all_seats_pool():
+    seat_lines = [ln for ln in _show_board_lines(0) if "[pool" in ln or "[reserve]" in ln]
+    assert all("[pool" in ln for ln in seat_lines), seat_lines
+    assert not any("[reserve]" in ln for ln in seat_lines)
+
+
+def test_show_board_tags_by_index_not_model_for_duplicate_models():
+    """A board with the SAME model in two seats must tag each by INDEX, so a duplicate
+    model in the reserve isn't mislabeled `pool` (codex P2)."""
+    lines = _show_board_lines(1, board_models=["codex", "codex", "gemini"])
+    seat_lines = [ln for ln in lines if "[pool" in ln or "[reserve]" in ln]
+    assert len(seat_lines) == 3
+    assert "[pool" in seat_lines[0]
+    assert "[reserve]" in seat_lines[1], seat_lines[1]  # the duplicate codex, by index
+    assert "[reserve]" in seat_lines[2]
 
 
 def test_cli_list_defaults_reports_normalized_config_models(capfd=None):

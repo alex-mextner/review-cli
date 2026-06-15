@@ -58,14 +58,29 @@ def mode_brainstorm(
     moderators: list[str],
     rounds: int,
     max_rounds: int,
+    diff: str = "",
 ) -> int:
     min_rounds = max(rounds, 5)
     max_rounds = max(max_rounds, min_rounds)
     panel = models  # run-as-is; personas always fill >= 3 slots even if panel < 3
+    # OPTIONAL grounding diff: when a working-tree / --staged / piped diff is present,
+    # the brainstorm is ABOUT that specific change — the diff is fed to every persona
+    # (and the moderator) as constant context so the ideation is grounded, not abstract.
+    # An empty diff keeps the classic pure-ideation behaviour unchanged.
+    grounded = bool(diff.strip())
+    # A one-line note appended to each persona prompt when grounded, so the model knows
+    # the fenced ```diff``` block (added by the backend's _payload from PanelJob.diff) is
+    # the concrete change to brainstorm about, not stray context.
+    diff_note = (
+        "\n\nA specific code change is provided below as a ```diff``` block — brainstorm "
+        "concretely ABOUT this change (its design, risks, alternatives, follow-ups), "
+        "grounding every idea in it rather than reasoning in the abstract."
+        if grounded else ""
+    )
     transcript_blocks: list[str] = []
     moderator_label = ">".join(moderators)
     out: list[str] = [f"# Brainstorm: {topic}", f"panel={','.join(panel)} moderator={moderator_label} "
-                      f"rounds>={min_rounds} max={max_rounds}"]
+                      f"rounds>={min_rounds} max={max_rounds}{' grounded=diff' if grounded else ''}"]
 
     # DISCUSSION LOG: write the conversation to one file as each round/decision
     # lands (line-buffered, 0600, O_EXCL). The whole brainstorm used to be
@@ -112,10 +127,14 @@ def mode_brainstorm(
                     f"You are a '{persona_name}' ({persona_bg}). You are in round {round_no} of a "
                     "multi-round brainstorm. Build on the shared transcript of prior rounds — "
                     "react, extend, challenge, or propose new angles from YOUR perspective. "
-                    "Be concrete; offer ideas, not pleasantries. Do not edit files.\n\n"
+                    "Be concrete; offer ideas, not pleasantries. Do not edit files."
+                    f"{diff_note}\n\n"
                     f"TOPIC:\n{topic}\n\n=== SHARED TRANSCRIPT (prior rounds) ===\n{shared}"
                 )
-                jobs.append(PanelJob(model=model, prompt=prompt, diff="", label=f"{persona_name} ({model})", round_no=round_no))
+                # The constant grounding diff (if any) rides PanelJob.diff so the backend's
+                # _payload appends it as a fenced ```diff``` block over STDIN — ARG_MAX-safe,
+                # the same transport the shared transcript uses.
+                jobs.append(PanelJob(model=model, prompt=prompt, diff=diff, label=f"{persona_name} ({model})", round_no=round_no))
 
             round_results = run_panel(jobs, cwd, timeout)
             round_text = "\n\n".join(
@@ -132,10 +151,11 @@ def mode_brainstorm(
                 "You are the MODERATOR of a brainstorm. Summarize the round below in a few bullets, "
                 "then decide whether the discussion has CONVERGED / saturated (diminishing new ideas). "
                 "End your reply with a final line that is EXACTLY one of: 'DECISION: STOP' or "
-                "'DECISION: CONTINUE'.\n\n"
+                "'DECISION: CONTINUE'."
+                f"{diff_note}\n\n"
                 f"TOPIC:\n{topic}\n\n=== ROUND {round_no} ===\n{round_text}"
             )
-            mod_result = run_moderator(moderators, mod_prompt, cwd, timeout, round_no=round_no)
+            mod_result = run_moderator(moderators, mod_prompt, cwd, timeout, diff=diff, round_no=round_no)
             out.append(f"\n## Moderator (round {round_no})\n" + format_result(mod_result))
             _disc(f"\n## Moderator (round {round_no})\n"
                   f"{(mod_result.stdout.strip() or mod_result.stderr.strip() or '(no output)')}\n")
@@ -154,13 +174,14 @@ def mode_brainstorm(
         full_transcript = "\n\n".join(transcript_blocks)
         synth_prompt = (
             "You are the MODERATOR. The brainstorm is complete. Read the full transcript and produce a "
-            "final synthesis with: BEST IDEAS (ranked), TRADEOFFS, and a single concrete RECOMMENDATION.\n\n"
+            "final synthesis with: BEST IDEAS (ranked), TRADEOFFS, and a single concrete RECOMMENDATION."
+            f"{diff_note}\n\n"
             f"TOPIC:\n{topic}\n\n=== FULL TRANSCRIPT ({completed} rounds) ===\n{full_transcript}"
         )
         # Final synthesis is part of the brainstorm: stamp it with the completed round
         # count so it logs as `-r{N}` (>=1), keeping the whole invocation off `-r0` and
         # the parser's brainstorm inference correct (HYP-742 finding 3).
-        synth = run_moderator(moderators, synth_prompt, cwd, timeout, round_no=max(completed, 1))
+        synth = run_moderator(moderators, synth_prompt, cwd, timeout, diff=diff, round_no=max(completed, 1))
         out.append("\n# Final synthesis\n" + format_result(synth))
         _disc(f"\n# Final synthesis\n{(synth.stdout.strip() or synth.stderr.strip() or '(no output)')}\n")
     finally:

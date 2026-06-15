@@ -24,19 +24,37 @@ bin/review --help | grep -q -- "--strict"
 # Stage 2a: the local pre-classifier toggle must appear in help.
 bin/review --help | grep -q -- "--no-local-model"
 
-# Reviewer board (HYP-741): the board flags must appear in help, and --show-board
-# must list the out-of-the-box 8-seat DEFAULT_BOARD (no config file needed) with
-# roles and byte-exact model ids — incl. the z.ai-direct tests seat (zai:glm-5.2)
-# and the gpt-5.5 contracts seat. Availability depends on the env, but the LISTING
-# is always complete.
+# Reviewer board (HYP-741 / board redesign): the board flags must appear in help, and
+# --show-board must list the out-of-the-box 8-seat DEFAULT_BOARD (no config file needed)
+# with roles and byte-exact model ids — incl. the z.ai-direct tests seat (zai:glm-5.2)
+# and the gpt-5.5 contracts seat. Availability depends on the env, but the LISTING is
+# always complete. The board can NEVER be disabled — there is no --no-board flag.
 bin/review --help | grep -q -- "--show-board"
-bin/review --help | grep -q -- "--no-board"
+bin/review --help | grep -q -- "--pool"
+! bin/review --help | grep -q -- "--no-board"
 bin/review --show-board | grep -q "architect"
 bin/review --show-board | grep -q "commandcode:deepseek/deepseek-v4-pro"
 bin/review --show-board | grep -q "zai:glm-5.2"
 bin/review --show-board | grep -q "commandcode:gpt-5.5"
 bin/review --show-board | grep -q "contracts"
 bin/review --show-board | grep -q "8 seats"
+
+# Board redesign: default reviewer POOL SIZE = 4. --show-board must advertise the
+# default pool (first 4 seats run; the other 4 are reserve) and the --pool sizing.
+bin/review --show-board | grep -qi "pool = first 4"
+bin/review --show-board | grep -q "reserve"
+bin/review --show-board | grep -qi "pool 4"
+bin/review --show-board | grep -q -- "--pool"
+# --show-board honors an explicit --pool N: --pool 2 tags only the first 2 seats `pool`.
+[ "$(bin/review --show-board --pool 2 | grep -c '\[pool')" -eq 2 ]
+[ "$(bin/review --show-board --pool 0 | grep -c '\[reserve\]')" -eq 0 ]
+# The --no-board flag is GONE: passing it must be a parse error (exit 2), not accepted.
+! bin/review --no-board --show-board >/dev/null 2>&1
+
+# Board redesign: --brainstorm COMBINES with a diff. The flag/help wiring must parse
+# and advertise that brainstorm can take a diff as grounding context. (No backend is
+# invoked — only --help is exercised here; the behavioural path is covered in pytest.)
+bin/review --help | grep -q -- "--brainstorm"
 
 # spec-web subcommand: dispatches + advertises its flags (no server started here).
 bin/review spec-web --help | grep -q -- "--seed"
@@ -94,6 +112,12 @@ echo "provider-keys tests OK"
 # offline (backends monkeypatched / forced unavailable; no keys, no network).
 python3 tests/test_reviewer_board.py
 echo "reviewer-board tests OK"
+
+# Board redesign: --brainstorm + diff grounding. With a diff present, every persona
+# job (and the moderator) sees it as context; with no diff it's pure ideation. All
+# offline (run_panel / run_moderator stubbed — no model call, no network).
+python3 tests/test_brainstorm_diff.py
+echo "brainstorm-diff tests OK"
 
 # Run-stats store + startup ETA: record shape (mode/pool/duration/ok/fail), the
 # (mode,pool_size) -> pool-only -> no-history ETA fallbacks, real wall-clock on a

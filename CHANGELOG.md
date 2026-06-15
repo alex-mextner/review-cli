@@ -5,6 +5,17 @@ semantic versioning.
 
 ## Unreleased
 
+- **Board redesign (`--pool`, no `--no-board`, brainstorm + diff)** — the built-in
+  reviewer board is now an **8-seat panel kept as a reserve**: a plain `review` runs
+  only the **first 4 seats** by default (the default **pool**). New `--pool N` flag
+  sizes how many of the board's seats run (default 4; first N seats; `--pool 0`/`--pool 8`
+  runs all eight). The board can **never be disabled** — the `--no-board` flag is
+  **removed** (an explicit `-m` or a config `models:` list still bypasses the board).
+  `--show-board` now marks each seat `pool`/`reserve`. **`--brainstorm` can now take a
+  diff into account:** when there is an uncommitted working-tree diff under `-C`, a
+  `--staged` diff, or a piped diff, every persona (and the moderator) sees it as
+  grounding context so you can brainstorm ABOUT a specific change; with no diff it stays
+  pure ideation.
 - **Local web dashboard (`review dashboard`)** — serves logs, per-model stats,
   timeout/error metrics, and a moderator/overseer view over the sidecar `.log`
   files. Every REST backend now emits the same sidecar logs as the subprocess
