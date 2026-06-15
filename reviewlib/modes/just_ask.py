@@ -1,14 +1,17 @@
-"""--just-ask: multi-model answer to a plain question (no diff required).
+"""just-ask: multi-model answer to a plain question (diff optional).
 
-Extracted verbatim from the original single-file `bin/review` (Stage 0
-decomposition — zero behaviour change).
+`review just-ask "<question>"` — a single-shot panel question. Originally the
+`--just-ask` flag (Stage 0 decomposition); now a first-class SUBCOMMAND backed by the
+self-describing `MODE` descriptor at the bottom of this file (see `modes/contract.py`).
 """
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 from ..panel import PanelJob, format_result, run_panel
 from . import _diff_context_block
+from .contract import ModeContext, ModeSpec
 
 
 def mode_just_ask(question: str, models: list[str], diff: str, cwd: Path, timeout: int) -> int:
@@ -20,3 +23,26 @@ def mode_just_ask(question: str, models: list[str], diff: str, cwd: Path, timeou
     results = run_panel(jobs, cwd, timeout)
     print("\n\n---\n\n".join(format_result(r) for r in results))
     return 0 if all(r.returncode == 0 for r in results) else 1
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("question", help="the question to ask every backend")
+
+
+def _handler(ctx: ModeContext) -> int:
+    return mode_just_ask(
+        ctx.with_visual(ctx.args.question), ctx.models, ctx.diff, ctx.cwd, ctx.timeout
+    )
+
+
+MODE = ModeSpec(
+    name="just-ask",
+    subcommand="just-ask",
+    diff_policy="none",
+    stats_mode="just-ask",
+    summary="single-shot panel question (diff optional)",
+    handler=_handler,
+    add_arguments=_add_arguments,
+    announce_logs=True,
+    aliases=("ask",),
+)

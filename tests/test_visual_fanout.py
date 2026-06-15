@@ -30,6 +30,8 @@ import visual_fixtures as vf  # noqa: E402
 from reviewlib import cli  # noqa: E402
 from reviewlib.features.visual import compose as cmp  # noqa: E402
 from reviewlib.features.visual.vision_client import VisionVerdict  # noqa: E402
+from reviewlib.modes import brainstorm as _brainstorm_mod  # noqa: E402
+from reviewlib.modes import quorum as _quorum_mod  # noqa: E402
 
 
 def _styled(tmp: str = "/tmp/fanout-styled.png") -> str:
@@ -110,12 +112,12 @@ def test_brainstorm_personas_see_grounded_observation():
         captured["topic"] = topic
         return 0
 
-    old_bs = cli.mode_brainstorm
-    cli.mode_brainstorm = fake_brainstorm
+    old_bs = _brainstorm_mod.mode_brainstorm
+    _brainstorm_mod.mode_brainstorm = fake_brainstorm
     try:
-        rc = cli.main(["--brainstorm", "is the layout good", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["brainstorm", "is the layout good", "--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
-        cli.mode_brainstorm = old_bs
+        _brainstorm_mod.mode_brainstorm = old_bs
         _restore(*old)
     assert rc == 0
     assert "GROUNDED-SIGHT: teal sidebar, 6 cards" in captured["topic"], "persona prompt lacks grounded observation"
@@ -134,12 +136,12 @@ def test_quorum_voters_see_grounded_observation():
         captured["question"] = question
         return 0
 
-    old_q = cli.mode_quorum
-    cli.mode_quorum = fake_quorum
+    old_q = _quorum_mod.mode_quorum
+    _quorum_mod.mode_quorum = fake_quorum
     try:
-        rc = cli.main(["--quorum", "is it centered?", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["quorum", "is it centered?", "--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
-        cli.mode_quorum = old_q
+        _quorum_mod.mode_quorum = old_q
         _restore(*old)
     assert rc == 0
     assert "GROUNDED-SIGHT: button is centered" in captured["question"]

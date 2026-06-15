@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import reviewlib.backends as backends  # noqa: E402
+import reviewlib.modes.review as _review_mod  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.config import (  # noqa: E402
     DEFAULT_BOARD,
@@ -427,8 +428,8 @@ def test_cli_explicit_models_disable_board():
         captured["board"] = board
         return 0
 
-    old = cli.mode_review
-    cli.mode_review = _fake_mode_review
+    old = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
     # Avoid touching a real config file / git diff: feed the diff via stdin and
     # point the env file at nothing so no provider key resolves.
     old_stdin = sys.stdin
@@ -442,7 +443,7 @@ def test_cli_explicit_models_disable_board():
         assert captured["board"] is None, captured["board"]
         assert captured["models"] == ["codex"], captured["models"]
     finally:
-        cli.mode_review = old
+        _review_mod.mode_review = old
         sys.stdin = old_stdin
 
 
@@ -479,8 +480,8 @@ def test_cli_config_models_beat_board():
         captured["board"] = board
         return 0
 
-    old = cli.mode_review
-    cli.mode_review = _fake_mode_review
+    old = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
     # Inject a config with an explicit `models:` list (and a `board:` too, to prove
     # the board is ignored when models: is configured). load_board must NOT be hit.
     old_load_config = cli.load_config
@@ -502,7 +503,7 @@ def test_cli_config_models_beat_board():
         # The configured models flow through (alias-expanded, here identity).
         assert captured["models"] == ["codex", "gemini"], captured["models"]
     finally:
-        cli.mode_review = old
+        _review_mod.mode_review = old
         cli.load_config = old_load_config
         cli.load_board = old_load_board
         sys.stdin = old_stdin
@@ -522,8 +523,8 @@ def test_cli_empty_config_models_does_not_disable_board():
             captured["models"] = models
             return 0
 
-        old = cli.mode_review
-        cli.mode_review = _fake_mode_review
+        old = _review_mod.mode_review
+        _review_mod.mode_review = _fake_mode_review
         old_load_config = cli.load_config
         cli.load_config = lambda em=empty_models: {"models": em}
         old_load_board = cli.load_board
@@ -539,7 +540,7 @@ def test_cli_empty_config_models_does_not_disable_board():
             # And no blank model name leaked into the (unused) flat models list.
             assert all(m.strip() for m in captured["models"]), captured["models"]
         finally:
-            cli.mode_review = old
+            _review_mod.mode_review = old
             cli.load_config = old_load_config
             cli.load_board = old_load_board
             sys.stdin = old_stdin
@@ -556,8 +557,8 @@ def test_cli_all_malformed_board_errors_nonzero():
         called["mode_review"] = True
         return 0
 
-    old = cli.mode_review
-    cli.mode_review = _fake_mode_review
+    old = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
     old_load_config = cli.load_config
     cli.load_config = lambda: {"board": ["not-a-mapping", {"role": "x"}]}
     old_stdin = sys.stdin
@@ -570,7 +571,7 @@ def test_cli_all_malformed_board_errors_nonzero():
         assert rc != 0, rc
         assert called["mode_review"] is False, "must not run the panel on a bad board"
     finally:
-        cli.mode_review = old
+        _review_mod.mode_review = old
         cli.load_config = old_load_config
         sys.stdin = old_stdin
 
@@ -621,8 +622,8 @@ def test_cli_all_malformed_board_fails_before_visual_fanout():
         fanout_calls["n"] += 1
         raise AssertionError("visual fan-out must not run when the board config is invalid")
 
-    old_mode_review = cli.mode_review
-    cli.mode_review = lambda *_a, **_k: 0
+    old_mode_review = _review_mod.mode_review
+    _review_mod.mode_review = lambda *_a, **_k: 0
     old_load_config = cli.load_config
     cli.load_config = lambda: {"board": ["not-a-mapping"]}
     old_build = compose.build_mode_visual_context
@@ -637,7 +638,7 @@ def test_cli_all_malformed_board_fails_before_visual_fanout():
         assert rc == 2, rc
         assert fanout_calls["n"] == 0, "fan-out ran before the board was validated"
     finally:
-        cli.mode_review = old_mode_review
+        _review_mod.mode_review = old_mode_review
         cli.load_config = old_load_config
         compose.build_mode_visual_context = old_build
         sys.stdin = old_stdin
@@ -658,8 +659,8 @@ def _capture_default_review_board(argv: list[str]) -> dict:
         captured["pool_size"] = pool_size
         return 0
 
-    old = cli.mode_review
-    cli.mode_review = _fake_mode_review
+    old = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
     # Pin the board to DEFAULT_BOARD AND stub load_config to an empty dict so the
     # test is independent of the dev machine's ~/.config/review-cli/config.yaml —
     # which DOES set `models:`, and a configured `models:` now (correctly) disables
@@ -680,7 +681,7 @@ def _capture_default_review_board(argv: list[str]) -> dict:
         sys.stdin = io.StringIO("+added line\n")
         cli.main(argv)
     finally:
-        cli.mode_review = old
+        _review_mod.mode_review = old
         cli.load_board = old_load_board
         cli.load_config = old_load_config
         backends.backend_available = old_avail

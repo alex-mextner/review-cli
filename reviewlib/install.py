@@ -22,11 +22,12 @@ SKILL_MD = """\
 ---
 name: review
 description: >-
-  Read-only multi-model code review and AI panel. Use BEFORE committing to check a
-  diff across several models at once, to get a multi-model second opinion on a
-  question (--just-ask), to settle a contested technical decision with cited
-  evidence (--quorum), or to brainstorm an open design space across rotating expert
-  personas in a loop (--brainstorm). e.g. `review` on the current diff.
+  Read-only multi-model code review and AI panel. Modes are SUBCOMMANDS. Use BEFORE
+  committing to check a diff across several models at once (`review`), to get a
+  multi-model second opinion on a question (`review just-ask "Q"`), to settle a
+  contested technical decision with cited evidence (`review quorum "Q"`), or to
+  brainstorm an open design space across rotating expert personas in a loop
+  (`review brainstorm "TOPIC"`). e.g. `review` on the current diff.
 metadata:
   author: alex-mextner
   repo: https://github.com/alex-mextner/review-cli
@@ -37,10 +38,10 @@ metadata:
 Runs your git diff (or a question/topic) across several model backends in parallel.
 
 ## NEVER wrap `review` in a short timeout — it takes MINUTES
-`review`, `review --quorum`, and `review --brainstorm` are multi-model and/or
+`review`, `review quorum`, and `review brainstorm` are multi-model and/or
 multi-round: they fan out to several model backends in parallel, and the panel
 modes run several rounds plus a final moderator synthesis. A plain diff review of a
-full board is typically a few minutes; a `--brainstorm` is commonly 10–20 minutes
+full board is typically a few minutes; a `brainstorm` is commonly 10–20 minutes
 (min 5 / max 8 rounds + a final synthesis pass). Wrapping the command in
 `timeout 60` / `timeout 300` (or any short cap) KILLS the run before it finishes —
 a brainstorm only emits its synthesis at the very end, so a short timeout produces
@@ -68,18 +69,23 @@ ever does harm here: it kills good runs before their synthesis and adds nothing 
 internal backstop doesn't already guarantee. `$REVIEW_BACKSTOP_SECONDS` can only LOWER
 the internal ceiling, never raise it past 4h.
 
-## Invocation
+## Invocation — modes are SUBCOMMANDS
+A bare `review …` (no subcommand) defaults to the diff review, so `review -C <repo>` is
+unchanged. The other modes are subcommands: `brainstorm` / `just-ask` / `quorum`.
 ```
-review -C <repo>             # review current unstaged diff across the failover pool (top 4 available)
-review -C <repo> --staged    # review the staged diff (pre-commit)
-review -C <repo> --pool 8    # run all 8 available board seats (--pool 0 also = all); default pool is 4
+review -C <repo>                       # review current unstaged diff across the failover pool (top 4 available)
+review -C <repo> --staged              # review the staged diff (pre-commit)
+review -C <repo> --pool 8              # run all 8 available board seats (--pool 0 also = all); default pool is 4
 review -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); bypasses the board
-review -C <repo> --just-ask "Q"        # multi-model answer to a question (no diff needed)
-review -C <repo> --quorum "Q"          # experts answer + a moderator finds consensus/disagreement
-review -C <repo> --brainstorm "TOPIC"  # iterative persona ideation in a loop, with a moderator
-review -C <repo> --brainstorm "TOPIC"  # …+ an uncommitted/--staged diff -> brainstorm ABOUT that change
+review -C <repo> just-ask "Q"          # multi-model answer to a question (no diff needed)
+review -C <repo> quorum "Q"            # experts answer + a moderator finds consensus/disagreement
+review -C <repo> brainstorm "TOPIC"    # iterative persona ideation in a loop, with a moderator
+review -C <repo> brainstorm "TOPIC" --diff   # …+ the working-tree (or --staged) diff -> brainstorm ABOUT that change
 review -C <repo> -o out.md             # write the result to a file (still prints to stdout)
 ```
+The OLD mode flags (`--brainstorm` / `--quorum` / `--just-ask`) were REMOVED — they now
+print a one-line pointer and exit non-zero. `--visual <img>` stays a COMPOSABLE flag that
+rides any subcommand (it is not a mode).
 
 ## Save the result to a file: `-o FILE`, NOT `> FILE`
 Use `review -C <repo> -o out.md`, NOT `review -C <repo> … > out.md`. Under zsh
@@ -106,12 +112,12 @@ available. The board is **never disabled** — there is **no `--no-board` flag**
 `review --show-board` lists the seats in priority order with their pool/reserve/unavail
 tier and availability.
 
-## `--brainstorm` can take a diff
-`--brainstorm "<topic>"` is multi-round persona ideation. When there IS a diff present —
-an uncommitted working-tree diff under `-C`, a `--staged` diff, or a piped diff — every
-persona (and the moderator) sees it as grounding context, so you brainstorm concretely
-ABOUT that change. With no diff it stays pure ideation. The diff is optional: an absent
-diff / non-repo `-C` degrades silently to ideation.
+## `brainstorm` can take a diff
+`review brainstorm "<topic>"` is multi-round persona ideation. When there IS a diff
+present — the working-tree diff under `-C` (pass `--diff`), a `--staged` diff, or a piped
+diff — every persona (and the moderator) sees it as grounding context, so you brainstorm
+concretely ABOUT that change. With no diff it stays pure ideation. The diff is optional:
+an absent diff / non-repo `-C` degrades silently to ideation.
 
 ## ALWAYS pass `-C <project-root>`
 `review` runs the diff and the claude/opus workspace in `-C` (default: the current
@@ -120,7 +126,7 @@ directory). Agents often invoke `review` from a scratch or temp dir, so WITHOUT
 irrelevant result. Always pass `-C <absolute repo path>`. If `-C` is not inside a
 git repo, review resolves to the repo root when it can and otherwise prints a
 loud warning — heed it. When piping into review non-interactively, also redirect
-stdin (`review -C <repo> --just-ask "Q" < /dev/null`); review reads stdin for an
+stdin (`review -C <repo> just-ask "Q" < /dev/null`); review reads stdin for an
 optional piped diff and will hang waiting for EOF if stdin is an open pipe.
 
 ## claude / opus backend: API or CLI
@@ -170,18 +176,20 @@ All three resolve their key from the env first, then the shared
 `~/.config/review-cli/.env` (the same file the gemini key uses).
 
 ## When to use
-- Before committing — sanity-check a diff across multiple models in parallel.
-- For a hard decision — `--quorum` (settle with cited evidence) or `--brainstorm`
-  (explore an open design space across rotating expert roles, in a loop). The
-  moderator defaults to opus and falls back to codex/gemini automatically.
-- For a quick multi-model second opinion — `--just-ask`.
+- Before committing — sanity-check a diff across multiple models in parallel (`review`).
+- For a hard decision — `review quorum "Q"` (settle with cited evidence) or
+  `review brainstorm "TOPIC"` (explore an open design space across rotating expert roles,
+  in a loop). The moderator defaults to opus and falls back to codex/gemini automatically.
+- For a quick multi-model second opinion — `review just-ask "Q"`.
 
 Pair with `tg` to post the chosen options / pros-cons to Telegram.
 """
 SKILL_BLURB = (
     "`review` — multi-model read-only code review + AI panels "
-    "(codex/claude/gemini/opencode): `review -C <repo>` (diff), "
-    "`review -C <repo> --quorum \"Q\"`, `review -C <repo> --brainstorm \"topic\"`. "
+    "(codex/claude/gemini/opencode). Modes are SUBCOMMANDS: `review -C <repo>` (diff), "
+    "`review -C <repo> quorum \"Q\"`, `review -C <repo> brainstorm \"topic\"`, "
+    "`review -C <repo> just-ask \"Q\"`. A bare `review …` still defaults to the diff "
+    "review; the old --quorum/--brainstorm/--just-ask flags were removed. "
     "Always pass -C <project-root>. Use before commits and for hard decisions. "
     "NEVER wrap it in a short timeout — it is multi-model / multi-round and takes "
     "MINUTES (brainstorm 10–20m); it prints the expected duration for your pool "

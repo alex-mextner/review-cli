@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Composability tests — `--visual` as an orthogonal flag (§2.1). NO real backends.
+"""Composability tests — `--visual` as an orthogonal flag (§3). NO real backends.
 
 Proves the architecture, not just the pixels:
-  * `--visual` is OUTSIDE the mutually-exclusive panel group (it parses alongside
-    --brainstorm / --quorum, which the group forbids for each other);
+  * `--visual` is a COMPOSABLE flag, NOT a mode: it parses alongside any mode
+    SUBCOMMAND (brainstorm / quorum / just-ask / review);
   * with a companion mode the image's visual context is THREADED INTO that mode's
     prompt (the composition seam) — asserted by capturing the mode call;
   * standalone (`--visual img` with no mode, no diff) runs the verdict pipeline and
     returns the mapped exit code;
   * cvGate runs in the companion path too (a broken render surfaces in the context).
 
-The mode functions are monkeypatched on `reviewlib.cli` so the test never spawns
-codex/gemini/claude; the diff is forced empty / supplied so no git is touched.
+The mode functions are monkeypatched WHERE THEY ARE DEFINED (the per-mode modules) so
+the test never spawns codex/gemini/claude — the modes-subcommands redesign dispatches
+through `modes/registry`, not a `cli.mode_*` attribute. The diff is forced empty /
+supplied so no git is touched.
 """
 from __future__ import annotations
 
@@ -25,6 +27,10 @@ sys.path.insert(0, str(REPO_ROOT / "tests"))
 import visual_fixtures as vf  # noqa: E402
 from reviewlib import cli  # noqa: E402
 from reviewlib.features.visual import compose as _cmp  # noqa: E402
+from reviewlib.modes import brainstorm as _brainstorm_mod  # noqa: E402
+from reviewlib.modes import just_ask as _just_ask_mod  # noqa: E402
+from reviewlib.modes import quorum as _quorum_mod  # noqa: E402
+from reviewlib.modes import review as _review_mod  # noqa: E402
 
 # These composability tests assert the Stage-1 cvGate-described context threading. The
 # Stage-2 per-mode fan-out would otherwise fire a REAL vision call here (a Gemini/
@@ -43,23 +49,21 @@ def _blank(tmp: str = "/tmp/visual-compose-blank.png") -> str:
     return str(vf.blank_white(Path(tmp)))
 
 
-def test_visual_is_not_in_mutually_exclusive_group():
-    """--visual must combine with a panel mode (the group forbids two modes together,
-    so a clean parse with --brainstorm + --visual proves --visual is outside it)."""
-    # argparse would SystemExit if --visual were in the mutually-exclusive group with
-    # --brainstorm. We monkeypatch the mode so it does not actually run.
+def test_visual_composes_with_brainstorm_subcommand():
+    """--visual is composable with any mode subcommand: `review brainstorm "…" --visual
+    img` threads the image context into the brainstorm topic (the composition seam)."""
     captured = {}
 
     def fake_brainstorm(topic, *a, **k):
         captured["topic"] = topic
         return 0
 
-    old = cli.mode_brainstorm
-    cli.mode_brainstorm = fake_brainstorm
+    old = _brainstorm_mod.mode_brainstorm
+    _brainstorm_mod.mode_brainstorm = fake_brainstorm
     try:
-        rc = cli.main(["--brainstorm", "should we ship X", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["brainstorm", "should we ship X", "--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
-        cli.mode_brainstorm = old
+        _brainstorm_mod.mode_brainstorm = old
     assert rc == 0
     # The image context was threaded into the brainstorm topic.
     assert "ATTACHED RENDER" in captured["topic"], "visual context not folded into brainstorm topic"
@@ -73,12 +77,12 @@ def test_visual_threads_into_quorum():
         captured["question"] = question
         return 0
 
-    old = cli.mode_quorum
-    cli.mode_quorum = fake_quorum
+    old = _quorum_mod.mode_quorum
+    _quorum_mod.mode_quorum = fake_quorum
     try:
-        rc = cli.main(["--quorum", "is this styled?", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["quorum", "is this styled?", "--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
-        cli.mode_quorum = old
+        _quorum_mod.mode_quorum = old
     assert rc == 0
     assert "ATTACHED RENDER" in captured["question"]
     assert "is this styled?" in captured["question"]
@@ -94,12 +98,12 @@ def test_companion_cvgate_surfaces_passthrough_outcome():
         captured["question"] = question
         return 0
 
-    old = cli.mode_just_ask
-    cli.mode_just_ask = fake_just_ask
+    old = _just_ask_mod.mode_just_ask
+    _just_ask_mod.mode_just_ask = fake_just_ask
     try:
-        rc = cli.main(["--just-ask", "describe", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["just-ask", "describe", "--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
-        cli.mode_just_ask = old
+        _just_ask_mod.mode_just_ask = old
     assert rc == 0
     assert "cvGate pre-filter outcome: pass_through" in captured["question"]
     assert "ATTACHED RENDER" in captured["question"]
@@ -138,13 +142,13 @@ def test_companion_rollback_blocks_the_mode():
         called["n"] += 1
         return 0
 
-    old = cli.mode_just_ask
-    cli.mode_just_ask = fake_just_ask
+    old = _just_ask_mod.mode_just_ask
+    _just_ask_mod.mode_just_ask = fake_just_ask
     try:
-        rc = cli.main(["--just-ask", "describe", "--visual", _blank(), "--strict", "-C", str(REPO_ROOT)])
-        rc_advisory = cli.main(["--just-ask", "describe", "--visual", _blank(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["just-ask", "describe", "--visual", _blank(), "--strict", "-C", str(REPO_ROOT)])
+        rc_advisory = cli.main(["just-ask", "describe", "--visual", _blank(), "-C", str(REPO_ROOT)])
     finally:
-        cli.mode_just_ask = old
+        _just_ask_mod.mode_just_ask = old
     assert called["n"] == 0, "the mode must NOT run when the visual pre-filter rolls back"
     assert rc == 10, f"--strict pre-filter rollback must exit 10, got {rc}"
     assert rc_advisory == 1, f"non-strict pre-filter rollback must exit non-zero, got {rc_advisory}"
@@ -159,19 +163,20 @@ def test_companion_unreadable_image_is_usage_exit_1():
         called["n"] += 1
         return 0
 
-    old = cli.mode_just_ask
-    cli.mode_just_ask = fake_just_ask
+    old = _just_ask_mod.mode_just_ask
+    _just_ask_mod.mode_just_ask = fake_just_ask
     try:
-        rc = cli.main(["--just-ask", "x", "--visual", "/tmp/does-not-exist-zzz.png", "--strict", "-C", str(REPO_ROOT)])
+        rc = cli.main(["just-ask", "x", "--visual", "/tmp/does-not-exist-zzz.png", "--strict", "-C", str(REPO_ROOT)])
     finally:
-        cli.mode_just_ask = old
+        _just_ask_mod.mode_just_ask = old
     assert called["n"] == 0, "the mode must not run on an unreadable image"
     assert rc == 1, f"unreadable companion image must be usage exit 1 even under --strict, got {rc}"
 
 
 def test_default_review_with_diff_threads_visual():
     """--visual with a piped diff (no panel mode) routes to the diff-review companion
-    with the image as context — not the standalone pipeline."""
+    with the image as context — not the standalone pipeline. A bare `review --visual`
+    (no subcommand) still defaults to the review mode."""
     captured = {}
 
     def fake_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
@@ -180,14 +185,14 @@ def test_default_review_with_diff_threads_visual():
         captured["board"] = board
         return 0
 
-    old = cli.mode_review
+    old = _review_mod.mode_review
     old_stdin = cli._read_stdin_if_piped
-    cli.mode_review = fake_review
+    _review_mod.mode_review = fake_review
     cli._read_stdin_if_piped = lambda: "diff --git a/x b/x\n+change\n"
     try:
         rc = cli.main(["--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
-        cli.mode_review = old
+        _review_mod.mode_review = old
         cli._read_stdin_if_piped = old_stdin
     assert rc == 0
     assert "ATTACHED RENDER" in captured["prompt"], "diff-review companion must carry visual context"

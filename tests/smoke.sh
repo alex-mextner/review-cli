@@ -12,10 +12,34 @@ export REVIEW_STATS_FILE="$(mktemp -d)/run-stats.jsonl"
 bin/review --list-defaults | grep -q codex
 bin/review --help >/dev/null
 
-# New panel modes must appear in help.
-bin/review --help | grep -q -- "--just-ask"
-bin/review --help | grep -q -- "--quorum"
-bin/review --help | grep -q -- "--brainstorm"
+# Modes are now SUBCOMMANDS, not flags. The top-level help advertises the subcommand
+# list; each mode has its own `review <mode> --help`. The OLD mode flags are GONE.
+bin/review --help | grep -q "subcommands:"
+bin/review --help | grep -q "brainstorm"
+bin/review --help | grep -q "just-ask"
+bin/review --help | grep -q "quorum"
+# Each mode subcommand parses + advertises its positional / shared options.
+bin/review brainstorm --help | grep -q "topic"
+bin/review just-ask --help | grep -q "question"
+bin/review quorum --help | grep -q "question"
+# Brainstorm-only flags live ONLY on the brainstorm parser (not the shared surface): a
+# `review just-ask --rounds 5` must error (exit 2), and --rounds shows on brainstorm.
+bin/review brainstorm --help | grep -q -- "--rounds"
+! bin/review just-ask "q" --rounds 5 >/dev/null 2>&1
+! bin/review --help | grep -q -- "--rounds"   # not on the top-level/shared help
+# The removed mode FLAGS now ERROR helpfully (exit 2) and point at the subcommand.
+# `review` exits 2 here, so capture its output FIRST (a `review … | grep` would trip
+# `set -o pipefail` on review's nonzero exit even when grep matches).
+! bin/review --brainstorm "x" >/dev/null 2>&1
+! bin/review --quorum "x" >/dev/null 2>&1
+! bin/review --just-ask "x" >/dev/null 2>&1
+removed_msg="$(bin/review --brainstorm "x" 2>&1 || true)"; echo "$removed_msg" | grep -q "review brainstorm"
+removed_msg="$(bin/review --quorum "x" 2>&1 || true)"; echo "$removed_msg" | grep -q "review quorum"
+removed_msg="$(bin/review --just-ask "x" 2>&1 || true)"; echo "$removed_msg" | grep -q "review just-ask"
+# Bare `review` (no subcommand) still defaults to the review diff path: a meta query
+# like --list-defaults works WITHOUT a subcommand (the most common ergonomics, §4).
+bin/review --list-defaults | grep -q codex
+bin/review review --list-defaults | grep -q codex   # explicit review subcommand too
 
 # Stage 1: the composable --visual flag and its core sub-flags must appear in help.
 bin/review --help | grep -q -- "--visual"
@@ -81,10 +105,11 @@ bin/review --show-board | grep -q -- "--pool"
 # The --no-board flag is GONE: passing it must be a parse error (exit 2), not accepted.
 ! bin/review --no-board --show-board >/dev/null 2>&1
 
-# Board redesign: --brainstorm COMBINES with a diff. The flag/help wiring must parse
-# and advertise that brainstorm can take a diff as grounding context. (No backend is
-# invoked — only --help is exercised here; the behavioural path is covered in pytest.)
-bin/review --help | grep -q -- "--brainstorm"
+# Board redesign: the `brainstorm` subcommand COMBINES with a diff. Its help must parse
+# and advertise --diff/--staged grounding. (No backend is invoked — only --help is
+# exercised here; the behavioural path is covered in pytest.)
+bin/review brainstorm --help | grep -q -- "--diff"
+bin/review brainstorm --help | grep -q -- "--staged"
 
 # spec-web subcommand: dispatches + advertises its flags (no server started here).
 bin/review spec-web --help | grep -q -- "--seed"
@@ -168,6 +193,13 @@ echo "failover-pool tests OK"
 # offline (run_panel / run_moderator stubbed — no model call, no network).
 python3 tests/test_brainstorm_diff.py
 echo "brainstorm-diff tests OK"
+
+# Mode SUBCOMMANDS + the mode registry (the modes-subcommands redesign): each
+# subcommand dispatches to the right mode, a bare `review` defaults to review, brainstorm
+# composes with --diff, the removed mode flags error helpfully, and the registry contract
+# (get_mode/known_subcommands/default_mode). All offline (mode handlers stubbed).
+python3 tests/test_mode_subcommands.py
+echo "mode-subcommands tests OK"
 
 # Run-stats store + startup ETA: record shape (mode/pool/duration/ok/fail), the
 # (mode,pool_size) -> pool-only -> no-history ETA fallbacks, real wall-clock on a

@@ -1,0 +1,99 @@
+"""Mode registry — the core analogue of `features/visual/registry.py`.
+
+The visual feature discovers self-describing `VisualModule`s (built-in + per-project
+manifests) and folds them into one pipeline. This registry does the same for the core
+review MODES: each mode is a self-describing module that exposes a top-level
+`MODE = ModeSpec(...)` (see `modes/contract.py`); the registry collects them so:
+
+  * the CLI dispatches `review <subcommand>` to the right mode WITHOUT a per-mode
+    `if args.x is not None` ladder — it looks the verb up here;
+  * `review --help` lists the modes from this single source of truth;
+  * adding a mode = drop a `modes/<name>.py` exposing a `MODE` descriptor and list it
+    in `MODES` below. No `cli.py` surgery.
+
+Built-in modes are listed explicitly (like the visual feature's built-in modules in
+`features/visual/modules/`): an explicit list is auditable and import-order-stable, and
+keeps the hot review path free of a directory scan. A future "drop a Python file into a
+modes plugin dir" discovery step would mirror `features/visual/registry.discover_specs`
+— the contract (`ModeSpec` + a top-level `MODE`) is already discovery-ready.
+"""
+from __future__ import annotations
+
+from .brainstorm import MODE as _BRAINSTORM_MODE
+from .brainstorm import brainstorm_pool
+from .contract import ModeSpec
+from .just_ask import MODE as _JUST_ASK_MODE
+from .quorum import MODE as _QUORUM_MODE
+from .review import MODE as _REVIEW_MODE
+
+# The built-in review modes, in the order they appear in `--help`. `review` is first
+# (it is the default). Each entry is a self-describing `ModeSpec` exposed by its module
+# as a top-level `MODE` — exactly how a visual module exposes a top-level `MODULE`.
+MODES: tuple[ModeSpec, ...] = (
+    _REVIEW_MODE,
+    _BRAINSTORM_MODE,
+    _JUST_ASK_MODE,
+    _QUORUM_MODE,
+)
+
+# The default mode a bare `review` (no recognized subcommand) falls back to (§4). Keeping
+# the diff-review ergonomics is the whole point of the migration — `review -C <repo>`
+# stays a diff review.
+DEFAULT_MODE_NAME = "review"
+
+
+def iter_modes() -> tuple[ModeSpec, ...]:
+    """All registered modes, in help order."""
+    return MODES
+
+
+def get_mode(name_or_subcommand: str) -> ModeSpec | None:
+    """Resolve a mode by its subcommand verb (or one of its aliases). Returns None for
+    an unrecognized verb so the CLI can fall back to the default mode."""
+    for mode in MODES:
+        if name_or_subcommand == mode.subcommand or name_or_subcommand in mode.aliases:
+            return mode
+    return None
+
+
+def default_mode() -> ModeSpec:
+    """The mode a bare `review` (no recognized subcommand) routes to."""
+    mode = get_mode(DEFAULT_MODE_NAME)
+    assert mode is not None, "DEFAULT_MODE_NAME must name a registered mode"
+    return mode
+
+
+_KNOWN_SUBCOMMANDS: frozenset[str] = frozenset(
+    {m.subcommand for m in MODES} | {a for m in MODES for a in m.aliases}
+)
+
+
+def known_subcommands() -> frozenset[str]:
+    """Every verb (subcommand + aliases) that selects a mode — the set the CLI checks to
+    decide whether argv[0] is a mode subcommand or should fall through to the default.
+    Precomputed once (MODES is a module constant)."""
+    return _KNOWN_SUBCOMMANDS
+
+
+# The flags this redesign REMOVED (the old mode flags). The CLI rejects them with a
+# helpful "use the subcommand" message instead of silently treating the value as a
+# positional. Maps the dead flag -> the subcommand that replaces it.
+REMOVED_MODE_FLAGS: dict[str, str] = {
+    "--brainstorm": "brainstorm",
+    "--quorum": "quorum",
+    "--just-ask": "just-ask",
+}
+
+
+# Re-export brainstorm's slot-pool helper so the CLI's stats wrapper can key the ETA on
+# the per-round persona-slot count without reaching into the brainstorm module directly.
+__all__ = [
+    "MODES",
+    "DEFAULT_MODE_NAME",
+    "REMOVED_MODE_FLAGS",
+    "iter_modes",
+    "get_mode",
+    "default_mode",
+    "known_subcommands",
+    "brainstorm_pool",
+]

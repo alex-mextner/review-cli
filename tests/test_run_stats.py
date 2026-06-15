@@ -554,7 +554,7 @@ def test_cli_brainstorm_records_persona_slot_pool_not_raw_models():
         # also stubbed (returns ok), so each round is instant. Cap rounds via --rounds.
         try:
             with redirect_stderr(io.StringIO()), _capture_stdout():
-                _cli.main(["-C", d.name, "-m", "codex,gemini", "--brainstorm", "topic",
+                _cli.main(["brainstorm", "topic", "-C", d.name, "-m", "codex,gemini",
                            "--rounds", "1", "--max-rounds", "1"])
             recs = store.records()
             assert len(recs) == 1, recs
