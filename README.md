@@ -312,9 +312,10 @@ Vision runs **through the agent CLIs** — `codex` / `claude` / `opencode` — m
 how review's text backends shell out, but with the image attached and the structured verdict
 parsed from the CLI output. No provider REST keys for those three. **Gemini is the one
 exception**: its CLI is broken, so the Gemini vision call stays on the REST API key
-(`GEMINI_API_KEY`), same as review's text Gemini backend. opencode is a router — pick a
-vision-capable model via `oc:<provider>/<vision-model>`; a text-only model is never silently
-used to "verify" an image. `--no-local-model` disables the local cache pre-classifier (the
+(`GEMINI_API_KEY`), same as review's text Gemini backend. Vision requires a vision-capable
+model on whatever backend you pick — review never silently uses a text-only model to "verify"
+an image. (For router backends like opencode, that means selecting a vision model explicitly,
+e.g. `oc:<provider>/<vision-model>`.) `--no-local-model` disables the local cache pre-classifier (the
 cost-saver) and forces every cvGate pass-through to the paid AI-vision call.
 
 ### Modules
@@ -486,12 +487,11 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer --dir <repo>` (reads the real repo, read-only) |
 | anything else | cli | Treated as an opencode model id |
 
-**Transport split.** codex and opencode are **cli-only** (no REST API). gemini, z.ai,
-and commandcode are **api-only** keyed HTTP backends (no CLI on PATH). claude supports
-**both** — `REVIEW_CLAUDE_MODE=api|cli` forces one, else it auto-picks (CLI if the
-binary is present, API when it isn't and a key is set). Each backend's mode can be
-forced with `REVIEW_<NAME>_MODE`; forcing an unsupported mode (e.g.
-`REVIEW_COMMANDCODE_MODE=cli`) is a hard error, never a silent fall-through.
+**Transport split.** Each backend declares which transports it supports — `cli`, `api`,
+or both — shown in the *Transport* column above. `REVIEW_<NAME>_MODE` forces one; forcing
+a mode a backend doesn't support is a hard error, never a silent fall-through. (Today:
+codex/opencode are cli-only, gemini/z.ai/commandcode are api-only, claude does both and
+auto-picks — CLI if the binary is present, API when it isn't and a key is set.)
 
 The opencode backend is **agentic and read-only**: it runs in the **real `-C`
 repository** (via `opencode run --dir <repo>`), exactly like the codex backend, so an
