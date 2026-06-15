@@ -716,11 +716,13 @@ only read, never written.
 
 ## How review compares
 
-AI code review tools cluster into two camps. **PR-bots** (Qodo PR-Agent, CodeRabbit,
+AI code review tools cluster into three camps. **PR-bots** (Qodo PR-Agent, CodeRabbit,
 GitHub Copilot code review) run a single model against a *pull request* — they live on
 the platform, comment inline, and are great once a PR exists. **In-agent review** (Claude
 Code `/review`, Codex review) runs one model on the local diff inside the harness you are
-already in.
+already in. **Autonomous-loop tools** ([ralphex](https://github.com/umputun/ralphex)) fold
+review *into* a full code-gen loop — they drive a coding agent through a plan and review its
+output as one fused, opinionated pipeline (see [review vs ralphex](#review-vs-ralphex--the-whole-loop-vs-the-review-primitive) below).
 
 `review` is neither: it runs **several models in parallel on the local working-tree diff**
 before you ever push, then goes further — a cited **quorum** (consensus with evidence) and
@@ -729,18 +731,65 @@ edits your code), **CLI-first** (no PR, no hosted service — it shells out to m
 already have), and **harness-agnostic** (callable from Claude Code, Codex, opencode, or a
 plain shell).
 
-| Tool | Multi-model in parallel | Local pre-PR diff | Consensus / quorum | Design brainstorm | Read-only | No hosted service |
-|---|---|---|---|---|---|---|
-| **review** | ✓ | ✓ | ✓ (cited) | ✓ (multi-round) | ✓ | ✓ (your own model CLIs) |
-| Qodo PR-Agent | — (1 call) | ~ (CLI, PR-oriented) | — | — | — (suggests edits) | ~ (self-host or hosted) |
-| CodeRabbit CLI | — (1 service) | ✓ | — | — | — (one-click fixes) | — (hosted) |
-| GitHub Copilot review | — (1 model) | — (PR / IDE) | — | — | — (suggests edits) | — (hosted) |
-| Claude Code `/review` | — (1 model) | ✓ | — | — | ~ | — (in-harness) |
-| Codex review | — (1 model) | ✓ | — | — | ~ | — (in-harness) |
+| Tool | Multi-model in parallel | Local pre-PR diff | Consensus / quorum | Design brainstorm | Read-only | No hosted service | Generates code |
+|---|---|---|---|---|---|---|---|
+| **review** | ✓ | ✓ | ✓ (cited) | ✓ (multi-round) | ✓ | ✓ (your own model CLIs) | — (review only, by design) |
+| Qodo PR-Agent | — (1 call) | ~ (CLI, PR-oriented) | — | — | — (suggests edits) | ~ (self-host or hosted) | — |
+| CodeRabbit CLI | — (1 service) | ✓ | — | — | — (one-click fixes) | — (hosted) | — |
+| GitHub Copilot review | — (1 model) | — (PR / IDE) | — | — | — (suggests edits) | — (hosted) | — |
+| Claude Code `/review` | — (1 model) | ✓ | — | — | ~ | — (in-harness) | — |
+| Codex review | — (1 model) | ✓ | — | — | ~ | — (in-harness) | — |
+| ralphex | ✓ (5 review agents + opt. codex) | ✓ | — | — | — (drives an agent that edits) | ✓ (local Go binary) | ✓ (drives the coding agent) |
 
 `~` = partial. PR-bots shine *after* a PR exists and can apply fixes; `review` is the
 pre-commit, multi-perspective second opinion that runs from any shell and decides nothing
 for you — it surfaces findings and consensus, you stay in control of the edit.
+
+### review vs ralphex — the whole loop vs the review primitive
+
+[**ralphex**](https://github.com/umputun/ralphex) is the *extended Ralph loop*: a single
+local binary that takes a written plan and runs the **entire** autonomous loop — it drives
+a coding agent (Claude Code / codex / Copilot CLI) to write code task-by-task in fresh
+sessions, then runs its own multi-agent review pipeline (5 parallel agents → optional GPT-5
+codex cross-review → a final pass), committing after each step. It genuinely owns the part
+`review` does not touch at all: **code generation**. If you want "write a plan, walk away,
+come back to reviewed-and-committed code" in one opinionated tool, that is exactly what
+ralphex is for, and `review` is `—` on code-gen on purpose.
+
+`review` is the other half of that picture: not a loop, but the **review component an agent
+plugs into a loop it controls itself**. You (or your agent) drive the loop and call `review`
+only for the critique step — which is the step agents do *worst* on their own. The two shapes:
+
+```
+ralphex  — all-in-one encapsulated loop (opinionated, black-box):
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  ralphex (one binary owns the whole loop)                    │
+  │                                                              │
+  │   plan ──▶ code-gen agent ──▶ built-in review ──▶ commit ─┐  │
+  │              ▲                  (5 agents + codex)         │  │
+  │              └───────────────── repeat until plan done ◀──┘  │
+  └─────────────────────────────────────────────────────────────┘
+
+
+agent + review — composable primitive the AGENT orchestrates (transparent, controllable):
+
+   ┌── the AGENT drives its own loop ───────────────────────────────┐
+   │                                                                │
+   │  agent writes code ──▶  review  ──▶ agent reads verdict ──▶ ┐  │
+   │       ▲                 │ multi-model board                 │  │
+   │       │                 │ cited quorum / brainstorm         │  │
+   │       │                 │ (read-only — never edits)         │  │
+   │       └───────── agent decides: fix / ship / re-loop ◀──────┘  │
+   └────────────────────────────────────────────────────────────────┘
+              ▲ code-gen stays with the agent — review owns only the critique
+```
+
+In one sentence: **ralphex's strength is that it is all-in-one** — code-gen and review
+fused into one walk-away binary; **`review`'s strength is that it is focused and
+controllable** — a read-only, multi-model review primitive the agent composes into its own
+Ralph loop, so the agent keeps full control of code-gen and of every fix/ship/re-loop
+decision instead of handing the loop to a black box.
 
 ---
 
