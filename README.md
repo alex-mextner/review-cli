@@ -748,7 +748,7 @@ for you — it surfaces findings and consensus, you stay in control of the edit.
 
 Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
-- **[tg-cli](https://github.com/alex-mextner/tg-cli)** — Telegram bridge for agents: push reports, two-way control, Q→buttons
+- **[tg-cli](https://github.com/alex-mextner/tg-cli)** — simple Telegram CLI to send messages, photos & files, and a two-way agent bridge (reports, Q→buttons, voice/rich)
 - **[rig-cli](https://github.com/alex-mextner/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
 - **[agent-tools](https://github.com/alex-mextner/agent-tools)** — the shared umbrella: portable agent skills, git/agent hooks, CI gates, and the `agenttools_log` lib that the other CLIs consume
 - **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
