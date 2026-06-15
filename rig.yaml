@@ -1,60 +1,11 @@
-# rig.yaml — this repo dogfoods the agent-tools catalog it ships against.
-# COMMITTED source of truth for how the repo is wired. Global defaults live at
-# ~/.config/rig/config.yaml; this file overrides them. agent_tools_source is omitted so
-# it auto-detects and the file stays portable. Apply: rig apply. Drift: rig status.
-#
-# Auto-mode: harness.auto_mode true makes rig write permissions.defaultMode=bypassPermissions
-# into .claude/settings.json. That file is COMMITTED (Claude Code's shared/team settings slot),
-# so auto-mode turns on by itself on every checkout, matching the rig-cli reference. The
-# per-machine override slot is .claude/settings.local.json (gitignored), not this file.
+# rig.yaml — REPO-LEVEL config only.
+# The machine-wide installs (skills, agent-hooks, git-hooks dispatcher, MCP, harness
+# auto-mode) live in the GLOBAL layer ~/.config/rig/config.yaml and are NOT repeated here.
+# This file holds only what is specific to THIS repo (CI gates, repo settings). The cascade
+# is by LOCATION: global is global, this committed file is the repo and overrides it.
+# Apply: rig apply.  Drift: rig status.
 
 version: 1
-scope: both
-
-defaults:
-  skills_target: ~/.agents/skills
-  hooks_target: ~/.claude/hooks
-  ci_target: .github/workflows
-  mcp_target: ~/.claude/mcp
-  on_conflict: backup
-
-skills:
-  enabled: true
-  target: ~/.agents/skills
-  universal:
-    all: true
-    disable: []
-  by_type:
-    enable: [cli]
-
-agent_hooks:
-  enabled: true
-  target: ~/.claude/hooks
-  target_kind: claude-code
-  all: true
-
-git_hooks:
-  dispatcher:
-    enabled: true
-    dir: ~/.config/git/global-hooks.d
-    runner: ~/.config/git/run-global-hooks
-    set_global_hooks_path: true
-    install_local_retrofit_script: true
-    fragments:
-      secret-scan: { enabled: true }
 
 ci:
   enabled: false
-
-mcp:
-  enabled: true
-  target: ~/.claude/mcp
-  items:
-    review:
-      enabled: true
-      command: "review --mcp"
-
-harness:
-  enabled: true
-  kind: claude-code
-  auto_mode: true
