@@ -605,7 +605,7 @@ fully-keyed environment):
 |---|---|---|---|---|---|
 | 1 | pool | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries |
 | 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
-| 3 | pool | GPT-5.5 | `commandcode:gpt-5.5` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| 3 | pool | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
 | 4 | pool | Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
 | 5 | reserve | GLM | `zai:glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom |
 | 6 | reserve | Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
@@ -660,7 +660,7 @@ silently falls back to the paid default board.
 board:
   - { model: "claude:claude-fable-5",  role: architect }
   - { model: "claude:claude-opus-4-8", role: correctness }
-  - { model: "commandcode:gpt-5.5",    role: consistency, name: GPT-5.5 }
+  - { model: "codex",                  role: consistency, name: Codex }
   - { model: "commandcode:moonshotai/Kimi-K2.7-Code", role: performance, name: Kimi }
   - { model: "zai:glm-5.2",            role: quality }
   - { model: "commandcode:Qwen/Qwen3.7-Max", role: security, name: Qwen }
@@ -689,8 +689,9 @@ Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`
 `GEMINI_ENV_FILE=/path/to/.env` overrides the search path.
 
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
+Codex is the #3 board seat (GPT-5.5 IS codex — the agentic CLI route, free).
 
-**commandcode (DeepSeek / Kimi / Qwen / GPT-5.5 board reviewers):** set
+**commandcode (DeepSeek / Kimi / Qwen board reviewers):** set
 `COMMANDCODE_API_KEY` (a Command Code `user_...` token) in the environment or in
 `~/.config/review-cli/.env`. Without it, those commandcode board reviewers are
 skipped and the board runs with whatever remains. No key is ever written to disk by

@@ -51,9 +51,18 @@ semantic versioning.
   `unavail`, and shows the live pool. Run-stats `pool_size` reflects the models that
   actually produced verdicts (a backfilled reserve under its real model id), not the
   planned ones. Re-rank by reordering `DEFAULT_BOARD` (or a config `board:` list). The
-  default priority order is Fable 5, Opus 4.8, GPT-5.5, Kimi K2.7, GLM-5.2, Qwen3.7-Max,
-  DeepSeek-V4-Pro, Gemini. The board can **never be disabled** (an explicit `-m` or a
-  config `models:` list still bypasses it; the `--no-board` flag stays removed).
+  default priority order is Fable 5, Opus 4.8, Codex (GPT-5.5), Kimi K2.7, GLM-5.2,
+  Qwen3.7-Max, DeepSeek-V4-Pro, Gemini. The board can **never be disabled** (an explicit
+  `-m` or a config `models:` list still bypasses it; the `--no-board` flag stays removed).
+- **Seat 3 is `codex` (agentic), not `commandcode:gpt-5.5` (diff-only)** — GPT-5.5 IS
+  codex (same model, two routes). The board now seats the AGENTIC codex CLI route
+  (`codex exec -s read-only -C <cwd>`), which reads the whole repo and is free, instead
+  of the diff-only `commandcode:gpt-5.5` HTTP route for the same model. The bare `codex`
+  seat string takes no `-m`, so it uses the codex CLI default model (a `codex:<model>`
+  spec would pin a version). `--show-board` shows seat 3 as `Codex / codex / agentic`.
+  If your `config.yaml` `board:` pins `commandcode:gpt-5.5`, replace it with `codex` to
+  get the agentic route (a custom `board:` fully overrides `DEFAULT_BOARD`, so it keeps
+  the old diff-only route until you change it).
 
   **Migration note for existing `config.yaml` `board:` lists:** the ORDER of your
   `board:` entries is now interpreted as **priority** (first = highest), since that order

@@ -162,7 +162,10 @@ class BoardReviewer:
 # To RE-RANK the board, just reorder this tuple (top = highest priority). Model ids are
 # byte-exact against the provider catalogs (commandcode gateway /models, z.ai Coding-Plan)
 # — do not alter the strings. Each is the TOP available version of its model family
-# (fable-5, opus-4-8, gpt-5.5, Kimi-K2.7, glm-5.2, Qwen3.7-Max, deepseek-v4-pro).
+# (fable-5, opus-4-8, codex/GPT-5.5, Kimi-K2.7, glm-5.2, Qwen3.7-Max, deepseek-v4-pro).
+# Seat 3 is the AGENTIC codex CLI route (bare `codex` → `codex exec -s read-only -C <cwd>`,
+# reads the whole repo), NOT the diff-only `commandcode:gpt-5.5` HTTP route. GPT-5.5 is
+# codex; the agentic route is preferred. Rationale lives in the CHANGELOG.
 #
 # The `tests` seat goes DIRECT to z.ai (`zai:glm-5.2`, the newest GLM reachable on the
 # Coding-Plan endpoint) via the user's GLM subscription — not the commandcode gateway.
@@ -178,8 +181,9 @@ DEFAULT_BOARD = (
     BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
     # priority 2 — Opus 4.8. Also the moderator (MODERATOR_CANDIDATES[0]).
     BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
-    # priority 3 — GPT-5.5 via commandcode.
-    BoardReviewer("commandcode:gpt-5.5", "consistency", "GPT-5.5"),
+    # priority 3 — Codex: the agentic codex CLI route (reads the whole repo), NOT the
+    # diff-only `commandcode:gpt-5.5` HTTP route. GPT-5.5 is codex; the agentic route wins.
+    BoardReviewer("codex", "consistency", "Codex"),
     # priority 4 — Kimi K2.7 via commandcode.
     BoardReviewer("commandcode:moonshotai/Kimi-K2.7-Code", "performance", "Kimi"),
     # priority 5 — GLM-5.2 DIRECT to z.ai (his GLM subscription), the newest GLM.
