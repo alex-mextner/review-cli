@@ -91,7 +91,7 @@ body{
 .reply-box{margin-top:8px;display:none;flex-direction:column;gap:6px}
 .reply-box.open{display:flex}
 .reply-box textarea{width:100%;background:#11141c;border:1px solid var(--line);color:var(--ink);
-  border-radius:7px;padding:7px;font:13px/1.45 inherit;resize:vertical}
+  border-radius:7px;padding:7px;font:16px/1.45 inherit;resize:vertical}
 .reply-box .reply-send{align-self:flex-end}
 
 /* ---- buttons ------------------------------------------------------------ */
@@ -104,7 +104,10 @@ button.primary:hover{filter:brightness(1.08)}
 /* The prose container must never push the spec pane wider than the viewport.
    Long unbreakable tokens (file paths, identifiers, URLs, inline code) are the
    #1 mobile horizontal-scroll source — break them mid-token so they wrap. */
-.spec-body{max-width:100%;overflow-wrap:break-word;word-break:break-word}
+/* Spec prose must stay selectable on every device (some mobile resets disable text
+   selection globally); -webkit-user-select keeps iOS Safari able to start a selection. */
+.spec-body{max-width:100%;overflow-wrap:break-word;word-break:break-word;
+  -webkit-user-select:text;user-select:text;-webkit-touch-callout:default}
 .spec-body .md-h{scroll-margin-top:18px;line-height:1.3;position:relative}
 .spec-body .anchor-link{opacity:0;margin-left:8px;color:var(--muted);text-decoration:none;font-weight:400}
 .spec-body .md-h:hover .anchor-link{opacity:.6}
@@ -153,8 +156,14 @@ mark.sw-quote.active{background:var(--mark-active);color:#fff1c2;box-shadow:0 0 
 @keyframes flash{0%{background:#2b3a5e}100%{background:transparent}}
 
 /* ---- selection popup + composer ---------------------------------------- */
+/* The popup itself must NOT be text-selectable (tapping it on iOS would otherwise start a
+   new selection and clear the spec selection); touch-action:manipulation kills the 300ms
+   tap delay and double-tap-zoom so a single tap fires pointerup cleanly. touch-action does
+   not inherit, so it is set on both the popup and its buttons via the selector list below. */
+.sel-popup,.sel-popup button{touch-action:manipulation}
 .sel-popup{position:absolute;z-index:50;display:flex;gap:4px;background:#1c2230;
-  border:1px solid #33405e;border-radius:9px;padding:4px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
+  border:1px solid #33405e;border-radius:9px;padding:4px;box-shadow:0 6px 24px rgba(0,0,0,.5);
+  -webkit-user-select:none;user-select:none}
 .sel-popup button{background:#222b3d;border:1px solid var(--line);color:var(--ink);
   border-radius:6px;padding:5px 10px;font-size:12.5px;cursor:pointer;white-space:nowrap}
 .sel-popup button:hover{border-color:var(--accent)}
@@ -170,7 +179,7 @@ mark.sw-quote.active{background:var(--mark-active);color:#fff1c2;box-shadow:0 0 
 .composer-quote{margin:0;padding:7px 11px;border-left:3px solid var(--quote);background:#1c1a12;
   color:#ffe6ad;font-style:italic;border-radius:4px;font-size:13px;white-space:pre-wrap;max-height:8em;overflow:auto}
 .composer textarea{width:100%;background:#11141c;border:1px solid var(--line);color:var(--ink);
-  border-radius:9px;padding:10px;font:14px/1.5 inherit;resize:vertical}
+  border-radius:9px;padding:10px;font:16px/1.5 inherit;resize:vertical}
 .composer-actions{display:flex;justify-content:flex-end;gap:8px}
 .composer-actions button{background:#161b26;border:1px solid var(--line);color:var(--ink);
   border-radius:7px;padding:6px 13px;font-size:13px;cursor:pointer}
