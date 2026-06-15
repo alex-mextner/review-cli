@@ -91,7 +91,7 @@ body{
 .reply-box{margin-top:8px;display:none;flex-direction:column;gap:6px}
 .reply-box.open{display:flex}
 .reply-box textarea{width:100%;background:#11141c;border:1px solid var(--line);color:var(--ink);
-  border-radius:7px;padding:7px;font:13px/1.45 inherit;resize:vertical}
+  border-radius:7px;padding:7px;font:16px/1.45 inherit;resize:vertical}
 .reply-box .reply-send{align-self:flex-end}
 
 /* ---- buttons ------------------------------------------------------------ */
@@ -179,7 +179,7 @@ mark.sw-quote.active{background:var(--mark-active);color:#fff1c2;box-shadow:0 0 
 .composer-quote{margin:0;padding:7px 11px;border-left:3px solid var(--quote);background:#1c1a12;
   color:#ffe6ad;font-style:italic;border-radius:4px;font-size:13px;white-space:pre-wrap;max-height:8em;overflow:auto}
 .composer textarea{width:100%;background:#11141c;border:1px solid var(--line);color:var(--ink);
-  border-radius:9px;padding:10px;font:14px/1.5 inherit;resize:vertical}
+  border-radius:9px;padding:10px;font:16px/1.5 inherit;resize:vertical}
 .composer-actions{display:flex;justify-content:flex-end;gap:8px}
 .composer-actions button{background:#161b26;border:1px solid var(--line);color:var(--ink);
   border-radius:7px;padding:6px 13px;font-size:13px;cursor:pointer}
