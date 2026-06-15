@@ -173,6 +173,28 @@ DEFAULT_BOARD = (
 )
 
 
+# DEFAULT_POOL_SIZE: how many of the board's seats a plain `review` runs by default.
+# The board (DEFAULT_BOARD or a config `board:`) is an 8-seat panel kept as a RESERVE;
+# by default only the FIRST 4 seats participate (architect/correctness/consistency/
+# performance on the default board), and the remaining seats are the reserve you opt
+# into with `--pool N` (or `--pool 0` for all of them). The board is NEVER disabled —
+# `--pool` only sizes how many seats run. See select_pool().
+DEFAULT_POOL_SIZE = 4
+
+
+def select_pool(board: list[BoardReviewer], pool: int) -> list[BoardReviewer]:
+    """Pick the first `pool` seats of the board; the rest are the reserve.
+
+    The board is always on — this only sizes how many of its seats participate in a
+    run. The selection is deterministic (the FIRST `pool` seats, in board order) so
+    the reserve is simply the remainder. `pool <= 0` means "all seats" (the full
+    reserve), and a `pool` larger than the board is clamped to the whole board — a
+    caller can never ask for more seats than exist. An empty board stays empty."""
+    if pool <= 0 or pool >= len(board):
+        return list(board)
+    return list(board[:pool])
+
+
 def _display_name(model: str) -> str:
     """A short, human-friendly label for a board reviewer derived from its model
     string — used when config.yaml omits an explicit name. Takes the last path

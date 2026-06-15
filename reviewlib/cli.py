@@ -19,6 +19,7 @@ from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
 from .config import (
     DEFAULT_MODELS,
+    DEFAULT_POOL_SIZE,
     DEFAULT_PROMPT,
     PANEL_TIMEOUT_DEFAULT,
     BoardConfigError,
@@ -26,6 +27,7 @@ from .config import (
     _split_models,
     load_board,
     load_config,
+    select_pool,
 )
 from .install import install_commit_hook, install_skill
 from .modes.brainstorm import mode_brainstorm
@@ -268,7 +270,17 @@ def _dispatch(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
     parser.add_argument("--show-board", action="store_true", help="print the active reviewer board (model -> role, availability) and exit")
-    parser.add_argument("--no-board", action="store_true", help="disable the reviewer board; use the plain models list instead")
+    parser.add_argument(
+        "--pool",
+        type=int,
+        default=DEFAULT_POOL_SIZE,
+        metavar="N",
+        help=(
+            f"how many of the board's seats to run (default {DEFAULT_POOL_SIZE}); the "
+            "first N seats participate, the rest are kept in reserve. The board is "
+            "never off — --pool only sizes it. N<=0 means all seats."
+        ),
+    )
     parser.add_argument("--moderator", default=None, help="moderator backend for --quorum/--brainstorm")
     parser.add_argument("--rounds", type=int, default=5, help="brainstorm minimum rounds (min & default 5)")
     parser.add_argument("--max-rounds", type=int, default=8, help="brainstorm hard cap on rounds")
@@ -307,7 +319,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return 0
 
     if args.show_board:
-        return _show_board(config)
+        return _show_board(config, args.pool)
 
     cwd = _effective_cwd(args.cwd)
     explicit_models = _split_models(args.model)
@@ -329,32 +341,35 @@ def _dispatch(argv: list[str] | None = None) -> int:
     timeout = args.timeout if args.timeout is not None else (PANEL_TIMEOUT_DEFAULT if panel_mode else 1200)
 
     # Reviewer board (HYP-741): the default plain-review panel assigns each model its
-    # own role/lens. Precedence is COST-SAFETY first — the paid 8-model board runs only
-    # when the user expressed NO model preference at all:
+    # own role/lens. Precedence is COST-SAFETY first — the board runs only when the user
+    # expressed NO model preference at all:
     #   explicit -m  >  explicit `models:` in config.yaml  >  default board.
-    # So a configured `models:` gets exactly those (the flat panel), NOT the paid board;
-    # --no-board also forces the flat path. The board applies only on the DEFAULT diff
-    # review (no panel mode) with neither -m nor config models. `use_board` is a cheap
-    # boolean gate computed now; the actual load_board + cost-safety validation runs
-    # LATER (validate_board, below) — after the standalone-visual path has had its chance
-    # to short-circuit, so a malformed `board:` never blocks the board-unrelated
-    # standalone `review --visual` pipeline (codex P2). It still fires BEFORE the COMPANION
-    # visual fan-out, so a doomed config never spends a paid vision call.
+    # So a configured `models:` gets exactly those (the flat panel), NOT the board. The
+    # board applies on the DEFAULT diff review (no panel mode) with neither -m nor config
+    # models. The board is NEVER disabled — `--pool N` only sizes how many of its seats
+    # run (default 4 of the 8-seat board; the rest are a reserve). `use_board` is a cheap
+    # boolean gate computed now; the actual load_board + cost-safety validation (and the
+    # --pool slice) runs LATER (validate_board, below) — after the standalone-visual path
+    # has had its chance to short-circuit, so a malformed `board:` never blocks the
+    # board-unrelated standalone `review --visual` pipeline (codex P2). It still fires
+    # BEFORE the COMPANION visual fan-out, so a doomed config never spends a paid vision
+    # call.
     has_config_models = bool(config_models)  # filtered above: blanks-only counts as none
-    use_board = not panel_mode and not explicit_models and not has_config_models and not args.no_board
+    use_board = not panel_mode and not explicit_models and not has_config_models
     board: list | None = None
     board_validated = False
 
     def validate_board() -> int | None:
-        """Resolve + validate the reviewer board for the default review path, once.
-        Returns an exit code (2) on an all-malformed `board:` config, else None. No-op
-        when the board does not apply (panel mode / -m / config models / --no-board)."""
+        """Resolve + validate the reviewer board for the default review path, once,
+        then size it to --pool seats (the first N; the rest are the reserve). Returns
+        an exit code (2) on an all-malformed `board:` config, else None. No-op when the
+        board does not apply (panel mode / -m / config models)."""
         nonlocal board, board_validated
         if board_validated or not use_board:
             return None
         board_validated = True
         try:
-            board = load_board(config)
+            board = select_pool(load_board(config), args.pool)
         except BoardConfigError as exc:
             print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
             return 2
@@ -371,12 +386,31 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # an absent diff → the standalone pipeline — so we MUST still try to discover it,
     # but a missing diff / non-repo must degrade to standalone rather than abort.
     diff = _read_stdin_if_piped()
-    needs_diff = args.staged or (not panel_mode and not visual_mode)
+    # --brainstorm treats the diff as OPTIONAL grounding context even with --staged, so
+    # it must NOT take the hard-fail `needs_diff` path: a non-repo `-C` or a failing
+    # `git diff [--cached]` degrades to pure ideation (diff == ""), not an abort. Only a
+    # default review (no panel mode, no --visual) genuinely REQUIRES a diff; --staged on
+    # such a review still hard-requires it (the pre-commit gate). So brainstorm is
+    # excluded from needs_diff and routed through the caught/optional probe below.
+    needs_diff = (args.staged or (not panel_mode and not visual_mode)) and args.brainstorm is None
     if diff is None and needs_diff:
         diff = _git_diff(cwd, args.staged)
     elif diff is None and visual_mode and not panel_mode:
         # --visual riding the default review: probe the working-tree diff to decide
         # companion-vs-standalone, but tolerate "no diff / not a git repo".
+        try:
+            diff = _git_diff(cwd, args.staged)
+        except RuntimeError:
+            diff = ""
+    elif diff is None and args.brainstorm is not None:
+        # --brainstorm picks up the staged (--staged) or working-tree diff as OPTIONAL
+        # grounding context so you can brainstorm ABOUT a specific change. The diff is
+        # never required: an absent diff / non-repo / git failure degrades to pure
+        # ideation (diff == ""). `_read_stdin_if_piped` already returns the diff for a
+        # NON-EMPTY pipe (precedence); empty/`/dev/null` stdin reads as None here, so we
+        # still probe the working tree — matching every other mode and the documented
+        # `… --brainstorm "Q" < /dev/null` convention (an empty redirect must NOT suppress
+        # grounding).
         try:
             diff = _git_diff(cwd, args.staged)
         except RuntimeError:
@@ -485,7 +519,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
             "brainstorm", brainstorm_pool,
             lambda: mode_brainstorm(
                 _with_visual(args.brainstorm, visual_ctx), models, cwd, timeout,
-                pick_moderators(args.moderator, models), args.rounds, args.max_rounds
+                pick_moderators(args.moderator, models), args.rounds, args.max_rounds,
+                # When there IS a diff (working-tree, --staged, or piped), the personas
+                # see it as grounding context so you can brainstorm ABOUT a specific
+                # change. No diff -> pure ideation, exactly as before.
+                diff=diff,
             ),
         )
 
@@ -508,27 +546,36 @@ def _dispatch(argv: list[str] | None = None) -> int:
     )
 
 
-def _show_board(config: dict) -> int:
+def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE) -> int:
     """Print the active reviewer board: each reviewer's display name, role, model,
     and whether its backend is currently available (key/CLI present). Sourced from
-    config.yaml `board:` if set, else the built-in DEFAULT_BOARD. Read-only — no
-    model is called, no key is printed."""
+    config.yaml `board:` if set, else the built-in DEFAULT_BOARD. Each seat is tagged
+    `pool`/`reserve` for the EFFECTIVE pool (honoring an explicit `--pool N`, default 4);
+    the tag is by seat INDEX, not model identity, so a board with the same model in two
+    seats labels them independently. Read-only — no model is called, no key is printed."""
     try:
         board = load_board(config)
     except BoardConfigError as exc:
         print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
         return 2
     source = "config.yaml (board:)" if isinstance(config.get("board"), list) and config.get("board") else "default"
-    print(f"Reviewer board ({len(board)} seats, source: {source}):\n")
+    pool_count = len(select_pool(board, pool_size))  # first-N, clamped; pool<=0 -> all
+    sized = " (sized by --pool)" if pool_size != DEFAULT_POOL_SIZE else ""
+    print(f"Reviewer board ({len(board)} seats, source: {source}; "
+          f"pool = first {pool_count}{sized}, the rest are reserve — size with --pool N):\n")
     name_w = max((len(r.display) for r in board), default=0)
     role_w = max((len(r.role or "general") for r in board), default=0)
-    for reviewer in board:
+    for index, reviewer in enumerate(board):
         available = backends.backend_available(reviewer.model)
         status = "available" if available else "SKIPPED (no key/CLI)"
         role = (reviewer.role or "general").ljust(role_w)
-        print(f"  {reviewer.display.ljust(name_w)}  {role}  {reviewer.model}  [{status}]")
+        tier = "pool   " if index < pool_count else "reserve"
+        print(f"  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  {reviewer.model}  [{status}]")
+    print(f"\nA plain `review` runs the first {DEFAULT_POOL_SIZE} seats by default "
+          f"(--pool {DEFAULT_POOL_SIZE}); `--pool N` runs the first N, `--pool 0` runs all "
+          f"{len(board)}.")
     if any(not backends.backend_available(r.model) for r in board):
-        print("\nSkipped reviewers drop out of the panel at run time; the board degrades "
+        print("Skipped reviewers drop out of the panel at run time; the board degrades "
               "gracefully. commandcode reviewers need COMMANDCODE_API_KEY, gemini needs "
               "GEMINI_API_KEY, codex/claude need their CLI on PATH.")
     return 0

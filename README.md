@@ -161,6 +161,20 @@ concrete recommendation.
 Use for genuinely open design questions where you want the discussion to build across
 rounds rather than converge in one shot.
 
+**Brainstorm about a specific change (`--brainstorm` + a diff).** When there IS a diff
+— an uncommitted working-tree diff in `-C`, a `--staged` diff, or a piped diff — every
+persona (and the moderator) sees it as constant **grounding context**, so you can
+brainstorm concretely ABOUT a change instead of in the abstract. With **no** diff
+present it stays pure ideation, exactly as before. The diff is optional: an absent diff
+or a non-repo `-C` degrades silently to ideation.
+
+```bash
+# brainstorm grounded in the current uncommitted working-tree diff
+review -C <repo> --brainstorm "Is this caching approach sound? What are the risks?"
+review -C <repo> --staged --brainstorm "Alternatives to this design before I commit?"
+git diff main... | review -C <repo> --brainstorm "How else could we structure this?"
+```
+
 The whole conversation is also written **incrementally** to a single discussion log
 (`<logdir>/<stamp>-brainstorm.md`, path printed to stderr at the start) — each round
 and moderator decision is flushed as it lands, so a timeout or interruption leaves the
@@ -190,7 +204,7 @@ review --brainstorm "API shape for the cache layer" \
 | `review` | Pre-commit diff check — fast, parallel, no overhead |
 | `--just-ask` | Quick multi-model second opinion on any question |
 | `--quorum` | A contested decision that needs cited evidence to settle |
-| `--brainstorm` | An open design space you want to explore across multiple rounds |
+| `--brainstorm` | An open design space you want to explore across multiple rounds (optionally grounded in a diff — pass `--staged` or have an uncommitted diff to brainstorm about a specific change) |
 
 ---
 
@@ -487,7 +501,9 @@ context without getting an edit target.
 --max-rounds N      Hard cap on brainstorm rounds (default 8).
 --list-defaults     Print effective default backends and exit.
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
---no-board          Disable the reviewer board; use the plain models list instead.
+--pool N            How many of the board's seats to run (default 4); the first N seats run,
+                    the rest are kept in reserve. The board is never off — --pool only sizes
+                    it. N<=0 (e.g. --pool 0) runs all seats.
 --prompt TEXT       Override the default review prompt.
 -C / --cwd DIR      Run against a different repository directory.
 ```
@@ -528,18 +544,26 @@ instead of every model doing the same generic pass. The board is the default pan
 out of the box — no config file required. Reviewers whose backend isn't available
 (no key / not on PATH) are skipped and logged; the board degrades gracefully.
 
-The built-in board:
+The built-in board is an **8-seat panel**, but by default a plain `review` runs only
+the **first 4 seats** (the **default pool**); the other 4 are a **reserve**. Size the
+pool with `--pool N` — `--pool 8` (or `--pool 0`) runs all eight, `--pool 2` runs the
+first two. The board is **never disabled**; `--pool` only chooses how many of its seats
+participate. The first four seats — `architect`, `correctness`, `consistency`,
+`performance` — are the default pool; `quality`, `security`, `tests`, `contracts` are
+the reserve.
 
-| Reviewer | Backend | Role | Lens focus |
-|---|---|---|---|
-| Opus | `claude:claude-opus-4-8` | `architect` | architecture, design coherence, API shape, abstraction boundaries (also the moderator) |
-| Codex | `codex` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one |
-| Gemini | `gemini` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
-| DeepSeek | `commandcode:deepseek/deepseek-v4-pro` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
-| Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
-| Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| GLM | `zai:glm-5.2` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
-| GPT-5.5 | `commandcode:gpt-5.5` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+The built-in board (the `pool`/`reserve` column shows which seats run by default):
+
+| Seat | Reviewer | Backend | Role | Lens focus |
+|---|---|---|---|---|
+| pool | Opus | `claude:claude-opus-4-8` | `architect` | architecture, design coherence, API shape, abstraction boundaries (also the moderator) |
+| pool | Codex | `codex` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one |
+| pool | Gemini | `gemini` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| pool | DeepSeek | `commandcode:deepseek/deepseek-v4-pro` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
+| reserve | Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
+| reserve | Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| reserve | GLM | `zai:glm-5.2` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| reserve | GPT-5.5 | `commandcode:gpt-5.5` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
 
 The `tests` seat goes **direct to z.ai** (`zai:glm-5.2`, the newest GLM, reachable on
 the GLM Coding-Plan endpoint) via the z.ai backend — not through the commandcode
@@ -547,24 +571,27 @@ gateway. It needs a z.ai key (see Auth). All other commandcode seats need
 `COMMANDCODE_API_KEY`.
 
 ```bash
-review --show-board   # list the active board (model -> role) + availability
-review --no-board     # disable the board; use the plain `models` list instead
-review -m codex -m gemini   # an explicit -m also bypasses the board (exact models)
+review --show-board   # list the active board (model -> role) + pool/reserve + availability
+review                # default pool: the first 4 board seats
+review --pool 8       # run all 8 seats (--pool 0 also means "all")
+review --pool 2       # run only the first 2 seats
+review -m codex -m gemini   # an explicit -m bypasses the board entirely (exact models)
 ```
 
 ### Board vs. models precedence
 
 The board is the default **only when you have not expressed a model preference**.
-Precedence (cost-safety first — the paid 8-model board never runs against your wishes):
+Precedence (cost-safety first — the board never runs against your wishes):
 
 ```
-explicit -m on the CLI   >   `models:` in config.yaml   >   default board
+explicit -m on the CLI   >   `models:` in config.yaml   >   default board (pool seats)
 ```
 
 - A `models:` list in `config.yaml` **overrides the board**: you configured exact
-  models, so `review` runs exactly those (the flat panel), not the paid board.
-- `--no-board` forces the flat `models`/default list even with no `-m` and no `models:`.
-- The board runs only when there is **no** `-m`, **no** `models:`, and no `--no-board`.
+  models, so `review` runs exactly those (the flat panel), not the board.
+- The board runs whenever there is **no** `-m` and **no** `models:`. It can **never**
+  be disabled — there is no `--no-board` flag. Use `--pool N` to size it (default 4;
+  `--pool 0`/`--pool 8` runs all seats).
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
   preference — the board still applies.
 

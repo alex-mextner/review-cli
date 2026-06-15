@@ -290,7 +290,7 @@ def test_cli_review_run_records_stat_and_announces_eta():
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["-C", d.name, "-m", "codex,gemini", "--no-board"])
+                rc = _cli.main(["-C", d.name, "-m", "codex,gemini"])
             assert rc == 0, rc
             # ETA line went to stderr.
             assert "[review] pool=2 (review)" in err.getvalue()
@@ -313,6 +313,68 @@ def test_cli_review_run_records_stat_and_announces_eta():
             d.cleanup()
 
 
+def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
+    """Run a default board `review` (all 8 seats available) with `extra_argv` appended,
+    returning the single run-stats record + the captured stderr under key "_stderr".
+    The board is pinned to DEFAULT_BOARD and config to {} so the test is independent of
+    the dev machine's config.yaml; backends are stubbed (no model call)."""
+    from reviewlib import backends as _backends
+    from reviewlib.config import DEFAULT_BOARD
+
+    with _TmpStore() as store:
+        d = _git_init_with_diff()
+        restore = _with_backend_stub(_stub_resolve_backend(0))
+        saved_avail_b = _backends.backend_available
+        saved_avail_p = _panel.backend_available
+        _backends.backend_available = lambda _m: True
+        _panel.backend_available = lambda _m: True
+        saved_cfg = _cli.load_config
+        saved_lb = _cli.load_board
+        _cli.load_config = lambda: {}
+        _cli.load_board = lambda _cfg: list(DEFAULT_BOARD)
+        log = tempfile.mkdtemp()
+        os.environ["REVIEW_LOG_DIR"] = log
+        try:
+            err = io.StringIO()
+            with redirect_stderr(err), _capture_stdout():
+                rc = _cli.main(["-C", d.name, *extra_argv])
+            assert rc == 0, rc
+            recs = store.records()
+            assert len(recs) == 1, recs
+            r = dict(recs[0])
+            r["_stderr"] = err.getvalue()
+            return r
+        finally:
+            restore()
+            _backends.backend_available = saved_avail_b
+            _panel.backend_available = saved_avail_p
+            _cli.load_config = saved_cfg
+            _cli.load_board = saved_lb
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            d.cleanup()
+
+
+def test_cli_default_board_run_records_pool_size_four():
+    """A default `review` (no -m, no config models) runs the board sized to the default
+    pool (4 seats); the run-stats record must report pool_size == 4, NOT the full 8
+    (the slice must feed run-stats, not the pre-slice board)."""
+    r = _run_board_review_and_get_record([])  # default pool = 4
+    assert r["mode"] == "review"
+    assert r["pool_size"] == 4, r  # the SLICED board, not the full 8
+    assert len(r["models"]) == 4, r
+    assert "[review] pool=4 (review)" in r["_stderr"]
+
+
+def test_cli_board_run_records_explicit_pool_size():
+    """`--pool 2` must record pool_size == 2 (not 4, not 8): the slice feeds run-stats
+    at arbitrary sizes, not just the default (GLM finding 23)."""
+    r = _run_board_review_and_get_record(["--pool", "2"])
+    assert r["mode"] == "review"
+    assert r["pool_size"] == 2, r
+    assert len(r["models"]) == 2, r
+    assert "[review] pool=2 (review)" in r["_stderr"]
+
+
 def test_cli_records_failure_counts_per_call():
     with _TmpStore() as store:
         d = _git_init_with_diff()
@@ -322,7 +384,7 @@ def test_cli_records_failure_counts_per_call():
         os.environ["REVIEW_LOG_DIR"] = log
         try:
             with redirect_stderr(io.StringIO()), _capture_stdout():
-                rc = _cli.main(["-C", d.name, "-m", "codex,gemini", "--no-board"])
+                rc = _cli.main(["-C", d.name, "-m", "codex,gemini"])
             assert rc == 1, rc
             r = store.records()[0]
             assert r["ok_count"] == 1 and r["fail_count"] == 1, r
@@ -356,7 +418,7 @@ def test_cli_no_dispatch_run_is_not_recorded_but_eta_still_printed():
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["-C", d.name, "-m", "codex,gemini", "--no-board"])
+                rc = _cli.main(["-C", d.name, "-m", "codex,gemini"])
             assert rc == 1, rc  # "No diff to review."
             assert "[review] pool=2 (review)" in err.getvalue()  # ETA still printed
             assert store.records() == []  # but NOT recorded
@@ -379,7 +441,7 @@ def test_cli_second_run_eta_uses_first_runs_history():
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                _cli.main(["-C", d.name, "-m", "codex,gemini", "--no-board"])
+                _cli.main(["-C", d.name, "-m", "codex,gemini"])
             assert "past run" in err.getvalue() and "this size" in err.getvalue()
             assert len(store.records()) == 2  # seed + this run
         finally:
