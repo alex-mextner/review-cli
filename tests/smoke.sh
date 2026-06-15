@@ -55,7 +55,11 @@ bin/review --show-board | grep -q "claude:claude-fable-5"
 bin/review --show-board | grep -q "claude:claude-opus-4-8"
 bin/review --show-board | grep -q "commandcode:deepseek/deepseek-v4-pro"
 bin/review --show-board | grep -q "zai:glm-5.2"
-bin/review --show-board | grep -q "commandcode:gpt-5.5"
+# Seat 3 is the agentic codex route (GPT-5.5 IS codex) — assert the Codex seat line shows
+# the `codex` model AND the `agentic` scope (the diff-only commandcode:gpt-5.5 was retired).
+# Two portable substring checks on the seat line (no GNU-only `\b`, order-independent).
+bin/review --show-board | grep "Codex" | grep -q "codex"
+bin/review --show-board | grep "Codex" | grep -q "agentic"
 bin/review --show-board | grep -q "contracts"
 bin/review --show-board | grep -q "8 seats"
 # Priority order is shown (seat #1 etc.) and the failover pool is described.

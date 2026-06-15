@@ -137,7 +137,7 @@ def test_startup_failover_skips_unavailable_top_seat():
     pool, reserve = split_pool_reserve(board, 4, _avail(available))
     assert [r.model for r in pool] == [
         "claude:claude-opus-4-8",
-        "commandcode:gpt-5.5",
+        "codex",
         "commandcode:moonshotai/Kimi-K2.7-Code",
         "zai:glm-5.2",
     ], [r.model for r in pool]
@@ -209,7 +209,7 @@ def test_midrun_unavailable_body_triggers_backfill_fable_case():
     """The exact CTO scenario: Fable is in the startup pool (the cheap probe says
     available — its paywall is invisible) but returns an 'unavailable' body at run time.
     Mid-run failover treats that as a failure and backfills, so the working pool-4 ends as
-    Opus / GPT-5.5 / Kimi / GLM-5.2 — Fable replaced."""
+    Opus / Codex / Kimi / GLM-5.2 — Fable replaced."""
     board = list(DEFAULT_BOARD)
     # Cheap probe: ALL available (Fable's paywall is invisible to it).
     pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in board}))
@@ -223,7 +223,7 @@ def test_midrun_unavailable_body_triggers_backfill_fable_case():
     assert "claude:claude-fable-5" not in outcome.usable_models
     assert set(outcome.usable_models) == {
         "claude:claude-opus-4-8",
-        "commandcode:gpt-5.5",
+        "codex",
         "commandcode:moonshotai/Kimi-K2.7-Code",
         "zai:glm-5.2",
     }, outcome.usable_models

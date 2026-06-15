@@ -49,7 +49,8 @@ def test_default_board_matches_directive_table():
     expected = [
         ("claude:claude-fable-5", "architect", "Fable"),
         ("claude:claude-opus-4-8", "correctness", "Opus"),
-        ("commandcode:gpt-5.5", "consistency", "GPT-5.5"),
+        # Seat 3 is the agentic codex CLI route (see config.py / CHANGELOG for rationale).
+        ("codex", "consistency", "Codex"),
         ("commandcode:moonshotai/Kimi-K2.7-Code", "performance", "Kimi"),
         # GLM goes DIRECT to z.ai (his GLM subscription), not commandcode.
         ("zai:glm-5.2", "quality", "GLM"),
@@ -62,12 +63,12 @@ def test_default_board_matches_directive_table():
 
 
 def test_default_board_is_priority_ordered():
-    """The CTO's priority sketch (strongest first): Fable, Opus, GPT-5.5, Kimi, GLM-5.2,
+    """The CTO's priority sketch (strongest first): Fable, Opus, Codex, Kimi, GLM-5.2,
     Qwen, DeepSeek, Gemini. Re-ranking = reordering DEFAULT_BOARD; this pins the order."""
     assert [r.model for r in DEFAULT_BOARD] == [
         "claude:claude-fable-5",
         "claude:claude-opus-4-8",
-        "commandcode:gpt-5.5",
+        "codex",
         "commandcode:moonshotai/Kimi-K2.7-Code",
         "zai:glm-5.2",
         "commandcode:Qwen/Qwen3.7-Max",
@@ -282,6 +283,14 @@ class _AvailabilityPatch:
 
         self._old_panel = panel.backend_available
         panel.backend_available = _fake
+        # _mode_review_board also does `from ..backends import backend_available` (a
+        # direct binding in reviewlib.modes.review), so the board-pool split there must
+        # be patched too — otherwise the "no reviewers available" test silently hits the
+        # REAL probe (and now that `codex` is on PATH, a real seat could leak through).
+        import reviewlib.modes.review as review_mod
+
+        self._old_review_mod = review_mod.backend_available
+        review_mod.backend_available = _fake
         return self
 
     def __exit__(self, *exc):
@@ -289,6 +298,9 @@ class _AvailabilityPatch:
         import reviewlib.panel as panel
 
         panel.backend_available = self._old_panel
+        import reviewlib.modes.review as review_mod
+
+        review_mod.backend_available = self._old_review_mod
         return False
 
 
@@ -742,7 +754,7 @@ def test_show_board_honors_pool_flag_tagging():
 def test_show_board_startup_failover_skips_unavailable_top_seat():
     """The live pool is the top-N AVAILABLE seats by priority: an unavailable higher
     priority seat is tagged `unavail` and the next available seat fills the pool."""
-    # Fable (#1) unavailable -> the pool of 2 is Opus (#2) + GPT-5.5 (#3); Fable is unavail.
+    # Fable (#1) unavailable -> the pool of 2 is Opus (#2) + Codex (#3); Fable is unavail.
     avail = {r.model for r in DEFAULT_BOARD if r.model != "claude:claude-fable-5"}
     seat_lines = [ln for ln in _show_board_lines(2, available=avail)
                   if "[pool" in ln or "[reserve]" in ln or "[unavail]" in ln]
@@ -755,7 +767,7 @@ def test_show_board_startup_failover_skips_unavailable_top_seat():
     assert len(by_tier["pool"]) == 2, by_tier["pool"]
     assert "Fable" in by_tier["unavail"][0], by_tier["unavail"]
     assert "Opus" in by_tier["pool"][0]
-    assert "GPT-5.5" in by_tier["pool"][1]
+    assert "Codex" in by_tier["pool"][1]
 
 
 def test_show_board_pool_zero_marks_all_seats_pool():

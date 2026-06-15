@@ -187,9 +187,96 @@ def test_show_board_scope_label_tracks_cwd_for_opencode():
     # opencode: agentic iff cwd is a real repo.
     assert _seat_reads_repo("oc:opencode/m", True) is True
     assert _seat_reads_repo("oc:opencode/m", False) is False
-    # commandcode / z.ai are diff-only regardless of the repo bit.
-    assert _seat_reads_repo("commandcode:gpt-5.5", True) is False
+    # codex is the agentic route for the #3 GPT-5.5/codex seat — it reads the whole repo
+    # (the diff-only `commandcode:gpt-5.5` route for the SAME model was retired). Unlike
+    # opencode, codex's scope label does NOT gate on the repo bit (the helper returns True
+    # for review_codex unconditionally), so it stays `agentic` regardless of cwd_is_repo.
+    assert _seat_reads_repo("codex", True) is True
+    assert _seat_reads_repo("codex", False) is True
+    # commandcode / z.ai are diff-only regardless of the repo bit (keyed HTTP, no workspace).
+    assert _seat_reads_repo("commandcode:moonshotai/Kimi-K2.7-Code", True) is False
     assert _seat_reads_repo("zai:glm-5.2", True) is False
+
+
+class _CapturedCodex:
+    """Like `_Captured`, but its `__call__` accepts review_codex's `input_text=` kwarg
+    (the codex backend pipes the payload over stdin, unlike opencode's argv-only call)."""
+
+    def __init__(self) -> None:
+        self.argv: list[str] | None = None
+        self.cwd: Path | None = None
+        self.input_text: str | None = None
+
+    def __call__(self, argv, cwd, timeout, backend, round_no=0, announce=False, input_text=""):
+        self.argv = list(argv)
+        self.cwd = Path(cwd)
+        self.input_text = input_text
+
+        class _Proc:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        return _Proc()
+
+
+@contextlib.contextmanager
+def _capture_codex():
+    """Hermetic capture of review_codex's launch (no real `codex` binary needed): patch
+    `_run_streamed` to record argv/cwd and `_which` to a fake path. Single restore point."""
+    cap = _CapturedCodex()
+    orig_run = review_backends._run_streamed
+    orig_which = review_backends._which
+    review_backends._run_streamed = cap  # type: ignore[assignment]
+    review_backends._which = lambda name: f"/fake/bin/{name}"  # type: ignore[assignment]
+    try:
+        yield cap
+    finally:
+        review_backends._run_streamed = orig_run
+        review_backends._which = orig_which
+
+
+def test_codex_bare_seat_runs_agentic_read_only_in_repo_no_model_flag():
+    """The #3 board seat is the bare `codex` string -> the AGENTIC codex CLI route:
+    `codex exec -s read-only -C <cwd> --ephemeral -`. Bare `codex` (no `:model`) pins
+    NO `-m` flag (the codex CLI default model), and the run is read-only inside the real
+    repo, so it can read any project file — not just the diff."""
+    with _capture_codex() as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            res = review_backends.review_codex("codex", "Review.", "some diff", repo, 60)
+        assert res.returncode == 0, res
+        argv = cap.argv or []
+        assert argv[0].endswith("/codex"), argv
+        assert argv[1] == "exec", argv
+        # read-only scope + the real repo as -C, never a write/agentic-edit posture.
+        assert "-s" in argv and argv[argv.index("-s") + 1] == "read-only", argv
+        assert "-C" in argv and argv[argv.index("-C") + 1] == str(repo), argv
+        # Ephemeral session + the stdin marker `-` as the last arg (payload piped in).
+        assert "--ephemeral" in argv, argv
+        assert argv[-1] == "-", argv
+        # Bare `codex` carries NO `-m` (uses the codex CLI default model).
+        assert "-m" not in argv, argv
+        assert cap.cwd == repo
+        # The prompt AND the diff actually reach the model over stdin — a regression that
+        # drops the payload would otherwise pass an argv-only check while reviewing nothing.
+        assert "Review." in (cap.input_text or ""), cap.input_text
+        assert "some diff" in (cap.input_text or ""), cap.input_text
+
+
+def test_codex_pinned_model_seat_passes_model_flag():
+    """A `codex:<model>` spec DOES pin `-m <model>` (so a future board could pin a
+    version), unlike the bare `codex` seat. Pins the argv contract both ways."""
+    with _capture_codex() as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            review_backends.review_codex("codex:gpt-5.5", "Review.", "diff", repo, 60)
+        argv = cap.argv or []
+        assert "-m" in argv and argv[argv.index("-m") + 1] == "gpt-5.5", argv
 
 
 if __name__ == "__main__":
