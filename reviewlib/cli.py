@@ -24,10 +24,11 @@ from .config import (
     PANEL_TIMEOUT_DEFAULT,
     BoardConfigError,
     _expand_alias,
+    _effective_pool_size,
     _split_models,
     load_board,
     load_config,
-    select_pool,
+    split_pool_reserve,
 )
 from .install import install_commit_hook, install_skill
 from .modes.brainstorm import mode_brainstorm
@@ -143,15 +144,23 @@ def _spec_web(argv: list[str]) -> int:
     )
 
 
-def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch) -> int:
+def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch, models_after=None) -> int:
     """Announce the ETA, time the run on a monotonic clock, and append a stat record.
 
     `mode` is the EXACT mode (review/just-ask/quorum/brainstorm) and `pool_models` is
-    the list of backends actually DISPATCHED (so `pool_size` is ground truth — for
-    brainstorm that is the per-round persona slot count, which can exceed len(models)),
-    not the dashboard parser's inferred/proxy values. `dispatch` is a zero-arg callable
-    that runs the mode and returns its exit code. The per-call ok/fail tally is collected
-    via panel.begin/end_call_tally so success/fail counts are real per backend call.
+    the list of backends DISPATCHED, used to KEY the up-front ETA (so `pool_size` is
+    ground truth — for brainstorm that is the per-round persona slot count, which can
+    exceed len(models)), not the dashboard parser's inferred/proxy values. `dispatch` is
+    a zero-arg callable that runs the mode and returns its exit code. The per-call ok/fail
+    tally is collected via panel.begin/end_call_tally so success/fail counts are real per
+    backend call.
+
+    `models_after` (optional) is a zero-arg callable read AFTER the run to get the models
+    that ACTUALLY produced verdicts — used by the failover board path, where the final
+    pool can differ from the planned one (a skipped/failed seat is backfilled from the
+    reserve). When given and non-empty, its list is what lands in the stat record, so the
+    recorded `pool_size`/`models` reflect what really ran; the ETA still keys on the
+    planned `pool_models` (known up front). Without it, `pool_models` is recorded as-is.
 
     A run that dispatched ZERO backend calls (a clean-tree review with no diff, an
     early usage error) is NOT recorded: it has no real wall-clock to contribute and a
@@ -172,13 +181,21 @@ def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch) -> int:
         elapsed = time.monotonic() - start
         tally = end_call_tally()
         ok_count, fail_count = tally["ok"], tally["fail"]
+        recorded_models = pool_models
+        if models_after is not None:
+            try:
+                actual = models_after()
+            except Exception:  # noqa: BLE001 — stats must never break the run
+                actual = None
+            if actual:
+                recorded_models = actual
         # Only record a run that actually dispatched at least one backend call. No
         # dispatch -> nothing real to time -> skip, so no-op invocations never poison
         # the ETA average.
         if ok_count or fail_count:
             record_run(
                 mode=mode,
-                models=pool_models,
+                models=recorded_models,
                 duration_seconds=elapsed,
                 ok_count=ok_count,
                 fail_count=fail_count,
@@ -360,16 +377,19 @@ def _dispatch(argv: list[str] | None = None) -> int:
     board_validated = False
 
     def validate_board() -> int | None:
-        """Resolve + validate the reviewer board for the default review path, once,
-        then size it to --pool seats (the first N; the rest are the reserve). Returns
-        an exit code (2) on an all-malformed `board:` config, else None. No-op when the
-        board does not apply (panel mode / -m / config models)."""
+        """Resolve + validate the FULL priority-ordered reviewer board for the default
+        review path, once. The board is loaded whole (NOT sliced to --pool here): the
+        failover pool path (mode_review) does the startup failover — selecting the top
+        `args.pool` AVAILABLE seats by priority — and keeps the rest as the reserve that
+        backfills a seat which fails mid-run. Returns an exit code (2) on an all-malformed
+        `board:` config, else None. No-op when the board does not apply (panel mode / -m /
+        config models)."""
         nonlocal board, board_validated
         if board_validated or not use_board:
             return None
         board_validated = True
         try:
-            board = select_pool(load_board(config), args.pool)
+            board = load_board(config)
         except BoardConfigError as exc:
             print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
             return 2
@@ -533,13 +553,32 @@ def _dispatch(argv: list[str] | None = None) -> int:
     rc = validate_board()
     if rc is not None:
         return rc
-    # pool_size = backends actually dispatched. On the board path that is the number of
-    # AVAILABLE board reviewers (unavailable ones are skipped), not len(models); compute
-    # it from the same cheap availability probe build_board_jobs uses so the stat record
-    # and the ETA reflect what really ran.
-    run_models = [r.model for r in board if backends.backend_available(r.model)] if board else models
+    if board:
+        # Failover pool. The PLANNED pool keys the up-front ETA: the top `--pool`
+        # AVAILABLE seats by priority (startup failover — the same selection mode_review
+        # makes). The RECORDED models come from the failover outcome (the seats that
+        # actually produced verdicts, after any mid-run backfill), via outcome_sink.
+        planned_pool, _ = split_pool_reserve(
+            board, args.pool, lambda r: backends.backend_available(r.model),
+        )
+        eta_models = [r.model for r in planned_pool]
+        outcome_sink: list = []
+
+        def _ran_models() -> list[str]:
+            # The BARE model ids that produced verdicts (a backfilled reserve under its
+            # real id), so the stat record keys on what actually ran — not labels.
+            return outcome_sink[0].usable_models if outcome_sink else []
+
+        return _run_mode_with_stats(
+            "review", eta_models,
+            lambda: mode_review(
+                models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout,
+                args.staged, board=board, pool_size=args.pool, outcome_sink=outcome_sink,
+            ),
+            models_after=_ran_models,
+        )
     return _run_mode_with_stats(
-        "review", run_models,
+        "review", models,
         lambda: mode_review(
             models, _with_visual(args.prompt, visual_ctx), diff, cwd, timeout, args.staged, board=board,
         ),
@@ -547,37 +586,64 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
 
 def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE) -> int:
-    """Print the active reviewer board: each reviewer's display name, role, model,
-    and whether its backend is currently available (key/CLI present). Sourced from
-    config.yaml `board:` if set, else the built-in DEFAULT_BOARD. Each seat is tagged
-    `pool`/`reserve` for the EFFECTIVE pool (honoring an explicit `--pool N`, default 4);
-    the tag is by seat INDEX, not model identity, so a board with the same model in two
-    seats labels them independently. Read-only — no model is called, no key is printed."""
+    """Print the active reviewer board as a PRIORITY-ordered failover pool.
+
+    The board (config.yaml `board:` if set, else the built-in DEFAULT_BOARD) is listed
+    in priority order (strongest first). Each seat shows its display name, role, model,
+    backend availability (key/CLI present), and a failover TIER:
+      * `pool`    — one of the top-`pool_size` AVAILABLE seats that a plain `review`
+                    actually runs (startup failover: a higher-priority but UNAVAILABLE
+                    seat is skipped and the next available one is pulled into the pool);
+      * `reserve` — available, below the pool cut; backfills a pool seat that fails
+                    mid-run (mid-run failover);
+      * `unavail` — backend not reachable right now; it can't sit in the pool, but a
+                    run-time "unavailable" reply still triggers a reserve backfill.
+    Read-only — no model is called, no key is printed."""
     try:
         board = load_board(config)
     except BoardConfigError as exc:
         print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
         return 2
     source = "config.yaml (board:)" if isinstance(config.get("board"), list) and config.get("board") else "default"
-    pool_count = len(select_pool(board, pool_size))  # first-N, clamped; pool<=0 -> all
+    # The LIVE pool/reserve split is by PRIORITY + AVAILABILITY (the same split the
+    # failover review path makes), not by raw seat index — an unavailable top seat is
+    # skipped so the pool fills from the next available priority. Probe each seat ONCE by
+    # index (handles a board with the same model in two seats), then walk the available
+    # seats in priority order, tagging the first `pool_filled` `pool` and the rest
+    # `reserve`. `pool_filled` is how many of the AVAILABLE seats the pool size selects.
+    avail = [backends.backend_available(r.model) for r in board]
+    available_count = sum(avail)
+    pool_filled = _effective_pool_size(available_count, pool_size)
     sized = " (sized by --pool)" if pool_size != DEFAULT_POOL_SIZE else ""
-    print(f"Reviewer board ({len(board)} seats, source: {source}; "
-          f"pool = first {pool_count}{sized}, the rest are reserve — size with --pool N):\n")
+    pool_target = "all available" if pool_size <= 0 else pool_size
+    print(f"Reviewer board ({len(board)} seats, priority-ordered, source: {source}; "
+          f"live pool = top {pool_target} AVAILABLE by priority{sized}, "
+          f"{pool_filled} filled, the rest reserve — size with --pool N):\n")
     name_w = max((len(r.display) for r in board), default=0)
     role_w = max((len(r.role or "general") for r in board), default=0)
+    seen_available = 0  # how many AVAILABLE seats walked so far (priority order)
     for index, reviewer in enumerate(board):
-        available = backends.backend_available(reviewer.model)
+        available = avail[index]
         status = "available" if available else "SKIPPED (no key/CLI)"
         role = (reviewer.role or "general").ljust(role_w)
-        tier = "pool   " if index < pool_count else "reserve"
-        print(f"  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  {reviewer.model}  [{status}]")
-    print(f"\nA plain `review` runs the first {DEFAULT_POOL_SIZE} seats by default "
-          f"(--pool {DEFAULT_POOL_SIZE}); `--pool N` runs the first N, `--pool 0` runs all "
-          f"{len(board)}.")
-    if any(not backends.backend_available(r.model) for r in board):
-        print("Skipped reviewers drop out of the panel at run time; the board degrades "
-              "gracefully. commandcode reviewers need COMMANDCODE_API_KEY, gemini needs "
-              "GEMINI_API_KEY, codex/claude need their CLI on PATH.")
+        if not available:
+            tier = "unavail"
+        else:
+            tier = "pool   " if seen_available < pool_filled else "reserve"
+            seen_available += 1
+        prio = f"#{index + 1}"
+        print(f"  {prio:>3}  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  "
+              f"{reviewer.model}  [{status}]")
+    print(f"\nA plain `review` runs the top {DEFAULT_POOL_SIZE} AVAILABLE seats by "
+          f"priority (--pool {DEFAULT_POOL_SIZE}); a higher-priority seat that is "
+          f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "
+          f"pool keeps {DEFAULT_POOL_SIZE} working reviewers. `--pool N` sizes the pool; "
+          f"`--pool 0` runs all available seats.")
+    if not all(avail):
+        print("Unavailable reviewers drop out and are backfilled from the reserve; the "
+              "board degrades gracefully only if the reserve is exhausted. commandcode "
+              "reviewers need COMMANDCODE_API_KEY, gemini needs GEMINI_API_KEY, "
+              "codex/claude need their CLI on PATH.")
     return 0
 
 
