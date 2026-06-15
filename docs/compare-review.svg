@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="300" viewBox="0 0 800 300" role="img" aria-label="review is the critique primitive only: the agent drives its own loop, writes the code itself, and calls review just for the review step; review is read-only and never edits, and the agent decides whether to fix, ship, or re-loop. Code-gen stays with the agent.">
+  <defs>
+    <marker id="rcArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8a8a8a"/>
+    </marker>
+    <marker id="rcArrowAccent" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#4f8ef7"/>
+    </marker>
+  </defs>
+
+  <!-- title -->
+  <text x="40" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="26" font-weight="600" fill="#3a3a3a">review</text>
+  <rect x="40" y="56" width="46" height="4" rx="2" fill="#4f8ef7"/>
+  <text x="150" y="44" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="15" fill="#8a8a8a">a critique primitive the AGENT orchestrates &#8212; transparent, controllable</text>
+
+  <!-- the agent's loop container (dashed, owned by the agent) -->
+  <rect x="40" y="74" width="720" height="190" rx="18" fill="#4f8ef7" fill-opacity="0.04" stroke="#8a8a8a" stroke-opacity="0.55" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="64" y="104" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="600" fill="#6a6a6a">the AGENT drives its own loop</text>
+
+  <!-- agent writes code -->
+  <rect x="64" y="150" width="160" height="64" rx="12" fill="#8a8a8a" fill-opacity="0.08" stroke="#8a8a8a" stroke-opacity="0.55" stroke-width="1.5"/>
+  <text x="144" y="180" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="15" font-weight="600" fill="#3a3a3a">agent writes code</text>
+  <text x="144" y="200" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" fill="#8a8a8a">code-gen stays with the agent</text>
+
+  <!-- review (the highlighted primitive) -->
+  <rect x="288" y="138" width="224" height="92" rx="14" fill="#4f8ef7" fill-opacity="0.10" stroke="#4f8ef7" stroke-width="2"/>
+  <text x="400" y="166" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" font-weight="600" fill="#2f6fd6">review</text>
+  <text x="400" y="188" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" fill="#4a4a4a">multi-model board &#183; cited quorum</text>
+  <text x="400" y="206" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="12.5" fill="#4a4a4a">brainstorm &#183; visual</text>
+  <text x="400" y="223" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#2f6fd6">read-only &#8212; never edits</text>
+
+  <!-- agent decides -->
+  <rect x="576" y="150" width="160" height="64" rx="12" fill="#8a8a8a" fill-opacity="0.08" stroke="#8a8a8a" stroke-opacity="0.55" stroke-width="1.5"/>
+  <text x="656" y="180" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="15" font-weight="600" fill="#3a3a3a">agent decides</text>
+  <text x="656" y="200" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" fill="#8a8a8a">fix / ship / re-loop</text>
+
+  <!-- arrows: code -> review (accent) -->
+  <path d="M224 182 H 284" fill="none" stroke="#4f8ef7" stroke-width="2.25" stroke-linecap="round" marker-end="url(#rcArrowAccent)"/>
+  <!-- review -> decide (accent) -->
+  <path d="M512 182 H 572" fill="none" stroke="#4f8ef7" stroke-width="2.25" stroke-linecap="round" marker-end="url(#rcArrowAccent)"/>
+
+  <!-- re-loop back to writing code (gray, agent-owned) -->
+  <path d="M656 214 V 244 H 144 V 214" fill="none" stroke="#8a8a8a" stroke-width="2" stroke-linecap="round" marker-end="url(#rcArrow)"/>
+  <text x="400" y="240" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="12" fill="#8a8a8a">agent re-loops on its own terms</text>
+
+  <!-- caption -->
+  <text x="400" y="290" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" fill="#8a8a8a"><tspan font-weight="600" fill="#2f6fd6">review</tspan> owns only the critique &#8212; the step agents do worst alone. The agent keeps code-gen and every decision.</text>
+</svg>

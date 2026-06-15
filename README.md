@@ -7,6 +7,10 @@ and prints them side by side. Four modes let you go from a quick pre-commit sani
 all the way to a structured expert panel that builds consensus or explores a design space.
 Built for use from any shell or AI agent harness (Claude Code, Codex, opencode).
 
+Beyond the diff modes it also does **visual review** — attach a rendered screenshot to
+any review with the composable `--visual` flag for a keep / rollback / repair verdict — and
+ships **interactive spec-review tooling** so a markdown spec can be reviewed like a PR.
+
 ---
 
 ## Install
@@ -806,10 +810,12 @@ output as one fused, opinionated pipeline (see [review vs ralphex](#review-vs-ra
 
 `review` is neither: it runs **several models in parallel on the local working-tree diff**
 before you ever push, then goes further — a cited **quorum** (consensus with evidence) and
-a multi-round **brainstorm** panel for open design questions. It is **read-only** (never
-edits your code), **CLI-first** (no PR, no hosted service — it shells out to model CLIs you
-already have), and **harness-agnostic** (callable from Claude Code, Codex, opencode, or a
-plain shell).
+a multi-round **brainstorm** panel for open design questions. It adds **visual review**
+(attach a render with `--visual` for a keep / rollback / repair verdict) and **interactive
+spec-review tooling** (review a markdown spec like a PR), all from the same binary. It is
+**read-only** (never edits your code), **CLI-first** (no PR, no hosted service — it shells
+out to model CLIs you already have), and **harness-agnostic** (callable from Claude Code,
+Codex, opencode, or a plain shell).
 
 | Tool | Multi-model in parallel | Local pre-PR diff | Consensus / quorum | Design brainstorm | Read-only | No hosted service | Generates code |
 |---|---|---|---|---|---|---|---|
@@ -840,30 +846,15 @@ ralphex is for, and `review` is `—` on code-gen on purpose.
 plugs into a loop it controls itself**. You (or your agent) drive the loop and call `review`
 only for the critique step — which is the step agents do *worst* on their own. The two shapes:
 
-```
-ralphex  — all-in-one encapsulated loop (opinionated, black-box):
+**ralphex** — one opaque binary that encapsulates *both* code-generation and review in a single
+autonomous loop:
 
-  ┌─────────────────────────────────────────────────────────────┐
-  │  ralphex (one binary owns the whole loop)                    │
-  │                                                              │
-  │   plan ──▶ code-gen agent ──▶ built-in review ──▶ commit ─┐  │
-  │              ▲                  (5 agents + codex)         │  │
-  │              └───────────────── repeat until plan done ◀──┘  │
-  └─────────────────────────────────────────────────────────────┘
+![ralphex — all-in-one encapsulated loop: one binary drives a code-gen agent, runs its own built-in review, and commits, repeating until the plan is done](docs/compare-ralphex.svg)
 
+**`review`** — does *only* the review part (the part agents do badly), transparently and
+controllably, driven by the agent that keeps code-gen and every decision:
 
-agent + review — composable primitive the AGENT orchestrates (transparent, controllable):
-
-   ┌── the AGENT drives its own loop ───────────────────────────────┐
-   │                                                                │
-   │  agent writes code ──▶  review  ──▶ agent reads verdict ──▶ ┐  │
-   │       ▲                 │ multi-model board                 │  │
-   │       │                 │ cited quorum / brainstorm         │  │
-   │       │                 │ (read-only — never edits)         │  │
-   │       └───────── agent decides: fix / ship / re-loop ◀──────┘  │
-   └────────────────────────────────────────────────────────────────┘
-              ▲ code-gen stays with the agent — review owns only the critique
-```
+![review — a critique primitive the agent orchestrates: the agent writes code, calls review (multi-model, read-only, never edits) for the critique step, then decides fix / ship / re-loop](docs/compare-review.svg)
 
 In one sentence: **ralphex's strength is that it is all-in-one** — code-gen and review
 fused into one walk-away binary; **`review`'s strength is that it is focused and
