@@ -1,0 +1,360 @@
+"""Unit tests for `-o FILE` / `--output FILE` (cli.py).
+
+`-o` exists because agents run `review … > FILE`, which dies silently under zsh
+`noclobber` when FILE already exists. review-cli is Python, so `-o` writes the
+result via `open(...,"w")` — bypassing the shell redirect (and thus noclobber)
+entirely. These tests pin the contract:
+  * the result is teed to BOTH stdout and the file,
+  * an existing file is OVERWRITTEN (the whole point — noclobber must not block),
+  * parent dirs are created,
+  * a bad path errors clearly (non-zero exit, actionable message),
+  * argv parsing handles `-o FILE`, `--output FILE`, `--output=FILE`, `-oFILE`.
+
+Same harness style as tests/test_cwd.py: plain test_* functions, __main__ runner.
+"""
+from __future__ import annotations
+
+import contextlib
+import io
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from reviewlib import cli  # noqa: E402
+from reviewlib.cli import _extract_output_path, main  # noqa: E402
+
+
+def _run_main(argv: list[str]) -> tuple[int, str]:
+    """Run cli.main with stdout captured; return (exit_code, captured_stdout).
+
+    main() tees stdout itself when `-o` is present, so we capture the OUTER stdout
+    here to assert the tee still prints live."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(argv)
+    return rc, buf.getvalue()
+
+
+# --- argv extraction -----------------------------------------------------------
+
+def test_extract_space_form():
+    out, rest = _extract_output_path(["-o", "/tmp/x.md", "--list-defaults"])
+    assert out == Path("/tmp/x.md"), out
+    assert rest == ["--list-defaults"], rest
+
+
+def test_extract_long_form():
+    out, rest = _extract_output_path(["--output", "/tmp/y.md", "--staged"])
+    assert out == Path("/tmp/y.md"), out
+    assert rest == ["--staged"], rest
+
+
+def test_extract_equals_form():
+    out, rest = _extract_output_path(["--output=/tmp/z.md", "--show-board"])
+    assert out == Path("/tmp/z.md"), out
+    assert rest == ["--show-board"], rest
+
+
+def test_extract_glued_short_form():
+    out, rest = _extract_output_path(["-o/tmp/g.md", "--show-board"])
+    assert out == Path("/tmp/g.md"), out
+    assert rest == ["--show-board"], rest
+
+
+def test_extract_short_equals_form():
+    # `-o=FILE` must be accepted (symmetry with `--output=FILE`), not silently dropped.
+    out, rest = _extract_output_path(["-o=/tmp/e.md", "--show-board"])
+    assert out == Path("/tmp/e.md"), out
+    assert rest == ["--show-board"], rest
+
+
+def test_extract_stops_at_double_dash():
+    # `--` ends options: an `-o` AFTER it is a positional, not the output flag, and is
+    # kept verbatim (a brainstorm topic / question can legitimately start with `-o`).
+    out, rest = _extract_output_path(["-o", "/tmp/real.md", "--", "-o", "not-a-flag"])
+    assert out == Path("/tmp/real.md"), out
+    assert rest == ["--", "-o", "not-a-flag"], rest
+
+
+def test_extract_double_dash_with_no_output_flag():
+    out, rest = _extract_output_path(["--just-ask", "--", "-o-topic"])
+    assert out is None, out
+    assert rest == ["--just-ask", "--", "-o-topic"], rest
+
+
+def test_extract_does_not_steal_value_of_value_taking_flag():
+    # `review --just-ask --output FILE` — here `--output` is the QUESTION (just-ask's
+    # value), NOT the output flag. The pre-scan must NOT intercept it, or argparse would
+    # then error "--just-ask: expected one argument".
+    out, rest = _extract_output_path(["--just-ask", "--output", "FILE.md"])
+    assert out is None, out
+    assert rest == ["--just-ask", "--output", "FILE.md"], rest
+    # Same for --prompt consuming a value that looks like the glued short form.
+    out, rest = _extract_output_path(["--prompt", "-otext"])
+    assert out is None, out
+    assert rest == ["--prompt", "-otext"], rest
+    # But a REAL -o after the value-taking option's value still works.
+    out, rest = _extract_output_path(["--just-ask", "Q", "-o", "real.md"])
+    assert out == Path("real.md"), out
+    assert rest == ["--just-ask", "Q"], rest
+
+
+def test_extract_absent_returns_none_and_unchanged():
+    out, rest = _extract_output_path(["--show-board", "-m", "codex"])
+    assert out is None, out
+    assert rest == ["--show-board", "-m", "codex"], rest
+
+
+def test_extract_bare_flag_left_for_argparse():
+    # A `-o` with no following value is LEFT in argv so argparse reports the usage
+    # error instead of being silently swallowed.
+    out, rest = _extract_output_path(["-o"])
+    assert out is None, out
+    assert rest == ["-o"], rest
+
+
+def test_extract_expands_user():
+    out, _ = _extract_output_path(["-o", "~/some.md", "--show-board"])
+    assert "~" not in str(out), out
+
+
+# --- end-to-end via main() (uses --list-defaults, which prints to stdout) -------
+
+def test_writes_file_and_still_prints_to_stdout():
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "out.md"
+        rc, printed = _run_main(["-o", str(target), "--list-defaults"])
+        assert rc == 0, rc
+        # File written...
+        assert target.is_file(), target
+        body = target.read_text(encoding="utf-8")
+        assert "codex" in body, body
+        # ...AND stdout still got it (tee, not redirect).
+        assert "codex" in printed, printed
+        assert body == printed, (body, printed)
+
+
+def test_overwrites_existing_file():
+    # The bug this flag fixes: `> FILE` refuses to overwrite under noclobber. `-o`
+    # MUST overwrite, unconditionally.
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "out.md"
+        target.write_text("STALE CONTENT THAT MUST BE GONE\n", encoding="utf-8")
+        rc, _ = _run_main(["-o", str(target), "--list-defaults"])
+        assert rc == 0, rc
+        body = target.read_text(encoding="utf-8")
+        assert "STALE CONTENT" not in body, body
+        assert "codex" in body, body
+
+
+def test_creates_parent_dirs():
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "a" / "b" / "c" / "out.md"
+        rc, _ = _run_main(["-o", str(target), "--list-defaults"])
+        assert rc == 0, rc
+        assert target.is_file(), target
+        assert "codex" in target.read_text(encoding="utf-8")
+
+
+def test_bad_path_errors_clearly_nonzero():
+    with tempfile.TemporaryDirectory() as d:
+        # Make a PLAIN FILE where a parent dir would need to be -> mkdir fails.
+        blocker = Path(d) / "blocker"
+        blocker.write_text("", encoding="utf-8")
+        target = blocker / "sub" / "out.md"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, _ = _run_main(["-o", str(target), "--list-defaults"])
+        assert rc == 1, rc
+        msg = err.getvalue()
+        assert "-o" in msg and str(target) in msg, msg
+
+
+def test_file_written_even_on_nonzero_review_exit():
+    # A review with no diff exits non-zero ("No diff to review."), but the file must
+    # STILL be written (a caller that asked for `-o` always gets a file). We force a
+    # clean tree by pointing -C at an empty git repo.
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+        target = Path(d) / "out.md"
+        rc, _ = _run_main(["-C", str(repo), "-o", str(target)])
+        # No diff -> non-zero exit, but the file exists (empty result is fine).
+        assert rc != 0, rc
+        assert target.is_file(), target
+
+
+def test_real_review_result_text_lands_in_file():
+    # Beyond --list-defaults (a bare print): a REAL diff review must put its formatted
+    # RESULT into the file too. We mock the backend so no model is called, give the repo
+    # a staged diff, and assert the reviewer's text is BOTH printed and written. This
+    # guards the contract "write the review RESULT to a file", not just trivial output.
+    import subprocess
+
+    from reviewlib import backends  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(repo), check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+        (repo / "f.txt").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(repo), check=True)
+
+        sentinel = "SENTINEL-REVIEW-VERDICT-XYZ"
+
+        def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0):
+            return backends.ReviewResult(
+                model=model, command="fake", returncode=0, stdout=sentinel, stderr="",
+            )
+
+        orig_avail = backends.backend_available
+        # The plain `-m` path (mode_review) resolves the backend via
+        # reviewlib.modes.review.resolve_backend — patch exactly that one (and force
+        # availability), nothing else.
+        import reviewlib.modes.review as review_mod  # noqa: PLC0415
+
+        orig_mode_resolve = review_mod.resolve_backend
+        review_mod.resolve_backend = lambda _m: _fake_backend  # type: ignore[assignment]
+        backends.backend_available = lambda _m: True  # type: ignore[assignment]
+        try:
+            target = Path(d) / "out.md"
+            rc, printed = _run_main(
+                ["-C", str(repo), "--staged", "-m", "codex", "-o", str(target)],
+            )
+            body = target.read_text(encoding="utf-8")
+            assert sentinel in body, body          # the verdict reached the file
+            assert sentinel in printed, printed     # and still printed to stdout
+            assert rc == 0, rc
+        finally:
+            review_mod.resolve_backend = orig_mode_resolve
+            backends.backend_available = orig_avail
+
+
+def test_output_file_strips_ansi_escapes():
+    # The saved file must be clean text even if the captured stream carried ANSI colour
+    # codes (a coloured TTY run, or a backend's passed-through output). The LIVE stream
+    # is untouched; only the file is sanitized.
+    from reviewlib.cli import _write_output_file  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "out.md"
+        # CSI colours + an OSC hyperlink sequence — both must be stripped.
+        colored = (
+            "\x1b[31mRED finding\x1b[0m and \x1b[1mbold\x1b[22m plain "
+            "\x1b]8;;https://x\x07link\x1b]8;;\x07"
+        )
+        _write_output_file(target, colored)
+        body = target.read_text(encoding="utf-8")
+        assert "\x1b" not in body, repr(body)
+        assert body == "RED finding and bold plain link", repr(body)
+
+
+def test_tee_survives_isatty_and_encoding_access():
+    # The tee stands in for sys.stdout; helpers may probe isatty()/encoding. Both must
+    # work under `-o` (they delegate to the live stream), not raise.
+    from reviewlib.cli import _Tee  # noqa: PLC0415
+
+    buf = io.StringIO()
+    tee = _Tee(sys.stdout, buf)
+    # Should not raise; returns a bool / str.
+    assert isinstance(tee.isatty(), bool)
+    assert isinstance(tee.encoding, str)
+    tee.write("x")
+    assert buf.getvalue() == "x"
+
+
+def test_argparse_error_does_not_truncate_existing_output_file():
+    # DATA-LOSS GUARD: `review --bad-flag -o important.md` makes argparse raise
+    # SystemExit BEFORE any review runs. The pre-existing file must NOT be truncated
+    # (the old `finally`-always-writes would clobber it with an empty string).
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "important.md"
+        target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                main(["--definitely-not-a-flag", "-o", str(target)])
+            except SystemExit:
+                pass
+        assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", target.read_text()
+
+
+def test_help_with_output_flag_does_not_truncate_file():
+    # `review --help -o important.md` also exits via SystemExit (argparse prints help
+    # and exits 0) — must not clobber the target with the help text.
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "important.md"
+        target.write_text("KEEP ME\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                main(["--help", "-o", str(target)])
+            except SystemExit:
+                pass
+        assert target.read_text(encoding="utf-8") == "KEEP ME\n", target.read_text()
+
+
+def test_value_taking_opts_are_all_value_taking():
+    # Finding #2 guard: every entry in _VALUE_TAKING_OPTS must REALLY consume a value in
+    # the real parser, else the pre-scan would skip a non-value token (and `-o` after a
+    # store_true flag would be lost). Introspect the SAME parser _dispatch builds and
+    # assert each listed option's action consumes exactly one value (nargs is None and
+    # it is not a store_const/store_true action), and that no store_true flag leaked in.
+    from reviewlib.cli import _VALUE_TAKING_OPTS  # noqa: PLC0415
+
+    store_true_flags = {
+        "--staged", "--list-defaults", "--show-board", "--json", "--strict",
+        "--no-ai", "--no-local-model",
+    }
+    # None of the store_true flags must be in the value-taking set.
+    assert not (_VALUE_TAKING_OPTS & store_true_flags), _VALUE_TAKING_OPTS & store_true_flags
+
+    # Each listed opt errors "expected one argument" when given no value. We pass a
+    # leading no-op value-taking flag with a value so the parser reaches the bare opt
+    # without triggering a real review (it errors during parse).
+    for opt in sorted(_VALUE_TAKING_OPTS):
+        if opt in ("-o", "--output"):
+            continue  # handled by the pre-scan, covered by other tests
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                main(["--prompt", "p", opt])  # bare opt at the end -> needs a value
+            except SystemExit:
+                pass
+        msg = err.getvalue()
+        assert "expected one argument" in msg, (opt, msg)
+
+
+def test_help_documents_output_flag():
+    # `--help` must advertise `-o` and explicitly steer away from `> FILE`.
+    err = io.StringIO()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            main(["--help"])
+        except SystemExit:
+            pass
+    text = out.getvalue() + err.getvalue()
+    assert "-o" in text or "--output" in text, text
+
+
+if __name__ == "__main__":
+    failures = 0
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {name}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                print(f"ERROR {name}: {type(exc).__name__}: {exc}")
+    sys.exit(1 if failures else 0)

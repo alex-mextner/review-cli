@@ -50,7 +50,16 @@ review --quorum "Should we cap brainstorm at 8 rounds?"
 
 # Open-ended design exploration
 review --brainstorm "How should we design the plugin system?"
+
+# Save the result to a file — use -o, NOT `> file` (zsh noclobber-safe)
+review -o review.md
 ```
+
+> **Write to a file with `-o file.md`, not `review … > file.md`.** Under zsh
+> `noclobber` (a common default), `> file.md` refuses to overwrite an existing file
+> and the command dies silently — no review, no error. `-o` writes the result with
+> Python (`open(...,"w")`), bypassing the shell redirect entirely: it creates parent
+> dirs, always overwrites, and still prints to stdout. See [Flags](#flags).
 
 ---
 
@@ -474,7 +483,7 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | `gemini` / `gemini:<model>` | api | Gemini REST API (`gemini-2.5-flash` by default) |
 | `zai:<model>` / `glm` / `glm52` … | api | z.ai (GLM) OpenAI-compatible REST API — needs `ZAI_API_KEY` |
 | `commandcode:<model>` / `cc` | api | Command Code OpenAI-compatible Provider API — needs `COMMANDCODE_API_KEY` |
-| `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer` in a temp repo |
+| `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer --dir <repo>` (reads the real repo, read-only) |
 | anything else | cli | Treated as an opencode model id |
 
 **Transport split.** codex and opencode are **cli-only** (no REST API). gemini, z.ai,
@@ -484,9 +493,28 @@ binary is present, API when it isn't and a key is set). Each backend's mode can 
 forced with `REVIEW_<NAME>_MODE`; forcing an unsupported mode (e.g.
 `REVIEW_COMMANDCODE_MODE=cli`) is a hard error, never a silent fall-through.
 
-The opencode backend runs in a **temporary git repository** with the diff attached as
-`review.diff`. This keeps the source worktree out of reach — the model gets review
-context without getting an edit target.
+The opencode backend is **agentic and read-only**: it runs in the **real `-C`
+repository** (via `opencode run --dir <repo>`), exactly like the codex backend, so an
+`oc:` seat can **read any project file** — not just the diff in the prompt. Safety is
+enforced by the `read-only-reviewer` agent, which **denies** `edit`/`write`/`bash`/
+`webfetch`: opencode may open files but can never mutate the worktree, run a command,
+or hit the network.
+
+It falls back to an isolated temp dir (diff-only) in two cases:
+- `-C` is **not a git repo** (e.g. a `--just-ask` from a scratch dir) — nothing to read;
+- the repo **ships its own opencode config** (`.opencode/` or `opencode.json`/`.jsonc`).
+  A repo-local agent definition can **override** the global `read-only-reviewer` and
+  re-enable `write`/`bash` (verified: project config wins, and no opencode env flag
+  suppresses it), so to keep the sandbox trustworthy on a potentially adversarial repo,
+  review refuses to run agentically there and reviews the diff in a clean dir instead.
+
+> **Note on the api-only board seats (commandcode, z.ai).** These are kept as raw
+> `api` backends, not routed through opencode. opencode's `@ai-sdk/openai-compatible`
+> adapter does not reliably drive the Command Code gateway (the request hangs / returns
+> empty, while the same models answer correctly over raw HTTP), and z.ai/GLM is not an
+> opencode-native provider. So commandcode/z.ai stay on the direct keyed-HTTP path;
+> opencode-native models (`oc:deepseek/…`, `oc:fireworks/…`, the free `oc:opencode/…`
+> gateway) get the agentic real-repo treatment above.
 
 ---
 
@@ -506,6 +534,9 @@ context without getting an edit target.
                     it. N<=0 (e.g. --pool 0) runs all seats.
 --prompt TEXT       Override the default review prompt.
 -C / --cwd DIR      Run against a different repository directory.
+-o / --output FILE  Write the result to FILE via Python (creates parent dirs, always
+                    overwrites) while still printing to stdout. Use this instead of
+                    `review … > FILE`, which fails silently under zsh noclobber.
 ```
 
 ---

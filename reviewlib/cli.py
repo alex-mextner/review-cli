@@ -9,10 +9,15 @@ decomposition was about.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TextIO
 
 from . import backends
 from .backends import _which  # re-export for tests/compat  # noqa: F401
@@ -211,6 +216,130 @@ def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch, models_aft
 _SERVER_SUBCOMMANDS = frozenset({"dashboard", "spec-web"})
 
 
+class _Tee(io.TextIOBase):
+    """A write-through tee: every write goes to BOTH a live stream (the real stdout,
+    so the user still sees the review as it streams) AND an in-memory buffer that
+    `-o FILE` later persists. We mirror stdout rather than redirecting it so `-o`
+    NEVER swallows the on-screen output (the task: "still also print to stdout").
+    Only `write`/`flush` are exercised by `print()`; the rest delegates to the live
+    stream so the object stays a drop-in `sys.stdout`."""
+
+    def __init__(self, live: TextIO, buffer: io.StringIO) -> None:
+        self._live = live
+        self._buffer = buffer
+
+    def write(self, s: str) -> int:
+        self._buffer.write(s)
+        return self._live.write(s)
+
+    def flush(self) -> None:
+        self._live.flush()
+
+    def isatty(self) -> bool:
+        return self._live.isatty()
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._live, "encoding", "utf-8")
+
+
+# Options that CONSUME the next token as their value (space-separated form). When the
+# pre-scan for `-o` sees one of these, the FOLLOWING token is that option's value and
+# must be passed through untouched — even if it happens to look like `-o`/`--output`
+# (e.g. `review --just-ask --output` where `--output` is the question text, or a
+# `--prompt -o…`). This keeps the light pre-scan from stealing another flag's value.
+_VALUE_TAKING_OPTS = frozenset({
+    "-m", "--model", "-C", "--cwd", "-o", "--output", "--prompt", "--timeout",
+    "--pool", "--moderator", "--rounds", "--max-rounds", "--just-ask", "--quorum",
+    "--brainstorm", "--visual", "--before", "--intent", "--expect", "--check",
+    "--vision-timeout", "--project",
+})
+
+
+def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
+    """Pull the output flag OUT of argv before dispatch and return (path, remaining).
+
+    Recognized forms: `-o FILE`, `--output FILE`, `--output=FILE`, `-o=FILE`, and the
+    glued short `-oFILE`. `-o` is handled OUTSIDE the main argparse surface because the
+    capture has to wrap the WHOLE dispatch (every mode prints its final result to
+    stdout), and the bare subcommands (install-skill, dashboard, spec-web, …) never
+    reach the main parser. A single light pre-scan here makes `-o` work uniformly for
+    every path while the parser still advertises it in `--help`.
+
+    Two safeguards keep the pre-scan from misreading another option's value as the
+    output flag: (1) scanning STOPS at the first `--` (end-of-options), so a positional
+    that starts with `-o` is kept verbatim; (2) a token that is the VALUE of a preceding
+    value-taking option (`--just-ask --output`, `--prompt -o…`) is NOT intercepted — it
+    is passed through so argparse still receives that option's argument. When the flag
+    is absent the remaining list has the SAME contents as the input (a fresh list); a
+    bare `-o` with no value is left in the remaining argv so argparse reports the usage
+    error instead of a silent swallow."""
+    out: Path | None = None
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            # End of options: keep `--` and everything after it untouched.
+            rest.extend(argv[i:])
+            break
+        # If the PREVIOUS token is a value-taking option (space form), THIS token is its
+        # value — pass it through, never read it as the output flag.
+        if i > 0 and argv[i - 1] in _VALUE_TAKING_OPTS:
+            rest.append(tok)
+            i += 1
+            continue
+        if tok in ("-o", "--output"):
+            if i + 1 < len(argv):
+                out = Path(argv[i + 1]).expanduser()
+                i += 2
+                continue
+            # No value — leave it for argparse to flag (don't silently swallow).
+            rest.append(tok)
+            i += 1
+            continue
+        if tok.startswith("--output="):
+            out = Path(tok.split("=", 1)[1]).expanduser()
+            i += 1
+            continue
+        if tok.startswith("-o="):
+            # `-o=FILE` — accept it (symmetry with `--output=FILE`).
+            out = Path(tok.split("=", 1)[1]).expanduser()
+            i += 1
+            continue
+        if tok.startswith("-o") and len(tok) > 2:
+            # `-oFILE` (glued short form).
+            out = Path(tok[2:]).expanduser()
+            i += 1
+            continue
+        rest.append(tok)
+        i += 1
+    return out, rest
+
+
+# Strip ANSI/VT100 escape sequences from the captured text before it lands in the `-o`
+# file. review-cli emits plain text today, but a backend's passed-through output (or
+# future coloured formatting on a TTY — the tee delegates isatty to the real stdout)
+# could carry escapes; the saved file must stay clean markdown regardless, while the
+# LIVE stream keeps whatever it had. Covers both CSI sequences (`\x1b[ … m`, colours /
+# cursor moves) and OSC sequences (`\x1b] … BEL/ST`, e.g. hyperlinks / window titles).
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"        # CSI: ESC [ … final-byte
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: ESC ] … (BEL | ST)
+)
+
+
+def _write_output_file(path: Path, text: str) -> None:
+    """Persist captured stdout to `path` via Python `open(...,"w")` — which bypasses
+    the shell entirely, so it NEVER trips zsh `noclobber` the way `review … > FILE`
+    does (the bug this flag exists to kill). ANSI escape sequences are stripped so the
+    file is clean text even if the live stream was coloured. Parent dirs are created;
+    an existing file is overwritten (that is the point). A bad path raises a clear
+    OSError that the caller turns into a non-zero exit with an actionable message."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_ANSI_ESCAPE_RE.sub("", text), encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point: arm the internal run backstop around a review run, then dispatch.
 
@@ -226,12 +355,60 @@ def main(argv: list[str] | None = None) -> int:
     them would kill the server at the ceiling, and a lowered env var would kill it almost
     at once (codex P2). Every other path (the review/panel run and the instant
     subcommands) is wrapped.
+
+    This is also where `-o FILE` is handled: the flag is pre-scanned out of argv (so it
+    works for every dispatch path, including the bare subcommands), and when present the
+    whole dispatch runs under a stdout TEE whose captured text is persisted to FILE via
+    Python — bypassing the shell redirect (and thus zsh noclobber). The file is always
+    written; stdout still prints live.
     """
-    effective = sys.argv[1:] if argv is None else argv
-    if effective and effective[0] in _SERVER_SUBCOMMANDS:
-        return _dispatch(argv)
-    with run_backstop():
-        return _dispatch(argv)
+    raw = sys.argv[1:] if argv is None else argv
+    output_path, raw = _extract_output_path(list(raw))
+
+    # The persistent SERVER subcommands stream until Ctrl-C — capturing/teeing their
+    # output to a single `-o` file makes no sense (and the file would only be written
+    # on shutdown), so `-o` is ignored for them and they bypass both the tee and the
+    # backstop exactly as before.
+    if raw and raw[0] in _SERVER_SUBCOMMANDS:
+        return _dispatch(raw)
+
+    if output_path is None:
+        with run_backstop():
+            return _dispatch(raw)
+
+    # `-o FILE`: tee stdout (so the review STILL prints live) and persist the captured
+    # text via Python open()/write — which sidesteps zsh `noclobber` (the failure mode
+    # this flag fixes). The file is written even on a non-zero exit or empty result (a
+    # caller that asked for a file gets one) — but NOT when the dispatch exits EARLY via
+    # SystemExit. An argparse usage error or `--help` raises SystemExit before any review
+    # ran; writing then would TRUNCATE a pre-existing `-o` target to empty/help-text — a
+    # silent data-loss footgun (e.g. `review --bad-flag -o important.md`). So a SystemExit
+    # propagates with NO write; the file is touched only when `_dispatch` actually
+    # returned (the review path ran).
+    captured = io.StringIO()
+    real_stdout = sys.stdout
+    rc = 1
+    completed = False
+    try:
+        with contextlib.redirect_stdout(_Tee(real_stdout, captured)):
+            with run_backstop():
+                rc = _dispatch(raw)
+                completed = True
+    finally:
+        # Only persist when the dispatch RAN to a return (completed). On a SystemExit
+        # (argparse/--help) or any other propagating exception, skip the write so a
+        # pre-existing target is never truncated by an early exit. The write outcome is
+        # recorded but NOT returned from `finally` (a `return` there would swallow a
+        # propagating exception); the final return below applies it only on a clean run.
+        write_error: OSError | None = None
+        if completed:
+            try:
+                _write_output_file(output_path, captured.getvalue())
+            except OSError as exc:
+                write_error = exc
+                print(f"[review-cli] -o: could not write {output_path}: {exc}",
+                      file=sys.stderr, flush=True)
+    return 1 if write_error is not None else rc
 
 
 def _dispatch(argv: list[str] | None = None) -> int:
@@ -277,6 +454,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run read-only code reviews across multiple model backends.")
     parser.add_argument("-m", "--model", action="append", default=[], help="model/backend to run; repeat or comma-separate")
     parser.add_argument("-C", "--cwd", default=".", help="repository directory")
+    parser.add_argument(
+        "-o", "--output", metavar="FILE", default=None,
+        help=(
+            "write the review result to FILE via Python (creates parent dirs, "
+            "overwrites) while still printing to stdout. Use this instead of "
+            "`review … > FILE`, which fails under zsh noclobber."
+        ),
+    )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="review prompt")
     parser.add_argument("--staged", action="store_true", help="review staged diff instead of unstaged diff")
     parser.add_argument(
@@ -336,7 +521,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return 0
 
     if args.show_board:
-        return _show_board(config, args.pool)
+        # Resolve cwd up front so the agentic/diff-only labels reflect whether opencode
+        # would actually run in a real repo for THIS -C (it's diff-only outside a repo).
+        return _show_board(config, args.pool, _effective_cwd(args.cwd))
 
     cwd = _effective_cwd(args.cwd)
     explicit_models = _split_models(args.model)
@@ -585,7 +772,43 @@ def _dispatch(argv: list[str] | None = None) -> int:
     )
 
 
-def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE) -> int:
+def _seat_reads_repo(model: str, cwd_is_repo: bool) -> bool:
+    """True iff this seat's backend runs AGENTICALLY in the real repo (reads any file),
+    False if it only sees the diff embedded in the prompt (a raw keyed-HTTP call).
+
+    Agentic backends (codex, opencode, the claude CLI) run read-only inside `-C` and can
+    open project files beyond the diff. Raw-API backends (gemini, z.ai, commandcode, and
+    the claude API path) are stateless HTTP calls with no workspace, so they review only
+    the diff. This is purely for the `--show-board` label — it never affects routing.
+
+    `cwd_is_repo` matters for opencode: it is agentic ONLY when `-C` is a real git repo
+    (it falls back to a diff-only isolated temp dir otherwise), so the label mirrors
+    `review_opencode`'s own `_opencode_runs_in_repo(cwd)` check rather than claiming every
+    `oc:` seat is agentic regardless of where it would run. The caller resolves this bit
+    ONCE (a single `git rev-parse`) and passes it in, so labeling N seats stays O(1)
+    subprocesses, not O(N)."""
+    backend = backends.resolve_backend(model)
+    if backend is backends.review_codex:
+        return True
+    if backend is backends.review_opencode:
+        return cwd_is_repo
+    if backend is backends.review_claude:
+        # claude is agentic ONLY via the CLI path; the API path has no workspace.
+        mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
+        if mode == "api":
+            return False
+        if mode == "cli":
+            return True
+        # Auto-pick mirrors the dispatcher: CLI when the binary is present.
+        try:
+            backends._which("claude-p")
+            return True
+        except RuntimeError:
+            return False
+    return False
+
+
+def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | None = None) -> int:
     """Print the active reviewer board as a PRIORITY-ordered failover pool.
 
     The board (config.yaml `board:` if set, else the built-in DEFAULT_BOARD) is listed
@@ -621,6 +844,9 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE) -> int:
           f"{pool_filled} filled, the rest reserve — size with --pool N):\n")
     name_w = max((len(r.display) for r in board), default=0)
     role_w = max((len(r.role or "general") for r in board), default=0)
+    # Resolve the repo bit ONCE (a single git rev-parse) for the opencode scope label,
+    # rather than per seat in the loop.
+    cwd_is_repo = backends._opencode_runs_in_repo(cwd or Path.cwd())
     seen_available = 0  # how many AVAILABLE seats walked so far (priority order)
     for index, reviewer in enumerate(board):
         available = avail[index]
@@ -632,8 +858,12 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE) -> int:
             tier = "pool   " if seen_available < pool_filled else "reserve"
             seen_available += 1
         prio = f"#{index + 1}"
+        scope = "agentic" if _seat_reads_repo(reviewer.model, cwd_is_repo) else "diff-only"
         print(f"  {prio:>3}  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  "
-              f"{reviewer.model}  [{status}]")
+              f"{reviewer.model}  [{status}]  ({scope})")
+    print("\nScope: `agentic` seats (codex / opencode / claude-CLI) run read-only in the "
+          "real repo and can read any project file; `diff-only` seats (gemini / z.ai / "
+          "commandcode / claude-API) are stateless HTTP calls that see only the diff.")
     print(f"\nA plain `review` runs the top {DEFAULT_POOL_SIZE} AVAILABLE seats by "
           f"priority (--pool {DEFAULT_POOL_SIZE}); a higher-priority seat that is "
           f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "

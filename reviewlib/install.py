@@ -78,7 +78,17 @@ review -C <repo> --just-ask "Q"        # multi-model answer to a question (no di
 review -C <repo> --quorum "Q"          # experts answer + a moderator finds consensus/disagreement
 review -C <repo> --brainstorm "TOPIC"  # iterative persona ideation in a loop, with a moderator
 review -C <repo> --brainstorm "TOPIC"  # …+ an uncommitted/--staged diff -> brainstorm ABOUT that change
+review -C <repo> -o out.md             # write the result to a file (still prints to stdout)
 ```
+
+## Save the result to a file: `-o FILE`, NOT `> FILE`
+Use `review -C <repo> -o out.md`, NOT `review -C <repo> … > out.md`. Under zsh
+`noclobber` (a common shell default), `> out.md` REFUSES to overwrite an existing
+file and the command dies silently — you get no review and no error. `-o` writes
+the result with Python (`open(...,"w")`), which bypasses the shell redirect (and
+thus noclobber) entirely: it creates parent dirs, always overwrites, and STILL
+prints the result to stdout so you see it live. So whenever you want the review in
+a file, reach for `-o file.md`, never `> file.md`.
 
 ## Reviewer board + `--pool` (priority-ordered failover pool)
 A plain `review` runs the built-in **reviewer board** — a **priority-ordered** panel of 8
@@ -130,7 +140,10 @@ The `claude:` / opus backend runs two ways, so it works whether or not the
 Every backend declares which transports it supports and reads the SAME selector
 shape `REVIEW_<BACKEND>_MODE` (the one PR #8 introduced for claude):
 - **claude** — both `api` and `cli` (auto-picks; see above).
-- **codex / opencode** — `cli` only (agent CLIs that carry their own auth).
+- **codex / opencode** — `cli` only (agent CLIs that carry their own auth). Both
+  are AGENTIC: they run in the real `-C` repo READ-ONLY and can open any project
+  file, not just the diff — so an `oc:<provider>/<model>` seat reads the whole repo
+  (opencode's read-only-reviewer agent denies edit/write/bash, so it never mutates).
 - **z.ai, commandcode** — `api` only (no such CLI exists). Forcing `cli` on an
   api-only backend (`REVIEW_COMMANDCODE_MODE=cli`) is a hard error, not a silent
   fall-through to the API.
