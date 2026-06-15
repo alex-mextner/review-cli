@@ -714,11 +714,43 @@ only read, never written.
 
 ---
 
+## How review compares
+
+AI code review tools cluster into two camps. **PR-bots** (Qodo PR-Agent, CodeRabbit,
+GitHub Copilot code review) run a single model against a *pull request* — they live on
+the platform, comment inline, and are great once a PR exists. **In-agent review** (Claude
+Code `/review`, Codex review) runs one model on the local diff inside the harness you are
+already in.
+
+`review` is neither: it runs **several models in parallel on the local working-tree diff**
+before you ever push, then goes further — a cited **quorum** (consensus with evidence) and
+a multi-round **brainstorm** panel for open design questions. It is **read-only** (never
+edits your code), **CLI-first** (no PR, no hosted service — it shells out to model CLIs you
+already have), and **harness-agnostic** (callable from Claude Code, Codex, opencode, or a
+plain shell).
+
+| Tool | Multi-model in parallel | Local pre-PR diff | Consensus / quorum | Design brainstorm | Read-only | No hosted service |
+|---|---|---|---|---|---|---|
+| **review** | ✓ | ✓ | ✓ (cited) | ✓ (multi-round) | ✓ | ✓ (your own model CLIs) |
+| Qodo PR-Agent | — (1 call) | ~ (CLI, PR-oriented) | — | — | — (suggests edits) | ~ (self-host or hosted) |
+| CodeRabbit CLI | — (1 service) | ✓ | — | — | — (one-click fixes) | — (hosted) |
+| GitHub Copilot review | — (1 model) | — (PR / IDE) | — | — | — (suggests edits) | — (hosted) |
+| Claude Code `/review` | — (1 model) | ✓ | — | — | ~ | — (in-harness) |
+| Codex review | — (1 model) | ✓ | — | — | ~ | — (in-harness) |
+
+`~` = partial. PR-bots shine *after* a PR exists and can apply fixes; `review` is the
+pre-commit, multi-perspective second opinion that runs from any shell and decides nothing
+for you — it surfaces findings and consensus, you stay in control of the edit.
+
+---
+
 ## Ecosystem
 
 Part of the [HyperIDE.ai](https://hyperide.ai) agent toolchain:
 
 - **[tg-cli](https://github.com/alex-mextner/tg-cli)** — Telegram bridge for agents: push reports, two-way control, Q→buttons
+- **[rig-cli](https://github.com/alex-mextner/rig-cli)** — umbrella dev-env driver: sets up a repo from config — skills, hooks, CI, dep-bootstrap; reconciles drift
+- **[agent-tools](https://github.com/alex-mextner/agent-tools)** — the shared umbrella: portable agent skills, git/agent hooks, CI gates, and the `agenttools_log` lib that the other CLIs consume
 - **[draw-cli](https://github.com/alex-mextner/draw-cli)** — text-to-image via Hugging Face
 - **[3d-cli](https://github.com/alex-mextner/3d-cli)** — scriptable CLI for the full 3D FDM lifecycle: modeling, mesh repair, slicing, and print monitoring
 - **[hyperide.ai](https://hyperide.ai)** — Figma replacement inside VS Code. Edit React components directly through AST/LSP without AI hallucinations, token waste, or context-window limits. Works for indie vibe-coding and for enterprise teams with split design/dev roles.
