@@ -52,6 +52,69 @@ DEFAULT_SESSION_GAP_SECONDS = 90.0
 # to cap mtime-as-end-marker so an out-of-band touch can't balloon a session window.
 _MAX_CALL_WALL = timedelta(seconds=1200)
 
+# ---- per-model health classification ---------------------------------------------------
+# The dashboard's "Models & roles" tab surfaces, per board model, an ok-rate and the
+# dominant failure class so the CTO can see WHY a model is down at a glance. The classes
+# below are the real failure modes observed in `~/Library/Logs/review-cli/*.log` (see the
+# CHANGELOG / the HYP diagnosis): the per-call EXIT code + stderr + body sentinels each
+# map to one of these. `OK` and `EMPTY` are the two EXIT-0 outcomes (real verdict vs no
+# content); the rest are hard failures. Order here is the tie-break for "dominant class"
+# when two classes are equally frequent (hard-unavailable beats soft).
+HEALTH_OK = "ok"
+HEALTH_PAYWALL = "paywall"  # body says "currently unavailable" (Fable). EXIT is often 0.
+HEALTH_AUTH = "auth"  # EXIT 401 / stderr {"error":"bad key"} (z.ai / GLM bad key).
+HEALTH_BLOCKED = "blocked"  # EXIT 403 / "error code: 1010" (Cloudflare bot block).
+HEALTH_TIMEOUT = "timeout"  # EXIT 124 / "timed out".
+HEALTH_EMPTY = "empty"  # EXIT 0 but no real content (output_tokens=0 / framing-only body).
+HEALTH_ERROR = "error"  # any other non-zero exit not matched above.
+
+# The three "hard-unavailable" classes: a model currently in one of these is problematic
+# regardless of its longer-window rate (a fresh paywall/auth/block is down NOW). The order
+# here is the DOMINANT-CLASS TIE-BREAK only (when two failure classes are equally frequent,
+# the earlier one wins) — it is NOT the same as classify_call's recognition precedence,
+# which interleaves TIMEOUT and runs paywall first for the EXIT-0-lies reason. Two different
+# orderings, deliberately.
+HARD_UNAVAILABLE_CLASSES = (HEALTH_PAYWALL, HEALTH_AUTH, HEALTH_BLOCKED)
+# Every non-OK class is a failure for the ok-rate.
+FAILURE_CLASSES = (
+    HEALTH_PAYWALL,
+    HEALTH_AUTH,
+    HEALTH_BLOCKED,
+    HEALTH_TIMEOUT,
+    HEALTH_EMPTY,
+    HEALTH_ERROR,
+)
+
+# A model is PROBLEMATIC when its fail-rate over the window meets/exceeds this, OR its most
+# recent PROBLEMATIC_RECENT_N calls are ALL failures, OR it is currently in a hard-
+# unavailable class. One constant, not a literal scattered around (CTO standing rule).
+PROBLEMATIC_FAIL_RATE = 0.5
+PROBLEMATIC_RECENT_N = 3
+
+# Sentinel the Fable paywall body carries. review-cli's logger collapses interior
+# whitespace, so the on-disk body reads `ClaudeFable5iscurrentlyunavailable` — match the
+# NORMALIZED (whitespace-stripped, lower-cased) form so both the spaced and the collapsed
+# rendering hit. "unavailable" alone is too broad (a real review could mention it), so we
+# anchor on the full `currentlyunavailable` phrase.
+_PAYWALL_SENTINEL = "currentlyunavailable"
+# Cloudflare bot-block body marker (commandcode gateway behind CF).
+_CF_BLOCK_MARKER = "error code: 1010"
+# z.ai / GLM bad-key stderr marker.
+_BAD_KEY_MARKER = '{"error":"bad key"}'
+# `claude` backend header argv0 carries NO model id (Fable and Opus share the `claude-p`
+# wrapper), so the model is inferred from the body sentinel: a paywall body = Fable, any
+# other = Opus. These are the two board claude seats.
+_CLAUDE_FABLE_MODEL = "claude:claude-fable-5"
+_CLAUDE_OPUS_MODEL = "claude:claude-opus-4-8"
+# Backend-name -> board model id for the single-model backends (the agentic codex CLI and
+# the gemini REST route each map to exactly one board seat).
+_SINGLE_MODEL_BACKENDS = {"codex": "codex", "gemini": "gemini"}
+# `commandcode API <model>` / `z.ai API <model>` header argv0 reveals the gateway model.
+_API_MODEL_RE = re.compile(r"\bAPI\s+(?P<model>\S+)")
+# z.ai's board seat id is `zai:<model>` (config DEFAULT_BOARD), but the log backend/header
+# spell it `z.ai`. Normalise the header model to the board prefix so attribution lines up.
+_BACKEND_BOARD_PREFIX = {"commandcode": "commandcode", "z.ai": "zai"}
+
 
 def _parse_stamp(date_part: str, micros: str) -> datetime:
     """``20260613T040611`` + ``516399`` -> aware UTC datetime."""
@@ -704,4 +767,214 @@ def compute_stats(sessions: list[Session]) -> dict:
         # surfaced as nulls with a note rather than faked. See the Metrics panel.
         "tokens_recorded": False,
         "cost_recorded": False,
+        # Per-model health (ok-rate / dominant failure class / problematic flag) for the
+        # Models & roles tab, plus the count of problematic BOARD models for the tab badge.
+        "model_health": (_mh := compute_model_health(sessions))["models"],
+        "problematic_count": _mh["problematic_count"],
     }
+
+
+def _normalize_body(text: str) -> str:
+    """Lower-case + strip ALL whitespace, so a sentinel survives the logger's whitespace
+    collapsing. The Fable paywall body lands on disk as `ClaudeFable5iscurrentlyunavailable`
+    (interior spaces gone), so a spaced `currently unavailable` match would miss it; we
+    compare against the fully de-spaced form instead."""
+    return re.sub(r"\s+", "", text).lower()
+
+
+def _body_has_real_content(call: "CallLog") -> bool:
+    """Did this EXIT-0 call return a real verdict, or is it empty/framing-only?
+
+    A call is EMPTY when it exited cleanly but produced no usable review: an explicit
+    `output_tokens=0` usage line, or a body that — once the `[review-cli] …` framing and
+    stderr/usage lines are dropped — has no remaining prose. (The body has already had the
+    header + EXIT/timeout footer stripped by the parser; what remains can still be a usage
+    line or pure whitespace.)"""
+    # Explicit zero-output usage line is the strongest empty signal.
+    if re.search(r"\boutput_tokens=0\b", call.body):
+        return False
+    for raw in call.body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("[review-cli]"):
+            continue  # framing line
+        if line.startswith("[reasoning_content"):
+            continue  # reasoning-only, no final answer
+        if re.fullmatch(r"(prompt_tokens=\d+\s*)?(output_tokens=\d+\s*)?", line):
+            continue  # a bare usage line is not content
+        return True
+    return False
+
+
+def classify_call(call: "CallLog") -> str:
+    """Bucket one finished call into a health class (see HEALTH_* constants).
+
+    Precedence is by how hard/actionable the failure is: timeout and the three
+    hard-unavailable classes (paywall/auth/blocked) are recognised first, because their
+    sentinels are unambiguous and they explain a model being down NOW. EMPTY vs OK is the
+    EXIT-0 split (no content vs a real verdict). A non-zero exit with no recognised sentinel
+    falls through to the generic ERROR class so it still counts against the ok-rate."""
+    # Paywall: the body sentinel is authoritative even when EXIT is 0 (Fable returns 0 with
+    # an "unavailable" body — the EXIT code lies, the body tells the truth). This is the only
+    # check that must run on the EXIT-0 happy path, so it leads.
+    if _PAYWALL_SENTINEL in _normalize_body(call.body):
+        return HEALTH_PAYWALL
+    if call.timed_out or call.exit_code == 124:
+        return HEALTH_TIMEOUT
+    # The CF bot-block / bad-key markers can land in stderr OR the body; build the haystack
+    # once, only for the error-bearing calls that need it (the healthy majority skips this).
+    blob = ("\n".join(call.stderr_lines) + "\n" + call.body).lower()
+    # Blocked (Cloudflare): EXIT 403 or the CF marker.
+    if call.exit_code == 403 or _CF_BLOCK_MARKER in blob:
+        return HEALTH_BLOCKED
+    # Auth: EXIT 401 or the bad-key marker.
+    if call.exit_code == 401 or _BAD_KEY_MARKER in blob:
+        return HEALTH_AUTH
+    if call.has_error:
+        return HEALTH_ERROR
+    # EXIT 0 from here: real verdict vs empty/framing-only.
+    if not _body_has_real_content(call):
+        return HEALTH_EMPTY
+    return HEALTH_OK
+
+
+def model_id_for_call(call: "CallLog") -> str:
+    """Resolve the MODEL-level id for a call (Kimi vs Qwen vs DeepSeek all share the
+    `commandcode` backend, so the filename/backend alone is too coarse).
+
+    Source of truth, in order:
+      * `commandcode` / `z.ai`: the header argv0 carries `… API <model>` — map to the board
+        prefix (`commandcode:<model>` / `zai:<model>`). A bare probe (`commandcode` with no
+        `API …`) has no model, so it stays the backend name.
+      * `claude`: the wrapper argv0 is identical for Fable and Opus, so the model is inferred
+        from the body — a paywall body = Fable, anything else = the Opus seat.
+      * `codex` / `gemini`: one model each; the backend name IS the board id.
+      * anything else: fall back to the backend name."""
+    backend = call.backend
+    if backend == "claude":
+        if _PAYWALL_SENTINEL in _normalize_body(call.body):
+            return _CLAUDE_FABLE_MODEL
+        return _CLAUDE_OPUS_MODEL
+    if backend in _SINGLE_MODEL_BACKENDS:
+        return _SINGLE_MODEL_BACKENDS[backend]
+    prefix = _BACKEND_BOARD_PREFIX.get(backend)
+    if prefix is not None:
+        m = _API_MODEL_RE.search(call.argv0)
+        if m:
+            return f"{prefix}:{m.group('model')}"
+    return backend
+
+
+def _board_models() -> list[dict]:
+    """The canonical board model list (id/role/display) the health view covers. Imported
+    lazily so the parser stays import-light and free of a config dependency at module load."""
+    from ..config import DEFAULT_BOARD
+
+    return [{"model": b.model, "role": b.role, "display": b.display} for b in DEFAULT_BOARD]
+
+
+def _dominant_class(classes: list[str]) -> str | None:
+    """The most common failure class among a model's calls (hard-unavailable wins ties).
+
+    Only failure classes count toward "dominant" — a model with mostly OK calls but a few
+    failures reports the dominant FAILURE so the UI can label why it degrades, not 'ok'."""
+    counts: dict[str, int] = {}
+    for c in classes:
+        if c in FAILURE_CLASSES:
+            counts[c] = counts.get(c, 0) + 1
+    if not counts:
+        return None
+    # Sort by frequency desc, then by hard-unavailable precedence, then name for stability.
+    def _rank(item: tuple[str, int]) -> tuple[int, int, str]:
+        cls, n = item
+        hard = HARD_UNAVAILABLE_CLASSES.index(cls) if cls in HARD_UNAVAILABLE_CLASSES else len(HARD_UNAVAILABLE_CLASSES)
+        return (-n, hard, cls)
+
+    return sorted(counts.items(), key=_rank)[0][0]
+
+
+def _model_is_problematic(ok_rate: float | None, classes_newest_first: list[str], current_class: str | None) -> bool:
+    """A model is problematic when ANY of:
+      * it is currently in a hard-unavailable class (paywall/auth/blocked) — down NOW;
+      * its fail-rate over the window meets/exceeds PROBLEMATIC_FAIL_RATE;
+      * its most-recent PROBLEMATIC_RECENT_N calls are ALL failures (a fresh streak that an
+        averaged rate would dilute).
+    `classes_newest_first` is the per-call class list ordered newest first."""
+    if current_class in HARD_UNAVAILABLE_CLASSES:
+        return True
+    if ok_rate is not None and (1.0 - ok_rate) >= PROBLEMATIC_FAIL_RATE:
+        return True
+    recent = classes_newest_first[:PROBLEMATIC_RECENT_N]
+    if len(recent) >= PROBLEMATIC_RECENT_N and all(c in FAILURE_CLASSES for c in recent):
+        return True
+    return False
+
+
+def compute_model_health(sessions: list[Session]) -> dict:
+    """Per-model health rollup for the dashboard's Models & roles tab.
+
+    Walks every call across the (already window-bounded) sessions, attributes it to a
+    MODEL id (commandcode/z.ai gateway model, Fable-vs-Opus split, etc.), classifies it, and
+    rolls up per model: total/ok/fail counts, ok-rate, the dominant failure class, the most
+    recent class, and a `problematic` flag. Board models with NO calls in the window are
+    still listed (status `no_data`) so the view covers the whole board; any non-board model
+    that appears in the logs is appended too. Returns
+    `{"models": [...], "problematic_count": N}`; `problematic_count` is over BOARD models
+    (the tab badge), matching the spec."""
+    # Gather calls per model, newest-first (sessions arrive newest-first; within a session
+    # we keep call order then reverse so the most-recent call leads).
+    per_model_classes: dict[str, list[str]] = {}
+    for s in sessions:  # sessions are already sorted newest-first by the loader
+        for call in reversed(s.calls):
+            mid = model_id_for_call(call)
+            per_model_classes.setdefault(mid, []).append(classify_call(call))
+
+    board = _board_models()
+    board_ids = {b["model"] for b in board}
+    # Board models first (in board/priority order), then any extra model seen in the logs.
+    ordered_ids = [b["model"] for b in board]
+    for mid in per_model_classes:
+        if mid not in board_ids:
+            ordered_ids.append(mid)
+    board_meta = {b["model"]: b for b in board}
+
+    models_out: list[dict] = []
+    problematic_count = 0
+    for mid in ordered_ids:
+        classes = per_model_classes.get(mid, [])  # newest first
+        total = len(classes)
+        ok = sum(1 for c in classes if c == HEALTH_OK)
+        fail = total - ok
+        ok_rate = round(ok / total, 4) if total else None
+        current = classes[0] if classes else None
+        dominant = _dominant_class(classes)
+        meta = board_meta.get(mid)
+        on_board = mid in board_ids
+        if total == 0:
+            problematic = False
+            status = "no_data"
+        else:
+            problematic = _model_is_problematic(ok_rate, classes, current)
+            # A problematic model surfaces its dominant FAILURE class as the status; a
+            # not-problematic one is OK. `dominant` is guaranteed non-None when problematic
+            # (problematic ⇒ >=1 failure ⇒ a dominant failure class exists), but fall back to
+            # the generic ERROR class rather than rely on that coupling implicitly.
+            status = (dominant or HEALTH_ERROR) if problematic else HEALTH_OK
+        if problematic and on_board:
+            problematic_count += 1
+        models_out.append({
+            "model": mid,
+            "display": meta["display"] if meta else mid,
+            "role": meta["role"] if meta else None,
+            "on_board": on_board,
+            "calls": total,
+            "ok": ok,
+            "fail": fail,
+            "ok_rate": ok_rate,
+            "current_class": current,
+            "dominant_class": dominant,
+            "status": status,
+            "problematic": problematic,
+        })
+    return {"models": models_out, "problematic_count": problematic_count}

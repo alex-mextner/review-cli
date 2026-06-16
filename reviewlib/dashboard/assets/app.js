@@ -67,9 +67,27 @@ async function loadAll() {
     const [runs, stats] = await Promise.all([api(`/api/runs?gap=${state.gap}`), api(`/api/stats?gap=${state.gap}`)]);
     state.runs = runs;
     state.stats = stats;
+    updateTabBadges();
     render();
   } catch (e) {
     $('panel').innerHTML = `<div class="empty">Failed to load data: ${esc(e.message)}</div>`;
+  }
+}
+
+// The tab buttons live in the static shell (they are NOT re-rendered with the panel), so
+// their count badges are updated here whenever fresh stats land. Models & roles shows the
+// number of currently-problematic models; a zero count hides the badge entirely.
+function updateTabBadges() {
+  const badge = $('models-badge');
+  if (!badge) return;
+  const n = (state.stats && state.stats.problematic_count) || 0;
+  if (n > 0) {
+    badge.textContent = String(n);
+    badge.hidden = false;
+    badge.title = `${n} model(s) currently problematic`;
+  } else {
+    badge.textContent = '';
+    badge.hidden = true;
   }
 }
 
@@ -183,12 +201,61 @@ PANELS.stats = () => {
   return html;
 };
 
+// Human label + status-pill class for a model's health class. The pill reuses the
+// existing .badge palette (ok green, err red, degraded/nodata amber-ish).
+const HEALTH_LABEL = {
+  ok: 'ok',
+  paywall: 'paywall / unavailable',
+  auth: 'auth (bad key)',
+  blocked: 'blocked (bot)',
+  timeout: 'timeout',
+  empty: 'empty output',
+  error: 'error',
+  no_data: 'no data',
+};
+// The hard-unavailable classes get the loud red .err pill (vs amber for the softer
+// degraded ones). Mirrors parser.HARD_UNAVAILABLE_CLASSES; kept as one JS-side constant so
+// the pill-colour contract is reviewable in a single place (no build step to share it).
+const HARD_UNAVAILABLE = new Set(['paywall', 'auth', 'blocked']);
+function healthPill(m) {
+  if (m.status === 'no_data') return `<span class="badge nodata">${esc(HEALTH_LABEL.no_data)}</span>`;
+  if (!m.problematic) return `<span class="badge ok">${esc(HEALTH_LABEL.ok)}</span>`;
+  // A problematic model surfaces its dominant failure class; hard-unavailable classes get
+  // the loud red .err pill, the softer degraded ones get amber.
+  const cls = HARD_UNAVAILABLE.has(m.dominant_class) ? 'err' : 'degraded';
+  return `<span class="badge ${cls}">${esc(HEALTH_LABEL[m.dominant_class] || m.dominant_class || 'down')}</span>`;
+}
+function modelHealthRow(m) {
+  const rate = m.ok_rate == null ? '—' : Math.round(m.ok_rate * 100) + '%';
+  const pct = m.ok_rate == null ? 0 : Math.round(m.ok_rate * 100);
+  const sub = m.calls ? `${m.ok}/${m.calls} ok · ${m.fail} fail` : 'no calls in window';
+  return `<div class="run"><div class="model-health${m.problematic ? ' is-problematic' : ''}">
+      <span class="mh-name">${esc(m.display || m.model)}</span>
+      ${healthPill(m)}
+      <span class="mh-bar-track"><span class="mh-bar-fill" style="width:${pct}%"></span></span>
+      <span class="mh-rate">${rate}</span>
+      <span class="run-models">${esc(sub)}</span>
+    </div></div>`;
+}
+
 PANELS.models = () => {
   const s = state.stats;
   if (!s) return `<h2>Models &amp; roles</h2>` + emptyState('data');
-  let html = `<h2>Models &amp; roles</h2><p class="sub">Which models and personas were used, and in what roles.</p>`;
+  let html = `<h2>Models &amp; roles</h2><p class="sub">Which models and personas were used, in what roles, and each model's current health.</p>`;
+  // --- per-model health (problematic models first, then ok, then no-data) ---
+  const mh = (s.model_health || []).slice().sort((a, b) => {
+    const rank = (m) => (m.problematic ? 0 : m.status === 'no_data' ? 2 : 1);
+    if (rank(a) !== rank(b)) return rank(a) - rank(b);
+    return (a.ok_rate ?? 1) - (b.ok_rate ?? 1); // worst ok-rate first within a tier
+  });
+  const probCount = s.problematic_count || 0;
+  html += `<div class="section"><h3>Health <span class="muted">(${probCount} problematic)</span></h3>`;
+  html += mh.length
+    ? `<div class="list">${mh.map(modelHealthRow).join('')}</div>`
+    : emptyState('model health', 'No calls in the window to classify.');
+  html += `</div>`;
   const models = Object.entries(s.by_model || {}).sort((a, b) => b[1] - a[1]);
-  html += `<div class="section"><h3>Models</h3>`;
+  html += `<div class="section"><h3>Usage</h3>`;
   html += models.length
     ? `<div class="list">${models
         .map(

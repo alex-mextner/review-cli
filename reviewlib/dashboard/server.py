@@ -11,7 +11,8 @@ serves:
   GET  /api/health              -> {ok, log_dir, store_path, allowed_origins, ...}
   GET  /api/runs[?gap=N]        -> [session summaries], newest first
   GET  /api/runs/<id>           -> full session detail (calls/brainstorm/roles + annotation)
-  GET  /api/stats[?gap=N]       -> aggregate stats (modes/models/roles/days/durations)
+  GET  /api/stats[?gap=N]       -> aggregate stats (modes/models/roles/days/durations,
+                                   plus per-model `model_health` + `problematic_count`)
   GET  /api/annotations         -> {session_id: annotation} (overseer store dump)
   POST /api/runs/<id>/feedback  -> {feedback: "..."}          (overseer feedback)
   POST /api/runs/<id>/conscious -> {conscious: true|false}    (Tasks panel toggle)
