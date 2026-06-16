@@ -201,9 +201,10 @@ ideation.
 
 ```bash
 # brainstorm grounded in the current uncommitted working-tree diff
-review -C <repo> brainstorm "Is this caching approach sound? What are the risks?" --diff
-review -C <repo> brainstorm "Alternatives to this design before I commit?" --staged
-git diff main... | review -C <repo> brainstorm "How else could we structure this?"
+# (the subcommand leads; -C and the other shared options follow it)
+review brainstorm "Is this caching approach sound? What are the risks?" --diff -C <repo>
+review brainstorm "Alternatives to this design before I commit?" --staged -C <repo>
+git diff main... | review brainstorm "How else could we structure this?" -C <repo>
 ```
 
 The whole conversation is also written **incrementally** to a single discussion log

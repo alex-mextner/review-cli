@@ -294,14 +294,20 @@ def test_cli_brainstorm_empty_pipe_falls_back_to_worktree():
     assert cap["diff"] == _git_ok(None, None), repr(cap["diff"])
 
 
-def test_cli_default_review_staged_nonrepo_still_hard_fails():
+def test_cli_default_review_staged_nonrepo_fails_gracefully():
     """The needs_diff formula change ((... ) and brainstorm is None) must NOT relax the
-    DEFAULT review: `review --staged` (no brainstorm) against a non-repo must still
-    hard-fail (git diff raises, uncaught), not degrade (GLM finding 5)."""
+    DEFAULT review: `review --staged` (no brainstorm) where `git diff` fails must STILL fail
+    (the review handler must NEVER run on an empty/degraded diff — GLM finding 5). What
+    CHANGED with the no-git-graceful work: it no longer fails by leaking a raw RuntimeError
+    traceback — it fails GRACEFULLY with a stable non-zero exit (EXIT_GIT_DIFF_FAILED) and a
+    structured message. So: the run exits non-zero, mode_review is never reached, and no raw
+    RuntimeError escapes. (`-C REPO_ROOT` IS a real repo, so `_is_git_repo` passes and the
+    stubbed `_git_diff` failure stands in for an in-repo `git diff` blowup.)"""
     import io
     import os
 
     from reviewlib import cli
+    from reviewlib.cli import EXIT_GIT_DIFF_FAILED
     from reviewlib.modes import review as review_mod
 
     old_git = cli._git_diff
@@ -310,7 +316,13 @@ def test_cli_default_review_staged_nonrepo_still_hard_fails():
     old_env = os.environ.get("GEMINI_ENV_FILE")
     cli._git_diff = _git_raises
     cli.load_config = lambda: {}
-    review_mod.mode_review = lambda *_a, **_k: 0  # must never be reached
+    ran = {"review": False}
+
+    def _fake_review(*_a, **_k):
+        ran["review"] = True  # must never be reached — the diff is REQUIRED, not degraded
+        return 0
+
+    review_mod.mode_review = _fake_review
     old_stdin = sys.stdin
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -321,11 +333,14 @@ def test_cli_default_review_staged_nonrepo_still_hard_fails():
 
         sys.stdin = _Tty("")
         raised = False
+        rc = None
         try:
-            cli.main(["--staged", "-C", str(REPO_ROOT)])
+            rc = cli.main(["--staged", "-C", str(REPO_ROOT)])
         except RuntimeError:
-            raised = True  # default --staged review hard-fails on a non-repo, as before
-        assert raised, "default --staged review must still hard-fail on a non-repo"
+            raised = True  # the OLD bug: a raw traceback. The graceful path must NOT do this.
+        assert not raised, "default --staged review must FAIL GRACEFULLY, not raise a traceback"
+        assert rc == EXIT_GIT_DIFF_FAILED, rc  # stable non-zero, distinct from not-a-repo
+        assert not ran["review"], "the review handler must NOT run on a failed/empty diff"
     finally:
         cli._git_diff = old_git
         cli.load_config = old_load_config

@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -150,7 +151,14 @@ def _opencode_runs_in_repo(cwd: Path) -> bool:
         a clean dir, where no project config can touch it)."""
     if not cwd.is_dir():
         return False
-    proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd, timeout=10)
+    # This is reached by `--show-board` (a meta flag that must work anywhere) and the
+    # opencode-seat scope label, so a missing git binary (OSError -> FileNotFoundError) or a
+    # wedged `git rev-parse` (TimeoutExpired) must degrade to "not a repo" (False), never a
+    # raw traceback — same defensive catch as cli._is_git_repo.
+    try:
+        proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     if not (proc.returncode == 0 and proc.stdout.strip() == "true"):
         return False
     if _opencode_has_project_config(cwd):

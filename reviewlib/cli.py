@@ -61,12 +61,81 @@ from .stats import announce_eta, record_run
 # This tuple just keeps the names referenced so the imports aren't flagged unused.
 __mode_fns__ = (mode_brainstorm, mode_just_ask, mode_quorum, mode_review)
 
+# Stable, per-class exit codes (structured-exit-codes). The diff-review path REQUIRES a
+# git repo; run it outside one and it must fail GRACEFULLY with this distinct code (a
+# "wrong place to run this" usage class), NOT a raw traceback / generic crash. Scripts can
+# branch on it; it stays stable. 0=success, 2=argparse/usage (argparse's own), 124=backstop
+# (reviewlib.backstop). 3 is the not-a-repo class — distinct from argparse-2 so a caller can
+# tell "you ran the diff review outside a repo" apart from "you mistyped a flag".
+EXIT_NOT_A_REPO = 3
+# 4 is the "in a repo, but `git diff` itself failed" class (e.g. a wedged/timed-out git, a
+# corrupt index) — distinct from EXIT_NOT_A_REPO (you ARE in a repo) and argparse-2. The
+# REQUIRED review path catches the RuntimeError `_git_diff` raises so this never tracebacks.
+EXIT_GIT_DIFF_FAILED = 4
+
+
+def _is_git_repo(cwd: Path) -> bool:
+    """Cheap, correct "is `cwd` inside a git work tree?" probe.
+
+    `git rev-parse --is-inside-work-tree` is the canonical, fast check (exit 0 + `true`
+    inside a work tree, non-zero outside). The whole point of this probe is to AVOID a raw
+    traceback, so every way the spawn itself can blow up is caught and treated as "not a
+    repo": OSError (a non-existent / non-directory `cwd` -> FileNotFoundError /
+    NotADirectoryError, e.g. a stale `-C /missing/path`) and TimeoutExpired (a wedged `git
+    rev-parse` -> `_run` forwards `timeout=` straight to subprocess.run, which raises). `_run`
+    is `text=True, stdout=PIPE`, so `proc.stdout` is always a str (never None)."""
+    try:
+        proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip().lower() == "true"
+
+
+def _fail_not_a_repo(cwd: Path) -> int:
+    """Print the 3-part WHAT/WHY/HOW message for "ran the diff review outside a repo" and
+    return the stable EXIT_NOT_A_REPO code. Verb-named because it has a side effect (prints)
+    AND returns the code. No traceback — this is an expected user error, not a crash."""
+    print(
+        f"[review-cli] not in a git repository ({cwd}).\n"
+        "  the diff review needs a repo to diff (it reviews your working-tree / staged changes).\n"
+        "  fix: run a mode that needs no git — `review just-ask \"...\"` / "
+        "`review quorum \"...\"` / `review brainstorm \"...\"` — or cd into a repo and re-run.",
+        file=sys.stderr, flush=True,
+    )
+    return EXIT_NOT_A_REPO
+
+
+def _fail_git_diff(cwd: Path, exc: Exception) -> int:
+    """Print a structured error for "in a git repo, but `git diff` failed" (the REQUIRED
+    review path) and return the stable EXIT_GIT_DIFF_FAILED code. `_is_git_repo` passing does
+    NOT guarantee `git diff` succeeds (a wedged/timed-out git, a corrupt index), so this is
+    the no-traceback floor for that path — an expected runtime failure, not a crash."""
+    print(
+        f"[review-cli] could not read the git diff in {cwd}.\n"
+        f"  git diff failed: {exc}\n"
+        "  fix: check the repo is healthy (`git status`), or pipe a diff on stdin "
+        "(`git diff | review`).",
+        file=sys.stderr, flush=True,
+    )
+    return EXIT_GIT_DIFF_FAILED
+
 
 def _git_diff(cwd: Path, staged: bool) -> str:
+    """Return the working-tree (or --staged) diff. Raises RuntimeError on ANY failure —
+    a non-zero `git diff`, a spawn failure (missing/non-dir `cwd` -> OSError, or a missing
+    git binary -> FileNotFoundError), or a wedged git (TimeoutExpired). Normalizing every
+    failure to the single RuntimeError type is what lets each OPTIONAL caller (--visual /
+    brainstorm / panel --diff|--staged) catch it and degrade to "". The REQUIRED review path
+    is gated by `_is_git_repo` first, so the common non-repo case is handled gracefully
+    there; a RARE in-repo `git diff` failure (a wedge, a corrupt repo) on that path still
+    surfaces as the RuntimeError above — a clean one-line error, not a silent wrong result."""
     args = ["git", "diff", "--no-ext-diff"]
     if staged:
         args.append("--cached")
-    proc = _run(args, cwd=cwd, timeout=120)
+    try:
+        proc = _run(args, cwd=cwd, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"git diff could not run: {exc}") from exc
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "git diff failed")
     return proc.stdout
@@ -79,7 +148,7 @@ def _read_stdin_if_piped() -> str | None:
     return data if data else None
 
 
-def _effective_cwd(raw: str) -> Path:
+def _effective_cwd(raw: str, *, warn: bool = True) -> Path:
     """Resolve the review cwd, preferring the enclosing git repository root.
 
     Agents commonly invoke `review` from a scratch / temp directory and forget
@@ -88,15 +157,28 @@ def _effective_cwd(raw: str) -> Path:
     git toplevel when inside a repo (also robust to being run from a subdir), and
     warn loudly when the cwd is not a git repo at all so the mistake is visible
     instead of producing a misleading review. Pass -C <project-root> to be exact.
+
+    `warn=False` suppresses the non-repo "reviewing it as-is" warning for a caller that
+    will itself print a clearer message: the review-mode diff path hard-fails via
+    `_fail_not_a_repo`, so the "as-is" promise would contradict that hard-fail.
     """
     resolved = Path(raw).expanduser().resolve()
     if resolved.is_dir():
-        proc = _run(["git", "rev-parse", "--show-toplevel"], cwd=resolved, timeout=10)
-        if proc.returncode == 0 and proc.stdout.strip():
+        # This runs on EVERY invocation, BEFORE mode dispatch — including the no-git modes
+        # (just-ask / quorum / brainstorm) that must "work anywhere". So the git spawn here
+        # must NEVER leak a raw traceback: a missing git binary (OSError -> FileNotFoundError)
+        # or a wedged `git rev-parse` (TimeoutExpired) degrades to "review the dir as-is",
+        # exactly like a non-repo dir — same defensive catch as `_is_git_repo`.
+        try:
+            proc = _run(["git", "rev-parse", "--show-toplevel"], cwd=resolved, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc is not None and proc.returncode == 0 and proc.stdout.strip():
             return Path(proc.stdout.strip())
-    print(f"[review-cli] warning: {resolved} is not inside a git repository; "
-          "reviewing it as-is — pass -C <project-root> to point review at your repo.",
-          file=sys.stderr, flush=True)
+    if warn:
+        print(f"[review-cli] warning: {resolved} is not inside a git repository; "
+              "reviewing it as-is — pass -C <project-root> to point review at your repo.",
+              file=sys.stderr, flush=True)
     return resolved
 
 
@@ -889,7 +971,12 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if top_level:
         _hint_default_mode()
 
-    cwd = _effective_cwd(args.cwd)
+    # Suppress the "reviewing it as-is" non-repo warning on the REVIEW-mode required-diff
+    # path: there a non-repo hard-fails via `_fail_not_a_repo` (the authoritative message),
+    # so the "as-is" promise would contradict it. The no-git modes (panel) and the
+    # tolerant `--visual` review (which DOES proceed as-is) keep the warning.
+    _review_required = mode.name == "review" and (args.staged or args.visual is None)
+    cwd = _effective_cwd(args.cwd, warn=not _review_required)
     explicit_models = _split_models(args.model)
     is_brainstorm = mode.name == "brainstorm"
     # A "panel mode" is any non-review mode (brainstorm / just-ask / quorum): the diff is
@@ -970,7 +1057,38 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # and routed through the caught/optional probe below.
     needs_diff = (args.staged or (not panel_mode and not visual_mode)) and not is_brainstorm
     if diff is None and needs_diff:
-        diff = _git_diff(cwd, args.staged)
+        # This path attaches the working-tree / staged diff. Outside a git repo it must NOT
+        # raise a raw `git diff` traceback. Two cases:
+        #   * REVIEW mode (not panel_mode): the diff is genuinely REQUIRED, so a non-repo is
+        #     a user error — fail GRACEFULLY with the 3-part message + stable EXIT_NOT_A_REPO.
+        #   * PANEL mode (just-ask / quorum) with --staged: the diff is OPTIONAL context
+        #     (diff_policy="none"), so a non-repo degrades to no-context ("") — NOT a hard
+        #     error, and never the "run just-ask" message at someone already running it.
+        # A piped diff short-circuited above (diff is not None), so the stdin path never
+        # reaches here — it works without a repo.
+        if not _is_git_repo(cwd):
+            if panel_mode:
+                diff = ""  # optional context (diff_policy="none") -> degrade, never hard-fail
+            else:
+                return _fail_not_a_repo(cwd)
+        elif panel_mode:
+            # In a repo but the diff is OPTIONAL context for a panel mode: a `git diff`
+            # failure (e.g. an unborn HEAD with --staged, a partial repo) degrades to
+            # no-context, exactly like the `--diff` / brainstorm siblings below — never a
+            # raw traceback.
+            try:
+                diff = _git_diff(cwd, args.staged)
+            except RuntimeError:
+                diff = ""
+        else:
+            # REQUIRED path, in a real repo. `_is_git_repo` passing does NOT guarantee `git
+            # diff` succeeds (a wedged/timed-out git, a corrupt index -> `_git_diff` raises
+            # RuntimeError). The diff is required here, so we can't degrade to "" — but we must
+            # still NOT traceback: fail GRACEFULLY with a structured error + stable exit.
+            try:
+                diff = _git_diff(cwd, args.staged)
+            except RuntimeError as exc:
+                return _fail_git_diff(cwd, exc)
     elif diff is None and visual_mode and not panel_mode:
         # --visual riding the review mode: probe the working-tree diff to decide
         # companion-vs-standalone, but tolerate "no diff / not a git repo".
