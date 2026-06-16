@@ -322,13 +322,17 @@ def test_value_taking_opts_are_all_value_taking():
     # (--rounds/--max-rounds) live ONLY on the `brainstorm` subcommand parser now, so
     # route them through that subcommand (with a topic) to reach a parser that has them.
     brainstorm_only = {"--rounds", "--max-rounds"}
+    specweb_only = {"--spec"}  # lives ONLY on the `spec-web reply` subparser
     for opt in sorted(_VALUE_TAKING_OPTS):
         if opt in ("-o", "--output"):
             continue  # handled by the pre-scan, covered by other tests
-        argv = (
-            ["brainstorm", "topic", opt] if opt in brainstorm_only
-            else ["--prompt", "p", opt]  # bare opt at the end -> needs a value
-        )
+        if opt in brainstorm_only:
+            argv = ["brainstorm", "topic", opt]
+        elif opt in specweb_only:
+            # route through the subcommand whose parser actually defines --spec
+            argv = ["spec-web", "reply", "cid", "ans", opt]
+        else:
+            argv = ["--prompt", "p", opt]  # bare opt at the end -> needs a value
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             try:
