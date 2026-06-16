@@ -230,6 +230,15 @@ echo "mode-subcommands tests OK"
 python3 tests/test_sessions.py
 echo "sessions tests OK"
 
+# REAL end-to-end resume: spawn the actual `bin/review` CLI as a SUBPROCESS (not in-process
+# stubs), KILL it mid-brainstorm, then RESUME and verify continuation + synthesis. The ONLY
+# fake is the leaf model call (REVIEW_FAKE_BACKEND=1 -> the deterministic, network-free
+# review_fake at backends.resolve_backend); the whole cli.py->modes->panel path runs for real.
+# No network / no real backends, so it is CI-safe. The kill scenario self-skips if its timing
+# window can't be hit on a slow box; the deterministic spawn+resume path always runs.
+python3 tests/test_e2e_resume.py
+echo "e2e resume tests OK"
+
 # Run-stats store + startup ETA: record shape (mode/pool/duration/ok/fail), the
 # (mode,pool_size) -> pool-only -> no-history ETA fallbacks, real wall-clock on a
 # CLI run, and the no-timeout advertising warning. All offline (backends stubbed;

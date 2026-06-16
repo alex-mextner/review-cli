@@ -294,7 +294,7 @@ handled explicitly:
 |-----------|-----------|
 | Unknown id | Error (exit 2), suggests `review sessions -a` to list ids |
 | Ambiguous prefix (two runs in the same second) | Error (exit 2), lists the full ids to disambiguate |
-| Already-completed session | Refused with a message — pass `--force` to re-synthesize from the saved transcript |
+| Already-completed session | Refused (exit 2) with a message — pass `--force` to re-synthesize from the saved transcript |
 | Zero usable rounds | Degrades to a fresh run over the saved topic (nothing to continue) |
 
 ---

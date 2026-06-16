@@ -237,8 +237,12 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
             moderators=moderators, diff=diff, force=ns.force,
         )
     except _sessions.SessionAlreadyCompleteError as exc:
+        # A refused resume (already-complete, no --force) did NO requested work. Return the
+        # same non-zero code the unknown/ambiguous-id paths use so scripts and hooks can
+        # tell a refusal from a real resume — exit 0 here was indistinguishable from success
+        # (codex P2: CTO sided with the bot over the prior "intentional" exit-0 choice).
         print(f"[review sessions] {exc}", file=sys.stderr, flush=True)
-        return 0
+        return 2
 
 
 def _spec_web(argv: list[str]) -> int:
