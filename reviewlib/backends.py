@@ -1000,7 +1000,85 @@ def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
+# --- Fake backend (TEST-ONLY, env-gated) -------------------------------------------
+# `REVIEW_FAKE_BACKEND=1` replaces EVERY real backend with a deterministic in-process
+# responder — NO network, NO CLI subprocess, NO API key. It exists so the e2e tests
+# (tests/test_e2e_resume.py) can spawn the REAL `review` CLI as a subprocess, kill it
+# mid-run, and resume it, exercising the genuine cli.py -> modes/brainstorm -> panel
+# path while ONLY the leaf model call is faked. OFF by default: when the env var is unset
+# `resolve_backend` returns the real backends unchanged, so production behaviour is
+# untouched (the e2e/round-trip unit tests prove this — they don't set the var).
+#
+# It is wired at `resolve_backend` (the single chokepoint every run_panel / run_moderator
+# call funnels through), so the fake is the ONLY fake in the whole stack — argument
+# parsing, mode dispatch, the round loop, the discussion-log writer, the parser, and the
+# resume seeding all run for real.
+def _fake_backend_enabled() -> bool:
+    # Normalize case so `False`/`FALSE`/`No` are treated as OFF (not just lowercase forms) —
+    # otherwise a case-variant false value would silently route every backend to the fake.
+    return os.environ.get("REVIEW_FAKE_BACKEND", "").strip().lower() not in ("", "0", "false", "no")
+
+
+def review_fake(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+    """Deterministic, network-free stand-in for a real backend (TEST-ONLY).
+
+    Distinguishes the brainstorm prompt shapes by their fixed lead-in text (imported from the
+    prompt SOURCE — `modes.brainstorm` — so a reword can never silently misroute the fake):
+      * the final SYNTHESIS prompt (SYNTHESIS_PROMPT_MARKER) -> a synthesis body;
+      * a MODERATOR round prompt (MODERATOR_PROMPT_LEADIN) -> a summary ending in
+        `DECISION: CONTINUE` (so the loop runs to its max cap, then synthesizes — a
+        deterministic, always-terminating run with a guaranteed final synthesis);
+      * anything else (a persona prompt) -> a short per-round idea.
+    The text embeds `model`/`round_no` so each round's content is distinct and a resumed
+    run's new rounds are visibly different from the pre-kill ones. `REVIEW_FAKE_DELAY`
+    (float seconds, default 0) sleeps per call so an e2e can make a run slow enough to
+    reliably SIGTERM it mid-round; the delay still honours `timeout` as an upper bound."""
+    import time
+
+    # Lazy import (not at module top) so this lower backends layer never imports the higher
+    # modes layer at import time — only when the env-gated fake is actually exercised.
+    from .modes.brainstorm import MODERATOR_PROMPT_LEADIN, SYNTHESIS_PROMPT_MARKER
+
+    delay = 0.0
+    try:
+        delay = float(os.environ.get("REVIEW_FAKE_DELAY", "0") or "0")
+    except ValueError:
+        delay = 0.0
+    if delay > 0:
+        time.sleep(min(delay, max(timeout - 0.1, 0.0)))
+
+    if SYNTHESIS_PROMPT_MARKER in prompt:
+        body = (
+            f"FINAL SYNTHESIS (fake/{model}). BEST IDEAS (ranked): 1) idea-A 2) idea-B. "
+            "TRADEOFFS: A is simpler, B scales better. RECOMMENDATION: ship idea-A first."
+        )
+    elif MODERATOR_PROMPT_LEADIN in prompt:
+        body = (
+            f"Moderator summary (fake/{model}, round {round_no}): the panel converged on a "
+            "couple of concrete directions.\nDECISION: CONTINUE"
+        )
+    else:
+        body = (
+            f"Idea from {model} in round {round_no}: a concrete, deterministic suggestion "
+            f"(#{round_no}) the fake backend emits without any network or CLI."
+        )
+    # Mirror a real REST backend's sidecar live-log so `tail -f` / the dashboard parser behave
+    # the same under the fake. A log-dir hiccup must not break the call, but it shouldn't fail
+    # SILENTLY either — narrow to OSError (the only thing write_sidecar_log raises on disk) and
+    # note it on stderr so a broken log dir is diagnosable.
+    try:
+        write_sidecar_log(backend="fake", round_no=round_no, argv0=f"fake:{model}",
+                          returncode=0, stdout=body, stderr="")
+    except OSError as exc:
+        print(f"[review-cli] fake sidecar log skipped: {exc}", file=sys.stderr, flush=True)
+    return ReviewResult(model=model, command=f"fake:{model}", returncode=0, stdout=body, stderr="")
+
+
 def resolve_backend(model: str) -> Callable[..., ReviewResult]:
+    # TEST-ONLY: with REVIEW_FAKE_BACKEND set, every model routes to the deterministic
+    # in-process fake (no network/CLI). Unset (the default) -> real backends, unchanged.
+    if _fake_backend_enabled():
+        return review_fake
     lowered = model.lower()
     if lowered == "codex" or lowered.startswith("codex:"):
         return review_codex
@@ -1040,6 +1118,11 @@ def resolve_backend(model: str) -> Callable[..., ReviewResult]:
 
 def backend_available(model: str) -> bool:
     """Cheap availability probe so moderator selection never picks a dead backend."""
+    # TEST-ONLY: under the fake backend EVERY model is reachable (it is faked in-process,
+    # no key/CLI needed). Without this the panel/moderator selection would prune the faked
+    # models as "unavailable" on a host lacking the real CLIs (e.g. CI), defeating the e2e.
+    if _fake_backend_enabled():
+        return True
     backend = resolve_backend(model)
     try:
         if backend is review_gemini:

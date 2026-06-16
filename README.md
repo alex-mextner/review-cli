@@ -210,7 +210,8 @@ The whole conversation is also written **incrementally** to a single discussion 
 (`<logdir>/<stamp>-brainstorm.md`, path printed to stderr at the start) — each round
 and moderator decision is flushed as it lands, so a timeout or interruption leaves the
 discussion-so-far on disk instead of losing everything that was only being held in
-memory for the final print.
+memory for the final print. That log is also what makes a crashed brainstorm
+**resumable** — see [`review sessions`](#review-sessions--list--resume-brainstorm-sessions).
 
 The growing transcript is fed to the **claude and codex** backends over **stdin**
 (not a `-p`/argv argument), which removes review-cli's own argv overhead. Note the
@@ -236,6 +237,65 @@ review brainstorm "API shape for the cache layer" \
 | `just-ask` | Quick multi-model second opinion on any question |
 | `quorum` | A contested decision that needs cited evidence to settle |
 | `brainstorm` | An open design space you want to explore across multiple rounds (optionally grounded in a diff — pass `--diff` / `--staged` or have an uncommitted diff to brainstorm about a specific change) |
+
+---
+
+## `review sessions` — list / resume brainstorm sessions
+
+Every `review brainstorm` run is persisted as a round-by-round discussion log
+(`<logdir>/<stamp>-brainstorm.md`, written incrementally as each round lands). `review
+sessions` reads those logs so you can **list** past brainstorms — including ones that
+**crashed, were killed, or timed out** before the final synthesis — and **resume** an
+interrupted one instead of starting over.
+
+```bash
+review sessions          # recent COMPLETED sessions (those that reached a synthesis)
+review sessions -a       # ALL sessions, including dead/interrupted ones (no synthesis)
+review sessions -s <id>  # RESUME: reload the transcript, continue the round loop, synthesize
+```
+
+**Listing.** Each row shows a short **session id** (derived from the log's UTC
+timestamp, e.g. `20260616T013310`), the **status** (`completed` = has a Final synthesis /
+`interrupted` = crashed before one), the number of **rounds** captured (`r3`), the
+**timestamp**, and the **topic**:
+
+```
+Brainstorm all sessions (incl. interrupted) — newest first; resume with `review sessions -s <id>`:
+
+  20260616T020000  [interrupted]  r2  2026-06-16 02:00 UTC  resilient retry policy
+  20260616T013310  [completed  ]  r5  2026-06-16 01:33 UTC  how to cache the widget
+```
+
+By default (no `-a`) the list shows only **completed** sessions, newest first, capped at
+the 20 most recent — the "recent finished work" subset. `-a`/`--all` adds the
+dead/interrupted sessions and lifts the cap, so you can find a crashed run to resume.
+Listing is **read-only**, so it is safe to run against a brainstorm that is still
+in progress (it just parses as a shorter transcript).
+
+**Resuming.** `review sessions -s <id>` does **not** start from scratch: it reloads the
+prior transcript, **reuses the saved topic, panel, and moderator**, and continues the
+round loop from `completed_round + 1` to the original `--max-rounds` (respecting the
+min-rounds / moderator-STOP rules), then produces the final synthesis. The continued
+rounds and synthesis are **appended to the same log**, so the resumed run is one
+continuous session, not a new file. Override the saved panel/moderator with `-m` /
+`--moderator`, point at a repo with `-C`, or cap per-call time with `--timeout`. If the
+session crashed *after* the moderator already decided to STOP (but before the synthesis
+was written), resume skips straight to the synthesis — it does not run extra rounds.
+
+The original `--diff`/`--staged` grounding is **not** persisted in the log, so a resumed
+grounded brainstorm would otherwise continue ungrounded. Pass `--diff` (working-tree) or
+`--staged` to **re-attach** the current diff as grounding for the resumed rounds and
+synthesis.
+
+The `<id>` can be the short displayed id or any **unambiguous prefix**. Edge cases are
+handled explicitly:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Unknown id | Error (exit 2), suggests `review sessions -a` to list ids |
+| Ambiguous prefix (two runs in the same second) | Error (exit 2), lists the full ids to disambiguate |
+| Already-completed session | Refused (exit 2) with a message — pass `--force` to re-synthesize from the saved transcript |
+| Zero usable rounds | Degrades to a fresh run over the saved topic (nothing to continue) |
 
 ---
 
@@ -602,6 +662,7 @@ brainstorm TOPIC    Multi-round persona ideation; composable with --diff/--stage
 just-ask QUESTION   Single-shot multi-model answer to a question (diff optional).
 quorum QUESTION     Experts cite evidence + a moderator finds quorum/disagreement.
 dashboard           Local web dashboard over review-cli runs.
+sessions            List / resume brainstorm sessions (-a all, -s <id> resume).
 spec-web SPEC.md    Interactive web reviewer for a markdown spec.
 install-skill | install-commit-hook | register-module
 
