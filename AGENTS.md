@@ -26,8 +26,12 @@ A bare `review …` with no recognized subcommand defaults to the `review` mode 
 OLD mode flags (`--brainstorm` / `--quorum` / `--just-ask`) were REMOVED — they now print
 a one-line "use the subcommand" pointer and exit non-zero.
 
-Bare subcommands also handled by the CLI (unchanged): `dashboard`, `spec-web`,
-`install-skill`, `install-commit-hook`, `register-module`, `trust-module`.
+Bare subcommands also handled by the CLI (unchanged): `dashboard`, `sessions`, `spec-web`,
+`install-skill`, `install-commit-hook`, `register-module`, `trust-module`. `sessions` is a
+MANAGEMENT command (list / resume brainstorm sessions parsed from the discussion logs), NOT
+a fan-out mode — it is wired in `cli._dispatch` like `dashboard` and its logic lives in the
+lib (`reviewlib/sessions.py`); it deliberately does NOT register a `ModeSpec`, so it never
+collides with the mode registry.
 
 ## Architecture: `lib | cli | mcp`
 

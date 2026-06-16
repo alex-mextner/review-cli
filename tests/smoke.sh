@@ -125,6 +125,24 @@ python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse O
 bin/review dashboard --help | grep -q -- "--no-open"
 bin/review dashboard --help | grep -q -- "--port"
 
+# Resumable sessions: the `sessions` bare subcommand must be wired and advertise its
+# list/resume flags. Listing is exercised against a TEMP log dir ($REVIEW_LOG_DIR) seeded
+# with one completed + one interrupted brainstorm log — never the real logs. -a shows the
+# dead one; default hides it; -s resolves ids (unknown -> exit 2). No backend is invoked
+# (no resume is actually run here — the round-loop/seed path is covered in pytest).
+bin/review sessions --help | grep -q -- "--all"
+bin/review sessions --help | grep -q -- "--resume"
+bin/review sessions --help | grep -q -- "--diff"      # re-attach grounding on resume
+bin/review sessions --help | grep -q -- "--force"
+SESS_DIR="$(mktemp -d)"
+printf '# Brainstorm: smoke-complete\n\npanel=codex moderator=opus rounds>=5 max=8\n# Round 1\n#### codex\nx\n## Moderator (round 1)\nok\nDECISION: STOP\n# Final synthesis\ndone\n' > "$SESS_DIR/20260101T000000_000001Z-brainstorm.md"
+printf '# Brainstorm: smoke-dead\n\npanel=codex moderator=opus rounds>=5 max=8\n# Round 1\n#### codex\n(no output)\n' > "$SESS_DIR/20260101T000100_000001Z-brainstorm.md"
+REVIEW_LOG_DIR="$SESS_DIR" bin/review sessions    | grep -q "smoke-complete"   # default: completed only
+! REVIEW_LOG_DIR="$SESS_DIR" bin/review sessions    | grep -q "smoke-dead"      # default hides interrupted
+REVIEW_LOG_DIR="$SESS_DIR" bin/review sessions -a | grep -q "smoke-dead"        # -a includes interrupted
+REVIEW_LOG_DIR="$SESS_DIR" bin/review sessions -a | grep -q "interrupted"
+! REVIEW_LOG_DIR="$SESS_DIR" bin/review sessions -s NOPE >/dev/null 2>&1        # unknown id -> exit 2
+
 # Dashboard parser / store / JSON endpoints (no backends, no network beyond a local
 # 127.0.0.1 socket the test binds itself; log dir + store are redirected to temp dirs).
 python3 tests/test_dashboard.py
@@ -203,6 +221,14 @@ echo "brainstorm-diff tests OK"
 # (get_mode/known_subcommands/default_mode). All offline (mode handlers stubbed).
 python3 tests/test_mode_subcommands.py
 echo "mode-subcommands tests OK"
+
+# Resumable brainstorm sessions: id derivation, parsing a completed vs interrupted (incl.
+# empty-round) discussion log, list_sessions (default completed-only vs -a all), find_session
+# (exact/prefix/unknown/ambiguous), and the RESUME seed (continue from completed_round+1,
+# reuse saved topic/panel/moderator, append to the SAME log). All offline (run_panel /
+# run_moderator stubbed where defined; log dir redirected to a temp dir — never the real logs).
+python3 tests/test_sessions.py
+echo "sessions tests OK"
 
 # Run-stats store + startup ETA: record shape (mode/pool/duration/ok/fail), the
 # (mode,pool_size) -> pool-only -> no-history ETA fallbacks, real wall-clock on a

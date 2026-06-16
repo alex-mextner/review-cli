@@ -64,9 +64,37 @@ def mode_brainstorm(
     rounds: int,
     max_rounds: int,
     diff: str = "",
+    *,
+    seed_transcript: list[str] | None = None,
+    seed_persona_index: int = 0,
+    start_round: int = 1,
+    resume_log: Path | None = None,
+    synthesize_only: bool = False,
 ) -> int:
+    """Run (or RESUME) a multi-round brainstorm.
+
+    Fresh start (the default): `seed_transcript=None`, `start_round=1` — identical to the
+    original behaviour, first round sees `(this is the first round)`.
+
+    RESUME (`reviewlib.sessions`): the caller hands back a prior session's parsed
+    `seed_transcript` (its `## Round N` blocks), the `seed_persona_index` to continue the
+    persona rotation, `start_round = completed_round + 1`, and `resume_log` = the original
+    discussion-log path to APPEND to (so the resumed run continues the same log rather than
+    opening a new one). The loop continues from `start_round` to `max_rounds` (respecting
+    min/STOP) and produces the final synthesis. Topic / panel / moderator are passed in by
+    the caller from the saved session, so a resume reuses them unchanged.
+
+    `synthesize_only=True` (a forced re-synthesis of an already-COMPLETED session): skip the
+    round loop entirely and produce a fresh synthesis over the seeded transcript — no new
+    rounds, honouring the moderator's prior decision that the brainstorm was done.
+    """
     min_rounds = max(rounds, 5)
     max_rounds = max(max_rounds, min_rounds)
+    # `synthesize_only` (a forced re-synthesis of a finished session): skip the round loop
+    # entirely and go straight to the synthesis over the seeded transcript. Without this an
+    # explicit "no new rounds" intent is impossible — the min_rounds>=5 re-floor above would
+    # otherwise drag a low cap back up to 5 and run rounds the caller did not want.
+    loop_end = (start_round - 1) if synthesize_only else max_rounds
     panel = models  # run-as-is; personas always fill >= 3 slots even if panel < 3
     # OPTIONAL grounding diff: when a working-tree / --staged / piped diff is present,
     # the brainstorm is ABOUT that specific change — the diff is fed to every persona
@@ -82,7 +110,11 @@ def mode_brainstorm(
         "grounding every idea in it rather than reasoning in the abstract."
         if grounded else ""
     )
-    transcript_blocks: list[str] = []
+    resuming = resume_log is not None
+    # On resume, seed the transcript with the prior session's rounds so the personas see
+    # the same shared history a continuous run would have built; the persona rotation and
+    # the completed-round counter continue where the saved session stopped.
+    transcript_blocks: list[str] = list(seed_transcript) if seed_transcript else []
     moderator_label = ">".join(moderators)
     out: list[str] = [f"# Brainstorm: {topic}", f"panel={','.join(panel)} moderator={moderator_label} "
                       f"rounds>={min_rounds} max={max_rounds}{' grounded=diff' if grounded else ''}"]
@@ -91,12 +123,20 @@ def mode_brainstorm(
     # lands (line-buffered, 0600, O_EXCL). The whole brainstorm used to be
     # accumulated in memory and printed only at the very end, so a timeout / kill /
     # crash lost everything; now the discussion-so-far is always on disk + tail-f-able.
-    disc_path = log_dir() / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')}-brainstorm.md"
+    # On RESUME the original log is APPENDED to (O_APPEND, no O_EXCL/O_CREAT-new), so the
+    # continued rounds + the final synthesis land in the SAME session log — a resumed
+    # session is not a fresh file.
+    if resuming:
+        disc_path = resume_log  # type: ignore[assignment]
+    else:
+        disc_path = log_dir() / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')}-brainstorm.md"
     disc = None
     try:
-        disc = os.fdopen(os.open(str(disc_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+        flags = (os.O_WRONLY | os.O_APPEND) if resuming else (os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        disc = os.fdopen(os.open(str(disc_path), flags, 0o600),
                          "w", encoding="utf-8", buffering=1)
-        print(f"[review-cli] brainstorm discussion log: {disc_path} (tail -f to follow)",
+        verb = "resuming discussion log" if resuming else "brainstorm discussion log"
+        print(f"[review-cli] {verb}: {disc_path} (tail -f to follow)",
               file=sys.stderr, flush=True)
     except OSError as exc:
         # A read-only log dir must NOT take down a brainstorm that worked without one.
@@ -109,14 +149,17 @@ def mode_brainstorm(
         disc.write(text if text.endswith("\n") else text + "\n")
         disc.flush()
 
-    _disc(f"# Brainstorm: {topic}\n\npanel={','.join(panel)} moderator={moderator_label} "
-          f"rounds>={min_rounds} max={max_rounds}\n")
+    if resuming:
+        _disc(f"\n# Resumed (continuing from round {start_round})\n")
+    else:
+        _disc(f"# Brainstorm: {topic}\n\npanel={','.join(panel)} moderator={moderator_label} "
+              f"rounds>={min_rounds} max={max_rounds}\n")
 
-    persona_index = 0
-    completed = 0
+    persona_index = seed_persona_index
+    completed = start_round - 1
     synth = None
     try:
-        for round_no in range(1, max_rounds + 1):
+        for round_no in range(start_round, loop_end + 1):
             shared = "\n\n".join(transcript_blocks) if transcript_blocks else "(this is the first round)"
             jobs: list[PanelJob] = []
             # Assign >= 3 distinct personas this round, rotating across the pool.

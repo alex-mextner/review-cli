@@ -119,6 +119,128 @@ def _dashboard_subcommand(rest: list[str]) -> int:
     return run_dashboard(port=ns.port, host=ns.host, open_browser=not ns.no_open, verbose=ns.verbose)
 
 
+def _sessions_subcommand(rest: list[str]) -> int:
+    """`review sessions [-a/--all] [-s/--resume <id>] [--force] [-m … --moderator …]`.
+
+    List or RESUME brainstorm sessions parsed from the on-disk discussion logs. Kept as a
+    bare subcommand (like `dashboard`) — it is a MANAGEMENT command over the logs, not a
+    fan-out review mode, so it does not go through the mode registry. All session logic
+    lives in `reviewlib.sessions` (lib); this handler is thin.
+
+    Default listing (no `-a`) shows recent COMPLETED sessions (a sensible recent subset);
+    `-a/--all` adds the dead/interrupted ones (crashed / killed / timed out — no synthesis)
+    and lifts the cap. `-s <id>` RESUMES: it reloads the saved transcript and continues the
+    brainstorm from `completed_round + 1`, reusing the saved topic / panel / moderator,
+    then synthesizes — it does NOT start from scratch.
+    """
+    from . import sessions as _sessions
+
+    sub = argparse.ArgumentParser(
+        prog="review sessions",
+        description="List or resume brainstorm sessions (parsed from the discussion logs).",
+    )
+    sub.add_argument("-a", "--all", action="store_true",
+                     help="list ALL sessions incl. dead/interrupted (no synthesis); default lists recent completed")
+    sub.add_argument("-s", "--resume", metavar="ID", default=None,
+                     help="resume the session with this id (short id or unambiguous prefix): continue the round loop and synthesize")
+    sub.add_argument("--force", action="store_true",
+                     help="with --resume on an already-completed session, re-synthesize anyway")
+    # Resume reuses the saved panel/moderator by default; -m / --moderator override.
+    sub.add_argument("-m", "--model", action="append", default=[],
+                     help="override the resume panel (repeat or comma-separate); default = the saved session's panel")
+    sub.add_argument("-C", "--cwd", default=".", help="repository directory (resume diff/agentic cwd)")
+    sub.add_argument("--moderator", default=None, help="override the resume moderator; default = the saved session's moderator")
+    # Grounding diff on resume: the original `--diff`/`--staged` grounding is NOT persisted
+    # in the discussion log, so a resumed grounded brainstorm would otherwise continue
+    # UNgrounded. These flags re-attach the current working-tree (--diff) or staged
+    # (--staged) diff as grounding for the resumed rounds + synthesis (opt-in, like the
+    # brainstorm mode's own grounding). Absent -> the resume runs ungrounded.
+    sub.add_argument("--diff", action="store_true", help="re-attach the working-tree diff as grounding for the resumed rounds")
+    sub.add_argument("--staged", action="store_true", help="re-attach the staged diff (git diff --cached) as grounding for the resumed rounds")
+    sub.add_argument("--timeout", type=int, default=None,
+                     help=f"per-call timeout seconds for the resumed rounds (default {PANEL_TIMEOUT_DEFAULT})")
+    ns = sub.parse_args(rest)
+
+    if ns.resume:
+        return _resume_session_cli(ns)
+
+    sessions = _sessions.list_sessions(include_dead=ns.all)
+    if not sessions:
+        scope = "" if ns.all else " completed"
+        print(f"No{scope} brainstorm sessions found in {_sessions.log_dir()}.")
+        if not ns.all:
+            print("(pass -a/--all to include dead/interrupted sessions.)")
+        return 0
+    header = "all sessions (incl. interrupted)" if ns.all else "recent completed sessions"
+    print(f"Brainstorm {header} — newest first; resume with `review sessions -s <id>`:\n")
+    for s in sessions:
+        ts = s.timestamp.strftime("%Y-%m-%d %H:%M UTC") if s.timestamp else "?"
+        topic = (s.topic[:60] + "…") if len(s.topic) > 61 else (s.topic or "(no topic)")
+        print(f"  {s.session_id}  [{s.status:<11}]  r{s.completed_rounds}  {ts}  {topic}")
+    return 0
+
+
+def _resume_session_cli(ns: argparse.Namespace) -> int:
+    """Resolve the saved session by id and continue its brainstorm. Thin over
+    `reviewlib.sessions.resume_session`; resolves the panel/moderator (saved unless
+    overridden) and reports the clean errors (unknown id / ambiguous prefix / already
+    complete) with actionable messages + meaningful exit codes."""
+    from . import backends, sessions as _sessions
+
+    try:
+        sess = _sessions.find_session(ns.resume)
+    except _sessions.AmbiguousSessionError as exc:
+        print(f"[review sessions] {exc}", file=sys.stderr, flush=True)
+        return 2
+    if sess is None:
+        print(f"[review sessions] no session with id '{ns.resume}'. "
+              "Run `review sessions -a` to list available ids.", file=sys.stderr, flush=True)
+        return 2
+
+    cwd = _effective_cwd(ns.cwd)
+    # Panel: explicit -m override > the saved session panel (dropping unreachable
+    # backends so a vanished key never aborts) > whatever the saved panel was.
+    explicit_models = _split_models(ns.model)
+    if explicit_models:
+        models = explicit_models
+    else:
+        models = [m for m in sess.panel if backends.backend_available(m)] or sess.panel or list(DEFAULT_MODELS)
+    # Moderator: explicit --moderator override > the saved session moderator > picked.
+    # The log records the moderator FALLBACK CHAIN joined with `>` (e.g. `claude:..>codex`),
+    # so the saved value must be SPLIT back into candidates — passing the whole `a>b>c`
+    # string as one explicit seed would make `pick_moderators` try an invalid single
+    # backend id before falling back. Take the FIRST (highest-priority) saved candidate as
+    # the explicit seed; pick_moderators rebuilds the rest of the priority order.
+    saved_mod = (sess.moderator.split(">")[0].strip() if sess.moderator else "")
+    mod_seed = ns.moderator or (saved_mod or None)
+    moderators = pick_moderators(mod_seed, models)
+    timeout = ns.timeout if ns.timeout is not None else PANEL_TIMEOUT_DEFAULT
+
+    # Optional grounding diff for the resumed rounds: --diff / --staged re-attach the
+    # current diff (the original grounding is not persisted in the log). Degrades to
+    # ungrounded on a non-repo / git failure, exactly like the brainstorm mode.
+    diff = ""
+    if getattr(ns, "diff", False) or getattr(ns, "staged", False):
+        try:
+            diff = _git_diff(cwd, ns.staged)
+        except RuntimeError:
+            diff = ""
+
+    print(f"[review sessions] resuming '{sess.session_id}' ({sess.status}, "
+          f"{sess.completed_rounds} round(s) done): {sess.topic}", file=sys.stderr, flush=True)
+
+    # Panel modes announce their live-log paths (the resumed rounds stream to the log).
+    backends._ANNOUNCE_LOGS = True
+    try:
+        return _sessions.resume_session(
+            sess, models=models, cwd=cwd, timeout=timeout,
+            moderators=moderators, diff=diff, force=ns.force,
+        )
+    except _sessions.SessionAlreadyCompleteError as exc:
+        print(f"[review sessions] {exc}", file=sys.stderr, flush=True)
+        return 0
+
+
 def _spec_web(argv: list[str]) -> int:
     """`review spec-web <spec.md> [--host H] [--port N] [--seed f.json] [--open]`.
 
@@ -606,6 +728,7 @@ def _subcommand_epilog() -> str:
         f"  {m.subcommand:<11} {m.summary}" for m in iter_modes()
     ) + (
         "\n  dashboard   local web dashboard over review-cli runs"
+        "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
         "\n  spec-web    interactive web reviewer for a markdown spec"
         "\n  install-skill / install-commit-hook / register-module"
     )
@@ -676,6 +799,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # install-skill) so it doesn't bloat the main review argparse surface.
     if argv and argv[0] == "dashboard":
         return _dashboard_subcommand(argv[1:])
+    # `review sessions [-a] [-s <id>]` — list / resume brainstorm sessions parsed from
+    # the discussion logs. A bare MANAGEMENT subcommand (like dashboard), NOT a fan-out
+    # mode, so it is wired here and stays off the main review argparse surface.
+    if argv and argv[0] == "sessions":
+        return _sessions_subcommand(argv[1:])
     # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
     # install-skill) so they don't clutter the main review argparse surface. Project
     # modules load by default (trust-by-default); trust-module only pins under the
