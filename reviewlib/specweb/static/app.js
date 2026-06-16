@@ -35,6 +35,7 @@
     composerHead: document.getElementById('composerHead'),
     composerHint: document.getElementById('composerHint'),
     composerQuote: document.getElementById('composerQuote'),
+    composerDraftNote: document.getElementById('composerDraftNote'),
     composerBody: document.getElementById('composerBody'),
     composerCancel: document.getElementById('composerCancel'),
     composerSubmit: document.getElementById('composerSubmit'),
@@ -45,14 +46,33 @@
   var state = {
     headings: [], // [{level,text,id}]
     comments: [], // server comments
+    drafts: {}, // slot -> {body,kind,quote,section_id,section_title,start,end,updated}
     filter: 'all',
     pendingSelection: null, // {quote, section_id, section_title, start, end}
     pendingKind: 'remark', // 'question' | 'remark' for the OPEN composer
     editingId: null, // comment id being edited inline in the composer (null = new note)
+    activeDraftSlot: null, // the draft slot the OPEN composer autosaves to (null = closed)
     // Internal-link navigation history: each entry is the spec pane's scrollTop at the
     // moment an in-doc link was followed, so "← Back" returns to the exact prior position.
     navHistory: [],
   };
+
+  // The author stamped on a reply left by the AGENT (`review spec-web reply`), mirrored
+  // from store.AGENT_AUTHOR — drives the distinct agent-reply styling/badge in the UI.
+  // SYNC: reviewlib/specweb/store.py AGENT_AUTHOR (a test asserts they match).
+  var AGENT_AUTHOR = 'agent';
+  // Composer autosave debounce: persist the in-progress draft to the server this long
+  // after the last keystroke, so a page reload mid-typing never loses the text.
+  var DRAFT_DEBOUNCE_MS = 500;
+  // Poll the comments API on this interval so an OPEN page picks up an agent reply left via
+  // `review spec-web reply` (and any other out-of-band change) without a manual refresh.
+  var COMMENTS_POLL_MS = 5000;
+  // The fixed slot id of the new-note composer draft, and the edit-slot format.
+  // SYNC: reviewlib/specweb/store.py NEW_DRAFT_SLOT / edit_draft_slot (a test asserts match).
+  var NEW_DRAFT_SLOT = 'new';
+  function editDraftSlot(id) {
+    return 'edit:' + id;
+  }
 
   // A note is a QUESTION (expects an answer from the spec author) or a REMARK (feedback
   // that does not). Single source of truth for each kind's label/icon/hint.
@@ -85,12 +105,13 @@
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
   }
-  function api(method, url, body) {
+  function api(method, url, body, signal) {
     var opts = { method: method, headers: {} };
     if (body !== undefined) {
       opts.headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body);
     }
+    if (signal) opts.signal = signal;
     return fetch(url, opts).then(function (r) {
       if (!r.ok)
         return r.json().then(function (j) {
@@ -132,6 +153,18 @@
       renderComments();
       reanchorAll();
     });
+  }
+  // Drafts are the reviewer's in-progress composer text, persisted server-side (debounced)
+  // so a reload never loses a half-typed note. Fetched on boot; the newest one is restored
+  // into the composer (see restoreDraftOnLoad).
+  function loadDrafts() {
+    return api('GET', '/api/drafts')
+      .then(function (map) {
+        state.drafts = map && typeof map === 'object' ? map : {};
+      })
+      .catch(function () {
+        state.drafts = {};
+      });
   }
 
   // In-doc anchor links (e.g. [§9.4](#94-...)) scroll inside the spec pane + flash. Each
@@ -368,6 +401,10 @@
     els.composerBody.placeholder =
       opts.kind === 'question' ? 'Ask your question…' : 'Write your remark…';
     els.composerSubmit.textContent = opts.submitLabel;
+    // The slot this composer autosaves its draft to: 'new' for a new note, 'edit:<id>' for
+    // an edit. Set BEFORE showing so an immediate keystroke saves to the right slot.
+    state.activeDraftSlot = opts.slot || null;
+    els.composerDraftNote.hidden = !opts.draftRestored;
     els.composerBackdrop.hidden = false;
     syncComposerSubmit();
     els.composerBody.focus();
@@ -388,25 +425,43 @@
       quote: state.pendingSelection.quote,
       body: '',
       submitLabel: 'Add to review',
+      slot: NEW_DRAFT_SLOT,
     });
   }
   function openEditComposer(c) {
     state.pendingSelection = null;
     state.editingId = c.id;
-    state.pendingKind = kindOf(c);
+    // A saved edit-in-progress draft for this comment wins over the stored body (the
+    // reviewer was mid-edit when they reloaded); else start from the comment's text. The
+    // draft's kind wins too, so a mid-edit kind change survives the reload.
+    var draft = state.drafts[editDraftSlot(c.id)];
+    state.pendingKind = draft && draft.kind ? (draft.kind === 'question' ? 'question' : 'remark') : kindOf(c);
     showComposer({
       kind: state.pendingKind,
       headPrefix: 'Edit',
       quote: c.quote || '',
-      body: c.body || '',
+      body: draft && draft.body ? draft.body : c.body || '',
       submitLabel: 'Save',
+      slot: editDraftSlot(c.id),
+      draftRestored: !!(draft && draft.body),
     });
   }
   function closeComposer() {
+    // Cancel/Escape/backdrop close = KEEP the draft: persist the CURRENT box contents
+    // synchronously (superseding any not-yet-fired debounce) so closing never loses the
+    // latest text and never leaves a stale earlier draft to restore. An empty box clears
+    // the slot. The create/edit SUCCESS paths null activeDraftSlot first (the server already
+    // dropped the slot), so this flush is a no-op there — it won't re-create a saved note's
+    // draft.
+    cancelDraftSave();
+    var slot = state.activeDraftSlot;
+    if (slot) persistDraft(slot, els.composerBody.value || '');
     els.composerBackdrop.hidden = true;
+    els.composerDraftNote.hidden = true;
     state.pendingSelection = null;
     state.editingId = null;
     state.pendingKind = 'remark'; // reset all composer state together (no stale kind)
+    state.activeDraftSlot = null;
   }
   function submitComposer() {
     var body = (els.composerBody.value || '').trim();
@@ -417,12 +472,21 @@
     // kind, so omit it — the server preserves the existing kind when none is sent.
     if (state.editingId) {
       var id = state.editingId;
+      cancelPendingDraftSave(); // cancel + abort any in-flight autosave before the edit
+      var editSlot = editDraftSlot(id);
+      state.activeDraftSlot = null; // close's keep-draft flush is a no-op (note is saved)
       api('POST', '/api/comments/' + id + '/edit', { body: body })
         .then(function () {
           closeComposer();
-          return loadComments();
+          // Trailing explicit clear: the LAST write to the slot is a delete, so a stale
+          // autosave that slipped past the abort can't leave the draft behind.
+          return clearDraftOnServer(editSlot).then(loadComments);
         })
         .catch(function (e) {
+          // The save FAILED — the composer stays open. Re-arm autosave on this slot so the
+          // reviewer's text isn't lost on a later close/reload (nulling the slot above would
+          // otherwise disable it).
+          state.activeDraftSlot = editSlot;
           alert('Failed to save: ' + e.message);
         });
       return;
@@ -433,6 +497,8 @@
       closeComposer();
       return;
     }
+    cancelPendingDraftSave(); // cancel + abort any in-flight autosave before the create
+    state.activeDraftSlot = null; // close's keep-draft flush is a no-op (note is saved)
     api('POST', '/api/comments', {
       quote: sel.quote,
       body: body,
@@ -445,11 +511,155 @@
       .then(function () {
         closeComposer();
         window.getSelection().removeAllRanges();
-        return loadComments();
+        // Trailing explicit clear: the LAST write to the 'new' slot is a delete, so a stale
+        // autosave that slipped past the abort can't resurrect the draft over the saved note.
+        return clearDraftOnServer(NEW_DRAFT_SLOT).then(loadComments);
       })
       .catch(function (e) {
+        // The create FAILED — the composer stays open. Re-arm autosave on the 'new' slot so
+        // the reviewer's text isn't lost on a later close/reload.
+        state.activeDraftSlot = NEW_DRAFT_SLOT;
         alert('Failed to add note: ' + e.message);
       });
+  }
+
+  // ---- draft autosave / restore -------------------------------------------
+  // Persist the OPEN composer's in-progress text to the server, debounced, so a reload
+  // never loses a half-typed note. Keyed by the active slot ('new' or 'edit:<id>'); the
+  // selection context rides along for a new note so the composer can be re-opened anchored.
+  var draftSaveTimer = null;
+  var draftSaveAbort = null; // AbortController for an in-flight autosave POST
+  function cancelDraftSave() {
+    if (draftSaveTimer) {
+      clearTimeout(draftSaveTimer);
+      draftSaveTimer = null;
+    }
+    // ALSO abort an autosave already on the wire — cancelling only the timer would let a
+    // request that fired ~just before create/edit land AFTER the server cleared the slot,
+    // resurrecting a stale draft. Aborting closes that window (belt; the trailing explicit
+    // clear after create/edit is the braces).
+    if (draftSaveAbort) {
+      try {
+        draftSaveAbort.abort();
+      } catch (e) {
+        /* AbortController may be unavailable on an ancient browser — ignore */
+      }
+      draftSaveAbort = null;
+    }
+  }
+  function draftPayload(slot, body) {
+    var p = { body: body, kind: state.pendingKind };
+    // A NEW note's draft carries its selection anchor so restore can re-open it in place.
+    if (slot === NEW_DRAFT_SLOT && state.pendingSelection) {
+      var sel = state.pendingSelection;
+      p.quote = sel.quote;
+      p.section_id = sel.section_id;
+      p.section_title = sel.section_title;
+      p.start = sel.start;
+      p.end = sel.end;
+    }
+    return p;
+  }
+  function persistDraft(slot, body) {
+    var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    draftSaveAbort = ctrl;
+    api('POST', '/api/drafts/' + encodeURIComponent(slot), draftPayload(slot, body), ctrl && ctrl.signal)
+      .then(function (r) {
+        if (draftSaveAbort === ctrl) draftSaveAbort = null;
+        // Mirror the server's view locally so a same-session re-open sees the latest text
+        // (and a cleared slot drops it). r.draft is null when the body was emptied.
+        if (r && r.draft) state.drafts[slot] = r.draft;
+        else delete state.drafts[slot];
+      })
+      .catch(function () {
+        if (draftSaveAbort === ctrl) draftSaveAbort = null;
+        // Autosave is best-effort; a failed/aborted save must never interrupt typing. The
+        // next keystroke re-tries. (Submit/edit still send the authoritative body.)
+      });
+  }
+  // Explicitly clear a draft slot on the server (a POST with an empty body deletes it). Used
+  // as the TRAILING write after a comment is created/edited, so even if a stale autosave
+  // slipped through, the LAST write to the slot is this delete — the slot ends up empty and
+  // restoreDraftOnLoad can never reopen a composer over an already-saved note.
+  function clearDraftOnServer(slot) {
+    return api('POST', '/api/drafts/' + encodeURIComponent(slot), { body: '' })
+      .then(function () {
+        delete state.drafts[slot];
+      })
+      .catch(function () {
+        delete state.drafts[slot]; // best-effort; local mirror cleared regardless
+      });
+  }
+  function scheduleDraftSave() {
+    var slot = state.activeDraftSlot;
+    if (!slot) return;
+    cancelDraftSave();
+    var body = els.composerBody.value || '';
+    // Emptying the box CLEARS the draft IMMEDIATELY — not after the debounce. Otherwise a
+    // reviewer who deletes the text and closes/reloads before the timer fires would have the
+    // stale draft restored later (the contract is "an emptied composer has nothing to
+    // recover"). A non-empty body keeps debouncing.
+    if (!body.trim()) {
+      persistDraft(slot, body); // empty body -> server clears the slot
+      return;
+    }
+    draftSaveTimer = setTimeout(function () {
+      draftSaveTimer = null;
+      persistDraft(slot, body);
+    }, DRAFT_DEBOUNCE_MS);
+  }
+  // Flush a pending debounced save IMMEDIATELY (on submit/edit, before we clear the slot)
+  // so an outstanding timer can't re-persist a slot we are about to drop.
+  function cancelPendingDraftSave() {
+    cancelDraftSave();
+  }
+
+  // On boot, re-open the composer with the most-recently-updated saved draft so the
+  // reviewer continues exactly where they left off. A 'new' draft re-opens anchored to its
+  // saved selection; an 'edit:<id>' draft re-opens that comment's edit composer.
+  function restoreDraftOnLoad() {
+    if (!els.composerBackdrop.hidden) return; // composer already open — don't clobber
+    var newest = null;
+    var newestSlot = null;
+    // Branch on the MAP KEY (the authoritative slot id), not the draft's server-stamped
+    // `.slot` field — one source of truth for "which slot is this".
+    Object.keys(state.drafts).forEach(function (slot) {
+      var d = state.drafts[slot];
+      if (!d || !d.body || !d.body.trim()) return;
+      if (!newest || (d.updated || '') > (newest.updated || '')) {
+        newest = d;
+        newestSlot = slot;
+      }
+    });
+    if (!newest) return;
+    if (newestSlot === NEW_DRAFT_SLOT) {
+      state.pendingSelection = {
+        quote: newest.quote || '',
+        section_id: newest.section_id || '',
+        section_title: newest.section_title || '',
+        start: typeof newest.start === 'number' ? newest.start : null,
+        end: typeof newest.end === 'number' ? newest.end : null,
+      };
+      state.editingId = null;
+      state.pendingKind = newest.kind === 'question' ? 'question' : 'remark';
+      showComposer({
+        kind: state.pendingKind,
+        headPrefix: 'New',
+        quote: newest.quote || '',
+        body: newest.body,
+        submitLabel: 'Add to review',
+        slot: NEW_DRAFT_SLOT,
+        draftRestored: true,
+      });
+      return;
+    }
+    // edit:<id> — find the comment and re-open its edit composer (openEditComposer reads the
+    // saved draft body itself).
+    var cid = (newestSlot || '').slice('edit:'.length);
+    var c = state.comments.filter(function (x) {
+      return x.id === cid;
+    })[0];
+    if (c) openEditComposer(c);
   }
 
   // ---- comment rendering --------------------------------------------------
@@ -507,8 +717,16 @@
         '<div class="replies">' +
         c.replies
           .map(function (r) {
+            // An AGENT reply (left via `review spec-web reply`) is the spec author
+            // answering — style it distinctly with an accent border + a labelled badge so
+            // it reads apart from the reviewer's own threaded replies.
+            var isAgent = r.author === AGENT_AUTHOR;
+            var meta = isAgent
+              ? '<div class="reply-meta"><span class="reply-author-badge">Agent</span></div>'
+              : '';
             return (
-              '<div class="reply">' +
+              '<div class="reply' + (isAgent ? ' reply-agent' : '') + '">' +
+              meta +
               '<div class="reply-body">' +
               esc(r.body) +
               '</div></div>'
@@ -984,8 +1202,12 @@
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submitComposer();
       if (e.key === 'Escape') closeComposer();
     });
-    // Keep the submit button's enabled state in sync with the body (disabled while empty).
-    els.composerBody.addEventListener('input', syncComposerSubmit);
+    // Keep the submit button's enabled state in sync with the body (disabled while empty)
+    // and autosave the in-progress draft (debounced) so a reload never loses the text.
+    els.composerBody.addEventListener('input', function () {
+      syncComposerSubmit();
+      scheduleDraftSave();
+    });
     els.filterSelect.addEventListener('change', function () {
       setFilter(els.filterSelect.value);
     });
@@ -1005,7 +1227,38 @@
     wireDivider();
   }
 
+  // True when an inline reply box is OPEN and holds typed-but-unsent text. loadComments()
+  // rebuilds the whole comments list, which would discard a half-typed reply — so polling
+  // must hold off while the reviewer is composing one.
+  function hasUnsentReply() {
+    var boxes = els.commentsList.querySelectorAll('.reply-box.open');
+    for (var i = 0; i < boxes.length; i++) {
+      var ta = boxes[i].querySelector('textarea');
+      if (ta && (ta.value || '').trim()) return true;
+    }
+    return false;
+  }
+  // Poll the comments API so an OPEN page picks up an agent reply (left via
+  // `review spec-web reply`) without a manual reload. Best-effort — a failed poll just
+  // retries on the next tick.
+  function startCommentsPolling() {
+    setInterval(function () {
+      // Skip while: the composer is open (a re-render mid-edit is pointless); the tab is
+      // backgrounded (no point polling a page nobody is looking at); or a half-typed inline
+      // reply is open (a re-render would wipe the reviewer's unsent text).
+      if (!els.composerBackdrop.hidden || document.hidden || hasUnsentReply()) return;
+      loadComments().catch(function () {});
+    }, COMMENTS_POLL_MS);
+  }
+
   // ---- boot ---------------------------------------------------------------
   wire();
-  loadSpec().then(loadComments);
+  loadSpec()
+    .then(function () {
+      return Promise.all([loadComments(), loadDrafts()]);
+    })
+    .then(function () {
+      restoreDraftOnLoad();
+      startCommentsPolling();
+    });
 })();

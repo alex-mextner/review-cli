@@ -22,7 +22,13 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib.specweb import render as srender  # noqa: E402
 from reviewlib.specweb import server as sserver  # noqa: E402
-from reviewlib.specweb.store import SpecStore, spec_key  # noqa: E402
+from reviewlib.specweb.store import (  # noqa: E402
+    AGENT_AUTHOR,
+    NEW_DRAFT_SLOT,
+    SpecStore,
+    edit_draft_slot,
+    spec_key,
+)
 
 FIXTURE = REPO_ROOT / "fixtures" / "specweb" / "sample-spec.md"
 SEED = REPO_ROOT / "fixtures" / "specweb" / "seed-thread.json"
@@ -370,14 +376,24 @@ def test_store_import_carries_kind():
         assert kinds["a r"] == "remark"
 
 
-def test_store_export_labels_kind():
+def test_store_review_payload_structure_and_counts():
+    # The structured review payload is what the launching AGENT receives on submit: every
+    # comment carries its id (so the agent can `reply <id>`), kind, status, body, and its
+    # reply thread; counts split questions vs remarks.
     with _TempStoreEnv():
         store = SpecStore(FIXTURE)
-        store.add_comment(quote="q", body="my question", kind="question", section_title="1. Overview")
-        store.add_comment(quote="q", body="my remark", kind="remark", section_title="1. Overview")
-        md = store.export_markdown()
-        assert "Question [pending]" in md, md
-        assert "Remark [pending]" in md, md
+        q = store.add_comment(quote="the cascade winner", body="which one?", kind="question", section_title="1. Overview")
+        store.add_comment(quote="x", body="a remark", kind="remark")
+        store.add_reply(q["id"], body="the probe-positive one", author="agent")
+        payload = store.review_payload()
+        assert payload["spec_path"] == store.spec_path
+        assert payload["counts"] == {"questions": 1, "remarks": 1, "total": 2}, payload["counts"]
+        by_id = {c["id"]: c for c in payload["comments"]}
+        assert q["id"] in by_id, "every comment carries its id for the agent to answer"
+        rec = by_id[q["id"]]
+        assert rec["kind"] == "question" and rec["body"] == "which one?"
+        assert rec["replies"][0]["author"] == "agent"
+        assert rec["replies"][0]["body"] == "the probe-positive one"
 
 
 def test_store_import_seed_and_unanchored_preserved():
@@ -421,16 +437,53 @@ def test_store_import_non_list_replies_does_not_crash():
         assert store.all_comments()[0]["replies"] == []
 
 
-def test_store_export_markdown():
+def test_store_submit_returns_review_and_records_last_submit():
+    # submit_pending records the batch on the store (last_submit) and returns the structured
+    # review the launching process hands to the agent. An empty submit does not touch it.
     with _TempStoreEnv():
         store = SpecStore(FIXTURE)
-        c = store.add_comment(quote="the cascade winner", body="why this one?", section_title="1. Overview")
-        store.add_reply(c["id"], body="because probe says so", author="claude")
-        md = store.export_markdown()
-        assert "the cascade winner" in md
-        assert "why this one?" in md
-        assert "because probe says so" in md
-        assert md.startswith("# Spec review")
+        assert store.last_submit() is None
+        empty = store.submit_pending()  # nothing pending
+        assert empty["count"] == 0 and empty["batch"] is None
+        assert store.last_submit() is None, "an empty submit must not record a batch"
+        store.add_comment(quote="q", body="why this one?", kind="question")
+        res = store.submit_pending()
+        assert res["count"] == 1 and res["batch"]
+        assert res["review"]["counts"]["total"] == 1
+        assert res["review"]["batch"] == res["batch"]
+        assert store.last_submit() == res["batch"], "submit recorded for the launching process"
+        # persists across a fresh store instance
+        assert SpecStore(FIXTURE).last_submit() == res["batch"]
+        # a SECOND non-empty submit REPLACES last_submit with the newer batch
+        store.add_comment(quote="q2", body="another", kind="remark")
+        res2 = store.submit_pending()
+        assert res2["batch"] != res["batch"]
+        assert store.last_submit() == res2["batch"], "last_submit advances to the newest batch"
+        # an EMPTY submit after that does NOT reset/clear it
+        store.submit_pending()
+        assert store.last_submit() == res2["batch"], "an empty submit must not touch last_submit"
+
+
+def test_store_import_replace_clears_drafts_and_last_submit():
+    # A REPLACE seed discards the previous review entirely — including its in-progress
+    # drafts (so a stale composer can't reopen over the fresh seed) and its last_submit
+    # marker. A non-replace append leaves them intact.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.add_comment(quote="q", body="old")
+        store.save_draft(NEW_DRAFT_SLOT, body="half-typed old draft")
+        store.submit_pending()
+        assert store.last_submit() is not None
+        assert store.get_draft(NEW_DRAFT_SLOT) is not None
+        # replace wipes drafts + last_submit
+        store.import_thread({"comments": [{"body": "fresh seed"}]}, replace=True)
+        assert store.get_draft(NEW_DRAFT_SLOT) is None, "replace must clear in-progress drafts"
+        assert store.last_submit() is None, "replace must clear last_submit"
+        assert [c["body"] for c in store.all_comments()] == ["fresh seed"]
+        # a non-replace append leaves a fresh draft intact
+        store.save_draft(NEW_DRAFT_SLOT, body="new draft")
+        store.import_thread({"comments": [{"body": "another"}]}, replace=False)
+        assert store.get_draft(NEW_DRAFT_SLOT) is not None, "append must not touch drafts"
 
 
 def test_store_import_rejects_bad_payload():
@@ -676,15 +729,19 @@ def test_server_comment_crud_and_submit():
             # pending tray: one pending
             st, body, _ = s.get("/api/comments")
             assert len([c for c in json.loads(body) if c["status"] == "pending"]) == 1
-            # submit flips it
+            # submit flips it AND returns the structured review for the agent (with ids)
             st, body, _ = s.post("/api/submit", {})
-            assert st == 200 and json.loads(body)["count"] == 1
+            assert st == 200
+            sub = json.loads(body)
+            assert sub["count"] == 1
+            assert sub["review"]["counts"]["total"] == 1
+            assert sub["review"]["comments"][0]["id"] == cid
+            assert sub["review"]["comments"][0]["body"] == "which candidate wins?"
             st, body, _ = s.get("/api/comments")
             assert json.loads(body)[0]["status"] == "submitted"
-            # export endpoint returns markdown
-            st, body, hdrs = s.get("/api/export")
-            assert st == 200 and "text/markdown" in hdrs.get("Content-Type", "")
-            assert b"which candidate wins?" in body
+            # the removed markdown-export endpoint must be gone (404), not silently served
+            st, _, _ = s.get("/api/export")
+            assert st == 404, st
         finally:
             s.stop()
 
@@ -881,6 +938,515 @@ def test_server_import_seed_route():
             assert len(json.loads(body)) == 2
         finally:
             s.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Feature 2: drafts (in-progress composer text, debounced + reload-safe)
+# --------------------------------------------------------------------------- #
+def test_store_draft_save_restore_and_clear():
+    # A new-note draft persists with its selection context and restores across a fresh store
+    # instance (the reload case); an empty body clears the slot.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        d = store.save_draft(
+            NEW_DRAFT_SLOT, body="half-typed que", kind="question",
+            quote="the cascade winner", section_id="1-overview", section_title="1. Overview",
+            start=3, end=9,
+        )
+        assert d["slot"] == NEW_DRAFT_SLOT and d["body"] == "half-typed que"
+        assert d["kind"] == "question" and d["quote"] == "the cascade winner"
+        # restores across a fresh instance (page reload)
+        again = SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)
+        assert again is not None and again["body"] == "half-typed que"
+        assert again["section_id"] == "1-overview" and again["start"] == 3
+        # all_drafts maps slot -> draft
+        assert NEW_DRAFT_SLOT in SpecStore(FIXTURE).all_drafts()
+        # an empty body clears the slot (returns {})
+        assert store.save_draft(NEW_DRAFT_SLOT, body="   ") == {}
+        assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT) is None
+
+
+def test_store_edit_draft_slot_and_delete():
+    # An edit-in-progress draft is keyed per comment; deleting the comment drops its draft.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        c = store.add_comment(quote="q", body="original")
+        slot = edit_draft_slot(c["id"])
+        store.save_draft(slot, body="edit in progress")
+        assert store.get_draft(slot)["body"] == "edit in progress"
+        # delete_draft is idempotent
+        assert store.delete_draft(slot) is True
+        assert store.delete_draft(slot) is False
+        # re-save then delete the comment -> its edit draft is swept too
+        store.save_draft(slot, body="again mid-edit")
+        store.delete_comment(c["id"])
+        assert store.get_draft(slot) is None, "deleting a comment must drop its edit draft"
+
+
+def test_store_draft_requires_slot_and_drafts_persist_alongside_comments():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        try:
+            store.save_draft("   ", body="x")
+            raise AssertionError("empty slot should raise")
+        except ValueError:
+            pass
+        # a draft and a comment coexist in the same file without clobbering each other
+        store.add_comment(quote="q", body="a real note")
+        store.save_draft(NEW_DRAFT_SLOT, body="a draft")
+        fresh = SpecStore(FIXTURE)
+        assert len(fresh.all_comments()) == 1
+        assert fresh.get_draft(NEW_DRAFT_SLOT)["body"] == "a draft"
+
+
+def test_server_draft_save_restore_and_clear_on_create():
+    # The server autosaves a draft (POST /api/drafts/<slot>), exposes it (GET /api/drafts),
+    # and CLEARS the 'new' slot when the note is actually created.
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, _ = s.post("/api/drafts/new", {
+                "body": "mid-typing", "kind": "question",
+                "quote": "the cascade winner", "section_id": "1-overview",
+            })
+            assert st == 200, (st, body)
+            assert json.loads(body)["draft"]["body"] == "mid-typing"
+            # GET /api/drafts returns the slot map
+            st, body, _ = s.get("/api/drafts")
+            assert st == 200 and "new" in json.loads(body)
+            # creating the note clears the 'new' draft slot
+            st, body, _ = s.post("/api/comments", {"body": "the real note", "kind": "question"})
+            assert st == 201, (st, body)
+            st, body, _ = s.get("/api/drafts")
+            assert "new" not in json.loads(body), "create must clear the new-note draft"
+        finally:
+            s.stop()
+
+
+def test_server_trailing_clear_wins_over_stale_draft_after_create():
+    # The create/edit success path issues a TRAILING draft-clear so the LAST write to the
+    # slot is a delete — defeating a stale autosave that landed after the comment was saved.
+    # Simulate the race ORDER at the HTTP layer: create -> (stale autosave slips in) ->
+    # trailing clear. The slot must end empty so restore can't reopen a saved note.
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            # create the note (server clears the 'new' slot)
+            st, _, _ = s.post("/api/comments", {"body": "the real note"})
+            assert st == 201, st
+            # a STALE autosave that fired just before submit lands AFTER the create
+            s.post("/api/drafts/new", {"body": "stale half-typed text"})
+            assert "new" in json.loads(s.get("/api/drafts")[1]), "stale draft is present (the race)"
+            # the trailing explicit clear (empty body) removes it -> last write wins
+            st, body, _ = s.post("/api/drafts/new", {"body": ""})
+            assert st == 200 and json.loads(body)["draft"] is None
+            assert "new" not in json.loads(s.get("/api/drafts")[1]), "trailing clear must win the race"
+        finally:
+            s.stop()
+
+
+def test_server_draft_empty_body_clears_slot():
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            s.post("/api/drafts/new", {"body": "something"})
+            st, body, _ = s.post("/api/drafts/new", {"body": "   "})
+            assert st == 200 and json.loads(body)["draft"] is None, body
+            st, body, _ = s.get("/api/drafts")
+            assert json.loads(body) == {}
+        finally:
+            s.stop()
+
+
+def test_server_edit_draft_cleared_on_edit():
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, _ = s.post("/api/comments", {"body": "original"})
+            cid = json.loads(body)["comment"]["id"]
+            slot = "edit:" + cid
+            s.post("/api/drafts/" + slot, {"body": "mid-edit"})
+            st, body, _ = s.get("/api/drafts")
+            assert slot in json.loads(body)
+            # the edit clears that comment's edit draft
+            st, _, _ = s.post("/api/comments/%s/edit" % cid, {"body": "saved edit"})
+            assert st == 200, st
+            st, body, _ = s.get("/api/drafts")
+            assert slot not in json.loads(body), "edit must clear the edit-in-progress draft"
+        finally:
+            s.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Feature 3: agent reply (store threading + the `reply` CLI command)
+# --------------------------------------------------------------------------- #
+def test_store_agent_reply_threads_and_is_distinct_author():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        q = store.add_comment(quote="q", body="a question", kind="question")
+        store.submit_pending()
+        rec = store.add_reply(q["id"], body="here is the answer", author=AGENT_AUTHOR)
+        assert rec is not None
+        # the reply threads under the comment and carries the agent author (UI styles it)
+        again = store.get_comment(q["id"])
+        assert again["replies"][-1]["author"] == AGENT_AUTHOR
+        assert again["replies"][-1]["body"] == "here is the answer"
+        # a reply to a submitted comment flips it to answered
+        assert again["status"] == "answered"
+
+
+def test_cli_spec_web_reply_threads_and_calls_tg():
+    # `review spec-web reply <id> <answer> --spec <spec>` threads the agent's reply into the
+    # store and shells out to `tg` — the tg call is STUBBED so no Telegram is sent.
+    import reviewlib.cli as cli
+
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        c = store.add_comment(quote="q", body="why?", kind="question")
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return _R()
+
+        # Stub the tg shell-out at its module boundary: shutil.which('tg') -> a fake path;
+        # subprocess.run captured (cli imports both lazily inside the reply path).
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        old_which = _shutil.which
+        old_run = _subprocess.run
+        _shutil.which = lambda name: "/fake/tg" if name == "tg" else old_which(name)
+        _subprocess.run = fake_run
+        try:
+            rc = cli._spec_web(["reply", c["id"], "because the probe is positive", "--spec", str(FIXTURE)])
+        finally:
+            _shutil.which = old_which
+            _subprocess.run = old_run
+        assert rc == 0, rc
+        # the reply is threaded with the agent author
+        again = SpecStore(FIXTURE).get_comment(c["id"])
+        assert again["replies"][-1]["author"] == AGENT_AUTHOR
+        assert again["replies"][-1]["body"] == "because the probe is positive"
+        # tg was invoked once, with the answer text in the message argument
+        assert len(calls) == 1, calls
+        args = calls[0][0]
+        assert args[0] == "/fake/tg"
+        assert any("because the probe is positive" in a for a in args), args
+
+
+def test_cli_spec_web_reply_spec_path_not_stolen_by_output_prescan():
+    # `--spec` is value-taking, so the global `-o`/`--output` pre-scan must NOT consume a
+    # spec path that looks like an option (e.g. `--spec --output` or `--spec -odd.md`).
+    from reviewlib.cli import _extract_output_path
+
+    for victim in ("--output", "-odd-name.md", "-o"):
+        out, rest = _extract_output_path(["spec-web", "reply", "id", "ans", "--spec", victim])
+        assert out is None, f"the --spec value {victim!r} must not be taken as -o (got {out!r})"
+        assert rest[-1] == victim, rest
+
+
+def test_cli_spec_web_reply_unknown_id_returns_error():
+    import reviewlib.cli as cli
+
+    with _TempStoreEnv():
+        SpecStore(FIXTURE)  # ensure the store file area exists
+        rc = cli._spec_web(["reply", "no-such-id", "an answer", "--spec", str(FIXTURE), "--no-tg"])
+        assert rc == 1, rc
+
+
+def test_cli_spec_web_reply_tg_failure_is_best_effort():
+    # tg being absent/failing must NOT fail the reply (it is already saved to the store/UI).
+    import reviewlib.cli as cli
+
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        c = store.add_comment(quote="q", body="why?")
+        import shutil as _shutil
+
+        old_which = _shutil.which
+        _shutil.which = lambda name: None if name == "tg" else old_which(name)  # tg not on PATH
+        try:
+            rc = cli._spec_web(["reply", c["id"], "answer text", "--spec", str(FIXTURE)])
+        finally:
+            _shutil.which = old_which
+        assert rc == 0, "missing tg must not fail the reply"
+        assert SpecStore(FIXTURE).get_comment(c["id"])["replies"][-1]["body"] == "answer text"
+
+
+def test_cli_spec_web_reply_tg_found_but_fails_is_best_effort():
+    # tg FOUND but failing (non-zero exit) or raising must ALSO not fail the reply — the
+    # reply is already in the store/UI; tg is best-effort only.
+    import reviewlib.cli as cli
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    for failure in ("nonzero", "raise"):
+        with _TempStoreEnv():
+            store = SpecStore(FIXTURE)
+            c = store.add_comment(quote="q", body="why?")
+
+            def fake_run(args, **kwargs):
+                if failure == "raise":
+                    raise OSError("tg blew up")
+
+                class _R:
+                    returncode = 1
+                    stdout = ""
+                    stderr = "tg: send failed"
+
+                return _R()
+
+            old_which = _shutil.which
+            old_run = _subprocess.run
+            _shutil.which = lambda name: "/fake/tg" if name == "tg" else old_which(name)
+            _subprocess.run = fake_run
+            try:
+                rc = cli._spec_web(["reply", c["id"], "answer text", "--spec", str(FIXTURE)])
+            finally:
+                _shutil.which = old_which
+                _subprocess.run = old_run
+            assert rc == 0, f"a failing tg ({failure}) must not fail the reply"
+            assert SpecStore(FIXTURE).get_comment(c["id"])["replies"][-1]["body"] == "answer text"
+
+
+def test_server_submit_enqueues_review_snapshot_for_launcher():
+    # A non-empty Submit enqueues ITS OWN review snapshot on the server's submit_queue so the
+    # launching process hands exactly that batch's payload to the agent; an empty submit does
+    # NOT enqueue. Two submits enqueue two snapshots (each re-emits — no coalescing, and the
+    # snapshot is per-batch so it can't carry a later batch's state).
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            assert s.httpd.submit_queue.empty()
+            st, _, _ = s.post("/api/submit", {})  # nothing pending
+            assert st == 200 and s.httpd.submit_queue.empty(), "empty submit must not enqueue"
+            s.post("/api/comments", {"body": "first note"})
+            st, body, _ = s.post("/api/submit", {})
+            assert st == 200 and json.loads(body)["count"] == 1
+            snap1 = s.httpd.submit_queue.get_nowait()
+            assert snap1["batch"] == json.loads(body)["batch"]
+            assert snap1["counts"]["total"] == 1, "first snapshot is THIS batch's state (1 comment)"
+            # a SECOND non-empty submit enqueues a fresh snapshot (no coalescing)
+            s.post("/api/comments", {"body": "second note"})
+            st, body, _ = s.post("/api/submit", {})
+            assert st == 200 and json.loads(body)["count"] == 1
+            snap2 = s.httpd.submit_queue.get_nowait()
+            assert snap2["batch"] == json.loads(body)["batch"]
+            assert snap2["batch"] != snap1["batch"], "each submit carries its own batch"
+            assert snap2["counts"]["total"] == 2
+        finally:
+            s.stop()
+
+
+def test_store_guarded_writes_create_lockfile_and_lose_nothing():
+    # The guarded load-modify-write creates the sibling .lock file (the cross-process flock
+    # target) and serialises concurrent writers so no update is lost. Exercised here from
+    # many THREADS (the flock path runs on every guarded write); the .lock file is the same
+    # one a separate `review spec-web reply` PROCESS contends on.
+    import concurrent.futures
+
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        # the lock file is created on first guarded write
+        store.add_comment(quote="q", body="seed")
+        assert store.lock_path.exists(), "a guarded write must create the .lock file"
+
+        def _add(i):
+            SpecStore(FIXTURE).add_comment(quote="q", body=f"c{i}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_add, range(40)))
+        # every concurrent write landed (no lost update from a load-modify-write race)
+        assert len(SpecStore(FIXTURE).all_comments()) == 41, "all concurrent writes must persist"
+
+
+def test_store_guard_serialises_across_processes():
+    # The flock is genuinely cross-PROCESS: spawn real subprocesses that each append a comment
+    # to the SAME store file concurrently and assert none is lost (an unguarded
+    # load-modify-write would drop some under contention).
+    import subprocess
+    import sys as _sys
+
+    with _TempStoreEnv() as tmp:
+        SpecStore(FIXTURE)  # create the store area
+        prog = (
+            "import sys;"
+            "sys.path.insert(0, %r);" % str(REPO_ROOT)
+            + "from reviewlib.specweb.store import SpecStore;"
+            "SpecStore(%r).add_comment(quote='q', body='p'+sys.argv[1])" % str(FIXTURE)
+        )
+        env = dict(os.environ, REVIEW_SPECWEB_DIR=str(tmp))
+        procs = [subprocess.Popen([_sys.executable, "-c", prog, str(i)], env=env) for i in range(12)]
+        for p in procs:
+            assert p.wait(timeout=30) == 0
+        assert len(SpecStore(FIXTURE).all_comments()) == 12, "every cross-process write must persist"
+
+
+def _run_specweb_until_submit(spec, posts):
+    """Drive run_specweb(exit_on_submit=True) in a thread: capture its stdout, wait for the
+    bound port from the banner, fire ``posts`` (a list of (path, obj)), then join (the server
+    stops itself after the submit). Returns (stdout_text, return_code). No leaked server —
+    exit_on_submit makes the blocking call return, so the thread joins cleanly."""
+    import contextlib
+    import http.client
+    import io
+    import re
+    import time
+
+    buf = io.StringIO()
+    holder = {}
+
+    def _serve():
+        with contextlib.redirect_stdout(buf):
+            holder["rc"] = sserver.run_specweb(spec, host="127.0.0.1", port=0, exit_on_submit=True)
+
+    th = threading.Thread(target=_serve, daemon=True)
+    th.start()
+    port = None
+    for _ in range(250):
+        m = re.search(r"serving http://127\.0\.0\.1:(\d+)/", buf.getvalue())
+        if m:
+            port = int(m.group(1))
+            break
+        time.sleep(0.02)
+    assert port, ("server did not start", buf.getvalue())
+    for path, obj in posts:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("POST", path, body=json.dumps(obj).encode("utf-8"),
+                  headers={"Content-Type": "application/json", "Origin": "http://127.0.0.1:%d" % port})
+        c.getresponse().read(); c.close()
+    th.join(timeout=10)
+    assert not th.is_alive(), ("run_specweb did not return after submit", buf.getvalue())
+    return buf.getvalue(), holder.get("rc")
+
+
+def test_run_specweb_emits_structured_review_on_submit():
+    # The headline handoff: run_specweb prints the structured review between the stable
+    # markers on Submit, so the launching agent parses it from the SINGLE line between them.
+    with _TempStoreEnv():
+        out, rc = _run_specweb_until_submit(FIXTURE, [
+            ("/api/comments", {"body": "why this design?", "kind": "question"}),
+            ("/api/submit", {}),
+        ])
+        assert rc == 0
+        assert sserver.SUBMIT_MARKER_BEGIN in out and sserver.SUBMIT_MARKER_END in out, out
+        seg = out.split(sserver.SUBMIT_MARKER_BEGIN, 1)[1].split(sserver.SUBMIT_MARKER_END, 1)[0].strip()
+        # the payload is exactly one line (compact JSON) between the markers
+        assert "\n" not in seg, ("payload must be a single JSON line", seg)
+        payload = json.loads(seg)
+        assert payload["counts"]["questions"] == 1
+        assert payload["comments"][0]["body"] == "why this design?"
+        assert "id" in payload["comments"][0]
+
+
+def test_run_specweb_marker_safe_against_marker_text_in_body():
+    # A reviewer body that literally contains the end-marker substring must NOT break the
+    # single-line framing — it is JSON-escaped on the one payload line, so the line AFTER the
+    # begin marker is still valid JSON and the parser recovers the body intact.
+    with _TempStoreEnv():
+        evil = "see " + sserver.SUBMIT_MARKER_END + " here"
+        out, rc = _run_specweb_until_submit(FIXTURE, [
+            ("/api/comments", {"body": evil}),
+            ("/api/submit", {}),
+        ])
+        assert rc == 0
+        seg = out.split(sserver.SUBMIT_MARKER_BEGIN, 1)[1].split("\n", 1)[1].split("\n", 1)[0]
+        payload = json.loads(seg)
+        assert payload["comments"][0]["body"] == evil
+
+
+def test_run_specweb_exit_on_submit_returns():
+    # --exit-on-submit: run_specweb returns (the blocking call ends) after the first submit.
+    with _TempStoreEnv():
+        out, rc = _run_specweb_until_submit(FIXTURE, [
+            ("/api/comments", {"body": "q"}),
+            ("/api/submit", {}),
+        ])
+        assert rc == 0, out
+        assert "--exit-on-submit" in out, out
+
+
+def test_review_payload_empty_state():
+    # The structured contract must be well-formed with zero comments (an empty review).
+    with _TempStoreEnv():
+        payload = SpecStore(FIXTURE).review_payload()
+        assert payload["counts"] == {"questions": 0, "remarks": 0, "total": 0}
+        assert payload["comments"] == []
+        assert payload["batch"] is None
+
+
+def test_server_delete_comment_clears_edit_draft():
+    # Server-level: deleting a comment sweeps its edit-in-progress draft (store-level is
+    # tested separately; this pins the HTTP path).
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, _ = s.post("/api/comments", {"body": "original"})
+            cid = json.loads(body)["comment"]["id"]
+            slot = "edit:" + cid
+            s.post("/api/drafts/" + slot, {"body": "mid-edit"})
+            assert slot in json.loads(s.get("/api/drafts")[1])
+            st, _, _ = s.post("/api/comments/%s/delete" % cid, {})
+            assert st == 200, st
+            assert slot not in json.loads(s.get("/api/drafts")[1]), "delete must sweep the edit draft"
+        finally:
+            s.stop()
+
+
+def test_server_draft_rejects_non_int_start_end():
+    # A JSON `true` for start/end must NOT be stored as the int 1 (isinstance(True,int) trap).
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, _ = s.post("/api/drafts/new", {"body": "x", "start": True, "end": True})
+            assert st == 200, (st, body)
+            d = json.loads(body)["draft"]
+            assert d["start"] is None and d["end"] is None, d
+        finally:
+            s.stop()
+
+
+def test_cli_spec_web_reply_no_tg_skips_subprocess():
+    # --no-tg must not shell out at all (no tg call), while still threading the reply.
+    import reviewlib.cli as cli
+
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        c = store.add_comment(quote="q", body="why?")
+        import subprocess as _subprocess
+
+        old_run = _subprocess.run
+
+        def _boom(*a, **k):
+            raise AssertionError("subprocess.run must not be called under --no-tg")
+
+        _subprocess.run = _boom
+        try:
+            rc = cli._spec_web(["reply", c["id"], "an answer", "--spec", str(FIXTURE), "--no-tg"])
+        finally:
+            _subprocess.run = old_run
+        assert rc == 0
+        assert SpecStore(FIXTURE).get_comment(c["id"])["replies"][-1]["body"] == "an answer"
+
+
+def test_js_python_draft_constants_in_sync():
+    # The draft-slot ids + agent author are defined independently in store.py and app.js;
+    # if one drifts, drafts silently break or agent-reply styling is lost. Pin them.
+    from reviewlib.specweb.store import AGENT_AUTHOR as PY_AGENT
+    from reviewlib.specweb.store import NEW_DRAFT_SLOT as PY_NEW
+
+    js = (REPO_ROOT / "reviewlib" / "specweb" / "static" / "app.js").read_text(encoding="utf-8")
+    assert ("var AGENT_AUTHOR = '%s'" % PY_AGENT) in js, "app.js AGENT_AUTHOR out of sync with store.py"
+    assert ("var NEW_DRAFT_SLOT = '%s'" % PY_NEW) in js, "app.js NEW_DRAFT_SLOT out of sync with store.py"
+    assert "return 'edit:' + id;" in js, "app.js edit-slot format out of sync with store.edit_draft_slot"
+    assert "edit:" in edit_draft_slot("x"), "store edit_draft_slot must use the 'edit:' prefix"
 
 
 if __name__ == "__main__":

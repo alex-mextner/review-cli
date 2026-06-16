@@ -5,6 +5,28 @@ semantic versioning.
 
 ## Unreleased
 
+- **`review spec-web` is now a bidirectional review channel (phase 2).** Three changes:
+  - **Submit delivers the review to the launching agent** (no markdown export). The
+    primitive "Export review as markdown" button + the `/api/export` endpoint + the
+    `--export` flag are **removed**. Instead, clicking **Submit review** marks the batch
+    submitted in the store and the blocking `review spec-web` process prints the
+    **structured review** (a JSON object with every comment's `id`, `kind`, `status`,
+    `quote`, `section_title`, `body`, reply thread, and `counts`) to stdout between the
+    markers `<<<REVIEW-SPEC-WEB-SUBMITTED` … `REVIEW-SPEC-WEB-SUBMITTED>>>`, so the agent
+    that launched it can parse and act on it. `--exit-on-submit` returns after the first
+    submit; by default the server keeps serving so the reviewer can continue and the agent
+    can `reply`. The on-disk store stays the single source of truth.
+  - **In-progress drafts autosave to disk, reload-safe.** The composer autosaves the
+    half-typed note text to the server (debounced ~500ms) under a per-slot key (a new note
+    and each edit-in-progress have their own slot), persisted in the same per-spec JSON
+    file. On page load the most recent draft is restored into the composer, so a reload
+    mid-typing continues where you left off. Saving the note (or emptying the box) clears
+    its draft. New routes: `GET /api/drafts`, `POST /api/drafts/<slot>`.
+  - **`review spec-web reply <comment-id> <answer> --spec <spec>`** lets the agent answer a
+    reviewer's question/remark. The reply threads into the store stamped with the `agent`
+    author (the UI styles it distinctly and an open page picks it up by polling the comments
+    API), and is **also** delivered to Telegram via the `tg` CLI on `PATH` — best-effort: a
+    missing/failing `tg` logs and continues, never failing the reply (`--no-tg` skips it).
 - **`-o FILE` / `--output FILE`** — write the review result to a file via Python
   (`open(...,"w")`), which **bypasses the shell redirect** and therefore zsh
   `noclobber`. Agents that ran `review … > out.md` hit a silent failure under
