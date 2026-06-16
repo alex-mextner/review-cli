@@ -12,14 +12,19 @@ GET  /asset/<name>             -> a figure referenced by the spec (served from d
 GET  /api/health               -> {ok, spec_path, store_path, allowed_origins, ...}
 GET  /api/spec                 -> {html, headings, title}
 GET  /api/comments             -> [comment, ...]
-GET  /api/export               -> the review dumped as markdown (text/markdown)
+GET  /api/drafts               -> {slot: draft, ...} (restore in-progress composer text)
 POST /api/comments             -> create a comment (enters the pending batch)
 POST /api/comments/<id>/reply  -> thread an inline answer
 POST /api/comments/<id>/edit   -> edit a comment's body (and optionally its kind)
 POST /api/comments/<id>/status -> {status: pending|submitted|answered|resolved}
 POST /api/comments/<id>/delete -> remove a comment
-POST /api/submit               -> flip the pending batch to submitted
+POST /api/drafts/<slot>        -> autosave an in-progress composer draft (debounced client)
+POST /api/submit               -> flip the pending batch to submitted; deliver to the agent
 POST /api/import               -> seed/import an initial review thread (JSON payload)
+
+On SUBMIT the server signals the launching ``review spec-web`` process (a threading.Event
+on the server) so the structured review is handed back to the agent that started it (see
+``run_specweb``); the store stays the single source of truth on disk.
 
 Security
 --------
@@ -34,13 +39,14 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import render as srender
-from .store import DEFAULT_KIND, SpecStore, store_dir
+from .store import DEFAULT_KIND, NEW_DRAFT_SLOT, SpecStore, _as_int, edit_draft_slot, store_dir
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _ALLOWED_STATIC = {"app.js", "app.css"}
@@ -110,6 +116,20 @@ class SpecWebHandler(BaseHTTPRequestHandler):
     @property
     def _store(self) -> SpecStore:
         return self.server.store  # type: ignore[attr-defined]
+
+    def _notify_submit(self, review: dict) -> None:
+        """Wake the launching process: a non-empty Submit happened. Enqueues THE REVIEW
+        SNAPSHOT taken at submit time (``submit_pending()['review']``) on the server's submit
+        QUEUE so ``run_specweb`` (draining it) hands exactly that batch's payload to the
+        agent. A QUEUE carrying the snapshot — not a bare Event, and not a re-read of the
+        store — so two rapid submits each deliver THEIR OWN marker-framed payload (the
+        documented "each later submit re-emits" contract): an Event would coalesce them, and
+        re-reading the store on drain could emit a later batch's state for an earlier submit.
+        Best-effort — a missing queue (a test driving make_server with no watcher) is a no-op,
+        never a 500."""
+        q = getattr(self.server, "submit_queue", None)
+        if q is not None:
+            q.put(review)
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
         if getattr(self.server, "verbose", False):
@@ -250,9 +270,8 @@ class SpecWebHandler(BaseHTTPRequestHandler):
                 return self._serve_spec_json()
             if path == "/api/comments":
                 return self._send_json(self._store.all_comments())
-            if path == "/api/export":
-                md = self._store.export_markdown().encode("utf-8")
-                return self._send_bytes(md, "text/markdown; charset=utf-8")
+            if path == "/api/drafts":
+                return self._send_json(self._store.all_drafts())
             return self._error(404, f"not found: {path}")
         except BrokenPipeError:
             pass
@@ -278,13 +297,23 @@ class SpecWebHandler(BaseHTTPRequestHandler):
             if path == "/api/comments":
                 return self._create_comment(body)
             if path == "/api/submit":
-                return self._send_json({"ok": True, **self._store.submit_pending()})
+                result = self._store.submit_pending()
+                # Signal the launching process so it can hand the structured review to the
+                # agent. Only a non-empty submit (count>0) is a real handoff; an empty
+                # submit (no pending notes) must not wake the agent with nothing. Enqueue the
+                # review SNAPSHOT from this submit so the watcher emits exactly this batch.
+                if result.get("count"):
+                    self._notify_submit(result.get("review") or {})
+                return self._send_json({"ok": True, **result})
             if path == "/api/import":
                 try:
                     result = self._store.import_thread(body, replace=bool(body.get("replace")))
                 except ValueError as exc:
                     return self._error(400, str(exc))
                 return self._send_json({"ok": True, **result})
+            if path.startswith("/api/drafts/"):
+                slot = unquote(path[len("/api/drafts/"):])
+                return self._save_draft(slot, body)
             if path.startswith("/api/comments/"):
                 rest = path[len("/api/comments/"):]
                 if "/" not in rest:
@@ -308,15 +337,45 @@ class SpecWebHandler(BaseHTTPRequestHandler):
             body=text,
             section_id=body.get("section_id", "") if isinstance(body.get("section_id"), str) else "",
             section_title=body.get("section_title", "") if isinstance(body.get("section_title"), str) else "",
-            start=body.get("start") if isinstance(body.get("start"), int) else None,
-            end=body.get("end") if isinstance(body.get("end"), int) else None,
+            start=_as_int(body.get("start")),
+            end=_as_int(body.get("end")),
             kind=body.get("kind") if isinstance(body.get("kind"), str) else DEFAULT_KIND,
             # Single implicit reviewer: the UI client doesn't expose an author field, so a
             # normal create omits it and defaults to "reviewer". An explicit author (e.g. an
             # import/seed payload) is still honoured so those round-trip.
             author=body.get("author", "reviewer") if isinstance(body.get("author"), str) else "reviewer",
         )
+        # The note is now persisted as a comment — clear the new-note composer draft so a
+        # stale draft never restores over a note the reviewer already saved.
+        self._store.delete_draft(NEW_DRAFT_SLOT)
         self._send_json({"ok": True, "comment": rec}, status=201)
+
+    def _save_draft(self, slot: str, body: dict) -> None:
+        """Autosave an in-progress composer draft (the debounced client write). An EMPTY
+        body clears the slot (returns {ok, draft: null}); a non-empty one stores it. The
+        slot id comes from the URL (``new`` or ``edit:<id>``) and is required."""
+        slot = (slot or "").strip()
+        if not slot:
+            return self._error(404, "expected /api/drafts/<slot>")
+        text = body.get("body", "")
+        if not isinstance(text, str):
+            return self._error(400, "draft 'body' must be a string")
+        try:
+            draft = self._store.save_draft(
+                slot,
+                body=text,
+                kind=body.get("kind") if isinstance(body.get("kind"), str) else DEFAULT_KIND,
+                quote=body.get("quote", "") if isinstance(body.get("quote"), str) else "",
+                section_id=body.get("section_id", "") if isinstance(body.get("section_id"), str) else "",
+                section_title=body.get("section_title", "") if isinstance(body.get("section_title"), str) else "",
+                start=_as_int(body.get("start")),
+                end=_as_int(body.get("end")),
+            )
+        except ValueError as exc:
+            return self._error(400, str(exc))
+        # An empty body cleared the slot -> draft is {} -> report null so the client knows
+        # there is nothing to restore for this slot.
+        return self._send_json({"ok": True, "draft": draft or None})
 
     def _comment_action(self, cid: str, action: str, body: dict) -> None:
         if action == "reply":
@@ -342,6 +401,8 @@ class SpecWebHandler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc))
             if rec is None:
                 return self._error(404, f"unknown comment {cid}")
+            # The edit is persisted — clear that comment's edit-in-progress draft.
+            self._store.delete_draft(edit_draft_slot(cid))
             return self._send_json({"ok": True, "comment": rec})
         if action == "status":
             status = body.get("status", "")
@@ -480,6 +541,11 @@ def make_server(spec_path: Path | str, *, host: str = "127.0.0.1", port: int = 0
     httpd.store = SpecStore(spec_path)  # type: ignore[attr-defined]
     httpd.assets = {}  # type: ignore[attr-defined]
     httpd.verbose = verbose  # type: ignore[attr-defined]
+    # Each non-empty POST /api/submit puts its batch timestamp here so the launching process
+    # (draining the queue in run_specweb) hands the finalized review back to the agent. A
+    # QUEUE, not an Event, so two rapid submits each get delivered (no coalescing). A test
+    # that drives make_server with no watcher just leaves items unread — harmless.
+    httpd.submit_queue = queue.Queue()  # type: ignore[attr-defined]
     httpd.daemon_threads = True
     return httpd
 
@@ -498,6 +564,31 @@ def _reachable_urls(host: str, port: int) -> list[str]:
     return urls
 
 
+# Stable markers framing the structured-review JSON emitted on Submit, so the launching
+# agent can extract it from the process's stdout regardless of the surrounding banner
+# lines. The payload sits on the SINGLE line BETWEEN the markers (compact JSON, no internal
+# newlines), so the agent reads exactly the one line after the begin marker — a reviewer's
+# free-text body that happens to contain the end-marker substring is JSON-escaped on that
+# one line and can never be mistaken for the marker line itself.
+SUBMIT_MARKER_BEGIN = "<<<REVIEW-SPEC-WEB-SUBMITTED"
+SUBMIT_MARKER_END = "REVIEW-SPEC-WEB-SUBMITTED>>>"
+
+
+def _emit_submitted_review(review: dict) -> None:
+    """Print the structured review between stable markers (machine-readable handoff to the
+    launching agent) plus a one-line human summary. The JSON is compact (one line) so the
+    framing is unambiguous even when a comment body contains marker-like text."""
+    counts = review.get("counts") or {}
+    print(
+        f"[review spec-web] REVIEW SUBMITTED — {counts.get('questions', 0)} question(s), "
+        f"{counts.get('remarks', 0)} remark(s), {counts.get('total', 0)} total.",
+        flush=True,
+    )
+    print(SUBMIT_MARKER_BEGIN, flush=True)
+    print(json.dumps(review, sort_keys=True, separators=(",", ":")), flush=True)
+    print(SUBMIT_MARKER_END, flush=True)
+
+
 def run_specweb(
     spec_path: Path | str,
     *,
@@ -506,8 +597,16 @@ def run_specweb(
     open_browser: bool = False,
     seed: Path | str | None = None,
     verbose: bool = False,
+    exit_on_submit: bool = False,
 ) -> int:
-    """Blocking entry for ``review spec-web``. Returns a process exit code."""
+    """Blocking entry for ``review spec-web``. Returns a process exit code.
+
+    Submit handoff: a separate watcher thread waits on the server's ``submit_event``; on a
+    non-empty Submit it prints the structured review (between SUBMIT_MARKER_* markers) to
+    stdout so the launching agent receives it. With ``exit_on_submit`` the server stops
+    after the FIRST submit (the blocking call returns); otherwise it keeps serving so the
+    reviewer can continue and the agent can ``reply`` — each later submit re-emits.
+    """
     spec_path = Path(spec_path).expanduser().resolve()
     if not spec_path.is_file():
         print(f"[review spec-web] spec not found: {spec_path}", flush=True)
@@ -562,11 +661,34 @@ def run_specweb(
 
         threading.Timer(0.4, _open).start()
 
+    # Submit watcher: each non-empty Submit enqueues ITS OWN review snapshot; we DRAIN the
+    # queue and hand each one to the launching agent (stdout). Two rapid submits each emit a
+    # marker-framed payload for their batch — no coalescing, no re-read race. A daemon thread
+    # so Ctrl-C still exits cleanly. A sentinel (pushed by the finally block) breaks the
+    # blocking get on shutdown.
+    submit_queue = httpd.submit_queue  # type: ignore[attr-defined]
+    _STOP = object()
+
+    def _watch_submits() -> None:
+        while True:
+            item = submit_queue.get()
+            if item is _STOP:
+                return
+            _emit_submitted_review(item)
+            if exit_on_submit:
+                print("[review spec-web] --exit-on-submit: stopping after submit.", flush=True)
+                httpd.shutdown()
+                return
+
+    watcher = threading.Thread(target=_watch_submits, daemon=True)
+    watcher.start()
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[review spec-web] stopped.", flush=True)
     finally:
+        submit_queue.put(_STOP)  # break the watcher's blocking get so it exits
         httpd.shutdown()
         httpd.server_close()
     return 0

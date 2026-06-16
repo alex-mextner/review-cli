@@ -120,45 +120,36 @@ def _dashboard_subcommand(rest: list[str]) -> int:
 
 
 def _spec_web(argv: list[str]) -> int:
-    """`review spec-web <spec.md> [--host H] [--port N] [--seed f.json] [--export] [--open]`.
+    """`review spec-web <spec.md> [--host H] [--port N] [--seed f.json] [--open]`.
 
     Interactive web server to review a markdown spec: select text -> ask a question /
-    comment, accumulate a pending batch, submit the review, answer inline. Reusable for
-    ANY spec. See reviewlib.specweb for the full design.
+    comment, accumulate a pending batch, submit the review (delivered to the launching
+    agent), answer inline. Reusable for ANY spec. See reviewlib.specweb for the full design.
+
+    Also dispatches the `reply` subcommand: `review spec-web reply <comment-id> <answer>`
+    lets the AGENT answer a reviewer's question — it threads the reply into the store
+    (shown in the UI) and delivers it to the user via tg.
     """
+    if argv and argv[0] == "reply":
+        return _spec_web_reply(argv[1:])
+
     parser = argparse.ArgumentParser(prog="review spec-web", description="Interactive web reviewer for a markdown spec.")
     parser.add_argument("spec", help="path to the spec markdown file")
     parser.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1; use 0.0.0.0 to expose over Tailscale)")
     parser.add_argument("--port", type=int, default=None, help="bind port (default: a free ephemeral port)")
     parser.add_argument("--seed", metavar="FILE", default=None, help="import an initial review thread from a JSON file before serving")
-    parser.add_argument("--export", action="store_true", help="print the review as markdown to stdout and exit (no server)")
+    parser.add_argument("--exit-on-submit", dest="exit_on_submit", action="store_true",
+                        help="stop the server after the first Submit (the blocking call returns once the review is delivered)")
     parser.add_argument("--open", dest="open_browser", action="store_true", help="open the URL in a browser on startup")
     parser.add_argument("--verbose", action="store_true", help="verbose request logging")
     ns = parser.parse_args(argv)
 
     from .specweb.server import run_specweb
-    from .specweb.store import SpecStore
 
     spec = Path(ns.spec).expanduser()
     if not spec.is_file():
         print(f"[review spec-web] spec not found: {spec}", file=sys.stderr)
         return 1
-
-    if ns.export:
-        # --export dumps the persisted review as markdown and exits (after an optional
-        # seed import), so it doubles as the CLI export path.
-        if ns.seed:
-            import json as _json
-
-            try:
-                payload = _json.loads(Path(ns.seed).expanduser().read_text(encoding="utf-8"))
-                replace = bool(payload.get("replace")) if isinstance(payload, dict) else False
-                SpecStore(spec).import_thread(payload, replace=replace)
-            except (OSError, ValueError) as exc:
-                print(f"[review spec-web] bad seed: {exc}", file=sys.stderr)
-                return 1
-        sys.stdout.write(SpecStore(spec).export_markdown())
-        return 0
 
     return run_specweb(
         spec,
@@ -167,7 +158,91 @@ def _spec_web(argv: list[str]) -> int:
         open_browser=ns.open_browser,
         seed=ns.seed,
         verbose=ns.verbose,
+        exit_on_submit=ns.exit_on_submit,
     )
+
+
+def _spec_web_reply(argv: list[str]) -> int:
+    """`review spec-web reply <comment-id> <answer> --spec <spec.md>`: the AGENT answers a
+    reviewer's question/remark. Threads the reply into the store (so the spec-web UI shows
+    it under that comment) and best-effort delivers it to the user via the `tg` CLI.
+
+    The spec is required (the store is keyed per spec): pass it as ``--spec``. The reply is
+    stamped with the agent author so the UI styles it distinctly.
+    """
+    parser = argparse.ArgumentParser(
+        prog="review spec-web reply",
+        description="Answer a reviewer's spec-web question/remark (shown in the UI + sent to tg).",
+    )
+    parser.add_argument("comment_id", help="the id of the comment/question to answer (from the structured review)")
+    parser.add_argument("answer", help="the answer text")
+    parser.add_argument("--spec", required=True, metavar="FILE", help="path to the spec markdown file (the store is keyed per spec)")
+    parser.add_argument("--no-tg", action="store_true", help="do not deliver the reply to Telegram (UI only)")
+    ns = parser.parse_args(argv)
+
+    from .specweb.store import AGENT_AUTHOR, SpecStore
+
+    spec = Path(ns.spec).expanduser()
+    if not spec.is_file():
+        print(f"[review spec-web reply] spec not found: {spec}", file=sys.stderr)
+        return 1
+    answer = (ns.answer or "").strip()
+    if not answer:
+        print("[review spec-web reply] answer is empty", file=sys.stderr)
+        return 2
+
+    store = SpecStore(spec)
+    rec = store.add_reply(ns.comment_id, body=answer, author=AGENT_AUTHOR)
+    if rec is None:
+        print(f"[review spec-web reply] unknown comment id: {ns.comment_id}", file=sys.stderr)
+        return 1
+    print(f"[review spec-web reply] replied to {ns.comment_id} (now {rec.get('status')}); shown in the spec-web UI.", flush=True)
+
+    if not ns.no_tg:
+        _spec_web_reply_to_tg(spec, rec, answer)
+    return 0
+
+
+def _spec_web_reply_to_tg(spec: Path, comment: dict, answer: str) -> None:
+    """Best-effort: deliver the agent's reply to the user via the `tg` CLI on PATH. NEVER
+    raises — tg being absent/failing must not fail the reply (it is already in the store /
+    UI). Logs the outcome."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which("tg")
+    if not exe:
+        print("[review spec-web reply] tg not on PATH — reply saved to the UI only (no Telegram).", flush=True)
+        return
+    question = (comment.get("body") or "").strip()
+    quote = (comment.get("quote") or "").strip()
+    kind = comment.get("kind") or "remark"
+
+    def _clip(text: str, limit: int) -> str:
+        # Bound the reviewer's free text so a long multi-paragraph remark can't blow past
+        # Telegram's ~4096-char message limit (the answer is always shown in full).
+        return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+    # Plain-text message (no --format html) so we never have to escape the spec/question
+    # free text. tg's own --title/--tag give it structure.
+    lines = [f"Spec: {spec.name}"]
+    if quote:
+        lines.append(f"On: “{_clip(quote, 200)}”")
+    lines.append(f"{'Question' if kind == 'question' else 'Remark'}: {_clip(question, 600)}")
+    lines.append(f"Agent answer: {_clip(answer, 3000)}")
+    message = "\n".join(lines)
+    try:
+        proc = subprocess.run(
+            [exe, "--tag", "ANSWER", "--title", f"Spec-web reply — {spec.name}", message],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 0:
+            print("[review spec-web reply] delivered to Telegram via tg.", flush=True)
+        else:
+            err = (proc.stderr or proc.stdout or "").strip()
+            print(f"[review spec-web reply] tg delivery failed (exit {proc.returncode}): {err}", flush=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[review spec-web reply] tg delivery error: {exc}", flush=True)
 
 
 def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch, models_after=None) -> int:
@@ -237,6 +312,18 @@ def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch, models_aft
 _SERVER_SUBCOMMANDS = frozenset({"dashboard", "spec-web"})
 
 
+def _is_persistent_server_invocation(argv: list[str]) -> bool:
+    """True when argv starts a PERSISTENT server (`dashboard`, `spec-web <spec>`) that runs
+    until Ctrl-C and so must bypass the `-o` tee + the run backstop. The short-lived
+    `review spec-web reply …` is NOT a server — it returns immediately — so it is excluded
+    and goes through the normal tee/backstop path like any instant subcommand."""
+    if not argv or argv[0] not in _SERVER_SUBCOMMANDS:
+        return False
+    if argv[0] == "spec-web" and len(argv) > 1 and argv[1] == "reply":
+        return False
+    return True
+
+
 class _Tee(io.TextIOBase):
     """A write-through tee: every write goes to BOTH a live stream (the real stdout,
     so the user still sees the review as it streams) AND an in-memory buffer that
@@ -274,6 +361,10 @@ _VALUE_TAKING_OPTS = frozenset({
     "--pool", "--moderator", "--rounds", "--max-rounds",
     "--visual", "--before", "--intent", "--expect", "--check",
     "--vision-timeout", "--project",
+    # `review spec-web reply <id> <answer> --spec <path>`: the value after --spec is a spec
+    # path that could look like an option (e.g. `--spec -odd-name.md`); list it so the `-o`
+    # pre-scan never steals it.
+    "--spec",
 })
 
 
@@ -389,8 +480,10 @@ def main(argv: list[str] | None = None) -> int:
     # The persistent SERVER subcommands stream until Ctrl-C — capturing/teeing their
     # output to a single `-o` file makes no sense (and the file would only be written
     # on shutdown), so `-o` is ignored for them and they bypass both the tee and the
-    # backstop exactly as before.
-    if raw and raw[0] in _SERVER_SUBCOMMANDS:
+    # backstop exactly as before. `review spec-web reply …` is the EXCEPTION: it is a
+    # short-lived command, not the server, so it must NOT bypass — `-o` should work and
+    # the backstop should bound it like any other instant subcommand.
+    if _is_persistent_server_invocation(raw):
         return _dispatch(raw)
 
     if output_path is None:

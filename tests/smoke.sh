@@ -114,7 +114,10 @@ bin/review brainstorm --help | grep -q -- "--staged"
 # spec-web subcommand: dispatches + advertises its flags (no server started here).
 bin/review spec-web --help | grep -q -- "--seed"
 bin/review spec-web --help | grep -q -- "--host"
-bin/review spec-web --help | grep -q -- "--export"
+bin/review spec-web --help | grep -q -- "--exit-on-submit"
+# the `reply` subcommand (agent answers a reviewer's question) dispatches + advertises args.
+bin/review spec-web reply --help | grep -q -- "--spec"
+bin/review spec-web reply --help | grep -q -- "comment_id"
 # The single-file CLI must always parse.
 python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse OK')"
 

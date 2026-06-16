@@ -389,12 +389,16 @@ Add `--no-ai` to run cvGate only (fast CI smoke / offline), `--json` for the mac
 
 ## `review spec-web <spec.md>` — interactive spec reviewer
 
-**Render any markdown spec server-side and review it like a GitHub PR.** Select any text in
-the rendered spec → leave a **question** (expects an answer from the spec author) or a
-**remark** (feedback that doesn't), anchored to that selection; notes accumulate in a
-**pending batch**; one **Submit review** finalizes them; answers thread inline under each
-note, and any note can be **edited** in place. Single implicit reviewer (no author field).
-Reusable for *any* spec markdown file. Serve it over Tailscale to review from your phone.
+**Render any markdown spec server-side and review it like a GitHub PR — as a bidirectional
+channel between a human reviewer and the agent that launched it.** Select any text in the
+rendered spec → leave a **question** (expects an answer from the spec author) or a **remark**
+(feedback that doesn't), anchored to that selection; notes accumulate in a **pending batch**;
+one **Submit review** finalizes them **and delivers the structured review back to the
+launching agent** (no copy-paste export step). The agent answers a question with
+`review spec-web reply <id> <answer>` — the reply shows **in the UI** (distinct agent
+styling) and is pushed to **Telegram**. In-progress note text **autosaves to disk** so a page
+reload never loses a half-typed comment. Single implicit reviewer (no author field). Reusable
+for *any* spec markdown file. Serve it over Tailscale to review from your phone.
 
 ```sh
 # local, ephemeral port, opens a browser
@@ -406,8 +410,11 @@ review spec-web docs/specs/my-spec.md --host 0.0.0.0 --port 8787
 # pre-load an existing Q&A thread
 review spec-web docs/specs/my-spec.md --seed thread.json
 
-# dump the whole review (quotes + questions + threaded answers) as markdown
-review spec-web docs/specs/my-spec.md --export > review.md
+# return to the agent as soon as the reviewer submits (one-shot review handoff)
+review spec-web docs/specs/my-spec.md --exit-on-submit
+
+# the agent answers a reviewer's question (shown in the UI + sent to Telegram)
+review spec-web reply <comment-id> "the answer" --spec docs/specs/my-spec.md
 ```
 
 | Flag | Meaning |
@@ -415,8 +422,36 @@ review spec-web docs/specs/my-spec.md --export > review.md
 | `--host` | bind host (default `127.0.0.1`; `0.0.0.0` exposes over Tailscale) |
 | `--port` | bind port (default: a free ephemeral port) |
 | `--seed FILE` | import an initial review thread from a JSON file before serving |
-| `--export` | print the persisted review as markdown and exit (no server) |
+| `--exit-on-submit` | stop the server after the first Submit (the blocking call returns once the review is delivered) |
 | `--open` | open the URL in a browser on startup |
+
+**The submit → agent handoff.** `review spec-web` is started by an agent and blocks. When the
+reviewer clicks **Submit review**, the server marks the batch submitted in the store and the
+launching process prints the **structured review** to stdout framed by a line that is exactly
+`<<<REVIEW-SPEC-WEB-SUBMITTED`, then **one line** of compact JSON, then a line that is exactly
+`REVIEW-SPEC-WEB-SUBMITTED>>>`. **Parse by taking the single line immediately after the begin
+marker** (not by splitting on the end marker) — the JSON is one line and a reviewer's free
+text is JSON-escaped on it, so a body that happens to contain the marker substring can never
+break the framing. The payload carries every comment's **id** (so the agent can answer a
+specific one), `kind`, `status`, `quote`, `section_title`, `body`, and its reply thread, plus
+`counts` (questions/remarks/total). By default the server keeps serving after a submit (the
+reviewer can keep going and the agent can `reply`), re-emitting a fresh framed payload on each
+submit; `--exit-on-submit` returns after the first submit instead. (Like the other persistent
+server paths, `--exit-on-submit` ignores `-o FILE` — read the framed payload from stdout.) The
+store on disk stays the single source of truth.
+
+**The agent reply → UI + Telegram.** `review spec-web reply <comment-id> <answer> --spec <spec>`
+threads the agent's answer under that comment in the store (stamped with the `agent` author so
+the UI styles it distinctly), and **also** delivers it to Telegram via the `tg` CLI on `PATH`
+(best-effort — a missing/failing `tg` never fails the reply; it logs and continues; `--no-tg`
+skips it). An open spec-web page **polls** the comments API, so the agent's reply appears under
+the question without a manual refresh.
+
+**Drafts (reload-safe).** While you type a note, the composer **autosaves** the in-progress
+text to the server (debounced, persisted to disk) under a per-slot key (the new-note composer
+and each edit-in-progress have their own slot). On page load the most recent draft is **restored
+into the composer**, so an accidental reload mid-typing continues exactly where you left off.
+Saving the note (or clearing the box) drops its draft.
 
 **Layout.** Desktop (≥900px) = two panes side-by-side (spec left, comments right, a
 draggable divider). Mobile (<900px) = comments as a bottom sheet under the spec. The
@@ -439,13 +474,17 @@ reload, each note re-anchors by locating its quote within its section and highli
 quote that can't be re-found shows in the sidebar as **unanchored** (never a crash).
 
 **Persistence.** One JSON file per spec at `~/.config/review-cli/spec-web/<sha1-of-abspath>.json`
-(mode `0600`), surviving restarts. Override the directory with `$REVIEW_SPECWEB_DIR`.
+(mode `0600`), surviving restarts. It holds the comments, the in-progress composer **drafts**
+(per slot), and the `last_submit` batch the launching agent reads back. Override the directory
+with `$REVIEW_SPECWEB_DIR`.
 
-**Security.** Reads (spec, assets, comments) are open; only figures the markdown
-*references* are served (an unrelated file in the assets dir 404s), SVGs are served with a
-`sandbox` CSP so a directly-opened one can't run script, and symlinked assets that escape
-the assets dir are refused. Writes (post comment / reply / submit / import) are
-origin-guarded against both CSRF and DNS rebinding: a write requires (1) the request's
+**Security.** Reads (spec, assets, comments, **drafts**) are open — same model as comments
+(the in-progress composer text is readable by anyone who can reach the port; there are no
+secrets in a spec review); only figures the markdown *references* are served (an unrelated
+file in the assets dir 404s), SVGs are served with a `sandbox` CSP so a directly-opened one
+can't run script, and symlinked assets that escape the assets dir are refused. Writes (post
+comment / reply / submit / import / draft autosave)
+are origin-guarded against both CSRF and DNS rebinding: a write requires (1) the request's
 **Host** to be in the allowlist — **loopback + this machine's Tailscale identity
 (discovered at runtime via `tailscale status`, never hardcoded) + `$REVIEW_SPECWEB_ALLOWED_HOSTS`**
 (comma-separated) — and (2) the **Origin/Referer** to match that Host (classic CSRF check),
@@ -478,8 +517,10 @@ Missing `id`/`created` are generated; unknown keys are ignored. Add `"replace": 
 top level to discard existing comments before importing.
 
 Routes: `GET /` (SPA shell), `GET /static/<app.css|app.js>`, `GET /asset/<name>`,
-`GET /api/spec`, `GET /api/comments`, `GET /api/export`, `POST /api/comments`,
-`POST /api/comments/<id>/{reply,edit,status,delete}`, `POST /api/submit`, `POST /api/import`.
+`GET /api/spec`, `GET /api/comments`, `GET /api/drafts`, `POST /api/comments`,
+`POST /api/comments/<id>/{reply,edit,status,delete}`, `POST /api/drafts/<slot>`,
+`POST /api/submit`, `POST /api/import`. (The old `GET /api/export` is removed — Submit now
+delivers the structured review to the launching agent.)
 
 ---
 

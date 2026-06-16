@@ -47,9 +47,6 @@
     <div class="comments-empty" id="commentsEmpty">
       Select any text in the spec to ask a question or leave a remark.
     </div>
-    <div class="export-row">
-      <a href="/api/export" id="exportLink" download>Export review as markdown</a>
-    </div>
   </aside>
 </div>
 
@@ -70,6 +67,7 @@
   <div class="composer" id="composer" role="dialog" aria-modal="true" aria-labelledby="composerHead">
     <div class="composer-head" id="composerHead">New remark</div>
     <div class="composer-hint" id="composerHint"></div>
+    <div class="composer-draft-note" id="composerDraftNote" hidden>Restored your in-progress draft.</div>
     <blockquote class="composer-quote" id="composerQuote"></blockquote>
     <textarea id="composerBody" placeholder="Write a remark or a question…" rows="4"></textarea>
     <div class="composer-actions">

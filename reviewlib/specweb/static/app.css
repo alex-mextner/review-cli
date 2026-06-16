@@ -51,8 +51,7 @@ body{
 .layout.comments-collapsed .comments-pane{flex:0 0 auto;overflow:visible}
 .layout.comments-collapsed .comments-list,
 .layout.comments-collapsed .pending-tray,
-.layout.comments-collapsed .comments-empty,
-.layout.comments-collapsed .export-row{display:none}
+.layout.comments-collapsed .comments-empty{display:none}
 .layout.comments-collapsed .divider{display:none}
 
 /* ---- comments pane ------------------------------------------------------ */
@@ -82,9 +81,6 @@ body{
 
 .comments-list{padding:10px 12px;display:flex;flex-direction:column;gap:10px;flex:1}
 .comments-empty{padding:14px 16px;color:var(--muted);font-size:13px;text-align:center}
-.export-row{padding:12px;border-top:1px solid var(--line);font-size:12.5px}
-.export-row a{color:var(--accent);text-decoration:none}
-.export-row a:hover{text-decoration:underline}
 
 .comment{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--line);
   border-radius:10px;padding:11px 12px;cursor:pointer;transition:border-color .15s,background .12s}
@@ -114,8 +110,18 @@ body{
 .comment-body{font-size:13.5px;white-space:pre-wrap;word-break:break-word}
 .replies{margin-top:9px;display:flex;flex-direction:column;gap:6px}
 .reply{background:#13161f;border:1px solid var(--line);border-radius:7px;padding:6px 9px;font-size:12.5px}
-.reply .reply-meta{font-size:10.5px;color:var(--muted);margin-bottom:2px}
+.reply .reply-meta{font-size:10.5px;color:var(--muted);margin-bottom:2px;display:flex;align-items:center;gap:6px}
 .reply-body{white-space:pre-wrap;word-break:break-word}
+/* An AGENT reply (left via `review spec-web reply`) is the spec author answering, not the
+   reviewer — style it distinctly (accent left border + a labelled badge) so it stands out
+   from the reviewer's own threaded replies. */
+.reply.reply-agent{border-left:3px solid var(--accent);background:#141a26}
+.reply-author-badge{font-weight:700;letter-spacing:.3px;text-transform:uppercase;
+  border-radius:999px;padding:0 7px;font-size:9.5px;color:var(--accent);border:1px solid var(--accent)}
+/* A restored in-progress draft hint in the composer: reassures the reviewer their text was
+   recovered after a reload. */
+.composer-draft-note{font-size:11.5px;color:var(--answered);margin:0 0 6px}
+.composer-draft-note[hidden]{display:none}
 .comment-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
 .comment-actions button{background:#161b26;border:1px solid var(--line);color:var(--muted);
   border-radius:6px;padding:3px 9px;font-size:11.5px;cursor:pointer}
