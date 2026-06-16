@@ -3,6 +3,9 @@
   --line:#2a2f3c; --accent:#5b9dff; --accent2:#7ee0c0; --quote:#ffd479;
   --mark:#3a3416; --mark-active:#5a4f12; --danger:#e2778a;
   --pending:#caa24a; --submitted:#5b9dff; --answered:#7ee0c0; --resolved:#7a8294;
+  /* question (expects an answer) vs remark (feedback) — distinct hues so the two kinds
+     are obvious at a glance. */
+  --question:#c98bff; --remark:#7ee0c0;
   --topbar-h:48px;
 }
 *{box-sizing:border-box}
@@ -13,6 +16,11 @@ body{
   -webkit-text-size-adjust:100%;
 }
 
+.sr-only{
+  position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0 0 0 0);white-space:nowrap;border:0;
+}
+
 /* ---- topbar ------------------------------------------------------------- */
 .topbar{
   position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:12px;
@@ -21,13 +29,11 @@ body{
 }
 .topbar-title{font-weight:600;letter-spacing:.2px;flex:1;min-width:0;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.topbar-actions{display:flex;align-items:center;gap:10px}
-.icon-btn{background:#1c2230;border:1px solid var(--line);color:var(--ink);
-  border-radius:8px;padding:5px 9px;font-size:15px;cursor:pointer;line-height:1}
-.icon-btn:hover{border-color:var(--accent)}
-.author-field{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
-.author-field input{width:90px;background:#11141c;border:1px solid var(--line);color:var(--ink);
-  border-radius:6px;padding:4px 7px;font-size:12px}
+/* Back button: appears only after an internal cross-reference jump (JS toggles [hidden]). */
+.back-btn{background:#1c2230;border:1px solid var(--line);color:var(--ink);
+  border-radius:8px;padding:5px 11px;font-size:13px;cursor:pointer;line-height:1;
+  white-space:nowrap;flex:0 0 auto}
+.back-btn:hover{border-color:var(--accent)}
 
 /* ---- layout: desktop two columns --------------------------------------- */
 .layout{display:flex;height:calc(100vh - var(--topbar-h));overflow:hidden}
@@ -37,20 +43,37 @@ body{
 .comments-pane{flex:0 0 380px;overflow-y:auto;background:var(--panel);border-left:1px solid var(--line);
   display:flex;flex-direction:column;min-width:0}
 
-/* collapsed states (desktop) */
-.layout.spec-collapsed .spec-pane{display:none}
-.layout.spec-collapsed .divider{display:none}
-.layout.comments-collapsed .comments-pane{display:none}
+/* Collapsed state (desktop): the pane shrinks to just its header bar — NOT display:none.
+   The collapse toggle lives INSIDE the header, so hiding the whole pane would strand the
+   user with no way to reopen it. Keeping the header visible means the same in-panel toggle
+   re-expands it (and the header still shows the note count). The divider is hidden so the
+   spec gets the freed width. */
+.layout.comments-collapsed .comments-pane{flex:0 0 auto;overflow:visible}
+.layout.comments-collapsed .comments-list,
+.layout.comments-collapsed .pending-tray,
+.layout.comments-collapsed .comments-empty,
+.layout.comments-collapsed .export-row{display:none}
 .layout.comments-collapsed .divider{display:none}
 
 /* ---- comments pane ------------------------------------------------------ */
 .comments-header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:8px;
   padding:10px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
-.filters{display:flex;flex-wrap:wrap;gap:5px;flex:1}
-.filters button{background:#161b26;border:1px solid var(--line);color:var(--muted);
-  border-radius:999px;padding:3px 10px;font-size:11.5px;cursor:pointer}
-.filters button.active{background:#22304e;border-color:#33405e;color:#dce6ff}
-.mobile-collapse{display:none;background:none;border:none;color:var(--muted);font-size:18px;cursor:pointer}
+/* Collapse toggle doubles as the panel label + count badge so a collapsed panel still
+   shows how many notes exist. */
+.comments-collapse{display:flex;align-items:center;gap:7px;flex:0 0 auto;
+  background:none;border:none;color:var(--ink);font-size:13.5px;font-weight:600;cursor:pointer;padding:2px 0}
+.collapse-caret{color:var(--muted);font-size:14px;transition:transform .15s}
+.layout.comments-collapsed .collapse-caret{transform:rotate(-90deg)}
+.comments-count{background:#22304e;border:1px solid #33405e;color:#dce6ff;
+  border-radius:999px;padding:0 7px;font-size:11px;font-weight:700;min-width:18px;text-align:center}
+/* Filter is a compact <select> (one row on mobile, no wrapping pills). */
+.filter-select-label{margin-left:auto;flex:0 0 auto}
+.filter-select-label select{background:#161b26;border:1px solid var(--line);color:var(--ink);
+  border-radius:7px;padding:4px 26px 4px 9px;font-size:12px;cursor:pointer;
+  -webkit-appearance:none;appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%239aa3b2' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 9px center}
+.filter-select-label select:hover{border-color:var(--accent)}
 
 .pending-tray{display:flex;align-items:center;justify-content:space-between;gap:10px;
   padding:9px 12px;margin:10px 12px 0;background:#241f10;border:1px solid #4a3f18;
@@ -65,10 +88,19 @@ body{
 
 .comment{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--line);
   border-radius:10px;padding:11px 12px;cursor:pointer;transition:border-color .15s,background .12s}
+/* The left border is tinted by kind so question vs remark reads even before the chip. */
+.comment.kind-border-question{border-left-color:var(--question)}
+.comment.kind-border-remark{border-left-color:var(--remark)}
 .comment:hover{border-left-color:var(--accent)}
 .comment.active{background:#1f2740;border-left-color:var(--accent);border-color:#33405e}
 .comment.unanchored{border-left-color:var(--danger)}
 .comment-meta{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--muted);margin-bottom:6px;flex-wrap:wrap}
+/* Kind chip: distinct icon + colour for question vs remark. */
+.kind-chip{font-weight:700;font-size:10px;letter-spacing:.3px;border-radius:999px;
+  padding:1px 8px;border:1px solid}
+.kind-question{color:var(--question);border-color:var(--question);background:rgba(201,139,255,.1)}
+.kind-remark{color:var(--remark);border-color:var(--remark);background:rgba(126,224,192,.1)}
+.comment-section{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .status-pill{font-weight:700;font-size:10px;letter-spacing:.4px;text-transform:uppercase;
   border-radius:999px;padding:1px 8px;border:1px solid}
 .status-pending{color:var(--pending);border-color:var(--pending)}
@@ -98,6 +130,7 @@ body{
 button.primary{background:var(--accent);border:1px solid var(--accent);color:#06101f;
   border-radius:7px;padding:5px 12px;font-size:12.5px;font-weight:600;cursor:pointer}
 button.primary:hover{filter:brightness(1.08)}
+button.primary:disabled{opacity:.45;cursor:not-allowed;filter:none}
 
 /* ---- rendered spec ------------------------------------------------------ */
 .loading{color:var(--muted);padding:30px;text-align:center}
@@ -131,10 +164,16 @@ button.primary:hover{filter:brightness(1.08)}
 .spec-body blockquote{margin:12px 0;padding:8px 14px;border-left:3px solid #39425a;
   background:#12151d;color:#c4ccdb;border-radius:4px}
 .spec-body hr{border:none;border-top:1px solid var(--line);margin:24px 0}
-/* Wide tables scroll WITHIN themselves (display:block + overflow-x:auto), never the
-   page. max-width:100% pins the scroll box to the pane width on mobile. */
-table.md-table{border-collapse:collapse;width:100%;max-width:100%;margin:14px 0;font-size:13px;display:block;overflow-x:auto}
-table.md-table th,table.md-table td{border:1px solid #2a3142;padding:6px 9px;text-align:left;vertical-align:top}
+/* Tables: the table is laid out at its NATURAL content width (width:max-content) and the
+   block box scrolls horizontally when that exceeds the pane (max-width:100% + overflow-x).
+   The earlier `width:100%` on a display:block table forced every column to fit the pane,
+   which crushed narrow columns down to one CHARACTER per line (the "t-a-t-u-s" bug). Here
+   cells don't wrap mid-token (white-space:nowrap) and carry a min-width floor, so a short
+   value like "WORKS"/"status" stays on one line and the table scrolls sideways instead. */
+table.md-table{border-collapse:collapse;width:max-content;max-width:100%;
+  margin:14px 0;font-size:13px;display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+table.md-table th,table.md-table td{border:1px solid #2a3142;padding:6px 9px;text-align:left;
+  vertical-align:top;white-space:nowrap;min-width:3.5em}
 table.md-table th{background:#1a2030;color:#dce4f5}
 table.md-table tr:nth-child(even) td{background:#12151d}
 figure.fig{margin:18px 0;padding:14px;background:#0e1219;border:1px solid #222a38;border-radius:10px;text-align:center;max-width:100%;overflow-x:auto}
@@ -167,6 +206,13 @@ mark.sw-quote.active{background:var(--mark-active);color:#fff1c2;box-shadow:0 0 
 .sel-popup button{background:#222b3d;border:1px solid var(--line);color:var(--ink);
   border-radius:6px;padding:5px 10px;font-size:12.5px;cursor:pointer;white-space:nowrap}
 .sel-popup button:hover{border-color:var(--accent)}
+/* The two kinds are colour-keyed in the popup too, matching the chips on the cards. The
+   compound selector (.sel-popup button.sel-kind-*) out-specifies the generic .sel-popup
+   button border without resorting to !important. */
+.sel-popup button.sel-kind-question{border-left:3px solid var(--question)}
+.sel-popup button.sel-kind-remark{border-left:3px solid var(--remark)}
+.sel-kind-question:hover{border-color:var(--question)}
+.sel-kind-remark:hover{border-color:var(--remark)}
 
 /* [hidden] must win over display:flex — an explicit display otherwise overrides the
    hidden attribute's display:none, so a [hidden] flex element paints anyway. */
@@ -176,6 +222,7 @@ mark.sw-quote.active{background:var(--mark-active);color:#fff1c2;box-shadow:0 0 
 .composer{width:min(520px,100%);background:var(--panel2);border:1px solid #33405e;
   border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:10px;box-shadow:0 18px 60px rgba(0,0,0,.6)}
 .composer-head{font-weight:600}
+.composer-hint{font-size:12px;color:var(--muted);margin-top:-4px}
 .composer-quote{margin:0;padding:7px 11px;border-left:3px solid var(--quote);background:#1c1a12;
   color:#ffe6ad;font-style:italic;border-radius:4px;font-size:13px;white-space:pre-wrap;max-height:8em;overflow:auto}
 .composer textarea{width:100%;background:#11141c;border:1px solid var(--line);color:var(--ink);
@@ -184,7 +231,10 @@ mark.sw-quote.active{background:var(--mark-active);color:#fff1c2;box-shadow:0 0 
 .composer-actions button{background:#161b26;border:1px solid var(--line);color:var(--ink);
   border-radius:7px;padding:6px 13px;font-size:13px;cursor:pointer}
 
-/* ---- mobile: comments as bottom sheet, both panes collapsible ----------- */
+/* ---- mobile: comments as a bottom sheet that collapses to its header bar -- */
+/* The collapse-to-header-bar behaviour itself lives in the shared rule above (so desktop
+   and mobile behave identically); this block only adds the mobile bottom-sheet framing and
+   resets the sheet's max-height when collapsed. */
 @media (max-width:899px){
   .layout{flex-direction:column;height:calc(100vh - var(--topbar-h))}
   .divider{display:none}
@@ -193,17 +243,6 @@ mark.sw-quote.active{background:var(--mark-active);color:#fff1c2;box-shadow:0 0 
     flex:0 0 auto;max-height:55vh;border-left:none;border-top:2px solid #33405e;
     box-shadow:0 -10px 30px rgba(0,0,0,.45);
   }
-  .mobile-collapse{display:inline-block}
-  /* mobile collapse: comments sheet shrinks to just its header bar */
-  .layout.comments-collapsed .comments-pane{display:flex;flex:0 0 auto;max-height:none}
-  .layout.comments-collapsed .comments-list,
-  .layout.comments-collapsed .pending-tray,
-  .layout.comments-collapsed .comments-empty,
-  .layout.comments-collapsed .export-row{display:none}
+  .layout.comments-collapsed .comments-pane{max-height:none}
   .layout.comments-collapsed .spec-pane{display:block}
-  /* mobile collapse spec: spec hidden, comments take over */
-  .layout.spec-collapsed .spec-pane{display:none}
-  .layout.spec-collapsed .comments-pane{flex:1 1 auto;max-height:none}
-  .author-field span{display:none}
-  .author-field input{width:72px}
 }

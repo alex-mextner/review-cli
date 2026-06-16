@@ -15,6 +15,7 @@ GET  /api/comments             -> [comment, ...]
 GET  /api/export               -> the review dumped as markdown (text/markdown)
 POST /api/comments             -> create a comment (enters the pending batch)
 POST /api/comments/<id>/reply  -> thread an inline answer
+POST /api/comments/<id>/edit   -> edit a comment's body (and optionally its kind)
 POST /api/comments/<id>/status -> {status: pending|submitted|answered|resolved}
 POST /api/comments/<id>/delete -> remove a comment
 POST /api/submit               -> flip the pending batch to submitted
@@ -39,7 +40,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import render as srender
-from .store import SpecStore, store_dir
+from .store import DEFAULT_KIND, SpecStore, store_dir
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _ALLOWED_STATIC = {"app.js", "app.css"}
@@ -309,6 +310,10 @@ class SpecWebHandler(BaseHTTPRequestHandler):
             section_title=body.get("section_title", "") if isinstance(body.get("section_title"), str) else "",
             start=body.get("start") if isinstance(body.get("start"), int) else None,
             end=body.get("end") if isinstance(body.get("end"), int) else None,
+            kind=body.get("kind") if isinstance(body.get("kind"), str) else DEFAULT_KIND,
+            # Single implicit reviewer: the UI client doesn't expose an author field, so a
+            # normal create omits it and defaults to "reviewer". An explicit author (e.g. an
+            # import/seed payload) is still honoured so those round-trip.
             author=body.get("author", "reviewer") if isinstance(body.get("author"), str) else "reviewer",
         )
         self._send_json({"ok": True, "comment": rec}, status=201)
@@ -323,6 +328,18 @@ class SpecWebHandler(BaseHTTPRequestHandler):
                 body=text,
                 author=body.get("author", "reviewer") if isinstance(body.get("author"), str) else "reviewer",
             )
+            if rec is None:
+                return self._error(404, f"unknown comment {cid}")
+            return self._send_json({"ok": True, "comment": rec})
+        if action == "edit":
+            text = body.get("body", "")
+            if not isinstance(text, str) or not text.strip():
+                return self._error(400, "comment 'body' is required")
+            kind = body.get("kind") if isinstance(body.get("kind"), str) else None
+            try:
+                rec = self._store.edit_comment(cid, body=text, kind=kind)
+            except ValueError as exc:
+                return self._error(400, str(exc))
             if rec is None:
                 return self._error(404, f"unknown comment {cid}")
             return self._send_json({"ok": True, "comment": rec})

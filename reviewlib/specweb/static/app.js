@@ -1,12 +1,15 @@
-/* Spec-web reviewer — vanilla JS, no deps.
+/* Spec-web reviewer — vanilla JS, no deps. Single implicit reviewer (no author field).
  *
  * Flow: fetch the server-rendered spec HTML + headings, inject it; let the reviewer
- * SELECT text to open a popup -> composer -> POST a comment (enters the pending batch);
- * accumulate pending comments, "Submit review" flips them to submitted; answer inline via
- * a reply box that threads under each comment. On reload, comments re-anchor by locating
- * their quote within the recorded section (pragmatic quote-within-section search); an
- * unfindable quote shows as "unanchored" in the sidebar. Desktop = two panes; mobile =
- * comments as a bottom sheet. Both panes collapse/expand.
+ * SELECT text to open a popup -> composer -> POST a note. A note is a QUESTION (expects an
+ * answer from the spec author) or a REMARK (feedback that does not); the kind is shown via
+ * a coloured chip + icon. Notes enter the pending batch; "Submit review" flips them to
+ * submitted; answer inline via a reply box that threads under each note; each note can be
+ * Edited in place. On reload, notes re-anchor by locating their quote within the recorded
+ * section (pragmatic quote-within-section search); an unfindable quote shows as
+ * "unanchored". Internal cross-reference links push the prior scroll position so "← Back"
+ * returns there. Desktop = two panes; mobile = comments as a bottom sheet that collapses to
+ * its header bar (which carries a count badge so added notes are visible while collapsed).
  */
 (function () {
   'use strict';
@@ -14,26 +17,27 @@
   var els = {
     specBody: document.getElementById('specBody'),
     specTitle: document.getElementById('specTitle'),
+    specPane: document.getElementById('specPane'),
     layout: document.getElementById('layout'),
+    navBack: document.getElementById('navBack'),
     commentsList: document.getElementById('commentsList'),
     commentsEmpty: document.getElementById('commentsEmpty'),
     pendingTray: document.getElementById('pendingTray'),
     pendingLabel: document.getElementById('pendingLabel'),
     submitReview: document.getElementById('submitReview'),
-    filters: document.getElementById('filters'),
+    filterSelect: document.getElementById('filterSelect'),
+    commentsCount: document.getElementById('commentsCount'),
     selPopup: document.getElementById('selPopup'),
-    selComment: document.getElementById('selComment'),
+    selRemark: document.getElementById('selRemark'),
     selQuestion: document.getElementById('selQuestion'),
     composerBackdrop: document.getElementById('composerBackdrop'),
     composer: document.getElementById('composer'),
     composerHead: document.getElementById('composerHead'),
+    composerHint: document.getElementById('composerHint'),
     composerQuote: document.getElementById('composerQuote'),
     composerBody: document.getElementById('composerBody'),
     composerCancel: document.getElementById('composerCancel'),
     composerSubmit: document.getElementById('composerSubmit'),
-    authorInput: document.getElementById('authorInput'),
-    toggleSpec: document.getElementById('toggleSpec'),
-    toggleComments: document.getElementById('toggleComments'),
     commentsCollapse: document.getElementById('commentsCollapse'),
     divider: document.getElementById('divider'),
   };
@@ -43,7 +47,35 @@
     comments: [], // server comments
     filter: 'all',
     pendingSelection: null, // {quote, section_id, section_title, start, end}
+    pendingKind: 'remark', // 'question' | 'remark' for the OPEN composer
+    editingId: null, // comment id being edited inline in the composer (null = new note)
+    // Internal-link navigation history: each entry is the spec pane's scrollTop at the
+    // moment an in-doc link was followed, so "← Back" returns to the exact prior position.
+    navHistory: [],
   };
+
+  // A note is a QUESTION (expects an answer from the spec author) or a REMARK (feedback
+  // that does not). Single source of truth for each kind's label/icon/hint.
+  var KINDS = {
+    question: {
+      label: 'Question',
+      icon: '❓',
+      hint: 'A question expects an answer from the spec author.',
+      replyLabel: 'Answer', // a question is answered
+    },
+    remark: {
+      label: 'Remark',
+      icon: '💬',
+      hint: 'A remark is feedback that does not expect an answer.',
+      replyLabel: 'Reply', // a remark is replied to
+    },
+  };
+  function kindOf(c) {
+    return c && c.kind === 'question' ? 'question' : 'remark';
+  }
+  // Cap the internal-link nav history so a long chain of cross-references can't grow it
+  // unboundedly (oldest entries are dropped first).
+  var MAX_NAV_HISTORY = 50;
 
   // ---- helpers ------------------------------------------------------------
   function esc(s) {
@@ -52,10 +84,6 @@
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
-  }
-  function author() {
-    var a = (els.authorInput.value || '').trim();
-    return a || 'reviewer';
   }
   function api(method, url, body) {
     var opts = { method: method, headers: {} };
@@ -106,7 +134,10 @@
     });
   }
 
-  // In-doc anchor links (e.g. [§9.4](#94-...)) scroll inside the spec pane + flash.
+  // In-doc anchor links (e.g. [§9.4](#94-...)) scroll inside the spec pane + flash. Each
+  // jump PUSHES the current scroll position onto a small history so "← Back" returns the
+  // reader to where they were before following the cross-reference (the #1 mobile gripe:
+  // a tap on an internal link strands you with no way back).
   function wireInDocLinks() {
     var links = els.specBody.querySelectorAll('a[href^="#"]');
     Array.prototype.forEach.call(links, function (a) {
@@ -115,10 +146,27 @@
         var t = specEl(id);
         if (t) {
           e.preventDefault();
+          pushNavHistory();
           scrollSpecTo(t);
         }
       });
     });
+  }
+  // The spec scrolls INSIDE .spec-pane (overflow-y:auto), not the window — read/write that
+  // element's scrollTop, never window.scrollY, or Back would jump to the wrong place.
+  function pushNavHistory() {
+    state.navHistory.push(els.specPane.scrollTop);
+    if (state.navHistory.length > MAX_NAV_HISTORY) state.navHistory.shift();
+    updateBackButton();
+  }
+  function navBack() {
+    if (!state.navHistory.length) return;
+    var top = state.navHistory.pop();
+    els.specPane.scrollTo({ top: top, behavior: 'smooth' });
+    updateBackButton();
+  }
+  function updateBackButton() {
+    els.navBack.hidden = state.navHistory.length === 0;
   }
   function scrollSpecTo(el) {
     el.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -307,30 +355,88 @@
   }
 
   // ---- composer -----------------------------------------------------------
+  // The composer serves TWO flows: creating a new note from a selection (kind = question /
+  // remark) and editing an existing note's text in place. state.editingId distinguishes
+  // them on submit. Both flows route through showComposer so the setup lives in one place.
+  function showComposer(opts) {
+    var meta = KINDS[opts.kind];
+    els.composerHead.textContent = meta.icon + ' ' + opts.headPrefix + ' ' + meta.label.toLowerCase();
+    els.composerHint.textContent = meta.hint;
+    els.composerQuote.textContent = opts.quote || '';
+    els.composerQuote.hidden = !opts.quote;
+    els.composerBody.value = opts.body || '';
+    els.composerBody.placeholder =
+      opts.kind === 'question' ? 'Ask your question…' : 'Write your remark…';
+    els.composerSubmit.textContent = opts.submitLabel;
+    els.composerBackdrop.hidden = false;
+    syncComposerSubmit();
+    els.composerBody.focus();
+  }
+  // The submit button is disabled while the body is empty, so an empty note can never be
+  // saved (and an empty edit can't silently discard the original on submit).
+  function syncComposerSubmit() {
+    els.composerSubmit.disabled = !(els.composerBody.value || '').trim();
+  }
   function openComposer(kind) {
     if (!state.pendingSelection) return;
     hidePopup();
-    els.composerHead.textContent = kind === 'question' ? 'Ask a question' : 'Add a comment';
-    els.composerQuote.textContent = state.pendingSelection.quote;
-    els.composerBody.value = '';
-    els.composerBackdrop.hidden = false;
-    els.composerBody.focus();
+    state.editingId = null;
+    state.pendingKind = kind === 'question' ? 'question' : 'remark';
+    showComposer({
+      kind: state.pendingKind,
+      headPrefix: 'New',
+      quote: state.pendingSelection.quote,
+      body: '',
+      submitLabel: 'Add to review',
+    });
+  }
+  function openEditComposer(c) {
+    state.pendingSelection = null;
+    state.editingId = c.id;
+    state.pendingKind = kindOf(c);
+    showComposer({
+      kind: state.pendingKind,
+      headPrefix: 'Edit',
+      quote: c.quote || '',
+      body: c.body || '',
+      submitLabel: 'Save',
+    });
   }
   function closeComposer() {
     els.composerBackdrop.hidden = true;
     state.pendingSelection = null;
+    state.editingId = null;
+    state.pendingKind = 'remark'; // reset all composer state together (no stale kind)
   }
   function submitComposer() {
-    var sel = state.pendingSelection;
     var body = (els.composerBody.value || '').trim();
-    if (!sel || !body) {
+    // An empty body is a no-op: keep the composer open (the submit button is already
+    // disabled in this state) so an accidental submit never discards an in-progress edit.
+    if (!body) return;
+    // EDIT flow: PATCH the existing note's body. The edit UI offers no way to change the
+    // kind, so omit it — the server preserves the existing kind when none is sent.
+    if (state.editingId) {
+      var id = state.editingId;
+      api('POST', '/api/comments/' + id + '/edit', { body: body })
+        .then(function () {
+          closeComposer();
+          return loadComments();
+        })
+        .catch(function (e) {
+          alert('Failed to save: ' + e.message);
+        });
+      return;
+    }
+    // CREATE flow: a new note anchored to the current selection.
+    var sel = state.pendingSelection;
+    if (!sel) {
       closeComposer();
       return;
     }
     api('POST', '/api/comments', {
       quote: sel.quote,
       body: body,
-      author: author(),
+      kind: state.pendingKind,
       section_id: sel.section_id,
       section_title: sel.section_title,
       start: sel.start,
@@ -342,13 +448,21 @@
         return loadComments();
       })
       .catch(function (e) {
-        alert('Failed to add comment: ' + e.message);
+        alert('Failed to add note: ' + e.message);
       });
   }
 
   // ---- comment rendering --------------------------------------------------
   function statusPill(status) {
     return '<span class="status-pill status-' + esc(status) + '">' + esc(status) + '</span>';
+  }
+  // The kind chip makes question-vs-remark obvious at a glance (distinct icon + colour).
+  // Interpolated values are escaped per this file's convention, even though KINDS holds
+  // only hardcoded glyphs today.
+  function kindChip(c) {
+    var k = kindOf(c);
+    var meta = KINDS[k];
+    return '<span class="kind-chip kind-' + k + '">' + esc(meta.icon) + ' ' + esc(meta.label) + '</span>';
   }
   function renderComments() {
     var list = state.comments.filter(function (c) {
@@ -363,18 +477,26 @@
       els.commentsList.appendChild(renderComment(c));
     });
     updatePendingTray();
+    updateCommentsCount();
+  }
+  // The collapsed bar shows a count badge so the reviewer knows there are notes without
+  // expanding the panel (the panel collapses to just its header).
+  function updateCommentsCount() {
+    var n = state.comments.length;
+    els.commentsCount.textContent = String(n);
+    // A bare number is meaningless to a screen reader; label it.
+    els.commentsCount.setAttribute('aria-label', n + (n === 1 ? ' note' : ' notes'));
+    els.commentsCount.hidden = n === 0;
   }
   function renderComment(c) {
     var div = document.createElement('div');
-    div.className = 'comment' + (c._unanchored ? ' unanchored' : '');
+    div.className = 'comment kind-border-' + kindOf(c) + (c._unanchored ? ' unanchored' : '');
     div.dataset.id = c.id;
     var meta =
       '<div class="comment-meta">' +
+      kindChip(c) +
       statusPill(c.status) +
-      '<span>' +
-      esc(c.author) +
-      '</span>' +
-      (c.section_title ? '<span>· ' + esc(c.section_title) + '</span>' : '') +
+      (c.section_title ? '<span class="comment-section">· ' + esc(c.section_title) + '</span>' : '') +
       (c._unanchored ? '<span class="unanchored-flag">· unanchored</span>' : '') +
       '</div>';
     var quote = c.quote ? '<blockquote class="comment-quote">' + esc(c.quote) + '</blockquote>' : '';
@@ -386,9 +508,7 @@
         c.replies
           .map(function (r) {
             return (
-              '<div class="reply"><div class="reply-meta">' +
-              esc(r.author) +
-              '</div>' +
+              '<div class="reply">' +
               '<div class="reply-body">' +
               esc(r.body) +
               '</div></div>'
@@ -397,9 +517,12 @@
           .join('') +
         '</div>';
     }
+    // A question expects an answer, so it leads with "Answer"; a remark leads with "Reply".
+    var replyLabel = KINDS[kindOf(c)].replyLabel;
     var actions =
       '<div class="comment-actions">' +
-      '<button data-act="reply">Reply</button>' +
+      '<button data-act="edit">Edit</button>' +
+      '<button data-act="reply">' + replyLabel + '</button>' +
       (c.status === 'resolved'
         ? '<button data-act="unresolve">Reopen</button>'
         : '<button data-act="resolve">Resolve</button>') +
@@ -408,7 +531,7 @@
     var replyBox =
       '<div class="reply-box">' +
       '<textarea rows="2" placeholder="Write an answer…"></textarea>' +
-      '<button class="primary reply-send">Reply</button></div>';
+      '<button class="primary reply-send">' + replyLabel + '</button></div>';
     div.innerHTML = meta + quote + bodyHtml + replies + actions + replyBox;
 
     div.addEventListener('click', function (e) {
@@ -425,7 +548,7 @@
       var ta = div.querySelector('.reply-box textarea');
       var body = (ta.value || '').trim();
       if (!body) return;
-      api('POST', '/api/comments/' + c.id + '/reply', { body: body, author: author() })
+      api('POST', '/api/comments/' + c.id + '/reply', { body: body })
         .then(function () {
           return loadComments();
         })
@@ -437,6 +560,10 @@
   }
 
   function handleAction(c, act, div) {
+    if (act === 'edit') {
+      openEditComposer(c);
+      return;
+    }
     if (act === 'reply') {
       var box = div.querySelector('.reply-box');
       box.classList.toggle('open');
@@ -444,7 +571,7 @@
       return;
     }
     if (act === 'delete') {
-      if (!confirm('Delete this comment?')) return;
+      if (!confirm('Delete this note?')) return;
       api('POST', '/api/comments/' + c.id + '/delete', {})
         .then(function () {
           return loadComments();
@@ -763,21 +890,19 @@
   }
 
   // ---- filters / submit ---------------------------------------------------
+  // The filter is a compact <select> (one row on mobile, no wrapping pills); keep its
+  // value in sync when the filter is changed programmatically (e.g. setFilterAndShow).
   function setFilter(f) {
     state.filter = f;
-    Array.prototype.forEach.call(els.filters.querySelectorAll('button'), function (b) {
-      b.classList.toggle('active', b.dataset.filter === f);
-    });
+    if (els.filterSelect.value !== f) els.filterSelect.value = f;
     renderComments();
   }
 
   // ---- pane collapse / resize --------------------------------------------
-  function toggleClass(cls) {
-    els.layout.classList.toggle(cls);
-    // never let both be collapsed at once
-    if (els.layout.classList.contains('spec-collapsed') && els.layout.classList.contains('comments-collapsed')) {
-      els.layout.classList.remove(cls === 'spec-collapsed' ? 'comments-collapsed' : 'spec-collapsed');
-    }
+  function toggleComments() {
+    els.layout.classList.toggle('comments-collapsed');
+    var collapsed = els.layout.classList.contains('comments-collapsed');
+    els.commentsCollapse.setAttribute('aria-expanded', String(!collapsed));
   }
   function wireDivider() {
     var dragging = false;
@@ -845,8 +970,11 @@
         openComposer(kind);
       });
     }
-    wirePopupButton(els.selComment, 'comment');
     wirePopupButton(els.selQuestion, 'question');
+    wirePopupButton(els.selRemark, 'remark');
+    // The framing hint lives once in KINDS; mirror it onto the popup buttons' tooltips.
+    els.selQuestion.title = KINDS.question.hint;
+    els.selRemark.title = KINDS.remark.hint;
     els.composerCancel.addEventListener('click', closeComposer);
     els.composerSubmit.addEventListener('click', submitComposer);
     els.composerBackdrop.addEventListener('click', function (e) {
@@ -856,8 +984,10 @@
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submitComposer();
       if (e.key === 'Escape') closeComposer();
     });
-    els.filters.addEventListener('click', function (e) {
-      if (e.target.dataset.filter) setFilter(e.target.dataset.filter);
+    // Keep the submit button's enabled state in sync with the body (disabled while empty).
+    els.composerBody.addEventListener('input', syncComposerSubmit);
+    els.filterSelect.addEventListener('change', function () {
+      setFilter(els.filterSelect.value);
     });
     els.submitReview.addEventListener('click', function () {
       api('POST', '/api/submit', {})
@@ -870,29 +1000,9 @@
           alert('Submit failed: ' + e.message);
         });
     });
-    els.toggleSpec.addEventListener('click', function () {
-      toggleClass('spec-collapsed');
-    });
-    els.toggleComments.addEventListener('click', function () {
-      toggleClass('comments-collapsed');
-    });
-    els.commentsCollapse.addEventListener('click', function () {
-      toggleClass('comments-collapsed');
-    });
+    els.commentsCollapse.addEventListener('click', toggleComments);
+    els.navBack.addEventListener('click', navBack);
     wireDivider();
-    try {
-      var savedAuthor = localStorage.getItem('specweb-author');
-      if (savedAuthor) els.authorInput.value = savedAuthor;
-    } catch (e) {
-      /* ignore */
-    }
-    els.authorInput.addEventListener('change', function () {
-      try {
-        localStorage.setItem('specweb-author', els.authorInput.value);
-      } catch (e) {
-        /* ignore */
-      }
-    });
   }
 
   // ---- boot ---------------------------------------------------------------

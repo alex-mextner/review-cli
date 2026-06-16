@@ -11,8 +11,11 @@ A comment captures enough to RE-ANCHOR it in the rendered spec on reload:
   * ``section_title`` — that heading's human text (for the sidebar);
   * ``start``/``end`` — char offsets of the selection WITHIN its section's text (a hint
                         for fuzzy re-anchoring; not authoritative);
+  * ``kind``        — ``question`` (expects an answer from the author) | ``remark``
+                       (feedback that does not). Drives the sidebar label/icon/colour.
   * ``body``        — the comment / question text;
-  * ``author``      — who left it;
+  * ``author``      — who left it (single implicit reviewer; not shown in the UI but kept
+                       so export/import payloads round-trip);
   * ``created``     — ISO-8601 UTC;
   * ``status``      — ``pending`` | ``submitted`` | ``answered`` | ``resolved``;
   * ``batch``       — the submit-batch timestamp once submitted (None while pending);
@@ -39,6 +42,19 @@ from pathlib import Path
 _LOCK = threading.RLock()
 
 VALID_STATUSES = ("pending", "submitted", "answered", "resolved")
+# A note is either a QUESTION (expects an answer from the spec author) or a REMARK
+# (feedback that does not). Default REMARK: a note created without an explicit kind, and
+# every legacy comment persisted before this field existed, reads as a remark.
+VALID_KINDS = ("question", "remark")
+DEFAULT_KIND = "remark"
+# Human label per kind — single source of truth for the markdown export (the client mirrors
+# these in KINDS in app.js). Keeping the map here means adding a third kind touches one spot.
+KIND_LABELS = {"question": "Question", "remark": "Remark"}
+
+
+def _norm_kind(value: object) -> str:
+    """Coerce an arbitrary value to a valid kind string, defaulting to ``remark``."""
+    return value if isinstance(value, str) and value in VALID_KINDS else DEFAULT_KIND
 
 
 def store_dir() -> Path:
@@ -135,9 +151,15 @@ class SpecStore:
         section_title: str = "",
         start: int | None = None,
         end: int | None = None,
+        kind: str = DEFAULT_KIND,
         author: str = "reviewer",
     ) -> dict:
-        """Create a new comment. It enters the PENDING batch (GitHub-review style)."""
+        """Create a new comment. It enters the PENDING batch (GitHub-review style).
+
+        ``author`` is an import/seed escape hatch: the single-reviewer UI never sends it
+        (it defaults to ``reviewer`` and is not displayed), but it is honoured so import/
+        export payloads with explicit attribution round-trip.
+        """
         rec = {
             "id": _new_id(),
             "quote": (quote or "").strip(),
@@ -145,6 +167,7 @@ class SpecStore:
             "section_title": (section_title or "").strip(),
             "start": start,
             "end": end,
+            "kind": _norm_kind(kind),
             "body": (body or "").strip(),
             "author": (author or "reviewer").strip() or "reviewer",
             "created": _now(),
@@ -179,6 +202,27 @@ class SpecStore:
                         c["status"] = "answered"
                     self._write(data)
                     return c
+        return None
+
+    def edit_comment(self, comment_id: str, *, body: str, kind: str | None = None) -> dict | None:
+        """Edit a comment's body and (optionally) its kind. Status/batch are NOT changed —
+        a submitted note stays submitted; the reviewer is just correcting what they wrote.
+
+        Two failure modes (mirrors set_status/add_reply): an EMPTY body raises ValueError
+        (the server maps it to 400); an UNKNOWN id returns None (mapped to 404). On success
+        returns a COPY of the updated record."""
+        new_body = (body or "").strip()
+        if not new_body:
+            raise ValueError("comment 'body' is required")
+        with _LOCK:
+            data = self.load()
+            for c in data["comments"]:
+                if c.get("id") == comment_id:
+                    c["body"] = new_body
+                    if kind is not None:
+                        c["kind"] = _norm_kind(kind)
+                    self._write(data)
+                    return dict(c)
         return None
 
     def set_status(self, comment_id: str, status: str) -> dict | None:
@@ -236,6 +280,7 @@ class SpecStore:
                   "section_id": "94-...",          # optional, for re-anchoring
                   "section_title": "§9.4 ...",     # optional, sidebar label
                   "start": 12, "end": 40,          # optional char offsets
+                  "kind": "question",              # optional, "question"|"remark" (default remark)
                   "author": "alex",                # optional, default "reviewer"
                   "status": "submitted",           # optional, default "pending"
                   "batch": "2026-06-14T...",        # optional
@@ -287,6 +332,7 @@ class SpecStore:
                     "section_title": _str(raw.get("section_title")).strip(),
                     "start": start if isinstance(start, int) else None,
                     "end": end if isinstance(end, int) else None,
+                    "kind": _norm_kind(raw.get("kind")),
                     "body": _str(raw.get("body")).strip(),
                     "author": _str(raw.get("author"), "reviewer") or "reviewer",
                     "created": _str(raw.get("created")) or _now(),
@@ -329,9 +375,9 @@ class SpecStore:
             lines.append("")
             for c in items:
                 status = c.get("status", "pending")
-                author = c.get("author", "reviewer")
                 created = c.get("created", "")
-                lines.append(f"### [{status}] {author} — {created}")
+                kind_label = KIND_LABELS[_norm_kind(c.get("kind"))]
+                lines.append(f"### {kind_label} [{status}] — {created}")
                 quote = c.get("quote", "")
                 if quote:
                     for q in quote.splitlines() or [quote]:

@@ -314,6 +314,72 @@ def test_store_delete():
         assert store.delete_comment("nope") is False
 
 
+def test_store_kind_defaults_remark_and_persists_question():
+    # A note's kind drives the sidebar label/icon; default is remark, an explicit question
+    # round-trips, and an invalid kind is coerced to the remark default (never crashes).
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        r = store.add_comment(quote="q", body="a remark")
+        assert r["kind"] == "remark", "default kind is remark"
+        q = store.add_comment(quote="q", body="a question", kind="question")
+        assert q["kind"] == "question"
+        bad = store.add_comment(quote="q", body="bogus", kind="not-a-kind")
+        assert bad["kind"] == "remark", "invalid kind coerces to remark"
+        # persists across a fresh store instance
+        assert SpecStore(FIXTURE).get_comment(q["id"])["kind"] == "question"
+
+
+def test_store_edit_comment_changes_body_keeps_status():
+    # Editing a note's text must not disturb its status/batch — the reviewer is correcting
+    # what they wrote, not reopening the thread.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        c = store.add_comment(quote="q", body="original", kind="question")
+        store.submit_pending()
+        assert store.get_comment(c["id"])["status"] == "submitted"
+        edited = store.edit_comment(c["id"], body="corrected text")
+        assert edited is not None and edited["body"] == "corrected text"
+        again = store.get_comment(c["id"])
+        assert again["status"] == "submitted", "edit must not reset status"
+        assert again["kind"] == "question", "kind preserved when not passed"
+        # persists across a fresh store instance (not an in-memory-only mutation)
+        assert SpecStore(FIXTURE).get_comment(c["id"])["body"] == "corrected text"
+        # editing the kind too; a bogus kind coerces to remark
+        store.edit_comment(c["id"], body="corrected text", kind="remark")
+        assert store.get_comment(c["id"])["kind"] == "remark"
+        store.edit_comment(c["id"], body="corrected text", kind="garbage")
+        assert store.get_comment(c["id"])["kind"] == "remark", "invalid kind coerces to remark"
+        # empty body rejected; unknown id -> None
+        try:
+            store.edit_comment(c["id"], body="   ")
+            raise AssertionError("empty body should raise")
+        except ValueError:
+            pass
+        assert store.edit_comment("nope", body="x") is None
+
+
+def test_store_import_carries_kind():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.import_thread({"comments": [
+            {"body": "a q", "kind": "question"},
+            {"body": "a r"},  # no kind -> remark
+        ]})
+        kinds = {c["body"]: c["kind"] for c in store.all_comments()}
+        assert kinds["a q"] == "question"
+        assert kinds["a r"] == "remark"
+
+
+def test_store_export_labels_kind():
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.add_comment(quote="q", body="my question", kind="question", section_title="1. Overview")
+        store.add_comment(quote="q", body="my remark", kind="remark", section_title="1. Overview")
+        md = store.export_markdown()
+        assert "Question [pending]" in md, md
+        assert "Remark [pending]" in md, md
+
+
 def test_store_import_seed_and_unanchored_preserved():
     with _TempStoreEnv():
         payload = json.loads(SEED.read_text(encoding="utf-8"))
@@ -629,6 +695,56 @@ def test_server_comment_requires_body():
         try:
             st, _, _ = s.post("/api/comments", {"quote": "x"})  # no body
             assert st == 400, st
+        finally:
+            s.stop()
+
+
+def test_server_comment_kind_and_edit():
+    # The create payload carries a kind (question|remark); /edit updates the body and the
+    # kind in place without changing status.
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, _ = s.post("/api/comments", {"body": "is this right?", "kind": "question"})
+            assert st == 201, (st, body)
+            cid = json.loads(body)["comment"]["id"]
+            assert json.loads(body)["comment"]["kind"] == "question"
+            # a create WITHOUT a kind defaults to remark at the HTTP boundary
+            st, body, _ = s.post("/api/comments", {"body": "no kind"})
+            assert st == 201 and json.loads(body)["comment"]["kind"] == "remark", body
+            # edit the body + flip to remark
+            st, body, _ = s.post("/api/comments/%s/edit" % cid, {"body": "rephrased", "kind": "remark"})
+            assert st == 200, (st, body)
+            rec = json.loads(body)["comment"]
+            assert rec["body"] == "rephrased" and rec["kind"] == "remark"
+            # editing with an empty body -> 400; editing an unknown id -> 404
+            st, _, _ = s.post("/api/comments/%s/edit" % cid, {"body": "   "})
+            assert st == 400, st
+            st, _, _ = s.post("/api/comments/does-not-exist/edit", {"body": "x"})
+            assert st == 404, st
+            # /edit WITHOUT kind keeps the existing kind (HTTP path passes kind=None).
+            st, body, _ = s.post("/api/comments/%s/edit" % cid, {"body": "no kind given"})
+            assert st == 200 and json.loads(body)["comment"]["kind"] == "remark", body
+            # an invalid kind on the HTTP path coerces to remark (never errors).
+            st, body, _ = s.post("/api/comments/%s/edit" % cid, {"body": "x", "kind": "not-a-kind"})
+            assert st == 200 and json.loads(body)["comment"]["kind"] == "remark", body
+        finally:
+            s.stop()
+
+
+def test_server_create_honours_explicit_author():
+    # The UI omits author (single implicit reviewer), but an explicit author on the create
+    # payload is still honoured so import/seed-style writes round-trip. Pin it so a future
+    # cleanup that drops the author line is caught.
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, _ = s.post("/api/comments", {"body": "x", "author": "alex"})
+            assert st == 201, (st, body)
+            assert json.loads(body)["comment"]["author"] == "alex"
+            # omitting author defaults to the implicit reviewer
+            st, body, _ = s.post("/api/comments", {"body": "y"})
+            assert json.loads(body)["comment"]["author"] == "reviewer"
         finally:
             s.stop()
 
