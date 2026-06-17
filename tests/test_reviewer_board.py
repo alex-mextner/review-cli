@@ -423,7 +423,7 @@ def test_cli_explicit_models_disable_board():
 
     captured: dict = {}
 
-    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None):
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
         captured["models"] = models
         captured["board"] = board
         return 0
@@ -475,7 +475,7 @@ def test_cli_config_models_beat_board():
 
     captured: dict = {}
 
-    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None):
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
         captured["models"] = models
         captured["board"] = board
         return 0
@@ -654,7 +654,7 @@ def _capture_default_review_board(argv: list[str]) -> dict:
     captured: dict = {}
 
     def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None,
-                          pool_size=DEFAULT_POOL_SIZE, outcome_sink=None):
+                          pool_size=DEFAULT_POOL_SIZE, outcome_sink=None, **kw):
         captured["board"] = board
         captured["pool_size"] = pool_size
         return 0

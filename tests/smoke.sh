@@ -232,6 +232,14 @@ echo "provider-keys tests OK"
 python3 tests/test_reviewer_board.py
 echo "reviewer-board tests OK"
 
+# Agent-tools session review marker (~/.cache/agent-tools/last-review): a successful
+# staged review touches the mtime-windowed marker the separate require-review-before-commit
+# hook checks; an unstaged or FAILED review does not; the touch is best-effort (an
+# unwritable marker never fails the review). Offline (REVIEW_FAKE_BACKEND, marker redirected
+# to a temp path via REVIEW_MARKER — never the real cache).
+python3 tests/test_review_marker.py
+echo "review-marker tests OK"
+
 # Failover pool (priority + availability): startup failover skips an unavailable
 # higher-priority seat and pulls the next up; mid-run failover backfills a FAILED seat
 # (incl. the rc=0 "unavailable" sentinel body) from the reserve to keep the count;

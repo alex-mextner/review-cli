@@ -351,6 +351,36 @@ def _write_review_stamp(cwd: Path, diff: str) -> None:
         pass
 
 
+# The session-scoped, mtime-windowed marker that the separate `agent-tools`
+# `require-review-before-commit` agent-hook checks (see that hook's docstring:
+# `review … && touch "$REVIEW_MARKER"`). review-cli and agent-tools stay
+# decoupled — review-cli does not import agent-tools; it just touches a
+# well-known cache path on a successful staged review so a genuine review run
+# satisfies that gate without the agent forging the marker. The path is
+# overridable via REVIEW_MARKER (the same env the hook reads) for tests / custom
+# setups; default matches the hook's DEFAULT_MARKER.
+DEFAULT_REVIEW_MARKER = "~/.cache/agent-tools/last-review"
+
+
+def _touch_review_marker() -> None:
+    """Touch the agent-tools review marker so the require-review-before-commit
+    hook sees "a review ran this session". Best-effort: a failure here must
+    never break a review (the marker is a discipline reminder, not correctness).
+    Honors the REVIEW_MARKER env var (same name the hook reads)."""
+    try:
+        marker = Path(
+            os.path.expanduser(os.environ.get("REVIEW_MARKER", DEFAULT_REVIEW_MARKER))
+        )
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError:
+        # Swallow only I/O failures (unwritable path, a dir in the way, a bad
+        # REVIEW_MARKER) — the marker is a discipline reminder, never correctness, so a
+        # disk hiccup must not break a review. A non-OSError (e.g. a bad default
+        # constant) is a real bug and is intentionally NOT swallowed.
+        pass
+
+
 def install_commit_hook() -> int:
     """Install a GLOBAL git pre-commit hook enforcing review-before-commit.
     Opt-in (not run by install-skill) because it affects every repo."""
