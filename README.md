@@ -31,25 +31,30 @@ pipx install git+https://github.com/alex-mextner/review-cli
 After install, run `review install-skill` to register the tool into agent harnesses
 (`~/.agents/skills/review/`) so that Claude Code, Codex, opencode, and Gemini agents
 know `review` exists and can call it. The one-liner above runs this automatically.
-`install-skill` is idempotent — safe to re-run.
+The `install-*` commands (`install-skill` / `install-commit-hook` / `register-module`)
+are idempotent and report their INSTALLED state: each target shows a green ✓ "already
+configured" when nothing changed, or "+ wrote/updated" when it (re)wrote — so a re-run on
+a fully-set-up machine prints "already configured — nothing to do". A target that can't be
+configured (a foreign pre-commit hook, a wrong/occupied skill symlink, an unwriteable
+settings.json) is reported as `! conflict`, left untouched, and the command exits non-zero —
+resolve the conflict and re-run.
 
 ---
 
 ## Quick start
 
-Modes are **subcommands**: `review <mode> …`. The first verb selects the mode; a bare
-`review …` (no subcommand) defaults to the `review` diff-review, so the most common
-invocation is unchanged.
+Modes are **subcommands**: `review <mode> …`. The first verb selects the mode. A bare
+`review` (no subcommand) prints the **help** — the diff review is `review diff`.
 
 ```bash
-# Review unstaged diff with your default backends (bare `review` == `review review`)
-review
+# Review unstaged diff with your default backends
+review diff
 
-# Review staged changes
-review --staged
+# Review staged changes (pre-commit)
+review diff --staged
 
 # Add backends to the defaults
-review -m codex -m fable5 -m gemini
+review diff -m codex -m fable5 -m gemini
 
 # Ask all backends a quick question (no diff needed)
 review just-ask "Is a single-file Python CLI the right idiom for this tool?"
@@ -65,14 +70,20 @@ review brainstorm "Alternatives before I commit?" --diff
 review brainstorm "Risks in this design?" --staged
 
 # Save the result to a file — use -o, NOT `> file` (zsh noclobber-safe)
-review -o review.md
+review diff -o review.md
 ```
+
+> **The diff review is `review diff` now.** A bare `review` (no subcommand) prints the
+> help — it does **not** run a diff review (the old "bare review == a diff review" default
+> was a mistake). The diff review moved from the stuttering `review review` to
+> **`review diff`**. The removed `review review` verb and `review -C <repo>` (flags with
+> no verb) print a one-line `review diff` pointer and exit non-zero. The meta flags
+> (`--list-defaults` / `--show-board` / `--help`) still work with no subcommand.
 
 > **Modes moved from flags to subcommands.** The old `--brainstorm` / `--quorum` /
 > `--just-ask` flags are gone — use the `brainstorm` / `quorum` / `just-ask`
-> subcommands. The flags now print a one-line pointer and exit non-zero. A bare
-> `review …` (and an explicit `review review …`) still runs the diff review exactly as
-> before. `--visual` stays a **composable flag** (not a mode): it rides any subcommand.
+> subcommands. The flags now print a one-line pointer and exit non-zero. `--visual` stays
+> a **composable flag** (not a mode): it rides any subcommand (e.g. `review diff --visual`).
 
 > **Write to a file with `-o file.md`, not `review … > file.md`.** Under zsh
 > `noclobber` (a common default), `> file.md` refuses to overwrite an existing file
@@ -80,24 +91,27 @@ review -o review.md
 > Python (`open(...,"w")`), bypassing the shell redirect entirely: it creates parent
 > dirs, always overwrites, and still prints to stdout. See [Flags](#flags).
 
+> **Deep help: `review help <topic>`.** Beyond `review --help` / `review <mode> --help`,
+> `review help config` (alias `review --help config`) prints the configuration reference —
+> the config file + cascade, the model/board selection, and keys/auth. The main `--help`
+> lists the available topics.
+
 ---
 
 ## Modes
 
-### Review (default)
+### Diff review (`review diff`)
 
 ![review mode](docs/mode-review.svg)
 
 N backends review your diff in parallel — one pass, no moderator. Best for pre-commit
-checks where you want fast, independent perspectives without ceremony. `review` (a bare
-invocation) and the explicit `review review` are the same diff-review path; **a diff is
-required** (the default).
+checks where you want fast, independent perspectives without ceremony. The diff review is
+the **`diff`** subcommand (`review diff`); **a diff is required**.
 
 ```bash
-review
-review --staged
-review review --staged          # explicit subcommand form (identical)
-git show --format= --no-ext-diff HEAD | review -m gemini,codex
+review diff
+review diff --staged
+git show --format= --no-ext-diff HEAD | review diff -m gemini,codex
 ```
 
 ---
@@ -366,7 +380,7 @@ small local-only JSON endpoints (`GET /api/runs|stats|runs/<id>`, `POST .../feed
 
 ---
 
-## `review --visual` — visual verification
+## `review diff --visual` — visual verification
 
 **Give it a screenshot; it judges keep / rollback / repair.** `--visual` is image-only
 visual verification: pixels in → verdict out. There is **no DOM, no page, no capture** —
@@ -390,21 +404,21 @@ self-decides and the local model never overrides it.
 
 ![review --visual cases — REPORTS-unstyled (top) vs no-report-styled (bottom)](docs/assets/visual-cases.png)
 
-*What `review --visual <image>` reports across real renders. Top row: unstyled / blank / FOUC /
+*What `review diff --visual <image>` reports across real renders. Top row: unstyled / blank / FOUC /
 error-overlay renders the detector flags (each one would block a `tg --photo` send). Bottom row:
 properly-styled renders it stays quiet on. (The grid's title art is the tool's old standalone
-name "styleprobe" in older copies — it is the `review --visual` detector.)*
+name "styleprobe" in older copies — it is the `--visual` detector.)*
 
 ### Composable flag, not a mode
 
 `--visual` is **orthogonal** to the four review modes — it is a **composable flag** on
-any subcommand (`brainstorm` / `quorum` / `just-ask` / `review`), so the personas /
+any subcommand (`brainstorm` / `quorum` / `just-ask` / `diff`), so the personas /
 voters / reviewer literally **see** the image as multimodal context, or it runs
 standalone:
 
 ```bash
-# Standalone — pure verdict pipeline on one render
-review --visual after.png
+# Standalone — pure verdict pipeline on one render (no diff present)
+review diff --visual after.png
 
 # The brainstorm personas see the screenshot and reason about it
 review brainstorm "is this layout good?" --visual after.png
@@ -412,8 +426,8 @@ review brainstorm "is this layout good?" --visual after.png
 # Every quorum voter gets the image as shared context
 review quorum "ship this UI?" --visual after.png
 
-# Default diff-review with the rendered result attached as evidence
-review --visual after.png        # (bare `review` with a diff present)
+# Diff review with the rendered result attached as evidence (a diff present)
+review diff --visual after.png
 ```
 
 When a companion mode is present the image and the active modules' visual questions are folded
@@ -457,9 +471,9 @@ short-circuiting before any vision call.
 
 ### `tg --photo` hook
 
-`tg` can run `review --visual` as a **pre-send hook** to block an unstyled / broken screenshot
+`tg` can run `review diff --visual` as a **pre-send hook** to block an unstyled / broken screenshot
 before it reaches Telegram — turning the often-violated "review screenshots before sending" rule
-into an enforced mechanism. The hook runs `review --visual <png> --json --strict`; a `rollback`
+into an enforced mechanism. The hook runs `review diff --visual <png> --json --strict`; a `rollback`
 verdict (exit 10) drops the photo, a `keep` lets it through, and a no-vision `human_review` /
 `unverified` fails *open* (warn + allow) so a missing key never bricks sends. See the
 `feat-tg-photo-visual-hook` branch and `docs/architecture-visual-verification.md` §7.
@@ -628,7 +642,7 @@ delivers the structured review to the launching agent.)
 3. For the closest calls, it builds the rival approaches in parallel **git worktrees**
    and compares them for real before committing.
 
-And before every commit, `review --staged` is a multi-model gate — optionally *enforced*
+And before every commit, `review diff --staged` is a multi-model gate — optionally *enforced*
 with `review install-commit-hook` (a global pre-commit hook that blocks unreviewed
 staged changes; bypass with `REVIEW_SKIP=1 git commit` or `git commit --no-verify`).
 
@@ -670,25 +684,27 @@ It falls back to an isolated temp dir (diff-only) in two cases:
   suppresses it), so to keep the sandbox trustworthy on a potentially adversarial repo,
   review refuses to run agentically there and reviews the diff in a clean dir instead.
 
-> **Note on the api-only board seats (commandcode, z.ai).** These are kept as raw
-> `api` backends, not routed through opencode. opencode's `@ai-sdk/openai-compatible`
-> adapter does not reliably drive the Command Code gateway (the request hangs / returns
-> empty, while the same models answer correctly over raw HTTP), and z.ai/GLM is not an
-> opencode-native provider. So commandcode/z.ai stay on the direct keyed-HTTP path;
-> opencode-native models (`oc:deepseek/…`, `oc:fireworks/…`, the free `oc:opencode/…`
-> gateway) get the agentic real-repo treatment above.
+> **Note on commandcode / z.ai (review-cli#24).** These were historically kept as raw
+> diff-only `api` backends — opencode's `@ai-sdk/openai-compatible` adapter did not
+> reliably drive the Command Code gateway, and z.ai/GLM was not an opencode-native
+> provider. That has been **re-investigated and resolved**: with `commandcode` and `zai`
+> registered as opencode **custom providers** (`~/.config/opencode/opencode.json`, auth via
+> `opencode auth login`), the default board's Kimi/GLM/Qwen/DeepSeek seats now run
+> agentically through opencode (`oc:commandcode/…`, `oc:zai/glm-5.2`) like the rest of the
+> board. The raw keyed-HTTP `commandcode:`/`zai:` backends remain for explicit `-m cc` /
+> `-m glm` and config-board seats on hosts without opencode.
 
 ---
 
 ## Subcommands & flags
 
 The mode is a **subcommand** (`review <mode> …`); the flags below are shared options
-available to the relevant subcommands. A bare `review …` (no subcommand) defaults to the
-`review` diff-review.
+available to the relevant subcommands. A bare `review` (no subcommand) prints this help —
+the diff review is `review diff`.
 
 ```
 SUBCOMMANDS
-review              Diff review across the reviewer board (the DEFAULT; requires a diff).
+diff                Diff review across the reviewer board (requires a diff).
 brainstorm TOPIC    Multi-round persona ideation; composable with --diff/--staged grounding.
 just-ask QUESTION   Single-shot multi-model answer to a question (diff optional).
 quorum QUESTION     Experts cite evidence + a moderator finds quorum/disagreement.
@@ -697,31 +713,39 @@ sessions            List / resume brainstorm sessions (-a all, -s <id> resume).
 spec-web SPEC.md    Interactive web reviewer for a markdown spec.
 install-skill | install-commit-hook | register-module
 
-SHARED FLAGS
--m / --model        Backend to include; repeat or comma-separate. Stacks with defaults.
---diff              Use the working-tree diff (default for review; optional grounding for brainstorm).
---staged            Use the staged diff (git diff --cached) instead of the working-tree diff.
---visual IMAGE      Composable flag (NOT a mode): attach/verify a render; rides any subcommand.
+GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)
+-m / --model        Backend to run; repeat or comma-separate. Default (no -m) is mode-aware:
+                    `review diff` runs the active reviewer board (or your config `models:`);
+                    brainstorm uses `brainstorm_models:`, just-ask/quorum the defaults.
+                    Each subcommand's `--help` shows its own effective default.
+-C / --cwd DIR      Run against a different repository directory.
+-o / --output FILE  Write the result to FILE via Python (creates parent dirs, always
+                    overwrites) while still printing to stdout. Use this instead of
+                    `review … > FILE`, which fails silently under zsh noclobber.
 --timeout N         Per-call timeout in seconds (default 1200 for review, 240 for panel modes).
---moderator M       Override the auto-selected moderator for quorum / brainstorm.
---rounds N          Minimum brainstorm rounds before STOP is allowed (default 5).
---max-rounds N      Hard cap on brainstorm rounds (default 8).
 --list-defaults     Print effective default backends and exit.
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
 --pool N            How many of the board's seats to run (default 4); the first N seats run,
                     the rest are kept in reserve. The board is never off — --pool only sizes
                     it. N<=0 (e.g. --pool 0) runs all seats.
---prompt TEXT       Override the default review prompt.
--C / --cwd DIR      Run against a different repository directory.
--o / --output FILE  Write the result to FILE via Python (creates parent dirs, always
-                    overwrites) while still printing to stdout. Use this instead of
-                    `review … > FILE`, which fails silently under zsh noclobber.
+
+SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
+--diff / --staged   Diff source: working-tree (--diff) or staged (--staged). On the diff
+                    review the diff is required; optional grounding for brainstorm.
+--prompt TEXT       (review diff) Override the diff-review prompt.
+--moderator M       (quorum / brainstorm) Override the auto-picked moderator.
+--rounds N          (brainstorm) Minimum rounds before STOP is allowed (default 5).
+--max-rounds N      (brainstorm) Hard cap on rounds (default 8).
+--visual IMAGE …    Composable visual-verification group (NOT a mode): attach/verify a
+                    render; rides any subcommand (e.g. `review diff --visual shot.png`).
+                    Companions: --before/--intent/--expect/--check/--json/--strict/--no-ai/
+                    --no-local-model/--vision-timeout/--project. See `review <mode> --help`.
 ```
 
 > **Modes are subcommands, not flags.** `--brainstorm` / `--quorum` / `--just-ask` were
 > removed; use `review brainstorm …` / `review quorum …` / `review just-ask …`. The old
-> flags print a one-line pointer and exit non-zero. `review …` (no subcommand) still runs
-> the diff review.
+> flags print a one-line pointer and exit non-zero. The diff review is `review diff` (a
+> bare `review` prints help; the removed `review review` verb points at `review diff`).
 
 ---
 
@@ -753,7 +777,7 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 
 ## Reviewer board
 
-The default `review` (plain diff review) runs a **reviewer board**: a panel where
+The plain `review diff` runs a **reviewer board**: a panel where
 each model is given its OWN review role/lens, so the panel covers the diff broadly
 instead of every model doing the same generic pass. The board is the default panel
 out of the box — no config file required.
@@ -761,7 +785,7 @@ out of the box — no config file required.
 ### Priority-ordered failover pool
 
 The board is a **priority-ordered** list of 8 models — strongest first — and a plain
-`review` runs a **pool of 4**. The pool is chosen by **priority + availability**, with
+`review diff` runs a **pool of 4**. The pool is chosen by **priority + availability**, with
 two layers of failover so the run keeps **4 working reviewers** even when models drop:
 
 - **Startup failover** — the active pool is the **top 4 AVAILABLE** seats by priority.
@@ -790,26 +814,42 @@ fully-keyed environment):
 | 1 | pool | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries |
 | 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
 | 3 | pool | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
-| 4 | pool | Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
-| 5 | reserve | GLM | `zai:glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom |
-| 6 | reserve | Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| 7 | reserve | DeepSeek | `commandcode:deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
+| 5 | reserve | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom |
+| 6 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| 7 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
 | 8 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+
+**Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
+the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
+Anthropic API only on a host that lacks the CLI but has an API key), Codex via the codex
+CLI, and Kimi/GLM/Qwen/DeepSeek through opencode (`oc:provider/model`) — all run read-only
+*inside* `-C` and can open any project file, not just the diff. **Gemini** is always
+diff-only (it has no agentic transport). `review --show-board` shows each seat's live
+`agentic`/`diff-only` scope for the current host. The board has
+a reserve, so an `oc:` seat that opencode can't reach is backfilled rather than blocking:
+a missing opencode **binary** is detected at startup (the seat probes unavailable and the
+pool fills from the next reserve); a missing **provider auth** (opencode present but the
+`commandcode`/`zai` provider not logged in) only surfaces at run time and triggers a mid-run
+reserve backfill. (The diff-only `commandcode:`/`zai:` keyed-HTTP backends are still there
+for explicit `-m cc`/`-m glm` and config boards on hosts without opencode.)
 
 **To re-rank** the board, reorder the priority list (`DEFAULT_BOARD` in
 `reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the
 highest priority. The role lens you attach to each model is independent of its priority.
 
-The GLM seat goes **direct to z.ai** (`zai:glm-5.2`, the newest GLM, reachable on the
-GLM Coding-Plan endpoint) via the z.ai backend — not through the commandcode gateway.
-It needs a z.ai key (see Auth). All other commandcode seats need `COMMANDCODE_API_KEY`.
+The GLM seat uses **his z.ai subscription** (`glm-5.2`, the newest GLM) through opencode's
+`zai` provider, so it reviews agentically — not the diff-only z.ai REST call. It needs that
+provider configured in opencode (see Auth); the other `oc:commandcode/…` seats reach the
+commandcode gateway the same way. opencode must be installed for the agentic seats; without
+it they fall back to the reserve.
 
 ```bash
-review --show-board   # priority order + which 4 are the live pool + reserve + availability
-review                # default failover pool: the top 4 AVAILABLE seats by priority
-review --pool 8       # run all 8 available seats (--pool 0 also means "all available")
-review --pool 2       # run the top 2 available seats (with failover)
-review -m codex -m gemini   # an explicit -m bypasses the board entirely (exact models)
+review --show-board        # priority order + which 4 are the live pool + reserve + availability
+review diff                # default failover pool: the top 4 AVAILABLE seats by priority
+review diff --pool 8       # run all 8 available seats (--pool 0 also means "all available")
+review diff --pool 2       # run the top 2 available seats (with failover)
+review diff -m codex -m gemini   # an explicit -m bypasses the board entirely (exact models)
 ```
 
 ### Board vs. models precedence
@@ -845,20 +885,24 @@ board:
   - { model: "claude:claude-fable-5",  role: architect }
   - { model: "claude:claude-opus-4-8", role: correctness }
   - { model: "codex",                  role: consistency, name: Codex }
-  - { model: "commandcode:moonshotai/Kimi-K2.7-Code", role: performance, name: Kimi }
-  - { model: "zai:glm-5.2",            role: quality }
-  - { model: "commandcode:Qwen/Qwen3.7-Max", role: security, name: Qwen }
+  # Agentic via opencode (oc:provider/model) — reads the repo read-only, like the default
+  # board (review-cli#24). Use the diff-only `commandcode:`/`zai:` forms only if you want a
+  # stateless keyed-HTTP seat that sees just the diff (and needs no opencode install).
+  - { model: "oc:commandcode/moonshotai/Kimi-K2.7-Code", role: performance, name: Kimi }
+  - { model: "oc:zai/glm-5.2",         role: quality }
+  - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
 ```
 
 **Optional heavyweight seats** (NOT enabled by default — the board stays at 8). Add
 either to your `board:` list for an extra 1M-context resilience / holistic-senior
-pass; both run through commandcode (need `COMMANDCODE_API_KEY`):
+pass; both run agentically through opencode's commandcode provider (needs opencode +
+`opencode auth login`, like the default `oc:` seats):
 
 ```yaml
 board:
   # ... the 8 default seats ...
-  - { model: "commandcode:MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
-  - { model: "commandcode:nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
+  - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
+  - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
 ```
 
 Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`,
@@ -875,27 +919,37 @@ Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
 Codex is the #3 board seat (GPT-5.5 IS codex — the agentic CLI route, free).
 
-**commandcode (DeepSeek / Kimi / Qwen board reviewers):** set
-`COMMANDCODE_API_KEY` (a Command Code `user_...` token) in the environment or in
-`~/.config/review-cli/.env`. Without it, those commandcode board reviewers are
-skipped and the board runs with whatever remains. No key is ever written to disk by
-review — it is only read.
+**Kimi / Qwen / DeepSeek / GLM board reviewers (agentic, via opencode):** since
+review-cli#24 these default board seats are `oc:commandcode/…` / `oc:zai/glm-5.2` —
+they run **agentically through opencode**, so they authenticate via **opencode's own
+provider config** (`opencode auth login`, the `commandcode`/`zai` providers in
+`~/.config/opencode/opencode.json`), NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
+opencode must be installed for these seats. A missing opencode **binary** makes the seat
+probe unavailable at startup (the board fills the pool from the next reserve); a missing
+**provider auth** (opencode present but the `commandcode`/`zai` provider not logged in) is
+NOT caught by the startup probe — it surfaces at run time and triggers a **mid-run reserve
+backfill**. Either way the board degrades gracefully rather than blocking. The default GLM
+seat pins `oc:zai/glm-5.2` (the
+flagship); to run an older GLM, override the seat in a `config.yaml` `board:` list (e.g.
+`{ model: "oc:zai/glm-5.1", role: quality }`).
 
-**z.ai / GLM (the `tests` board seat = `zai:glm-5.2`):** set `ZAI_API_KEY` (or
-`ZHIPU_API_KEY`) in the environment or `~/.config/review-cli/.env`. The default base
-URL is the **GLM Coding-Plan endpoint** `https://api.z.ai/api/coding/paas/v4` — only
-that endpoint serves the flagship `glm-5.2`; the standard `https://api.z.ai/api/paas/v4`
-endpoint tops out at `glm-5.1`. A Coding-Plan key gets `glm-5.2` out of the box; a
-standard-plan user overrides with `ZAI_BASE_URL=https://api.z.ai/api/paas/v4`. Note
-that the default `tests` board seat pins the model explicitly (`zai:glm-5.2`), and an
-explicit `zai:<model>` suffix wins over `ZAI_MODEL` — so a standard-plan user must
-also override that seat in a `config.yaml` `board:` list (e.g. `{ model: "zai:glm-5.1",
-role: tests }`); `ZAI_MODEL` alone only affects a bare `-m zai` invocation, not the
-suffix-pinned board seat. `glm-5.2` is a reasoning model: it returns a final
+**`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
+set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or
+`ZHIPU_API_KEY`) in the environment or `~/.config/review-cli/.env` to use the **diff-only**
+keyed-HTTP backends directly — `-m cc`, `-m glm`, or an explicit `commandcode:`/`zai:` seat
+in a `config.yaml` `board:` list. These keys are NOT consulted for the agentic `oc:` board
+seats above (opencode carries its own auth). No key is ever written to disk by review — it
+is only read. For z.ai the default base URL is the **GLM Coding-Plan endpoint**
+`https://api.z.ai/api/coding/paas/v4` — only that endpoint serves the flagship `glm-5.2`;
+the standard `https://api.z.ai/api/paas/v4` endpoint tops out at `glm-5.1`. A Coding-Plan
+key gets `glm-5.2` out of the box; a standard-plan user overrides with
+`ZAI_BASE_URL=https://api.z.ai/api/paas/v4`. An explicit `zai:<model>` suffix wins over
+`ZAI_MODEL`; `ZAI_MODEL` alone only affects a bare `-m zai` invocation. `glm-5.2` is a reasoning model: it returns a final
 answer plus a `reasoning_content` field; review reads the answer and falls back to the
-reasoning text when the answer is empty (e.g. a low output-token budget). Without a
-z.ai key the `tests` seat is skipped; the rest of the board still runs. The key is
-only read, never written.
+reasoning text when the answer is empty (e.g. a low output-token budget). This key gates
+only the **diff-only** `zai:` path (`-m glm` / an explicit `zai:` config seat) — the
+**default** GLM board seat is the agentic `oc:zai/glm-5.2` (role `quality`) and
+authenticates via opencode, not `ZAI_API_KEY`. The key is only read, never written.
 
 ---
 

@@ -71,7 +71,9 @@ def run(
     """Invoke ``bin/review`` (or an arbitrary argv when the first arg is absolute) and capture
     stdout+stderr together. Never raises on a non-zero exit — the caller asserts on rc."""
     argv = list(args)
-    if not os.path.isabs(argv[0]):
+    # Prepend the shim unless an absolute argv[0] was passed (an explicit binary path); a bare
+    # `run()` with no args runs `bin/review` with no subcommand.
+    if not argv or not os.path.isabs(argv[0]):
         argv = [REVIEW, *argv]
     full_env = {**os.environ, **(env or {})}
     return subprocess.run(
@@ -189,14 +191,21 @@ def test_removed_mcp_and_ln_flags_fail_loud():
     assert_in("`--ln` was removed", p2.stdout + p2.stderr)
 
 
-def test_bare_review_defaults_to_review_diff_path_for_meta():
+def test_diff_subcommand_and_review_review_pointer():
+    # The diff review is the `diff` SUBCOMMAND (review-cli#44, renamed from the stuttering
+    # `review review`). A bare meta `review --list-defaults` still works; `review diff
+    # --list-defaults` works explicitly; bare `review` (no subcommand) points at `review diff`;
+    # the removed `review review` verb errors (exit 2) pointing at the new verb.
     assert_in("codex", review_out("--list-defaults"))
-    assert_in("codex", review_out("review", "--list-defaults"))
+    assert_in("codex", review_out("diff", "--list-defaults"))
+    assert_in("review diff", review_out())  # bare review points at the new verb
+    p = assert_fails("review")             # `review review` is gone -> usage exit 2
+    assert_in("review diff", p.stdout + p.stderr)
 
 
 def test_non_git_dir_fails_gracefully_with_stable_code():
     nongit = _tmp()
-    p = run("-C", nongit, stdin="")
+    p = run("diff", "-C", nongit, stdin="")
     if p.returncode != 3:
         raise SmokeError(f"expected EXIT_NOT_A_REPO=3, got {p.returncode}\n{p.stdout}\n{p.stderr}")
     out = p.stdout + p.stderr
@@ -212,9 +221,11 @@ def test_non_git_dir_fails_gracefully_with_stable_code():
 
 
 def test_visual_flags_in_help():
-    top = review_out("--help")
+    # The composable --visual feature + companions ride the `diff` subcommand (review-cli#44),
+    # so they show on `review diff --help`, not the top-level overview.
+    diff_help = review_out("diff", "--help")
     for flag in ("--visual", "--no-ai", "--strict", "--no-local-model"):
-        assert_in(flag, top)
+        assert_in(flag, diff_help)
 
 
 def test_board_flags_and_listing():
@@ -225,7 +236,7 @@ def test_board_flags_and_listing():
     board = review_out("--show-board")
     for needle in (
         "architect", "claude:claude-fable-5", "claude:claude-opus-4-8",
-        "commandcode:deepseek/deepseek-v4-pro", "zai:glm-5.2", "contracts", "8 seats", "#1",
+        "oc:commandcode/deepseek/deepseek-v4-pro", "oc:zai/glm-5.2", "contracts", "8 seats", "#1",
     ):
         assert_in(needle, board, "in --show-board")
     assert_in("agentic", board.lower())
@@ -386,6 +397,11 @@ _UNIT_FILES = [
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_backstop.py", {}),
+    # From main's review-UX-chain (review-cli#44): help defaults, install hook text / state, topic help.
+    ("test_help_defaults.py", {}),
+    ("test_install_hook_text.py", {}),
+    ("test_install_state.py", {}),
+    ("test_topic_help.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in

@@ -400,7 +400,7 @@ PANELS.overview = () => {
     ? `<div class="list">${runs.slice(0, 12).map(runRow).join('')}</div>`
     : emptyState(
         'sessions',
-        'Run <code>review</code> / <code>review quorum</code> / <code>review brainstorm</code> and the per-call logs will appear here.',
+        'Run <code>review diff</code> / <code>review quorum</code> / <code>review brainstorm</code> and the per-call logs will appear here.',
       );
   html += `</div>`;
   return html;

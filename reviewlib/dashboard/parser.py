@@ -112,6 +112,12 @@ _CLAUDE_OPUS_MODEL = "claude:claude-opus-4-8"
 _SINGLE_MODEL_BACKENDS = {"codex": "codex", "gemini": "gemini"}
 # `commandcode API <model>` / `z.ai API <model>` header argv0 reveals the gateway model.
 _API_MODEL_RE = re.compile(r"\bAPI\s+(?P<model>\S+)")
+# opencode header argv0 is `opencode -m <provider/model>` (review_opencode passes it as
+# header_argv0). The board seat id is `oc:<provider/model>` (config DEFAULT_BOARD, built by
+# `_agentic`), so recover the selector and re-prefix it to the board id — otherwise every
+# agentic board seat (Kimi/GLM/Qwen/DeepSeek) would collapse to a single `opencode` row and
+# show `no_data` on the health view (review-cli#24).
+_OPENCODE_MODEL_RE = re.compile(r"-m\s+(?P<model>\S+)")
 # Claude API-mode header argv0 is EXACTLY `Anthropic API <model>` (optionally `@ <base>`),
 # written by review_claude_api. Anchor on that full prefix — NOT the generic `\bAPI` — so a
 # CLI-mode `claude-p` path that happens to contain `API ` (e.g. `/opt/API Tools/claude-p`)
@@ -942,6 +948,14 @@ def model_id_for_call(call: "CallLog") -> str:
         return _CLAUDE_OPUS_MODEL
     if backend in _SINGLE_MODEL_BACKENDS:
         return _SINGLE_MODEL_BACKENDS[backend]
+    if backend == "opencode":
+        # `opencode -m <provider/model>` -> board id `oc:<provider/model>` (the `_agentic`
+        # board seat). A bare opencode call with no `-m` (shouldn't happen for board seats)
+        # stays the backend name so it doesn't mis-attribute to a real seat.
+        m = _OPENCODE_MODEL_RE.search(call.argv0)
+        if m:
+            return f"oc:{m.group('model')}"
+        return backend
     prefix = _BACKEND_BOARD_PREFIX.get(backend)
     if prefix is not None:
         m = _API_MODEL_RE.search(call.argv0)
