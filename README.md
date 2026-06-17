@@ -85,6 +85,11 @@ review diff -o review.md
 > Python (`open(...,"w")`), bypassing the shell redirect entirely: it creates parent
 > dirs, always overwrites, and still prints to stdout. See [Flags](#flags).
 
+> **Deep help: `review help <topic>`.** Beyond `review --help` / `review <mode> --help`,
+> `review help config` (alias `review --help config`) prints the configuration reference —
+> the config file + cascade, the model/board selection, and keys/auth. The main `--help`
+> lists the available topics.
+
 ---
 
 ## Modes

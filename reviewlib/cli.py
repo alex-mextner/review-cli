@@ -23,6 +23,7 @@ from . import backends
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
 from .config import (
+    CONFIG_PATH,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
     DEFAULT_PROMPT,
@@ -810,7 +811,7 @@ def _model_default_help(mode: ModeSpec | None) -> str:
     # diff review (and the top-level overview, mode is None): models > the active board.
     if config_models:
         return f"your config.yaml models: {_fmt(config_models)}"
-    return "the active reviewer board (run `review --show-board`)"
+    return "the active reviewer board (run `review --show-board`; see `review help config`)"
 
 
 def _moderator_default_help() -> str:
@@ -977,7 +978,70 @@ def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
     return None
 
 
+def _help_topic_config() -> str:
+    """The `review help config` deep reference (ROADMAP "Topic-based help across the
+    ecosystem"): config file path + cascade, the keys, key/auth env vars, and how the
+    reviewer board + model selection resolve. Kept in sync with config.py / backends.py
+    behavior (help-docs-sync); a flag/behavior change updates this topic in the same commit."""
+    return f"""\
+review — configuration reference
+================================
+
+CONFIG FILE
+  {CONFIG_PATH}
+  Optional YAML. Absent / unparseable -> the built-in defaults apply (never an error).
+  Keys:
+    models:            list[str]  default backends for the diff review + just-ask/quorum.
+                       Set this and those EXACT models run (the flat panel) — it BYPASSES
+                       the reviewer board (cost-safety: you asked for specific models).
+    brainstorm_models: list[str]  default panel for `review brainstorm` (falls back to
+                       `models:`, then the built-in defaults). Unreachable backends are
+                       dropped gracefully.
+    board:             list[seat]  override the built-in reviewer board (see BOARD below).
+  Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
+  `glm` -> zai:glm-5.2, `cc` -> commandcode).
+
+SELECTION CASCADE (what runs when you do NOT pass -m), by mode:
+  review diff           : explicit -m  >  config `models:`  >  the active reviewer BOARD.
+  review brainstorm     : explicit -m  >  `brainstorm_models:`  >  `models:`  >  defaults.
+  review just-ask/quorum: explicit -m  >  `models:`  >  the built-in defaults.
+  Built-in defaults: {", ".join(_expand_alias(x) for x in DEFAULT_MODELS)}.
+  See the live default for each subcommand in `review <mode> --help` (the --model line).
+
+REVIEWER BOARD (the diff-review default; `review --show-board` prints it live)
+  A priority-ordered panel of {DEFAULT_POOL_SIZE * 2} seats, each model carrying its own
+  role/lens. A plain `review diff` runs a POOL of {DEFAULT_POOL_SIZE} (top-N AVAILABLE by
+  priority) with startup + mid-run failover from the reserve. `--pool N` sizes it
+  (`--pool 0` = all available). The board is never off — an explicit -m / config `models:`
+  bypasses it. To add/override a seat, set `board:` in config.yaml (a list of
+  {{model, role, name}} entries, strongest first; `name` is the display label, `role` is a
+  key into the built-in role lenses) or edit DEFAULT_BOARD in reviewlib/config.py.
+
+KEYS / AUTH (resolved from the process env first, then the shared .env)
+  Shared .env:  ~/.config/review-cli/.env   (override with $GEMINI_ENV_FILE)
+  Env vars:
+    GEMINI_API_KEY (or GOOGLE_API_KEY)  — gemini seat.
+    ZAI_API_KEY    (or ZHIPU_API_KEY)   — z.ai / GLM seat.
+    COMMANDCODE_API_KEY                 — commandcode seats (a `user_...` token ONLY).
+    ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN (+ optional ANTHROPIC_BASE_URL) — claude API.
+    REVIEW_CLAUDE_MODE=api|cli, REVIEW_<BACKEND>_MODE=api|cli — transport selection.
+  codex / opencode carry their own CLI auth (no key here).
+
+See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
+"""
+
+
+# Deep help TOPICS advertised from the main `review --help` and served by `review help
+# <topic>` / `review --help <topic>` (ROADMAP "Topic-based help across the ecosystem").
+# topic -> (one-line summary for the main-help listing, zero-arg renderer). Add a topic =
+# add an entry here; the main-help pointer + dispatch pick it up with no other edit.
+HELP_TOPICS: dict[str, tuple[str, "object"]] = {
+    "config": ("config file, the model/board selection cascade, keys/auth", _help_topic_config),
+}
+
+
 def _subcommand_epilog() -> str:
+    topics = "\n".join(f"  review help {t:<8} {summary}" for t, (summary, _) in HELP_TOPICS.items())
     return "subcommands:\n" + "\n".join(
         f"  {m.subcommand:<11} {m.summary}" for m in iter_modes()
     ) + (
@@ -985,6 +1049,9 @@ def _subcommand_epilog() -> str:
         "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
         "\n  spec-web    interactive web reviewer for a markdown spec"
         "\n  install-skill / install-commit-hook / register-module"
+        "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
+        + topics
+        + "\n  see `review help config` for configuration."
     )
 
 
@@ -1086,9 +1153,54 @@ def _reject_removed_subcommand(argv: list[str]) -> int | None:
     return None
 
 
+def _help_subcommand(rest: list[str]) -> int:
+    """`review help [<topic>]` — deep topic help (ROADMAP "Topic-based help across the
+    ecosystem"). Bare `review help` lists the topics; `review help <topic>` prints that
+    topic. An unknown topic lists the available ones + exits 2 (usage). Also reached as
+    `review --help <topic>` (see the main dispatch). Topics live in HELP_TOPICS so adding a
+    topic needs no edit here."""
+    if not rest:
+        print("review help topics:\n" + "\n".join(
+            f"  {t:<10} {summary}" for t, (summary, _) in HELP_TOPICS.items()
+        ) + "\n\nRun `review help <topic>` (or `review --help <topic>`) for the full reference.")
+        return 0
+    # Exactly one topic token — extra trailing args are a usage error, not silently dropped
+    # (codex review: `review help config --bogus` / `review --help config extra` must NOT
+    # exit 0 ignoring the tail).
+    if len(rest) > 1:
+        print(f"review help: takes a single topic, got extra arguments: {' '.join(rest[1:])}\n"
+              f"  use:  review help <topic>   (topics: {', '.join(HELP_TOPICS)})",
+              file=sys.stderr, flush=True)
+        return 2
+    topic = rest[0]
+    entry = HELP_TOPICS.get(topic)
+    if entry is None:
+        known = ", ".join(HELP_TOPICS)
+        print(f"review help: unknown topic '{topic}'. Known topics: {known}.",
+              file=sys.stderr, flush=True)
+        return 2
+    _summary, render = entry
+    text = render()
+    print(text, end="" if text.endswith("\n") else "\n")
+    return 0
+
+
 def _dispatch(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    # `review help [<topic>]` — deep topic help. Wired here (a bare management subcommand
+    # like `dashboard`), before mode resolution, so it stays off the main argparse surface.
+    if argv and argv[0] == "help":
+        return _help_subcommand(argv[1:])
+    # `review --help <topic>` is an alias for `review help <topic>` (ROADMAP advertises
+    # both spellings). Route ANY non-option token after `--help`/`-h` through the topic
+    # handler — so a known topic prints, and a TYPO (`review --help confg`) gets the same
+    # unknown-topic usage error (exit 2) as `review help confg`, not argparse's normal help
+    # (exit 0) (codex review). A bare `--help` (no token) falls through to argparse's help.
+    if len(argv) >= 2 and argv[0] in ("--help", "-h") and not argv[1].startswith("-"):
+        # Pass ALL tokens after --help (not just argv[1]) so extra trailing args are caught
+        # by _help_subcommand's usage check rather than silently dropped (codex review).
+        return _help_subcommand(argv[1:])
     if argv == ["install-skill"]:
         return install_skill()
     if argv == ["install-commit-hook"]:

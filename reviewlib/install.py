@@ -88,6 +88,8 @@ A bare `review` (no subcommand) prints HELP — it does NOT run a diff review (u
 verb) print a one-line `review diff` pointer and exit non-zero. The OLD mode flags
 (`--brainstorm` / `--quorum` / `--just-ask`) were likewise REMOVED. `--visual <img>` stays
 a COMPOSABLE flag that rides any subcommand (it is not a mode), e.g. `review diff --visual`.
+For configuration (config file, model/board selection, keys/auth) run `review help config`
+(alias `review --help config`); per-subcommand flags are on `review <mode> --help`.
 
 ## Save the result to a file: `-o FILE`, NOT `> FILE`
 Use `review diff -C <repo> -o out.md`, NOT `review diff -C <repo> … > out.md`. Under zsh

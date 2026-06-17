@@ -97,6 +97,19 @@ bin/review diff --help | grep -q "default 60"                  # --vision-timeou
 python3 tests/test_help_defaults.py
 echo "help-defaults tests OK"
 
+# Topic-based deep help (ROADMAP "Topic-based help across the ecosystem"): the main help
+# LISTS the topics + points at `review help config`; `review help config` (and the
+# `review --help config` alias) prints the config reference; an unknown topic is exit 2.
+bin/review --help | grep -q "help topics"
+bin/review --help | grep -q "review help config"
+bin/review help | grep -q "config"
+bin/review help config | grep -q "configuration reference"
+bin/review help config | grep -q "SELECTION CASCADE"
+bin/review --help config | grep -q "configuration reference"     # the alias form
+! bin/review help totally-bogus-topic >/dev/null 2>&1            # unknown topic -> exit 2
+python3 tests/test_topic_help.py
+echo "topic-help tests OK"
+
 # Subcommand-only options belong in the SUBCOMMAND help, not the global list (ROADMAP).
 # The composable --visual feature flags and their companions live on `review <mode> --help`
 # (they ride any subcommand), NOT on the top-level `review --help`.

@@ -51,6 +51,15 @@ the composable `--visual` group (rides any subcommand), `--prompt` (the diff rev
 + the mode-relevant flags + the `_add_visual_options` group + the mode's own positional).
 When you add a flag, put it where it belongs — do NOT pile it onto the global list.
 
+### Deep help topics
+
+`review help <topic>` (alias `review --help <topic>`) serves DEEP help topics; the main
+`review --help` lists them. Topics live in `HELP_TOPICS` in `cli.py` (topic -> (summary,
+renderer)); add a topic = add an entry, and the main-help listing + dispatch pick it up.
+Keep a topic in sync with behavior (help-docs-sync): a flag/behavior change updates its
+topic renderer in the same commit. `review help config` is the config reference (file +
+cascade + keys/auth + board).
+
 ## Architecture: `lib | cli | mcp`
 
 - **lib** — `reviewlib/` is the engine (`panel.py`, `backends.py`, `config.py`,
