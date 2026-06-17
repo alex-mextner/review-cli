@@ -177,9 +177,58 @@ bin/review spec-web reply --help | grep -q -- "comment_id"
 # The single-file CLI must always parse.
 python3 -c "import ast; ast.parse(open('bin/review').read()); print('ast.parse OK')"
 
-# HYP-742: the local web dashboard subcommand must be wired and its help must parse.
-bin/review dashboard --help | grep -q -- "--no-open"
-bin/review dashboard --help | grep -q -- "--port"
+# The local web dashboard is a MANAGED SERVICE (run/start/status/stop/enable/disable +
+# launchd/systemd autostart), powered by the shared `agenttools_service` lib. The hidden
+# `__serve` entry runs the blocking server and ALWAYS parses (no service lib needed) — it
+# carries the server flags (`--no-open`, `--port`, `--host`).
+bin/review dashboard __serve --help | grep -q -- "--no-open"
+bin/review dashboard __serve --help | grep -q -- "--port"
+bin/review dashboard __serve --help | grep -q -- "--host"
+# The managed-service surface depends on the optional `agenttools_service` lib. When it is
+# installed (`review-cli[dashboard]`), the lifecycle subcommands + bare-HELP-no-launch must
+# be wired; when it is ABSENT, the subcommand must fail with an ACTIONABLE error (exit 4),
+# never a raw ImportError traceback. Branch on whether the lib imports.
+if python3 -c "import agenttools_service" 2>/dev/null; then
+  bin/review dashboard --help | grep -q -- "--port"
+  for action in run start stop status enable disable; do
+    bin/review dashboard --help | grep -q -- "$action"
+  done
+  # BARE `review dashboard` prints HELP and launches NOTHING (it returns 0, not a server).
+  bin/review dashboard | grep -q -- "status"
+  bin/review dashboard | grep -qi "managed service"
+  # `status` with nothing running reports a clean state and the stable exit 3, no traceback.
+  set +e
+  dash_status_out="$(XDG_STATE_HOME="$(mktemp -d)" bin/review dashboard status 2>&1)"; dash_status_rc=$?
+  set -e
+  [ "$dash_status_rc" -eq 3 ]
+  ! echo "$dash_status_out" | grep -q "Traceback (most recent call last)"
+else
+  # A genuine lifecycle action without the lib: stable exit 4 + actionable error, no traceback.
+  set +e
+  dash_noimp_out="$(bin/review dashboard status 2>&1)"; dash_noimp_rc=$?
+  set -e
+  [ "$dash_noimp_rc" -eq 4 ]                                   # stable "missing lib" exit code
+  echo "$dash_noimp_out" | grep -q "agenttools_service"        # names the missing dep
+  echo "$dash_noimp_out" | grep -qi "pip install"              # tells the user how to fix it
+  ! echo "$dash_noimp_out" | grep -q "Traceback (most recent call last)"   # NO raw traceback
+  # BUT the bare-HELP contract does NOT depend on the lib: a bare `review dashboard` (and
+  # `--help`) must still print help and launch nothing (exit 0), advertising every action.
+  set +e
+  dash_help_out="$(bin/review dashboard 2>&1)"; dash_help_rc=$?
+  set -e
+  [ "$dash_help_rc" -eq 0 ]
+  for action in run start stop status enable disable; do
+    echo "$dash_help_out" | grep -q -- "$action"
+  done
+  ! echo "$dash_help_out" | grep -q "Traceback (most recent call last)"
+  bin/review dashboard --help | grep -q -- "status"            # --help also help-only, no error
+fi
+
+# Managed-dashboard WIRING unit tests (bare-HELP-no-launch, hidden __serve argv, absolute
+# argv[0] / live-symlink-trap probe, the backstop classifier incl. options-before-action).
+# Self-running, monkeypatches the service layer — does NOT need agenttools_service installed.
+python3 tests/test_dashboard_service.py
+echo "dashboard-service wiring tests OK"
 
 # Resumable sessions: the `sessions` bare subcommand must be wired and advertise its
 # list/resume flags. Listing is exercised against a TEMP log dir ($REVIEW_LOG_DIR) seeded

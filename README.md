@@ -301,17 +301,46 @@ handled explicitly:
 
 ---
 
-## `review dashboard` — local web dashboard
+## `review dashboard` — local web dashboard (managed service)
+
+The dashboard is a **managed service**: it gets the same lifecycle subcommands every
+long-running agent-tools server shares (run / start / status / stop / enable / disable),
+from the reusable `agenttools_service` lib — review-cli does not hand-roll pidfiles or
+autostart units.
 
 ```bash
-review dashboard            # start the dashboard, open a browser at http://127.0.0.1:<port>/
-review dashboard --port 8765 --no-open   # fixed port, no auto-open (for remote/tmux use)
+review dashboard            # bare = HELP (prints the actions, launches NOTHING)
+review dashboard run        # run in the FOREGROUND (this shell), blocking — ad-hoc / when disabled
+review dashboard start      # start in the BACKGROUND (detached daemon); returns immediately
+review dashboard status     # is it running? pid / port / url / autostart-enabled
+review dashboard stop       # stop the background instance
+review dashboard enable     # install OS autostart (launchd / systemd --user / fallback) AND start now
+review dashboard disable    # remove OS autostart AND stop
+review dashboard --port 8765 run   # global --host/--port apply to any action
 ```
+
+A bare `review dashboard` (no action) prints HELP and launches nothing. On `run`/`start`
+it hints how to `enable` autostart at login. `run` binds an ephemeral port; the managed
+`start`/`enable` bind a stable default port (so `status`'s url and a later restart land on
+the same address).
 
 A single-page web app over every review-cli run, built on the Python **stdlib** HTTP
 server (no extra deps) and a **vanilla-JS SPA** (no npm/build step — assets ship in the
-package). It binds **127.0.0.1 only**: the logs persist prompts/diffs that may carry
-secrets, so the dashboard is never exposed on the network.
+package). It binds **127.0.0.1 only** by default — the logs persist prompts/diffs that may
+carry secrets — so it is not exposed on the network unless you pass `--host 0.0.0.0` (e.g.
+to reach it over Tailscale).
+
+**Dependency:** the lifecycle subcommands need the shared `agenttools_service` lib (an
+in-ecosystem dependency, the `[dashboard]` extra). It is not yet on PyPI; until then install
+it editable from the agent-tools checkout (`pip install -e <agent-tools>/lib/agenttools_daemon
+-e <agent-tools>/lib/agenttools_service`). Without it, `run` still works for an ad-hoc
+foreground server and a bare `review dashboard` still prints help; only the managed
+start/status/stop/enable/disable actions emit an actionable error (exit 4).
+
+**Supported autostart matrix:** macOS → launchd LaunchAgent; Linux → systemd `--user`
+unit (with a no-systemd fallback); other OSes → no autostart (`enable` still starts the
+service now and warns it will not survive reboot). See `agent-tools/lib/agenttools_service`
+for the full matrix.
 
 **Data sources (read-only):** review-cli does not emit a structured run record, so the
 dashboard reads the real on-disk artifacts in `log_dir()` — the per-call streamed logs

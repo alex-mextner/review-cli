@@ -27,6 +27,12 @@ jobs:
       - name: Install ImageMagick
         run: sudo apt-get update && sudo apt-get install -y imagemagick
       - name: Install package + test deps
+        # NOTE: the managed-dashboard subcommands need the shared `agenttools_service` lib
+        # (the `[dashboard]` extra). It is an in-ecosystem lib, not yet on PyPI, so it is NOT
+        # installed here — the smoke suite exercises the actionable "lib missing" error path
+        # (exit 4, no traceback) instead, and the dashboard's data/parser tests don't need it.
+        # Once `agenttools-service` is published, add `[dashboard]` here to also exercise the
+        # wired lifecycle path in CI.
         run: pip install -e '.[test]'
       - name: Smoke + unit tests
         run: bash tests/smoke.sh

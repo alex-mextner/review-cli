@@ -312,11 +312,16 @@ def test_main_arms_the_backstop_around_dispatch():
 
 
 def test_main_does_not_backstop_persistent_server_subcommands():
-    """The persistent server subcommands (`dashboard`, `spec-web`) run until Ctrl-C, so
-    main() must NOT arm the watchdog around them — otherwise a lowered backstop (or the
-    4h ceiling) would kill the server (codex P2). Stub the server dispatch with a block
-    longer than a tiny backstop; if main() wrongly armed the backstop the child would
-    exit 124, so reaching the post-block print proves the server was left unbounded."""
+    """The persistent server invocations (`dashboard run` / its hidden `__serve`, and
+    `spec-web <spec>`) run until Ctrl-C, so main() must NOT arm the watchdog around them —
+    otherwise a lowered backstop (or the 4h ceiling) would kill the server (codex P2).
+
+    NOTE: a BARE `review dashboard` is now the managed-service HELP, not a server, and the
+    short-lived lifecycle actions (`start`/`status`/`stop`/`enable`/`disable`) return
+    immediately — only the FOREGROUND blocking server (`dashboard run`, `dashboard __serve`)
+    is persistent and must bypass the backstop. Stub the server dispatch with a block longer
+    than a tiny backstop; reaching the post-block print proves the server was left
+    unbounded."""
     from reviewlib import cli as _cli
 
     for sub in ("dashboard", "spec-web"):
@@ -326,7 +331,7 @@ def test_main_does_not_backstop_persistent_server_subcommands():
         "import reviewlib.cli as cli, time\n"
         # Server 'runs' for 5s; a 1s backstop, if armed, would kill it at ~1s with 124.
         "cli._dispatch = lambda argv=None: (time.sleep(5), print('SERVER-RAN'), 0)[-1]\n"
-        "sys.exit(cli.main(['dashboard']))\n"
+        "sys.exit(cli.main(['dashboard', 'run']))\n"
     ) % str(REPO_ROOT)
     env = dict(os.environ, REVIEW_BACKSTOP_SECONDS="1")
     proc = subprocess.run(
