@@ -5,6 +5,25 @@ semantic versioning.
 
 ## Unreleased
 
+- **The default board is AGENTIC by default (review-cli#24).** Every board seat that
+  *can* read the repo now does. The Kimi/GLM/Qwen/DeepSeek seats route through opencode
+  (`oc:provider/model`, e.g. `oc:commandcode/moonshotai/Kimi-K2.7-Code`, `oc:zai/glm-5.2`)
+  instead of the diff-only `commandcode:`/`zai:` keyed-HTTP REST calls, so they run
+  read-only *inside* the repo (`opencode run --agent read-only-reviewer --dir <cwd>`) and
+  can open any project file — not just the diff in the prompt — exactly like the codex and
+  claude-CLI seats already did. Only Gemini stays diff-only (it has no agentic transport).
+  opencode registers `commandcode` and `zai` as custom OpenAI-compatible providers, so the
+  same wire model ids are reachable agentically with no new auth. The diff-only
+  `commandcode:`/`zai:` backends stay available for explicit `-m cc`/`-m glm` and config
+  boards on hosts without opencode; the board prefers the agentic transport and, because it
+  has a reserve, an `oc:` seat that opencode can't reach is backfilled (startup/mid-run
+  failover) rather than blocking. The flat `DEFAULT_MODELS` panel deliberately keeps the
+  diff-only commandcode Kimi seat (it has no reserve, so it must not silently shrink on an
+  opencode-less host); `_agentic()` derives the board's agentic seat from the same constant
+  so the model id has one source of truth. The dashboard's per-model health view attributes
+  agentic opencode calls to their `oc:` board seat (the sidecar header now records the
+  `-m <provider/model>` selector), so Kimi/GLM/Qwen/DeepSeek no longer collapse into a
+  single `opencode` row.
 - **`review spec-web` is now a bidirectional review channel (phase 2).** Three changes:
   - **Submit delivers the review to the launching agent** (no markdown export). The
     primitive "Export review as markdown" button + the `/api/export` endpoint + the
@@ -47,12 +66,12 @@ semantic versioning.
   (e.g. `--just-ask` from a scratch dir) **or when the repo ships its own opencode config**
   (`.opencode/` or `opencode.json`/`.jsonc`) — a repo-local agent definition can override
   the global read-only agent and re-enable write/bash, so review refuses to run agentically
-  there and reviews the diff in a clean dir instead (sandbox-trust safety). **The api-only board seats (commandcode, z.ai) stay raw** and are
-  NOT routed through opencode: opencode's `@ai-sdk/openai-compatible` adapter does not
-  reliably drive the Command Code gateway (it hangs / returns empty while the same
-  models answer over raw HTTP), and z.ai/GLM is not an opencode-native provider — so
-  the agentic real-repo treatment applies to opencode-native models (`oc:deepseek/…`,
-  `oc:fireworks/…`, the free `oc:opencode/…` gateway).
+  there and reviews the diff in a clean dir instead (sandbox-trust safety). (At the time of
+  this entry the commandcode/z.ai board seats stayed raw diff-only — opencode's
+  `@ai-sdk/openai-compatible` adapter did not reliably drive the Command Code gateway, and
+  z.ai/GLM was not yet an opencode-native provider. **Superseded by review-cli#24 (see the
+  top Unreleased entry):** with `commandcode` and `zai` registered as opencode custom
+  providers, those default board seats now run agentically through opencode too.)
 - **Priority-ordered failover reviewer pool** — the reviewer board is now a
   **priority-ordered** list of 8 models (strongest first), and a plain `review` runs a
   **pool of 4** chosen by **priority + availability** with two layers of failover so the

@@ -138,8 +138,8 @@ def test_startup_failover_skips_unavailable_top_seat():
     assert [r.model for r in pool] == [
         "claude:claude-opus-4-8",
         "codex",
-        "commandcode:moonshotai/Kimi-K2.7-Code",
-        "zai:glm-5.2",
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "oc:zai/glm-5.2",
     ], [r.model for r in pool]
     # Fable is NOT in the pool nor the reserve — it's unavailable.
     assert "claude:claude-fable-5" not in {r.model for r in pool + reserve}
@@ -170,8 +170,8 @@ def test_startup_only_two_available_pool_shrinks_no_phantom():
     """Fewer available seats than the pool size -> the pool is just the available ones
     (no phantom seat), reserve empty."""
     board = list(DEFAULT_BOARD)
-    pool, reserve = split_pool_reserve(board, 4, _avail({"zai:glm-5.2", "gemini"}))
-    assert {r.model for r in pool} == {"zai:glm-5.2", "gemini"}
+    pool, reserve = split_pool_reserve(board, 4, _avail({"oc:zai/glm-5.2", "gemini"}))
+    assert {r.model for r in pool} == {"oc:zai/glm-5.2", "gemini"}
     assert reserve == []
 
 
@@ -224,8 +224,8 @@ def test_midrun_unavailable_body_triggers_backfill_fable_case():
     assert set(outcome.usable_models) == {
         "claude:claude-opus-4-8",
         "codex",
-        "commandcode:moonshotai/Kimi-K2.7-Code",
-        "zai:glm-5.2",
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "oc:zai/glm-5.2",
     }, outcome.usable_models
 
 

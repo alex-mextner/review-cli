@@ -37,6 +37,7 @@ from reviewlib.config import (  # noqa: E402
     REVIEW_ROLES,
     BoardConfigError,
     BoardReviewer,
+    _agentic,
     _split_models,
     load_board,
     select_pool,
@@ -55,11 +56,13 @@ def test_default_board_matches_directive_table():
         ("claude:claude-opus-4-8", "correctness", "Opus"),
         # Seat 3 is the agentic codex CLI route (see config.py / CHANGELOG for rationale).
         ("codex", "consistency", "Codex"),
-        ("commandcode:moonshotai/Kimi-K2.7-Code", "performance", "Kimi"),
-        # GLM goes DIRECT to z.ai (his GLM subscription), not commandcode.
-        ("zai:glm-5.2", "quality", "GLM"),
-        ("commandcode:Qwen/Qwen3.7-Max", "security", "Qwen"),
-        ("commandcode:deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
+        # Seats 4-7 route through opencode (`oc:`) so they run AGENTICALLY (read the repo
+        # read-only), not the diff-only commandcode/z.ai REST call (review-cli#24).
+        ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "performance", "Kimi"),
+        # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic.
+        ("oc:zai/glm-5.2", "quality", "GLM"),
+        ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
+        ("oc:commandcode/deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
         ("gemini", "contracts", "Gemini"),
     ]
     got = [(r.model, r.role, r.display) for r in DEFAULT_BOARD]
@@ -68,15 +71,16 @@ def test_default_board_matches_directive_table():
 
 def test_default_board_is_priority_ordered():
     """The CTO's priority sketch (strongest first): Fable, Opus, Codex, Kimi, GLM-5.2,
-    Qwen, DeepSeek, Gemini. Re-ranking = reordering DEFAULT_BOARD; this pins the order."""
+    Qwen, DeepSeek, Gemini. Re-ranking = reordering DEFAULT_BOARD; this pins the order.
+    Seats 4-7 are the AGENTIC opencode (`oc:`) routes (review-cli#24)."""
     assert [r.model for r in DEFAULT_BOARD] == [
         "claude:claude-fable-5",
         "claude:claude-opus-4-8",
         "codex",
-        "commandcode:moonshotai/Kimi-K2.7-Code",
-        "zai:glm-5.2",
-        "commandcode:Qwen/Qwen3.7-Max",
-        "commandcode:deepseek/deepseek-v4-pro",
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "oc:zai/glm-5.2",
+        "oc:commandcode/Qwen/Qwen3.7-Max",
+        "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
     ]
 
@@ -121,32 +125,63 @@ def test_kimi_seat_itself_is_clean():
 
 
 def test_every_default_kimi_entry_is_the_canonical_seat():
-    """Any default model string that names Kimi must BE KIMI_SEAT — one source of truth,
-    so a second hard-coded (and drift-prone) Kimi string can never slip into the flat
-    panel, the board, or a reserve seat (review-cli#25)."""
+    """Any default model string that names Kimi must be EITHER the canonical diff-only seat
+    KIMI_SEAT (flat panel) or its agentic opencode form `_agentic(KIMI_SEAT)` (board) — one
+    source of truth for the Kimi MODEL ID across both transports (review-cli#24/#25). A
+    third hard-coded (and drift-prone) Kimi string can never slip into the flat panel, the
+    board, or a reserve seat. Both forms share the same wire model id (the bit after the
+    provider), so a future id bump touches ONE constant and both transports follow."""
     kimi_entries = [m for m in _all_default_model_strings() if "kimi" in m.lower()]
     assert kimi_entries, "no Kimi entry found in the defaults at all"
-    assert set(kimi_entries) == {KIMI_SEAT}, kimi_entries
+    assert set(kimi_entries) == {KIMI_SEAT, _agentic(KIMI_SEAT)}, kimi_entries
 
 
 def test_default_models_and_board_share_one_kimi_seat():
-    """The flat panel's Kimi entry IS the board's Kimi seat — one source of truth
-    (KIMI_SEAT), so a future model-id bump can't update one and leave the other pointing
-    at a stale/dead provider (the exact staleness this fix removed). Matched by MODEL
-    string, not the display label (which is cosmetic and may be renamed)."""
+    """The flat panel's Kimi entry is KIMI_SEAT (diff-only); the board's Kimi seat is its
+    agentic opencode form `_agentic(KIMI_SEAT)` (review-cli#24). Both derive from the SAME
+    constant, so a future model-id bump can't update one and leave the other pointing at a
+    stale/dead provider (the exact staleness #25 removed). Matched by MODEL string, not the
+    display label (which is cosmetic and may be renamed). The board has a reserve so the
+    agentic seat can fail over on an opencode-less host; the flat panel has none, which is
+    why it keeps the robust key-only commandcode route."""
     assert KIMI_SEAT in DEFAULT_MODELS, DEFAULT_MODELS
     board_models = {r.model for r in DEFAULT_BOARD}
-    assert KIMI_SEAT in board_models, board_models
+    assert _agentic(KIMI_SEAT) in board_models, board_models
+    # And the agentic board seat carries the SAME wire model id as the flat-panel seat
+    # (everything after the provider) — transport-only difference, never an id fork.
+    assert KIMI_SEAT.split(":", 1)[1] == _agentic(KIMI_SEAT).split("/", 1)[1]
 
 
 def test_default_models_routes_kimi_through_commandcode():
-    """The replacement Kimi seat goes through the commandcode gateway (the live account),
+    """The FLAT panel's Kimi seat goes through the commandcode gateway (the live account),
     not the dead `oc:fireworks` opencode route — and `_split_models` round-trips the whole
     flat panel unchanged (no alias rewrite / no drop), the normalization the review path
-    applies before dispatch."""
+    applies before dispatch. The flat panel stays diff-only on purpose: it has no
+    reserve/failover, so it keeps the key-only route that needs no opencode install (#24)."""
     assert KIMI_SEAT.startswith("commandcode:"), KIMI_SEAT
     assert DEFAULT_MODELS == ("codex", "gemini", KIMI_SEAT), DEFAULT_MODELS
     assert _split_models(list(DEFAULT_MODELS)) == ["codex", "gemini", KIMI_SEAT]
+
+
+def test_agentic_helper_rewrites_provider_seat_idempotent_and_canonical():
+    """`_agentic` flips a diff-only `provider:model` seat to its agentic `oc:provider/model`
+    opencode form, and a colonless seat (e.g. `codex`) to `oc:<seat>`. It is IDEMPOTENT
+    and CANONICAL: an already-agentic seat is returned in the `oc:` spelling — `oc:foo/bar`
+    unchanged, and the `opencode:foo/bar` ALIAS normalized to `oc:foo/bar`. Both resolve to
+    review_opencode and run the same `opencode -m foo/bar`, which the dashboard attributes
+    to `oc:foo/bar`; canonicalizing keeps the board seat id == the attributed id so a seat
+    never splits into a `no_data` board row plus a separate `oc:` health row (review-cli#24,
+    codex review). Double-wrapping can't produce a nonsense `oc:oc/...` id."""
+    assert _agentic("commandcode:moonshotai/Kimi-K2.7-Code") == "oc:commandcode/moonshotai/Kimi-K2.7-Code"
+    assert _agentic("zai:glm-5.2") == "oc:zai/glm-5.2"
+    assert _agentic("codex") == "oc:codex"
+    # Idempotent: wrapping an already-`oc:` seat is a no-op (no `oc:oc/...`).
+    assert _agentic("oc:zai/glm-5.2") == "oc:zai/glm-5.2"
+    assert _agentic(_agentic("commandcode:Qwen/Qwen3.7-Max")) == "oc:commandcode/Qwen/Qwen3.7-Max"
+    # Canonical: the `opencode:` alias is normalized to the canonical `oc:` spelling, so it
+    # matches the dashboard's `oc:`-prefixed attribution of the same opencode run.
+    assert _agentic("opencode:foo/bar") == "oc:foo/bar"
+    assert _agentic(_agentic("opencode:foo/bar")) == "oc:foo/bar"
 
 
 # === --pool seat selection (board redesign): default 4, first-N, reserve = rest ==
@@ -160,10 +195,11 @@ def test_select_pool_default_picks_first_four_seats():
     pool = select_pool(list(DEFAULT_BOARD), DEFAULT_POOL_SIZE)
     assert len(pool) == 4
     assert [r.model for r in pool] == [r.model for r in DEFAULT_BOARD[:4]]
-    # The reserve is exactly the remainder (priority order).
+    # The reserve is exactly the remainder (priority order). Seats 5-7 are the agentic
+    # opencode routes (review-cli#24); only Gemini stays diff-only.
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
-    assert reserve == ["zai:glm-5.2", "commandcode:Qwen/Qwen3.7-Max",
-                       "commandcode:deepseek/deepseek-v4-pro", "gemini"]
+    assert reserve == ["oc:zai/glm-5.2", "oc:commandcode/Qwen/Qwen3.7-Max",
+                       "oc:commandcode/deepseek/deepseek-v4-pro", "gemini"]
 
 
 def test_select_pool_zero_or_negative_means_all_seats():
@@ -204,14 +240,108 @@ def test_select_pool_does_not_mutate_input(  ):
     assert select_pool(src, 0) is not src
 
 
-def test_glm_seat_routes_to_zai_backend_with_glm52():
-    """The GLM seat must route to the z.ai backend (his subscription), model glm-5.2 —
-    NOT the commandcode gateway. resolve_backend(zai:glm-5.2) -> review_zai."""
-    seat = next(r for r in DEFAULT_BOARD if r.model == "zai:glm-5.2")
-    assert seat.display == "GLM"
-    assert backends.resolve_backend(seat.model) is backends.review_zai
-    # The backend sends model id glm-5.2 on the wire (suffix after `zai:`).
-    assert seat.model.split(":", 1)[1] == "glm-5.2"
+def test_glm_seat_routes_agentically_via_opencode_zai_provider():
+    """The GLM seat must run AGENTICALLY via opencode's `zai` provider (review-cli#24), so
+    it reads the repo read-only instead of the diff-only z.ai REST call. resolve_backend(
+    oc:zai/glm-5.2) -> review_opencode, and the opencode model selector (after `oc:`) is
+    `zai/glm-5.2` — his z.ai subscription, glm-5.2 the newest GLM. This is the agentic form
+    of the diff-only `zai:glm-5.2` seat (`_agentic` flips the transport, keeps the id)."""
+    seat = next(r for r in DEFAULT_BOARD if r.display == "GLM")
+    assert seat.model == "oc:zai/glm-5.2", seat.model
+    assert seat.model == _agentic("zai:glm-5.2"), seat.model
+    assert backends.resolve_backend(seat.model) is backends.review_opencode
+    # The opencode model selector (after stripping `oc:`) is the z.ai provider/model pair.
+    assert seat.model.split(":", 1)[1] == "zai/glm-5.2"
+
+
+def test_all_repo_capable_default_seats_are_agentic():
+    """review-cli#24 acceptance: every DEFAULT_BOARD seat that CAN read the repo routes to
+    an AGENTIC backend (the codex CLI, opencode, or the claude CLI) — not a stateless
+    diff-only REST/keyed-HTTP call. Only Gemini stays diff-only (it has no agentic
+    transport: a workspace-less REST API).
+
+    This pins the agentic-by-default contract: Kimi/GLM/Qwen/DeepSeek go through opencode
+    (`oc:`), Codex through the codex CLI, the two Anthropic seats through claude. A future
+    edit that silently reverts a seat to the diff-only commandcode/z.ai REST route fails
+    here. (claude is agentic via its CLI path; resolve_backend returns review_claude for
+    both, and the board's claude seats run the CLI on a normal host.)"""
+    agentic = {backends.review_codex, backends.review_opencode, backends.review_claude}
+    for seat in DEFAULT_BOARD:
+        backend = backends.resolve_backend(seat.model)
+        if seat.display == "Gemini":
+            assert backend is backends.review_gemini, seat.model
+            continue
+        assert backend in agentic, f"{seat.display} ({seat.model}) is not agentic"
+    # Belt-and-suspenders: NO default board seat uses the diff-only commandcode/z.ai REST
+    # backends anymore (those are reserved for explicit `-m cc`/`-m glm` and config boards).
+    diff_only = {backends.review_commandcode, backends.review_zai}
+    assert not any(backends.resolve_backend(s.model) in diff_only for s in DEFAULT_BOARD)
+
+
+def test_install_skill_text_documents_agentic_default_board(  ):
+    """The embedded skill text `review install-skill` writes into agent harnesses must
+    reflect the agentic default board (review-cli#24, codex review) — otherwise agents keep
+    the stale diff-only mental model. It must mention the `oc:` default seats AND clarify
+    that the keyed-HTTP commandcode/z.ai backends back only the explicit `-m cc`/`-m glm`
+    paths, not the default board."""
+    from reviewlib.install import SKILL_MD
+
+    low = SKILL_MD.lower()
+    assert "oc:commandcode/" in SKILL_MD, "skill text must name the agentic oc: default seats"
+    assert "oc:zai/glm-5.2" in SKILL_MD, SKILL_MD[:0]
+    # The keyed-HTTP section must be scoped to explicit `-m cc`/`-m glm`, not the default board.
+    assert "diff-only" in low and "default board" in low
+    """review-cli#24 contract (codex review): the agentic `oc:` board seats authenticate via
+    opencode's OWN provider config — NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
+    So their availability gates on the `opencode` BINARY being present, regardless of whether
+    review-cli's commandcode/z.ai keys are set. A host whose keys live only in review-cli's
+    `.env` (and never ran `opencode auth login`) must NOT have an `oc:` seat falsely
+    reported available on key-presence alone — and conversely, a host WITH opencode but
+    WITHOUT those review-cli keys still reports the seat available (opencode carries auth).
+    This pins that the two auth surfaces are decoupled; the board's reserve backfills an
+    `oc:` seat opencode can't actually reach at run time (mid-run failover)."""
+    oc_seats = [r.model for r in DEFAULT_BOARD if r.model.startswith("oc:")]
+    assert oc_seats, "expected agentic oc: seats on the default board"
+
+    saved_which = backends._which
+    # Snapshot EVERY env var we mutate (incl. GEMINI_ENV_FILE, which we overwrite below) so
+    # a dev/CI environment that already sets any of them is restored exactly — otherwise
+    # later tests become order-dependent on this one's teardown (codex review).
+    saved_env = {
+        k: os.environ.get(k)
+        for k in ("COMMANDCODE_API_KEY", "ZAI_API_KEY", "ZHIPU_API_KEY", "GEMINI_ENV_FILE")
+    }
+    try:
+        # Scrub review-cli's commandcode/z.ai keys AND point the env-file at nothing, so the
+        # only thing that could make the seat available is the opencode binary.
+        for k in saved_env:
+            os.environ.pop(k, None)
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+
+        # opencode present -> available even with NO review-cli commandcode/z.ai key.
+        backends._which = lambda name: f"/fake/bin/{name}"
+        for seat in oc_seats:
+            assert backends.backend_available(seat) is True, seat
+
+        # opencode absent -> unavailable (so the board backfills), even if review-cli keys
+        # existed they would not rescue an `oc:` seat — it needs the opencode binary.
+        def _no_opencode(name: str) -> str:
+            if name == "opencode":
+                raise RuntimeError("opencode not found")
+            return f"/fake/bin/{name}"
+
+        backends._which = _no_opencode
+        for seat in oc_seats:
+            assert backends.backend_available(seat) is False, seat
+    finally:
+        backends._which = saved_which
+        # Restore each mutated var to its exact prior state (set it back, or remove it if it
+        # was unset before) — never leave a stale override for the next test.
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_contracts_role_has_a_lens():
@@ -398,7 +528,7 @@ def test_build_board_jobs_unknown_role_uses_generic_prompt():
 # === graceful skip of unavailable reviewers =====================================
 def test_unavailable_reviewers_are_skipped_not_crashed():
     board = list(DEFAULT_BOARD)
-    reachable = {"gemini", "zai:glm-5.2"}  # only two reachable
+    reachable = {"gemini", "oc:zai/glm-5.2"}  # only two reachable (GLM is now agentic)
     with _AvailabilityPatch(reachable):
         jobs, skipped = build_board_jobs(board, DEFAULT_PROMPT, "+x")
     assert {j.model for j in jobs} == reachable

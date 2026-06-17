@@ -441,7 +441,7 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
     assert r["mode"] == "review"
     assert r["pool_size"] == 4, r            # backfilled back up to 4
     assert "claude:claude-fable-5" not in r["models"], r
-    assert "zai:glm-5.2" in r["models"], r   # the promoted reserve, by its real id
+    assert "oc:zai/glm-5.2" in r["models"], r   # the promoted reserve (agentic GLM), by its real id
     assert "[review] pool=4 (review)" in r["_stderr"]  # ETA still keys on the planned 4
     assert "promoting reserve" in r["_stderr"]          # failover actually fired
 

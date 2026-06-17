@@ -37,10 +37,12 @@ class _Captured:
     def __init__(self) -> None:
         self.argv: list[str] | None = None
         self.cwd: Path | None = None
+        self.header_argv0: str | None = None
 
-    def __call__(self, argv, cwd, timeout, backend, round_no=0, announce=False):
+    def __call__(self, argv, cwd, timeout, backend, round_no=0, announce=False, header_argv0=None):
         self.argv = list(argv)
         self.cwd = Path(cwd)
+        self.header_argv0 = header_argv0
 
         class _Proc:
             returncode = 0
@@ -95,6 +97,11 @@ def test_runs_in_real_repo_with_dir_flag():
         assert cap.cwd == repo, (cap.cwd, repo)
         # still the read-only-reviewer agent (the safety boundary).
         assert "read-only-reviewer" in argv, argv
+        # The sidecar log header carries the model SELECTOR (not the bare binary path), so
+        # the dashboard attributes the call to its `oc:` board seat (review-cli#24). It is
+        # the `oc_model` (everything after `oc:`), and must NOT carry the prompt/diff.
+        assert cap.header_argv0 == "opencode -m opencode/deepseek-v4-flash-free", cap.header_argv0
+        assert "some diff" not in (cap.header_argv0 or ""), cap.header_argv0
 
 
 def test_real_repo_message_invites_reading_files():
@@ -120,6 +127,8 @@ def test_non_repo_cwd_falls_back_to_temp_dir():
         # No --dir into the scratch dir; the run is isolated in a temp dir instead.
         assert "--dir" not in argv, argv
         assert cap.cwd is not None and cap.cwd != plain, cap.cwd
+        # The fallback path also stamps the model selector header for dashboard attribution.
+        assert cap.header_argv0 == "opencode -m m", cap.header_argv0
 
 
 def test_repo_detection_helper():
