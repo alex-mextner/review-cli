@@ -24,7 +24,7 @@ from pathlib import Path
 
 from ..backends import ReviewResult, backend_available, resolve_backend
 from ..config import DEFAULT_POOL_SIZE, BoardReviewer, split_pool_reserve
-from ..install import _write_review_stamp
+from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
     FailoverOutcome,
     _tally_result,
@@ -69,9 +69,12 @@ def mode_review(
     print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))
     ok = all(result.returncode == 0 for result in results)
     # Only stamp staged reviews — the commit gate verifies the STAGED diff, so an
-    # unstaged/piped review must not satisfy it (and must not block later).
+    # unstaged/piped review must not satisfy it (and must not block later). The
+    # session marker is touched on the same condition so the (separate) agent-tools
+    # time-windowed review gate also sees this genuine review.
     if ok and staged:
         _write_review_stamp(cwd, diff)
+        _touch_review_marker()
     return 0 if ok else 1
 
 
@@ -122,6 +125,7 @@ def _mode_review_board(
     ok = not outcome.degraded
     if ok and staged:
         _write_review_stamp(cwd, diff)
+        _touch_review_marker()
     return 0 if ok else 1
 
 
