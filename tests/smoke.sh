@@ -246,6 +246,13 @@ echo "failover-pool tests OK"
 python3 tests/test_brainstorm_diff.py
 echo "brainstorm-diff tests OK"
 
+# Brainstorm FAILS LOUD on a dead panel (ROADMAP CTO 2026-06-16): a round whose seats all
+# return empty/errored output aborts with a clear error + the stable EXIT_DEAD_PANEL code,
+# instead of a hollow DECISION: STOP + empty synthesis. Exercises the real loop /
+# _round_is_dead / result_is_usable; only the backend boundary is stubbed (no network).
+REVIEW_LOG_DIR="$(mktemp -d)" python3 tests/test_brainstorm_dead_panel.py
+echo "brainstorm-dead-panel tests OK"
+
 # Mode SUBCOMMANDS + the mode registry (the modes-subcommands redesign): each
 # subcommand dispatches to the right mode, a bare `review` defaults to review, brainstorm
 # composes with --diff, the removed mode flags error helpfully, and the registry contract

@@ -85,6 +85,33 @@ def _tally_result(returncode: int) -> None:
         _call_tally["ok" if returncode == 0 else "fail"] += 1
 
 
+def recount_round_by_usability(results: list[ReviewResult]) -> None:
+    """Correct the active run-stats tally for a round that `run_panel` already auto-tallied.
+
+    `run_panel` auto-tallies each call by EXIT CODE (rc 0 == ok). For a brainstorm persona
+    round that is wrong for a seat that exits 0 with EMPTY / "unavailable" output — a dead or
+    credential-less backend — which `result_is_usable` rejects but the rc-only tally counted
+    as ok. Left uncorrected, a fully-dead rc=0 round records `ok=N, fail=0`, which both lies
+    in the run-stats and poisons the ETA average for that pool size. This reclassifies each
+    such seat from ok->fail so the recorded tally matches `result_is_usable` (the same
+    judgement the dead-panel guard and the failover board use). A no-op outside a CLI run
+    (no active tally) and for a round whose seats were all genuinely usable."""
+    with _TALLY_LOCK:
+        if _call_tally is None:
+            return
+        for result in results:
+            if result.returncode == 0 and not result_is_usable(result):
+                # run_panel counted this rc=0 seat as ok; it is not a real verdict. MOVE the
+                # count ok->fail (a reclassification — the total stays constant). Only when
+                # there IS an ok to move: run_panel always counted this seat as ok, so the
+                # guard holds in practice, but keeping fail++ inside it means a broken
+                # invariant can never INFLATE the total (ok+fail > calls made) — it would
+                # only under-count, never lie upward.
+                if _call_tally["ok"] > 0:
+                    _call_tally["ok"] -= 1
+                    _call_tally["fail"] += 1
+
+
 def result_is_usable(result: ReviewResult) -> bool:
     """Did this reviewer produce a REAL verdict (vs a failed/empty/unavailable seat)?
 
