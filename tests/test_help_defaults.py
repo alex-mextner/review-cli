@@ -18,6 +18,7 @@ so it never reads the developer's real config.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +27,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib import cli  # noqa: E402
+
+
+def _canon_optstrings(help_text: str) -> str:
+    """Canonicalize argparse's short/long option rendering so assertions are stable across
+    Python versions. Python <=3.12 renders a metavar after EVERY option string
+    (`-m MODEL, --model MODEL`); 3.13+ shows it once after the last (`-m, --model MODEL`).
+    Collapse the <=3.12 form to the 3.13+ form so `-m, --model` matches on both."""
+    # `-m MODEL, --model` -> `-m, --model`  (drop the metavar that sits between a short
+    # option and the following `, --long`). The metavar is an uppercase/〈〉 token.
+    return re.sub(r"(-\w) [A-Z][A-Z0-9_]*(, --)", r"\1\2", help_text)
 
 
 def _top_level_help() -> str:
@@ -42,7 +53,7 @@ def _model_line(help_text: str) -> str:
     """Extract just the `-m, --model …` option block (up to the next option), whitespace-
     normalized. The `--show-board` flag's own description also says "active reviewer board",
     so a whole-help substring check would false-positive — scope to the --model default."""
-    norm = " ".join(help_text.split())
+    norm = " ".join(_canon_optstrings(help_text).split())
     start = norm.index("-m, --model")
     end = norm.index("-C, --cwd", start)
     return norm[start:end]
@@ -165,7 +176,7 @@ def _option_strings(parser_help: str) -> str:
     """The OPTIONS section of a help text (between 'options:' and the next top-level
     heading / EOF), whitespace-normalized — so a flag named only in the subcommand epilog
     or a description doesn't count as 'an option on this parser'."""
-    norm = parser_help
+    norm = _canon_optstrings(parser_help)
     start = norm.index("options:")
     # Stop at the subcommands epilog (top-level) if present.
     end = norm.find("\nsubcommands:", start)
