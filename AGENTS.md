@@ -4,8 +4,10 @@ Agent-facing notes for working IN this repo. (User-facing docs live in `README.m
 
 ## What this is
 
-`review` is a read-only, multi-model code-review + AI-panel CLI. It fans a git diff (or a
-question / topic) out to several model backends in parallel and prints their findings.
+multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic.
+
+Operationally, `review` fans a git diff (or a question / topic) out to several model
+backends in parallel and prints their findings.
 
 ## Invocation — modes are SUBCOMMANDS
 
