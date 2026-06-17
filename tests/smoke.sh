@@ -229,6 +229,14 @@ echo "cwd tests OK"
 python3 tests/test_shim_bootstrap.py
 echo "shim-bootstrap tests OK"
 
+# install.sh shadow warning: drive the real installer in an isolated HOME/PATH/cwd with a
+# fixture `review` shadowing it. A HEALTHY shadow (its interpreter imports reviewlib) is
+# EXPLAINED only — never told to uninstall (pipx is a documented install method); a broken
+# stale console-script (import fails) gets the uninstall+rm remediation. Guards against
+# advising removal of a valid install. Offline; cleans up its own temp sandbox.
+python3 tests/test_install_shadow_warning.py
+echo "install-shadow-warning tests OK"
+
 # No-git-repo graceful failure: the diff-review path outside a repo prints the 3-part
 # message + the stable EXIT_NOT_A_REPO code with NO traceback; the no-git modes + meta
 # flags work anywhere; a piped diff needs no repo; a real repo is regression-safe. Driven

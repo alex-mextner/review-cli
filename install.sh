@@ -81,6 +81,11 @@ echo "review: symlinked $BIN/$TOOL -> $ENTRY_PATH"
 # every shell. Detect the shadow and WARN LOUDLY with copy-paste remediation. We do
 # NOT delete the file (it is not ours to remove; the user may have installed it on
 # purpose) — we surface exactly what shadows us and how to undo it.
+# CAUTION: a shadow is not necessarily BROKEN. A healthy pipx/pip install (pipx is a
+# documented install method) is ALSO a regular file with a `#!`-shebang that mentions
+# reviewlib, but its `import reviewlib` SUCCEEDS. We only advise uninstalling when the
+# import probe actually FAILS; a healthy shadow gets an explain-only warning, never
+# "uninstall review-cli" — that would tell the user to remove a valid install.
 # Canonicalize a path (follow every symlink). Try realpath, then python3, else as-is.
 # realpath can FAIL (missing path / unreadable intermediate dir) even when present, so we
 # fall THROUGH to python3 on failure rather than echoing the raw input — otherwise one side
@@ -120,10 +125,23 @@ if [[ -n "$RESOLVED" ]]; then
     # FILE (not a symlink into a repo) that does a bare `from reviewlib.cli import main`
     # with no sys.path bootstrap, and/or whose interpreter can't import reviewlib.
     _first_line="$(head -n1 "$RESOLVED" 2>/dev/null || true)"
-    # Only diagnose a stale pip/uv console-script for a regular (non-symlink) FILE that both
-    # starts with a `#!` shebang AND mentions `reviewlib` — otherwise a plain text file that
-    # merely mentions `reviewlib` (a wrapper, a doc) would get a misleading "stale
-    # console-script → pip uninstall" message. Anything else gets the generic remediation.
+    # A regular (non-symlink) FILE that both starts with a `#!` shebang AND mentions
+    # `reviewlib` is a CANDIDATE for the stale-console-script diagnosis — a plain text file
+    # that merely mentions `reviewlib` (a wrapper, a doc) is not, and gets the generic
+    # remediation. But "candidate" is NOT "stale": a healthy pipx/pip-installed `review`
+    # is ALSO a regular file with a `#!` shebang that mentions reviewlib, and pipx is a
+    # documented install method. So we only emit the stale-specific "uninstall review-cli"
+    # remediation when the `import reviewlib` probe below actually FAILS (proving the
+    # install is broken). When the probe SUCCEEDS — a valid shadowing install — we fall
+    # through to the generic shadow warning: explain it shadows the new symlink, DON'T tell
+    # the user to uninstall a working install.
+    _is_stale_console_script=""
+    _healthy_reviewlib_shadow=""
+    # Reset interp_bin alongside the flags (not inside the candidate block): the stale-branch
+    # echo interpolates "$interp_bin", and resetting it here keeps that safe even if a future
+    # refactor adds a second writer or wraps this in a loop. Today it is set ONLY below, and
+    # the stale branch is reachable ONLY when it is non-empty — this reset preserves that.
+    interp_bin=""
     if [[ -f "$RESOLVED" && ! -L "$RESOLVED" && "${_first_line:0:2}" == "#!" ]] && \
        grep -Iq 'reviewlib' "$RESOLVED" 2>/dev/null; then
       # Extract the REAL interpreter from the shebang. pip emits either an absolute path
@@ -156,11 +174,6 @@ if [[ -n "$RESOLVED" ]]; then
           *)         interp="$_t"; break ;;
         esac
       done
-      echo "  That entry looks like a stale pip/uv console-script (a regular file with a" >&2
-      echo "  hardcoded interpreter and a bare \`from reviewlib.cli import main\`, no path" >&2
-      echo "  bootstrap). If its editable install points at a deleted worktree, it will" >&2
-      echo "  raise ModuleNotFoundError: No module named 'reviewlib' in EVERY shell." >&2
-      echo "" >&2
       # Resolve the interpreter to a runnable FILE: an absolute path to an executable file
       # as-is, else look it up on PATH (handles a bare `python3` from an env-shebang).
       interp_bin=""
@@ -175,21 +188,50 @@ if [[ -n "$RESOLVED" ]]; then
       # Only TRUST it as an interpreter if it actually IS Python. The token-walk can land on
       # a non-Python binary — e.g. `env -C dir python3` mis-yields `dir`, which on Debian is
       # the real coreutils `/usr/bin/dir`. Running `<that> -c 'import reviewlib'` would
-      # mis-report and the `<that> -m pip …` remediation would be garbage. `python -c
-      # 'import sys'` is the cheapest "is this CPython?" probe and also avoids executing an
-      # arbitrary shebang-named binary for the heavier reviewlib check.
-      if [[ -n "$interp_bin" ]] && ! "$interp_bin" -c 'import sys' >/dev/null 2>&1; then
+      # mis-report and the `<that> -m pip …` remediation would be garbage. `<py> -I -c
+      # 'import sys'` is the cheapest "is this a Python that accepts -I?" probe — it gates out
+      # non-Python binaries AND anything older than the isolated-mode flag (3.2 / 2.7.3), so
+      # the deciding reviewlib probe below can safely run isolated. It also avoids executing an
+      # arbitrary shebang-named binary for the heavier reviewlib check. (Keep the -I: it is
+      # what makes the reviewlib probe cwd/PYTHONPATH-independent — see below.)
+      if [[ -n "$interp_bin" ]] && ! "$interp_bin" -I -c 'import sys' >/dev/null 2>&1; then
         interp_bin=""
       fi
-      if [[ -n "$interp_bin" ]] && ! "$interp_bin" -c 'import reviewlib' >/dev/null 2>&1; then
-        echo "  Confirmed: its interpreter ($interp_bin) cannot \`import reviewlib\`." >&2
-      fi
-      echo "  REMEDIATION (copy-paste) — uninstall the stale console-script:" >&2
+      # The DECIDING probe: does this shadowing entry's interpreter import reviewlib? Only a
+      # FAILED probe proves a genuinely-broken stale console-script worth uninstalling. If
+      # the import SUCCEEDS, it is a VALID install (e.g. pipx) that merely shadows us — never
+      # advise uninstall. If we couldn't resolve a Python interpreter at all (interp_bin
+      # empty), we CANNOT prove breakage, so we conservatively decline the uninstall advice
+      # too and fall back to the generic shadow warning — telling a user to remove a possibly
+      # -valid install on a guess is exactly the harm we are avoiding.
+      #
+      # `-I` (ISOLATED mode) is LOAD-BEARING here. Without it the probe inherits install.sh's
+      # CWD and PYTHONPATH, and CPython prepends the CWD to sys.path[0]. The documented fresh
+      # install runs `./install.sh` FROM the review-cli source checkout, so `./reviewlib/`
+      # would be importable from CWD — and a genuinely-broken stale console-script would then
+      # probe SUCCESSFULLY and be mislabeled "healthy, just shadows" instead of getting the
+      # uninstall remediation. `-I` ignores PYTHONPATH and drops the CWD/script dir from
+      # sys.path, so the probe answers the ONLY question that matters: can THIS interpreter
+      # import reviewlib from its OWN site-packages (i.e. is it a real install)?
       if [[ -n "$interp_bin" ]]; then
-        echo "      $interp_bin -m pip uninstall -y review-cli" >&2
-      else
-        echo "      pip uninstall -y review-cli   # in the python that owns $RESOLVED" >&2
+        if "$interp_bin" -I -c 'import reviewlib' >/dev/null 2>&1; then
+          _healthy_reviewlib_shadow="yes"
+        else
+          _is_stale_console_script="yes"
+        fi
       fi
+    fi
+    if [[ -n "$_is_stale_console_script" ]]; then
+      echo "  That entry looks like a stale pip/uv console-script (a regular file with a" >&2
+      echo "  hardcoded interpreter and a bare \`from reviewlib.cli import main\`, no path" >&2
+      echo "  bootstrap). This is consistent with an editable install whose target was" >&2
+      echo "  deleted, which raises ModuleNotFoundError: No module named 'reviewlib' in EVERY" >&2
+      echo "  shell. (Other broken-install causes fail the same probe; the remediation below" >&2
+      echo "  clears all of them.)" >&2
+      echo "" >&2
+      echo "  Confirmed: its interpreter ($interp_bin) cannot \`import reviewlib\`." >&2
+      echo "  REMEDIATION (copy-paste) — uninstall the stale console-script:" >&2
+      echo "      $interp_bin -m pip uninstall -y review-cli" >&2
       echo "  or remove just the shadowing script:" >&2
       # Quote for copy-paste safety even if the path contains a single quote: replace each
       # `'` with the classic `'\''` idiom (close-quote, escaped-quote, reopen). Two bash
@@ -200,8 +242,21 @@ if [[ -n "$RESOLVED" ]]; then
       _rm_arg=${RESOLVED//\'/\'\\\'\'}
       printf "      rm '%s'\n" "$_rm_arg" >&2
     else
-      echo "  REMEDIATION: ensure $BIN precedes the dir holding '$RESOLVED' on PATH," >&2
-      echo "  or remove/rename that earlier '$TOOL' so the working symlink wins." >&2
+      # Not a (provably) broken stale console-script, so we only EXPLAIN the shadow and how
+      # to make our symlink win — we never advise uninstalling it. Two sub-cases:
+      #   - a VALID install (e.g. pipx) whose interpreter imports reviewlib fine; or
+      #   - anything else (symlink, no shebang, doesn't mention reviewlib, or an interpreter
+      #     we couldn't resolve to prove breakage).
+      if [[ -n "$_healthy_reviewlib_shadow" ]]; then
+        echo "  This earlier '$TOOL' imports reviewlib fine (e.g. a pipx/pip install) — it is" >&2
+        echo "  NOT broken, it just shadows the symlink we installed at $BIN/$TOOL." >&2
+        echo "  REMEDIATION: ensure $BIN precedes the dir holding '$RESOLVED' on PATH so the" >&2
+        echo "  symlink wins. (Both installs work — keep whichever you prefer; only remove the" >&2
+        echo "  earlier one if you actually meant to switch off that install.)" >&2
+      else
+        echo "  REMEDIATION: ensure $BIN precedes the dir holding '$RESOLVED' on PATH," >&2
+        echo "  or remove/rename that earlier '$TOOL' so the working symlink wins." >&2
+      fi
     fi
     echo "  ============================================================================" >&2
     echo "" >&2
