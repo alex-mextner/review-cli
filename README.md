@@ -31,7 +31,13 @@ pipx install git+https://github.com/alex-mextner/review-cli
 After install, run `review install-skill` to register the tool into agent harnesses
 (`~/.agents/skills/review/`) so that Claude Code, Codex, opencode, and Gemini agents
 know `review` exists and can call it. The one-liner above runs this automatically.
-`install-skill` is idempotent — safe to re-run.
+The `install-*` commands (`install-skill` / `install-commit-hook` / `register-module`)
+are idempotent and report their INSTALLED state: each target shows a green ✓ "already
+configured" when nothing changed, or "+ wrote/updated" when it (re)wrote — so a re-run on
+a fully-set-up machine prints "already configured — nothing to do". A target that can't be
+configured (a foreign pre-commit hook, a wrong/occupied skill symlink, an unwriteable
+settings.json) is reported as `! conflict`, left untouched, and the command exits non-zero —
+resolve the conflict and re-run.
 
 ---
 

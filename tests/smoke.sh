@@ -358,6 +358,14 @@ echo "mode-subcommands tests OK"
 python3 tests/test_install_hook_text.py
 echo "install-hook-text tests OK"
 
+# install-* INSTALLED state (ROADMAP "install-* commands must show INSTALLED state"): a
+# re-run of install-skill / install-commit-hook / register-module on an already-set-up target
+# reports a green ✓ "already configured — nothing to do" instead of silently rewriting. All
+# state (HOME / git config / registry) is isolated to temp dirs INSIDE the test — never the
+# real machine — so this is safe to run in CI / smoke.
+python3 tests/test_install_state.py
+echo "install-state tests OK"
+
 # Resumable brainstorm sessions: id derivation, parsing a completed vs interrupted (incl.
 # empty-round) discussion log, list_sessions (default completed-only vs -a all), find_session
 # (exact/prefix/unknown/ambiguous), and the RESUME seed (continue from completed_round+1,

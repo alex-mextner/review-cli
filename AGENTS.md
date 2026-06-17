@@ -100,6 +100,19 @@ e.g. its positional question/topic), and its thin handler.
 3. No `cli.py` surgery — dispatch is registry-driven. (`cli.py` only special-cases the
    diff-review mode's failover-board wiring, which is genuinely CLI-side.)
 
+## install-* commands report INSTALLED state
+
+`install-skill` / `install-commit-hook` (`reviewlib/install.py`) and `register-module`
+(`reviewlib/features/visual/registry.py`) are idempotent AND report state: each target prints a green ✓
+"already configured" when unchanged, "+ wrote/updated" when it (re)wrote; a fully-set-up
+re-run says "already configured — nothing to do". A target that could NOT be configured (a
+foreign pre-commit hook, a wrong/occupied skill-symlink target, an unwriteable
+settings.json) is reported as `! conflict`, left as-is, and the command exits non-zero —
+"nothing to do" is never printed when a conflict exists. The change-detection helpers
+(`_write_if_changed`, `_append_marked` returning a changed bool, `_sessionstart_hook_present`)
+keep that honest — when you add an install target, return whether it changed so the summary
+stays accurate.
+
 ## Tests
 
 CI runs **`bash tests/smoke.sh`** (this IS the test runner — it runs the bash smoke

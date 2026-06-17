@@ -456,11 +456,29 @@ def register_module(manifest_path: str, *, env: RegistryEnv | None = None) -> in
         data = {}
     manifests = data.setdefault("manifests", [])
     if not isinstance(manifests, list):
+        # A corrupt non-list `manifests` is reset to empty, so our path is necessarily absent
+        # below and we fall through to the write path — the corrected shape always reaches
+        # disk. (No "already-registered + repaired" branch exists because membership in a
+        # just-emptied list is impossible.)
         manifests = []
         data["manifests"] = manifests
-    if str(path) not in manifests:
-        manifests.append(str(path))
-    env.global_registry_path.parent.mkdir(parents=True, exist_ok=True)
-    env.global_registry_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    print(f"review: registered module manifest {path}")
+    if str(path) in manifests:
+        # Idempotent no-op: report the INSTALLED state (ROADMAP "install-* commands must
+        # show INSTALLED state") rather than silently rewriting the same registry.
+        print(f"review: ✓ already registered — module manifest {path} (nothing to do).")
+        return 0
+    manifests.append(str(path))
+    try:
+        env.global_registry_path.parent.mkdir(parents=True, exist_ok=True)
+        env.global_registry_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        # An unwritable registry (read-only FS, EPERM, ENOSPC) is a structured conflict +
+        # non-zero exit, not a traceback — same install-* contract as the other writes (glm
+        # review).
+        # Conflicts go to STDOUT (consistent with install.py's `! conflict` lines) so a CI
+        # scraper watching one stream catches every install-* failure (glm review).
+        print(f"review: ! conflict — registry {env.global_registry_path} could not be written "
+              f"({exc}). Fix permissions and re-run.")
+        return 1
+    print(f"review: + registered module manifest {path}")
     return 0

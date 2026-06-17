@@ -218,26 +218,82 @@ def _detected(cmd: str, *dirs: str) -> bool:
     return any(os.path.isdir(os.path.expanduser(d)) for d in dirs)
 
 
-def _append_marked(path, tool: str, blurb: str) -> None:
+def _append_marked(path, tool: str, blurb: str) -> bool:
+    """Insert/refresh the marked skill blurb block in `path`. Returns True if the file was
+    CHANGED (newly added or the block content differs), False if it was already up to date —
+    so the caller can report "already configured" vs "updated" (install-* INSTALLED state)."""
     import re
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     start, end = f"<!-- skill:{tool} -->", f"<!-- /skill:{tool} -->"
-    existing = p.read_text(encoding="utf-8") if p.exists() else ""
-    existing = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"\n?", "", existing, flags=re.S)
+    # NOTE: read as UTF-8 WITHOUT swallowing a decode error. These are user-authored harness
+    # files (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md). If one held non-UTF-8 bytes we must NOT
+    # treat it as empty and overwrite it — that would destroy the user's content. We instead
+    # let the (rare) decode error propagate; the caller (`install_agent_skill`) catches it and
+    # records a `! conflict` (file left as-is, non-zero exit), so there's neither data loss nor
+    # a crash (glm review). OUR-generated files go through `_write_if_changed`, which safely
+    # rewrites an undecodable file because we own its content.
+    before = p.read_text(encoding="utf-8") if p.exists() else ""
+    existing = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"\n?", "", before, flags=re.S)
     block = f"{start}\n{blurb}\n{end}\n"
-    p.write_text((existing.rstrip() + "\n\n" + block) if existing.strip() else block, encoding="utf-8")
+    after = (existing.rstrip() + "\n\n" + block) if existing.strip() else block
+    if after == before:
+        return False
+    p.write_text(after, encoding="utf-8")
+    return True
+
+
+def _sessionstart_hook_present(home) -> bool:
+    """True if our marked SessionStart hook is already in ~/.claude/settings.json — so
+    install-skill can report it as "already configured" (vs added). Read-only; any
+    read/parse failure -> False (treat as not-present)."""
+    settings = Path(home) / ".claude" / "settings.json"
+    if not settings.exists():
+        return False
+    try:
+        # UnicodeDecodeError is a ValueError (so is JSONDecodeError) — a non-UTF-8
+        # settings.json must degrade to "not present", never crash the install (glm review;
+        # matches the ValueError handling in `_write_if_changed` / `_append_marked`).
+        data = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    # Tolerate a malformed-but-valid-JSON settings shape: a non-dict `hooks` (e.g.
+    # `{"hooks": "bad"}`) or a non-list `SessionStart` must degrade to "not present", not
+    # crash on `.get()` / iteration (codex review — `_ensure_sessionstart_hook` guards the
+    # same way).
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    sessionstart = hooks.get("SessionStart")
+    if not isinstance(sessionstart, list):
+        return False
+    for group in sessionstart:
+        for h in (group or {}).get("hooks", []) if isinstance(group, dict) else []:
+            if isinstance(h, dict) and _HOOK_MARKER in str(h.get("command", "")):
+                return True
+    return False
 
 
 def _ensure_sessionstart_hook(home) -> bool:
     """Idempotently add a SessionStart hook to ~/.claude/settings.json that
-    surfaces installed agent CLIs. Conservative: never removes unrelated config."""
+    surfaces installed agent CLIs. Conservative: never removes unrelated config.
+
+    Return contract (load-bearing for the install-* INSTALLED-state reporting):
+    True IFF a write occurred (the hook was just ADDED); False if it was already present OR
+    could not be written (unparseable / malformed / unwritable settings). Callers
+    distinguish "already present" from "could not write" by re-probing with
+    `_sessionstart_hook_present`. Do NOT change this to return True on "updated" without
+    updating `install_agent_skill`, or every idempotent rerun would flip to "wrote/updated"."""
     settings = Path(home) / ".claude" / "settings.json"
     if not settings.parent.is_dir():
         return False
     try:
+        # (OSError, ValueError) also covers UnicodeDecodeError (a non-UTF-8 settings.json) and
+        # JSONDecodeError — degrade to "could not write" rather than crash (glm review).
         data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
-    except (json.JSONDecodeError, OSError):
+    except (OSError, ValueError):
         return False
     if not isinstance(data, dict):
         return False
@@ -258,26 +314,88 @@ def _ensure_sessionstart_hook(home) -> bool:
     return True
 
 
+def _write_if_changed(path: Path, content: str) -> bool:
+    """Write `content` to `path` only if it differs from what's there. Returns True if it
+    CHANGED (file absent or different), False if already up to date — so install-skill can
+    report "already configured" vs "updated" (install-* INSTALLED state)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Read in one shot; if we can't prove the existing content matches, fall through and
+        # (re)write rather than crash the whole install (glm review — no exists()+read TOCTOU).
+        # OSError = vanished/unreadable; UnicodeDecodeError (a ValueError, NOT an OSError) =
+        # the target holds non-UTF-8 bytes (binary blob / foreign installer) — treat as "needs
+        # write", don't propagate.
+        if path.read_text(encoding="utf-8") == content:
+            return False
+    except (OSError, ValueError):
+        pass
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
 def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
+    """Idempotently install the agent skill across detected harnesses. Reports each target's
+    STATE (ROADMAP "install-* commands must show INSTALLED state"): a green check + "already
+    configured" when nothing changed, "+ wrote/updated" when it (re)wrote. A re-run on a
+    fully-installed machine shows all ✓ and "already configured — nothing to do"."""
     home = Path.home()
-    written = []
+    # (label, changed?) per target — `changed` False == already-configured.
+    results: list[tuple[str, bool]] = []
+    conflicts: list[str] = []  # targets we could NOT configure (left as-is) — block "nothing to do"
+
+    def _write_target(path: Path, content: str) -> None:
+        # A write that fails (read-only FS, ENOSPC, EPERM, immutable flag) must become a
+        # `! conflict` (non-zero exit), NOT a mid-loop crash that strands later targets and
+        # prints a traceback instead of the documented conflict output (glm review). Mirrors
+        # the per-harness-file handling below.
+        try:
+            results.append((str(path), _write_if_changed(path, content)))
+        except (OSError, ValueError) as exc:
+            conflicts.append(f"{path} could not be written ({exc}) — fix permissions and re-run")
 
     skill_dir = home / ".agents" / "skills" / name
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
-    written.append(str(skill_dir / "SKILL.md"))
+    _write_target(skill_dir / "SKILL.md", skill_md)
     blurbs = home / ".agents" / "skills" / ".blurbs"
-    blurbs.mkdir(parents=True, exist_ok=True)
-    (blurbs / f"{name}.md").write_text(f"- {blurb}\n", encoding="utf-8")
+    _write_target(blurbs / f"{name}.md", f"- {blurb}\n")
 
     claude_skills = home / ".claude" / "skills"
     if claude_skills.is_dir():
         link = claude_skills / name
-        if not link.exists():
+        want = Path("..") / ".." / ".agents" / "skills" / name
+        # `exists()` follows symlinks (False for a broken/dangling one), so probe the link
+        # itself with is_symlink(): report "already configured" ONLY when it is a symlink
+        # pointing at the EXPECTED target. A regular file/dir, or a symlink to the WRONG
+        # target, is a CONFLICT — never a silent "nothing to do" (codex review).
+        if link.is_symlink():
             try:
-                link.symlink_to(Path("..") / ".." / ".agents" / "skills" / name)
+                points_at = link.readlink()
             except OSError:
-                pass
+                points_at = None
+            # Compare by RESOLVED target, not the raw stored string: a symlink written with an
+            # absolute target (older installer / packaging script / user) that lands on the
+            # SAME directory as our relative `want` is already-configured, not a CONFLICT
+            # (glm review). Resolve both relative to the link's parent.
+            if points_at is not None and (
+                points_at == want
+                or (link.parent / points_at).resolve() == (link.parent / want).resolve()
+            ):
+                results.append((str(link), False))  # correct symlink already present
+            else:
+                target_desc = "an unreadable target" if points_at is None else f"{points_at}"
+                conflicts.append(f"{link} is a symlink to {target_desc} (expected {want})")
+        elif link.exists():
+            # A regular file/dir occupies the path (is_symlink already handled all symlinks,
+            # incl. dangling ones, above).
+            conflicts.append(f"{link} exists but is not our skill symlink")
+        else:
+            try:
+                link.symlink_to(want)
+                results.append((str(link), True))
+            except OSError as exc:
+                # A FAILED symlink creation is a conflict, not a silent skip — otherwise a
+                # rerun with everything else unchanged would falsely say "nothing to do"
+                # while the Claude skill link was never installed (codex review).
+                conflicts.append(f"{link} could not be created ({exc})")
 
     harness_files = [
         ("claude", home / ".claude" / "CLAUDE.md", ("~/.claude",)),
@@ -287,16 +405,53 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
     ]
     for cmd, path, dirs in harness_files:
         if _detected(cmd, *dirs):
-            _append_marked(path, name, blurb)
-            written.append(str(path))
+            try:
+                results.append((str(path), _append_marked(path, name, blurb)))
+            except (OSError, ValueError) as exc:
+                # A user harness file (CLAUDE.md / AGENTS.md / GEMINI.md) we can't read as
+                # UTF-8 (non-UTF-8 bytes -> UnicodeDecodeError, a ValueError) is left UNTOUCHED
+                # — never overwritten (data loss) and never a mid-loop crash that strands later
+                # targets. Record a conflict so the run exits non-zero and tells the user to
+                # fix the file (glm review: honor the `! conflict` contract for this case too).
+                conflicts.append(f"{path} is not readable as UTF-8 ({exc}) — left as-is, fix it manually")
 
     if (home / ".claude").is_dir():
-        if _ensure_sessionstart_hook(home):
-            written.append("SessionStart hook -> ~/.claude/settings.json")
+        # _ensure_sessionstart_hook returns True if it ADDED the hook, False if already there
+        # (or it could not write). Distinguish "already present" from "couldn't write" by
+        # re-probing: if the marker is in settings now, it is configured either way.
+        added = _ensure_sessionstart_hook(home)
+        if added or _sessionstart_hook_present(home):
+            results.append(("SessionStart hook -> ~/.claude/settings.json", added))
+        else:
+            # Could neither write the hook nor find it present -> the target is genuinely
+            # UNCONFIGURED. Surface it as a conflict (non-zero exit, blocks "nothing to do")
+            # instead of silently dropping it and falsely claiming the install is complete
+            # (glm review).
+            conflicts.append(
+                "SessionStart hook -> ~/.claude/settings.json could not be written "
+                "(unparseable or unwritable settings.json) — add it manually or fix the file"
+            )
 
-    for w in written:
-        print(f"  ✓ {w}")
-    print(f"{name}: install-skill done ({len(written)} target(s)). Re-run anytime; idempotent.")
+    changed = sum(1 for _label, c in results if c)
+    for label, c in results:
+        print(f"  {'+ wrote/updated' if c else '✓ already configured'}  {label}")
+    for c in conflicts:
+        print(f"  ! conflict  {c} — left as-is; fix it manually.")
+    if conflicts:
+        # A conflict means a target is NOT configured — never say "nothing to do" / done.
+        # Return non-zero so a caller/script sees the install is incomplete (codex review).
+        print(f"{name}: install-skill — {changed} updated, "
+              f"{len(results) - changed} already configured, "
+              f"{len(conflicts)} CONFLICT(S) left unconfigured. Resolve the conflict(s) "
+              "above and re-run.")
+        return 1
+    if changed == 0:
+        print(f"{name}: install-skill — already configured, nothing to do "
+              f"({len(results)} target(s) ✓). Idempotent; re-run anytime.")
+    else:
+        print(f"{name}: install-skill done — {changed} updated, "
+              f"{len(results) - changed} already configured ({len(results)} target(s)). "
+              "Idempotent; re-run anytime.")
     return 0
 
 
@@ -408,18 +563,53 @@ def install_commit_hook() -> int:
     hooks_dir.mkdir(parents=True, exist_ok=True)
     pre_commit = hooks_dir / "pre-commit"
 
+    already = False  # the gate is ALREADY installed with our exact content AND executable
     if pre_commit.exists():
         body = pre_commit.read_text(encoding="utf-8", errors="replace")
         if _PRECOMMIT_MARKER not in body:
             print(f"review: a pre-commit hook already exists at {pre_commit} and is NOT ours.")
             print("        Not overwriting. Merge the gate manually or remove that hook first.")
             return 1
-    pre_commit.write_text(_PRECOMMIT, encoding="utf-8")
-    pre_commit.chmod(0o755)
+        # "Already configured" requires the exec bit too: a 0644 hook with our exact content
+        # is SKIPPED by git, so reporting "already active" would be a false claim (codex
+        # review). Re-chmod below in that case instead of an idempotent no-op.
+        already = body == _PRECOMMIT and os.access(pre_commit, os.X_OK)
+    # core.hooksPath is "already configured" iff it already points at our hooks_dir. Compare
+    # RESOLVED paths so a symlinked HOME (macOS /var -> /private/var, firmlinks) doesn't make
+    # an equivalent path look different and needlessly break "nothing to do" (glm review). Both
+    # sides already exist here (hooks_dir was just mkdir'd; it equals existing_path's dir).
+    hookspath_ok = bool(existing_path) and (
+        Path(os.path.expanduser(existing_path)).resolve() == hooks_dir.resolve()
+    )
+
+    if already and hookspath_ok:
+        # Idempotent no-op: report the INSTALLED state (ROADMAP "install-* commands must show
+        # INSTALLED state") instead of silently rewriting identical content.
+        print(f"  ✓ already configured  {pre_commit}")
+        print(f"  ✓ already configured  core.hooksPath -> {hooks_dir}")
+        print("review: commit gate already active — nothing to do. `review diff --staged` "
+              "before committing; bypass with REVIEW_SKIP=1 or --no-verify.")
+        return 0
+
+    if not already:
+        try:
+            pre_commit.write_text(_PRECOMMIT, encoding="utf-8")
+            pre_commit.chmod(0o755)
+        except OSError as exc:
+            # A write/chmod that fails (read-only FS, EPERM, ENOSPC) must be a structured
+            # conflict + non-zero exit, NOT a traceback — same contract as install-skill's
+            # write paths (glm review). Don't print "gate active": it isn't.
+            print(f"  ! conflict  {pre_commit} could not be written ({exc}) — fix permissions "
+                  "and re-run.")
+            return 1
+        print(f"  + wrote {pre_commit}")
+    else:
+        print(f"  ✓ already configured  {pre_commit}")
     if not existing_path:
         subprocess.run(["git", "config", "--global", "core.hooksPath", str(hooks_dir)], check=False)
-        print(f"  ✓ set global core.hooksPath -> {hooks_dir}")
-    print(f"  ✓ wrote {pre_commit}")
+        print(f"  + set global core.hooksPath -> {hooks_dir}")
+    elif hookspath_ok:
+        print(f"  ✓ already configured  core.hooksPath -> {hooks_dir}")
     print("review: commit gate active. `review diff --staged` before committing; "
           "bypass with REVIEW_SKIP=1 or --no-verify.")
     return 0
