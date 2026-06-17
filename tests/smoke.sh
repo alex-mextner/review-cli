@@ -41,6 +41,30 @@ removed_msg="$(bin/review --just-ask "x" 2>&1 || true)"; echo "$removed_msg" | g
 bin/review --list-defaults | grep -q codex
 bin/review review --list-defaults | grep -q codex   # explicit review subcommand too
 
+# Outside a git repo, the diff-review path must fail GRACEFULLY (no traceback): a clear
+# 3-part message + the STABLE EXIT_NOT_A_REPO=3 code. Meta + no-git modes still work
+# anywhere. `-C <non-git-dir>` from inside this repo is the non-repo case (a fresh
+# mktemp dir is never a git work tree). Capture output FIRST: `review` exits 3 here, so a
+# `review … | grep` would trip `set -o pipefail` on the nonzero exit even when grep matches.
+NONGIT_SMOKE="$(mktemp -d)"
+set +e
+nogit_out="$(bin/review -C "$NONGIT_SMOKE" </dev/null 2>&1)"; nogit_rc=$?
+set -e
+[ "$nogit_rc" -eq 3 ]                                            # stable not-a-repo exit code
+echo "$nogit_out" | grep -q "not in a git repository"           # WHAT
+echo "$nogit_out" | grep -q "diff review needs a repo"          # WHY
+echo "$nogit_out" | grep -q "just-ask"                          # HOW (a no-git mode)
+echo "$nogit_out" | grep -q "cd into a repo"                    # HOW (or cd into one)
+! echo "$nogit_out" | grep -q "Traceback (most recent call last)"   # NO raw traceback
+! echo "$nogit_out" | grep -q "RuntimeError"                        # NO raw exception
+# A no-git mode + the meta flags must still work from a non-git dir (exit 0, no git error).
+# NOTE: the subcommand must come FIRST — `_dispatch` only recognizes a mode as argv[0], so
+# `review -C DIR just-ask …` is a TOP-LEVEL review parse (the documented order is
+# `review just-ask -C DIR …`). Assert on the SUBCOMMAND-specific help string ("the question
+# to ask") so this can't pass spuriously off the top-level overview text.
+bin/review just-ask -C "$NONGIT_SMOKE" --help | grep -q "the question to ask"
+bin/review -C "$NONGIT_SMOKE" --list-defaults | grep -q codex
+
 # Stage 1: the composable --visual flag and its core sub-flags must appear in help.
 bin/review --help | grep -q -- "--visual"
 bin/review --help | grep -q -- "--no-ai"
@@ -165,6 +189,13 @@ echo "moderator tests OK"
 # cwd resolution: git-toplevel detection + non-repo warning (real temp git repos).
 python3 tests/test_cwd.py
 echo "cwd tests OK"
+
+# No-git-repo graceful failure: the diff-review path outside a repo prints the 3-part
+# message + the stable EXIT_NOT_A_REPO code with NO traceback; the no-git modes + meta
+# flags work anywhere; a piped diff needs no repo; a real repo is regression-safe. Driven
+# through the real bin/review as a subprocess (catches any uncaught traceback). Offline.
+python3 tests/test_no_git_repo.py
+echo "no-git-repo tests OK"
 
 # -o / --output: argv extraction (all flag forms), tee-to-stdout + file write, overwrite
 # (the noclobber fix), parent-dir creation, bad-path error, file written even on a

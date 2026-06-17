@@ -77,10 +77,10 @@ review -C <repo>                       # review current unstaged diff across the
 review -C <repo> --staged              # review the staged diff (pre-commit)
 review -C <repo> --pool 8              # run all 8 available board seats (--pool 0 also = all); default pool is 4
 review -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); bypasses the board
-review -C <repo> just-ask "Q"          # multi-model answer to a question (no diff needed)
-review -C <repo> quorum "Q"            # experts answer + a moderator finds consensus/disagreement
-review -C <repo> brainstorm "TOPIC"    # iterative persona ideation in a loop, with a moderator
-review -C <repo> brainstorm "TOPIC" --diff   # …+ the working-tree (or --staged) diff -> brainstorm ABOUT that change
+review just-ask "Q" -C <repo>          # multi-model answer to a question (no diff needed)
+review quorum "Q" -C <repo>            # experts answer + a moderator finds consensus/disagreement
+review brainstorm "TOPIC" -C <repo>    # iterative persona ideation in a loop, with a moderator
+review brainstorm "TOPIC" --diff -C <repo>   # …+ the working-tree (or --staged) diff -> brainstorm ABOUT that change
 review -C <repo> -o out.md             # write the result to a file (still prints to stdout)
 ```
 The OLD mode flags (`--brainstorm` / `--quorum` / `--just-ask`) were REMOVED — they now
@@ -126,7 +126,7 @@ directory). Agents often invoke `review` from a scratch or temp dir, so WITHOUT
 irrelevant result. Always pass `-C <absolute repo path>`. If `-C` is not inside a
 git repo, review resolves to the repo root when it can and otherwise prints a
 loud warning — heed it. When piping into review non-interactively, also redirect
-stdin (`review -C <repo> just-ask "Q" < /dev/null`); review reads stdin for an
+stdin (`review just-ask "Q" -C <repo> < /dev/null`); review reads stdin for an
 optional piped diff and will hang waiting for EOF if stdin is an open pipe.
 
 ## claude / opus backend: API or CLI
@@ -186,9 +186,10 @@ Pair with `tg` to post the chosen options / pros-cons to Telegram.
 """
 SKILL_BLURB = (
     "`review` — multi-model read-only code review + AI panels "
-    "(codex/claude/gemini/opencode). Modes are SUBCOMMANDS: `review -C <repo>` (diff), "
-    "`review -C <repo> quorum \"Q\"`, `review -C <repo> brainstorm \"topic\"`, "
-    "`review -C <repo> just-ask \"Q\"`. A bare `review …` still defaults to the diff "
+    "(codex/claude/gemini/opencode). Modes are SUBCOMMANDS (the verb leads; -C follows): "
+    "`review -C <repo>` (diff), `review quorum \"Q\" -C <repo>`, "
+    "`review brainstorm \"topic\" -C <repo>`, `review just-ask \"Q\" -C <repo>`. "
+    "A bare `review …` still defaults to the diff "
     "review; the old --quorum/--brainstorm/--just-ask flags were removed. "
     "Always pass -C <project-root>. Use before commits and for hard decisions. "
     "NEVER wrap it in a short timeout — it is multi-model / multi-round and takes "
