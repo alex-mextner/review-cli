@@ -31,10 +31,13 @@ import reviewlib.modes.review as _review_mod  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.config import (  # noqa: E402
     DEFAULT_BOARD,
+    DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
+    KIMI_SEAT,
     REVIEW_ROLES,
     BoardConfigError,
     BoardReviewer,
+    _split_models,
     load_board,
     select_pool,
 )
@@ -80,6 +83,70 @@ def test_default_board_is_priority_ordered():
 
 def test_default_board_has_eight_seats():
     assert len(DEFAULT_BOARD) == 8, len(DEFAULT_BOARD)
+
+
+# === No dead Fireworks/glide provider in the defaults (review-cli#25) ============
+# The flat DEFAULT_MODELS panel used to pin `oc:fireworks/.../kimi-k2p6-turbo`, which ran
+# on the suspended Fireworks `glide` account — a dead route. These pin that it is gone and
+# that the flat panel + the board share ONE canonical Kimi seat (KIMI_SEAT) so they cannot
+# drift back to the dead provider.
+
+# The DEAD-ROUTE tokens this fix removed. Matched as exact substrings (not a bare
+# "fireworks", which would false-trip on a future legitimately re-enabled Fireworks
+# account or an unrelated `commandcode:fireworks/...` route — the ban is on THIS dead
+# route, not the provider name forever).
+_DEAD_ROUTE_TOKENS = ("oc:fireworks/", "kimi-k2p6-turbo", "glide")
+
+
+def _all_default_model_strings() -> list[str]:
+    """Every model string reachable from the CODE-defined defaults: the flat DEFAULT_MODELS
+    panel and every DEFAULT_BOARD seat (the board IS pool + reserve; BoardReviewer carries
+    no other model field). The dead-route ban is global across these defaults — a new
+    seat/pool must not reintroduce the suspended route anywhere (review-cli#25). It does
+    NOT police user-supplied config models, which are out of scope for this fix."""
+    return list(DEFAULT_MODELS) + [r.model for r in DEFAULT_BOARD]
+
+
+def test_no_default_model_string_uses_the_dead_route():
+    for model in _all_default_model_strings():
+        low = model.lower()
+        for tok in _DEAD_ROUTE_TOKENS:
+            assert tok not in low, f"{model!r} contains dead-route token {tok!r}"
+
+
+def test_kimi_seat_itself_is_clean():
+    low = KIMI_SEAT.lower()
+    for tok in _DEAD_ROUTE_TOKENS:
+        assert tok not in low, f"KIMI_SEAT {KIMI_SEAT!r} contains dead-route token {tok!r}"
+
+
+def test_every_default_kimi_entry_is_the_canonical_seat():
+    """Any default model string that names Kimi must BE KIMI_SEAT — one source of truth,
+    so a second hard-coded (and drift-prone) Kimi string can never slip into the flat
+    panel, the board, or a reserve seat (review-cli#25)."""
+    kimi_entries = [m for m in _all_default_model_strings() if "kimi" in m.lower()]
+    assert kimi_entries, "no Kimi entry found in the defaults at all"
+    assert set(kimi_entries) == {KIMI_SEAT}, kimi_entries
+
+
+def test_default_models_and_board_share_one_kimi_seat():
+    """The flat panel's Kimi entry IS the board's Kimi seat — one source of truth
+    (KIMI_SEAT), so a future model-id bump can't update one and leave the other pointing
+    at a stale/dead provider (the exact staleness this fix removed). Matched by MODEL
+    string, not the display label (which is cosmetic and may be renamed)."""
+    assert KIMI_SEAT in DEFAULT_MODELS, DEFAULT_MODELS
+    board_models = {r.model for r in DEFAULT_BOARD}
+    assert KIMI_SEAT in board_models, board_models
+
+
+def test_default_models_routes_kimi_through_commandcode():
+    """The replacement Kimi seat goes through the commandcode gateway (the live account),
+    not the dead `oc:fireworks` opencode route — and `_split_models` round-trips the whole
+    flat panel unchanged (no alias rewrite / no drop), the normalization the review path
+    applies before dispatch."""
+    assert KIMI_SEAT.startswith("commandcode:"), KIMI_SEAT
+    assert DEFAULT_MODELS == ("codex", "gemini", KIMI_SEAT), DEFAULT_MODELS
+    assert _split_models(list(DEFAULT_MODELS)) == ["codex", "gemini", KIMI_SEAT]
 
 
 # === --pool seat selection (board redesign): default 4, first-N, reserve = rest ==
