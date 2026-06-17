@@ -428,6 +428,94 @@ def test_value_taking_opts_are_all_value_taking():
         assert "expected one argument" in msg, (opt, msg)
 
 
+def test_help_topic_usage_error_with_output_flag_does_not_truncate_file():
+    # DATA-LOSS GUARD (premium merge-gate, same class as #37): the NEW `review help <topic>`
+    # command, on a USAGE error (unknown topic / extra trailing args / a bad topic via the
+    # `--help <topic>` alias), used to `return 2` from `_help_subcommand` — which the `-o` tee
+    # path treats as a completed dispatch and persists the (empty) captured stdout, TRUNCATING
+    # a pre-existing `-o` target to empty. A usage error must behave like argparse's own usage
+    # errors w.r.t. `-o`: raise SystemExit BEFORE the tee writes, so the file is left untouched.
+    # `review help bogus-topic -o existing.md` must NOT empty existing.md.
+    # (argv, expected stderr fragment). Both usage-error shapes (unknown topic / extra trailing
+    # args) are covered through BOTH spellings — the `help` subcommand AND the `--help`/`-h <topic>`
+    # alias — since the alias routes all trailing tokens through the same _help_subcommand check.
+    usage_error_cases = (
+        (["help", "bogus-topic"], "unknown topic"),
+        (["help", "config", "extra-arg"], "extra arguments"),
+        (["--help", "bogustopic"], "unknown topic"),
+        (["-h", "bogustopic"], "unknown topic"),
+        (["--help", "config", "extra-arg"], "extra arguments"),
+        (["-h", "config", "extra-arg"], "extra arguments"),
+    )
+    for prefix, msg_fragment in usage_error_cases:
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "important.md"
+            target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                try:
+                    rc = main([*prefix, "-o", str(target)])
+                except SystemExit as exc:
+                    rc = exc.code
+            assert rc == 2, (prefix, rc)
+            actual = target.read_text(encoding="utf-8")
+            assert actual == "PRECIOUS USER DATA\n", (prefix, repr(actual))
+            # The helpful diagnostic must still reach stderr (a future refactor must not drop the
+            # message before the raise) — and it must NOT have been teed into the file.
+            assert msg_fragment in err.getvalue(), (prefix, err.getvalue())
+
+    # The other half of the contract: a usage error must not CREATE a fresh empty `-o` file
+    # either (if the tee ever switched to "open in 'w' then conditionally write", a brand-new
+    # empty file would silently appear). `review help bogus -o newfile.md` must touch nothing.
+    for prefix, _ in usage_error_cases:
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "newfile.md"  # does NOT pre-exist
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    rc = main([*prefix, "-o", str(target)])
+                except SystemExit as exc:
+                    rc = exc.code
+            assert rc == 2, (prefix, rc)
+            assert not target.exists(), (prefix, "usage error created an empty -o file")
+
+
+def test_help_topic_usage_error_exits_2_without_output_flag():
+    # The usage-error → `raise SystemExit(2)` path must surface a clean exit code 2 (NOT 1, and
+    # NOT argparse's exit-0 help) on its own, with no `-o` involved — so a script can detect a
+    # bad `review help <topic>` invocation. Pins that main() does not translate the SystemExit
+    # into a different code on the way out (the SAME usage-error shapes as the truncation guard
+    # above: unknown topic / extra trailing args, through both `help` and the `--help`/`-h` alias).
+    for prefix in (
+        ["help", "bogus-topic"],
+        ["help", "config", "extra-arg"],
+        ["--help", "bogustopic"],
+        ["-h", "bogustopic"],
+        ["--help", "config", "extra-arg"],
+        ["-h", "config", "extra-arg"],
+    ):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = main(list(prefix))
+            except SystemExit as exc:
+                rc = exc.code
+        assert rc == 2, (prefix, rc)
+
+
+def test_help_valid_topic_with_output_flag_writes_topic_text():
+    # The flip side of the data-loss guard: a SUCCESSFUL `review help <topic> -o FILE` (and the
+    # bare `review help -o FILE` listing) is real output, not a usage error — it MUST still tee
+    # the topic reference into the file (like `--list-defaults -o FILE`). Only the usage-ERROR
+    # branches skip the write; the happy path keeps writing.
+    for prefix in (["help", "config"], ["help"]):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "out.md"
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main([*prefix, "-o", str(target)])
+            assert rc == 0, (prefix, rc)
+            assert target.is_file(), (prefix, target)
+            assert target.read_text(encoding="utf-8").strip(), (prefix, "empty topic-help file")
+
+
 def test_help_documents_output_flag():
     # `--help` must advertise `-o` and explicitly steer away from `> FILE`.
     err = io.StringIO()

@@ -1158,7 +1158,15 @@ def _help_subcommand(rest: list[str]) -> int:
     ecosystem"). Bare `review help` lists the topics; `review help <topic>` prints that
     topic. An unknown topic lists the available ones + exits 2 (usage). Also reached as
     `review --help <topic>` (see the main dispatch). Topics live in HELP_TOPICS so adding a
-    topic needs no edit here."""
+    topic needs no edit here.
+
+    A USAGE error here `raise`s SystemExit(2), it does NOT `return` — like argparse's own
+    usage errors and the bare-`review` help path below. `main()`'s `-o` tee only persists the
+    captured output on a `return` (a "the dispatch ran" signal); a `return 2` here would let
+    that tee TRUNCATE a pre-existing `-o` target to empty on `review help bogus -o file.md`
+    (premium merge-gate finding, same data-loss class as #37). SystemExit propagates through
+    the tee's `finally` with `completed=False`, so no write happens. The SUCCESS paths (the
+    topic listing / a valid topic) still `return 0`: that output is real and SHOULD be teed."""
     if not rest:
         print("review help topics:\n" + "\n".join(
             f"  {t:<10} {summary}" for t, (summary, _) in HELP_TOPICS.items()
@@ -1171,14 +1179,14 @@ def _help_subcommand(rest: list[str]) -> int:
         print(f"review help: takes a single topic, got extra arguments: {' '.join(rest[1:])}\n"
               f"  use:  review help <topic>   (topics: {', '.join(HELP_TOPICS)})",
               file=sys.stderr, flush=True)
-        return 2
+        raise SystemExit(2)
     topic = rest[0]
     entry = HELP_TOPICS.get(topic)
     if entry is None:
         known = ", ".join(HELP_TOPICS)
         print(f"review help: unknown topic '{topic}'. Known topics: {known}.",
               file=sys.stderr, flush=True)
-        return 2
+        raise SystemExit(2)
     _summary, render = entry
     text = render()
     print(text, end="" if text.endswith("\n") else "\n")
