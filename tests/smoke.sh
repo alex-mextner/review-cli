@@ -12,6 +12,28 @@ export REVIEW_STATS_FILE="$(mktemp -d)/run-stats.jsonl"
 bin/review --list-defaults | grep -q codex
 bin/review --help >/dev/null
 
+# Symlink-shim sys.path bootstrap: the installed `review` is a SYMLINK into this repo;
+# its bin/review shim is the ONLY thing that makes `import reviewlib` resolve from an
+# arbitrary cwd. Prove it works from a dir OUTSIDE the repo with PYTHONPATH CLEARED — a
+# regression (or a stale pip/uv console-script shadowing the symlink with a bare import)
+# would die here with ModuleNotFoundError. Use the absolute shim path + env -u PYTHONPATH
+# so neither the cwd nor an inherited PYTHONPATH can mask a broken shim. (The full
+# subprocess matrix — incl. the cwd-not-leaked-onto-sys.path guard — is in pytest below.)
+SHIM_ABS="$(cd "$(dirname "$0")/.." && pwd)/bin/review"
+[ -x "$SHIM_ABS" ] || { echo "smoke: shim is missing its exec bit: $SHIM_ABS" >&2; exit 1; }
+SHIM_SMOKE_CWD="$(mktemp -d)"
+# Clean up on EXIT so the dir is removed even if the pipeline below fails under `set -e`
+# (an inline post-line rm would be skipped on that path). This is the ONLY EXIT trap in
+# this file; if you add another, CHAIN them (a bare second `trap ... EXIT` would clobber
+# this one). The guard makes `rm -rf ""` impossible if mktemp ever returned empty.
+trap '[ -n "$SHIM_SMOKE_CWD" ] && rm -rf "$SHIM_SMOKE_CWD"' EXIT
+# Capture FIRST, then grep — a bare `shim | grep -q` would report grep's exit status under
+# `set -o pipefail`'s left-tolerant default here, so a shim that crashes mid-output (or
+# prints `codex` inside a traceback on stderr) could slip through. Run it, demand exit 0,
+# THEN assert `codex` is in stdout.
+SHIM_OUT="$( cd "$SHIM_SMOKE_CWD" && env -u PYTHONPATH "$SHIM_ABS" --list-defaults )"
+printf '%s\n' "$SHIM_OUT" | grep -q codex
+
 # Modes are now SUBCOMMANDS, not flags. The top-level help advertises the subcommand
 # list; each mode has its own `review <mode> --help`. The OLD mode flags are GONE.
 bin/review --help | grep -q "subcommands:"
@@ -199,6 +221,21 @@ echo "moderator tests OK"
 # cwd resolution: git-toplevel detection + non-repo warning (real temp git repos).
 python3 tests/test_cwd.py
 echo "cwd tests OK"
+
+# Symlink-shim sys.path bootstrap: run the repo's bin/review as a subprocess from a tmp
+# dir OUTSIDE the repo with PYTHONPATH cleared, asserting `import reviewlib` resolves via
+# the shim's own realpath bootstrap (the breakage a stale shadowing console-script causes),
+# and that the shim does NOT leak cwd onto sys.path (a decoy reviewlib/ in cwd is ignored).
+python3 tests/test_shim_bootstrap.py
+echo "shim-bootstrap tests OK"
+
+# install.sh shadow warning: drive the real installer in an isolated HOME/PATH/cwd with a
+# fixture `review` shadowing it. A HEALTHY shadow (its interpreter imports reviewlib) is
+# EXPLAINED only — never told to uninstall (pipx is a documented install method); a broken
+# stale console-script (import fails) gets the uninstall+rm remediation. Guards against
+# advising removal of a valid install. Offline; cleans up its own temp sandbox.
+python3 tests/test_install_shadow_warning.py
+echo "install-shadow-warning tests OK"
 
 # No-git-repo graceful failure: the diff-review path outside a repo prints the 3-part
 # message + the stable EXIT_NOT_A_REPO code with NO traceback; the no-git modes + meta
