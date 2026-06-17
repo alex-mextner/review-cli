@@ -418,10 +418,23 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
     if (home / ".claude").is_dir():
         # _ensure_sessionstart_hook returns True if it ADDED the hook, False if already there
         # (or it could not write). Distinguish "already present" from "couldn't write" by
-        # re-probing: if the marker is in settings now, it is configured either way.
-        added = _ensure_sessionstart_hook(home)
+        # re-probing: if the marker is in settings now, it is configured either way. A WRITE
+        # failure (locked/read-only settings.json or a failed .bak write) raises OSError from
+        # its write path — catch it here so install-skill reports a `! conflict` and exits
+        # non-zero instead of aborting with a traceback (codex review).
+        write_error: OSError | None = None
+        try:
+            added = _ensure_sessionstart_hook(home)
+        except OSError as exc:
+            added = False
+            write_error = exc
         if added or _sessionstart_hook_present(home):
             results.append(("SessionStart hook -> ~/.claude/settings.json", added))
+        elif write_error is not None:
+            conflicts.append(
+                f"SessionStart hook -> ~/.claude/settings.json could not be written "
+                f"({write_error}) — fix the file/permissions and re-run"
+            )
         else:
             # Could neither write the hook nor find it present -> the target is genuinely
             # UNCONFIGURED. Surface it as a conflict (non-zero exit, blocks "nothing to do")
@@ -606,7 +619,19 @@ def install_commit_hook() -> int:
     else:
         print(f"  ✓ already configured  {pre_commit}")
     if not existing_path:
-        subprocess.run(["git", "config", "--global", "core.hooksPath", str(hooks_dir)], check=False)
+        # If git can't write the global config (locked / read-only / corrupt $GIT_CONFIG_GLOBAL),
+        # the hook file exists but git never points at it — so commits would NOT be gated. Don't
+        # claim "+ set" / "gate active" in that case: report a `! conflict` + non-zero exit
+        # (codex review).
+        cfg = subprocess.run(
+            ["git", "config", "--global", "core.hooksPath", str(hooks_dir)],
+            capture_output=True, text=True,
+        )
+        if cfg.returncode != 0:
+            print(f"  ! conflict  could not set global core.hooksPath -> {hooks_dir} "
+                  f"({cfg.stderr.strip() or 'git config failed'}). The hook is written but git "
+                  "is not pointed at it; fix your global git config and re-run.")
+            return 1
         print(f"  + set global core.hooksPath -> {hooks_dir}")
     elif hookspath_ok:
         print(f"  ✓ already configured  core.hooksPath -> {hooks_dir}")

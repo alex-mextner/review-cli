@@ -390,6 +390,66 @@ def test_install_skill_unwritable_target_is_a_conflict_not_a_crash():
             _restore(saved)
 
 
+def test_install_skill_sessionstart_write_failure_is_a_conflict_not_a_crash():
+    """If `_ensure_sessionstart_hook` can PARSE settings.json but cannot WRITE it (locked /
+    read-only / failed .bak write -> OSError), `install_agent_skill` must report a `! conflict`
+    + non-zero exit, not abort with a traceback (codex review). Stub the settings write to
+    raise; the parse path (read) still succeeds."""
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        settings = Path(tmp) / ".claude" / "settings.json"
+        settings.write_text("{}", encoding="utf-8")  # valid, parseable
+        orig = Path.write_text
+
+        def _boom(self, *a, **k):
+            # Fail writing settings.json (and its .bak), leave all other writes alone.
+            if self.name in ("settings.json", "settings.json.bak"):
+                raise OSError("simulated locked settings.json")
+            return orig(self, *a, **k)
+
+        try:
+            with mock.patch.object(Path, "write_text", autospec=True, side_effect=_boom):
+                rc, out = _capture(install.install_agent_skill, "review", "SKILL", "- blurb")
+            sess_lines = [ln for ln in out.splitlines() if "SessionStart hook" in ln]
+            assert any("conflict" in ln for ln in sess_lines), (sess_lines, out)
+            # Exactly one SessionStart conflict line (the write-error path must not ALSO trigger
+            # the not-present `else` branch — no duplicate conflict).
+            assert sum("SessionStart hook" in ln and "conflict" in ln
+                       for ln in out.splitlines()) == 1, out
+            assert rc != 0, (rc, out)
+            assert "nothing to do" not in out, out
+        finally:
+            _restore(saved)
+
+
+def test_install_commit_hook_git_config_failure_is_a_conflict():
+    """If `git config --global core.hooksPath` fails (locked/corrupt global config), the hook
+    file exists but git never points at it — so the installer must NOT claim "gate active":
+    it reports a `! conflict` and exits non-zero (codex review)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        orig_run = subprocess.run
+
+        def _fake_run(cmd, *a, **k):
+            # Let the "--get core.hooksPath" probe return empty (unset); make the SET fail.
+            if cmd[:3] == ["git", "config", "--global"] and "--get" not in cmd and len(cmd) >= 5:
+                class _R:
+                    returncode = 1
+                    stdout = ""
+                    stderr = "fatal: could not lock config file"
+                return _R()
+            return orig_run(cmd, *a, **k)
+
+        try:
+            with mock.patch.object(subprocess, "run", side_effect=_fake_run):
+                rc, out = _capture(install.install_commit_hook)
+            assert rc != 0, (rc, out)
+            assert "conflict" in out, out
+            assert "gate active" not in out, out
+        finally:
+            _restore(saved)
+
+
 def test_install_skill_non_utf8_settings_json_does_not_crash():
     """A `~/.claude/settings.json` holding non-UTF-8 bytes must not crash install-skill:
     `_ensure_sessionstart_hook` / `_sessionstart_hook_present` degrade to "could not write"
