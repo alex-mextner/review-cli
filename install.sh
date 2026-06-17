@@ -79,9 +79,9 @@ fi
 # ── done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "  review is installed."
-echo "  Usage: review                   — review current git diff (all backends)"
-echo "         review -m codex -m gemini — select specific backends"
+echo "  Usage: review diff              — review current git diff (all backends)"
+echo "         review diff -m codex -m gemini — select specific backends"
 echo "         review install-skill      — re-register skill with agent harnesses"
 echo "         review install-commit-hook — install pre-commit hook"
-echo "         review --help             — full usage"
+echo "         review --help             — full usage (bare 'review' prints this)"
 echo ""

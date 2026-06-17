@@ -4,17 +4,18 @@
 The review modes moved from `--` flags into first-class SUBCOMMANDS backed by a
 plugin-directory-style mode registry (mirrors features/visual/registry). These tests pin:
 
-  * each subcommand (review / brainstorm / just-ask / quorum, + the `ask` alias)
+  * each subcommand (diff / brainstorm / just-ask / quorum, + the `ask` alias)
     dispatches to the RIGHT mode handler;
-  * a bare `review …` (no recognized subcommand) defaults to the REVIEW mode (the §4
-    ergonomics) and prints the one-line migration hint to stderr — but never hard-errors;
+  * the diff review is `review diff` (renamed from the stuttering `review review`); a
+    bare `review` (no subcommand) prints HELP and exits 0 — it does NOT run a diff review;
+  * the removed verb `review review` prints a one-line "use `review diff`" pointer (exit 2);
   * `review brainstorm "…" --diff` composes the working-tree diff as grounding;
   * the removed mode FLAGS (--brainstorm/--quorum/--just-ask) now error helpfully (exit 2)
     and point at the subcommand;
   * the no-replacement removed FLAGS (--mcp/--ln) fail LOUD with a structured
     what/why/how-to-fix error (exit 2) instead of argparse's opaque "unrecognized
     arguments" — so a stale `review --mcp` MCP registration is diagnosable;
-  * the registry contract (get_mode / known_subcommands / default_mode / iter_modes).
+  * the registry contract (get_mode / known_subcommands / diff_mode / iter_modes).
 
 All offline: the mode handlers are stubbed WHERE THEY ARE DEFINED (the per-mode modules)
 so no backend is spawned; the diff is faked so no real git is touched.
@@ -39,10 +40,12 @@ from reviewlib.modes import review as _review_mod  # noqa: E402
 
 
 # --- A small harness that stubs every mode handler + diff acquisition + config. -------
-def _run(argv: list[str], *, diff: str = "") -> dict:
+def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
     """Run `cli.main(argv)` with all four mode handlers + _git_diff + load_config stubbed.
-    Returns {"mode": <name of the mode whose handler ran>, "text": <the first positional
-    arg the handler saw>, "rc": <exit code>, "stderr": <captured>}."""
+    `stdin` (default None) is what `_read_stdin_if_piped` returns — a non-None string
+    simulates a diff piped in (`git diff | review`). Returns {"mode": <name of the mode
+    whose handler ran>, "text": <the first positional arg the handler saw>, "rc": <exit
+    code>, "stderr": <captured>}."""
     captured: dict = {"mode": None, "text": None}
 
     def _mk(name):
@@ -68,13 +71,20 @@ def _run(argv: list[str], *, diff: str = "") -> dict:
     _quorum_mod.mode_quorum = _mk("quorum")
     cli._git_diff = lambda cwd, staged: diff
     cli.load_config = lambda: {"models": ["codex"]}  # explicit models -> no real board
-    cli._read_stdin_if_piped = lambda: None
+    cli._read_stdin_if_piped = lambda: stdin
     old_env = os.environ.get("GEMINI_ENV_FILE")
     os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
     err = io.StringIO()
+    out = io.StringIO()
     try:
-        with redirect_stderr(err), redirect_stdout(io.StringIO()):
-            captured["rc"] = cli.main(argv)
+        with redirect_stderr(err), redirect_stdout(out):
+            try:
+                captured["rc"] = cli.main(argv)
+            except SystemExit as exc:
+                # A bare `review` / `review --flag …` (no verb) prints help and exits via
+                # SystemExit, exactly like `review --help` — capture its code as the rc the
+                # real CLI process would surface (argparse normalizes None -> 0).
+                captured["rc"] = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
     finally:
         _review_mod.mode_review = saved["review"]
         _brainstorm_mod.mode_brainstorm = saved["brainstorm"]
@@ -88,12 +98,13 @@ def _run(argv: list[str], *, diff: str = "") -> dict:
         else:
             os.environ["GEMINI_ENV_FILE"] = old_env
     captured["stderr"] = err.getvalue()
+    captured["stdout"] = out.getvalue()
     return captured
 
 
 # --- Each subcommand dispatches to the right mode. ------------------------------------
-def test_review_subcommand_dispatches_to_review():
-    cap = _run(["review", "-C", str(REPO_ROOT)], diff="diff --git a/x b/x\n+y\n")
+def test_diff_subcommand_dispatches_to_review():
+    cap = _run(["diff", "-C", str(REPO_ROOT)], diff="diff --git a/x b/x\n+y\n")
     assert cap["mode"] == "review", cap
     assert cap["rc"] == 0
 
@@ -122,28 +133,62 @@ def test_quorum_subcommand_dispatches_to_quorum():
     assert cap["text"] == "ship it?", cap
 
 
-# --- Bare `review …` (no subcommand) defaults to the review mode (§4). ----------------
-def test_no_subcommand_defaults_to_review():
-    # The hint is printed once per process; reset the latch so this test is self-
-    # contained regardless of which tests ran before it (the hint is process-global).
-    cli._DEFAULT_HINT_SHOWN = False
+# --- Bare `review` (no subcommand) prints HELP — it does NOT run a diff review. -------
+def test_bare_review_prints_help_and_does_not_run_diff():
+    """A bare `review` (no args) must print the HELP/usage to stdout and exit 0 WITHOUT
+    dispatching any mode handler (the old "bare review = diff review" default was the
+    mistake this migration fixes)."""
+    cap = _run([], diff="diff --git a/x b/x\n+y\n")
+    assert cap["mode"] is None, ("no mode handler must run on bare review", cap)
+    assert cap["rc"] == 0, cap
+    # The help/overview was printed (it names the subcommands + the diff pointer).
+    out = cap["stdout"]
+    assert "subcommands:" in out, out
+    assert "review diff" in out, out
+
+
+def test_flags_without_subcommand_print_help_and_point_at_diff():
+    """`review -C <repo>` (flags, no verb) is the old diff-default invocation. It must NOT
+    silently run a diff review: it prints help + a `review diff` pointer and exits 2 (the
+    user passed args meaning to DO something)."""
     cap = _run(["-C", str(REPO_ROOT)], diff="diff --git a/x b/x\n+y\n")
-    assert cap["mode"] == "review", cap
-    assert cap["rc"] == 0
-    # And it prints the one-line migration hint to stderr (but does NOT hard-error).
-    assert "review review" in cap["stderr"], cap["stderr"]
-    assert "subcommands" in cap["stderr"], cap["stderr"]
+    assert cap["mode"] is None, ("no mode handler must run", cap)
+    assert cap["rc"] == 2, cap
+    assert "review diff" in cap["stderr"], cap["stderr"]
 
 
-def test_no_subcommand_with_staged_still_review():
+def test_staged_without_subcommand_points_at_diff():
     cap = _run(["--staged", "-C", str(REPO_ROOT)], diff="diff --git a/s b/s\n+z\n")
-    assert cap["mode"] == "review", cap
-    assert cap["rc"] == 0
+    assert cap["mode"] is None, cap
+    assert cap["rc"] == 2, cap
+    assert "review diff" in cap["stderr"], cap["stderr"]
 
 
-def test_meta_flag_without_subcommand_does_not_nag():
-    """A meta query (--list-defaults) without a subcommand must NOT print the hint — it
-    is not a diff-review dispatch (the hint is for the default review path only)."""
+def test_piped_diff_without_subcommand_fails_loud_not_silent_noop():
+    """`git diff | review` (a piped diff, no subcommand) used to run a diff review; a bare
+    `review` no longer does. Silently exiting 0 would turn it into an undetectable no-op
+    SUCCESS (codex P1) — so it must FAIL LOUD (exit 2) pointing at `git diff | review diff`,
+    and run no mode handler."""
+    cap = _run([], stdin="diff --git a/x b/x\n+y\n")
+    assert cap["mode"] is None, ("no mode handler must run", cap)
+    assert cap["rc"] == 2, cap
+    assert "review diff" in cap["stderr"], cap["stderr"]
+    assert "piped in" in cap["stderr"], cap["stderr"]
+
+
+def test_removed_review_verb_points_at_diff():
+    """The old stuttering `review review` verb is gone: it prints a one-line `review diff`
+    pointer (exit 2), like the removed mode flags — it does NOT run a diff review."""
+    cap = _run(["review", "-C", str(REPO_ROOT)], diff="diff --git a/x b/x\n+y\n")
+    assert cap["mode"] is None, ("review review must not dispatch the diff handler", cap)
+    assert cap["rc"] == 2, cap
+    assert "review diff" in cap["stderr"], cap["stderr"]
+    assert "no longer a subcommand" in cap["stderr"], cap["stderr"]
+
+
+def test_meta_flag_without_subcommand_works():
+    """A meta query (--list-defaults) without a subcommand still works (exit 0) and prints
+    the defaults, not the help."""
     err = io.StringIO()
     out = io.StringIO()
     saved_cfg = cli.load_config
@@ -154,7 +199,7 @@ def test_meta_flag_without_subcommand_does_not_nag():
     finally:
         cli.load_config = saved_cfg
     assert rc == 0
-    assert "review review" not in err.getvalue(), err.getvalue()
+    assert "codex" in out.getvalue(), out.getvalue()
 
 
 # --- brainstorm composes with --diff grounding. --------------------------------------
@@ -316,12 +361,14 @@ def test_removed_flag_caught_before_a_subcommand():
 
 def test_removed_no_replacement_flag_after_double_dash_is_not_intercepted():
     """A `--mcp` AFTER `--` is a positional value, not the removed flag — the reject scan
-    stops at `--`, so the structured removed-flag error must NOT fire."""
+    stops at `--`, so the structured removed-flag error must NOT fire. Driven through the
+    `diff` subcommand (the diff review mode has no positional, so argparse rejects the
+    stray token with a usage SystemExit)."""
     err = io.StringIO()
     raised = False
     with redirect_stderr(err), redirect_stdout(io.StringIO()):
         try:
-            cli.main(["review", "--", "--mcp"])
+            cli.main(["diff", "--", "--mcp"])
         except SystemExit:
             raised = True  # argparse usage error on the stray positional — acceptable
     assert "`--mcp` was removed" not in err.getvalue(), err.getvalue()
@@ -330,13 +377,14 @@ def test_removed_no_replacement_flag_after_double_dash_is_not_intercepted():
 
 def test_removed_flag_after_double_dash_is_not_intercepted():
     """A `--quorum` AFTER `--` is NOT the removed flag — the reject scan stops at `--`.
-    The review mode has no positional, so argparse rejects the extra token with a usage
-    SystemExit, but crucially NOT with the removed-flag message (the scan never fired)."""
+    The diff review mode has no positional, so argparse rejects the extra token with a
+    usage SystemExit, but crucially NOT with the removed-flag message (the scan never
+    fired)."""
     err = io.StringIO()
     raised = False
     with redirect_stderr(err), redirect_stdout(io.StringIO()):
         try:
-            cli.main(["review", "--", "--quorum"])
+            cli.main(["diff", "--", "--quorum"])
         except SystemExit:
             raised = True  # argparse usage error on the stray positional — acceptable
     assert "no longer a flag" not in err.getvalue(), err.getvalue()
@@ -346,19 +394,28 @@ def test_removed_flag_after_double_dash_is_not_intercepted():
 # --- The mode registry contract. -----------------------------------------------------
 def test_registry_known_subcommands():
     subs = _registry.known_subcommands()
-    for verb in ("review", "brainstorm", "just-ask", "quorum", "ask"):
+    for verb in ("diff", "brainstorm", "just-ask", "quorum", "ask"):
         assert verb in subs, (verb, subs)
+    # The old stuttering verb is GONE from the subcommand set (it is a removed verb now).
+    assert "review" not in subs, subs
 
 
 def test_registry_get_mode_resolves_subcommand_and_alias():
     assert _registry.get_mode("brainstorm").name == "brainstorm"
     assert _registry.get_mode("ask").name == "just-ask"   # alias
+    assert _registry.get_mode("diff").name == "review"    # diff verb -> the review mode
+    assert _registry.get_mode("review") is None           # the old verb no longer resolves
     assert _registry.get_mode("not-a-mode") is None
 
 
-def test_registry_default_mode_is_review():
-    assert _registry.default_mode().name == "review"
-    assert _registry.DEFAULT_MODE_NAME == "review"
+def test_registry_diff_mode_is_the_review_mode():
+    assert _registry.diff_mode().name == "review"
+    assert _registry.diff_mode().subcommand == "diff"
+    assert _registry.DIFF_MODE_NAME == "review"
+
+
+def test_registry_removed_subcommands_maps_review_to_diff():
+    assert _registry.REMOVED_SUBCOMMANDS.get("review") == "diff"
 
 
 def test_registry_iter_modes_are_self_describing():
@@ -366,7 +423,7 @@ def test_registry_iter_modes_are_self_describing():
     diff_policy / handler) — the descriptor a plugin-dir mode would also expose."""
     from reviewlib.modes.contract import DIFF_POLICIES
     seen_review_first = _registry.iter_modes()[0].name == "review"
-    assert seen_review_first, "review must be the first (default) mode"
+    assert seen_review_first, "the diff-review mode must be the first registered mode"
     for mode in _registry.iter_modes():
         assert mode.name and mode.subcommand, mode
         assert mode.diff_policy in DIFF_POLICIES, mode
@@ -374,17 +431,18 @@ def test_registry_iter_modes_are_self_describing():
 
 
 def test_review_mode_declares_require_diff_policy():
-    """The review mode's descriptor declares diff_policy 'require' (it is the diff-review
-    that always needs a diff), unlike the panel modes ('none'/'optional')."""
-    assert _registry.get_mode("review").diff_policy == "require"
+    """The diff-review mode's descriptor declares diff_policy 'require' (it always needs a
+    diff), unlike the panel modes ('none'/'optional')."""
+    assert _registry.get_mode("diff").diff_policy == "require"
     assert _registry.get_mode("just-ask").diff_policy == "none"
     assert _registry.get_mode("quorum").diff_policy == "none"
     assert _registry.get_mode("brainstorm").diff_policy == "optional"
 
 
-def test_review_mode_empty_diff_returns_nonzero_no_diff_to_review():
-    """End-to-end: a `review` with an EMPTY diff reaches the REAL mode_review and returns
-    non-zero ('No diff to review') — the 'require' policy enforced, not just declared."""
+def test_diff_mode_empty_diff_returns_nonzero_no_diff_to_review():
+    """End-to-end: a `review diff` with an EMPTY diff reaches the REAL mode_review and
+    returns non-zero ('No diff to review') — the 'require' policy enforced, not just
+    declared."""
     saved_cfg = cli.load_config
     saved_git = cli._git_diff
     saved_stdin = cli._read_stdin_if_piped
@@ -393,7 +451,7 @@ def test_review_mode_empty_diff_returns_nonzero_no_diff_to_review():
     cli._read_stdin_if_piped = lambda: None
     try:
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
-            rc = cli.main(["review", "-C", str(REPO_ROOT)])
+            rc = cli.main(["diff", "-C", str(REPO_ROOT)])
     finally:
         cli.load_config = saved_cfg
         cli._git_diff = saved_git

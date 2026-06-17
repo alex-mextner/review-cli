@@ -37,19 +37,18 @@ know `review` exists and can call it. The one-liner above runs this automaticall
 
 ## Quick start
 
-Modes are **subcommands**: `review <mode> …`. The first verb selects the mode; a bare
-`review …` (no subcommand) defaults to the `review` diff-review, so the most common
-invocation is unchanged.
+Modes are **subcommands**: `review <mode> …`. The first verb selects the mode. A bare
+`review` (no subcommand) prints the **help** — the diff review is `review diff`.
 
 ```bash
-# Review unstaged diff with your default backends (bare `review` == `review review`)
-review
+# Review unstaged diff with your default backends
+review diff
 
-# Review staged changes
-review --staged
+# Review staged changes (pre-commit)
+review diff --staged
 
 # Add backends to the defaults
-review -m codex -m fable5 -m gemini
+review diff -m codex -m fable5 -m gemini
 
 # Ask all backends a quick question (no diff needed)
 review just-ask "Is a single-file Python CLI the right idiom for this tool?"
@@ -65,14 +64,20 @@ review brainstorm "Alternatives before I commit?" --diff
 review brainstorm "Risks in this design?" --staged
 
 # Save the result to a file — use -o, NOT `> file` (zsh noclobber-safe)
-review -o review.md
+review diff -o review.md
 ```
+
+> **The diff review is `review diff` now.** A bare `review` (no subcommand) prints the
+> help — it does **not** run a diff review (the old "bare review == a diff review" default
+> was a mistake). The diff review moved from the stuttering `review review` to
+> **`review diff`**. The removed `review review` verb and `review -C <repo>` (flags with
+> no verb) print a one-line `review diff` pointer and exit non-zero. The meta flags
+> (`--list-defaults` / `--show-board` / `--help`) still work with no subcommand.
 
 > **Modes moved from flags to subcommands.** The old `--brainstorm` / `--quorum` /
 > `--just-ask` flags are gone — use the `brainstorm` / `quorum` / `just-ask`
-> subcommands. The flags now print a one-line pointer and exit non-zero. A bare
-> `review …` (and an explicit `review review …`) still runs the diff review exactly as
-> before. `--visual` stays a **composable flag** (not a mode): it rides any subcommand.
+> subcommands. The flags now print a one-line pointer and exit non-zero. `--visual` stays
+> a **composable flag** (not a mode): it rides any subcommand (e.g. `review diff --visual`).
 
 > **Write to a file with `-o file.md`, not `review … > file.md`.** Under zsh
 > `noclobber` (a common default), `> file.md` refuses to overwrite an existing file
@@ -84,20 +89,18 @@ review -o review.md
 
 ## Modes
 
-### Review (default)
+### Diff review (`review diff`)
 
 ![review mode](docs/mode-review.svg)
 
 N backends review your diff in parallel — one pass, no moderator. Best for pre-commit
-checks where you want fast, independent perspectives without ceremony. `review` (a bare
-invocation) and the explicit `review review` are the same diff-review path; **a diff is
-required** (the default).
+checks where you want fast, independent perspectives without ceremony. The diff review is
+the **`diff`** subcommand (`review diff`); **a diff is required**.
 
 ```bash
-review
-review --staged
-review review --staged          # explicit subcommand form (identical)
-git show --format= --no-ext-diff HEAD | review -m gemini,codex
+review diff
+review diff --staged
+git show --format= --no-ext-diff HEAD | review diff -m gemini,codex
 ```
 
 ---
@@ -369,13 +372,13 @@ name "styleprobe" in older copies — it is the `review --visual` detector.)*
 ### Composable flag, not a mode
 
 `--visual` is **orthogonal** to the four review modes — it is a **composable flag** on
-any subcommand (`brainstorm` / `quorum` / `just-ask` / `review`), so the personas /
+any subcommand (`brainstorm` / `quorum` / `just-ask` / `diff`), so the personas /
 voters / reviewer literally **see** the image as multimodal context, or it runs
 standalone:
 
 ```bash
-# Standalone — pure verdict pipeline on one render
-review --visual after.png
+# Standalone — pure verdict pipeline on one render (no diff present)
+review diff --visual after.png
 
 # The brainstorm personas see the screenshot and reason about it
 review brainstorm "is this layout good?" --visual after.png
@@ -383,8 +386,8 @@ review brainstorm "is this layout good?" --visual after.png
 # Every quorum voter gets the image as shared context
 review quorum "ship this UI?" --visual after.png
 
-# Default diff-review with the rendered result attached as evidence
-review --visual after.png        # (bare `review` with a diff present)
+# Diff review with the rendered result attached as evidence (a diff present)
+review diff --visual after.png
 ```
 
 When a companion mode is present the image and the active modules' visual questions are folded
@@ -428,9 +431,9 @@ short-circuiting before any vision call.
 
 ### `tg --photo` hook
 
-`tg` can run `review --visual` as a **pre-send hook** to block an unstyled / broken screenshot
+`tg` can run `review diff --visual` as a **pre-send hook** to block an unstyled / broken screenshot
 before it reaches Telegram — turning the often-violated "review screenshots before sending" rule
-into an enforced mechanism. The hook runs `review --visual <png> --json --strict`; a `rollback`
+into an enforced mechanism. The hook runs `review diff --visual <png> --json --strict`; a `rollback`
 verdict (exit 10) drops the photo, a `keep` lets it through, and a no-vision `human_review` /
 `unverified` fails *open* (warn + allow) so a missing key never bricks sends. See the
 `feat-tg-photo-visual-hook` branch and `docs/architecture-visual-verification.md` §7.
@@ -599,7 +602,7 @@ delivers the structured review to the launching agent.)
 3. For the closest calls, it builds the rival approaches in parallel **git worktrees**
    and compares them for real before committing.
 
-And before every commit, `review --staged` is a multi-model gate — optionally *enforced*
+And before every commit, `review diff --staged` is a multi-model gate — optionally *enforced*
 with `review install-commit-hook` (a global pre-commit hook that blocks unreviewed
 staged changes; bypass with `REVIEW_SKIP=1 git commit` or `git commit --no-verify`).
 
@@ -654,12 +657,12 @@ It falls back to an isolated temp dir (diff-only) in two cases:
 ## Subcommands & flags
 
 The mode is a **subcommand** (`review <mode> …`); the flags below are shared options
-available to the relevant subcommands. A bare `review …` (no subcommand) defaults to the
-`review` diff-review.
+available to the relevant subcommands. A bare `review` (no subcommand) prints this help —
+the diff review is `review diff`.
 
 ```
 SUBCOMMANDS
-review              Diff review across the reviewer board (the DEFAULT; requires a diff).
+diff                Diff review across the reviewer board (requires a diff).
 brainstorm TOPIC    Multi-round persona ideation; composable with --diff/--staged grounding.
 just-ask QUESTION   Single-shot multi-model answer to a question (diff optional).
 quorum QUESTION     Experts cite evidence + a moderator finds quorum/disagreement.
@@ -691,8 +694,8 @@ SHARED FLAGS
 
 > **Modes are subcommands, not flags.** `--brainstorm` / `--quorum` / `--just-ask` were
 > removed; use `review brainstorm …` / `review quorum …` / `review just-ask …`. The old
-> flags print a one-line pointer and exit non-zero. `review …` (no subcommand) still runs
-> the diff review.
+> flags print a one-line pointer and exit non-zero. The diff review is `review diff` (a
+> bare `review` prints help; the removed `review review` verb points at `review diff`).
 
 ---
 
@@ -724,7 +727,7 @@ Code defaults (when no config file exists): `codex`, `gemini`,
 
 ## Reviewer board
 
-The default `review` (plain diff review) runs a **reviewer board**: a panel where
+The plain `review diff` runs a **reviewer board**: a panel where
 each model is given its OWN review role/lens, so the panel covers the diff broadly
 instead of every model doing the same generic pass. The board is the default panel
 out of the box — no config file required.
@@ -732,7 +735,7 @@ out of the box — no config file required.
 ### Priority-ordered failover pool
 
 The board is a **priority-ordered** list of 8 models — strongest first — and a plain
-`review` runs a **pool of 4**. The pool is chosen by **priority + availability**, with
+`review diff` runs a **pool of 4**. The pool is chosen by **priority + availability**, with
 two layers of failover so the run keeps **4 working reviewers** even when models drop:
 
 - **Startup failover** — the active pool is the **top 4 AVAILABLE** seats by priority.
@@ -776,11 +779,11 @@ GLM Coding-Plan endpoint) via the z.ai backend — not through the commandcode g
 It needs a z.ai key (see Auth). All other commandcode seats need `COMMANDCODE_API_KEY`.
 
 ```bash
-review --show-board   # priority order + which 4 are the live pool + reserve + availability
-review                # default failover pool: the top 4 AVAILABLE seats by priority
-review --pool 8       # run all 8 available seats (--pool 0 also means "all available")
-review --pool 2       # run the top 2 available seats (with failover)
-review -m codex -m gemini   # an explicit -m bypasses the board entirely (exact models)
+review --show-board        # priority order + which 4 are the live pool + reserve + availability
+review diff                # default failover pool: the top 4 AVAILABLE seats by priority
+review diff --pool 8       # run all 8 available seats (--pool 0 also means "all available")
+review diff --pool 2       # run the top 2 available seats (with failover)
+review diff -m codex -m gemini   # an explicit -m bypasses the board entirely (exact models)
 ```
 
 ### Board vs. models precedence

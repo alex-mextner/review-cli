@@ -6,10 +6,11 @@ Bug (CTO 2026-06-16): a bare `review` (the diff-review default) run outside a
 diff` failed). A user just trying the tool got a stack trace.
 
 Contract pinned here:
-  * git is REQUIRED only by the REVIEW mode (bare `review` / `review review`, incl.
-    `--staged`): its diff is mandatory, so outside a repo it prints a clear 3-part
-    message (WHAT / WHY / HOW) with NO traceback and a STABLE non-zero exit code
-    (EXIT_NOT_A_REPO), not a generic crash.
+  * git is REQUIRED only by the diff-review mode (`review diff`, incl. `--staged`): its
+    diff is mandatory, so outside a repo it prints a clear 3-part message (WHAT / WHY /
+    HOW) with NO traceback and a STABLE non-zero exit code (EXIT_NOT_A_REPO), not a
+    generic crash. (A bare `review` no longer runs a diff review — it prints HELP — so the
+    not-a-repo path is reached via the `diff` subcommand.)
   * For the PANEL modes (`just-ask` / `quorum` / `brainstorm`), the diff is OPTIONAL
     context even with `--diff` / `--staged` (diff_policy "none"/"optional"): outside a
     repo those flags degrade to no-context ("") rather than hard-fail — so panel modes
@@ -75,9 +76,23 @@ def _no_traceback(proc: subprocess.CompletedProcess) -> None:
     assert "RuntimeError" not in combined, combined
 
 
-def test_bare_review_outside_repo_is_graceful():
+def test_bare_review_outside_repo_prints_help_not_crash():
+    """A bare `review` outside a repo no longer runs a diff review — it prints HELP and
+    exits 0. The key regression: NO traceback and NO not-a-repo error (it never reaches
+    the diff path)."""
     with tempfile.TemporaryDirectory() as d:
         proc = _run([], cwd=d)
+        _no_traceback(proc)
+        assert proc.returncode == 0, (proc.returncode, proc.stderr)
+        out = proc.stdout + proc.stderr
+        assert "subcommands:" in out, out
+        assert "review diff" in out, out
+        assert "not in a git repository" not in out.lower(), out
+
+
+def test_diff_subcommand_outside_repo_is_graceful():
+    with tempfile.TemporaryDirectory() as d:
+        proc = _run(["diff"], cwd=d)
         _no_traceback(proc)
         assert proc.returncode == EXIT_NOT_A_REPO, (proc.returncode, proc.stderr)
         err = (proc.stdout + proc.stderr).lower()
@@ -88,17 +103,9 @@ def test_bare_review_outside_repo_is_graceful():
         assert "cd into a repo" in err, err                    # HOW (alternative)
 
 
-def test_staged_outside_repo_is_graceful():
+def test_diff_staged_outside_repo_is_graceful():
     with tempfile.TemporaryDirectory() as d:
-        proc = _run(["--staged"], cwd=d)
-        _no_traceback(proc)
-        assert proc.returncode == EXIT_NOT_A_REPO, (proc.returncode, proc.stderr)
-        assert "not in a git repository" in (proc.stdout + proc.stderr).lower()
-
-
-def test_explicit_review_subcommand_outside_repo_is_graceful():
-    with tempfile.TemporaryDirectory() as d:
-        proc = _run(["review"], cwd=d)
+        proc = _run(["diff", "--staged"], cwd=d)
         _no_traceback(proc)
         assert proc.returncode == EXIT_NOT_A_REPO, (proc.returncode, proc.stderr)
         assert "not in a git repository" in (proc.stdout + proc.stderr).lower()
@@ -157,7 +164,7 @@ def test_nonexistent_cwd_is_graceful_not_a_traceback():
     (Driven through the real CLI in a non-repo dir; the path simply does not exist.)"""
     with tempfile.TemporaryDirectory() as d:
         missing = str(Path(d) / "no" / "such" / "path")
-        proc = _run(["-C", missing], cwd=d)
+        proc = _run(["diff", "-C", missing], cwd=d)
         _no_traceback(proc)
         assert "FileNotFoundError" not in (proc.stdout + proc.stderr), proc.stderr
         assert proc.returncode == EXIT_NOT_A_REPO, (proc.returncode, proc.stderr)
@@ -190,7 +197,7 @@ def test_piped_diff_outside_repo_does_not_require_git():
     err = io.StringIO()
     try:
         with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
-            rc = cli._dispatch(["-C", d])
+            rc = cli._dispatch(["diff", "-C", d])
     finally:
         _review_mod.mode_review = saved_handler
         cli._read_stdin_if_piped = saved_stdin
@@ -248,7 +255,7 @@ def test_real_repo_empty_diff_is_not_treated_as_not_a_repo():
         repo = Path(d) / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
-        proc = _run([], cwd=repo)
+        proc = _run(["diff"], cwd=repo)
         _no_traceback(proc)
         assert proc.returncode != EXIT_NOT_A_REPO, (proc.returncode, proc.stderr)
         assert proc.returncode == 1, (proc.returncode, proc.stderr)  # existing empty-diff contract
@@ -471,8 +478,8 @@ def test_required_review_in_repo_fails_gracefully_when_git_diff_raises():
             repo = Path(d) / "repo"
             repo.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
-            # Bare review (the REQUIRED diff path) in a real repo where git diff blows up.
-            rc = cli._dispatch(["-C", str(repo)])
+            # `review diff` (the REQUIRED diff path) in a real repo where git diff blows up.
+            rc = cli._dispatch(["diff", "-C", str(repo)])
     finally:
         cli._read_stdin_if_piped = saved_stdin
         cli.load_config = saved_cfg
@@ -484,6 +491,9 @@ def test_required_review_in_repo_fails_gracefully_when_git_diff_raises():
     assert "index file corrupt" in msg, msg          # the underlying cause is surfaced
     assert "Traceback" not in msg, msg               # no raw traceback
     assert "not in a git repository" not in msg.lower(), msg  # not the wrong message
+    # The stdin fix hint must point at the CURRENT verb (`git diff | review diff`), not the
+    # bare `review` (which now exits 2 on a piped diff) — codex review finding.
+    assert "git diff | review diff" in msg, msg
 
 
 def test_opencode_runs_in_repo_tolerates_spawn_failures():

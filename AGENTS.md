@@ -14,19 +14,24 @@ backends in parallel and prints their findings.
 The mode is selected by a **subcommand**, not a flag:
 
 ```
-review                       # bare -> the diff review (the default mode)
-review review --staged       # explicit diff-review subcommand (identical)
+review                       # bare -> prints HELP (does NOT run a diff review)
+review diff                  # the diff review (was the stuttering `review review`)
+review diff --staged         # review the staged diff (pre-commit)
 review brainstorm "TOPIC"    # multi-round persona ideation
 review brainstorm "TOPIC" --diff    # …grounded in the working-tree (or --staged) diff
 review just-ask "QUESTION"   # single-shot multi-model answer (alias: review ask "Q")
 review quorum "QUESTION"     # experts cite evidence + a moderator finds quorum
-review --visual shot.png …   # COMPOSABLE flag (NOT a mode): rides any subcommand
+review diff --visual shot.png …   # COMPOSABLE flag (NOT a mode): rides any subcommand
 ```
 
-A bare `review …` with no recognized subcommand defaults to the `review` mode (so
-`review -C <repo>` / `review --staged` / `review --visual shot.png` keep working). The
-OLD mode flags (`--brainstorm` / `--quorum` / `--just-ask`) were REMOVED — they now print
-a one-line "use the subcommand" pointer and exit non-zero.
+A bare `review` (no subcommand) prints the HELP/usage — it does **NOT** run a diff review
+(the old "bare review == a diff review" default was a mistake; never reintroduce it). The
+diff review is the `diff` subcommand: `review diff` (renamed from the stuttering
+`review review`). The removed verb `review review` and `review -C <repo>` (flags with no
+verb) print a one-line "use `review diff`" pointer and exit non-zero. The meta flags
+(`--list-defaults` / `--show-board` / `--help`) still work with no subcommand. The OLD
+mode flags (`--brainstorm` / `--quorum` / `--just-ask`) were likewise REMOVED — they print
+a "use the subcommand" pointer and exit non-zero.
 
 Bare subcommands also handled by the CLI (unchanged): `dashboard`, `sessions`, `spec-web`,
 `install-skill`, `install-commit-hook`, `register-module`, `trust-module`. `sessions` is a
@@ -54,8 +59,8 @@ review modes:
 ```
 reviewlib/modes/
   contract.py     # ModeSpec descriptor + ModeContext
-  registry.py     # MODES list + get_mode / known_subcommands / default_mode / iter_modes
-  review.py       # MODE = ModeSpec(subcommand="review",     diff_policy="require",  handler=…)
+  registry.py     # MODES list + get_mode / known_subcommands / diff_mode / iter_modes
+  review.py       # MODE = ModeSpec(subcommand="diff",       diff_policy="require",  handler=…)
   brainstorm.py   # MODE = ModeSpec(subcommand="brainstorm", diff_policy="optional", handler=…)
   just_ask.py     # MODE = ModeSpec(subcommand="just-ask",   diff_policy="none",     handler=…)
   quorum.py       # MODE = ModeSpec(subcommand="quorum",     diff_policy="none",     handler=…)
@@ -73,7 +78,7 @@ e.g. its positional question/topic), and its thin handler.
 2. Add `from .<name> import MODE as _<NAME>_MODE` and list it in `MODES` in
    `registry.py`.
 3. No `cli.py` surgery — dispatch is registry-driven. (`cli.py` only special-cases the
-   `review` mode's failover-board wiring, which is genuinely CLI-side.)
+   diff-review mode's failover-board wiring, which is genuinely CLI-side.)
 
 ## Tests
 

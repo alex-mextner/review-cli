@@ -296,11 +296,11 @@ def test_cli_brainstorm_empty_pipe_falls_back_to_worktree():
 
 def test_cli_default_review_staged_nonrepo_fails_gracefully():
     """The needs_diff formula change ((... ) and brainstorm is None) must NOT relax the
-    DEFAULT review: `review --staged` (no brainstorm) where `git diff` fails must STILL fail
-    (the review handler must NEVER run on an empty/degraded diff — GLM finding 5). What
-    CHANGED with the no-git-graceful work: it no longer fails by leaking a raw RuntimeError
-    traceback — it fails GRACEFULLY with a stable non-zero exit (EXIT_GIT_DIFF_FAILED) and a
-    structured message. So: the run exits non-zero, mode_review is never reached, and no raw
+    diff review: `review diff --staged` where `git diff` fails must STILL fail (the review
+    handler must NEVER run on an empty/degraded diff — GLM finding 5). What CHANGED with
+    the no-git-graceful work: it no longer fails by leaking a raw RuntimeError traceback —
+    it fails GRACEFULLY with a stable non-zero exit (EXIT_GIT_DIFF_FAILED) and a structured
+    message. So: the run exits non-zero, mode_review is never reached, and no raw
     RuntimeError escapes. (`-C REPO_ROOT` IS a real repo, so `_is_git_repo` passes and the
     stubbed `_git_diff` failure stands in for an in-repo `git diff` blowup.)"""
     import io
@@ -335,7 +335,7 @@ def test_cli_default_review_staged_nonrepo_fails_gracefully():
         raised = False
         rc = None
         try:
-            rc = cli.main(["--staged", "-C", str(REPO_ROOT)])
+            rc = cli.main(["diff", "--staged", "-C", str(REPO_ROOT)])
         except RuntimeError:
             raised = True  # the OLD bug: a raw traceback. The graceful path must NOT do this.
         assert not raised, "default --staged review must FAIL GRACEFULLY, not raise a traceback"

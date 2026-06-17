@@ -290,7 +290,7 @@ def test_cli_review_run_records_stat_and_announces_eta():
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["-C", d.name, "-m", "codex,gemini"])
+                rc = _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
             assert rc == 0, rc
             # ETA line went to stderr.
             assert "[review] pool=2 (review)" in err.getvalue()
@@ -345,7 +345,7 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["-C", d.name, *extra_argv])
+                rc = _cli.main(["diff", "-C", d.name, *extra_argv])
             assert rc == 0, rc
             recs = store.records()
             assert len(recs) == 1, recs
@@ -411,7 +411,7 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["-C", d.name, *extra_argv])
+                rc = _cli.main(["diff", "-C", d.name, *extra_argv])
             recs = store.records()
             assert len(recs) == 1, recs
             r = dict(recs[0])
@@ -473,7 +473,7 @@ def test_cli_records_failure_counts_per_call():
         os.environ["REVIEW_LOG_DIR"] = log
         try:
             with redirect_stderr(io.StringIO()), _capture_stdout():
-                rc = _cli.main(["-C", d.name, "-m", "codex,gemini"])
+                rc = _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
             assert rc == 1, rc
             r = store.records()[0]
             assert r["ok_count"] == 1 and r["fail_count"] == 1, r
@@ -507,7 +507,7 @@ def test_cli_no_dispatch_run_is_not_recorded_but_eta_still_printed():
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["-C", d.name, "-m", "codex,gemini"])
+                rc = _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
             assert rc == 1, rc  # "No diff to review."
             assert "[review] pool=2 (review)" in err.getvalue()  # ETA still printed
             assert store.records() == []  # but NOT recorded
@@ -530,7 +530,7 @@ def test_cli_second_run_eta_uses_first_runs_history():
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                _cli.main(["-C", d.name, "-m", "codex,gemini"])
+                _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
             assert "past run" in err.getvalue() and "this size" in err.getvalue()
             assert len(store.records()) == 2  # seed + this run
         finally:
