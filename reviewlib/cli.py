@@ -686,6 +686,17 @@ def main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else argv
     output_path, raw = _extract_output_path(list(raw))
 
+    # A REMOVED flag (--mcp/--ln, or a removed mode flag) is a USAGE error — it must behave
+    # like argparse's own usage errors w.r.t. `-o`: print the structured error and exit
+    # WITHOUT writing the `-o` file. Rejecting it INSIDE `_dispatch` only `return`s 2, which
+    # the tee path below treats as "the dispatch completed" and would persist the (empty)
+    # captured stdout — truncating a pre-existing `-o` target (codex P2). Reject it here,
+    # before the tee is armed, so no write happens. `_reject_removed_flags` is a pure argv
+    # pre-scan; the later call in `_dispatch` is then a harmless no-op.
+    rejected = _reject_removed_flags(raw)
+    if rejected is not None:
+        return rejected
+
     # The persistent SERVER subcommands stream until Ctrl-C — capturing/teeing their
     # output to a single `-o` file makes no sense (and the file would only be written
     # on shutdown), so `-o` is ignored for them and they bypass both the tee and the
