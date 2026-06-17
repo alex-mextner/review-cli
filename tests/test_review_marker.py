@@ -175,6 +175,25 @@ def test_failed_staged_review_does_not_touch_marker():
         assert not marker.exists(), "a FAILED staged review must NOT touch the gate marker"
 
 
+def test_piped_staged_review_does_not_touch_marker():
+    """A diff piped on stdin (`printf ... | review --staged`) is NOT the git index, so it
+    must NOT satisfy the commit gate even under --staged — otherwise the mtime-only marker
+    would be forgeable for a commit whose staged changes were never reviewed (codex P2).
+    The handler passes diff_from_stdin=True, which suppresses the stamp/marker."""
+    with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        repo = _make_repo(tmp)
+        marker = tmp / "cache" / "agent-tools" / "last-review"
+        os.environ["REVIEW_MARKER"] = str(marker)
+        os.environ["REVIEW_FAKE_BACKEND"] = "1"
+        rc = mode_review(
+            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True,
+            diff_from_stdin=True,
+        )
+        assert rc == 0, rc
+        assert not marker.exists(), "a piped --staged review must NOT touch the gate marker"
+
+
 def test_staged_review_returns_zero_even_if_marker_unwritable():
     """Best-effort contract at the INTEGRATION level: if the marker can't be written
     (its parent is a regular file), a successful staged review still returns 0 — the

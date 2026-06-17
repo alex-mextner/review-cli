@@ -1049,6 +1049,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # pipeline — so we MUST still try to discover it, but a missing diff / non-repo must
     # degrade to standalone rather than abort.
     diff = _read_stdin_if_piped()
+    # A piped diff is NOT the git index, so it must not satisfy the staged commit gate
+    # even under `--staged` (the stamp/marker mean "the staged index was reviewed", and
+    # `printf ... | review --staged` reviews arbitrary stdin, not `git diff --cached`).
+    # Record the provenance so the review handler can suppress the stamp/marker for it.
+    diff_from_stdin = diff is not None
     # brainstorm treats the diff as OPTIONAL grounding context even with --staged/--diff,
     # so it must NOT take the hard-fail `needs_diff` path: a non-repo `-C` or a failing
     # `git diff [--cached]` degrades to pure ideation (diff == ""), not an abort. Only the
@@ -1201,6 +1206,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     ctx = ModeContext(
         args=args, models=models, diff=diff, cwd=cwd, timeout=timeout,
         with_visual=_with_visual_text, visual_ctx=visual_ctx, moderators=moderators,
+        extra={"diff_from_stdin": diff_from_stdin},
     )
 
     # The recorded mode is the EXACT mode (a brainstorm of 4 is nothing like a plain

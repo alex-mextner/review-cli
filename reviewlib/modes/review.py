@@ -38,6 +38,7 @@ def mode_review(
     models: list[str], prompt: str, diff: str, cwd: Path, timeout: int, staged: bool,
     board: list[BoardReviewer] | None = None, pool_size: int = DEFAULT_POOL_SIZE,
     outcome_sink: list[FailoverOutcome] | None = None,
+    diff_from_stdin: bool = False,
 ) -> int:
     if not diff.strip():
         print("No diff to review.", file=sys.stderr)
@@ -46,6 +47,7 @@ def mode_review(
     if board:
         return _mode_review_board(
             board, prompt, diff, cwd, timeout, staged, pool_size, outcome_sink,
+            diff_from_stdin,
         )
 
     results: list[ReviewResult] = []
@@ -68,19 +70,35 @@ def mode_review(
     by_model = {result.model: result for result in results}
     print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))
     ok = all(result.returncode == 0 for result in results)
-    # Only stamp staged reviews — the commit gate verifies the STAGED diff, so an
-    # unstaged/piped review must not satisfy it (and must not block later). The
-    # session marker is touched on the same condition so the (separate) agent-tools
-    # time-windowed review gate also sees this genuine review.
-    if ok and staged:
+    _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
+    return 0 if ok else 1
+
+
+def _stamp_if_staged_commit_review(
+    ok: bool, staged: bool, diff_from_stdin: bool, cwd: Path, diff: str,
+) -> None:
+    """Write the diff-scoped review-stamp and touch the session marker iff this review
+    genuinely satisfies the staged commit gate. Shared by the flat and board paths so the
+    gate condition stays in ONE place.
+
+    Conditions (all required):
+      * `ok`             — the review actually passed (every seat usable / not degraded).
+      * `staged`         — `--staged`; an unstaged/working-tree review is not the gate.
+      * NOT `diff_from_stdin` — the diff came from `git diff --cached`, not piped stdin.
+        `printf ... | review --staged` reviews ARBITRARY stdin, not the index, so it must
+        not satisfy the commit gate. The stamp is diff-scoped (the hook re-derives the
+        cached diff and compares), but the marker is mtime-only and would otherwise be
+        forgeable this way — so both are gated on real-index provenance.
+    """
+    if ok and staged and not diff_from_stdin:
         _write_review_stamp(cwd, diff)
         _touch_review_marker()
-    return 0 if ok else 1
 
 
 def _mode_review_board(
     board: list[BoardReviewer], prompt: str, diff: str, cwd: Path, timeout: int,
     staged: bool, pool_size: int, outcome_sink: list[FailoverOutcome] | None,
+    diff_from_stdin: bool = False,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -123,9 +141,7 @@ def _mode_review_board(
     # A failed-then-replaced seat is handled, so it must not block — only a real
     # shortfall (reserve exhausted) does.
     ok = not outcome.degraded
-    if ok and staged:
-        _write_review_stamp(cwd, diff)
-        _touch_review_marker()
+    _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
     return 0 if ok else 1
 
 
@@ -144,16 +160,20 @@ def _handler(ctx: ModeContext) -> int:
     shape there is identical to the pre-redesign default review (a board=None call with
     no pool_size/outcome_sink), so consumers/stubs of the flat path stay compatible."""
     board = ctx.extra.get("board")
+    # A diff piped on stdin (vs read from `git diff --cached`) must not satisfy the staged
+    # commit gate even under --staged — see _stamp_if_staged_commit_review.
+    diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
     base = (
         ctx.models, ctx.with_visual(ctx.args.prompt), ctx.diff, ctx.cwd, ctx.timeout,
         ctx.args.staged,
     )
     if board is None:
-        return mode_review(*base, board=None)
+        return mode_review(*base, board=None, diff_from_stdin=diff_from_stdin)
     return mode_review(
         *base, board=board,
         pool_size=ctx.extra.get("pool_size", DEFAULT_POOL_SIZE),
         outcome_sink=ctx.extra.get("outcome_sink"),
+        diff_from_stdin=diff_from_stdin,
     )
 
 
