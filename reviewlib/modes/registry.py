@@ -19,6 +19,8 @@ modes plugin dir" discovery step would mirror `features/visual/registry.discover
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from .brainstorm import MODE as _BRAINSTORM_MODE
 from .brainstorm import brainstorm_pool
 from .contract import ModeSpec
@@ -85,12 +87,49 @@ REMOVED_MODE_FLAGS: dict[str, str] = {
 }
 
 
+@dataclass(frozen=True)
+class RemovedFlag:
+    """A flag that was REMOVED outright — it has NO replacement subcommand (unlike the
+    mode flags in REMOVED_MODE_FLAGS, which map to a verb). `reason` is WHY it is gone
+    (the PR / refactor that dropped it); `fix` is the concrete HOW-TO-FIX line (what to
+    remove and from where). The CLI prints both as a structured 3-part error (what / why /
+    how-to-fix) instead of argparse's bare `unrecognized arguments`, so a stale launcher —
+    e.g. an MCP server still spawning `review --mcp` — is diagnosable, not a silent failure."""
+
+    reason: str
+    fix: str
+
+
+# Flags REMOVED with no replacement (distinct from REMOVED_MODE_FLAGS). The headline case
+# is `--mcp`: the review-MCP entrypoint was dropped in the subcommand refactor (agent-tools
+# #32) — review is a CLI + skill, not an MCP server — but stale registrations
+# (`~/.claude/mcp/mcp.json`, a rig.yaml `mcp.review.command`) still invoke `review --mcp`,
+# which argparse rejected with an opaque `unrecognized arguments: --mcp`. We give the dead
+# flag a real, actionable error instead. `--ln` (the old line-number companion) was likewise
+# dropped and gets the same treatment.
+REMOVED_FLAGS: dict[str, RemovedFlag] = {
+    "--mcp": RemovedFlag(
+        reason="the `review --mcp` MCP entrypoint was removed in the subcommand refactor "
+        "(agent-tools #32) — review is a CLI + skill, not an MCP server.",
+        fix="remove the review MCP server registration: delete the `review` entry from "
+        "~/.claude/mcp/mcp.json (and any rig.yaml `mcp.review` / `mcp.items.review` block), "
+        "then re-run `rig apply`. Use the `review` CLI or its skill directly instead.",
+    ),
+    "--ln": RemovedFlag(
+        reason="the `--ln` line-number flag was removed in the subcommand refactor.",
+        fix="drop `--ln` from the invocation; it no longer does anything.",
+    ),
+}
+
+
 # Re-export brainstorm's slot-pool helper so the CLI's stats wrapper can key the ETA on
 # the per-round persona-slot count without reaching into the brainstorm module directly.
 __all__ = [
     "MODES",
     "DEFAULT_MODE_NAME",
     "REMOVED_MODE_FLAGS",
+    "REMOVED_FLAGS",
+    "RemovedFlag",
     "iter_modes",
     "get_mode",
     "default_mode",

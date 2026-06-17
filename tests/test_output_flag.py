@@ -301,6 +301,23 @@ def test_help_with_output_flag_does_not_truncate_file():
         assert target.read_text(encoding="utf-8") == "KEEP ME\n", target.read_text()
 
 
+def test_removed_flag_with_output_flag_does_not_truncate_file():
+    # DATA-LOSS GUARD (codex P2): a REMOVED flag (`--mcp`/`--ln`) is a usage error rejected
+    # via `_reject_removed_flags`, which RETURNS 2 (it does not raise SystemExit). The `-o`
+    # tee path must NOT treat that as a completed dispatch and persist the empty captured
+    # stdout — `review --mcp -o important.md` must leave the pre-existing file untouched,
+    # exactly like the argparse-usage-error case above.
+    for bad in ("--mcp", "--ln"):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "important.md"
+            target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main([bad, "-o", str(target)])
+            assert rc == 2, (bad, rc)
+            assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", (
+                bad, target.read_text())
+
+
 def test_value_taking_opts_are_all_value_taking():
     # Finding #2 guard: every entry in _VALUE_TAKING_OPTS must REALLY consume a value in
     # the real parser, else the pre-scan would skip a non-value token (and `-o` after a

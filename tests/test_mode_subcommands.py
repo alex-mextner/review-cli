@@ -11,6 +11,9 @@ plugin-directory-style mode registry (mirrors features/visual/registry). These t
   * `review brainstorm "…" --diff` composes the working-tree diff as grounding;
   * the removed mode FLAGS (--brainstorm/--quorum/--just-ask) now error helpfully (exit 2)
     and point at the subcommand;
+  * the no-replacement removed FLAGS (--mcp/--ln) fail LOUD with a structured
+    what/why/how-to-fix error (exit 2) instead of argparse's opaque "unrecognized
+    arguments" — so a stale `review --mcp` MCP registration is diagnosable;
   * the registry contract (get_mode / known_subcommands / default_mode / iter_modes).
 
 All offline: the mode handlers are stubbed WHERE THEY ARE DEFINED (the per-mode modules)
@@ -252,6 +255,77 @@ def test_removed_flag_equals_form_errors():
     rc, err = _capture_main(["--brainstorm=topic", "-C", str(REPO_ROOT)])
     assert rc == 2, rc
     assert "review brainstorm" in err, err
+
+
+# --- Flags removed WITH NO replacement (--mcp / --ln) fail LOUD, not opaque. ----------
+# `review --mcp` used to hit argparse's bare `unrecognized arguments: --mcp` — useless to
+# a user whose stale `~/.claude/mcp/mcp.json` still spawns it. Now it gets a structured
+# what/why/how-to-fix error so the dead MCP registration is diagnosable (ROADMAP §9).
+def test_removed_mcp_flag_errors_with_structured_pointer():
+    rc, err = _capture_main(["--mcp", "-C", str(REPO_ROOT)])
+    assert rc == 2, rc
+    assert "`--mcp` was removed" in err, err
+    # The 3-part structured error: what / why / how-to-fix.
+    assert "why:" in err and "fix:" in err, err
+    # It must NOT be the opaque argparse message.
+    assert "unrecognized arguments" not in err, err
+
+
+def test_removed_mcp_flag_names_the_registration_to_remove():
+    """The fix line must point at the concrete stale registration to delete — the whole
+    reason this exists is that a dead `mcp.json`/rig entry keeps spawning `review --mcp`."""
+    rc, err = _capture_main(["--mcp", "-C", str(REPO_ROOT)])
+    assert rc == 2, rc
+    assert "mcp.json" in err, err
+    assert "rig apply" in err, err
+
+
+def test_removed_mcp_flag_equals_form_errors():
+    rc, err = _capture_main(["--mcp=stdio", "-C", str(REPO_ROOT)])
+    assert rc == 2, rc
+    assert "`--mcp` was removed" in err, err
+
+
+def test_removed_ln_flag_errors_with_pointer():
+    rc, err = _capture_main(["--ln", "-C", str(REPO_ROOT)])
+    assert rc == 2, rc
+    assert "`--ln` was removed" in err, err
+
+
+def test_removed_ln_flag_equals_form_errors():
+    rc, err = _capture_main(["--ln=5", "-C", str(REPO_ROOT)])
+    assert rc == 2, rc
+    assert "`--ln` was removed" in err, err
+
+
+def test_removed_flag_caught_after_valid_global_args():
+    """A stale launcher can put `--mcp` AFTER valid args (e.g. `-C <dir> --mcp`). The
+    scan walks the whole pre-`--` argv, so it is still caught — not left to argparse."""
+    rc, err = _capture_main(["-C", str(REPO_ROOT), "--mcp"])
+    assert rc == 2, rc
+    assert "`--mcp` was removed" in err, err
+
+
+def test_removed_flag_caught_before_a_subcommand():
+    """`--mcp brainstorm x` (removed flag before a verb) is still intercepted with the
+    structured error, not parsed as a brainstorm run."""
+    rc, err = _capture_main(["--mcp", "brainstorm", "x"])
+    assert rc == 2, rc
+    assert "`--mcp` was removed" in err, err
+
+
+def test_removed_no_replacement_flag_after_double_dash_is_not_intercepted():
+    """A `--mcp` AFTER `--` is a positional value, not the removed flag — the reject scan
+    stops at `--`, so the structured removed-flag error must NOT fire."""
+    err = io.StringIO()
+    raised = False
+    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+        try:
+            cli.main(["review", "--", "--mcp"])
+        except SystemExit:
+            raised = True  # argparse usage error on the stray positional — acceptable
+    assert "`--mcp` was removed" not in err.getvalue(), err.getvalue()
+    assert raised, "argparse should reject the stray positional after --"
 
 
 def test_removed_flag_after_double_dash_is_not_intercepted():

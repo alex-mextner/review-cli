@@ -36,6 +36,16 @@ bin/review brainstorm --help | grep -q -- "--rounds"
 removed_msg="$(bin/review --brainstorm "x" 2>&1 || true)"; echo "$removed_msg" | grep -q "review brainstorm"
 removed_msg="$(bin/review --quorum "x" 2>&1 || true)"; echo "$removed_msg" | grep -q "review quorum"
 removed_msg="$(bin/review --just-ask "x" 2>&1 || true)"; echo "$removed_msg" | grep -q "review just-ask"
+# `--mcp` (the dead review-MCP entrypoint) and `--ln` were removed with NO replacement —
+# they must FAIL LOUD with a structured what/why/how-to-fix error (exit 2), not argparse's
+# opaque "unrecognized arguments". The --mcp fix names the stale registration to delete
+# (so a dead `~/.claude/mcp/mcp.json` `review --mcp` is diagnosable, ROADMAP §9).
+! bin/review --mcp >/dev/null 2>&1
+mcp_msg="$(bin/review --mcp 2>&1 || true)"
+echo "$mcp_msg" | grep -q '`--mcp` was removed'
+echo "$mcp_msg" | grep -q "mcp.json"
+! echo "$mcp_msg" | grep -q "unrecognized arguments"
+ln_msg="$(bin/review --ln 2>&1 || true)"; echo "$ln_msg" | grep -q '`--ln` was removed'
 # Bare `review` (no subcommand) still defaults to the review diff path: a meta query
 # like --list-defaults works WITHOUT a subcommand (the most common ergonomics, §4).
 bin/review --list-defaults | grep -q codex
