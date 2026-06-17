@@ -17,7 +17,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from . import backends
 from .backends import _which  # re-export for tests/compat  # noqa: F401
@@ -56,6 +56,9 @@ from .modes.review import mode_review
 from .panel import begin_call_tally, end_call_tally, pick_moderators
 from .process import _run
 from .stats import announce_eta, record_run
+
+if TYPE_CHECKING:
+    from agenttools_service import ServiceManager
 
 # Keep the mode-handler names imported off `cli` for legacy import compatibility ONLY
 # (some external/legacy callers `from reviewlib.cli import mode_review`). Dispatch goes
@@ -186,16 +189,64 @@ def _effective_cwd(raw: str, *, warn: bool = True) -> Path:
     return resolved
 
 
-def _dashboard_subcommand(rest: list[str]) -> int:
-    """Parse `dashboard [--host H] [--port N] [--no-open]` and start the web server.
+# Shared between the `__serve` parser and the managed-service parser so the two surfaces never
+# drift on what `--host` means (loopback-only by default; 0.0.0.0 exposes over Tailscale).
+_DASHBOARD_HOST_HELP = (
+    "interface to bind (default: 127.0.0.1 loopback-only; 0.0.0.0 exposes over Tailscale)"
+)
+
+# Printed (exit 4) when a genuine lifecycle action is requested but the shared service lib is
+# absent. Kept as a module constant so the smoke test can grep it and it stays aligned with the
+# `pyproject.toml [dashboard]` extra comment that explains the same in-ecosystem dependency.
+_AGENTTOOLS_SERVICE_MISSING_MSG = (
+    "[review dashboard] the managed-service subcommands need the shared "
+    "'agenttools_service' lib, which isn't installed.\n"
+    "  why:  run/start/status/stop/enable/disable come from one shared service-manager "
+    "(agent-tools/lib/agenttools_service), not a per-tool copy.\n"
+    "  fix:  pip install -e <agent-tools>/lib/agenttools_service   "
+    "(or `pip install 'review-cli[dashboard]'` once published).\n"
+    "  note: `review dashboard run` still works without it for an ad-hoc foreground server."
+)
+
+
+def _dashboard_help_no_lib() -> int:
+    """Help for a BARE ``review dashboard`` when the service lib is ABSENT (still launches nothing).
+
+    Mirrors the lib-present help surface — it advertises every lifecycle action so the bare-HELP
+    contract (and the smoke test that greps for ``status`` / the action names) holds regardless of
+    whether ``agenttools_service`` is installed — while making clear those actions need the lib."""
+    print(
+        "usage: review dashboard [--host H] [--port N] "
+        "{run,start,stop,status,enable,disable}\n\n"
+        "review-cli dashboard as a managed service. A bare `review dashboard` prints this help "
+        "and launches nothing.\n\n"
+        "actions:\n"
+        "  run      run in the FOREGROUND (this shell), blocking — ad-hoc / when disabled\n"
+        "  start    start in the BACKGROUND (detached daemon); return immediately\n"
+        "  status   is it running? pid / port / url / autostart-enabled\n"
+        "  stop     stop the background instance\n"
+        "  enable   install OS autostart (launchd / systemd --user / fallback) AND start now\n"
+        "  disable  remove OS autostart AND stop\n\n"
+        "note: start/status/stop/enable/disable need the shared 'agenttools_service' lib "
+        "(`pip install 'review-cli[dashboard]'`); `run` works without it."
+    )
+    return 0
+
+
+def _dashboard_serve(rest: list[str]) -> int:
+    """Hidden entry: ``review dashboard __serve`` — run the blocking web server in THIS shell.
+
+    This is the FOREGROUND server the managed service runs (``run``) and detaches (``start``):
+    it calls ``run_dashboard`` directly and so never re-enters the service dispatcher (a bare
+    ``run`` action whose argv pointed back at ``review dashboard run`` would fork-bomb). Not
+    advertised in help — operators use ``review dashboard run`` (ad-hoc) or ``start`` (managed).
 
     Binds 127.0.0.1 by default; ``--host 0.0.0.0`` exposes it over Tailscale (mirrors
-    ``review spec-web``). Imported lazily so the dashboard's stdlib HTTP stack never loads
-    on the hot review path (and a stray import error in dashboard code can't break
-    `review`)."""
-    sub = argparse.ArgumentParser(prog="review dashboard", description="Web dashboard for review-cli runs.")
-    sub.add_argument("--host", default="127.0.0.1",
-                     help="interface to bind (default: 127.0.0.1 loopback-only; 0.0.0.0 exposes over Tailscale)")
+    ``review spec-web``). Imported lazily so the dashboard's stdlib HTTP stack never loads on
+    the hot review path (and a stray import error in dashboard code can't break `review`)."""
+    sub = argparse.ArgumentParser(prog="review dashboard __serve",
+                                  description="Run the review-cli dashboard web server (blocking).")
+    sub.add_argument("--host", default="127.0.0.1", help=_DASHBOARD_HOST_HELP)
     sub.add_argument("--port", type=int, default=None, help="port to bind (default: a free ephemeral port)")
     sub.add_argument("--no-open", action="store_true", help="do not open a browser window")
     sub.add_argument("--verbose", action="store_true", help="log every HTTP request to stderr")
@@ -203,6 +254,99 @@ def _dashboard_subcommand(rest: list[str]) -> int:
     from .dashboard import run_dashboard
 
     return run_dashboard(port=ns.port, host=ns.host, open_browser=not ns.no_open, verbose=ns.verbose)
+
+
+def _dashboard_subcommand(rest: list[str]) -> int:
+    """`review dashboard [run|start|status|stop|enable|disable]` — the dashboard as a MANAGED
+    service, plus the legacy ad-hoc ``run``.
+
+    The lifecycle subcommands (run/start/status/stop/enable/disable) come from the shared
+    ``agenttools_service`` lib (one service-manager for every long-running server in the
+    ecosystem — review dashboard, config-web, tg-ctl, future daemons), NOT hand-rolled here:
+
+      run      run in the FOREGROUND (this shell), blocking — ad-hoc / when disabled.
+      start    start in the BACKGROUND (detached daemon); return immediately.
+      status   is it running? pid / port / url / autostart-enabled.
+      stop     stop the background instance.
+      enable   install OS autostart (launchd / systemd --user / no-systemd fallback) AND start now.
+      disable  remove OS autostart AND stop.
+
+    A BARE ``review dashboard`` (no action) prints HELP and launches NOTHING. ``--host`` /
+    ``--port`` select the managed bind (a stable default port, unlike ad-hoc ``run``'s ephemeral
+    one). Everything (the lib, the service descriptor) is imported lazily so the hot ``review``
+    path never pays for the dashboard/service stack."""
+    # Hidden foreground entry that the service argv points at (see dashboard.service._serve_argv).
+    # Kept BEFORE the agenttools_service import so the blocking server still runs even on a host
+    # where the shared service lib isn't installed (a detached `start` from a host that HAS the
+    # lib can run `__serve` here).
+    if rest and rest[0] == "__serve":
+        return _dashboard_serve(rest[1:])
+
+    try:
+        from agenttools_service import add_service_subcommands, dispatch
+    except ImportError:
+        # No shared service lib on this host. The bare-HELP and ad-hoc `run` contracts must
+        # still hold (they don't depend on the lib): a BARE `review dashboard` (or `--help`)
+        # prints help and launches nothing, and `run` still brings up an ad-hoc foreground
+        # server so a lib-less operator isn't fully blocked. Only the genuine lifecycle actions
+        # (start/status/stop/enable/disable) need the lib — for those, emit an actionable error
+        # (structured-exit-codes) instead of a raw ImportError traceback.
+        action, action_idx = _dashboard_action_with_index(rest)
+        # A BARE `review dashboard` OR a help-only `review dashboard [--help|-h]` (no lifecycle
+        # action) prints help and launches nothing — exit 0. The help surface is the SAME
+        # whether or not the lib is installed (the smoke test greps it for the action names),
+        # so a lib-less operator still sees what the dashboard can do. `--help`/`-h` with no
+        # action was previously mis-routed to the missing-lib error (exit 4), breaking the
+        # bare-HELP contract — a `--help`/`-h` is NOT itself a lifecycle action.
+        if action is None:
+            return _dashboard_help_no_lib()
+        if action == "run":
+            # Ad-hoc foreground server still works without the lib. Drop ONLY the `run` action
+            # token (by index, not by value — a value that happens to equal "run" must survive);
+            # `_dashboard_serve` parses the rest as server flags (and prints its own --help/exit 0
+            # for `run --help`, so the help contract holds there too).
+            return _dashboard_serve(rest[:action_idx] + rest[action_idx + 1 :])
+        # A genuine lifecycle action (start/status/stop/enable/disable) needs the lib — emit the
+        # actionable missing-lib error (structured-exit-codes) instead of a raw ImportError.
+        print(_AGENTTOOLS_SERVICE_MISSING_MSG, file=sys.stderr)
+        return 4
+
+    from .dashboard.service import DEFAULT_DASHBOARD_HOST, DEFAULT_DASHBOARD_PORT
+
+    parser = argparse.ArgumentParser(
+        prog="review dashboard",
+        description="review-cli dashboard as a managed service (run/start/status/stop/enable/disable).",
+    )
+    parser.add_argument("--host", default=DEFAULT_DASHBOARD_HOST, help=_DASHBOARD_HOST_HELP)
+    parser.add_argument("--port", type=int, default=DEFAULT_DASHBOARD_PORT,
+                        help=f"port to bind the managed dashboard (default: {DEFAULT_DASHBOARD_PORT})")
+    subs = parser.add_subparsers(dest="action")
+    # Parse FIRST, then build the manager factory over the parsed namespace. The factory closes
+    # over `ns`, so `ns` must exist before any action can invoke it; registering the subcommands
+    # does not call the factory (it is lazy, per the lib contract), so registration order vs parse
+    # is free — but binding `ns` explicitly avoids a fragile forward-reference closure.
+    add_service_subcommands(
+        subs,
+        manager_factory=lambda: _dashboard_manager(ns.host, ns.port),
+        service_name="dashboard",
+    )
+    ns = parser.parse_args(rest)
+
+    def _print_help_ok() -> int:
+        parser.print_help()
+        return 0
+
+    return dispatch(ns, on_no_subcommand=_print_help_ok)
+
+
+def _dashboard_manager(host: str, port: int) -> "ServiceManager":
+    """Build a ``ServiceManager`` for the dashboard at ``host:port`` (lazy, per the lib's
+    ``manager_factory`` contract — constructed only when an action actually runs)."""
+    from agenttools_service import ServiceManager
+
+    from .dashboard.service import dashboard_service
+
+    return ServiceManager(dashboard_service(port=port, host=host))
 
 
 def _sessions_subcommand(rest: list[str]) -> int:
@@ -525,15 +669,56 @@ _SERVER_SUBCOMMANDS = frozenset({"dashboard", "spec-web"})
 
 
 def _is_persistent_server_invocation(argv: list[str]) -> bool:
-    """True when argv starts a PERSISTENT server (`dashboard`, `spec-web <spec>`) that runs
-    until Ctrl-C and so must bypass the `-o` tee + the run backstop. The short-lived
-    `review spec-web reply …` is NOT a server — it returns immediately — so it is excluded
-    and goes through the normal tee/backstop path like any instant subcommand."""
+    """True when argv starts a PERSISTENT server that runs until Ctrl-C and so must bypass the
+    `-o` tee + the run backstop. The short-lived management actions are NOT servers — they
+    return immediately — so they go through the normal tee/backstop path like any instant
+    subcommand:
+
+      * ``spec-web reply …``  — returns immediately, not a server.
+      * ``dashboard`` lifecycle actions (``start``/``status``/``stop``/``enable``/``disable``
+        and the bare HELP) — return immediately. Only the FOREGROUND blocking server blocks:
+        ad-hoc ``dashboard run`` and the hidden ``dashboard __serve`` it dispatches to.
+    """
     if not argv or argv[0] not in _SERVER_SUBCOMMANDS:
         return False
     if argv[0] == "spec-web" and len(argv) > 1 and argv[1] == "reply":
         return False
+    if argv[0] == "dashboard":
+        # Only the blocking foreground server is persistent; everything else returns fast.
+        # The managed-service parser accepts the global `--host`/`--port` options BEFORE the
+        # action (`dashboard --port 7878 run`), so the action is NOT necessarily argv[1] — it
+        # is the first NON-OPTION token. Misclassifying `--port N run` as non-persistent would
+        # wrap the foreground server in the run backstop and let it be killed. `--host`/`--port`
+        # are the only options that take a value here; skip the flag and its argument.
+        return _dashboard_action(argv[1:]) in ("run", "__serve")
     return True
+
+
+def _dashboard_action(rest: list[str]) -> str | None:
+    """The dashboard ACTION (run/start/…) from the tokens after ``dashboard``, or ``None``."""
+    return _dashboard_action_with_index(rest)[0]
+
+
+def _dashboard_action_with_index(rest: list[str]) -> tuple[str | None, int]:
+    """``(action, index)`` for the dashboard action token, or ``(None, -1)``.
+
+    Skips the global ``--host``/``--port`` options (and their values) that the managed-service
+    parser allows before the action, so ``--port 7878 run`` resolves to ``run`` — matching how
+    argparse itself parses it (see :func:`_dashboard_subcommand`). The index lets a caller drop
+    exactly the action token (not a value that merely equals it)."""
+    i = 0
+    value_opts = ("--host", "--port")
+    while i < len(rest):
+        tok = rest[i]
+        if tok in value_opts:
+            i += 2  # skip the flag and its value
+            continue
+        if tok.startswith("-"):
+            # `--port=7878` or any other valueless flag — skip the single token.
+            i += 1
+            continue
+        return tok, i  # first non-option token == the action
+    return None, -1
 
 
 class _Tee(io.TextIOBase):
@@ -1045,7 +1230,7 @@ def _subcommand_epilog() -> str:
     return "subcommands:\n" + "\n".join(
         f"  {m.subcommand:<11} {m.summary}" for m in iter_modes()
     ) + (
-        "\n  dashboard   local web dashboard over review-cli runs"
+        "\n  dashboard   managed web dashboard over review-cli runs (run/start/status/stop/enable/disable)"
         "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
         "\n  spec-web    interactive web reviewer for a markdown spec"
         "\n  install-skill / install-commit-hook / register-module"
@@ -1213,6 +1398,15 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return install_skill()
     if argv == ["install-commit-hook"]:
         return install_commit_hook()
+    # `review --reviewlib-dir` — print the directory of the `reviewlib` package this `review`
+    # actually runs, then exit. Used by the managed-dashboard service to detect the live-symlink
+    # trap (the `review` on PATH resolving to a DIFFERENT checkout than the one wiring the
+    # service), so autostart never launches the wrong code. Deliberately introspection-only.
+    if argv == ["--reviewlib-dir"]:
+        import reviewlib
+
+        print(Path(reviewlib.__file__).resolve().parent)
+        return 0
     # `review dashboard [--port N] [--no-open]` — local-only web dashboard over the
     # review-cli logs + overseer annotations. Kept as a bare subcommand (like
     # install-skill) so it doesn't bloat the main review argparse surface.

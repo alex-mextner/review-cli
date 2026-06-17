@@ -12,9 +12,21 @@ dependencies = ["pyyaml"]
 # The visual-verification test suite generates fixture PNGs with Pillow and shells out
 # to ImageMagick (`magick`, a SYSTEM dependency — install separately, e.g. `brew install
 # imagemagick`). Pillow is TEST-only, not a runtime dependency (cvGate uses ImageMagick,
-# never Pillow). Install with `pip install -e '.[test]'` before running tests/smoke.sh.
+# never Pillow). Install with `pip install -e '.[test]'` before running the smoke suite.
+# The smoke suite (tests/smoke.py) is Python and runs standalone (`python tests/smoke.py`,
+# what CI runs); it is ALSO pytest-collectable (`pytest tests/smoke.py`) when pytest is present.
 [project.optional-dependencies]
-test = ["pillow"]
+test = ["pillow", "pytest>=8,<9"]
+# `review dashboard` as a MANAGED SERVICE (run/start/status/stop/enable/disable + launchd/
+# systemd autostart) is powered by the shared `agenttools_service` lib — ONE service-manager
+# every long-running agent-tools server reuses, instead of each tool hand-rolling pidfiles /
+# autostart units. It is an IN-ECOSYSTEM dependency (agent-tools/lib/agenttools_service, itself
+# stdlib-only + agenttools-daemon), not yet on PyPI, so it is an OPTIONAL extra rather than a
+# hard runtime dep: `review` and the rest of the dashboard work without it; only the lifecycle
+# subcommands need it. Until it is published, install editable from the agent-tools checkout:
+#   pip install -e <agent-tools>/lib/agenttools_daemon -e <agent-tools>/lib/agenttools_service
+# The lazy import in reviewlib.cli emits an actionable error (exit 4) if it is missing.
+dashboard = ["agenttools-service>=0.1.0,<1"]
 
 # Stage 0 (decomposition) packaging — see docs/architecture-visual-verification.md §8.1, D8.
 # The CLI is now a real package (`reviewlib`), so it is exposed via a proper console

@@ -115,12 +115,15 @@ stays accurate.
 
 ## Tests
 
-CI runs **`bash tests/smoke.sh`** (this IS the test runner — it runs the bash smoke
-assertions then every `tests/test_*.py`). Replicate it locally:
+CI runs **`python tests/smoke.py`** (this IS the test runner — the ecosystem is Python-only:
+it drives the real `bin/review` CLI via subprocess for the smoke assertions, then runs every
+`tests/test_*.py`). The same file is pytest-collectable (`pytest tests/smoke.py`). Replicate
+it locally:
 
 ```
-pip install -e '.[test]'      # pyyaml runtime + pillow (test); ImageMagick `magick` is a system dep
-bash tests/smoke.sh
+pip install -e '.[test]'      # pyyaml runtime + pillow + pytest (test); ImageMagick `magick` is a system dep
+python tests/smoke.py         # standalone (what CI runs)
+pytest tests/smoke.py         # or under pytest
 ```
 
 The visual-verification suite needs ImageMagick v7 (`magick`) + Pillow; without them it

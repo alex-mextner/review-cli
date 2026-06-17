@@ -5,6 +5,36 @@ semantic versioning.
 
 ## Unreleased
 
+- **Dashboard overhaul — real model brand logos, an interactive Errors recovery view, and a
+  Python smoke suite.** Five changes:
+  - **Per-model BRAND LOGOS, not emoji.** Every seat / participant / model chip across the
+    dashboard now renders the model's REAL brand logo as an `<img>` (the committed
+    `assets/icons/mini_<brand>.png` set, shared with tg-cli) — Anthropic starburst, the
+    OpenAI/Codex mark, Gemini's spark, the DeepSeek whale, Qwen, Kimi, Meta, Mistral, Grok,
+    etc. — instead of the unicode-emoji fallback. Each model resolves to its brand via the
+    same exact-then-prefix logic tg-cli uses (`extractBaseModel`): Opus/Fable → Anthropic,
+    GPT/o1/o3/Codex → OpenAI, Llama → Meta, GLM/z.ai → the GLM brand tile, and so on — so the
+    8-seat default board (Fable/Opus/Codex/Kimi/GLM/Qwen/DeepSeek/Gemini) renders all real
+    logos with no odd-one-out. A family with no shipped logo (MiniMax, a bare gateway probe)
+    renders a clean two-letter brand monogram — never a generic emoji. The server serves the
+    PNGs from an allowlisted `assets/icons/` path.
+  - **Errors tab is now a drill-down recovery view.** Each failed call is a clickable card
+    showing its failure CLASS (paywall / auth / blocked / timeout / error), a RECOVERY status
+    (recovered — a later seat/retry returned a clean verdict — or unrecovered), the
+    planned FALLBACK seat the failover pool would promote (next board seat by priority + its
+    lens), and — when auto-failover is exhausted — a **take manual control** button that opens
+    the run with a manual-control note primed in the overseer feedback box. Clicking a card
+    opens the failing session detail scrolled to and expanded on the failing call.
+  - **Detail / session views** lead with the run's prompt/topic and now resolve each call's
+    chip to its gateway MODEL (e.g. "Qwen", not the bare "gateway" backend), so the brand
+    logo + label are accurate per call.
+  - **Smoke suite converted to Python** (`tests/smoke.py`, replacing the bash `smoke.sh`):
+    it drives the real `bin/review` CLI via subprocess and runs the `tests/test_*.py` files.
+    Runnable standalone (`python tests/smoke.py`, what CI now runs) or under pytest.
+  - **Fixed the lib-absent dashboard `--help` path** (the CI failure): a `review dashboard
+    --help`/`-h` with the optional `agenttools_service` lib absent now prints help and exits 0
+    (the bare-HELP contract), instead of mis-routing to the missing-lib error (exit 4).
+
 - **The default board is AGENTIC by default (review-cli#24).** Every board seat that
   *can* read the repo now does. The Kimi/GLM/Qwen/DeepSeek seats route through opencode
   (`oc:provider/model`, e.g. `oc:commandcode/moonshotai/Kimi-K2.7-Code`, `oc:zai/glm-5.2`)

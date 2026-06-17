@@ -471,6 +471,164 @@ def test_panel_session_surfaces_recorded_invocations_as_prompt():
         assert empty.invocations == [], empty.invocations
 
 
+def test_error_recovery_recovered_when_a_clean_call_follows_in_session():
+    """A failed seat is `recovered` when a clean OK call ran concurrently-or-after it in the
+    same session (the failover pool / a retry produced a verdict). Each error also carries its
+    resolved MODEL id, failure CLASS, and the planned FALLBACK seat (next board priority)."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # A panel: a Cloudflare-blocked agentic Qwen seat (403) + a clean agentic DeepSeek seat
+        # right after. The default board is AGENTIC (review-cli#24), so the seats are the `oc:`
+        # opencode ids — model_id_for_call recovers the `-m <provider/model>` selector.
+        _write_call_log(ld, "20260601T100000_000000", "opencode", 0, "[stderr] error code: 1010\n",
+                        argv0="opencode run --agent read-only-reviewer --dir /x -m commandcode/Qwen/Qwen3.7-Max",
+                        exit_code=403)
+        _write_call_log(ld, "20260601T100002_000000", "opencode", 0,
+                        "## Findings\nA real verdict.\n",
+                        argv0="opencode run --agent read-only-reviewer --dir /x -m commandcode/deepseek/deepseek-v4-pro",
+                        exit_code=0)
+        s = p.load_sessions(ld, gap_seconds=90)[0]
+        errs = s.errors
+        assert len(errs) == 1, errs
+        e = errs[0]
+        assert e["model"] == "oc:commandcode/Qwen/Qwen3.7-Max", e
+        assert e["health_class"] == p.HEALTH_BLOCKED, e
+        assert e["recovery"] == "recovered", e  # DeepSeek's clean call after it recovered the run
+        # The planned fallback is the next board seat by priority after Qwen (DeepSeek).
+        assert e["fallback"] is not None and e["fallback"]["display"] == "DeepSeek", e["fallback"]
+
+
+def test_error_recovery_unrecovered_when_no_clean_call():
+    """A lone failed seat with no clean call anywhere is `unrecovered` — the Errors tab surfaces
+    the manual-control affordance for these."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T100000_000000", "z.ai", 0, '[stderr] {"error":"bad key"}\n',
+                        argv0="z.ai API glm-5.2", exit_code=401)
+        s = p.load_sessions(ld, gap_seconds=90)[0]
+        e = s.errors[0]
+        assert e["model"] == "zai:glm-5.2", e
+        assert e["health_class"] == p.HEALTH_AUTH, e
+        assert e["recovery"] == "unrecovered", e
+
+
+def test_error_recovery_does_not_overclaim_from_an_earlier_round_success():
+    """(glm review finding 5) A round-1 success must NOT mark a LATER-round failure 'recovered'.
+    Recovery is 'a clean call in the SAME round (parallel sibling) or at/after the failure', not
+    'any clean call in the session', so a failure whose only clean call is in an EARLIER round is
+    honestly `unrecovered`."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # Round 1: a clean codex call. Round 3 (later): a GLM auth failure with nothing clean
+        # in its round or after — the earlier round-1 success must NOT count as recovery.
+        _write_call_log(ld, "20260601T100000_000000", "codex", 1, "## Findings\nverdict.\n",
+                        argv0="/opt/homebrew/bin/codex", exit_code=0)
+        _write_call_log(ld, "20260601T100030_000000", "z.ai", 3, '[stderr] {"error":"bad key"}\n',
+                        argv0="z.ai API glm-5.2", exit_code=401)
+        s = p.load_sessions(ld, gap_seconds=90)[0]
+        glm_err = next(e for e in s.errors if e["model"] == "zai:glm-5.2")
+        assert glm_err["recovery"] == "unrecovered", glm_err
+
+
+def test_error_recovery_recovered_by_parallel_panel_sibling_same_round():
+    """A parallel panel fan-out: all seats answer the SAME request in the same round. A clean
+    sibling in that round means the run produced a verdict despite this seat failing — even if
+    the sibling's log finished a moment BEFORE this seat's failure timestamp (the file mtimes in
+    a fan-out aren't strictly ordered)."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # DeepSeek (clean) logged first, then Kimi (blocked) — both round 0 of one panel.
+        _write_call_log(ld, "20260601T100000_000000", "commandcode", 0, "## Findings\nverdict.\n",
+                        argv0="commandcode API deepseek/deepseek-v4-pro", exit_code=0)
+        _write_call_log(ld, "20260601T100004_000000", "commandcode", 0, "[stderr] error code: 1010\n",
+                        argv0="commandcode API moonshotai/Kimi-K2.7-Code", exit_code=403)
+        s = p.load_sessions(ld, gap_seconds=90)[0]
+        kimi_err = next(e for e in s.errors if "Kimi" in e["model"])
+        assert kimi_err["recovery"] == "recovered", kimi_err
+
+
+def test_fallback_seat_is_next_priority_and_none_for_last_seat():
+    """`_fallback_seat_for` returns the next board seat by priority, and None for the
+    lowest-priority seat (the board has no lower reserve) or an off-board model."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.config import DEFAULT_BOARD
+
+    first = DEFAULT_BOARD[0].model
+    second = DEFAULT_BOARD[1]
+    last = DEFAULT_BOARD[-1].model
+    fb = p._fallback_seat_for(first)
+    assert fb is not None and fb["model"] == second.model and fb["priority"] == 2, fb
+    assert p._fallback_seat_for(last) is None, "the lowest-priority seat has no fallback"
+    assert p._fallback_seat_for("opencode") is None, "an off-board model has no board fallback"
+
+
+def test_fallback_resolves_for_real_call_resolved_gateway_ids():
+    """(glm review finding 2/6) The id `model_id_for_call` returns for a real gateway call (e.g.
+    `commandcode:moonshotai/Kimi-K2.7-Code`, `zai:glm-5.2`) is EXACTLY a DEFAULT_BOARD seat id,
+    so `_fallback_seat_for` resolves a real next-priority seat — NOT None — for the in-production
+    failing-seat case. Pin it so a board re-id can't silently make every fallback hint blank."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.config import DEFAULT_BOARD
+
+    board_ids = [b.model for b in DEFAULT_BOARD]
+    # Every NON-LAST board seat must resolve a concrete fallback whose id is the next board seat.
+    for idx, b in enumerate(DEFAULT_BOARD[:-1]):
+        fb = p._fallback_seat_for(b.model)
+        assert fb is not None, f"{b.model} (priority {idx + 1}) should have a fallback"
+        assert fb["model"] == board_ids[idx + 1], (b.model, fb)
+    # The gateway-routed seats a failing Kimi / GLM call carries (the board's exact ids — agentic
+    # `oc:` form today) resolve a real fallback, not None — the production failing-seat case.
+    kimi_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Kimi")
+    glm_seat = next(b.model for b in DEFAULT_BOARD if b.display == "GLM")
+    assert p._fallback_seat_for(kimi_seat) is not None
+    assert p._fallback_seat_for(glm_seat) is not None
+
+
+def test_to_summary_exposes_enriched_errors_for_the_errors_tab():
+    """to_summary carries the enriched `errors` list so the Errors tab can drill down + show
+    recovery/fallback without a per-session detail fetch. A clean session has an empty list."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n",
+                        argv0="/opt/homebrew/bin/codex", exit_code=0)
+        clean = p.load_sessions(ld)[0]
+        assert clean.to_summary()["errors"] == [], "a clean session surfaces no errors"
+
+
+def test_call_to_dict_carries_resolved_model_for_the_detail_chip():
+    """to_dict exposes the resolved gateway MODEL id (not the bare backend) so the detail view's
+    per-call chip wears the right brand logo/label (e.g. Qwen, not the generic gateway)."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(ld, "20260601T100000_000000", "commandcode", 0, "x\n",
+                               argv0="commandcode API Qwen/Qwen3.7-Max", exit_code=0)
+        c = p.parse_call_log(path)
+        assert c.to_dict()["model"] == "commandcode:Qwen/Qwen3.7-Max", c.to_dict()
+
+
+def test_stats_exposes_priority_ordered_board():
+    """compute_stats carries the priority-ordered board so the UI can show failover order."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.config import DEFAULT_BOARD
+
+    stats = p.compute_stats([])
+    board = stats["board"]
+    assert [b["model"] for b in board] == [b.model for b in DEFAULT_BOARD]
+    assert board[0]["priority"] == 1 and board[-1]["priority"] == len(DEFAULT_BOARD)
+
+
 def test_invocations_endpoint_returns_populated_prompt_for_panel():
     """GET /api/runs returns a populated `invocations` list for a panel session, so the Prompts
     panel renders the invoked command rather than a blank/redacted placeholder."""
@@ -1931,12 +2089,26 @@ def test_endpoints_end_to_end():
                     assert b"review-cli" in resp.read()
                 with urllib.request.urlopen(base + "/assets/app.js", timeout=10) as resp:
                     assert resp.status == 200
-                # asset traversal blocked
+                # A committed model brand-logo PNG is served from the allowlisted icons/ path
+                # as a real image (the front-end renders each model as <img>, never an emoji).
+                # mini_claude.png is the Anthropic brand mark (always committed — Opus/Fable seats).
+                with urllib.request.urlopen(base + "/assets/icons/mini_claude.png", timeout=10) as resp:
+                    assert resp.status == 200
+                    assert resp.headers.get("Content-Type") == "image/png"
+                    assert resp.read(8) == b"\x89PNG\r\n\x1a\n"  # real PNG magic, not an HTML error
+                # An icon name NOT in the discovered allowlist is rejected (no arbitrary read).
                 try:
-                    urllib.request.urlopen(base + "/assets/../server.py", timeout=10)
-                    raise AssertionError("expected traversal block")
+                    urllib.request.urlopen(base + "/assets/icons/nope.png", timeout=10)
+                    raise AssertionError("expected unknown-icon 404")
                 except urllib.error.HTTPError as e:
                     assert e.code == 404
+                # asset traversal blocked (top-level and via the icons/ subpath)
+                for bad in ("/assets/../server.py", "/assets/icons/../app.css"):
+                    try:
+                        urllib.request.urlopen(base + bad, timeout=10)
+                        raise AssertionError(f"expected traversal block for {bad}")
+                    except urllib.error.HTTPError as e:
+                        assert e.code == 404
             finally:
                 httpd.shutdown()
                 httpd.server_close()

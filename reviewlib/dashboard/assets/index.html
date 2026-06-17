@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="no-referrer" />
   <title>review-cli dashboard</title>
+  <!-- Inline SVG favicon: a small iris dot mark, so the browser doesn't 404 on /favicon.ico. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%237c9cff'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/assets/app.css" />
 </head>
 <body>
@@ -19,6 +21,9 @@
       <button id="refresh" class="btn" title="reload data">↻ refresh</button>
     </div>
   </header>
+  <!-- Each tab maps to a PANELS.<name> renderer in app.js; the static shell keeps the tab
+       buttons (so their count badges persist across panel re-renders). -->
+
 
   <nav class="tabs" id="tabs">
     <button data-panel="overview" class="tab active">Overview</button>

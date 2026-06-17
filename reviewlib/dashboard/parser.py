@@ -30,6 +30,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import cached_property, lru_cache
 from pathlib import Path
 
 # Per-call log filename: 20260613T040611_516399Z-claude-r0.log
@@ -255,6 +256,10 @@ class CallLog:
             "filename": self.filename,
             "started": self.started.isoformat(),
             "backend": self.backend,
+            # The resolved MODEL id (gateway model split out of the shared commandcode/z.ai
+            # backends, Fable-vs-Opus split) so the detail view's call chip wears the right
+            # brand logo/label (e.g. "Qwen", not the generic "gateway" backend name).
+            "model": model_id_for_call(self),
             "round": self.round,
             "argv0": self.argv0,
             "duration_seconds": self.duration_seconds,
@@ -577,12 +582,63 @@ class Session:
         rather than a green OK badge (codex P2)."""
         return not self.has_error and any(not c.completed for c in self.calls)
 
-    @property
+    @cached_property
     def errors(self) -> list[dict]:
+        """Failed calls, each enriched with the failure CLASS, the resolved model id, the
+        planned FALLBACK seat (the next board seat by priority — what the failover pool would
+        promote), and a per-error RECOVERY assessment so the Errors tab can show what happened
+        next instead of a dead end.
+
+        CACHED per Session instance (cached_property): `to_summary()` exposes this for EVERY
+        session on the runs-list endpoint, and `to_detail()` reads it again, so the O(calls^2)
+        recovery scan runs once per session, not per access (glm review finding 4). A Session is
+        rebuilt on each parse, so the cache never goes stale against changed logs.
+
+        Recovery is read off the session's OWN calls (review-cli records no explicit retry
+        link): a `recovered` error is one where SOME later call in the same session — a retry of
+        the same seat or a different seat — returned a clean OK verdict, so the run still
+        produced a result. An error with no clean call after it is `unrecovered` and surfaces a
+        suggested next action (the fallback seat) + the manual-control affordance in the UI."""
+        # A panel fans out its seats at nearly the same instant for the SAME request, so a
+        # same-round sibling that returns cleanly recovers the run even if the failed seat's
+        # timestamp lands a moment later. Sort by start only to give "at/after the failure" a
+        # well-defined meaning; the same-round clause below (not timestamps) is what credits a
+        # concurrent panel sibling, so strict end-time overlap math isn't needed.
+        ordered = sorted(self.calls, key=lambda c: c.started)
         out = []
-        for c in self.calls:
-            if c.has_error:
-                out.append({"backend": c.backend, "round": c.round, "summary": c.error_summary, "filename": c.filename})
+        for i, c in enumerate(ordered):
+            if not c.has_error:
+                continue
+            model_id = model_id_for_call(c)
+            cls = classify_call(c) if c.completed else HEALTH_ERROR
+            # Recovered iff SOME OTHER clean-OK call either ran in the SAME round (a parallel
+            # panel sibling answering the same request — its success means the run produced a
+            # verdict despite this seat failing) OR started at/after this failure (a later
+            # retry / next-round seat). It is NOT recovered by an EARLIER round's success, so a
+            # round-1 OK never masks a round-3 failure (glm review finding 5: the old
+            # session-wide `any_ok` overclaimed recovery across rounds).
+            recovered = any(
+                other is not c
+                and _call_is_clean_ok(other)
+                and (other.round == c.round or other.started >= c.started)
+                for other in ordered
+            )
+            out.append({
+                "backend": c.backend,
+                "round": c.round,
+                "summary": c.error_summary,
+                "filename": c.filename,
+                "model": model_id,
+                "started": c.started.isoformat(),
+                "health_class": cls,
+                # The next board seat by priority — what the failover pool promotes when this
+                # seat is down. None when this seat is off-board or already the lowest priority.
+                "fallback": _fallback_seat_for(model_id),
+                # Did the run still produce a usable verdict at/after this failure?
+                #   recovered   — a clean OK call ran concurrently-or-after this failed seat.
+                #   unrecovered — no clean OK call did; this run needs attention (manual control).
+                "recovery": "recovered" if recovered else "unrecovered",
+            })
         return out
 
     def to_summary(self) -> dict:
@@ -603,6 +659,9 @@ class Session:
             # run leaves behind (the prompt itself is redacted). Lets the Prompts panel /
             # panel rows show the invoked command instead of "redacted, argv only".
             "invocations": self.invocations,
+            # The enriched per-error list (model / failure class / recovery / planned fallback)
+            # so the Errors tab can drill down + show recovery without a per-session detail fetch.
+            "errors": self.errors,
         }
 
     def to_detail(self) -> dict:
@@ -782,6 +841,9 @@ def compute_stats(sessions: list[Session]) -> dict:
         # Models & roles tab, plus the count of problematic BOARD models for the tab badge.
         "model_health": (_mh := compute_model_health(sessions))["models"],
         "problematic_count": _mh["problematic_count"],
+        # The priority-ordered board (id/display/role/priority) so the UI can show the failover
+        # order and compute a seat's planned fallback without re-deriving it client-side.
+        "board": _board_models(),
     }
 
 
@@ -904,10 +966,55 @@ def model_id_for_call(call: "CallLog") -> str:
 
 def _board_models() -> list[dict]:
     """The canonical board model list (id/role/display) the health view covers. Imported
-    lazily so the parser stays import-light and free of a config dependency at module load."""
+    lazily so the parser stays import-light and free of a config dependency at module load.
+
+    Carries the 1-based PRIORITY (DEFAULT_BOARD is priority-ordered, strongest first) so the
+    Models tab and the Errors-tab fallback hint can reason about who the failover pool would
+    promote when a seat is down. The cached source is the frozen DEFAULT_BOARD; this returns
+    FRESH dict copies so a caller can never mutate the shared cache (glm review finding 7 —
+    the lookup runs once per failed call on the runs-list endpoint, so rebuilding the config
+    objects each time was the wasteful part; copying small dicts is cheap)."""
+    return [dict(b) for b in _board_models_cached()]
+
+
+@lru_cache(maxsize=1)
+def _board_models_cached() -> tuple[dict, ...]:
     from ..config import DEFAULT_BOARD
 
-    return [{"model": b.model, "role": b.role, "display": b.display} for b in DEFAULT_BOARD]
+    return tuple(
+        {"model": b.model, "role": b.role, "display": b.display, "priority": i + 1}
+        for i, b in enumerate(DEFAULT_BOARD)
+    )
+
+
+def _call_is_clean_ok(call: "CallLog") -> bool:
+    """True when a call FINISHED with a clean OK verdict (used for the recovery assessment).
+
+    A footerless/in-flight call is not 'ok' (its outcome is unknown), an errored call is not,
+    and an EXIT-0-but-empty/paywall call is not — only a real OK verdict counts as recovery."""
+    return call.completed and not call.has_error and classify_call(call) == HEALTH_OK
+
+
+def _fallback_seat_for(model_id: str) -> dict | None:
+    """The next board seat (by priority) the failover pool would promote when ``model_id`` is
+    down, or ``None`` if the model is off-board or already the lowest-priority seat.
+
+    review-cli's pool runs the top-N AVAILABLE seats and backfills a failed seat from the
+    next-priority reserve (config.select_pool / panel.run_board_with_failover). So the honest
+    'planned fallback' for a failed seat is simply the next board seat after it.
+
+    `model_id` is a `model_id_for_call` result, which shares the DEFAULT_BOARD id scheme exactly
+    (e.g. `commandcode:moonshotai/Kimi-K2.7-Code`, `zai:glm-5.2`), so the exact match below
+    resolves every BOARD seat's fallback; an off-board model (e.g. `opencode`) correctly has
+    none. Iterates the CACHED board tuple directly (no per-call rebuild — glm review finding 5)."""
+    board = _board_models_cached()
+    for idx, seat in enumerate(board):
+        if seat["model"] == model_id:
+            nxt = board[idx + 1] if idx + 1 < len(board) else None
+            if nxt is None:
+                return None
+            return {"model": nxt["model"], "display": nxt["display"], "role": nxt["role"], "priority": nxt["priority"]}
+    return None
 
 
 def _dominant_class(classes: list[str]) -> str | None:
