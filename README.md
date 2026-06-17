@@ -641,13 +641,15 @@ It falls back to an isolated temp dir (diff-only) in two cases:
   suppresses it), so to keep the sandbox trustworthy on a potentially adversarial repo,
   review refuses to run agentically there and reviews the diff in a clean dir instead.
 
-> **Note on the api-only board seats (commandcode, z.ai).** These are kept as raw
-> `api` backends, not routed through opencode. opencode's `@ai-sdk/openai-compatible`
-> adapter does not reliably drive the Command Code gateway (the request hangs / returns
-> empty, while the same models answer correctly over raw HTTP), and z.ai/GLM is not an
-> opencode-native provider. So commandcode/z.ai stay on the direct keyed-HTTP path;
-> opencode-native models (`oc:deepseek/…`, `oc:fireworks/…`, the free `oc:opencode/…`
-> gateway) get the agentic real-repo treatment above.
+> **Note on commandcode / z.ai (review-cli#24).** These were historically kept as raw
+> diff-only `api` backends — opencode's `@ai-sdk/openai-compatible` adapter did not
+> reliably drive the Command Code gateway, and z.ai/GLM was not an opencode-native
+> provider. That has been **re-investigated and resolved**: with `commandcode` and `zai`
+> registered as opencode **custom providers** (`~/.config/opencode/opencode.json`, auth via
+> `opencode auth login`), the default board's Kimi/GLM/Qwen/DeepSeek seats now run
+> agentically through opencode (`oc:commandcode/…`, `oc:zai/glm-5.2`) like the rest of the
+> board. The raw keyed-HTTP `commandcode:`/`zai:` backends remain for explicit `-m cc` /
+> `-m glm` and config-board seats on hosts without opencode.
 
 ---
 
@@ -761,19 +763,35 @@ fully-keyed environment):
 | 1 | pool | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries |
 | 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
 | 3 | pool | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
-| 4 | pool | Kimi | `commandcode:moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
-| 5 | reserve | GLM | `zai:glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom |
-| 6 | reserve | Qwen | `commandcode:Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| 7 | reserve | DeepSeek | `commandcode:deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
+| 5 | reserve | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom |
+| 6 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| 7 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
 | 8 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+
+**Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
+the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
+Anthropic API only on a host that lacks the CLI but has an API key), Codex via the codex
+CLI, and Kimi/GLM/Qwen/DeepSeek through opencode (`oc:provider/model`) — all run read-only
+*inside* `-C` and can open any project file, not just the diff. **Gemini** is always
+diff-only (it has no agentic transport). `review --show-board` shows each seat's live
+`agentic`/`diff-only` scope for the current host. The board has
+a reserve, so an `oc:` seat that opencode can't reach is backfilled rather than blocking:
+a missing opencode **binary** is detected at startup (the seat probes unavailable and the
+pool fills from the next reserve); a missing **provider auth** (opencode present but the
+`commandcode`/`zai` provider not logged in) only surfaces at run time and triggers a mid-run
+reserve backfill. (The diff-only `commandcode:`/`zai:` keyed-HTTP backends are still there
+for explicit `-m cc`/`-m glm` and config boards on hosts without opencode.)
 
 **To re-rank** the board, reorder the priority list (`DEFAULT_BOARD` in
 `reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the
 highest priority. The role lens you attach to each model is independent of its priority.
 
-The GLM seat goes **direct to z.ai** (`zai:glm-5.2`, the newest GLM, reachable on the
-GLM Coding-Plan endpoint) via the z.ai backend — not through the commandcode gateway.
-It needs a z.ai key (see Auth). All other commandcode seats need `COMMANDCODE_API_KEY`.
+The GLM seat uses **his z.ai subscription** (`glm-5.2`, the newest GLM) through opencode's
+`zai` provider, so it reviews agentically — not the diff-only z.ai REST call. It needs that
+provider configured in opencode (see Auth); the other `oc:commandcode/…` seats reach the
+commandcode gateway the same way. opencode must be installed for the agentic seats; without
+it they fall back to the reserve.
 
 ```bash
 review --show-board   # priority order + which 4 are the live pool + reserve + availability
@@ -816,20 +834,24 @@ board:
   - { model: "claude:claude-fable-5",  role: architect }
   - { model: "claude:claude-opus-4-8", role: correctness }
   - { model: "codex",                  role: consistency, name: Codex }
-  - { model: "commandcode:moonshotai/Kimi-K2.7-Code", role: performance, name: Kimi }
-  - { model: "zai:glm-5.2",            role: quality }
-  - { model: "commandcode:Qwen/Qwen3.7-Max", role: security, name: Qwen }
+  # Agentic via opencode (oc:provider/model) — reads the repo read-only, like the default
+  # board (review-cli#24). Use the diff-only `commandcode:`/`zai:` forms only if you want a
+  # stateless keyed-HTTP seat that sees just the diff (and needs no opencode install).
+  - { model: "oc:commandcode/moonshotai/Kimi-K2.7-Code", role: performance, name: Kimi }
+  - { model: "oc:zai/glm-5.2",         role: quality }
+  - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
 ```
 
 **Optional heavyweight seats** (NOT enabled by default — the board stays at 8). Add
 either to your `board:` list for an extra 1M-context resilience / holistic-senior
-pass; both run through commandcode (need `COMMANDCODE_API_KEY`):
+pass; both run agentically through opencode's commandcode provider (needs opencode +
+`opencode auth login`, like the default `oc:` seats):
 
 ```yaml
 board:
   # ... the 8 default seats ...
-  - { model: "commandcode:MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
-  - { model: "commandcode:nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
+  - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
+  - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
 ```
 
 Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`,
@@ -846,27 +868,37 @@ Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
 Codex is the #3 board seat (GPT-5.5 IS codex — the agentic CLI route, free).
 
-**commandcode (DeepSeek / Kimi / Qwen board reviewers):** set
-`COMMANDCODE_API_KEY` (a Command Code `user_...` token) in the environment or in
-`~/.config/review-cli/.env`. Without it, those commandcode board reviewers are
-skipped and the board runs with whatever remains. No key is ever written to disk by
-review — it is only read.
+**Kimi / Qwen / DeepSeek / GLM board reviewers (agentic, via opencode):** since
+review-cli#24 these default board seats are `oc:commandcode/…` / `oc:zai/glm-5.2` —
+they run **agentically through opencode**, so they authenticate via **opencode's own
+provider config** (`opencode auth login`, the `commandcode`/`zai` providers in
+`~/.config/opencode/opencode.json`), NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
+opencode must be installed for these seats. A missing opencode **binary** makes the seat
+probe unavailable at startup (the board fills the pool from the next reserve); a missing
+**provider auth** (opencode present but the `commandcode`/`zai` provider not logged in) is
+NOT caught by the startup probe — it surfaces at run time and triggers a **mid-run reserve
+backfill**. Either way the board degrades gracefully rather than blocking. The default GLM
+seat pins `oc:zai/glm-5.2` (the
+flagship); to run an older GLM, override the seat in a `config.yaml` `board:` list (e.g.
+`{ model: "oc:zai/glm-5.1", role: quality }`).
 
-**z.ai / GLM (the `tests` board seat = `zai:glm-5.2`):** set `ZAI_API_KEY` (or
-`ZHIPU_API_KEY`) in the environment or `~/.config/review-cli/.env`. The default base
-URL is the **GLM Coding-Plan endpoint** `https://api.z.ai/api/coding/paas/v4` — only
-that endpoint serves the flagship `glm-5.2`; the standard `https://api.z.ai/api/paas/v4`
-endpoint tops out at `glm-5.1`. A Coding-Plan key gets `glm-5.2` out of the box; a
-standard-plan user overrides with `ZAI_BASE_URL=https://api.z.ai/api/paas/v4`. Note
-that the default `tests` board seat pins the model explicitly (`zai:glm-5.2`), and an
-explicit `zai:<model>` suffix wins over `ZAI_MODEL` — so a standard-plan user must
-also override that seat in a `config.yaml` `board:` list (e.g. `{ model: "zai:glm-5.1",
-role: tests }`); `ZAI_MODEL` alone only affects a bare `-m zai` invocation, not the
-suffix-pinned board seat. `glm-5.2` is a reasoning model: it returns a final
+**`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
+set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or
+`ZHIPU_API_KEY`) in the environment or `~/.config/review-cli/.env` to use the **diff-only**
+keyed-HTTP backends directly — `-m cc`, `-m glm`, or an explicit `commandcode:`/`zai:` seat
+in a `config.yaml` `board:` list. These keys are NOT consulted for the agentic `oc:` board
+seats above (opencode carries its own auth). No key is ever written to disk by review — it
+is only read. For z.ai the default base URL is the **GLM Coding-Plan endpoint**
+`https://api.z.ai/api/coding/paas/v4` — only that endpoint serves the flagship `glm-5.2`;
+the standard `https://api.z.ai/api/paas/v4` endpoint tops out at `glm-5.1`. A Coding-Plan
+key gets `glm-5.2` out of the box; a standard-plan user overrides with
+`ZAI_BASE_URL=https://api.z.ai/api/paas/v4`. An explicit `zai:<model>` suffix wins over
+`ZAI_MODEL`; `ZAI_MODEL` alone only affects a bare `-m zai` invocation. `glm-5.2` is a reasoning model: it returns a final
 answer plus a `reasoning_content` field; review reads the answer and falls back to the
-reasoning text when the answer is empty (e.g. a low output-token budget). Without a
-z.ai key the `tests` seat is skipped; the rest of the board still runs. The key is
-only read, never written.
+reasoning text when the answer is empty (e.g. a low output-token budget). This key gates
+only the **diff-only** `zai:` path (`-m glm` / an explicit `zai:` config seat) — the
+**default** GLM board seat is the agentic `oc:zai/glm-5.2` (role `quality`) and
+authenticates via opencode, not `ZAI_API_KEY`. The key is only read, never written.
 
 ---
 

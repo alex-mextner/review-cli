@@ -155,7 +155,11 @@ shape `REVIEW_<BACKEND>_MODE` (the one PR #8 introduced for claude):
   fall-through to the API.
 
 ## Keyed HTTP backends: z.ai (GLM) and commandcode
-OpenAI-compatible `POST /chat/completions` REST backends — no CLI, just a key:
+OpenAI-compatible `POST /chat/completions` REST backends — **diff-only** (no workspace),
+no CLI, just a key. NOTE: the DEFAULT board's Kimi/GLM/Qwen/DeepSeek seats are now the
+**agentic** `oc:commandcode/...` / `oc:zai/glm-5.2` opencode routes (they read the repo and
+authenticate via opencode, not these keys). These keyed-HTTP backends back the **explicit**
+`-m cc` / `-m glm` invocations and `commandcode:`/`zai:` config-board seats:
 - **z.ai (Zhipu / GLM)**: `-m zai` / `-m glm` (newest, glm-5.2) — or a pinned id
   `-m glm52`/`-m glm51`/`-m glm47`/`-m glm46`; `-m zai:<model>` for an explicit one.
   Key: `ZAI_API_KEY` (or `ZHIPU_API_KEY`). Base/model override: `ZAI_BASE_URL` /

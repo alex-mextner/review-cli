@@ -1392,9 +1392,12 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | No
           f"`--pool 0` runs all available seats.")
     if not all(avail):
         print("Unavailable reviewers drop out and are backfilled from the reserve; the "
-              "board degrades gracefully only if the reserve is exhausted. commandcode "
-              "reviewers need COMMANDCODE_API_KEY, gemini needs GEMINI_API_KEY, "
-              "codex/claude need their CLI on PATH.")
+              "board degrades gracefully only if the reserve is exhausted. The default "
+              "agentic seats (`oc:…` Kimi/GLM/Qwen/DeepSeek, codex, claude) need their CLI "
+              "on PATH — `oc:` seats need the `opencode` binary plus its own provider auth "
+              "(`opencode auth login`), NOT review-cli's COMMANDCODE_API_KEY/ZAI_API_KEY. "
+              "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "
+              "diff-only `commandcode:`/`zai:` backends for `-m cc`/`-m glm` and config seats.)")
     return 0
 
 

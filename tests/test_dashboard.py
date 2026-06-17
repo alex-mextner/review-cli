@@ -619,14 +619,25 @@ def test_model_attribution_splits_shared_backends_and_claude():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
+        # The board's Kimi/DeepSeek/GLM seats run AGENTICALLY via opencode now
+        # (review-cli#24): the runtime header is `opencode -m <provider/model>`, attributed
+        # to the `oc:` board seat (not a single `opencode` row).
         kimi = p.parse_call_log(_write_call_log(
-            ld, "20260601T100000_000000", "commandcode", 0, "x\n",
-            argv0="commandcode API moonshotai/Kimi-K2.7-Code", exit_code=0))
+            ld, "20260601T100000_000000", "opencode", 0, "x\n",
+            argv0="opencode -m commandcode/moonshotai/Kimi-K2.7-Code", exit_code=0))
         deepseek = p.parse_call_log(_write_call_log(
-            ld, "20260601T100100_000000", "commandcode", 0, "x\n",
-            argv0="commandcode API deepseek/deepseek-v4-pro", exit_code=0))
+            ld, "20260601T100100_000000", "opencode", 0, "x\n",
+            argv0="opencode -m commandcode/deepseek/deepseek-v4-pro", exit_code=0))
         glm = p.parse_call_log(_write_call_log(
-            ld, "20260601T100200_000000", "z.ai", 0, "x\n",
+            ld, "20260601T100200_000000", "opencode", 0, "x\n",
+            argv0="opencode -m zai/glm-5.2", exit_code=0))
+        # The diff-only commandcode/z.ai REST backends still exist (explicit `-m cc`/`-m glm`,
+        # config boards) and must still split into their gateway board prefixes.
+        kimi_rest = p.parse_call_log(_write_call_log(
+            ld, "20260601T100210_000000", "commandcode", 0, "x\n",
+            argv0="commandcode API moonshotai/Kimi-K2.7-Code", exit_code=0))
+        glm_rest = p.parse_call_log(_write_call_log(
+            ld, "20260601T100220_000000", "z.ai", 0, "x\n",
             argv0="z.ai API glm-5.2", exit_code=0))
         codex = p.parse_call_log(_write_call_log(
             ld, "20260601T100300_000000", "codex", 0, "x\n",
@@ -634,14 +645,45 @@ def test_model_attribution_splits_shared_backends_and_claude():
         fable = p.parse_call_log(_fable_paywall_log(ld, "20260601T100400_000000"))
         opus = p.parse_call_log(_opus_ok_log(ld, "20260601T100500_000000"))
 
-        # commandcode + z.ai split into their gateway model ids (board prefixes).
-        assert p.model_id_for_call(kimi) == "commandcode:moonshotai/Kimi-K2.7-Code"
-        assert p.model_id_for_call(deepseek) == "commandcode:deepseek/deepseek-v4-pro"
-        assert p.model_id_for_call(glm) == "zai:glm-5.2"
+        # opencode seats attribute to the `oc:provider/model` board id.
+        assert p.model_id_for_call(kimi) == "oc:commandcode/moonshotai/Kimi-K2.7-Code"
+        assert p.model_id_for_call(deepseek) == "oc:commandcode/deepseek/deepseek-v4-pro"
+        assert p.model_id_for_call(glm) == "oc:zai/glm-5.2"
+        # The diff-only REST backends still split into their gateway model ids.
+        assert p.model_id_for_call(kimi_rest) == "commandcode:moonshotai/Kimi-K2.7-Code"
+        assert p.model_id_for_call(glm_rest) == "zai:glm-5.2"
         assert p.model_id_for_call(codex) == "codex"
         # claude wrapper is identical on disk; the body splits Fable (paywall) from Opus.
         assert p.model_id_for_call(fable) == "claude:claude-fable-5"
         assert p.model_id_for_call(opus) == "claude:claude-opus-4-8"
+
+
+def test_opencode_call_attributes_to_oc_board_seat_and_matches_default_board():
+    """review-cli#24: an agentic opencode call's header is `opencode -m <provider/model>`
+    (review_opencode passes it as header_argv0), and the dashboard attributes it to the
+    `oc:<provider/model>` board seat — the EXACT id DEFAULT_BOARD carries — so the health
+    view splits Kimi/GLM/Qwen/DeepSeek instead of collapsing them to one `opencode` row.
+    A bare opencode call with NO `-m` stays the backend name (`opencode`) so it can't
+    mis-attribute to a real seat."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.config import DEFAULT_BOARD
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # Every agentic (oc:) seat on the default board round-trips header -> board id.
+        oc_seats = [b.model for b in DEFAULT_BOARD if b.model.startswith("oc:")]
+        assert oc_seats, "expected agentic oc: seats on the default board (#24)"
+        for i, seat in enumerate(oc_seats):
+            oc_model = seat.split(":", 1)[1]  # provider/model
+            call = p.parse_call_log(_write_call_log(
+                ld, f"20260601T1000{i:02d}_000000", "opencode", 0, "ok\n",
+                argv0=f"opencode -m {oc_model}", exit_code=0))
+            assert p.model_id_for_call(call) == seat, (seat, p.model_id_for_call(call))
+        # Bare opencode (no -m) -> backend name, not a board seat.
+        bare = p.parse_call_log(_write_call_log(
+            ld, "20260601T100900_000000", "opencode", 0, "ok\n",
+            argv0="/opt/homebrew/bin/opencode", exit_code=0))
+        assert p.model_id_for_call(bare) == "opencode"
 
 
 def test_claude_api_argv0_identifies_model_before_opus_default():
@@ -706,16 +748,18 @@ def test_compute_model_health_covers_board_and_flags_problematic():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        # Kimi (commandcode) — 3 blocked calls => hard-unavailable + 0% ok => problematic.
+        # Kimi (agentic opencode) — 3 blocked calls => hard-unavailable + 0% ok =>
+        # problematic. The runtime log is an `opencode -m <provider/model>` header now
+        # (review-cli#24), attributed to the `oc:` board seat.
         for i in range(3):
-            _write_call_log(ld, f"20260601T1000{i:02d}_000000", "commandcode", 0,
+            _write_call_log(ld, f"20260601T1000{i:02d}_000000", "opencode", 0,
                             "[stderr] error code: 1010\n",
-                            argv0="commandcode API moonshotai/Kimi-K2.7-Code", exit_code=403)
-        # GLM (z.ai) — 3 auth failures => problematic.
+                            argv0="opencode -m commandcode/moonshotai/Kimi-K2.7-Code", exit_code=403)
+        # GLM (agentic opencode via the zai provider) — 3 auth failures => problematic.
         for i in range(3):
-            _write_call_log(ld, f"20260601T1100{i:02d}_000000", "z.ai", 0,
+            _write_call_log(ld, f"20260601T1100{i:02d}_000000", "opencode", 0,
                             '[stderr] {"error":"bad key"}\n',
-                            argv0="z.ai API glm-5.2", exit_code=401)
+                            argv0="opencode -m zai/glm-5.2", exit_code=401)
         # Fable (claude) — paywall => problematic.
         _fable_paywall_log(ld, "20260601T120000_000000")
         # Codex — 4 healthy calls => NOT problematic (ok-rate 100%).
@@ -729,13 +773,13 @@ def test_compute_model_health_covers_board_and_flags_problematic():
 
         # Every board model is represented (covers the whole board, even no-data seats).
         for board_id in ("claude:claude-fable-5", "claude:claude-opus-4-8", "codex",
-                         "commandcode:moonshotai/Kimi-K2.7-Code", "zai:glm-5.2"):
+                         "oc:commandcode/moonshotai/Kimi-K2.7-Code", "oc:zai/glm-5.2"):
             assert board_id in health, board_id
 
-        assert health["commandcode:moonshotai/Kimi-K2.7-Code"]["problematic"] is True
-        assert health["commandcode:moonshotai/Kimi-K2.7-Code"]["dominant_class"] == p.HEALTH_BLOCKED
-        assert health["zai:glm-5.2"]["problematic"] is True
-        assert health["zai:glm-5.2"]["dominant_class"] == p.HEALTH_AUTH
+        assert health["oc:commandcode/moonshotai/Kimi-K2.7-Code"]["problematic"] is True
+        assert health["oc:commandcode/moonshotai/Kimi-K2.7-Code"]["dominant_class"] == p.HEALTH_BLOCKED
+        assert health["oc:zai/glm-5.2"]["problematic"] is True
+        assert health["oc:zai/glm-5.2"]["dominant_class"] == p.HEALTH_AUTH
         assert health["claude:claude-fable-5"]["problematic"] is True
         assert health["claude:claude-fable-5"]["dominant_class"] == p.HEALTH_PAYWALL
         assert health["codex"]["problematic"] is False
@@ -782,7 +826,7 @@ def test_model_health_empty_log_dir_is_graceful():
         assert stats["problematic_count"] == 0
         # The board is still listed (all no_data), so the view never shows a blank tab.
         assert all(m["status"] == "no_data" for m in stats["model_health"])
-        assert {m["model"] for m in stats["model_health"]} >= {"codex", "zai:glm-5.2"}
+        assert {m["model"] for m in stats["model_health"]} >= {"codex", "oc:zai/glm-5.2"}
 
 
 def test_bare_commandcode_probe_keeps_backend_name_and_classifies_error():

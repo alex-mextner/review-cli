@@ -133,8 +133,30 @@ bin/review --show-board | grep -qi "diff-only"
 bin/review --show-board | grep -q "architect"
 bin/review --show-board | grep -q "claude:claude-fable-5"
 bin/review --show-board | grep -q "claude:claude-opus-4-8"
-bin/review --show-board | grep -q "commandcode:deepseek/deepseek-v4-pro"
-bin/review --show-board | grep -q "zai:glm-5.2"
+# review-cli#24: the repo-capable api seats now route through opencode (`oc:provider/model`)
+# so they run AGENTICALLY — the diff-only `commandcode:`/`zai:` REST routes were retired
+# from the default board (they remain for explicit `-m cc`/`-m glm` + config boards).
+bin/review --show-board | grep -q "oc:commandcode/deepseek/deepseek-v4-pro"
+bin/review --show-board | grep -q "oc:zai/glm-5.2"
+bin/review --show-board | grep -q "oc:commandcode/moonshotai/Kimi-K2.7-Code"
+bin/review --show-board | grep -q "oc:commandcode/Qwen/Qwen3.7-Max"
+# review-cli#24 acceptance: every repo-capable default seat (Kimi/GLM/Qwen/DeepSeek) shows
+# the `agentic` scope on its BOARD ROW, not `diff-only` — only Gemini stays diff-only.
+# Match by the seat's UNIQUE oc: model id, which appears ONLY on its board row — NOT by the
+# display name (which also appears in the unavailable-seats footer warning, so grepping the
+# name could false-match that line). Capture --show-board once.
+SHOW_BOARD="$(bin/review --show-board)"
+echo "$SHOW_BOARD" | grep "oc:commandcode/moonshotai/Kimi-K2.7-Code" | grep -q "agentic"
+! echo "$SHOW_BOARD" | grep "oc:commandcode/moonshotai/Kimi-K2.7-Code" | grep -q "diff-only"
+echo "$SHOW_BOARD" | grep "oc:zai/glm-5.2" | grep -q "agentic"
+! echo "$SHOW_BOARD" | grep "oc:zai/glm-5.2" | grep -q "diff-only"
+echo "$SHOW_BOARD" | grep "oc:commandcode/Qwen/Qwen3.7-Max" | grep -q "agentic"
+! echo "$SHOW_BOARD" | grep "oc:commandcode/Qwen/Qwen3.7-Max" | grep -q "diff-only"
+echo "$SHOW_BOARD" | grep "oc:commandcode/deepseek/deepseek-v4-pro" | grep -q "agentic"
+! echo "$SHOW_BOARD" | grep "oc:commandcode/deepseek/deepseek-v4-pro" | grep -q "diff-only"
+# Gemini's board row (the `contracts` role line) is diff-only. Match the row by its role +
+# model so the footer (which mentions gemini) can't false-match.
+echo "$SHOW_BOARD" | grep "contracts" | grep "gemini" | grep -q "diff-only"
 # Seat 3 is the agentic codex route (GPT-5.5 IS codex) — assert the Codex seat line shows
 # the `codex` model AND the `agentic` scope (the diff-only commandcode:gpt-5.5 was retired).
 # Two portable substring checks on the seat line (no GNU-only `\b`, order-independent).

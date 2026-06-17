@@ -206,7 +206,8 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
             oc_model,
             message,
         ]
-        proc = _run_streamed(argv, cwd=cwd, timeout=timeout, backend="opencode", round_no=round_no, announce=_ANNOUNCE_LOGS)
+        proc = _run_streamed(argv, cwd=cwd, timeout=timeout, backend="opencode", round_no=round_no,
+                             announce=_ANNOUNCE_LOGS, header_argv0=f"opencode -m {oc_model}")
         return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
     # FALLBACK: cwd is not a git repo (e.g. a panel `--just-ask` run from a scratch
@@ -235,7 +236,8 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
             oc_model,
             message,
         ]
-        proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", round_no=round_no, announce=_ANNOUNCE_LOGS)
+        proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", round_no=round_no,
+                             announce=_ANNOUNCE_LOGS, header_argv0=f"opencode -m {oc_model}")
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 

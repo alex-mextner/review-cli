@@ -26,6 +26,41 @@ DEFAULT_PROMPT = (
 # the board was kept current (the flat panel rotted on the dead Fireworks route).
 KIMI_SEAT = "commandcode:moonshotai/Kimi-K2.7-Code"
 
+
+def _agentic(seat: str) -> str:
+    """Turn a diff-only keyed-HTTP seat (`provider:model`) into its AGENTIC opencode
+    form (`oc:provider/model`), so the SAME model runs read-only INSIDE the repo and can
+    read any project file — not just the diff in the prompt (review-cli#24).
+
+    opencode registers `commandcode` and `zai` as custom OpenAI-compatible providers
+    (`~/.config/opencode/opencode.json`), so the exact model ids the diff-only
+    `review_commandcode` / `review_zai` REST backends POST are reachable agentically with
+    no new wire id — only the transport changes. resolve_backend routes the `oc:` prefix
+    to review_opencode; everything after `oc:` is opencode's `provider/model` selector.
+
+    Deriving the board's agentic seats FROM the diff-only constants keeps ONE source of
+    truth for each model id: the flat DEFAULT_MODELS panel (which has no failover/reserve,
+    so it stays on the robust key-only commandcode route) and the board's agentic seat can
+    never drift to different model ids, and neither can drift back to the dead Fireworks
+    route (review-cli#25). The flip is transport-only — a single, reversible rewrite.
+
+    Idempotent + canonical: a seat that is ALREADY agentic is returned in the CANONICAL
+    `oc:` spelling — `oc:foo/bar` unchanged, and the `opencode:foo/bar` alias normalized to
+    `oc:foo/bar`. Both spellings resolve to review_opencode and run the same
+    `opencode -m foo/bar`, which the dashboard attributes to `oc:foo/bar`; canonicalizing
+    here keeps the board seat id == the attributed id, so a seat can't split into a
+    `no_data` board row plus a separate `oc:` health row (review-cli#24, codex review).
+    Wrapping twice can never produce a nonsense `oc:oc/...` id."""
+    if seat.startswith("oc:"):
+        return seat
+    if seat.startswith("opencode:"):
+        return "oc:" + seat[len("opencode:"):]
+    if ":" not in seat:
+        return f"oc:{seat}"
+    provider, model = seat.split(":", 1)
+    return f"oc:{provider}/{model}"
+
+
 # Code default keeps a self-sufficient panel (incl. opencode). Personal model
 # preferences live in ~/.config/review-cli/config.yaml (keys: models,
 # brainstorm_models) and override this — see load_config().
@@ -173,17 +208,28 @@ class BoardReviewer:
 # byte-exact against the provider catalogs (commandcode gateway /models, z.ai Coding-Plan)
 # — do not alter the strings. Each is the TOP available version of its model family
 # (fable-5, opus-4-8, codex/GPT-5.5, Kimi-K2.7, glm-5.2, Qwen3.7-Max, deepseek-v4-pro).
-# Seat 3 is the AGENTIC codex CLI route (bare `codex` → `codex exec -s read-only -C <cwd>`,
-# reads the whole repo), NOT the diff-only `commandcode:gpt-5.5` HTTP route. GPT-5.5 is
-# codex; the agentic route is preferred. Rationale lives in the CHANGELOG.
 #
-# The `tests` seat goes DIRECT to z.ai (`zai:glm-5.2`, the newest GLM reachable on the
-# Coding-Plan endpoint) via the user's GLM subscription — not the commandcode gateway.
+# AGENTIC BY DEFAULT (review-cli#24): every board seat that CAN read the repo does. The
+# two claude seats run via the agentic claude CLI; Codex via the codex CLI
+# (`codex exec -s read-only -C <cwd>`); Kimi/GLM/Qwen/DeepSeek through opencode
+# (`oc:provider/model`, built by `_agentic()` from the diff-only constant) so they ALSO
+# run read-only inside `-C` and can open ANY project file — not just the diff in the
+# prompt. The board has a reserve, so an `oc:` seat that opencode can't reach on a given
+# host probes UNAVAILABLE and is backfilled (startup or mid-run failover) — the board
+# degrades gracefully rather than blocking. Only Gemini stays diff-only: it has no agentic
+# transport (a workspace-less keyed-HTTP REST call). The diff-only `commandcode:`/`zai:`
+# REST backends stay available for `-m cc`/`-m glm` and config boards on hosts without
+# opencode; the board just prefers the agentic transport when it can.
+#
+# The FLAT DEFAULT_MODELS panel deliberately keeps the diff-only commandcode Kimi seat
+# (KIMI_SEAT): that panel has NO reserve/failover, so an opencode-less host would silently
+# shrink it; the board can absorb that via its reserve, the flat panel cannot. Same model
+# id (`_agentic(KIMI_SEAT)`), transport-only difference — one source of truth, no drift.
 #
 # OPTIONAL HEAVYWEIGHTS (NOT in the default board): add them to a config.yaml `board:`
 # list if you want a 1M-context resilience / holistic pass:
-#   - { model: "commandcode:MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx
-#   - { model: "commandcode:nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx
+#   - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx, agentic
+#   - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx
 DEFAULT_BOARD = (
     # priority 1 — Fable 5 (Anthropic flagship). Currently paywalled/"unavailable", so
     # the failover skips it at startup (the cheap probe can't see the paywall, but its
@@ -194,15 +240,16 @@ DEFAULT_BOARD = (
     # priority 3 — Codex: the agentic codex CLI route (reads the whole repo), NOT the
     # diff-only `commandcode:gpt-5.5` HTTP route. GPT-5.5 is codex; the agentic route wins.
     BoardReviewer("codex", "consistency", "Codex"),
-    # priority 4 — Kimi K2.7 via commandcode (KIMI_SEAT: the same canonical seat the flat
-    # DEFAULT_MODELS panel uses, so the two share one source of truth and can't drift).
-    BoardReviewer(KIMI_SEAT, "performance", "Kimi"),
-    # priority 5 — GLM-5.2 DIRECT to z.ai (his GLM subscription), the newest GLM.
-    BoardReviewer("zai:glm-5.2", "quality", "GLM"),
-    # priority 6 — Qwen3.7-Max via commandcode.
-    BoardReviewer("commandcode:Qwen/Qwen3.7-Max", "security", "Qwen"),
-    # priority 7 — DeepSeek-V4-Pro via commandcode.
-    BoardReviewer("commandcode:deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
+    # priority 4 — Kimi K2.7, AGENTIC through opencode (reads the repo). Same model id as
+    # the flat panel's KIMI_SEAT (one source of truth via `_agentic`); transport-only diff.
+    BoardReviewer(_agentic(KIMI_SEAT), "performance", "Kimi"),
+    # priority 5 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
+    # opencode's `zai` provider (reads the repo) instead of the diff-only z.ai REST call.
+    BoardReviewer(_agentic("zai:glm-5.2"), "quality", "GLM"),
+    # priority 6 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
+    BoardReviewer(_agentic("commandcode:Qwen/Qwen3.7-Max"), "security", "Qwen"),
+    # priority 7 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
+    BoardReviewer(_agentic("commandcode:deepseek/deepseek-v4-pro"), "tests", "DeepSeek"),
     # priority 8 — Gemini.
     BoardReviewer("gemini", "contracts", "Gemini"),
 )

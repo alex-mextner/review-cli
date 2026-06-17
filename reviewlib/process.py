@@ -260,6 +260,7 @@ def _run_streamed(
     backend: str = "backend",
     round_no: int = 0,
     announce: bool = False,
+    header_argv0: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a long backend call, streaming its output in real time.
 
@@ -300,8 +301,12 @@ def _run_streamed(
     log_fh = os.fdopen(fd, "w", encoding="utf-8", buffering=1)  # line-buffered
     try:
         # Header records the backend + argv[0] only — NOT the full argv, which carries
-        # the prompt/diff for claude/opencode and could leak secrets into the log.
-        log_fh.write(f"[review-cli] {backend}: {argv[0] if argv else '?'} (args redacted)\n")
+        # the prompt/diff for claude/opencode and could leak secrets into the log. A
+        # backend may pass `header_argv0` to record a model SELECTOR instead of the bare
+        # binary path (e.g. opencode's `opencode -m <provider/model>`), so the dashboard
+        # can attribute the call to its board seat — it must still contain NO prompt/diff.
+        header = header_argv0 or (argv[0] if argv else "?")
+        log_fh.write(f"[review-cli] {backend}: {header} (args redacted)\n")
         log_fh.flush()
 
         proc = subprocess.Popen(
