@@ -42,8 +42,25 @@ from . import parser as dparser
 from . import store as dstore
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-_ALLOWED_ASSETS = {"app.js", "app.css"}
-_CONTENT_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
+_ICONS_DIR = ASSETS_DIR / "icons"
+# The brand-logo PNGs (icons/mini_<brand>.png) are committed assets shared with tg-cli's
+# emoji-icons set; the front-end renders each model/seat as an <img> of its logo, not a unicode
+# emoji. The set is discovered at import time so dropping a new mini_*.png in icons/ serves it
+# with no server edit (and keeps the allowlist exact — no path traversal, only known files).
+# Only REGULAR files (not symlinks) enter the allowlist, so a `mini_*.png` symlink pointing
+# outside the tree can't be admitted by name — defence in depth alongside the per-request
+# resolve()/relative_to() check in _serve_asset.
+_ICON_NAMES = (
+    frozenset(p.name for p in _ICONS_DIR.glob("mini_*.png") if p.is_file() and not p.is_symlink())
+    if _ICONS_DIR.is_dir()
+    else frozenset()
+)
+_ALLOWED_ASSETS = {"app.js", "app.css"} | {f"icons/{n}" for n in _ICON_NAMES}
+_CONTENT_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".png": "image/png",
+}
 
 # Max request body for a write (feedback/conscious/links). Feedback is free text but a
 # few KB is generous; this caps a malicious/runaway POST before we read it into memory.
@@ -424,10 +441,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_bytes(html, "text/html; charset=utf-8")
 
     def _serve_asset(self, name: str) -> None:
-        # Allowlist: no traversal, only known assets.
+        # Allowlist: no traversal, only known assets. The set lists `app.js`/`app.css` and the
+        # discovered `icons/mini_<brand>.png` logos by their exact relative name, so a name that
+        # isn't in it (incl. any `../` traversal attempt) is rejected before touching the disk.
         if name not in _ALLOWED_ASSETS:
             return self._error(404, f"asset not allowed: {name}")
         p = ASSETS_DIR / name
+        # Defence in depth: even though the name came from the allowlist, confirm the resolved
+        # path is still inside ASSETS_DIR before reading it.
+        try:
+            p.resolve().relative_to(ASSETS_DIR.resolve())
+        except ValueError:
+            return self._error(404, f"asset not allowed: {name}")
         try:
             body = p.read_bytes()
         except OSError:

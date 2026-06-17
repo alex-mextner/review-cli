@@ -3,8 +3,9 @@
  * string-templated with strict HTML escaping (logs contain arbitrary model output).
  *
  * Design primitive: the SEAT CHIP. A review board is a panel of named models, each with a
- * lens/role. Every model the dashboard shows is rendered as `icon + name` (see seatChip /
- * MODEL_ICON) so a board model reads as an identity, not a `oc:provider/model` log string.
+ * lens/role. Every model the dashboard shows is rendered as its REAL brand-logo PNG + name
+ * (see seatChip / modelIconHtml / MODEL_LOGO) so a board model reads as a recognizable identity,
+ * not a `oc:provider/model` log string — and NOT a unicode emoji.
  * Seat chips and role chips are CLICKABLE — they set state.filterModel / state.filterRole and
  * narrow the session lists, so the dashboard is a tool you drill through, not a static dump. */
 'use strict';
@@ -20,47 +21,79 @@ const state = {
 };
 
 // ---- model identity --------------------------------------------------------
-// Model name -> unicode brand glyph. Mirrors tg-cli's branding map
-// (tg-cli/features/branding/emoji.ts MODEL_EMOJI_MAP) so a board model wears the SAME icon
-// across the whole HyperIDE ecosystem. Keys are lower-cased base families; resolveModel()
-// does exact-then-prefix matching so suffixed ids (`opus-4-8`, `glm-5.2`, `claude-fable-5`,
-// `commandcode:Qwen/Qwen3.7-Max`, `zai:glm-5.2`) all resolve to the right family.
-const MODEL_ICON = {
-  fable: '✳️', // Anthropic flagship seat (distinct from Opus in the board, shares Claude's glyph)
-  opus: '✳️',
-  sonnet: '✳️',
-  haiku: '✳️',
-  claude: '✳️',
-  anthropic: '✳️',
-  codex: '👐',
-  openai: '👐',
-  o3: '👐',
-  o1: '👐',
-  gpt: '⚡',
-  gemini: '♊️',
-  google: '♊️',
-  deepseek: '🐳',
-  qwen: '🟣',
-  alibaba: '🟣',
-  kimi: '🌙',
-  moonshot: '🌙',
-  glm: '🗂',
-  chatglm: '🗂',
-  zai: '🗂', // z.ai serves GLM
-  llama: '🦙',
-  meta: '🦙',
-  ollama: '🦙',
-  mistral: 'Ⓜ️',
-  grok: '🤘',
-  xai: '🤘',
-  copilot: '🦾',
-  github: '🦾',
-  perplexity: '🔮',
-  cursor: '👆',
-  windsurf: '🏄',
-  hyperide: '🚁',
-  commandcode: '🧭', // the gateway; only shown for a bare probe with no resolved model
+// Model name -> the BRAND-LOGO key whose committed PNG (assets/icons/mini_<brand>.png) the
+// chip renders as an <img>. These are the SAME per-vendor brand logos tg-cli ships
+// (tg-cli/emoji-icons/mini_<brand>.png), so a board model wears its REAL logo — not a unicode
+// emoji — across the whole HyperIDE ecosystem. Keys are lower-cased base families; resolveModel()
+// does exact-then-prefix matching (tg-cli's extractBaseModel logic) so suffixed ids
+// (`opus-4-8`, `glm-5.2`, `claude-fable-5`, `commandcode:Qwen/Qwen3.7-Max`, `zai:glm-5.2`) all
+// resolve to the right brand. A family with no dedicated logo maps to its closest brand: every
+// Anthropic seat (Opus/Fable/Sonnet/Haiku/Devin/Aider) → the Claude (Anthropic) logo; every
+// OpenAI seat (GPT/o1/o3/Codex) → the Codex (OpenAI) logo; Llama/Meta → Meta; xAI → Grok, etc.
+const ICON_DIR = '/assets/icons/';
+const MODEL_LOGO = {
+  // Anthropic — one brand mark (the starburst). The board's two seats (Fable, Opus) share it;
+  // the seat `label` (from the server's board `display`) is what tells them apart.
+  claude: 'claude',
+  anthropic: 'claude',
+  fable: 'claude',
+  opus: 'claude',
+  sonnet: 'claude',
+  haiku: 'claude',
+  devin: 'claude',
+  cognition: 'claude',
+  aider: 'claude',
+  // OpenAI family → the Codex (OpenAI) mark.
+  codex: 'codex',
+  openai: 'codex',
+  o3: 'codex',
+  o1: 'codex',
+  gpt: 'codex',
+  // Google
+  gemini: 'gemini',
+  google: 'gemini',
+  // DeepSeek
+  deepseek: 'deepseek',
+  // Alibaba Qwen
+  qwen: 'qwen',
+  alibaba: 'qwen',
+  // Moonshot Kimi
+  kimi: 'kimi',
+  moonshot: 'kimi',
+  // Meta / Llama (+ Ollama runs Llama locally → Ollama's own mark)
+  llama: 'meta',
+  meta: 'meta',
+  ollama: 'ollama',
+  // Mistral
+  mistral: 'mistral',
+  // xAI Grok
+  grok: 'grok',
+  xai: 'grok',
+  // Microsoft Copilot / GitHub
+  copilot: 'copilot',
+  github: 'copilot',
+  // Perplexity
+  perplexity: 'perplexity',
+  // Editors
+  cursor: 'cursor',
+  windsurf: 'windsurf',
+  // HyperIDE
+  hyperide: 'hyperide',
+  // z.ai serves Zhipu's GLM — the board's priority-5 `tests` seat (zai:glm-5.2). The shipped
+  // GLM tile carries the brand wordmark so the seat reads as a real logo image alongside its
+  // board siblings, not a bare monogram.
+  glm: 'glm',
+  zai: 'glm',
+  chatglm: 'glm',
+  // NOTE: `minimax` (an OPTIONAL heavyweight, not in the default board) has NO dedicated logo
+  // and no close brand — resolveModel() renders it as a clean two-letter brand MONOGRAM (still
+  // a branded chip, never a generic 🤖/💬 emoji). `commandcode` is the gateway, shown only for
+  // a bare probe with no resolved model: also a monogram.
 };
+// The (always-present) src for a brand key.
+function logoSrc(key) {
+  return ICON_DIR + 'mini_' + key + '.png';
+}
 // Family -> the clean display label used on a seat chip. Lets `opus-4-8` read as "Opus".
 const MODEL_LABEL = {
   fable: 'Fable',
@@ -77,7 +110,12 @@ const MODEL_LABEL = {
   kimi: 'Kimi',
   glm: 'GLM',
   zai: 'GLM',
+  'z.ai': 'GLM', // the raw backend name in the call logs (board id is `zai:glm-5.2`)
+  chatglm: 'GLM',
+  minimax: 'MiniMax',
   llama: 'Llama',
+  meta: 'Meta',
+  ollama: 'Ollama',
   mistral: 'Mistral',
   grok: 'Grok',
   copilot: 'Copilot',
@@ -87,20 +125,28 @@ const MODEL_LABEL = {
   hyperide: 'HyperIDE',
   commandcode: 'gateway',
 };
-// Resolve a raw model/backend string to {key, icon, label}. Strips a gateway prefix
-// (`commandcode:` / `zai:` / `oc:` / `claude:` / `codex:`) and a vendor path, then matches
-// the longest known family substring. Falls back to the raw string with a neutral glyph so an
-// unknown model is still legible (and never blank).
+// Every base family we know a label OR a logo for — the list resolveModel() iterates for the
+// boundary match, and the Set for the O(1) exact-hit check. (A few keys, e.g. `minimax`, have a
+// label but no logo → they render a monogram.)
+const KNOWN_FAMILIES = Array.from(new Set([...Object.keys(MODEL_LOGO), ...Object.keys(MODEL_LABEL)]));
+const KNOWN_FAMILY_SET = new Set(KNOWN_FAMILIES);
+// Resolve a raw model/backend string to {key, logo, label}. `logo` is the brand key whose PNG
+// (assets/icons/mini_<logo>.png) the chip renders as an <img>, or null when no brand logo
+// exists — then the chip falls back to a clean letter MONOGRAM (never a unicode emoji). Strips a
+// gateway prefix (`commandcode:` / `zai:` / `oc:` / `claude:` / `codex:`) and a vendor path,
+// then matches the longest known family on a token boundary (tg-cli's extractBaseModel logic).
 function resolveModel(raw) {
   const s = String(raw == null ? '' : raw).trim();
-  if (!s) return { key: '', icon: '•', label: '—' };
+  if (!s) return { key: '', logo: null, label: '—' };
   let body = s.toLowerCase();
   const colon = body.indexOf(':');
   if (colon !== -1) body = body.slice(colon + 1); // drop gateway prefix
   const slash = body.lastIndexOf('/');
   if (slash !== -1) body = body.slice(slash + 1); // drop vendor path
-  // exact family hit first
-  if (MODEL_ICON[body]) return { key: body, icon: MODEL_ICON[body], label: MODEL_LABEL[body] || cap(body) };
+  // exact family hit first (O(1) Set lookup)
+  if (KNOWN_FAMILY_SET.has(body)) {
+    return { key: body, logo: MODEL_LOGO[body] || null, label: MODEL_LABEL[body] || cap(body) };
+  }
   // BOUNDARY match. A bare `includes` false-positives on short keys (`o1`/`o3`/`gpt`/`glm`
   // would hit any id that merely contains those letters, e.g. `proto3` → OpenAI). Require the
   // family to sit on a token boundary: at the start, or preceded by a non-alphanumeric
@@ -111,7 +157,7 @@ function resolveModel(raw) {
   const GENERIC = new Set(['claude', 'anthropic', 'openai', 'google', 'meta', 'alibaba', 'moonshot', 'chatglm', 'xai', 'github']);
   let best = null;
   let bestGeneric = true;
-  for (const fam of Object.keys(MODEL_ICON)) {
+  for (const fam of KNOWN_FAMILIES) {
     const i = body.indexOf(fam);
     if (i === -1) continue;
     if (i !== 0 && /[a-z0-9]/.test(body[i - 1])) continue; // not on a token boundary
@@ -121,8 +167,45 @@ function resolveModel(raw) {
       bestGeneric = generic;
     }
   }
-  if (best) return { key: best, icon: MODEL_ICON[best], label: MODEL_LABEL[best] || cap(best) };
-  return { key: body, icon: '•', label: cap(s) };
+  if (best) return { key: best, logo: MODEL_LOGO[best] || null, label: MODEL_LABEL[best] || cap(best) };
+  return { key: body, logo: null, label: cap(s) };
+}
+// The brand-logo <img> (or a clean letter monogram when no logo exists), used everywhere a model
+// icon appears. A real PNG brand mark — NEVER a unicode emoji. `loading=lazy` + fixed box keeps
+// the lists light; `alt` carries the brand name for screen readers; a broken/missing PNG falls
+// back to the monogram via onerror (so an unknown brand never shows a broken-image glyph).
+function modelIconHtml(m, cls) {
+  // `cls` is always a literal from our own call sites, but escape it anyway so this can never
+  // become an injection vector if a future caller derives it from data (glm review finding).
+  const klass = esc('model-ic' + (cls ? ' ' + cls : ''));
+  if (m.logo) {
+    // A broken/missing PNG swaps to the monogram via the global onImgError handler. The
+    // attribute value is a FIXED literal (`onImgError(this)`) — no data value is interpolated
+    // into it; the fallback text rides in data-mono and is read by the handler, so the handler
+    // body never executes attacker/data-derived strings.
+    return `<img class="${klass}" src="${esc(logoSrc(m.logo))}" alt="${esc(m.label)} logo" loading="lazy" decoding="async" data-mono="${esc(monogram(m.label))}" onerror="onImgError(this)" />`;
+  }
+  return `<span class="${klass} mono" aria-hidden="true">${esc(monogram(m.label))}</span>`;
+}
+// Global handler for a broken/missing logo PNG: replace the <img> with the monogram span it
+// carries in data-mono. Defined as a function (not an inline onerror body) so no value is ever
+// interpolated into an HTML attribute as executable JS. textContent assignment is inherently safe.
+window.onImgError = function (img) {
+  const span = document.createElement('span');
+  span.className = img.className + ' mono';
+  span.setAttribute('aria-hidden', 'true');
+  span.textContent = img.getAttribute('data-mono') || '?';
+  img.replaceWith(span);
+};
+// A two-letter brand monogram for a model with no shipped logo (MiniMax, gateway probes):
+// first letter of each of the first two ALPHANUMERIC words, else the first two alnum chars.
+// Splits on any non-alphanumeric run (so `z.ai` → "ZA", not ".A"), and never yields a stray
+// punctuation char. Branded, not emoji.
+function monogram(label) {
+  const words = String(label || '').split(/[^a-z0-9]+/i).filter(Boolean);
+  if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase();
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return '?';
 }
 function cap(s) {
   s = String(s);
@@ -189,7 +272,7 @@ function seatChip(raw, opts) {
   const active = state.filterModel && state.filterModel === String(raw);
   const small = opts && opts.small ? ' chip-sm' : '';
   return `<button type="button" class="seat${small}${active ? ' is-active' : ''}" data-model="${esc(raw)}" title="filter sessions by ${esc(label)} (${esc(raw)})">
-    <span class="seat-ic" aria-hidden="true">${esc(m.icon)}</span><span class="seat-name">${esc(label)}</span></button>`;
+    ${modelIconHtml(m, 'seat-ic')}<span class="seat-name">${esc(label)}</span></button>`;
 }
 function seatChips(list) {
   const arr = list || [];
@@ -268,7 +351,7 @@ function filterBar() {
   if (state.filterModel) {
     const m = resolveModel(state.filterModel);
     bits.push(
-      `<span class="filter-pill"><span class="seat-ic" aria-hidden="true">${esc(m.icon)}</span> ${esc(m.label)} <button class="filter-x" data-clear="model" aria-label="clear model filter">×</button></span>`,
+      `<span class="filter-pill">${modelIconHtml(m, 'seat-ic')} ${esc(m.label)} <button class="filter-x" data-clear="model" aria-label="clear model filter">×</button></span>`,
     );
   }
   if (state.filterRole) {
@@ -532,13 +615,77 @@ PANELS.modes = () => {
   return html;
 };
 
+// Human label + badge class for a per-error recovery state. recovered = a clean OK call ran
+// concurrently-or-after this failed seat (the failover pool / retry produced a verdict);
+// unrecovered = no clean OK call did — this run needs attention.
+const RECOVERY_LABEL = { recovered: 'recovered', unrecovered: 'unrecovered' };
+const RECOVERY_CLASS = { recovered: 'ok', unrecovered: 'err' };
+
+// One error card: clickable to open the failing session's detail (scrolled to the call), with
+// the failure CLASS, recovery status, and — when unrecovered — the planned fallback seat the
+// failover pool would promote + a "take manual control" affordance.
+function errorCard(sid, mode, started, e) {
+  const m = resolveModel(e.model || e.backend);
+  const cls = e.health_class || 'error';
+  const rec = e.recovery || 'unrecovered';
+  const recBadge = `<span class="badge ${RECOVERY_CLASS[rec] || 'err'}" title="recovery status">${esc(RECOVERY_LABEL[rec] || rec)}</span>`;
+  // A timeout is amber (transient/retryable); every other failure class — hard-unavailable
+  // (paywall/auth/blocked) and the generic error — is red.
+  const classBadge = `<span class="badge ${cls === 'timeout' ? 'degraded' : 'err'}">${esc(HEALTH_LABEL[cls] || cls)}</span>`;
+  const summary = e.summary ? `<div class="err-summary"><code>${esc(e.summary)}</code></div>` : '';
+  // Recovery action row: a recovered/partial error needs no action; an unrecovered one offers
+  // the next fallback seat (retry path) and a manual-control button (give up on auto-failover).
+  let action = '';
+  if (rec === 'unrecovered') {
+    const fb = e.fallback
+      ? `<span class="err-fallback"><span class="muted">planned fallback →</span> ${seatChip(e.fallback.model, { small: true, label: e.fallback.display })} <span class="muted">(priority ${esc(e.fallback.priority)} · ${esc(e.fallback.role)} lens)</span></span>`
+      : `<span class="err-fallback muted">no lower-priority reserve seat — the board is exhausted for this lens</span>`;
+    action = `<div class="err-action">
+      ${fb}
+      <button class="btn small danger" data-manual="${esc(sid)}" data-manual-model="${esc(e.model || e.backend)}" data-manual-file="${esc(e.filename || '')}" title="take manual control: stop relying on auto-failover and act on this run yourself">⛬ take manual control</button>
+    </div>`;
+  } else {
+    action = `<div class="err-action muted">A retry / next seat returned a clean verdict — the run still produced a result.</div>`;
+  }
+  return `<div class="err-card recovery-${esc(rec)}" data-sid="${esc(sid)}" data-open="chat" data-call-file="${esc(e.filename || '')}" tabindex="0" role="button">
+    <div class="err-card-head">
+      ${seatChip(e.model || e.backend, { small: true, label: m.label })}
+      ${classBadge}${recBadge}
+      <span class="muted err-round">round ${esc(e.round)}</span>
+      <span class="muted err-time">${fmtTime(started)}</span>
+      ${modeBadge(mode)}
+    </div>
+    ${summary}
+    ${action}
+  </div>`;
+}
+
 PANELS.errors = () => {
   const runs = filteredRuns((state.runs || []).filter((r) => r.has_error));
-  let html = `<div class="panel-head"><h2>Errors</h2><p class="sub">Failed / timed-out runs with error details.</p></div>`;
+  // Flatten to individual errors so each failing seat is its own drill-down card.
+  const allErrors = [];
+  runs.forEach((r) => (r.errors || []).forEach((e) => allErrors.push({ sid: r.session_id, mode: r.mode, started: r.started, e })));
+  const unrecovered = allErrors.filter((x) => x.e.recovery === 'unrecovered');
+  let html = `<div class="panel-head"><h2>Errors</h2><p class="sub">Failed / timed-out calls, each with its failure class, recovery status, and — when a run didn't recover — the planned fallback seat. Click a card to open the run; take manual control when auto-failover is exhausted.</p></div>`;
   html += filterBar();
-  html += runs.length
-    ? `<div class="list">${runs.map(runRow).join('')}</div>`
-    : emptyState('errors', 'No failed runs in the current log window.');
+  if (!allErrors.length) {
+    html += emptyState('errors', 'No failed calls in the current log window.');
+    return html;
+  }
+  // Summary strip: total failing calls + how many runs never recovered (the actionable ones).
+  html += `<div class="err-strip">
+    <span class="err-stat"><strong>${allErrors.length}</strong> failed call${allErrors.length === 1 ? '' : 's'}</span>
+    <span class="err-stat ${unrecovered.length ? 'is-bad' : ''}"><strong>${unrecovered.length}</strong> unrecovered <span class="muted">(need attention)</span></span>
+  </div>`;
+  if (unrecovered.length) {
+    html += `<div class="section"><div class="section-head"><h3>Unrecovered <span class="muted">— auto-failover did not produce a clean verdict</span></h3></div>
+      <div class="err-list">${unrecovered.map((x) => errorCard(x.sid, x.mode, x.started, x.e)).join('')}</div></div>`;
+  }
+  const recovered = allErrors.filter((x) => x.e.recovery !== 'unrecovered');
+  if (recovered.length) {
+    html += `<div class="section"><div class="section-head"><h3>Recovered <span class="muted">— a later seat / retry returned a verdict</span></h3></div>
+      <div class="err-list">${recovered.map((x) => errorCard(x.sid, x.mode, x.started, x.e)).join('')}</div></div>`;
+  }
   return html;
 };
 
@@ -640,7 +787,9 @@ function barChart(obj, opts) {
 }
 
 // ---- session detail (chat transcript) -------------------------------------
-async function openDetail(sid) {
+// `focusCallFile` (optional) auto-expands and scrolls to a specific call (used by the Errors
+// tab so clicking an error card lands on the failing call, not the top of a long session).
+async function openDetail(sid, focusCallFile) {
   state.detail = sid;
   setActiveTab('chat');
   const want = 'chat/' + encodeURIComponent(sid);
@@ -657,6 +806,34 @@ async function openDetail(sid) {
   }
   $('panel').innerHTML = renderDetail(d);
   wireDetail(d);
+  // If we arrived from an error card, expand + scroll to the failing call.
+  if (focusCallFile) focusCall(d, focusCallFile);
+  // If we arrived via "take manual control", prime the feedback box with the manual note and
+  // scroll the overseer controls into view (the place to record the manual decision).
+  if (state.manualSeed && state.manualSeed.sid === sid) {
+    const fb = $('fb');
+    if (fb) {
+      if (!fb.value.trim()) fb.value = state.manualSeed.text;
+      fb.focus();
+      fb.scrollIntoView({ block: 'center' });
+    }
+    state.manualSeed = null;
+  }
+}
+
+// Expand + scroll to the call whose log filename matches (Errors-tab deep link).
+function focusCall(d, filename) {
+  const idx = (d.calls || []).findIndex((c) => c.filename === filename);
+  if (idx < 0) return;
+  const cb = $('cb-' + idx);
+  const head = document.querySelector(`[data-call="${idx}"]`);
+  if (cb) cb.style.display = 'block';
+  if (head) {
+    const ix = head.querySelector('.call-ix');
+    if (ix) ix.textContent = '▾';
+    head.classList.add('call-focused');
+    head.scrollIntoView({ block: 'center' });
+  }
 }
 
 function renderDetail(d) {
@@ -724,7 +901,7 @@ function renderDetail(d) {
     html += `<div class="call">
       <div class="call-head" data-call="${i}">
         <span class="call-ix">▸</span>
-        ${seatChip(c.backend, { small: true })}
+        ${seatChip(c.model || c.backend, { small: true })}
         <span class="muted">round ${esc(c.round)}</span>
         ${status}
         <span class="muted">${fmtDur(c.duration_seconds)} · ${esc(c.size_bytes)}B</span>
@@ -987,8 +1164,15 @@ function render() {
     el.setAttribute('tabindex', '0');
     el.setAttribute('role', 'button');
     const open = (e) => {
-      if (e.target.closest('[data-conscious]') || e.target.closest('[data-model]') || e.target.closest('[data-role]')) return;
-      openDetail(el.dataset.sid);
+      if (
+        e.target.closest('[data-conscious]') ||
+        e.target.closest('[data-model]') ||
+        e.target.closest('[data-role]') ||
+        e.target.closest('[data-manual]')
+      )
+        return;
+      // An error card carries the failing call's filename so the detail can auto-expand it.
+      openDetail(el.dataset.sid, el.dataset.callFile || null);
     };
     el.onclick = open;
     el.onkeydown = (e) => {
@@ -1014,7 +1198,30 @@ function render() {
       invalidate();
     };
   });
+  document.querySelectorAll('[data-manual]').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      openManualControl(el.dataset.manual, el.dataset.manualModel, el.dataset.manualFile || null);
+    };
+  });
   wireChips();
+}
+
+// Take manual control of a stuck/unrecovered run: open its detail (where the overseer can
+// mark it conscious, leave feedback on what to do next, and attach the PR/ticket the manual
+// follow-up lands under) and prime the feedback box with a manual-control note. This is the
+// overseer's escape hatch when auto-failover is exhausted — review-cli has no live "retry this
+// seat" RPC, so the honest action is to hand the run to the human with the context loaded.
+async function openManualControl(sid, model, callFile) {
+  const m = resolveModel(model);
+  toast(`manual control: ${m.label} — opening run for overseer follow-up`);
+  state.manualSeed = {
+    sid,
+    text: `MANUAL CONTROL — auto-failover exhausted for ${m.label}. Next step (decide & record): rerun with a different seat, fix the backend (key/paywall/block), or accept the partial result.`,
+  };
+  // Land on the failing call (so the overseer sees what failed) AND prime the feedback box.
+  openDetail(sid, callFile);
 }
 
 function boot() {

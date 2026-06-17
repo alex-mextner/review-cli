@@ -12,9 +12,11 @@ dependencies = ["pyyaml"]
 # The visual-verification test suite generates fixture PNGs with Pillow and shells out
 # to ImageMagick (`magick`, a SYSTEM dependency — install separately, e.g. `brew install
 # imagemagick`). Pillow is TEST-only, not a runtime dependency (cvGate uses ImageMagick,
-# never Pillow). Install with `pip install -e '.[test]'` before running tests/smoke.sh.
+# never Pillow). Install with `pip install -e '.[test]'` before running the smoke suite.
+# The smoke suite (tests/smoke.py) is Python and runs standalone (`python tests/smoke.py`,
+# what CI runs); it is ALSO pytest-collectable (`pytest tests/smoke.py`) when pytest is present.
 [project.optional-dependencies]
-test = ["pillow"]
+test = ["pillow", "pytest>=8,<9"]
 # `review dashboard` as a MANAGED SERVICE (run/start/status/stop/enable/disable + launchd/
 # systemd autostart) is powered by the shared `agenttools_service` lib — ONE service-manager
 # every long-running agent-tools server reuses, instead of each tool hand-rolling pidfiles /

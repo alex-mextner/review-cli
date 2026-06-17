@@ -289,13 +289,22 @@ def _dashboard_subcommand(rest: list[str]) -> int:
         # (start/status/stop/enable/disable) need the lib — for those, emit an actionable error
         # (structured-exit-codes) instead of a raw ImportError traceback.
         action, action_idx = _dashboard_action_with_index(rest)
-        if action in (None, "run") and "--help" not in rest and "-h" not in rest:
-            if action == "run":
-                # Drop ONLY the `run` action token (by index, not by value — a value that
-                # happens to equal "run" must survive); `_dashboard_serve` parses the rest as
-                # server flags (--host/--port/--no-open/--verbose).
-                return _dashboard_serve(rest[:action_idx] + rest[action_idx + 1 :])
+        # A BARE `review dashboard` OR a help-only `review dashboard [--help|-h]` (no lifecycle
+        # action) prints help and launches nothing — exit 0. The help surface is the SAME
+        # whether or not the lib is installed (the smoke test greps it for the action names),
+        # so a lib-less operator still sees what the dashboard can do. `--help`/`-h` with no
+        # action was previously mis-routed to the missing-lib error (exit 4), breaking the
+        # bare-HELP contract — a `--help`/`-h` is NOT itself a lifecycle action.
+        if action is None:
             return _dashboard_help_no_lib()
+        if action == "run":
+            # Ad-hoc foreground server still works without the lib. Drop ONLY the `run` action
+            # token (by index, not by value — a value that happens to equal "run" must survive);
+            # `_dashboard_serve` parses the rest as server flags (and prints its own --help/exit 0
+            # for `run --help`, so the help contract holds there too).
+            return _dashboard_serve(rest[:action_idx] + rest[action_idx + 1 :])
+        # A genuine lifecycle action (start/status/stop/enable/disable) needs the lib — emit the
+        # actionable missing-lib error (structured-exit-codes) instead of a raw ImportError.
         print(_AGENTTOOLS_SERVICE_MISSING_MSG, file=sys.stderr)
         return 4
 

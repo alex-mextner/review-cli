@@ -35,4 +35,7 @@ jobs:
         # wired lifecycle path in CI.
         run: pip install -e '.[test]'
       - name: Smoke + unit tests
-        run: bash tests/smoke.sh
+        # The smoke suite is Python (the ecosystem is Python-only): it drives the real
+        # `bin/review` CLI via subprocess and runs the standalone tests/test_*.py unit files.
+        # Runnable standalone (`python tests/smoke.py`) or under pytest (`pytest tests/smoke.py`).
+        run: python tests/smoke.py

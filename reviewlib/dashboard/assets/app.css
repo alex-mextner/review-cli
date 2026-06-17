@@ -24,6 +24,9 @@
   --teal: #38c1b0;
   --radius: 10px;
   --radius-sm: 7px;
+  --text-dim: #b6bfd2; /* dimmer than --text, brighter than --muted — for the logo monogram */
+  --logo-chip-bg: #ffffff0d; /* faint light card behind a brand logo so a dark mark reads */
+  --logo-chip-ring: #ffffff1a; /* hairline ring around the logo card */
   /* Sticky-tabs offset = the topbar's rendered height. Kept as one var so the tabs can't
      drift from the topbar if its padding/line-height changes (the old hardcoded 53px did). */
   --topbar-h: 53px;
@@ -83,6 +86,8 @@ body {
 .btn.primary { background: var(--accent-dim); border-color: var(--accent-dim); color: #fff; }
 .btn.primary:hover { background: var(--accent); border-color: var(--accent); }
 .btn.small { padding: 4px 9px; font-size: 12px; }
+.btn.danger { color: var(--red); border-color: rgba(255, 93, 93, .55); background: rgba(255, 93, 93, .08); font-weight: 650; }
+.btn.danger:hover { border-color: var(--red); background: rgba(255, 93, 93, .16); }
 
 /* ---- tabs ---- */
 .tabs {
@@ -191,8 +196,29 @@ code { font-family: var(--mono); font-size: .92em; background: var(--bg-elev2); 
 .seat:active { transform: translateY(1px); }
 .seat.is-active { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent) inset; }
 .seat.chip-sm { padding: 2px 9px 2px 7px; font-size: 12px; }
-.seat-ic { font-size: 13px; line-height: 1; filter: saturate(1.1); }
 .seat .seat-name { letter-spacing: -.01em; }
+
+/* ---- model brand-logo icons (REAL per-vendor PNG marks, not emoji) ---- */
+/* The shipped logos are flat brand marks on a transparent ground; a fixed square box keeps
+   them aligned with text regardless of the source PNG's aspect, and `object-fit: contain`
+   never distorts a mark. A subtle ring + light card behind it makes a white/transparent logo
+   readable on the dark UI without recoloring the brand. */
+.model-ic {
+  flex: 0 0 auto; width: 18px; height: 18px; border-radius: 5px;
+  object-fit: contain; display: inline-block; vertical-align: middle;
+  background: var(--logo-chip-bg); padding: 1px;
+  box-shadow: inset 0 0 0 1px var(--logo-chip-ring);
+}
+.model-ic.seat-ic { width: 16px; height: 16px; }
+.chip-sm .model-ic.seat-ic { width: 15px; height: 15px; }
+/* Monogram fallback for a brand with no shipped logo (GLM / MiniMax / gateway). Still a
+   branded chip — a two-letter mark on the same card — never a generic emoji. */
+.model-ic.mono {
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--sans); font-weight: 800; font-size: 8.5px; letter-spacing: -.02em;
+  color: var(--text-dim); padding: 0;
+}
+.model-ic.seat-ic.mono { font-size: 8px; }
 
 /* ---- role / lens chips ---- */
 .role-chip {
@@ -226,6 +252,39 @@ code { font-family: var(--mono); font-size: .92em; background: var(--bg-elev2); 
 .badge.nodata { color: var(--muted); border-color: var(--muted2); }
 .badge.pr a, .badge.ticket a { color: inherit; text-decoration: none; margin-left: 2px; opacity: .7; }
 .badge.pr a:hover, .badge.ticket a:hover { opacity: 1; }
+
+/* ---- Errors tab: drill-down cards with recovery + fallback ---- */
+.err-strip { display: flex; gap: 18px; flex-wrap: wrap; margin: 4px 0 16px; }
+.err-stat { font-size: 13px; color: var(--muted); }
+.err-stat strong { color: var(--text); font-size: 16px; font-weight: 750; margin-right: 4px; }
+.err-stat.is-bad strong { color: var(--red); }
+.err-list { display: flex; flex-direction: column; gap: 10px; }
+.err-card {
+  border: 1px solid var(--border); border-left: 3px solid var(--muted2); border-radius: var(--radius-sm);
+  background: var(--bg-elev); padding: 12px 14px; cursor: pointer;
+  transition: border-color .14s ease, background .14s ease, transform .06s ease;
+}
+.err-card:hover { background: var(--bg-elev2); border-left-color: var(--accent); }
+.err-card:active { transform: translateY(1px); }
+.err-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.err-card.recovery-unrecovered { border-left-color: var(--red); }
+.err-card.recovery-recovered { border-left-color: var(--green); }
+.err-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.err-round, .err-time { font-size: 11.5px; }
+.err-time { margin-left: auto; }
+.err-summary { margin: 9px 0 0; }
+.err-summary code {
+  display: block; font-family: var(--mono); font-size: 12px; color: var(--red);
+  background: rgba(255, 93, 93, .07); border: 1px solid rgba(255, 93, 93, .25);
+  border-radius: 6px; padding: 7px 10px; white-space: pre-wrap; word-break: break-word;
+}
+.err-action {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 11px; padding-top: 10px; border-top: 1px dashed var(--border); font-size: 12.5px;
+}
+.err-action.muted { color: var(--muted); }
+.err-fallback { display: inline-flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.call-focused { box-shadow: 0 0 0 2px var(--accent) inset; border-radius: var(--radius-sm); }
 
 /* ---- filter bar ---- */
 .filterbar {

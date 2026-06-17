@@ -20,11 +20,24 @@ from __future__ import annotations
 import contextlib
 import io
 import sys
+import unittest
 from pathlib import Path
 from unittest import mock
 
 from reviewlib import cli
 from reviewlib.dashboard import service as svc
+
+# The `Service` DESCRIPTOR tests below build a real `agenttools_service.Service`, so they only
+# run when the shared service lib is installed (the `[dashboard]` extra). CI installs the core
+# deps WITHOUT it on purpose (it isn't on PyPI yet), exercising the lib-ABSENT error path; when
+# absent, the descriptor-shape tests SKIP loudly instead of erroring with a raw ImportError —
+# the WIRING tests (which never touch the lib) still run and cover our own glue.
+try:
+    import agenttools_service as _agenttools_service  # noqa: F401
+
+    _HAS_SERVICE_LIB = True
+except ImportError:
+    _HAS_SERVICE_LIB = False
 
 
 # --- bare invocation prints HELP, launches nothing ---------------------------------------
@@ -46,16 +59,80 @@ def test_bare_dashboard_prints_help_and_does_not_launch():
         assert action in out, (action, out)
 
 
-def test_dashboard_explicit_help_flag_exits_via_systemexit():
-    # `review dashboard --help` is argparse's own help: it raises SystemExit (exit 0), never
-    # launches. Distinct from the BARE invocation above, which print_help()s and returns 0.
-    raised = False
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            cli._dashboard_subcommand(["--help"])
-    except SystemExit:
-        raised = True
-    assert raised, "`review dashboard --help` must raise SystemExit"
+@contextlib.contextmanager
+def _force_lib_absent():
+    """Make `import agenttools_service` raise ImportError, so a test can exercise the lib-ABSENT
+    branch of `_dashboard_subcommand` regardless of whether the optional lib is actually
+    installed on this host (the CI failure was on this path). Poisoning `sys.modules` with a
+    `None` entry is the standard idiom — Python treats a None module entry as 'not importable'
+    and raises ImportError, with no builtins monkey-patching."""
+    with mock.patch.dict(sys.modules, {"agenttools_service": None}):
+        yield
+
+
+def test_dashboard_help_is_exit0_when_service_lib_is_absent():
+    """REGRESSION (the CI failure): with the optional `agenttools_service` lib ABSENT, a bare
+    `review dashboard` AND a help-only `review dashboard --help`/`-h` print help and launch
+    nothing (return 0) — NOT the missing-lib error (exit 4). A `--help`/`-h` is not a lifecycle
+    action. Forces the lib-absent import path so this holds even where the lib IS installed."""
+    import reviewlib.dashboard as dash
+
+    def _boom(*a, **k):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("dashboard help must NOT launch the server")
+
+    with _force_lib_absent(), mock.patch.object(dash, "run_dashboard", _boom):
+        for argv in ([], ["--help"], ["-h"]):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli._dashboard_subcommand(argv)
+            out = buf.getvalue()
+            assert rc == 0, (argv, rc)
+            for action in ("run", "start", "stop", "status", "enable", "disable"):
+                assert action in out, (argv, action, out)
+
+
+def test_dashboard_lifecycle_action_exit4_when_service_lib_is_absent():
+    """The other half: a GENUINE lifecycle action (status/start/…) with the lib absent emits the
+    actionable missing-lib error (exit 4), no traceback — structured-exit-codes."""
+    import io as _io
+
+    with _force_lib_absent():
+        buf_err = _io.StringIO()
+        old = sys.stderr
+        sys.stderr = buf_err
+        try:
+            rc = cli._dashboard_subcommand(["status"])
+        finally:
+            sys.stderr = old
+    assert rc == 4, rc
+    err = buf_err.getvalue()
+    assert "agenttools_service" in err
+    assert "Traceback (most recent call last)" not in err
+
+
+def test_dashboard_explicit_help_flag_prints_help_and_launches_nothing():
+    # `review dashboard --help` / `-h` (no lifecycle action) prints HELP and launches nothing —
+    # exit 0, the SAME bare-HELP contract whether or not the shared service lib is installed.
+    # A `--help`/`-h` is NOT itself a lifecycle action, so it must never hit the missing-lib
+    # error (exit 4) on a lib-less host (the bug the smoke `dashboard --help | grep status`
+    # caught). The lib-PRESENT path serves it via argparse, which print_help()s + exits 0 too.
+    import reviewlib.dashboard as dash
+
+    def _boom(*a, **k):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("`review dashboard --help` must NOT launch the server")
+
+    for flag in ("--help", "-h"):
+        with mock.patch.object(dash, "run_dashboard", _boom):
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    rc = cli._dashboard_subcommand([flag])
+            except SystemExit as exc:  # lib-present: argparse's own --help exits 0
+                rc = exc.code or 0
+            out = buf.getvalue()
+        assert rc == 0, (flag, rc)
+        for action in ("run", "start", "stop", "status", "enable", "disable"):
+            assert action in out, (flag, action, out)
 
 
 # --- the foreground server argv: hidden __serve, absolute argv[0], no browser -------------
@@ -94,8 +171,20 @@ def test_review_argv0_uses_path_review_when_it_is_us():
     assert argv0 == ["/usr/local/bin/review"], argv0
 
 
+# A test raises this to signal "not applicable on this host" (vs PASS / FAIL); the runner
+# below reports it as SKIP and does NOT count it as a failure. Mirrors smoke.sh's loud-skip of
+# the visual suite when ImageMagick/Pillow are absent — a missing OPTIONAL dep skips, never fails.
+# Subclasses unittest.SkipTest so a DIRECT `pytest tests/test_dashboard_service.py` run (not via
+# smoke.py's standalone subprocess runner) also reports these as SKIP rather than a spurious
+# ERROR — pytest treats SkipTest natively, and the `except _Skip` runner below still catches it.
+class _Skip(unittest.SkipTest):
+    pass
+
+
 # --- the Service descriptor --------------------------------------------------------------
 def test_dashboard_service_descriptor_shape():
+    if not _HAS_SERVICE_LIB:
+        raise _Skip("agenttools_service not installed (the [dashboard] extra)")
     s = svc.dashboard_service()
     assert s.name == "dashboard"
     assert s.tool == "review"
@@ -106,6 +195,8 @@ def test_dashboard_service_descriptor_shape():
 
 
 def test_dashboard_service_honors_explicit_port_and_host():
+    if not _HAS_SERVICE_LIB:
+        raise _Skip("agenttools_service not installed (the [dashboard] extra)")
     s = svc.dashboard_service(port=9999, host="0.0.0.0")
     assert s.port == 9999
     assert s.host == "0.0.0.0"
@@ -187,6 +278,8 @@ if __name__ == "__main__":
             try:
                 _fn()
                 print(f"PASS {_name}")
+            except _Skip as exc:
+                print(f"SKIP {_name}: {exc}")
             except AssertionError as exc:
                 failures += 1
                 print(f"FAIL {_name}: {exc}")
