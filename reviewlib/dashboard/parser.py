@@ -111,6 +111,11 @@ _CLAUDE_OPUS_MODEL = "claude:claude-opus-4-8"
 _SINGLE_MODEL_BACKENDS = {"codex": "codex", "gemini": "gemini"}
 # `commandcode API <model>` / `z.ai API <model>` header argv0 reveals the gateway model.
 _API_MODEL_RE = re.compile(r"\bAPI\s+(?P<model>\S+)")
+# Claude API-mode header argv0 is EXACTLY `Anthropic API <model>` (optionally `@ <base>`),
+# written by review_claude_api. Anchor on that full prefix — NOT the generic `\bAPI` — so a
+# CLI-mode `claude-p` path that happens to contain `API ` (e.g. `/opt/API Tools/claude-p`)
+# can't be mis-read as a model and bypass the paywall/Opus fallback.
+_CLAUDE_API_MODEL_RE = re.compile(r"^Anthropic API\s+(?P<model>\S+)")
 # z.ai's board seat id is `zai:<model>` (config DEFAULT_BOARD), but the log backend/header
 # spell it `z.ai`. Normalise the header model to the board prefix so attribution lines up.
 _BACKEND_BOARD_PREFIX = {"commandcode": "commandcode", "z.ai": "zai"}
@@ -785,14 +790,16 @@ def _normalize_body(text: str) -> str:
 def _body_has_real_content(call: "CallLog") -> bool:
     """Did this EXIT-0 call return a real verdict, or is it empty/framing-only?
 
-    A call is EMPTY when it exited cleanly but produced no usable review: an explicit
-    `output_tokens=0` usage line, or a body that — once the `[review-cli] …` framing and
-    stderr/usage lines are dropped — has no remaining prose. (The body has already had the
-    header + EXIT/timeout footer stripped by the parser; what remains can still be a usage
-    line or pure whitespace.)"""
-    # Explicit zero-output usage line is the strongest empty signal.
-    if re.search(r"\boutput_tokens=0\b", call.body):
-        return False
+    A call is EMPTY when it exited cleanly but produced no usable review: a body that —
+    once the `[review-cli] …` framing and stderr/usage lines are dropped — has no remaining
+    prose. (The body has already had the header + EXIT/timeout footer stripped by the
+    parser; what remains can still be a usage line or pure whitespace.)
+
+    A bare `output_tokens=0` usage line is NOT, on its own, an empty signal: a REST backend
+    that returns REAL review text but omits usage metadata still appends a zero fallback
+    usage line (`input_tokens=0 output_tokens=0`). The verdict above that line is real, so
+    presence of actual prose decides — we only treat the usage line itself as non-content,
+    not the whole call (codex P2)."""
     for raw in call.body.splitlines():
         line = raw.strip()
         if not line:
@@ -801,8 +808,13 @@ def _body_has_real_content(call: "CallLog") -> bool:
             continue  # framing line
         if line.startswith("[reasoning_content"):
             continue  # reasoning-only, no final answer
-        if re.fullmatch(r"(prompt_tokens=\d+\s*)?(output_tokens=\d+\s*)?", line):
-            continue  # a bare usage line is not content
+        # A bare usage line is not content. Match both spellings review-cli emits: the
+        # OpenAI-shaped `prompt_tokens=` (z.ai / commandcode) and the Anthropic-shaped
+        # `input_tokens=` (the claude REST backend), in either order, regardless of value.
+        if re.fullmatch(
+            r"((prompt|input)_tokens=\d+\s*)?(output_tokens=\d+\s*)?", line
+        ):
+            continue
         return True
     return False
 
@@ -847,12 +859,22 @@ def model_id_for_call(call: "CallLog") -> str:
       * `commandcode` / `z.ai`: the header argv0 carries `… API <model>` — map to the board
         prefix (`commandcode:<model>` / `zai:<model>`). A bare probe (`commandcode` with no
         `API …`) has no model, so it stays the backend name.
-      * `claude`: the wrapper argv0 is identical for Fable and Opus, so the model is inferred
-        from the body — a paywall body = Fable, anything else = the Opus seat.
+      * `claude`: in API mode (`REVIEW_CLAUDE_MODE=api`, or no `claude-p`) the sidecar argv0
+        carries the EXACT model as `Anthropic API <model>` — read that first and map it to
+        the board id (`claude:<model>`). Only the CLI wrapper (`claude-p`) hides the model
+        (its argv0 is identical for Fable and Opus); there the model is inferred from the
+        body — a paywall body = Fable, anything else = the Opus seat.
       * `codex` / `gemini`: one model each; the backend name IS the board id.
       * anything else: fall back to the backend name."""
     backend = call.backend
     if backend == "claude":
+        # API mode names the exact model in argv0 (`Anthropic API <model>` [@ <base>]); use
+        # it before defaulting to Opus, so an API-mode Fable (no paywall body) isn't
+        # mis-attributed to the Opus seat (codex P2). Anchored on the full `Anthropic API `
+        # prefix so a CLI-mode `claude-p` path containing `API ` isn't mistaken for a model.
+        m = _CLAUDE_API_MODEL_RE.match(call.argv0)
+        if m:
+            return f"claude:{m.group('model')}"
         if _PAYWALL_SENTINEL in _normalize_body(call.body):
             return _CLAUDE_FABLE_MODEL
         return _CLAUDE_OPUS_MODEL

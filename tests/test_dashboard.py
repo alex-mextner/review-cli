@@ -587,6 +587,33 @@ def test_classify_paywall_auth_blocked_timeout_empty_ok():
         assert p.classify_call(ok) == p.HEALTH_OK
 
 
+def test_real_output_with_zero_usage_fallback_is_ok_not_empty():
+    """A REST backend that returns REAL review text but omits usage metadata still appends a
+    fallback usage line (`input_tokens=0 output_tokens=0`). The zero-usage line must NOT make
+    the classifier call it empty — there is a real verdict above it, so it's OK."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # claude API mode: real verdict body, then the zero-usage fallback the backend writes
+        # when the response carried no usage block.
+        real = p.parse_call_log(_write_call_log(
+            ld, "20260601T100600_000000", "claude", 0,
+            "## Findings\n1. A real, substantive review verdict about the diff.\n"
+            "\n\ninput_tokens=0 output_tokens=0\n",
+            argv0="Anthropic API claude-opus-4-8", exit_code=0))
+        assert p.classify_call(real) == p.HEALTH_OK
+
+        # Guard the other half: a claude API call with ONLY the zero-usage fallback line
+        # (no verdict text) is still genuinely EMPTY — dropping the blanket short-circuit
+        # must not start mis-classifying a truly empty call as OK.
+        truly_empty = p.parse_call_log(_write_call_log(
+            ld, "20260601T100650_000000", "claude", 0,
+            "input_tokens=0 output_tokens=0\n",
+            argv0="Anthropic API claude-opus-4-8", exit_code=0))
+        assert p.classify_call(truly_empty) == p.HEALTH_EMPTY
+
+
 def test_model_attribution_splits_shared_backends_and_claude():
     from reviewlib.dashboard import parser as p
 
@@ -615,6 +642,47 @@ def test_model_attribution_splits_shared_backends_and_claude():
         # claude wrapper is identical on disk; the body splits Fable (paywall) from Opus.
         assert p.model_id_for_call(fable) == "claude:claude-fable-5"
         assert p.model_id_for_call(opus) == "claude:claude-opus-4-8"
+
+
+def test_claude_api_argv0_identifies_model_before_opus_default():
+    """In Claude API mode the sidecar argv0 carries the EXACT model as `Anthropic API
+    <model>` (optionally `@ <base>`). The attributor must read that argv0 to identify the
+    model BEFORE defaulting to Opus — otherwise an API-mode Fable call (no paywall body)
+    is mis-attributed to the Opus seat."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # API-mode Fable: real text body (no paywall sentinel), argv0 names Fable.
+        fable_api = p.parse_call_log(_write_call_log(
+            ld, "20260601T100600_000000", "claude", 0,
+            "## Findings\n1. A real verdict from Fable via the API.\n",
+            argv0="Anthropic API claude-fable-5", exit_code=0))
+        # API-mode Opus, with the trailing `@ <base>` form the backend also emits.
+        opus_api = p.parse_call_log(_write_call_log(
+            ld, "20260601T100700_000000", "claude", 0,
+            "## Findings\n1. A real verdict from Opus via the API.\n",
+            argv0="Anthropic API claude-opus-4-8 @ https://api.anthropic.com", exit_code=0))
+        # CLI mode (claude-p): argv0 has no model, so the body sentinel still decides.
+        opus_cli = p.parse_call_log(_opus_ok_log(ld, "20260601T100800_000000"))
+        # CLI mode where the `claude-p` binary PATH itself contains `API ` (e.g. installed
+        # under `/opt/API Tools/`). A generic `\bAPI ` match would mis-read `Tools/claude-p`
+        # as the model; the anchored `^Anthropic API ` match must NOT, so this still falls
+        # through to the body sentinel (paywall=Fable / else Opus).
+        opus_cli_apipath = p.parse_call_log(_write_call_log(
+            ld, "20260601T100900_000000", "claude", 0,
+            "## Findings\n1. A real verdict from Opus via the CLI.\n",
+            argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p", exit_code=0))
+        fable_cli_apipath = p.parse_call_log(_write_call_log(
+            ld, "20260601T101000_000000", "claude", 0,
+            "ClaudeFable5iscurrentlyunavailable.Learnmore:\n",
+            argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p", exit_code=0))
+
+        assert p.model_id_for_call(fable_api) == "claude:claude-fable-5"
+        assert p.model_id_for_call(opus_api) == "claude:claude-opus-4-8"
+        assert p.model_id_for_call(opus_cli) == "claude:claude-opus-4-8"
+        assert p.model_id_for_call(opus_cli_apipath) == "claude:claude-opus-4-8"
+        assert p.model_id_for_call(fable_cli_apipath) == "claude:claude-fable-5"
 
 
 def test_paywall_sentinel_survives_whitespace_collapse():
