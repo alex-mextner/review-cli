@@ -1,15 +1,16 @@
 # review-cli
 
-**Multi-model read-only code review from a single command.**
+**multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic.**
 
 Runs your git diff through multiple AI backends **in parallel**, collects their findings,
-and prints them side by side. Four modes let you go from a quick pre-commit sanity check
-all the way to a structured expert panel that builds consensus or explores a design space.
-Built for use from any shell or AI agent harness (Claude Code, Codex, opencode).
+and prints them side by side. Core review modes let you go from a quick pre-commit
+sanity check all the way to a structured expert panel that builds consensus or explores
+a design space. Built for use from any shell or AI agent harness (Claude Code, Codex,
+opencode).
 
-Beyond the diff modes it also does **visual review** — attach a rendered screenshot to
-any review with the composable `--visual` flag for a keep / rollback / repair verdict — and
-ships **interactive spec-review tooling** so a markdown spec can be reviewed like a PR.
+Beyond the core modes it also does **visual review** — attach a rendered screenshot to any
+review with the composable `--visual` flag for a keep / rollback / repair verdict — and ships
+**interactive spec-review tooling** so a markdown spec can be reviewed like a PR.
 
 ---
 
