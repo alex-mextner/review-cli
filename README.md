@@ -672,7 +672,10 @@ spec-web SPEC.md    Interactive web reviewer for a markdown spec.
 install-skill | install-commit-hook | register-module
 
 SHARED FLAGS
--m / --model        Backend to include; repeat or comma-separate. Stacks with defaults.
+-m / --model        Backend to run; repeat or comma-separate. Default (no -m) is mode-aware:
+                    `review diff` runs the active reviewer board (or your config `models:`);
+                    brainstorm uses `brainstorm_models:`, just-ask/quorum the defaults.
+                    Each subcommand's `--help` shows its own effective default.
 --diff              Use the working-tree diff (default for review; optional grounding for brainstorm).
 --staged            Use the staged diff (git diff --cached) instead of the working-tree diff.
 --visual IMAGE      Composable flag (NOT a mode): attach/verify a render; rides any subcommand.

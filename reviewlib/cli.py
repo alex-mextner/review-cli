@@ -26,6 +26,7 @@ from .config import (
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
     DEFAULT_PROMPT,
+    MODERATOR_CANDIDATES,
     PANEL_TIMEOUT_DEFAULT,
     BoardConfigError,
     _expand_alias,
@@ -750,13 +751,89 @@ def main(argv: list[str] | None = None) -> int:
 
 
 
+def _model_default_help(mode: ModeSpec | None) -> str:
+    """The EFFECTIVE `--model` default for THIS parser's mode, for `--help` (ROADMAP: help
+    must show ACTUAL defaults — esp `--model`). The default is MODE-AWARE because the
+    runtime selection differs per mode (only the diff review runs the board):
+
+      * diff review (mode.name == "review", and the top-level overview where mode is None):
+        a `models:` list in config.yaml -> those exact models, else the active reviewer
+        BOARD (run `review --show-board`).
+      * brainstorm: a `brainstorm_models:` list -> those, else `models:`, else the built-in
+        DEFAULT_MODELS — the board does NOT apply here.
+      * just-ask / quorum: a `models:` list -> those, else DEFAULT_MODELS.
+
+    Best-effort: any config read failure degrades to the built-in DEFAULT_MODELS phrasing
+    (never raises in --help)."""
+    try:
+        config = load_config()
+    except Exception:  # noqa: BLE001 — --help must never crash on a bad config
+        config = {}
+
+    def _fmt(models: list[str]) -> str:
+        shown = ", ".join(models[:4]) + (", …" if len(models) > 4 else "")
+        # This string is interpolated into an argparse `help=`, where `%` is formatting
+        # syntax — an un-escaped `%` in a config model id (e.g. `models: ["bad%model"]`)
+        # crashes `review --help` with "badly formed help string". Config values are
+        # untrusted input here, so escape `%` -> `%%` (codex review). The static phrasing
+        # below has no `%`, so escaping only the config-derived fragment is sufficient.
+        return shown.replace("%", "%%")
+
+    try:
+        config_models = _split_models(config.get("models") or [])
+    except Exception:  # noqa: BLE001
+        config_models = []
+    default_models = [_expand_alias(x) for x in DEFAULT_MODELS]
+
+    # brainstorm: brainstorm_models > models > DEFAULT_MODELS (no board).
+    if mode is not None and mode.name == "brainstorm":
+        try:
+            bs = _split_models(config.get("brainstorm_models") or [])
+        except Exception:  # noqa: BLE001
+            bs = []
+        if bs:
+            return f"your config.yaml brainstorm_models: {_fmt(bs)}"
+        if config_models:
+            return f"your config.yaml models: {_fmt(config_models)}"
+        return f"{_fmt(default_models)} (the built-in defaults)"
+
+    # just-ask / quorum: models > DEFAULT_MODELS (no board).
+    if mode is not None and mode.name not in ("review",):
+        if config_models:
+            return f"your config.yaml models: {_fmt(config_models)}"
+        return f"{_fmt(default_models)} (the built-in defaults)"
+
+    # diff review (and the top-level overview, mode is None): models > the active board.
+    if config_models:
+        return f"your config.yaml models: {_fmt(config_models)}"
+    return "the active reviewer board (run `review --show-board`)"
+
+
+def _moderator_default_help() -> str:
+    """The EFFECTIVE auto-picked `--moderator` default, for `--help`. The moderator is
+    chosen from MODERATOR_CANDIDATES (opus -> codex -> gemini) filtered to availability at
+    run time; the help names that priority chain so the default is concrete, not vague.
+
+    Escape `%` -> `%%`: this is interpolated into an argparse `help=`, where `%` is
+    formatting syntax. The candidates are hardcoded today (no `%`), but escaping keeps the
+    same defensive guarantee as `_model_default_help` so a future `%`-bearing candidate id
+    can't crash `review --help` (gemini review)."""
+    return " -> ".join(MODERATOR_CANDIDATES).replace("%", "%%")
+
+
 def _add_shared_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
     """Add the SHARED options every mode subcommand understands. `--list-defaults` /
     `--show-board` / `--pool` are review/board meta-flags that stay available on the
     default (review) parser; the panel/brainstorm/visual-only flags are available to the
     relevant modes too (a flag a mode ignores is harmless). Mode-UNIQUE arguments (the
-    positional question/topic) are added by the mode's own `add_arguments`."""
-    parser.add_argument("-m", "--model", action="append", default=[], help="model/backend to run; repeat or comma-separate")
+    positional question/topic) are added by the mode's own `add_arguments`.
+
+    Configurable options show their EFFECTIVE default value (ROADMAP: help must show ACTUAL
+    defaults), resolving the config cascade where relevant (`--model` / `--moderator`)."""
+    parser.add_argument(
+        "-m", "--model", action="append", default=[],
+        help=f"model/backend to run; repeat or comma-separate (default: {_model_default_help(mode)})",
+    )
     parser.add_argument("-C", "--cwd", default=".", help="repository directory")
     parser.add_argument(
         "-o", "--output", metavar="FILE", default=None,
@@ -787,7 +864,10 @@ def _add_shared_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             "never off — --pool only sizes it. N<=0 means all seats."
         ),
     )
-    parser.add_argument("--moderator", default=None, help="moderator backend for quorum / brainstorm")
+    parser.add_argument(
+        "--moderator", default=None,
+        help=f"moderator backend for quorum / brainstorm (default: auto-pick, first available of {_moderator_default_help()})",
+    )
     # --rounds / --max-rounds are brainstorm-only and added by the brainstorm mode's own
     # add_arguments (so `review just-ask --rounds 5` correctly errors). They are still in
     # _VALUE_TAKING_OPTS so the mode-agnostic `-o` pre-scan treats them as value-taking.

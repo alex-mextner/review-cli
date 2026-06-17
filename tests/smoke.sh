@@ -86,6 +86,16 @@ echo "$nogit_out" | grep -q "cd into a repo"                    # HOW (or cd int
 bin/review just-ask -C "$NONGIT_SMOKE" --help | grep -q "the question to ask"
 bin/review -C "$NONGIT_SMOKE" --list-defaults | grep -q codex
 
+# Help must show ACTUAL defaults (ROADMAP "Help must show ACTUAL defaults — esp. --model"):
+# --model names the effective default (the active board when no -m/config), --moderator the
+# auto-pick chain, and the numeric flags their concrete defaults.
+bin/review --help | grep -q "active reviewer board"            # --model default
+bin/review --help | grep -q "claude:claude-opus-4-8"           # --moderator auto-pick chain
+bin/review --help | grep -q "default 4"                        # --pool
+bin/review --help | grep -q "default 60"                       # --vision-timeout
+python3 tests/test_help_defaults.py
+echo "help-defaults tests OK"
+
 # Stage 1: the composable --visual flag and its core sub-flags must appear in help.
 bin/review --help | grep -q -- "--visual"
 bin/review --help | grep -q -- "--no-ai"
