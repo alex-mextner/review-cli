@@ -16,9 +16,24 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..panel import PanelJob, format_result, run_moderator, run_panel
+from ..panel import (
+    PanelJob,
+    format_result,
+    recount_round_by_usability,
+    result_is_usable,
+    run_moderator,
+    run_panel,
+)
 from ..process import log_dir
 from .contract import ModeContext, ModeSpec
+
+# Stable, distinct exit code for "the panel backends produced nothing" (dead / credential-less
+# backends). A brainstorm that runs its rounds with every seat returning empty used to print a
+# hollow synthesis and exit 0 as if it worked (the moderator stamps DECISION: STOP over a
+# transcript of "(no output)") — wasting ~20 min of "it's still thinking". This code lets a
+# caller branch on "the run was empty because the backends are dead" vs a real failure (1) or
+# success (0). 0=success, 1=synthesis failed, 2=argparse/usage. 5 is the dead-panel class.
+EXIT_DEAD_PANEL = 5
 
 # UNFORGEABLE structural sentinels emitted by the discussion-log WRITER (this module) and
 # read by the session parser (reviewlib.sessions). The key to making them unforgeable is a
@@ -103,6 +118,24 @@ PERSONAS = (
         "footprint; allergic to waste and premature scale.",
     ),
 )
+
+
+def _round_is_dead(round_results: list) -> bool:
+    """Did this brainstorm round come back with NO real persona output?
+
+    A round is "dead" when MOST of its seats produced no usable verdict — empty stdout, a
+    non-zero exit, or an "unavailable" sentinel body (the same `result_is_usable` shape the
+    failover board uses, so the two judgements can't drift). "Most" = a strict majority are
+    unusable, which is exactly the all-/most-empty case the dead-panel guard exists to catch
+    (every backend credential-less / suspended). A round with at least half its seats usable
+    is NOT dead — a single flaky backend must not abort an otherwise productive brainstorm.
+
+    An empty result list counts as dead (nothing ran). The threshold is on the round's OWN
+    seats, so it scales with the panel size (a 3-slot or a 6-slot round)."""
+    if not round_results:
+        return True
+    usable = sum(1 for r in round_results if result_is_usable(r))
+    return usable * 2 < len(round_results)
 
 
 def mode_brainstorm(
@@ -266,8 +299,48 @@ def mode_brainstorm(
                 f"#### {r.model}\n{(r.stdout.strip() or r.stderr.strip() or '(no output)')}"
                 for r in round_results
             )
-            transcript_blocks.append(f"## Round {round_no}\n{round_text}")
             out.append(f"\n# Round {round_no}\n" + "\n\n---\n\n".join(format_result(r) for r in round_results))
+
+            # FAIL LOUD on a dead panel (see _round_is_dead): abort before recording the round
+            # as COMPLETED, so a dead round is never appended to the transcript / counted in
+            # `completed` / given a structural sentinel — a resume re-runs it rather than seeding
+            # its "(no output)" (codex P2). The round is still logged below for diagnosis.
+            #
+            # ONLY when NO usable round has accumulated yet (`not transcript_blocks`): that is
+            # the bug this guards — every seat dead from round 1 (keyless/suspended backends),
+            # which used to print a hollow synthesis and exit 0. If earlier rounds WERE
+            # productive and a later round flakes (a transient rate-limit on a couple of
+            # seats), we must NOT throw away the good rounds — fall through and synthesize what
+            # we have, the pre-existing graceful behavior (claude-opus review). Mid-run
+            # transient-failure resilience (retry/reserve-swap) is a separate ROADMAP item.
+            if not transcript_blocks and _round_is_dead(round_results):
+                usable = sum(1 for r in round_results if result_is_usable(r))
+                msg = (
+                    f"[review-cli] brainstorm aborted: round {round_no} produced no usable output "
+                    f"({usable}/{len(round_results)} panel seats answered).\n"
+                    "  most/all backends are dead or credential-less (empty output, an error, or an "
+                    "'unavailable' notice) — continuing would only print a hollow synthesis.\n"
+                    f"  panel: {', '.join(panel)}\n"
+                    "  fix: check the backends are reachable (keys present, CLIs installed, provider "
+                    "not suspended), then re-run — or pass a working panel with `-m`."
+                )
+                print(msg, file=sys.stderr, flush=True)
+                # Correct the run-stats tally: run_panel auto-counted each rc=0 seat as ok, but a
+                # dead seat (rc=0, empty/"unavailable") is not a real verdict — reclassify it to
+                # fail so the recorded run is honest and doesn't poison the ETA average (codex P2).
+                recount_round_by_usability(round_results)
+                # Diagnosis-only: log the dead round WITHOUT a structural round sentinel, so the
+                # session parser does NOT count it as a completed round (a resume re-runs it).
+                _disc(f"\n# Round {round_no} (ABORTED: dead panel — "
+                      f"{usable}/{len(round_results)} seats usable)\n{round_text}\n")
+                # Surface the partial output we DID gather so a human sees the dead seats.
+                if out:
+                    print("\n\n".join(out))
+                if disc is not None:
+                    print(f"[review-cli] partial discussion log: {disc_path}", file=sys.stderr, flush=True)
+                return EXIT_DEAD_PANEL
+
+            transcript_blocks.append(f"## Round {round_no}\n{round_text}")
             # The nonce'd `<!-- review:round N nonce=... -->` sentinel on its own line right
             # after the heading is the UNFORGEABLE structural marker the session parser keys
             # on: the personas never see the per-run nonce, so a model echoing `# Round 9`
