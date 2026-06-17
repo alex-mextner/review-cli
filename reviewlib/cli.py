@@ -41,6 +41,7 @@ from .modes.contract import ModeContext, ModeSpec
 from .modes.just_ask import mode_just_ask
 from .modes.quorum import mode_quorum
 from .modes.registry import (
+    REMOVED_FLAGS,
     REMOVED_MODE_FLAGS,
     brainstorm_pool,
     default_mode,
@@ -850,15 +851,22 @@ def _build_mode_parser(mode: ModeSpec, *, top_level: bool = False) -> argparse.A
 
 
 def _reject_removed_flags(argv: list[str]) -> int | None:
-    """The mode flags (`--brainstorm`/`--quorum`/`--just-ask`) were REPLACED by the
-    subcommands (§2). Reject them with a helpful "use the subcommand" message instead of
-    silently mis-parsing. Returns an exit code (2) when a removed flag is present, else
-    None. Scans only up to the first `--` (end-of-options), so the same string appearing
-    as a positional value (e.g. a quote that literally contains '--quorum') is untouched."""
+    """Reject flags this redesign REMOVED with a clear, actionable error instead of letting
+    them silently mis-parse (mode flags) or hit argparse's opaque `unrecognized arguments`
+    (the no-replacement flags). Two classes:
+
+      * REMOVED_MODE_FLAGS (`--brainstorm`/`--quorum`/`--just-ask`) → "use the subcommand";
+      * REMOVED_FLAGS (`--mcp`/`--ln`) → a 3-part what/why/how-to-fix error (the `--mcp`
+        case is the dead review-MCP entrypoint a stale `~/.claude/mcp/mcp.json` still spawns;
+        the error tells the user to drop that registration — see structured-exit-codes).
+
+    Returns the stable usage exit code (2) when a removed flag is present, else None. Scans
+    only up to the first `--` (end-of-options), so the same string appearing as a positional
+    value (e.g. a quote that literally contains '--quorum') is untouched."""
     for tok in argv:
         if tok == "--":
             break
-        # `--brainstorm=foo` form too.
+        # `--brainstorm=foo` / `--mcp=foo` form too.
         bare = tok.split("=", 1)[0]
         sub = REMOVED_MODE_FLAGS.get(bare)
         if sub is not None:
@@ -867,6 +875,15 @@ def _reject_removed_flags(argv: list[str]) -> int | None:
                 f"  use:  review {sub} \"<your text>\" [options]\n"
                 f"  (modes are subcommands now: brainstorm / just-ask / quorum; "
                 f"run `review --help`)",
+                file=sys.stderr, flush=True,
+            )
+            return 2
+        removed = REMOVED_FLAGS.get(bare)
+        if removed is not None:
+            print(
+                f"review: `{bare}` was removed and is no longer accepted.\n"
+                f"  why:  {removed.reason}\n"
+                f"  fix:  {removed.fix}",
                 file=sys.stderr, flush=True,
             )
             return 2
