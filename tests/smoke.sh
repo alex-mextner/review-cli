@@ -87,21 +87,36 @@ bin/review just-ask -C "$NONGIT_SMOKE" --help | grep -q "the question to ask"
 bin/review -C "$NONGIT_SMOKE" --list-defaults | grep -q codex
 
 # Help must show ACTUAL defaults (ROADMAP "Help must show ACTUAL defaults — esp. --model"):
-# --model names the effective default (the active board when no -m/config), --moderator the
-# auto-pick chain, and the numeric flags their concrete defaults.
-bin/review --help | grep -q "active reviewer board"            # --model default
-bin/review --help | grep -q "claude:claude-opus-4-8"           # --moderator auto-pick chain
-bin/review --help | grep -q "default 4"                        # --pool
-bin/review --help | grep -q "default 60"                       # --vision-timeout
+# --model names the effective default (the active board when no -m/config) on the GLOBAL
+# help; --moderator (scoped to quorum/brainstorm) names the auto-pick chain on THAT
+# subcommand's help; the numeric flags show their concrete defaults on the right surface.
+bin/review --help | grep -q "active reviewer board"            # --model default (global)
+bin/review quorum --help | grep -q "claude:claude-opus-4-8"    # --moderator auto-pick chain (panel mode)
+bin/review --help | grep -q "default 4"                        # --pool (global)
+bin/review diff --help | grep -q "default 60"                  # --vision-timeout (visual, on the subcommand)
 python3 tests/test_help_defaults.py
 echo "help-defaults tests OK"
 
-# Stage 1: the composable --visual flag and its core sub-flags must appear in help.
-bin/review --help | grep -q -- "--visual"
-bin/review --help | grep -q -- "--no-ai"
-bin/review --help | grep -q -- "--strict"
-# Stage 2a: the local pre-classifier toggle must appear in help.
-bin/review --help | grep -q -- "--no-local-model"
+# Subcommand-only options belong in the SUBCOMMAND help, not the global list (ROADMAP).
+# The composable --visual feature flags and their companions live on `review <mode> --help`
+# (they ride any subcommand), NOT on the top-level `review --help`.
+bin/review diff --help | grep -q -- "--visual"
+bin/review diff --help | grep -q -- "--no-ai"
+bin/review diff --help | grep -q -- "--strict"
+bin/review diff --help | grep -q -- "--no-local-model"        # Stage-2a local pre-classifier toggle
+bin/review diff --help | grep -q -- "--vision-timeout"
+# …and they must NOT appear in the GLOBAL top-level help (option list scoped to truly-global).
+# Strip the subcommand-summary epilog first (`brainstorm  …(composable with --diff/--staged…)`
+# legitimately names those flags in prose), then assert no visual/mode-only flag is an OPTION.
+top_opts="$(bin/review --help | sed -n '/^options:/,/^subcommands:/p')"
+! echo "$top_opts" | grep -qE -- "--visual|--no-ai|--strict|--no-local-model|--vision-timeout|--before|--intent|--expect|--check|--json|--project"
+! echo "$top_opts" | grep -qE -- "--prompt|--moderator"        # mode-only opts off the global list too
+# --prompt is the diff review's; --moderator steers quorum/brainstorm — each on its own help.
+bin/review diff --help | grep -q -- "--prompt"
+! bin/review just-ask --help | grep -q -- "--prompt"
+! bin/review just-ask --help | grep -q -- "--moderator"
+bin/review quorum --help | grep -q -- "--moderator"
+bin/review brainstorm --help | grep -q -- "--moderator"
 
 # Reviewer board (HYP-741 / failover pool): the board flags must appear in help, and
 # --show-board must list the out-of-the-box 8-seat PRIORITY-ordered DEFAULT_BOARD (no

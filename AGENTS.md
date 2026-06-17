@@ -40,6 +40,17 @@ a fan-out mode — it is wired in `cli._dispatch` like `dashboard` and its logic
 lib (`reviewlib/sessions.py`); it deliberately does NOT register a `ModeSpec`, so it never
 collides with the mode registry.
 
+### Option scoping — global vs subcommand
+
+Flags are SCOPED so `review --help` (the top-level overview) lists only TRULY-GLOBAL
+options (`-m/--model`, `-C`, `-o`, `--timeout`, `--list-defaults`, `--show-board`, `--pool`)
++ the subcommand list. Subcommand- and feature-specific flags live on `review <mode> --help`:
+the composable `--visual` group (rides any subcommand), `--prompt` (the diff review),
+`--moderator` (quorum/brainstorm), `--rounds`/`--max-rounds` (brainstorm). In `cli.py`:
+`_add_global_options` (top-level + every mode) vs `_add_mode_options` (= global + diff-source
++ the mode-relevant flags + the `_add_visual_options` group + the mode's own positional).
+When you add a flag, put it where it belongs — do NOT pile it onto the global list.
+
 ## Architecture: `lib | cli | mcp`
 
 - **lib** — `reviewlib/` is the engine (`panel.py`, `backends.py`, `config.py`,

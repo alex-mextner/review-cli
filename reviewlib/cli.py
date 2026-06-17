@@ -696,7 +696,11 @@ def main(argv: list[str] | None = None) -> int:
     # pre-existing `-o` target (codex P1/P2). Reject it here, before the tee is armed, so no
     # write happens. Both are pure argv pre-scans; the later calls in `_dispatch` are then
     # harmless no-ops.
-    for _reject in (_reject_removed_flags, _reject_removed_subcommand):
+    for _reject in (
+        _reject_removed_flags,
+        _reject_removed_subcommand,
+        _reject_subcommand_only_flag_without_verb,
+    ):
         rejected = _reject(raw)
         if rejected is not None:
             return rejected
@@ -821,15 +825,15 @@ def _moderator_default_help() -> str:
     return " -> ".join(MODERATOR_CANDIDATES).replace("%", "%%")
 
 
-def _add_shared_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
-    """Add the SHARED options every mode subcommand understands. `--list-defaults` /
-    `--show-board` / `--pool` are review/board meta-flags that stay available on the
-    default (review) parser; the panel/brainstorm/visual-only flags are available to the
-    relevant modes too (a flag a mode ignores is harmless). Mode-UNIQUE arguments (the
-    positional question/topic) are added by the mode's own `add_arguments`.
+def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
+    """Add the TRULY-GLOBAL options — the only ones the top-level `review --help` should
+    list (ROADMAP "Subcommand-only options belong in the subcommand help, not the global
+    list"): `-m/--model`, `-C/--cwd`, `-o/--output`, `--timeout`, `--list-defaults`,
+    `--show-board`, `--pool`. These apply to every path (the meta flags + every mode), so
+    they sit on the top-level parser AND every mode parser.
 
-    Configurable options show their EFFECTIVE default value (ROADMAP: help must show ACTUAL
-    defaults), resolving the config cascade where relevant (`--model` / `--moderator`)."""
+    Configurable options show their EFFECTIVE default value (ROADMAP "Help must show ACTUAL
+    defaults"), resolving the config cascade + the mode where relevant (`--model`)."""
     parser.add_argument(
         "-m", "--model", action="append", default=[],
         help=f"model/backend to run; repeat or comma-separate (default: {_model_default_help(mode)})",
@@ -843,13 +847,6 @@ def _add_shared_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             "which fails under zsh noclobber."
         ),
     )
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="review prompt (review mode)")
-    # --diff is an explicit, composable alias for the working-tree diff. It is the
-    # DEFAULT for the review mode (which always reviews the diff) and an OPTIONAL
-    # grounding source for brainstorm — `review brainstorm "…" --diff` reads the
-    # working-tree diff as context. --staged is its staged counterpart.
-    parser.add_argument("--diff", action="store_true", help="use the working-tree diff (default for review; optional grounding for brainstorm)")
-    parser.add_argument("--staged", action="store_true", help="use the staged diff (git diff --cached) instead of the working-tree diff")
     parser.add_argument(
         "--timeout", type=int, default=None,
         help="per-call timeout seconds (default 1200 for review, 240 for panel modes)",
@@ -864,29 +861,120 @@ def _add_shared_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             "never off — --pool only sizes it. N<=0 means all seats."
         ),
     )
-    parser.add_argument(
-        "--moderator", default=None,
-        help=f"moderator backend for quorum / brainstorm (default: auto-pick, first available of {_moderator_default_help()})",
+
+
+def _add_visual_options(parser: argparse.ArgumentParser) -> None:
+    """Add the composable `--visual` feature flags as their own argument GROUP. These are
+    SUBCOMMAND-scoped, NOT global (ROADMAP): `--visual` rides any subcommand, so they live
+    on every MODE parser but must NOT clutter the top-level `review --help`. Grouping them
+    makes `review <mode> --help` render them under a clear "visual verification" heading."""
+    group = parser.add_argument_group(
+        "visual verification (the composable --visual flag; rides any subcommand)"
     )
-    # --rounds / --max-rounds are brainstorm-only and added by the brainstorm mode's own
-    # add_arguments (so `review just-ask --rounds 5` correctly errors). They are still in
-    # _VALUE_TAKING_OPTS so the mode-agnostic `-o` pre-scan treats them as value-taking.
-    # --visual is a COMPOSABLE flag, NOT a mode: it rides any subcommand (diff /
-    # brainstorm / just-ask / quorum). On `review diff --visual <img>` with NO diff present
-    # it runs the standalone verdict pipeline (§3); with a diff it is the companion review.
-    parser.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; rides any subcommand (e.g. `review diff --visual`; standalone verdict pipeline when no diff)")
-    parser.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
-    parser.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
-    parser.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
-    parser.add_argument("--check", action="append", default=[], metavar="NAME", help="force-activate a visual module by name (repeatable)")
-    parser.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
-    parser.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
-    parser.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
-    parser.add_argument("--no-local-model", action="store_true", help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)")
-    parser.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
-    parser.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
-    if mode is not None and mode.add_arguments is not None:
+    group.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; rides any subcommand (e.g. `review diff --visual`; standalone verdict pipeline when no diff)")
+    group.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
+    group.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
+    group.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
+    group.add_argument("--check", action="append", default=[], metavar="NAME", help="force-activate a visual module by name (repeatable)")
+    group.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
+    group.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
+    group.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
+    group.add_argument("--no-local-model", action="store_true", help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)")
+    group.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
+    group.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
+
+
+def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> None:
+    """Add the full surface for an EXPLICIT `review <mode> …` subcommand parser: the global
+    options, the diff-source flags, the mode-relevant flags (`--prompt` for the diff review,
+    `--moderator` for the panel modes), the composable visual group, and the mode's own
+    UNIQUE arguments (its positional question/topic, via `add_arguments`).
+
+    `--diff`/`--staged` and `--prompt`/`--moderator` are scoped to the modes that use them
+    (ROADMAP): `--prompt` is the diff review's prompt; `--moderator` steers quorum/brainstorm.
+    They are harmless if a mode ignores them, but scoping keeps each `review <mode> --help`
+    showing only what that mode actually reads."""
+    _add_global_options(parser, mode=mode)
+
+    # --diff / --staged select the diff source. They matter to the diff review (its diff is
+    # required) and brainstorm/panel grounding; keep them on every mode parser (a mode that
+    # ignores one is harmless) but OFF the top-level overview.
+    parser.add_argument("--diff", action="store_true", help="use the working-tree diff (default for the diff review; optional grounding for brainstorm)")
+    parser.add_argument("--staged", action="store_true", help="use the staged diff (git diff --cached) instead of the working-tree diff")
+
+    # --prompt is the DIFF REVIEW's prompt override only.
+    if mode.name == "review":
+        parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="override the diff-review prompt")
+    # --moderator steers the quorum / brainstorm synthesis only.
+    if mode.name in ("quorum", "brainstorm"):
+        parser.add_argument(
+            "--moderator", default=None,
+            help=f"moderator backend (default: auto-pick, first available of {_moderator_default_help()})",
+        )
+
+    # The composable --visual feature rides any subcommand, so its group is on every mode
+    # parser (but never the top-level overview). --rounds / --max-rounds are brainstorm-only
+    # and added by the brainstorm mode's own add_arguments; they stay in _VALUE_TAKING_OPTS
+    # so the mode-agnostic `-o` pre-scan treats them as value-taking.
+    _add_visual_options(parser)
+
+    if mode.add_arguments is not None:
         mode.add_arguments(parser)
+
+
+# Flags that live ONLY on a subcommand parser (NOT the global top-level parser), per the
+# option-scoping. When one of these LEADS a no-subcommand invocation (e.g. the old pre-commit
+# `review --staged`, or `review --visual shot.png`), the top-level parser would reject it with
+# argparse's opaque "unrecognized arguments", losing the `review diff` migration pointer. The
+# pre-parse guard below catches them and emits the friendly pointer instead.
+_SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
+    "--diff", "--staged", "--prompt", "--moderator", "--rounds", "--max-rounds",
+    "--visual", "--before", "--intent", "--expect", "--check", "--json", "--strict",
+    "--no-ai", "--no-local-model", "--vision-timeout", "--project",
+})
+
+# The BARE management subcommands `_dispatch` handles directly (NOT mode verbs in
+# known_subcommands(), and NOT the diff review): they have their OWN flag parsers (e.g.
+# `review sessions -s <id> --diff --moderator …`). The verb-less migration guard must leave
+# them alone — a `--diff`/`--moderator` after `sessions` belongs to that subparser, not a
+# missing `review diff`.
+_BARE_SUBCOMMANDS: frozenset[str] = frozenset({
+    "install-skill", "install-commit-hook", "dashboard", "sessions",
+    "trust-module", "register-module", "spec-web",
+})
+
+
+def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
+    """If a SUBCOMMAND-scoped flag appears with NO recognized subcommand, print the friendly
+    `review diff` migration pointer + the usage code (2), instead of letting argparse reject
+    it with an opaque "unrecognized arguments" that drops the pointer (codex review). Scans
+    up to the first `--` (end-of-options), matching the `=value` form too. Returns 2 when such
+    a flag leads a verb-less invocation, else None (a purely-global `review -C <repo>` falls
+    through to the help pointer; a recognized mode OR bare management subcommand is left
+    alone — those own their flags).
+
+    Self-contained (checks the no-subcommand condition itself) so it is safe to call in
+    `main()` BEFORE the `-o` tee is armed — a usage error must NOT write/truncate the `-o`
+    file (like the removed-flags guards)."""
+    if argv and not argv[0].startswith("-") and (
+        argv[0] in known_subcommands() or argv[0] in _BARE_SUBCOMMANDS
+    ):
+        return None  # a recognized subcommand (mode or management) owns these flags
+    for tok in argv:
+        if tok == "--":
+            break
+        if tok.split("=", 1)[0] in _SUBCOMMAND_ONLY_FLAGS:
+            print(
+                "review: no subcommand given. The diff review is now `review diff` "
+                "(a bare `review` no longer runs one), and that flag belongs to a "
+                "subcommand.\n"
+                "  use:  review diff [options]   (e.g. `review diff --staged`, "
+                "`review diff --visual shot.png`)\n"
+                "  (run `review --help` for all subcommands)",
+                file=sys.stderr, flush=True,
+            )
+            return 2
+    return None
 
 
 def _subcommand_epilog() -> str:
@@ -918,18 +1006,24 @@ def _build_top_level_parser() -> argparse.ArgumentParser:
         epilog=_subcommand_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    _add_shared_options(parser, mode=None)
+    # Only the truly-global options — NOT the mode/visual-only flags (ROADMAP: those belong
+    # in the subcommand help, not the global list). The top-level parser only ever serves the
+    # meta flags (--list-defaults / --show-board / --help) + the help fall-through; it never
+    # dispatches a review, so it does not need --prompt / --diff / --moderator / the visual
+    # group.
+    _add_global_options(parser, mode=None)
     return parser
 
 
 def _build_mode_parser(mode: ModeSpec) -> argparse.ArgumentParser:
     """Build the argparse surface for an EXPLICIT `review <mode> …` subcommand (its prog
-    is `review <subcommand>` and it carries the mode's own positional/flags)."""
+    is `review <subcommand>` and it carries the global options + the mode-relevant flags +
+    the composable visual group + the mode's own positional)."""
     parser = argparse.ArgumentParser(
         prog=f"review {mode.subcommand}", description=mode.summary,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    _add_shared_options(parser, mode=mode)
+    _add_mode_options(parser, mode=mode)
     return parser
 
 
@@ -1066,8 +1160,16 @@ def _dispatch(argv: list[str] | None = None) -> int:
         rest = argv[1:]
         parser = _build_mode_parser(mode)
     else:
-        # No recognized subcommand. Parse the meta flags off the top-level parser; if none
-        # short-circuit below, fall through to the HELP path (no implicit diff review).
+        # No recognized subcommand. A SUBCOMMAND-scoped flag here (e.g. the old pre-commit
+        # `review --staged`, or `review --visual …`) would hit argparse's opaque
+        # "unrecognized arguments" on the top-level parser — losing the `review diff`
+        # migration pointer. Catch those leading mode/visual-only flags BEFORE argparse and
+        # emit the friendly pointer (the friendly path for GLOBAL flags without a verb is the
+        # help fall-through below). Then parse the meta flags off the top-level parser; if
+        # none short-circuit, fall through to the HELP path (no implicit diff review).
+        rc = _reject_subcommand_only_flag_without_verb(argv)
+        if rc is not None:
+            return rc
         mode = diff_mode()  # only used by the meta-flag handlers (--list-defaults / --show-board)
         rest = argv
         parser = _build_top_level_parser()
@@ -1361,7 +1463,12 @@ def _dispatch(argv: list[str] | None = None) -> int:
     def _with_visual_text(text: str) -> str:
         return _with_visual(text, visual_ctx)
 
-    moderators = pick_moderators(args.moderator, models) if panel_mode else []
+    # --moderator is scoped to the modes that USE a moderator (quorum / brainstorm); a flat
+    # panel like just-ask has no `--moderator` on its parser, so read it defensively. A mode
+    # with no moderator flag -> None -> pick_moderators falls back to the auto-pick chain
+    # (harmless: just-ask ignores the resolved moderators anyway).
+    moderator_arg = getattr(args, "moderator", None)
+    moderators = pick_moderators(moderator_arg, models) if panel_mode else []
     ctx = ModeContext(
         args=args, models=models, diff=diff, cwd=cwd, timeout=timeout,
         with_visual=_with_visual_text, visual_ctx=visual_ctx, moderators=moderators,

@@ -361,6 +361,23 @@ def test_bare_review_help_with_output_flag_does_not_truncate_file():
         assert target.read_text(encoding="utf-8") == "KEEP ME\n", target.read_text()
 
 
+def test_subcommand_only_flag_without_verb_with_output_does_not_truncate_file():
+    # DATA-LOSS GUARD (codex review): `review --staged -o important.md` / `review --visual
+    # shot.png -o important.md` (a subcommand-scoped flag, no verb) is rejected with the
+    # friendly `review diff` pointer BEFORE the `-o` tee is armed (like the removed-flag
+    # guards) — it must leave the pre-existing file untouched, not clobber it with empty
+    # captured stdout.
+    for argv_prefix in (["--staged"], ["--visual", "shot.png"]):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "important.md"
+            target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main([*argv_prefix, "-o", str(target)])
+            assert rc == 2, (argv_prefix, rc)
+            assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", (
+                argv_prefix, target.read_text())
+
+
 def test_value_taking_opts_are_all_value_taking():
     # Finding #2 guard: every entry in _VALUE_TAKING_OPTS must REALLY consume a value in
     # the real parser, else the pre-scan would skip a non-value token (and `-o` after a
@@ -378,11 +395,14 @@ def test_value_taking_opts_are_all_value_taking():
 
     # Each listed opt errors "expected one argument" when given no value. We pass a
     # leading no-op value-taking flag with a value so the parser reaches the bare opt
-    # without triggering a real review (it errors during parse). Brainstorm-only flags
-    # (--rounds/--max-rounds) live ONLY on the `brainstorm` subcommand parser now, so
-    # route them through that subcommand (with a topic) to reach a parser that has them.
+    # without triggering a real review (it errors during parse). Each opt must be routed
+    # through a SUBCOMMAND whose parser actually DEFINES it — the option-scoping (ROADMAP
+    # "subcommand-only options belong in the subcommand help") means the top-level parser no
+    # longer carries the mode/visual-only flags, so a top-level `--prompt …` would now
+    # error "unrecognized arguments", not "expected one argument".
     brainstorm_only = {"--rounds", "--max-rounds"}
-    specweb_only = {"--spec"}  # lives ONLY on the `spec-web reply` subparser
+    specweb_only = {"--spec"}        # lives ONLY on the `spec-web reply` subparser
+    moderator_only = {"--moderator"}  # lives on quorum / brainstorm, NOT the diff review
     for opt in sorted(_VALUE_TAKING_OPTS):
         if opt in ("-o", "--output"):
             continue  # handled by the pre-scan, covered by other tests
@@ -391,8 +411,13 @@ def test_value_taking_opts_are_all_value_taking():
         elif opt in specweb_only:
             # route through the subcommand whose parser actually defines --spec
             argv = ["spec-web", "reply", "cid", "ans", opt]
+        elif opt in moderator_only:
+            argv = ["quorum", "q", opt]  # --moderator is a quorum/brainstorm flag
         else:
-            argv = ["--prompt", "p", opt]  # bare opt at the end -> needs a value
+            # Everything else (global + the review-only --prompt + the visual group) lives
+            # on the `diff` subcommand parser. Lead with --timeout (global, value-taking) so
+            # the parser reaches the bare opt at the end without running a review.
+            argv = ["diff", "--timeout", "100", opt]
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             try:

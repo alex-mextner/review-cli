@@ -158,7 +158,21 @@ def test_flags_without_subcommand_print_help_and_point_at_diff():
 
 
 def test_staged_without_subcommand_points_at_diff():
+    """`review --staged` (no verb) is the old pre-commit muscle-memory command. `--staged`
+    is scoped to the subcommands now, so a pre-parse guard catches it and emits the friendly
+    `review diff` pointer (exit 2, no mode run) — NOT argparse's opaque "unrecognized
+    arguments", which would drop the migration guidance (codex review)."""
     cap = _run(["--staged", "-C", str(REPO_ROOT)], diff="diff --git a/s b/s\n+z\n")
+    assert cap["mode"] is None, cap
+    assert cap["rc"] == 2, cap
+    assert "review diff" in cap["stderr"], cap["stderr"]
+    assert "unrecognized arguments" not in cap["stderr"], cap["stderr"]
+
+
+def test_visual_without_subcommand_points_at_diff():
+    """`review --visual shot.png` (no verb) likewise points at `review diff --visual`, not
+    an opaque argparse error — the visual flags are subcommand-scoped now."""
+    cap = _run(["--visual", "shot.png", "-C", str(REPO_ROOT)])
     assert cap["mode"] is None, cap
     assert cap["rc"] == 2, cap
     assert "review diff" in cap["stderr"], cap["stderr"]

@@ -17,11 +17,9 @@ so it never reads the developer's real config.
 """
 from __future__ import annotations
 
-import io
 import os
 import sys
 import tempfile
-from contextlib import redirect_stdout
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -111,18 +109,21 @@ def test_brainstorm_model_default_reflects_brainstorm_models():
 
 
 def test_moderator_help_shows_the_autopick_chain():
-    text = _top_level_help()
+    # --moderator is scoped to the panel modes (quorum / brainstorm) now, so its help lives
+    # on those subcommands — assert the concrete auto-pick chain there, not the bare phrasing.
+    text = _mode_help("quorum")
     assert "--moderator" in text
-    # The concrete priority chain, not a vague "moderator backend".
     assert "claude:claude-opus-4-8" in text, text
     assert "codex" in text and "gemini" in text, text
 
 
 def test_numeric_defaults_are_concrete():
-    text = _top_level_help()
-    assert "default 4" in text, text          # --pool
-    assert "1200" in text and "240" in text, text  # --timeout (review / panel)
-    assert "default 60" in text, text          # --vision-timeout
+    # --pool / --timeout are global (top-level); --vision-timeout is a visual flag scoped to
+    # the subcommands. Assert each shows its concrete numeric default on the right surface.
+    top = _top_level_help()
+    assert "default 4" in top, top              # --pool
+    assert "1200" in top and "240" in top, top  # --timeout (review / panel)
+    assert "default 60" in _mode_help("diff"), _mode_help("diff")  # --vision-timeout (visual)
 
 
 def test_model_help_does_not_crash_on_unreadable_config():
@@ -158,6 +159,87 @@ def test_model_help_does_not_crash_on_percent_in_config_model_id():
         assert cli._build_top_level_parser().format_help()
     finally:
         cli.load_config = saved
+
+
+def _option_strings(parser_help: str) -> str:
+    """The OPTIONS section of a help text (between 'options:' and the next top-level
+    heading / EOF), whitespace-normalized — so a flag named only in the subcommand epilog
+    or a description doesn't count as 'an option on this parser'."""
+    norm = parser_help
+    start = norm.index("options:")
+    # Stop at the subcommands epilog (top-level) if present.
+    end = norm.find("\nsubcommands:", start)
+    section = norm[start:] if end == -1 else norm[start:end]
+    return section
+
+
+# --- Subcommand-only options belong in the SUBCOMMAND help, not the global list (ROADMAP). -
+VISUAL_FLAGS = ("--visual", "--before", "--intent", "--expect", "--check", "--json",
+                "--strict", "--no-ai", "--no-local-model", "--vision-timeout", "--project")
+
+
+def test_visual_flags_absent_from_global_help_present_on_subcommands():
+    opts = _option_strings(_top_level_help())
+    for flag in VISUAL_FLAGS:
+        assert flag not in opts, (flag, "leaked into the GLOBAL option list")
+    # …and present on every mode parser (the --visual feature rides any subcommand).
+    for sub in ("diff", "brainstorm", "just-ask", "quorum"):
+        mode_opts = _option_strings(_mode_help(sub))
+        for flag in VISUAL_FLAGS:
+            assert flag in mode_opts, (sub, flag, "missing from the subcommand help")
+
+
+def test_prompt_is_scoped_to_the_diff_review():
+    assert "--prompt" not in _option_strings(_top_level_help()), "prompt leaked to global"
+    assert "--prompt" in _option_strings(_mode_help("diff")), "diff review needs --prompt"
+    for sub in ("just-ask", "quorum", "brainstorm"):
+        assert "--prompt" not in _option_strings(_mode_help(sub)), (sub, "must not have --prompt")
+
+
+def test_moderator_is_scoped_to_panel_modes():
+    assert "--moderator" not in _option_strings(_top_level_help()), "moderator leaked to global"
+    for sub in ("quorum", "brainstorm"):
+        assert "--moderator" in _option_strings(_mode_help(sub)), (sub, "panel mode needs --moderator")
+    for sub in ("diff", "just-ask"):
+        assert "--moderator" not in _option_strings(_mode_help(sub)), (sub, "must not have --moderator")
+
+
+def test_subcommand_only_flags_set_covers_every_mode_only_flag():
+    """`_SUBCOMMAND_ONLY_FLAGS` (the pre-parse guard's list) must stay COMPLETE: every long
+    option that exists on a mode parser but NOT on the top-level parser must be in the set —
+    else a verb-less `review --that-flag` would hit argparse's opaque "unrecognized
+    arguments" instead of the friendly `review diff` pointer (gemini review). This guards
+    against a future mode-only flag being added without updating the set."""
+    from reviewlib.modes.registry import iter_modes
+
+    def _long_opts(parser) -> set[str]:
+        opts: set[str] = set()
+        for action in parser._actions:  # noqa: SLF001 — introspection is the point
+            for s in action.option_strings:
+                if s.startswith("--"):
+                    opts.add(s)
+        return opts
+
+    global_opts = _long_opts(cli._build_top_level_parser())
+    mode_only: set[str] = set()
+    for mode in iter_modes():
+        mode_only |= _long_opts(cli._build_mode_parser(mode)) - global_opts
+    mode_only.discard("--help")  # argparse's own, present everywhere
+    missing = mode_only - cli._SUBCOMMAND_ONLY_FLAGS
+    assert not missing, (
+        f"these mode-only flags are missing from _SUBCOMMAND_ONLY_FLAGS (the verb-less guard "
+        f"would drop the friendly pointer for them): {sorted(missing)}"
+    )
+
+
+def test_global_help_lists_only_truly_global_options():
+    opts = _option_strings(_top_level_help())
+    for flag in ("-m, --model", "-C, --cwd", "-o, --output", "--timeout",
+                 "--list-defaults", "--show-board", "--pool"):
+        assert flag in opts, (flag, "missing from the global option list")
+    # The mode/diff-source-only flags must NOT be global.
+    for flag in ("--diff", "--staged", "--prompt", "--moderator"):
+        assert flag not in opts, (flag, "leaked into the GLOBAL option list")
 
 
 def test_help_end_to_end_via_cli_shows_model_default():

@@ -340,7 +340,7 @@ small local-only JSON endpoints (`GET /api/runs|stats|runs/<id>`, `POST .../feed
 
 ---
 
-## `review --visual` — visual verification
+## `review diff --visual` — visual verification
 
 **Give it a screenshot; it judges keep / rollback / repair.** `--visual` is image-only
 visual verification: pixels in → verdict out. There is **no DOM, no page, no capture** —
@@ -364,10 +364,10 @@ self-decides and the local model never overrides it.
 
 ![review --visual cases — REPORTS-unstyled (top) vs no-report-styled (bottom)](docs/assets/visual-cases.png)
 
-*What `review --visual <image>` reports across real renders. Top row: unstyled / blank / FOUC /
+*What `review diff --visual <image>` reports across real renders. Top row: unstyled / blank / FOUC /
 error-overlay renders the detector flags (each one would block a `tg --photo` send). Bottom row:
 properly-styled renders it stays quiet on. (The grid's title art is the tool's old standalone
-name "styleprobe" in older copies — it is the `review --visual` detector.)*
+name "styleprobe" in older copies — it is the `--visual` detector.)*
 
 ### Composable flag, not a mode
 
@@ -671,28 +671,33 @@ sessions            List / resume brainstorm sessions (-a all, -s <id> resume).
 spec-web SPEC.md    Interactive web reviewer for a markdown spec.
 install-skill | install-commit-hook | register-module
 
-SHARED FLAGS
+GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)
 -m / --model        Backend to run; repeat or comma-separate. Default (no -m) is mode-aware:
                     `review diff` runs the active reviewer board (or your config `models:`);
                     brainstorm uses `brainstorm_models:`, just-ask/quorum the defaults.
                     Each subcommand's `--help` shows its own effective default.
---diff              Use the working-tree diff (default for review; optional grounding for brainstorm).
---staged            Use the staged diff (git diff --cached) instead of the working-tree diff.
---visual IMAGE      Composable flag (NOT a mode): attach/verify a render; rides any subcommand.
+-C / --cwd DIR      Run against a different repository directory.
+-o / --output FILE  Write the result to FILE via Python (creates parent dirs, always
+                    overwrites) while still printing to stdout. Use this instead of
+                    `review … > FILE`, which fails silently under zsh noclobber.
 --timeout N         Per-call timeout in seconds (default 1200 for review, 240 for panel modes).
---moderator M       Override the auto-selected moderator for quorum / brainstorm.
---rounds N          Minimum brainstorm rounds before STOP is allowed (default 5).
---max-rounds N      Hard cap on brainstorm rounds (default 8).
 --list-defaults     Print effective default backends and exit.
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
 --pool N            How many of the board's seats to run (default 4); the first N seats run,
                     the rest are kept in reserve. The board is never off — --pool only sizes
                     it. N<=0 (e.g. --pool 0) runs all seats.
---prompt TEXT       Override the default review prompt.
--C / --cwd DIR      Run against a different repository directory.
--o / --output FILE  Write the result to FILE via Python (creates parent dirs, always
-                    overwrites) while still printing to stdout. Use this instead of
-                    `review … > FILE`, which fails silently under zsh noclobber.
+
+SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
+--diff / --staged   Diff source: working-tree (--diff) or staged (--staged). On the diff
+                    review the diff is required; optional grounding for brainstorm.
+--prompt TEXT       (review diff) Override the diff-review prompt.
+--moderator M       (quorum / brainstorm) Override the auto-picked moderator.
+--rounds N          (brainstorm) Minimum rounds before STOP is allowed (default 5).
+--max-rounds N      (brainstorm) Hard cap on rounds (default 8).
+--visual IMAGE …    Composable visual-verification group (NOT a mode): attach/verify a
+                    render; rides any subcommand (e.g. `review diff --visual shot.png`).
+                    Companions: --before/--intent/--expect/--check/--json/--strict/--no-ai/
+                    --no-local-model/--vision-timeout/--project. See `review <mode> --help`.
 ```
 
 > **Modes are subcommands, not flags.** `--brainstorm` / `--quorum` / `--just-ask` were
