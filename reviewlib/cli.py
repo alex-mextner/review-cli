@@ -23,9 +23,11 @@ from . import backends
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
 from .config import (
+    CONFIG_PATH,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
     DEFAULT_PROMPT,
+    MODERATOR_CANDIDATES,
     PANEL_TIMEOUT_DEFAULT,
     BoardConfigError,
     _expand_alias,
@@ -43,8 +45,9 @@ from .modes.quorum import mode_quorum
 from .modes.registry import (
     REMOVED_FLAGS,
     REMOVED_MODE_FLAGS,
+    REMOVED_SUBCOMMANDS,
     brainstorm_pool,
-    default_mode,
+    diff_mode,
     get_mode,
     iter_modes,
     known_subcommands,
@@ -115,7 +118,7 @@ def _fail_git_diff(cwd: Path, exc: Exception) -> int:
         f"[review-cli] could not read the git diff in {cwd}.\n"
         f"  git diff failed: {exc}\n"
         "  fix: check the repo is healthy (`git status`), or pipe a diff on stdin "
-        "(`git diff | review`).",
+        "(`git diff | review diff`).",
         file=sys.stderr, flush=True,
     )
     return EXIT_GIT_DIFF_FAILED
@@ -686,16 +689,22 @@ def main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else argv
     output_path, raw = _extract_output_path(list(raw))
 
-    # A REMOVED flag (--mcp/--ln, or a removed mode flag) is a USAGE error — it must behave
-    # like argparse's own usage errors w.r.t. `-o`: print the structured error and exit
-    # WITHOUT writing the `-o` file. Rejecting it INSIDE `_dispatch` only `return`s 2, which
-    # the tee path below treats as "the dispatch completed" and would persist the (empty)
-    # captured stdout — truncating a pre-existing `-o` target (codex P2). Reject it here,
-    # before the tee is armed, so no write happens. `_reject_removed_flags` is a pure argv
-    # pre-scan; the later call in `_dispatch` is then a harmless no-op.
-    rejected = _reject_removed_flags(raw)
-    if rejected is not None:
-        return rejected
+    # A REMOVED flag (--mcp/--ln, or a removed mode flag) OR the removed `review review`
+    # SUBCOMMAND verb is a USAGE error — it must behave like argparse's own usage errors
+    # w.r.t. `-o`: print the structured error and exit WITHOUT writing the `-o` file.
+    # Rejecting it INSIDE `_dispatch` only `return`s 2, which the tee path below treats as
+    # "the dispatch completed" and would persist the (empty) captured stdout — truncating a
+    # pre-existing `-o` target (codex P1/P2). Reject it here, before the tee is armed, so no
+    # write happens. Both are pure argv pre-scans; the later calls in `_dispatch` are then
+    # harmless no-ops.
+    for _reject in (
+        _reject_removed_flags,
+        _reject_removed_subcommand,
+        _reject_subcommand_only_flag_without_verb,
+    ):
+        rejected = _reject(raw)
+        if rejected is not None:
+            return rejected
 
     # The persistent SERVER subcommands stream until Ctrl-C — capturing/teeing their
     # output to a single `-o` file makes no sense (and the file would only be written
@@ -745,31 +754,91 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if write_error is not None else rc
 
 
-# A bare `review` (no recognized subcommand) defaults to the `review` diff-review mode
-# (§4) — the single most common invocation. We print a ONE-LINE migration hint to stderr
-# the first time per process, then run the diff review unchanged. Never a hard error.
-_DEFAULT_HINT_SHOWN = False
 
 
-def _hint_default_mode() -> None:
-    global _DEFAULT_HINT_SHOWN
-    if _DEFAULT_HINT_SHOWN:
-        return
-    _DEFAULT_HINT_SHOWN = True
-    print(
-        "tip: this is now `review review …`; modes are subcommands: "
-        "brainstorm / just-ask / quorum (run `review --help`).",
-        file=sys.stderr, flush=True,
+def _model_default_help(mode: ModeSpec | None) -> str:
+    """The EFFECTIVE `--model` default for THIS parser's mode, for `--help` (ROADMAP: help
+    must show ACTUAL defaults — esp `--model`). The default is MODE-AWARE because the
+    runtime selection differs per mode (only the diff review runs the board):
+
+      * diff review (mode.name == "review", and the top-level overview where mode is None):
+        a `models:` list in config.yaml -> those exact models, else the active reviewer
+        BOARD (run `review --show-board`).
+      * brainstorm: a `brainstorm_models:` list -> those, else `models:`, else the built-in
+        DEFAULT_MODELS — the board does NOT apply here.
+      * just-ask / quorum: a `models:` list -> those, else DEFAULT_MODELS.
+
+    Best-effort: any config read failure degrades to the built-in DEFAULT_MODELS phrasing
+    (never raises in --help)."""
+    try:
+        config = load_config()
+    except Exception:  # noqa: BLE001 — --help must never crash on a bad config
+        config = {}
+
+    def _fmt(models: list[str]) -> str:
+        shown = ", ".join(models[:4]) + (", …" if len(models) > 4 else "")
+        # This string is interpolated into an argparse `help=`, where `%` is formatting
+        # syntax — an un-escaped `%` in a config model id (e.g. `models: ["bad%model"]`)
+        # crashes `review --help` with "badly formed help string". Config values are
+        # untrusted input here, so escape `%` -> `%%` (codex review). The static phrasing
+        # below has no `%`, so escaping only the config-derived fragment is sufficient.
+        return shown.replace("%", "%%")
+
+    try:
+        config_models = _split_models(config.get("models") or [])
+    except Exception:  # noqa: BLE001
+        config_models = []
+    default_models = [_expand_alias(x) for x in DEFAULT_MODELS]
+
+    # brainstorm: brainstorm_models > models > DEFAULT_MODELS (no board).
+    if mode is not None and mode.name == "brainstorm":
+        try:
+            bs = _split_models(config.get("brainstorm_models") or [])
+        except Exception:  # noqa: BLE001
+            bs = []
+        if bs:
+            return f"your config.yaml brainstorm_models: {_fmt(bs)}"
+        if config_models:
+            return f"your config.yaml models: {_fmt(config_models)}"
+        return f"{_fmt(default_models)} (the built-in defaults)"
+
+    # just-ask / quorum: models > DEFAULT_MODELS (no board).
+    if mode is not None and mode.name not in ("review",):
+        if config_models:
+            return f"your config.yaml models: {_fmt(config_models)}"
+        return f"{_fmt(default_models)} (the built-in defaults)"
+
+    # diff review (and the top-level overview, mode is None): models > the active board.
+    if config_models:
+        return f"your config.yaml models: {_fmt(config_models)}"
+    return "the active reviewer board (run `review --show-board`; see `review help config`)"
+
+
+def _moderator_default_help() -> str:
+    """The EFFECTIVE auto-picked `--moderator` default, for `--help`. The moderator is
+    chosen from MODERATOR_CANDIDATES (opus -> codex -> gemini) filtered to availability at
+    run time; the help names that priority chain so the default is concrete, not vague.
+
+    Escape `%` -> `%%`: this is interpolated into an argparse `help=`, where `%` is
+    formatting syntax. The candidates are hardcoded today (no `%`), but escaping keeps the
+    same defensive guarantee as `_model_default_help` so a future `%`-bearing candidate id
+    can't crash `review --help` (gemini review)."""
+    return " -> ".join(MODERATOR_CANDIDATES).replace("%", "%%")
+
+
+def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
+    """Add the TRULY-GLOBAL options — the only ones the top-level `review --help` should
+    list (ROADMAP "Subcommand-only options belong in the subcommand help, not the global
+    list"): `-m/--model`, `-C/--cwd`, `-o/--output`, `--timeout`, `--list-defaults`,
+    `--show-board`, `--pool`. These apply to every path (the meta flags + every mode), so
+    they sit on the top-level parser AND every mode parser.
+
+    Configurable options show their EFFECTIVE default value (ROADMAP "Help must show ACTUAL
+    defaults"), resolving the config cascade + the mode where relevant (`--model`)."""
+    parser.add_argument(
+        "-m", "--model", action="append", default=[],
+        help=f"model/backend to run; repeat or comma-separate (default: {_model_default_help(mode)})",
     )
-
-
-def _add_shared_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
-    """Add the SHARED options every mode subcommand understands. `--list-defaults` /
-    `--show-board` / `--pool` are review/board meta-flags that stay available on the
-    default (review) parser; the panel/brainstorm/visual-only flags are available to the
-    relevant modes too (a flag a mode ignores is harmless). Mode-UNIQUE arguments (the
-    positional question/topic) are added by the mode's own `add_arguments`."""
-    parser.add_argument("-m", "--model", action="append", default=[], help="model/backend to run; repeat or comma-separate")
     parser.add_argument("-C", "--cwd", default=".", help="repository directory")
     parser.add_argument(
         "-o", "--output", metavar="FILE", default=None,
@@ -779,13 +848,6 @@ def _add_shared_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             "which fails under zsh noclobber."
         ),
     )
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="review prompt (review mode)")
-    # --diff is an explicit, composable alias for the working-tree diff. It is the
-    # DEFAULT for the review mode (which always reviews the diff) and an OPTIONAL
-    # grounding source for brainstorm — `review brainstorm "…" --diff` reads the
-    # working-tree diff as context. --staged is its staged counterpart.
-    parser.add_argument("--diff", action="store_true", help="use the working-tree diff (default for review; optional grounding for brainstorm)")
-    parser.add_argument("--staged", action="store_true", help="use the staged diff (git diff --cached) instead of the working-tree diff")
     parser.add_argument(
         "--timeout", type=int, default=None,
         help="per-call timeout seconds (default 1200 for review, 240 for panel modes)",
@@ -800,28 +862,186 @@ def _add_shared_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             "never off — --pool only sizes it. N<=0 means all seats."
         ),
     )
-    parser.add_argument("--moderator", default=None, help="moderator backend for quorum / brainstorm")
-    # --rounds / --max-rounds are brainstorm-only and added by the brainstorm mode's own
-    # add_arguments (so `review just-ask --rounds 5` correctly errors). They are still in
-    # _VALUE_TAKING_OPTS so the mode-agnostic `-o` pre-scan treats them as value-taking.
-    # --visual is a COMPOSABLE flag, NOT a mode: it combines with any mode (review /
-    # brainstorm / just-ask / quorum), or runs the standalone verdict pipeline (§3).
-    parser.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; composable with any mode (alone = the verdict pipeline)")
-    parser.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
-    parser.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
-    parser.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
-    parser.add_argument("--check", action="append", default=[], metavar="NAME", help="force-activate a visual module by name (repeatable)")
-    parser.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
-    parser.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
-    parser.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
-    parser.add_argument("--no-local-model", action="store_true", help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)")
-    parser.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
-    parser.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
-    if mode is not None and mode.add_arguments is not None:
+
+
+def _add_visual_options(parser: argparse.ArgumentParser) -> None:
+    """Add the composable `--visual` feature flags as their own argument GROUP. These are
+    SUBCOMMAND-scoped, NOT global (ROADMAP): `--visual` rides any subcommand, so they live
+    on every MODE parser but must NOT clutter the top-level `review --help`. Grouping them
+    makes `review <mode> --help` render them under a clear "visual verification" heading."""
+    group = parser.add_argument_group(
+        "visual verification (the composable --visual flag; rides any subcommand)"
+    )
+    group.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; rides any subcommand (e.g. `review diff --visual`; standalone verdict pipeline when no diff)")
+    group.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
+    group.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
+    group.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
+    group.add_argument("--check", action="append", default=[], metavar="NAME", help="force-activate a visual module by name (repeatable)")
+    group.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
+    group.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
+    group.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
+    group.add_argument("--no-local-model", action="store_true", help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)")
+    group.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
+    group.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
+
+
+def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> None:
+    """Add the full surface for an EXPLICIT `review <mode> …` subcommand parser: the global
+    options, the diff-source flags, the mode-relevant flags (`--prompt` for the diff review,
+    `--moderator` for the panel modes), the composable visual group, and the mode's own
+    UNIQUE arguments (its positional question/topic, via `add_arguments`).
+
+    `--diff`/`--staged` and `--prompt`/`--moderator` are scoped to the modes that use them
+    (ROADMAP): `--prompt` is the diff review's prompt; `--moderator` steers quorum/brainstorm.
+    They are harmless if a mode ignores them, but scoping keeps each `review <mode> --help`
+    showing only what that mode actually reads."""
+    _add_global_options(parser, mode=mode)
+
+    # --diff / --staged select the diff source. They matter to the diff review (its diff is
+    # required) and brainstorm/panel grounding; keep them on every mode parser (a mode that
+    # ignores one is harmless) but OFF the top-level overview.
+    parser.add_argument("--diff", action="store_true", help="use the working-tree diff (default for the diff review; optional grounding for brainstorm)")
+    parser.add_argument("--staged", action="store_true", help="use the staged diff (git diff --cached) instead of the working-tree diff")
+
+    # --prompt is the DIFF REVIEW's prompt override only.
+    if mode.name == "review":
+        parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="override the diff-review prompt")
+    # --moderator steers the quorum / brainstorm synthesis only.
+    if mode.name in ("quorum", "brainstorm"):
+        parser.add_argument(
+            "--moderator", default=None,
+            help=f"moderator backend (default: auto-pick, first available of {_moderator_default_help()})",
+        )
+
+    # The composable --visual feature rides any subcommand, so its group is on every mode
+    # parser (but never the top-level overview). --rounds / --max-rounds are brainstorm-only
+    # and added by the brainstorm mode's own add_arguments; they stay in _VALUE_TAKING_OPTS
+    # so the mode-agnostic `-o` pre-scan treats them as value-taking.
+    _add_visual_options(parser)
+
+    if mode.add_arguments is not None:
         mode.add_arguments(parser)
 
 
+# Flags that live ONLY on a subcommand parser (NOT the global top-level parser), per the
+# option-scoping. When one of these LEADS a no-subcommand invocation (e.g. the old pre-commit
+# `review --staged`, or `review --visual shot.png`), the top-level parser would reject it with
+# argparse's opaque "unrecognized arguments", losing the `review diff` migration pointer. The
+# pre-parse guard below catches them and emits the friendly pointer instead.
+_SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
+    "--diff", "--staged", "--prompt", "--moderator", "--rounds", "--max-rounds",
+    "--visual", "--before", "--intent", "--expect", "--check", "--json", "--strict",
+    "--no-ai", "--no-local-model", "--vision-timeout", "--project",
+})
+
+# The BARE management subcommands `_dispatch` handles directly (NOT mode verbs in
+# known_subcommands(), and NOT the diff review): they have their OWN flag parsers (e.g.
+# `review sessions -s <id> --diff --moderator …`). The verb-less migration guard must leave
+# them alone — a `--diff`/`--moderator` after `sessions` belongs to that subparser, not a
+# missing `review diff`.
+_BARE_SUBCOMMANDS: frozenset[str] = frozenset({
+    "install-skill", "install-commit-hook", "dashboard", "sessions",
+    "trust-module", "register-module", "spec-web",
+})
+
+
+def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
+    """If a SUBCOMMAND-scoped flag appears with NO recognized subcommand, print the friendly
+    `review diff` migration pointer + the usage code (2), instead of letting argparse reject
+    it with an opaque "unrecognized arguments" that drops the pointer (codex review). Scans
+    up to the first `--` (end-of-options), matching the `=value` form too. Returns 2 when such
+    a flag leads a verb-less invocation, else None (a purely-global `review -C <repo>` falls
+    through to the help pointer; a recognized mode OR bare management subcommand is left
+    alone — those own their flags).
+
+    Self-contained (checks the no-subcommand condition itself) so it is safe to call in
+    `main()` BEFORE the `-o` tee is armed — a usage error must NOT write/truncate the `-o`
+    file (like the removed-flags guards)."""
+    if argv and not argv[0].startswith("-") and (
+        argv[0] in known_subcommands() or argv[0] in _BARE_SUBCOMMANDS
+    ):
+        return None  # a recognized subcommand (mode or management) owns these flags
+    for tok in argv:
+        if tok == "--":
+            break
+        if tok.split("=", 1)[0] in _SUBCOMMAND_ONLY_FLAGS:
+            print(
+                "review: no subcommand given. The diff review is now `review diff` "
+                "(a bare `review` no longer runs one), and that flag belongs to a "
+                "subcommand.\n"
+                "  use:  review diff [options]   (e.g. `review diff --staged`, "
+                "`review diff --visual shot.png`)\n"
+                "  (run `review --help` for all subcommands)",
+                file=sys.stderr, flush=True,
+            )
+            return 2
+    return None
+
+
+def _help_topic_config() -> str:
+    """The `review help config` deep reference (ROADMAP "Topic-based help across the
+    ecosystem"): config file path + cascade, the keys, key/auth env vars, and how the
+    reviewer board + model selection resolve. Kept in sync with config.py / backends.py
+    behavior (help-docs-sync); a flag/behavior change updates this topic in the same commit."""
+    return f"""\
+review — configuration reference
+================================
+
+CONFIG FILE
+  {CONFIG_PATH}
+  Optional YAML. Absent / unparseable -> the built-in defaults apply (never an error).
+  Keys:
+    models:            list[str]  default backends for the diff review + just-ask/quorum.
+                       Set this and those EXACT models run (the flat panel) — it BYPASSES
+                       the reviewer board (cost-safety: you asked for specific models).
+    brainstorm_models: list[str]  default panel for `review brainstorm` (falls back to
+                       `models:`, then the built-in defaults). Unreachable backends are
+                       dropped gracefully.
+    board:             list[seat]  override the built-in reviewer board (see BOARD below).
+  Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
+  `glm` -> zai:glm-5.2, `cc` -> commandcode).
+
+SELECTION CASCADE (what runs when you do NOT pass -m), by mode:
+  review diff           : explicit -m  >  config `models:`  >  the active reviewer BOARD.
+  review brainstorm     : explicit -m  >  `brainstorm_models:`  >  `models:`  >  defaults.
+  review just-ask/quorum: explicit -m  >  `models:`  >  the built-in defaults.
+  Built-in defaults: {", ".join(_expand_alias(x) for x in DEFAULT_MODELS)}.
+  See the live default for each subcommand in `review <mode> --help` (the --model line).
+
+REVIEWER BOARD (the diff-review default; `review --show-board` prints it live)
+  A priority-ordered panel of {DEFAULT_POOL_SIZE * 2} seats, each model carrying its own
+  role/lens. A plain `review diff` runs a POOL of {DEFAULT_POOL_SIZE} (top-N AVAILABLE by
+  priority) with startup + mid-run failover from the reserve. `--pool N` sizes it
+  (`--pool 0` = all available). The board is never off — an explicit -m / config `models:`
+  bypasses it. To add/override a seat, set `board:` in config.yaml (a list of
+  {{model, role, name}} entries, strongest first; `name` is the display label, `role` is a
+  key into the built-in role lenses) or edit DEFAULT_BOARD in reviewlib/config.py.
+
+KEYS / AUTH (resolved from the process env first, then the shared .env)
+  Shared .env:  ~/.config/review-cli/.env   (override with $GEMINI_ENV_FILE)
+  Env vars:
+    GEMINI_API_KEY (or GOOGLE_API_KEY)  — gemini seat.
+    ZAI_API_KEY    (or ZHIPU_API_KEY)   — z.ai / GLM seat.
+    COMMANDCODE_API_KEY                 — commandcode seats (a `user_...` token ONLY).
+    ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN (+ optional ANTHROPIC_BASE_URL) — claude API.
+    REVIEW_CLAUDE_MODE=api|cli, REVIEW_<BACKEND>_MODE=api|cli — transport selection.
+  codex / opencode carry their own CLI auth (no key here).
+
+See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
+"""
+
+
+# Deep help TOPICS advertised from the main `review --help` and served by `review help
+# <topic>` / `review --help <topic>` (ROADMAP "Topic-based help across the ecosystem").
+# topic -> (one-line summary for the main-help listing, zero-arg renderer). Add a topic =
+# add an entry here; the main-help pointer + dispatch pick it up with no other edit.
+HELP_TOPICS: dict[str, tuple[str, "object"]] = {
+    "config": ("config file, the model/board selection cascade, keys/auth", _help_topic_config),
+}
+
+
 def _subcommand_epilog() -> str:
+    topics = "\n".join(f"  review help {t:<8} {summary}" for t, (summary, _) in HELP_TOPICS.items())
     return "subcommands:\n" + "\n".join(
         f"  {m.subcommand:<11} {m.summary}" for m in iter_modes()
     ) + (
@@ -829,35 +1049,48 @@ def _subcommand_epilog() -> str:
         "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
         "\n  spec-web    interactive web reviewer for a markdown spec"
         "\n  install-skill / install-commit-hook / register-module"
+        "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
+        + topics
+        + "\n  see `review help config` for configuration."
     )
 
 
-def _build_mode_parser(mode: ModeSpec, *, top_level: bool = False) -> argparse.ArgumentParser:
-    """Build the argparse surface for a mode subcommand.
-
-    `top_level=True` is the BARE `review …` invocation (no explicit subcommand): it
-    routes to the default (review) mode but the help/usage advertises the SUBCOMMAND
-    list (so `review --help` is the overview) and the prog stays `review` rather than
-    `review review`. An explicit `review <mode> …` uses the per-mode surface."""
-    if top_level:
-        prog = "review"
-        desc = (
-            "Run read-only code reviews / AI panels across multiple model backends. "
-            "Modes are SUBCOMMANDS: review (default), brainstorm, just-ask, quorum. "
-            "A bare `review …` defaults to `review review …` (a diff review)."
-        )
-        epilog: str | None = _subcommand_epilog()
-    else:
-        prog = f"review {mode.subcommand}"
-        desc = mode.summary
-        epilog = None
+def _build_top_level_parser() -> argparse.ArgumentParser:
+    """Build the TOP-LEVEL `review` parser — the overview shown by a bare `review` and by
+    `review --help`. It advertises the SUBCOMMAND list (the diff review is `review diff`
+    now; a bare `review` no longer runs a diff review — it prints this help) and carries
+    only the TRULY GLOBAL options + the board/meta flags (`--list-defaults` / `--show-board`
+    / `--pool`). Mode/visual-only flags live on their own subparsers (scoped help)."""
     parser = argparse.ArgumentParser(
-        prog=prog, description=desc, epilog=epilog,
+        prog="review",
+        description=(
+            "Run read-only code reviews / AI panels across multiple model backends. "
+            "Everything is a SUBCOMMAND: `review diff` (review the git diff), "
+            "`review brainstorm`, `review just-ask`, `review quorum`. A bare `review` "
+            "(no subcommand) prints this help — it does NOT run a diff review; use "
+            "`review diff` for that."
+        ),
+        epilog=_subcommand_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # The bare/top-level parser does NOT add the default mode's positional (review has
-    # none anyway); an explicit subcommand adds its own. Shared options are always added.
-    _add_shared_options(parser, mode=None if top_level else mode)
+    # Only the truly-global options — NOT the mode/visual-only flags (ROADMAP: those belong
+    # in the subcommand help, not the global list). The top-level parser only ever serves the
+    # meta flags (--list-defaults / --show-board / --help) + the help fall-through; it never
+    # dispatches a review, so it does not need --prompt / --diff / --moderator / the visual
+    # group.
+    _add_global_options(parser, mode=None)
+    return parser
+
+
+def _build_mode_parser(mode: ModeSpec) -> argparse.ArgumentParser:
+    """Build the argparse surface for an EXPLICIT `review <mode> …` subcommand (its prog
+    is `review <subcommand>` and it carries the global options + the mode-relevant flags +
+    the composable visual group + the mode's own positional)."""
+    parser = argparse.ArgumentParser(
+        prog=f"review {mode.subcommand}", description=mode.summary,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_mode_options(parser, mode=mode)
     return parser
 
 
@@ -901,9 +1134,81 @@ def _reject_removed_flags(argv: list[str]) -> int | None:
     return None
 
 
+def _reject_removed_subcommand(argv: list[str]) -> int | None:
+    """Reject the renamed-away SUBCOMMAND verb `review review` (the diff review is `review
+    diff` now) with a one-line `review diff` pointer + the stable usage code (2), else None.
+    A pure argv check (argv[0] only) so it can run in `main()` BEFORE the `-o` tee is armed —
+    a usage error must NOT write/truncate the `-o` file (codex P1), exactly like the removed
+    FLAGS. The later call in `_dispatch` is then a harmless no-op."""
+    if argv and argv[0] in REMOVED_SUBCOMMANDS:
+        replacement = REMOVED_SUBCOMMANDS[argv[0]]
+        print(
+            f"review: `review {argv[0]}` is no longer a subcommand — the diff review is "
+            f"now `review {replacement}`.\n"
+            f"  use:  review {replacement} [options]\n"
+            f"  (run `review --help` for all subcommands)",
+            file=sys.stderr, flush=True,
+        )
+        return 2
+    return None
+
+
+def _help_subcommand(rest: list[str]) -> int:
+    """`review help [<topic>]` — deep topic help (ROADMAP "Topic-based help across the
+    ecosystem"). Bare `review help` lists the topics; `review help <topic>` prints that
+    topic. An unknown topic lists the available ones + exits 2 (usage). Also reached as
+    `review --help <topic>` (see the main dispatch). Topics live in HELP_TOPICS so adding a
+    topic needs no edit here.
+
+    A USAGE error here `raise`s SystemExit(2), it does NOT `return` — like argparse's own
+    usage errors and the bare-`review` help path below. `main()`'s `-o` tee only persists the
+    captured output on a `return` (a "the dispatch ran" signal); a `return 2` here would let
+    that tee TRUNCATE a pre-existing `-o` target to empty on `review help bogus -o file.md`
+    (premium merge-gate finding, same data-loss class as #37). SystemExit propagates through
+    the tee's `finally` with `completed=False`, so no write happens. The SUCCESS paths (the
+    topic listing / a valid topic) still `return 0`: that output is real and SHOULD be teed."""
+    if not rest:
+        print("review help topics:\n" + "\n".join(
+            f"  {t:<10} {summary}" for t, (summary, _) in HELP_TOPICS.items()
+        ) + "\n\nRun `review help <topic>` (or `review --help <topic>`) for the full reference.")
+        return 0
+    # Exactly one topic token — extra trailing args are a usage error, not silently dropped
+    # (codex review: `review help config --bogus` / `review --help config extra` must NOT
+    # exit 0 ignoring the tail).
+    if len(rest) > 1:
+        print(f"review help: takes a single topic, got extra arguments: {' '.join(rest[1:])}\n"
+              f"  use:  review help <topic>   (topics: {', '.join(HELP_TOPICS)})",
+              file=sys.stderr, flush=True)
+        raise SystemExit(2)
+    topic = rest[0]
+    entry = HELP_TOPICS.get(topic)
+    if entry is None:
+        known = ", ".join(HELP_TOPICS)
+        print(f"review help: unknown topic '{topic}'. Known topics: {known}.",
+              file=sys.stderr, flush=True)
+        raise SystemExit(2)
+    _summary, render = entry
+    text = render()
+    print(text, end="" if text.endswith("\n") else "\n")
+    return 0
+
+
 def _dispatch(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    # `review help [<topic>]` — deep topic help. Wired here (a bare management subcommand
+    # like `dashboard`), before mode resolution, so it stays off the main argparse surface.
+    if argv and argv[0] == "help":
+        return _help_subcommand(argv[1:])
+    # `review --help <topic>` is an alias for `review help <topic>` (ROADMAP advertises
+    # both spellings). Route ANY non-option token after `--help`/`-h` through the topic
+    # handler — so a known topic prints, and a TYPO (`review --help confg`) gets the same
+    # unknown-topic usage error (exit 2) as `review help confg`, not argparse's normal help
+    # (exit 0) (codex review). A bare `--help` (no token) falls through to argparse's help.
+    if len(argv) >= 2 and argv[0] in ("--help", "-h") and not argv[1].startswith("-"):
+        # Pass ALL tokens after --help (not just argv[1]) so extra trailing args are caught
+        # by _help_subcommand's usage check rather than silently dropped (codex review).
+        return _help_subcommand(argv[1:])
     if argv == ["install-skill"]:
         return install_skill()
     if argv == ["install-commit-hook"]:
@@ -953,23 +1258,42 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if rc is not None:
         return rc
 
-    # --- Mode SUBCOMMAND resolution (§2/§4). The first token selects a mode; an
-    # unrecognized first token (a flag, or a positional that is not a known verb) routes
-    # to the DEFAULT review mode so `review -C <repo>` keeps working unchanged. -------
-    rest = argv
-    top_level = False
-    if argv and not argv[0].startswith("-") and argv[0] in known_subcommands():
+    # The removed SUBCOMMAND verb `review review` (the old stuttering diff review) prints a
+    # one-line "use `review diff`" pointer and exits with the usage code — like the removed
+    # mode flags. Done BEFORE the help fall-through so a stale `review review …` is
+    # diagnosed, not silently turned into a help dump. (Pre-rejected in `main()` before the
+    # `-o` tee, so this is a no-op when reached via `main`; it still fires for a direct
+    # `_dispatch` call, e.g. in tests.)
+    rc = _reject_removed_subcommand(argv)
+    if rc is not None:
+        return rc
+
+    # --- Subcommand resolution (§2/§4). A recognized leading VERB selects its mode and runs
+    # the per-mode parser. ANYTHING else — a bare `review`, `review --flag …` with no verb,
+    # an unknown verb — routes to the TOP-LEVEL parser, which serves --help / --list-defaults
+    # / --show-board and otherwise prints HELP (a bare `review` no longer runs a diff review:
+    # that was the mistake this migration fixes — use `review diff`). ----------------------
+    is_subcommand = bool(argv) and not argv[0].startswith("-") and argv[0] in known_subcommands()
+    if is_subcommand:
         mode = get_mode(argv[0])
         assert mode is not None  # known_subcommands() guarantees it
         rest = argv[1:]
+        parser = _build_mode_parser(mode)
     else:
-        # Bare `review …` (no recognized subcommand) -> default mode. Print the one-line
-        # migration hint (once) ONLY when there is something to review — a bare `--help`
-        # or no-args run should NOT nag (the hint is for the diff-review default path).
-        mode = default_mode()
-        top_level = True
+        # No recognized subcommand. A SUBCOMMAND-scoped flag here (e.g. the old pre-commit
+        # `review --staged`, or `review --visual …`) would hit argparse's opaque
+        # "unrecognized arguments" on the top-level parser — losing the `review diff`
+        # migration pointer. Catch those leading mode/visual-only flags BEFORE argparse and
+        # emit the friendly pointer (the friendly path for GLOBAL flags without a verb is the
+        # help fall-through below). Then parse the meta flags off the top-level parser; if
+        # none short-circuit, fall through to the HELP path (no implicit diff review).
+        rc = _reject_subcommand_only_flag_without_verb(argv)
+        if rc is not None:
+            return rc
+        mode = diff_mode()  # only used by the meta-flag handlers (--list-defaults / --show-board)
+        rest = argv
+        parser = _build_top_level_parser()
 
-    parser = _build_mode_parser(mode, top_level=top_level)
     args = parser.parse_args(rest)
 
     config = load_config()
@@ -992,12 +1316,41 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # would actually run in a real repo for THIS -C (it's diff-only outside a repo).
         return _show_board(config, args.pool, _effective_cwd(args.cwd))
 
-    # Bare `review …` that will actually DISPATCH a review (not a meta query like
-    # --list-defaults / --show-board, already returned above): print the one-line
-    # migration hint once, then run the diff review unchanged (§4). An explicit
-    # `review review …` (top_level=False) is already on the new syntax — no hint.
-    if top_level:
-        _hint_default_mode()
+    # A bare `review` (or `review --flag …` with no verb / an unknown verb) reaches here
+    # without a meta flag to serve: print the HELP/usage instead of silently running a diff
+    # review. There are three shapes:
+    #   * args passed (`review -C <repo>`)            -> usage error (exit 2): point at `review diff`;
+    #   * a diff piped on stdin (`git diff | review`)  -> usage error (exit 2): the classic
+    #       piped-diff review is `git diff | review diff` now — a bare `review` here used to
+    #       run a diff review, so silently exiting 0 would turn it into a no-op SUCCESS that
+    #       a script can't detect (codex P1). Fail loud, pointing at `review diff`;
+    #   * truly bare (`review`, no args, TTY stdin)    -> print the overview help, exit 0.
+    #
+    # Raise SystemExit (do NOT `return`): like argparse's own --help / usage errors, a
+    # help/usage dump must NOT write the `-o` file — `main()`'s tee only persists on a
+    # `return` (a "the dispatch ran" signal), so a `return` here would truncate a
+    # pre-existing `-o` target with the help text / an empty buffer. SystemExit propagates
+    # through the tee's `finally` with `completed=False`, so no write happens.
+    if not is_subcommand:
+        piped_diff = (not rest) and (_read_stdin_if_piped() is not None)
+        usage_error = bool(rest) or piped_diff
+        parser.print_help(sys.stderr if usage_error else sys.stdout)
+        if piped_diff:
+            print(
+                "\nreview: a diff was piped in but no subcommand given. The diff review is "
+                "now `review diff` (a bare `review` no longer runs one). "
+                "Run `git diff | review diff`.",
+                file=sys.stderr, flush=True,
+            )
+            raise SystemExit(2)
+        if rest:
+            print(
+                "\nreview: no subcommand given. The diff review is now `review diff` "
+                "(a bare `review` no longer runs one). Run `review diff [options]`.",
+                file=sys.stderr, flush=True,
+            )
+            raise SystemExit(2)
+        raise SystemExit(0)
 
     # Suppress the "reviewing it as-is" non-repo warning on the REVIEW-mode required-diff
     # path: there a non-repo hard-fails via `_fail_not_a_repo` (the authoritative message),
@@ -1230,7 +1583,12 @@ def _dispatch(argv: list[str] | None = None) -> int:
     def _with_visual_text(text: str) -> str:
         return _with_visual(text, visual_ctx)
 
-    moderators = pick_moderators(args.moderator, models) if panel_mode else []
+    # --moderator is scoped to the modes that USE a moderator (quorum / brainstorm); a flat
+    # panel like just-ask has no `--moderator` on its parser, so read it defensively. A mode
+    # with no moderator flag -> None -> pick_moderators falls back to the auto-pick chain
+    # (harmless: just-ask ignores the resolved moderators anyway).
+    moderator_arg = getattr(args, "moderator", None)
+    moderators = pick_moderators(moderator_arg, models) if panel_mode else []
     ctx = ModeContext(
         args=args, models=models, diff=diff, cwd=cwd, timeout=timeout,
         with_visual=_with_visual_text, visual_ctx=visual_ctx, moderators=moderators,
@@ -1385,7 +1743,7 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | No
     print("\nScope: `agentic` seats (codex / opencode / claude-CLI) run read-only in the "
           "real repo and can read any project file; `diff-only` seats (gemini / z.ai / "
           "commandcode / claude-API) are stateless HTTP calls that see only the diff.")
-    print(f"\nA plain `review` runs the top {DEFAULT_POOL_SIZE} AVAILABLE seats by "
+    print(f"\nA plain `review diff` runs the top {DEFAULT_POOL_SIZE} AVAILABLE seats by "
           f"priority (--pool {DEFAULT_POOL_SIZE}); a higher-priority seat that is "
           f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "
           f"pool keeps {DEFAULT_POOL_SIZE} working reviewers. `--pool N` sizes the pool; "

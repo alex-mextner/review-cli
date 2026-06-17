@@ -38,10 +38,11 @@ MODES: tuple[ModeSpec, ...] = (
     _QUORUM_MODE,
 )
 
-# The default mode a bare `review` (no recognized subcommand) falls back to (§4). Keeping
-# the diff-review ergonomics is the whole point of the migration — `review -C <repo>`
-# stays a diff review.
-DEFAULT_MODE_NAME = "review"
+# The diff-review mode's stable `name` (its run-stats key / dispatch identity). Its
+# user-facing SUBCOMMAND is `diff` (renamed from the stuttering `review review`); a bare
+# `review` no longer runs it — bare `review` prints HELP, and the diff review is reached
+# explicitly via `review diff`.
+DIFF_MODE_NAME = "review"
 
 
 def iter_modes() -> tuple[ModeSpec, ...]:
@@ -58,11 +59,13 @@ def get_mode(name_or_subcommand: str) -> ModeSpec | None:
     return None
 
 
-def default_mode() -> ModeSpec:
-    """The mode a bare `review` (no recognized subcommand) routes to."""
-    mode = get_mode(DEFAULT_MODE_NAME)
-    assert mode is not None, "DEFAULT_MODE_NAME must name a registered mode"
-    return mode
+def diff_mode() -> ModeSpec:
+    """The diff-review mode (subcommand `diff`). Resolved by stable NAME, not subcommand,
+    so the lookup is stable even as the verb evolved (`review` -> `review diff`)."""
+    for mode in MODES:
+        if mode.name == DIFF_MODE_NAME:
+            return mode
+    raise AssertionError("DIFF_MODE_NAME must name a registered mode")
 
 
 _KNOWN_SUBCOMMANDS: frozenset[str] = frozenset(
@@ -84,6 +87,17 @@ REMOVED_MODE_FLAGS: dict[str, str] = {
     "--brainstorm": "brainstorm",
     "--quorum": "quorum",
     "--just-ask": "just-ask",
+}
+
+
+# Subcommand VERBS that were renamed away. `review review …` (the old stuttering diff
+# review) is gone — the diff review is `review diff` now. Rather than silently running it
+# (the old default-mode behavior, which was the mistake this migration fixes) or letting
+# it fall through to a confusing parse, the CLI prints a one-line "use `review <new>`"
+# pointer and exits with the usage code — exactly like the removed mode FLAGS above.
+# Maps the dead verb -> the subcommand that replaces it.
+REMOVED_SUBCOMMANDS: dict[str, str] = {
+    "review": "diff",
 }
 
 
@@ -126,13 +140,14 @@ REMOVED_FLAGS: dict[str, RemovedFlag] = {
 # the per-round persona-slot count without reaching into the brainstorm module directly.
 __all__ = [
     "MODES",
-    "DEFAULT_MODE_NAME",
+    "DIFF_MODE_NAME",
     "REMOVED_MODE_FLAGS",
+    "REMOVED_SUBCOMMANDS",
     "REMOVED_FLAGS",
     "RemovedFlag",
     "iter_modes",
     "get_mode",
-    "default_mode",
+    "diff_mode",
     "known_subcommands",
     "brainstorm_pool",
 ]

@@ -179,10 +179,13 @@ def _handler(ctx: ModeContext) -> int:
 
 MODE = ModeSpec(
     name="review",
-    subcommand="review",
+    # The diff-review SUBCOMMAND is `diff` (renamed from the stuttering `review review`).
+    # The stable mode `name` / `stats_mode` stay "review" (the run-stats key and the
+    # handler dispatch identity are unchanged); only the user-facing verb moved.
+    subcommand="diff",
     diff_policy="require",
     stats_mode="review",
-    summary="diff review across the reviewer board (the default; requires a diff)",
+    summary="diff review across the reviewer board (requires a diff)",
     handler=_handler,
     add_arguments=_add_arguments,
     announce_logs=False,

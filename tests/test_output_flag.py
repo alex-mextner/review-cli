@@ -185,7 +185,7 @@ def test_file_written_even_on_nonzero_review_exit():
         repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
         target = Path(d) / "out.md"
-        rc, _ = _run_main(["-C", str(repo), "-o", str(target)])
+        rc, _ = _run_main(["diff", "-C", str(repo), "-o", str(target)])
         # No diff -> non-zero exit, but the file exists (empty result is fine).
         assert rc != 0, rc
         assert target.is_file(), target
@@ -228,7 +228,7 @@ def test_real_review_result_text_lands_in_file():
         try:
             target = Path(d) / "out.md"
             rc, printed = _run_main(
-                ["-C", str(repo), "--staged", "-m", "codex", "-o", str(target)],
+                ["diff", "-C", str(repo), "--staged", "-m", "codex", "-o", str(target)],
             )
             body = target.read_text(encoding="utf-8")
             assert sentinel in body, body          # the verdict reached the file
@@ -318,6 +318,66 @@ def test_removed_flag_with_output_flag_does_not_truncate_file():
                 bad, target.read_text())
 
 
+def test_removed_subcommand_with_output_flag_does_not_truncate_file():
+    # DATA-LOSS GUARD (codex P1): the renamed-away `review review` verb is a usage error
+    # rejected (RETURNS 2) before any review runs. Like the removed FLAGS, it is pre-rejected
+    # in main() BEFORE the `-o` tee is armed, so `review review -o important.md` must leave
+    # the pre-existing file untouched (not clobber it with the empty captured stdout).
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "important.md"
+        target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["review", "-o", str(target)])
+        assert rc == 2, rc
+        assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", target.read_text()
+
+
+def test_no_subcommand_with_args_and_output_flag_does_not_truncate_file():
+    # DATA-LOSS GUARD (codex P1): `review -C <repo> -o important.md` (flags, no verb) now
+    # prints help + a `review diff` pointer and exits via SystemExit(2) — a help/usage dump
+    # must NOT write the `-o` file (it would clobber the target with help text / empty).
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "important.md"
+        target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                main(["-C", d, "-o", str(target)])
+            except SystemExit as exc:
+                assert exc.code == 2, exc.code
+        assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", target.read_text()
+
+
+def test_bare_review_help_with_output_flag_does_not_truncate_file():
+    # A truly bare `review -o important.md` prints the help to stdout and exits via
+    # SystemExit(0), like `review --help` — it must NOT clobber the target with the help.
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "important.md"
+        target.write_text("KEEP ME\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                main(["-o", str(target)])
+            except SystemExit as exc:
+                assert exc.code == 0, exc.code
+        assert target.read_text(encoding="utf-8") == "KEEP ME\n", target.read_text()
+
+
+def test_subcommand_only_flag_without_verb_with_output_does_not_truncate_file():
+    # DATA-LOSS GUARD (codex review): `review --staged -o important.md` / `review --visual
+    # shot.png -o important.md` (a subcommand-scoped flag, no verb) is rejected with the
+    # friendly `review diff` pointer BEFORE the `-o` tee is armed (like the removed-flag
+    # guards) — it must leave the pre-existing file untouched, not clobber it with empty
+    # captured stdout.
+    for argv_prefix in (["--staged"], ["--visual", "shot.png"]):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "important.md"
+            target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main([*argv_prefix, "-o", str(target)])
+            assert rc == 2, (argv_prefix, rc)
+            assert target.read_text(encoding="utf-8") == "PRECIOUS USER DATA\n", (
+                argv_prefix, target.read_text())
+
+
 def test_value_taking_opts_are_all_value_taking():
     # Finding #2 guard: every entry in _VALUE_TAKING_OPTS must REALLY consume a value in
     # the real parser, else the pre-scan would skip a non-value token (and `-o` after a
@@ -335,11 +395,14 @@ def test_value_taking_opts_are_all_value_taking():
 
     # Each listed opt errors "expected one argument" when given no value. We pass a
     # leading no-op value-taking flag with a value so the parser reaches the bare opt
-    # without triggering a real review (it errors during parse). Brainstorm-only flags
-    # (--rounds/--max-rounds) live ONLY on the `brainstorm` subcommand parser now, so
-    # route them through that subcommand (with a topic) to reach a parser that has them.
+    # without triggering a real review (it errors during parse). Each opt must be routed
+    # through a SUBCOMMAND whose parser actually DEFINES it — the option-scoping (ROADMAP
+    # "subcommand-only options belong in the subcommand help") means the top-level parser no
+    # longer carries the mode/visual-only flags, so a top-level `--prompt …` would now
+    # error "unrecognized arguments", not "expected one argument".
     brainstorm_only = {"--rounds", "--max-rounds"}
-    specweb_only = {"--spec"}  # lives ONLY on the `spec-web reply` subparser
+    specweb_only = {"--spec"}        # lives ONLY on the `spec-web reply` subparser
+    moderator_only = {"--moderator"}  # lives on quorum / brainstorm, NOT the diff review
     for opt in sorted(_VALUE_TAKING_OPTS):
         if opt in ("-o", "--output"):
             continue  # handled by the pre-scan, covered by other tests
@@ -348,8 +411,13 @@ def test_value_taking_opts_are_all_value_taking():
         elif opt in specweb_only:
             # route through the subcommand whose parser actually defines --spec
             argv = ["spec-web", "reply", "cid", "ans", opt]
+        elif opt in moderator_only:
+            argv = ["quorum", "q", opt]  # --moderator is a quorum/brainstorm flag
         else:
-            argv = ["--prompt", "p", opt]  # bare opt at the end -> needs a value
+            # Everything else (global + the review-only --prompt + the visual group) lives
+            # on the `diff` subcommand parser. Lead with --timeout (global, value-taking) so
+            # the parser reaches the bare opt at the end without running a review.
+            argv = ["diff", "--timeout", "100", opt]
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             try:
@@ -358,6 +426,94 @@ def test_value_taking_opts_are_all_value_taking():
                 pass
         msg = err.getvalue()
         assert "expected one argument" in msg, (opt, msg)
+
+
+def test_help_topic_usage_error_with_output_flag_does_not_truncate_file():
+    # DATA-LOSS GUARD (premium merge-gate, same class as #37): the NEW `review help <topic>`
+    # command, on a USAGE error (unknown topic / extra trailing args / a bad topic via the
+    # `--help <topic>` alias), used to `return 2` from `_help_subcommand` — which the `-o` tee
+    # path treats as a completed dispatch and persists the (empty) captured stdout, TRUNCATING
+    # a pre-existing `-o` target to empty. A usage error must behave like argparse's own usage
+    # errors w.r.t. `-o`: raise SystemExit BEFORE the tee writes, so the file is left untouched.
+    # `review help bogus-topic -o existing.md` must NOT empty existing.md.
+    # (argv, expected stderr fragment). Both usage-error shapes (unknown topic / extra trailing
+    # args) are covered through BOTH spellings — the `help` subcommand AND the `--help`/`-h <topic>`
+    # alias — since the alias routes all trailing tokens through the same _help_subcommand check.
+    usage_error_cases = (
+        (["help", "bogus-topic"], "unknown topic"),
+        (["help", "config", "extra-arg"], "extra arguments"),
+        (["--help", "bogustopic"], "unknown topic"),
+        (["-h", "bogustopic"], "unknown topic"),
+        (["--help", "config", "extra-arg"], "extra arguments"),
+        (["-h", "config", "extra-arg"], "extra arguments"),
+    )
+    for prefix, msg_fragment in usage_error_cases:
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "important.md"
+            target.write_text("PRECIOUS USER DATA\n", encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                try:
+                    rc = main([*prefix, "-o", str(target)])
+                except SystemExit as exc:
+                    rc = exc.code
+            assert rc == 2, (prefix, rc)
+            actual = target.read_text(encoding="utf-8")
+            assert actual == "PRECIOUS USER DATA\n", (prefix, repr(actual))
+            # The helpful diagnostic must still reach stderr (a future refactor must not drop the
+            # message before the raise) — and it must NOT have been teed into the file.
+            assert msg_fragment in err.getvalue(), (prefix, err.getvalue())
+
+    # The other half of the contract: a usage error must not CREATE a fresh empty `-o` file
+    # either (if the tee ever switched to "open in 'w' then conditionally write", a brand-new
+    # empty file would silently appear). `review help bogus -o newfile.md` must touch nothing.
+    for prefix, _ in usage_error_cases:
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "newfile.md"  # does NOT pre-exist
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    rc = main([*prefix, "-o", str(target)])
+                except SystemExit as exc:
+                    rc = exc.code
+            assert rc == 2, (prefix, rc)
+            assert not target.exists(), (prefix, "usage error created an empty -o file")
+
+
+def test_help_topic_usage_error_exits_2_without_output_flag():
+    # The usage-error → `raise SystemExit(2)` path must surface a clean exit code 2 (NOT 1, and
+    # NOT argparse's exit-0 help) on its own, with no `-o` involved — so a script can detect a
+    # bad `review help <topic>` invocation. Pins that main() does not translate the SystemExit
+    # into a different code on the way out (the SAME usage-error shapes as the truncation guard
+    # above: unknown topic / extra trailing args, through both `help` and the `--help`/`-h` alias).
+    for prefix in (
+        ["help", "bogus-topic"],
+        ["help", "config", "extra-arg"],
+        ["--help", "bogustopic"],
+        ["-h", "bogustopic"],
+        ["--help", "config", "extra-arg"],
+        ["-h", "config", "extra-arg"],
+    ):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = main(list(prefix))
+            except SystemExit as exc:
+                rc = exc.code
+        assert rc == 2, (prefix, rc)
+
+
+def test_help_valid_topic_with_output_flag_writes_topic_text():
+    # The flip side of the data-loss guard: a SUCCESSFUL `review help <topic> -o FILE` (and the
+    # bare `review help -o FILE` listing) is real output, not a usage error — it MUST still tee
+    # the topic reference into the file (like `--list-defaults -o FILE`). Only the usage-ERROR
+    # branches skip the write; the happy path keeps writing.
+    for prefix in (["help", "config"], ["help"]):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "out.md"
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = main([*prefix, "-o", str(target)])
+            assert rc == 0, (prefix, rc)
+            assert target.is_file(), (prefix, target)
+            assert target.read_text(encoding="utf-8").strip(), (prefix, "empty topic-help file")
 
 
 def test_help_documents_output_flag():

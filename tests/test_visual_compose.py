@@ -121,14 +121,15 @@ def _clean_repo() -> str:
 
 
 def test_standalone_runs_pipeline_and_maps_exit():
-    """--visual with no mode and no diff runs the verdict pipeline. A blank image with
-    --no-ai --strict must exit 10 (rollback)."""
+    """`review diff --visual` with no diff runs the standalone verdict pipeline (--visual
+    rides the diff mode; an absent diff routes to standalone). A blank image with --no-ai
+    --strict must exit 10 (rollback)."""
     clean = _clean_repo()
-    rc = cli.main(["--visual", _blank(), "--no-ai", "--strict", "-C", clean])
+    rc = cli.main(["diff", "--visual", _blank(), "--no-ai", "--strict", "-C", clean])
     assert rc == 10, f"blank standalone --strict must exit 10, got {rc}"
 
     # A styled pass-through under --no-ai is human_review → non-strict exit 0.
-    rc2 = cli.main(["--visual", _styled(), "--no-ai", "-C", clean])
+    rc2 = cli.main(["diff", "--visual", _styled(), "--no-ai", "-C", clean])
     assert rc2 == 0
 
 
@@ -174,9 +175,8 @@ def test_companion_unreadable_image_is_usage_exit_1():
 
 
 def test_default_review_with_diff_threads_visual():
-    """--visual with a piped diff (no panel mode) routes to the diff-review companion
-    with the image as context — not the standalone pipeline. A bare `review --visual`
-    (no subcommand) still defaults to the review mode."""
+    """`review diff --visual` with a piped diff routes to the diff-review companion with
+    the image as context — not the standalone pipeline (--visual rides the diff mode)."""
     captured = {}
 
     def fake_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
@@ -190,7 +190,7 @@ def test_default_review_with_diff_threads_visual():
     _review_mod.mode_review = fake_review
     cli._read_stdin_if_piped = lambda: "diff --git a/x b/x\n+change\n"
     try:
-        rc = cli.main(["--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["diff", "--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
         _review_mod.mode_review = old
         cli._read_stdin_if_piped = old_stdin

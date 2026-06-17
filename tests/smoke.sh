@@ -35,12 +35,15 @@ SHIM_OUT="$( cd "$SHIM_SMOKE_CWD" && env -u PYTHONPATH "$SHIM_ABS" --list-defaul
 printf '%s\n' "$SHIM_OUT" | grep -q codex
 
 # Modes are now SUBCOMMANDS, not flags. The top-level help advertises the subcommand
-# list; each mode has its own `review <mode> --help`. The OLD mode flags are GONE.
+# list; each mode has its own `review <mode> --help`. The OLD mode flags are GONE. The
+# diff review is the `diff` subcommand (renamed from the stuttering `review review`).
 bin/review --help | grep -q "subcommands:"
+bin/review --help | grep -q "diff"
 bin/review --help | grep -q "brainstorm"
 bin/review --help | grep -q "just-ask"
 bin/review --help | grep -q "quorum"
 # Each mode subcommand parses + advertises its positional / shared options.
+bin/review diff --help | grep -q -- "--prompt"
 bin/review brainstorm --help | grep -q "topic"
 bin/review just-ask --help | grep -q "question"
 bin/review quorum --help | grep -q "question"
@@ -68,19 +71,27 @@ echo "$mcp_msg" | grep -q '`--mcp` was removed'
 echo "$mcp_msg" | grep -q "mcp.json"
 ! echo "$mcp_msg" | grep -q "unrecognized arguments"
 ln_msg="$(bin/review --ln 2>&1 || true)"; echo "$ln_msg" | grep -q '`--ln` was removed'
-# Bare `review` (no subcommand) still defaults to the review diff path: a meta query
-# like --list-defaults works WITHOUT a subcommand (the most common ergonomics, §4).
+# The diff review is now the `diff` SUBCOMMAND (`review diff`), NOT a bare `review`. A bare
+# `review` prints HELP (exit 0) — it does NOT run a diff review. Meta queries still work
+# without a subcommand. The removed `review review` verb prints a `review diff` pointer.
 bin/review --list-defaults | grep -q codex
-bin/review review --list-defaults | grep -q codex   # explicit review subcommand too
+bin/review diff --list-defaults | grep -q codex                 # explicit diff subcommand
+bin/review | grep -q "subcommands:"                             # bare review = HELP (exit 0)
+bin/review | grep -q "review diff"                              # …and points at `review diff`
+review_review_msg="$(bin/review review 2>&1 || true)"
+echo "$review_review_msg" | grep -q "no longer a subcommand"    # removed stutter verb
+echo "$review_review_msg" | grep -q "review diff"               # …points at the new verb
+! bin/review review >/dev/null 2>&1                             # exit 2 (usage)
 
 # Outside a git repo, the diff-review path must fail GRACEFULLY (no traceback): a clear
 # 3-part message + the STABLE EXIT_NOT_A_REPO=3 code. Meta + no-git modes still work
-# anywhere. `-C <non-git-dir>` from inside this repo is the non-repo case (a fresh
-# mktemp dir is never a git work tree). Capture output FIRST: `review` exits 3 here, so a
-# `review … | grep` would trip `set -o pipefail` on the nonzero exit even when grep matches.
+# anywhere. `review diff -C <non-git-dir>` from inside this repo is the non-repo case (a
+# fresh mktemp dir is never a git work tree). Capture output FIRST: `review diff` exits 3
+# here, so a `review … | grep` would trip `set -o pipefail` on the nonzero exit even when
+# grep matches.
 NONGIT_SMOKE="$(mktemp -d)"
 set +e
-nogit_out="$(bin/review -C "$NONGIT_SMOKE" </dev/null 2>&1)"; nogit_rc=$?
+nogit_out="$(bin/review diff -C "$NONGIT_SMOKE" </dev/null 2>&1)"; nogit_rc=$?
 set -e
 [ "$nogit_rc" -eq 3 ]                                            # stable not-a-repo exit code
 echo "$nogit_out" | grep -q "not in a git repository"           # WHAT
@@ -97,12 +108,50 @@ echo "$nogit_out" | grep -q "cd into a repo"                    # HOW (or cd int
 bin/review just-ask -C "$NONGIT_SMOKE" --help | grep -q "the question to ask"
 bin/review -C "$NONGIT_SMOKE" --list-defaults | grep -q codex
 
-# Stage 1: the composable --visual flag and its core sub-flags must appear in help.
-bin/review --help | grep -q -- "--visual"
-bin/review --help | grep -q -- "--no-ai"
-bin/review --help | grep -q -- "--strict"
-# Stage 2a: the local pre-classifier toggle must appear in help.
-bin/review --help | grep -q -- "--no-local-model"
+# Help must show ACTUAL defaults (ROADMAP "Help must show ACTUAL defaults — esp. --model"):
+# --model names the effective default (the active board when no -m/config) on the GLOBAL
+# help; --moderator (scoped to quorum/brainstorm) names the auto-pick chain on THAT
+# subcommand's help; the numeric flags show their concrete defaults on the right surface.
+bin/review --help | grep -q "active reviewer board"            # --model default (global)
+bin/review quorum --help | grep -q "claude:claude-opus-4-8"    # --moderator auto-pick chain (panel mode)
+bin/review --help | grep -q "default 4"                        # --pool (global)
+bin/review diff --help | grep -q "default 60"                  # --vision-timeout (visual, on the subcommand)
+python3 tests/test_help_defaults.py
+echo "help-defaults tests OK"
+
+# Topic-based deep help (ROADMAP "Topic-based help across the ecosystem"): the main help
+# LISTS the topics + points at `review help config`; `review help config` (and the
+# `review --help config` alias) prints the config reference; an unknown topic is exit 2.
+bin/review --help | grep -q "help topics"
+bin/review --help | grep -q "review help config"
+bin/review help | grep -q "config"
+bin/review help config | grep -q "configuration reference"
+bin/review help config | grep -q "SELECTION CASCADE"
+bin/review --help config | grep -q "configuration reference"     # the alias form
+! bin/review help totally-bogus-topic >/dev/null 2>&1            # unknown topic -> exit 2
+python3 tests/test_topic_help.py
+echo "topic-help tests OK"
+
+# Subcommand-only options belong in the SUBCOMMAND help, not the global list (ROADMAP).
+# The composable --visual feature flags and their companions live on `review <mode> --help`
+# (they ride any subcommand), NOT on the top-level `review --help`.
+bin/review diff --help | grep -q -- "--visual"
+bin/review diff --help | grep -q -- "--no-ai"
+bin/review diff --help | grep -q -- "--strict"
+bin/review diff --help | grep -q -- "--no-local-model"        # Stage-2a local pre-classifier toggle
+bin/review diff --help | grep -q -- "--vision-timeout"
+# …and they must NOT appear in the GLOBAL top-level help (option list scoped to truly-global).
+# Strip the subcommand-summary epilog first (`brainstorm  …(composable with --diff/--staged…)`
+# legitimately names those flags in prose), then assert no visual/mode-only flag is an OPTION.
+top_opts="$(bin/review --help | sed -n '/^options:/,/^subcommands:/p')"
+! echo "$top_opts" | grep -qE -- "--visual|--no-ai|--strict|--no-local-model|--vision-timeout|--before|--intent|--expect|--check|--json|--project"
+! echo "$top_opts" | grep -qE -- "--prompt|--moderator"        # mode-only opts off the global list too
+# --prompt is the diff review's; --moderator steers quorum/brainstorm — each on its own help.
+bin/review diff --help | grep -q -- "--prompt"
+! bin/review just-ask --help | grep -q -- "--prompt"
+! bin/review just-ask --help | grep -q -- "--moderator"
+bin/review quorum --help | grep -q -- "--moderator"
+bin/review brainstorm --help | grep -q -- "--moderator"
 
 # Reviewer board (HYP-741 / failover pool): the board flags must appear in help, and
 # --show-board must list the out-of-the-box 8-seat PRIORITY-ordered DEFAULT_BOARD (no
@@ -226,6 +275,31 @@ REVIEW_LOG_DIR="$SESS_DIR" bin/review sessions -a | grep -q "interrupted"
 python3 tests/test_dashboard.py
 echo "dashboard tests OK"
 
+# Stale-command guard (codex review): the dashboard UI must not suggest the REMOVED
+# invocations — a bare `review` (now prints help) or the `--quorum`/`--brainstorm`/`--just-ask`
+# flags (now error). It must point at the current `review diff` / `review quorum` etc.
+! grep -qE 'review --(quorum|brainstorm|just-ask)' reviewlib/dashboard/assets/app.js
+grep -q "review diff" reviewlib/dashboard/assets/app.js
+echo "dashboard-stale-command guard OK"
+
+# Stale-command guard for USER-FACING DOCS (codex review): the README + the visual spec must
+# not contain the UNAMBIGUOUSLY-BROKEN executable command shapes the rename retired — the old
+# mode FLAGS as a command (`review --quorum`/`--brainstorm`/`--just-ask`, NOT a "was removed"
+# note), or a piped diff into a bare `review` (`git diff | review` with NO verb, which now
+# exits 2). The composable `--visual` flag (`review diff --visual`) is the current spelling;
+# bare `review --visual` as a command is also retired. (Prose that NAMES the `--visual`
+# feature is fine; we match only command-leading forms.) Keeps docs from sending users to
+# commands that now fail.
+for doc in README.md docs/architecture-visual-verification.md; do
+  # Removed mode flags used AS a command (line starts with `review --<flag>`), not prose.
+  ! grep -nE '^[[:space:]]*review --(quorum|brainstorm|just-ask|visual)\b' "$doc"
+  # A diff piped into a bare `review` with no subcommand (now exits 2). Allow `review diff`,
+  # `review just-ask`, `review quorum`, `review brainstorm` after the pipe.
+  ! grep -nE '\| *review +(-|$)' "$doc"
+  ! grep -nE '\| *review +--' "$doc"
+done
+echo "docs-stale-command guard OK"
+
 # Streaming runner: real-time log growth + partial-output-on-timeout (no backends
 # needed — drives a fake slow python child).
 REVIEW_LOG_DIR="$(mktemp -d)" python3 tests/test_streaming.py
@@ -331,11 +405,25 @@ REVIEW_LOG_DIR="$(mktemp -d)" python3 tests/test_brainstorm_dead_panel.py
 echo "brainstorm-dead-panel tests OK"
 
 # Mode SUBCOMMANDS + the mode registry (the modes-subcommands redesign): each
-# subcommand dispatches to the right mode, a bare `review` defaults to review, brainstorm
-# composes with --diff, the removed mode flags error helpfully, and the registry contract
-# (get_mode/known_subcommands/default_mode). All offline (mode handlers stubbed).
+# subcommand dispatches to the right mode, a bare `review` prints HELP (the diff review is
+# `review diff`), brainstorm composes with --diff, the removed mode flags error helpfully,
+# and the registry contract
+# (get_mode/known_subcommands/diff_mode). All offline (mode handlers stubbed).
 python3 tests/test_mode_subcommands.py
 echo "mode-subcommands tests OK"
+
+# Installed pre-commit hook text: the review-before-commit gate must tell a blocked user to
+# run `review diff --staged` (the renamed diff review), not the dead bare `review --staged`.
+python3 tests/test_install_hook_text.py
+echo "install-hook-text tests OK"
+
+# install-* INSTALLED state (ROADMAP "install-* commands must show INSTALLED state"): a
+# re-run of install-skill / install-commit-hook / register-module on an already-set-up target
+# reports a green ✓ "already configured — nothing to do" instead of silently rewriting. All
+# state (HOME / git config / registry) is isolated to temp dirs INSIDE the test — never the
+# real machine — so this is safe to run in CI / smoke.
+python3 tests/test_install_state.py
+echo "install-state tests OK"
 
 # Resumable brainstorm sessions: id derivation, parsing a completed vs interrupted (incl.
 # empty-round) discussion log, list_sessions (default completed-only vs -a all), find_session

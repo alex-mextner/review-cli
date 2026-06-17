@@ -138,7 +138,7 @@ PANELS.overview = () => {
     ? `<div class="list">${runs.slice(0, 12).map(runRow).join('')}</div>`
     : emptyState(
         'sessions',
-        'Run <code>review</code> / <code>review --quorum</code> / <code>review --brainstorm</code> and the per-call logs will appear here.',
+        'Run <code>review diff</code> / <code>review quorum</code> / <code>review brainstorm</code> and the per-call logs will appear here.',
       );
   html += `</div>`;
   return html;
@@ -274,7 +274,7 @@ PANELS.models = () => {
             `<div class="run"><div class="run-head"><span class="badge mode-brainstorm">${esc(r)}</span><span class="run-models">${n} appearance(s)</span></div></div>`,
         )
         .join('')}</div>`
-    : emptyState('roles', 'Roles/personas are only recorded for <code>review --brainstorm</code> runs.');
+    : emptyState('roles', 'Roles/personas are only recorded for <code>review brainstorm</code> runs.');
   html += `</div>`;
   return html;
 };
