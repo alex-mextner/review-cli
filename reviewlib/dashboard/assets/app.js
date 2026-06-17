@@ -138,9 +138,16 @@ function runRow(r) {
     ((r.links && r.links.prs) || []).map((p) => `<span class="badge pr">${esc(p)}</span>`).join(''),
     ((r.links && r.links.tickets) || []).map((t) => `<span class="badge ticket">${esc(t)}</span>`).join(''),
   ].join(' ');
-  const topic = r.topic
-    ? `<div class="run-body muted">${esc(r.topic.slice(0, 160))}${r.topic.length > 160 ? '…' : ''}</div>`
-    : '';
+  // Body line: the brainstorm topic when present, else the recorded invocation(s) so a
+  // panel/review row isn't blank (the literal prompt is redacted in the logs).
+  const inv = r.invocations || [];
+  let bodyLine = '';
+  if (r.topic) {
+    bodyLine = `<div class="run-body muted">${esc(r.topic.slice(0, 160))}${r.topic.length > 160 ? '…' : ''}</div>`;
+  } else if (inv.length) {
+    const joined = inv.join(', ');
+    bodyLine = `<div class="run-body muted">${esc(joined.slice(0, 160))}${joined.length > 160 ? '…' : ''}</div>`;
+  }
   const fb = r.feedback
     ? `<div class="run-body" style="color:var(--amber)">📝 ${esc(r.feedback.slice(0, 120))}</div>`
     : '';
@@ -150,7 +157,7 @@ function runRow(r) {
       <span class="run-time">${fmtTime(r.started)}</span>
       <span class="run-models">${esc((r.models || []).join(', ') || '—')}</span>
       <span class="run-models">· ${r.call_count} call(s) · ${fmtDur(r.duration_seconds)}</span>
-    </div>${topic}${fb}
+    </div>${bodyLine}${fb}
   </div>`;
 }
 
@@ -307,20 +314,29 @@ function taskRow(r) {
   </div>`;
 }
 
+// The prompt body for a run row in the Prompts panel. review-cli redacts the literal
+// prompt/diff, so the durable signal is the brainstorm topic (when present) and otherwise
+// the recorded invocation(s) — the command/endpoint each backend was called with. Show the
+// most specific thing we have, falling back to the redacted note only when nothing was
+// recorded (e.g. a brainstorm whose per-call logs aged out and carried no topic).
+function promptBody(r) {
+  if (r.topic) return `<div class="run-body"><strong>Topic:</strong> ${esc(r.topic)}</div>`;
+  const inv = r.invocations || [];
+  if (inv.length)
+    return `<div class="run-body"><strong>Invoked:</strong> ${inv.map((i) => `<code>${esc(i)}</code>`).join(', ')} <span class="muted">· prompt/diff redacted in logs</span></div>`;
+  return `<div class="run-body muted">prompt redacted in logs — argv only</div>`;
+}
+
 PANELS.prompts = () => {
   const runs = state.runs || [];
-  let html = `<h2>Prompts</h2><p class="sub">The prompts/argv used per run. review-cli REDACTS the prompt/diff from logs (they may carry secrets) — only argv[0] is recorded, plus the brainstorm topic where present. Open a session for full per-call detail.</p>`;
+  let html = `<h2>Prompts</h2><p class="sub">The prompts/argv used per run. review-cli REDACTS the prompt/diff from logs (they may carry secrets) — only the invoked command (argv[0]) is recorded, plus the brainstorm topic where present. Open a session for full per-call detail.</p>`;
   html += runs.length
     ? `<div class="list">${runs
         .map(
           (r) =>
             `<div class="run" data-sid="${esc(r.session_id)}" data-open="chat">
       <div class="run-head">${modeBadge(r.mode)}<span class="run-time">${fmtTime(r.started)}</span></div>
-      ${
-        r.topic
-          ? `<div class="run-body"><strong>Topic:</strong> ${esc(r.topic)}</div>`
-          : `<div class="run-body muted">prompt redacted in logs — argv only</div>`
-      }
+      ${promptBody(r)}
     </div>`,
         )
         .join('')}</div>`

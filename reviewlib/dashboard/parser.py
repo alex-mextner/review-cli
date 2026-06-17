@@ -481,6 +481,18 @@ class Session:
         return max(0.0, (self.ended - self.started).total_seconds())
 
     @property
+    def invocations(self) -> list[str]:
+        """The distinct recorded invocation lines (``argv0``) for this session, in order.
+
+        The prompt/diff is redacted from the logs, so ``argv0`` (the backend command/endpoint,
+        e.g. ``z.ai API glm-5.2``) is the only durable "what was run" a non-brainstorm session
+        has; surfacing it lets the Prompts panel / panel rows show the invocation instead of a
+        bare "redacted" note. Order-preserving de-dup (one entry per distinct seat)."""
+        return list(dict.fromkeys(
+            inv for c in self.calls if (inv := (c.argv0 or "").strip())
+        ))
+
+    @property
     def has_error(self) -> bool:
         return any(c.has_error for c in self.calls)
 
@@ -513,6 +525,10 @@ class Session:
             "running": self.running,
             "has_brainstorm": self.brainstorm is not None,
             "topic": self.brainstorm.topic if self.brainstorm else None,
+            # The recorded invocation(s) — the closest thing to a "prompt" a non-brainstorm
+            # run leaves behind (the prompt itself is redacted). Lets the Prompts panel /
+            # panel rows show the invoked command instead of "redacted, argv only".
+            "invocations": self.invocations,
         }
 
     def to_detail(self) -> dict:

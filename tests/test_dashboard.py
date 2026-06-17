@@ -145,6 +145,60 @@ def test_parse_brainstorm_personas_not_polluted_by_model_headings():
         assert "must stay in the persona body" in prag["text"]
 
 
+def test_parse_brainstorm_real_on_disk_format_with_sentinels():
+    """The parser extracts the real topic/panel/moderator/personas from the ACTUAL discussion
+    log shape modes/brainstorm.py writes (session/round/final `<!-- review:* -->` sentinels +
+    a blank line before `panel=`), keeping the sentinels out of the topic and transcripts."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        md = ld / "20260601T120000_000000Z-brainstorm.md"
+        # Byte-for-byte the structure modes/brainstorm.py emits (see its `_disc` calls).
+        md.write_text(
+            "# Brainstorm: Design a fast change-vs-justAsk classifier\n"
+            "<!-- review:session abc123 -->\n"
+            "\n"
+            "panel=codex,gemini moderator=codex rounds>=5 max=8\n"
+            "\n"
+            "# Round 1\n"
+            "<!-- review:round 1 nonce=abc123 -->\n"
+            "#### Pragmatic staff engineer (codex)\n"
+            "Keep it simple, short-circuit interrogatives.\n"
+            "\n"
+            "#### Security reviewer (gemini)\n"
+            "Watch for prompt-injection in the cached text.\n"
+            "\n"
+            "## Moderator (round 1)\n"
+            "CONTINUE. Panel agrees on a heuristic prefilter.\n"
+            "\n"
+            "# Final synthesis\n"
+            "<!-- review:final nonce=abc123 -->\n"
+            "Ship the tiered classifier.\n",
+            encoding="utf-8",
+        )
+        bs = p.parse_brainstorm_log(md)
+        assert bs is not None
+        # The REAL topic — never the sentinel, never empty.
+        assert bs.topic == "Design a fast change-vs-justAsk classifier", repr(bs.topic)
+        assert "review:session" not in bs.topic
+        assert bs.panel == ["codex", "gemini"], bs.panel
+        assert bs.moderator == "codex", bs.moderator
+        r1 = next(r for r in bs.rounds if r["round"] == 1)
+        assert [pp["name"] for pp in r1["personas"]] == ["Pragmatic staff engineer", "Security reviewer"]
+        # The round/session sentinels must NOT bleed into any persona transcript.
+        for pp in r1["personas"]:
+            assert "review:round" not in pp["text"], pp
+            assert "review:session" not in pp["text"], pp
+            assert "review:final" not in pp["text"], pp
+        assert "short-circuit interrogatives" in r1["personas"][0]["text"]
+        # The moderator decision + the synthesis are not attributed to a persona.
+        for rnd in bs.rounds:
+            for pp in rnd["personas"]:
+                assert "CONTINUE" not in pp["text"], pp
+                assert "Ship the tiered classifier" not in pp["text"], pp
+
+
 def test_brainstorm_moderator_and_synthesis_not_attributed_to_a_persona():
     """(codex P2) `## Moderator (round N)` and `# Final synthesis` are written after a
     round's persona blocks; they must NOT bleed into the last persona's transcript, or the
@@ -382,6 +436,70 @@ def test_cluster_sessions_and_modes():
         assert bs.brainstorm is not None
         assert bs.brainstorm.topic == "How to decompose a CLI"
         assert len(bs.roles()) >= 2
+
+
+def test_panel_session_surfaces_recorded_invocations_as_prompt():
+    """A non-brainstorm panel run has no topic; Session.invocations must surface the DISTINCT
+    recorded argv0 lines and to_summary must expose them as `invocations`, so the Prompts panel
+    / panel rows can show the invocation instead of a blank 'redacted' note."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # A 3-seat panel at the same instant: each call records a distinct argv0. The 2nd and
+        # 3rd share a backend invocation string to prove de-dup keeps it once.
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n",
+                        argv0="/opt/homebrew/bin/codex", exit_code=0)
+        _write_call_log(ld, "20260601T100001_000000", "z.ai", 0, "ok\n",
+                        argv0="z.ai API glm-5.2", exit_code=0)
+        _write_call_log(ld, "20260601T100002_000000", "gemini", 0, "ok\n",
+                        argv0="z.ai API glm-5.2", exit_code=0)  # duplicate invocation string
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        assert len(sessions) == 1, sessions
+        s = sessions[0]
+        assert s.mode == "panel", s.mode
+        # Distinct, order-preserving, de-duplicated invocation lines.
+        assert s.invocations == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], s.invocations
+        # And the summary exposes them for the UI (was missing entirely before).
+        summ = s.to_summary()
+        assert summ["topic"] is None, "a panel run has no brainstorm topic"
+        assert summ["invocations"] == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], summ
+        # An empty argv0 is never surfaced as a blank invocation.
+        empty = p.Session("sess-x", s.started, s.ended, calls=[
+            p.CallLog("", "x.log", s.started, "codex", 0, argv0="", body="")
+        ])
+        assert empty.invocations == [], empty.invocations
+
+
+def test_invocations_endpoint_returns_populated_prompt_for_panel():
+    """GET /api/runs returns a populated `invocations` list for a panel session, so the Prompts
+    panel renders the invoked command rather than a blank/redacted placeholder."""
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        try:
+            _write_call_log(Path(logd), "20260601T100000_000000", "codex", 0, "ok\n",
+                            argv0="/opt/homebrew/bin/codex", exit_code=0)
+            _write_call_log(Path(logd), "20260601T100001_000000", "z.ai", 0, "ok\n",
+                            argv0="z.ai API glm-5.2", exit_code=0)
+            from reviewlib.dashboard import server
+
+            httpd = server.make_server(0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                with urllib.request.urlopen(base + "/api/runs", timeout=10) as r:
+                    runs = json.loads(r.read().decode("utf-8"))
+                assert len(runs) == 1, runs
+                assert runs[0]["mode"] == "panel", runs[0]
+                assert runs[0]["invocations"] == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], runs[0]
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
 
 
 def test_compute_stats_against_fixtures():
