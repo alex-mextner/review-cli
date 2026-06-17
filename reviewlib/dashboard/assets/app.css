@@ -68,6 +68,28 @@ body {
 }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+/* Count of currently-problematic models, shown on the Models & roles tab. Hidden
+   (the [hidden] attribute) when zero. Same red palette as .badge.err. */
+.tab-badge {
+  display: inline-block; min-width: 16px; margin-left: 6px; padding: 0 5px;
+  border-radius: 999px; font-size: 10px; font-weight: 700; line-height: 16px;
+  text-align: center; color: #fff; background: var(--red); vertical-align: middle;
+}
+.tab-badge[hidden] { display: none; }
+
+/* Per-model health rows on the Models & roles tab. */
+.model-health { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.model-health .mh-name { font-family: var(--mono); font-size: 12px; min-width: 120px; }
+.model-health .mh-rate { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.model-health .mh-bar-track {
+  flex: 1 1 120px; min-width: 80px; max-width: 220px; height: 8px;
+  background: var(--bg-elev2); border-radius: 4px; overflow: hidden;
+}
+.model-health .mh-bar-fill { height: 100%; background: var(--green); }
+.model-health.is-problematic .mh-bar-fill { background: var(--red); }
+/* Health status pills reuse the .badge palette; .degraded is the amber middle ground. */
+.badge.degraded { color: var(--amber); border-color: var(--amber); }
+.badge.nodata { color: var(--muted); border-color: var(--muted); }
 
 #main { padding: 20px; max-width: 1200px; margin: 0 auto; }
 .panel h2 { font-size: 18px; margin: 0 0 4px; }

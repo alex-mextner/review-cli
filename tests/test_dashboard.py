@@ -520,6 +520,331 @@ def test_compute_stats_against_fixtures():
         assert stats["by_mode"]["brainstorm"] == 1
 
 
+# --- per-model health classifier (Models & roles tab) -----------------------
+#
+# These cover the dashboard's per-model health view + the problematic-count badge. Each
+# fixture log is written in the EXACT on-disk format for one real failure class, so the
+# classifier is exercised against the same bytes review-cli writes (paywall / 401 auth /
+# 403 + 1010 blocked / 124 timeout / empty / ok), plus the model-attribution that splits
+# the shared `commandcode` / `z.ai` backends into their gateway models and the `claude`
+# wrapper into Fable (paywall) vs Opus.
+
+
+def _fable_paywall_log(log_dir: Path, stamp: str) -> Path:
+    # The on-disk Fable body has interior whitespace collapsed (the logger strips it), so
+    # the sentinel reads `currentlyunavailable`. EXIT is 0 — the body, not the code, is the
+    # failure signal.
+    return _write_call_log(
+        log_dir, stamp, "claude", 0,
+        "ClaudeFable5iscurrentlyunavailable.Learnmore:\nhttps://www.anthropic.com/news/fable\n",
+        argv0="/Users/x/.local/bin/claude-p", exit_code=0,
+    )
+
+
+def _opus_ok_log(log_dir: Path, stamp: str) -> Path:
+    return _write_call_log(
+        log_dir, stamp, "claude", 0,
+        "## Findings\n1. A real, substantive review verdict about the diff.\n",
+        argv0="/Users/x/.local/bin/claude-p", exit_code=0,
+    )
+
+
+def test_classify_paywall_auth_blocked_timeout_empty_ok():
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # paywall — Fable, EXIT 0, body sentinel
+        paywall = p.parse_call_log(_fable_paywall_log(ld, "20260601T100000_000000"))
+        # auth — z.ai bad key, EXIT 401
+        auth = p.parse_call_log(_write_call_log(
+            ld, "20260601T100100_000000", "z.ai", 0,
+            '[stderr] {"error":"bad key"}\n', argv0="z.ai API glm-5.2", exit_code=401))
+        # blocked — commandcode Cloudflare, EXIT 403 + 1010
+        blocked = p.parse_call_log(_write_call_log(
+            ld, "20260601T100200_000000", "commandcode", 0,
+            "[stderr] error code: 1010\n", argv0="commandcode API moonshotai/Kimi-K2.7-Code",
+            exit_code=403))
+        # timeout — EXIT 124 + marker
+        timeout = p.parse_call_log(_write_call_log(
+            ld, "20260601T100300_000000", "commandcode", 0,
+            "partial\n[stderr] commandcode API request failed: timed out\n"
+            "[review-cli] TIMEOUT after 10s — partial output above]\n",
+            argv0="commandcode API Qwen/Qwen3.7-Max", exit_code=124))
+        # empty — EXIT 0, output_tokens=0, no real content
+        empty = p.parse_call_log(_write_call_log(
+            ld, "20260601T100400_000000", "z.ai", 0,
+            "[reasoning_content — no final answer returned]\n\nprompt_tokens=0 output_tokens=0\n",
+            argv0="z.ai API glm-5.2", exit_code=0))
+        # ok — EXIT 0, real verdict
+        ok = p.parse_call_log(_opus_ok_log(ld, "20260601T100500_000000"))
+
+        assert p.classify_call(paywall) == p.HEALTH_PAYWALL
+        assert p.classify_call(auth) == p.HEALTH_AUTH
+        assert p.classify_call(blocked) == p.HEALTH_BLOCKED
+        assert p.classify_call(timeout) == p.HEALTH_TIMEOUT
+        assert p.classify_call(empty) == p.HEALTH_EMPTY
+        assert p.classify_call(ok) == p.HEALTH_OK
+
+
+def test_real_output_with_zero_usage_fallback_is_ok_not_empty():
+    """A REST backend that returns REAL review text but omits usage metadata still appends a
+    fallback usage line (`input_tokens=0 output_tokens=0`). The zero-usage line must NOT make
+    the classifier call it empty — there is a real verdict above it, so it's OK."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # claude API mode: real verdict body, then the zero-usage fallback the backend writes
+        # when the response carried no usage block.
+        real = p.parse_call_log(_write_call_log(
+            ld, "20260601T100600_000000", "claude", 0,
+            "## Findings\n1. A real, substantive review verdict about the diff.\n"
+            "\n\ninput_tokens=0 output_tokens=0\n",
+            argv0="Anthropic API claude-opus-4-8", exit_code=0))
+        assert p.classify_call(real) == p.HEALTH_OK
+
+        # Guard the other half: a claude API call with ONLY the zero-usage fallback line
+        # (no verdict text) is still genuinely EMPTY — dropping the blanket short-circuit
+        # must not start mis-classifying a truly empty call as OK.
+        truly_empty = p.parse_call_log(_write_call_log(
+            ld, "20260601T100650_000000", "claude", 0,
+            "input_tokens=0 output_tokens=0\n",
+            argv0="Anthropic API claude-opus-4-8", exit_code=0))
+        assert p.classify_call(truly_empty) == p.HEALTH_EMPTY
+
+
+def test_model_attribution_splits_shared_backends_and_claude():
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        kimi = p.parse_call_log(_write_call_log(
+            ld, "20260601T100000_000000", "commandcode", 0, "x\n",
+            argv0="commandcode API moonshotai/Kimi-K2.7-Code", exit_code=0))
+        deepseek = p.parse_call_log(_write_call_log(
+            ld, "20260601T100100_000000", "commandcode", 0, "x\n",
+            argv0="commandcode API deepseek/deepseek-v4-pro", exit_code=0))
+        glm = p.parse_call_log(_write_call_log(
+            ld, "20260601T100200_000000", "z.ai", 0, "x\n",
+            argv0="z.ai API glm-5.2", exit_code=0))
+        codex = p.parse_call_log(_write_call_log(
+            ld, "20260601T100300_000000", "codex", 0, "x\n",
+            argv0="/opt/homebrew/bin/codex", exit_code=0))
+        fable = p.parse_call_log(_fable_paywall_log(ld, "20260601T100400_000000"))
+        opus = p.parse_call_log(_opus_ok_log(ld, "20260601T100500_000000"))
+
+        # commandcode + z.ai split into their gateway model ids (board prefixes).
+        assert p.model_id_for_call(kimi) == "commandcode:moonshotai/Kimi-K2.7-Code"
+        assert p.model_id_for_call(deepseek) == "commandcode:deepseek/deepseek-v4-pro"
+        assert p.model_id_for_call(glm) == "zai:glm-5.2"
+        assert p.model_id_for_call(codex) == "codex"
+        # claude wrapper is identical on disk; the body splits Fable (paywall) from Opus.
+        assert p.model_id_for_call(fable) == "claude:claude-fable-5"
+        assert p.model_id_for_call(opus) == "claude:claude-opus-4-8"
+
+
+def test_claude_api_argv0_identifies_model_before_opus_default():
+    """In Claude API mode the sidecar argv0 carries the EXACT model as `Anthropic API
+    <model>` (optionally `@ <base>`). The attributor must read that argv0 to identify the
+    model BEFORE defaulting to Opus — otherwise an API-mode Fable call (no paywall body)
+    is mis-attributed to the Opus seat."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # API-mode Fable: real text body (no paywall sentinel), argv0 names Fable.
+        fable_api = p.parse_call_log(_write_call_log(
+            ld, "20260601T100600_000000", "claude", 0,
+            "## Findings\n1. A real verdict from Fable via the API.\n",
+            argv0="Anthropic API claude-fable-5", exit_code=0))
+        # API-mode Opus, with the trailing `@ <base>` form the backend also emits.
+        opus_api = p.parse_call_log(_write_call_log(
+            ld, "20260601T100700_000000", "claude", 0,
+            "## Findings\n1. A real verdict from Opus via the API.\n",
+            argv0="Anthropic API claude-opus-4-8 @ https://api.anthropic.com", exit_code=0))
+        # CLI mode (claude-p): argv0 has no model, so the body sentinel still decides.
+        opus_cli = p.parse_call_log(_opus_ok_log(ld, "20260601T100800_000000"))
+        # CLI mode where the `claude-p` binary PATH itself contains `API ` (e.g. installed
+        # under `/opt/API Tools/`). A generic `\bAPI ` match would mis-read `Tools/claude-p`
+        # as the model; the anchored `^Anthropic API ` match must NOT, so this still falls
+        # through to the body sentinel (paywall=Fable / else Opus).
+        opus_cli_apipath = p.parse_call_log(_write_call_log(
+            ld, "20260601T100900_000000", "claude", 0,
+            "## Findings\n1. A real verdict from Opus via the CLI.\n",
+            argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p", exit_code=0))
+        fable_cli_apipath = p.parse_call_log(_write_call_log(
+            ld, "20260601T101000_000000", "claude", 0,
+            "ClaudeFable5iscurrentlyunavailable.Learnmore:\n",
+            argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p", exit_code=0))
+
+        assert p.model_id_for_call(fable_api) == "claude:claude-fable-5"
+        assert p.model_id_for_call(opus_api) == "claude:claude-opus-4-8"
+        assert p.model_id_for_call(opus_cli) == "claude:claude-opus-4-8"
+        assert p.model_id_for_call(opus_cli_apipath) == "claude:claude-opus-4-8"
+        assert p.model_id_for_call(fable_cli_apipath) == "claude:claude-fable-5"
+
+
+def test_paywall_sentinel_survives_whitespace_collapse():
+    """The Fable body lands de-spaced (`currentlyunavailable`); a spaced match would miss
+    it. The classifier normalizes whitespace, so both renderings classify as paywall."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        spaced = p.parse_call_log(_write_call_log(
+            ld, "20260601T100000_000000", "claude", 0,
+            "Claude Fable 5 is currently unavailable. Learn more:\n",
+            argv0="/x/claude-p", exit_code=0))
+        collapsed = p.parse_call_log(_fable_paywall_log(ld, "20260601T100100_000000"))
+        assert p.classify_call(spaced) == p.HEALTH_PAYWALL
+        assert p.classify_call(collapsed) == p.HEALTH_PAYWALL
+
+
+def test_compute_model_health_covers_board_and_flags_problematic():
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # Kimi (commandcode) — 3 blocked calls => hard-unavailable + 0% ok => problematic.
+        for i in range(3):
+            _write_call_log(ld, f"20260601T1000{i:02d}_000000", "commandcode", 0,
+                            "[stderr] error code: 1010\n",
+                            argv0="commandcode API moonshotai/Kimi-K2.7-Code", exit_code=403)
+        # GLM (z.ai) — 3 auth failures => problematic.
+        for i in range(3):
+            _write_call_log(ld, f"20260601T1100{i:02d}_000000", "z.ai", 0,
+                            '[stderr] {"error":"bad key"}\n',
+                            argv0="z.ai API glm-5.2", exit_code=401)
+        # Fable (claude) — paywall => problematic.
+        _fable_paywall_log(ld, "20260601T120000_000000")
+        # Codex — 4 healthy calls => NOT problematic (ok-rate 100%).
+        for i in range(4):
+            _write_call_log(ld, f"20260601T1300{i:02d}_000000", "codex", 0,
+                            "## Findings\nA substantive review verdict.\n",
+                            argv0="/opt/homebrew/bin/codex", exit_code=0)
+
+        stats = p.compute_stats(p.load_sessions(ld))
+        health = {m["model"]: m for m in stats["model_health"]}
+
+        # Every board model is represented (covers the whole board, even no-data seats).
+        for board_id in ("claude:claude-fable-5", "claude:claude-opus-4-8", "codex",
+                         "commandcode:moonshotai/Kimi-K2.7-Code", "zai:glm-5.2"):
+            assert board_id in health, board_id
+
+        assert health["commandcode:moonshotai/Kimi-K2.7-Code"]["problematic"] is True
+        assert health["commandcode:moonshotai/Kimi-K2.7-Code"]["dominant_class"] == p.HEALTH_BLOCKED
+        assert health["zai:glm-5.2"]["problematic"] is True
+        assert health["zai:glm-5.2"]["dominant_class"] == p.HEALTH_AUTH
+        assert health["claude:claude-fable-5"]["problematic"] is True
+        assert health["claude:claude-fable-5"]["dominant_class"] == p.HEALTH_PAYWALL
+        assert health["codex"]["problematic"] is False
+        assert health["codex"]["ok_rate"] == 1.0
+        # Opus had no calls => no_data, not problematic.
+        assert health["claude:claude-opus-4-8"]["status"] == "no_data"
+        assert health["claude:claude-opus-4-8"]["problematic"] is False
+
+        # Badge count = problematic BOARD models. Kimi + GLM + Fable = 3.
+        assert stats["problematic_count"] == 3
+
+
+def test_recent_streak_makes_a_model_problematic_even_below_rate_threshold():
+    """Most-recent-N all-failing trips problematic even when the longer-window rate is OK
+    (a fresh outage an averaged rate would otherwise dilute)."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # 6 healthy OLD codex calls (rate stays high) ...
+        for i in range(6):
+            _write_call_log(ld, f"20260601T1000{i:02d}_000000", "codex", 0,
+                            "## Findings\nA real verdict.\n",
+                            argv0="/opt/homebrew/bin/codex", exit_code=0)
+        # ... then 3 fresh timeouts (newest) — the recent streak should flip problematic.
+        for i in range(3):
+            _write_call_log(ld, f"20260601T2000{i:02d}_000000", "codex", 0,
+                            "partial\n[review-cli] TIMEOUT after 10s — partial output above]\n",
+                            argv0="/opt/homebrew/bin/codex", exit_code=124)
+
+        stats = p.compute_stats(p.load_sessions(ld))
+        codex = next(m for m in stats["model_health"] if m["model"] == "codex")
+        # 6/9 ok => ok_rate 0.667 (below the 0.5 fail threshold) but the 3 newest all fail.
+        assert codex["ok_rate"] > 0.5
+        assert codex["current_class"] == p.HEALTH_TIMEOUT
+        assert codex["problematic"] is True
+
+
+def test_model_health_empty_log_dir_is_graceful():
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        stats = p.compute_stats(p.load_sessions(Path(d) / "nope"))
+        assert stats["problematic_count"] == 0
+        # The board is still listed (all no_data), so the view never shows a blank tab.
+        assert all(m["status"] == "no_data" for m in stats["model_health"])
+        assert {m["model"] for m in stats["model_health"]} >= {"codex", "zai:glm-5.2"}
+
+
+def test_bare_commandcode_probe_keeps_backend_name_and_classifies_error():
+    """A bare `commandcode` header (no `API <model>`) has no gateway model, so the id stays
+    the backend name — and a generic non-zero exit with no recognized sentinel is ERROR."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        probe = p.parse_call_log(_write_call_log(
+            ld, "20260601T100000_000000", "commandcode", 0,
+            "[stderr] something generic went wrong\n", argv0="commandcode", exit_code=2))
+        assert p.model_id_for_call(probe) == "commandcode"
+        assert p.classify_call(probe) == p.HEALTH_ERROR  # exit 2, no sentinel
+
+
+def test_blocked_marker_in_body_not_just_stderr_is_blocked():
+    """The CF bot-block marker can land in the BODY (not stderr); both must classify blocked."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        in_body = p.parse_call_log(_write_call_log(
+            ld, "20260601T100000_000000", "commandcode", 0,
+            "error code: 1010\n", argv0="commandcode API Qwen/Qwen3.7-Max", exit_code=1))
+        assert p.classify_call(in_body) == p.HEALTH_BLOCKED
+
+
+def test_dominant_class_tie_break_prefers_hard_unavailable():
+    """When two failure classes are equally frequent, the dominant-class tie-break picks the
+    hard-unavailable one (the only reason HARD_UNAVAILABLE_CLASSES is ordered)."""
+    from reviewlib.dashboard import parser as p
+
+    # 2 timeout + 2 blocked -> blocked wins (hard-unavailable beats timeout on a tie).
+    assert p._dominant_class(
+        [p.HEALTH_TIMEOUT, p.HEALTH_BLOCKED, p.HEALTH_TIMEOUT, p.HEALTH_BLOCKED]
+    ) == p.HEALTH_BLOCKED
+    # All-OK -> no dominant FAILURE class.
+    assert p._dominant_class([p.HEALTH_OK, p.HEALTH_OK]) is None
+
+
+def test_non_board_model_is_appended_after_board_in_order():
+    """A backend that isn't on DEFAULT_BOARD still appears (so the view is complete), but
+    AFTER the board models, which come out in board/priority order."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.config import DEFAULT_BOARD
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # `opencode` is not on DEFAULT_BOARD.
+        _write_call_log(ld, "20260601T100000_000000", "opencode", 0,
+                        "## Findings\nA real verdict.\n", argv0="/x/opencode", exit_code=0)
+        stats = p.compute_stats(p.load_sessions(ld))
+        ids = [m["model"] for m in stats["model_health"]]
+        board_ids = [b.model for b in DEFAULT_BOARD]
+        # Board ids lead, in DEFAULT_BOARD order; the non-board id trails.
+        assert ids[: len(board_ids)] == board_ids
+        assert "opencode" in ids and ids.index("opencode") >= len(board_ids)
+        opencode = next(m for m in stats["model_health"] if m["model"] == "opencode")
+        assert opencode["on_board"] is False
+
+
 def test_footerless_clean_log_is_running_not_success():
     """(codex P2) A footerless, error-free log = a call still streaming or whose writer
     died before the EXIT footer. It must NOT be counted as a success: completed is False,
