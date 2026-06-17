@@ -16,10 +16,20 @@ DEFAULT_PROMPT = (
     "Review this uncommitted git diff for bugs, regressions, security issues, "
     "and missing tests. Return only actionable findings. Do not edit files."
 )
+# Canonical Kimi seat — the SINGLE source of truth for "the Kimi model the defaults use",
+# referenced by BOTH the flat DEFAULT_MODELS panel below and the priority-4 seat of
+# DEFAULT_BOARD. It routes through the commandcode gateway, NOT the old
+# `oc:fireworks/.../kimi-k2p6-turbo` route, which ran on the suspended Fireworks `glide`
+# account and is dead (ROADMAP §7, review-cli#25). One constant so the flat panel and the
+# board can never drift back to the dead route — the staleness that motivated this fix
+# existed precisely because the Kimi seat was spelled independently in two places and only
+# the board was kept current (the flat panel rotted on the dead Fireworks route).
+KIMI_SEAT = "commandcode:moonshotai/Kimi-K2.7-Code"
+
 # Code default keeps a self-sufficient panel (incl. opencode). Personal model
 # preferences live in ~/.config/review-cli/config.yaml (keys: models,
 # brainstorm_models) and override this — see load_config().
-DEFAULT_MODELS = ("codex", "gemini", "oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo")
+DEFAULT_MODELS = ("codex", "gemini", KIMI_SEAT)
 # Friendly aliases for claude models, expanded in _split_models() and the
 # default/config paths, so `-m fable5` == `-m claude:claude-fable-5`.
 MODEL_ALIASES = {
@@ -184,8 +194,9 @@ DEFAULT_BOARD = (
     # priority 3 — Codex: the agentic codex CLI route (reads the whole repo), NOT the
     # diff-only `commandcode:gpt-5.5` HTTP route. GPT-5.5 is codex; the agentic route wins.
     BoardReviewer("codex", "consistency", "Codex"),
-    # priority 4 — Kimi K2.7 via commandcode.
-    BoardReviewer("commandcode:moonshotai/Kimi-K2.7-Code", "performance", "Kimi"),
+    # priority 4 — Kimi K2.7 via commandcode (KIMI_SEAT: the same canonical seat the flat
+    # DEFAULT_MODELS panel uses, so the two share one source of truth and can't drift).
+    BoardReviewer(KIMI_SEAT, "performance", "Kimi"),
     # priority 5 — GLM-5.2 DIRECT to z.ai (his GLM subscription), the newest GLM.
     BoardReviewer("zai:glm-5.2", "quality", "GLM"),
     # priority 6 — Qwen3.7-Max via commandcode.
