@@ -403,6 +403,7 @@ _UNIT_FILES = [
     ("test_no_git_repo.py", {}),
     ("test_output_flag.py", {}),
     ("test_opencode_realrepo.py", {}),
+    ("test_readonly_agent.py", {}),
     ("test_specweb.py", {}),
     ("test_claude_api.py", {}),
     ("test_provider_keys.py", {}),

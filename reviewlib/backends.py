@@ -14,7 +14,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import textwrap
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -84,34 +83,201 @@ def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int, ro
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
+# Every capability the read-only reviewer agent MUST deny. This is the security boundary
+# the whole agentic-opencode path relies on: opencode may READ project files under this
+# agent, but every one of these must be `deny` so it can never mutate the repo, run a
+# shell command, or hit the network. This list mirrors opencode's mutating/egress
+# permission keys as of the version this CLI targets.
+#
+# SCOPE / LIMITATION (review-cli#40 review finding): the validator's guarantee is "none of
+# THESE keys grants, and nothing PRESENT grants". It canNOT defend against a FUTURE
+# opencode capability that (a) is not in this list and (b) defaults to permissive when
+# absent — such a key would need to be added here AND to the canonical file. So this set
+# must be kept in sync with opencode's permission surface; it is the floor, not a proof
+# that opencode exposes nothing else. (opencode has no documented deny-by-default/wildcard
+# we can lean on instead, so an explicit, maintained key list is the available mitigation.)
+_READONLY_AGENT_DENIED_PERMISSIONS = (
+    "bash",
+    "edit",
+    "write",
+    "webfetch",
+    "task",
+    "todowrite",
+    "websearch",
+    "lsp",
+    "skill",
+)
+
+# The canonical, safe read-only-reviewer agent. SINGLE SOURCE OF TRUTH: the permission
+# block is GENERATED from `_READONLY_AGENT_DENIED_PERMISSIONS` (not duplicated as a
+# literal), so the validator (which reads that tuple) and the writer can never drift — a
+# deny key added to the tuple is both enforced AND written. Both the "create when missing"
+# and "rewrite a permissive/tampered one" paths write THIS exact content.
+def _build_readonly_agent_markdown() -> str:
+    perm_lines = "\n".join(f"  {name}: deny" for name in _READONLY_AGENT_DENIED_PERMISSIONS)
+    return (
+        "---\n"
+        "description: Read-only code reviewer for diff inspection.\n"
+        "mode: primary\n"
+        "permission:\n"
+        f"{perm_lines}\n"
+        "---\n"
+        "You are a read-only code reviewer. Do not edit files, write files, run\n"
+        "shell commands, or ask questions. Return only actionable findings.\n"
+    )
+
+
+_READONLY_AGENT_MARKDOWN = _build_readonly_agent_markdown()
+
+
+def _frontmatter_yaml(text: str) -> str | None:
+    """The YAML between the opening ``---`` and the next CLOSING ``---``, each on its OWN
+    line (the markdown frontmatter convention), or ``None`` if there is no such block.
+
+    Splitting on a LINE-anchored delimiter (not a bare ``---`` substring) avoids tearing
+    the YAML on a ``---`` that appears INSIDE a value (e.g. ``description: a---b``), which a
+    naive ``str.split('---')`` would mis-cut — turning a legit file into "unparseable" and
+    forcing a needless rewrite."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "\n".join(lines[1:i])
+    return None  # opening --- but no closing --- => not a frontmatter block
+
+
+def _agent_frontmatter(text: str) -> dict | None:
+    """Parse the YAML frontmatter of an opencode agent markdown file into a dict.
+
+    Returns ``None`` when there is no line-delimited ``---`` frontmatter block or it does
+    not parse to a mapping — the caller treats that as "not a trusted read-only definition"
+    and rewrites the canonical one. PyYAML is a hard dependency (it parses config.yaml),
+    but the import stays lazy/guarded so a broken install degrades to "rewrite" rather
+    than a traceback on the hot review path."""
+    block = _frontmatter_yaml(text)
+    if block is None:
+        return None
+    try:
+        import yaml
+
+        data = yaml.safe_load(block)
+    except Exception:  # noqa: BLE001 — any parse/import failure => not trusted
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _permission_value_is_fully_denied(value: object) -> bool:
+    """True if a single permission VALUE grants nothing.
+
+    opencode accepts both the scalar form (``bash: deny``) and a granular per-pattern map
+    (``bash: {"*": deny, "git diff": deny}``). A value denies everything iff it is:
+      * the string ``deny``; OR
+      * a granular map that has an explicit catch-all ``"*": deny`` AND every other leaf is
+        also fully denied.
+    The catch-all requirement is the SECURITY-CRITICAL bit (verified against opencode's
+    permission docs, review-cli#40): opencode's defaults are PERMISSIVE and rules match by
+    "last matching wins", so a granular map WITHOUT a ``"*"`` catch-all leaves every
+    UNLISTED command at the default ``allow``. A map like ``bash: {"git status": deny}``
+    would otherwise look "all-deny" to a naive scan yet permit arbitrary other shell — the
+    exact tampered-agent hole this hardening must close. An empty map, a missing/non-deny
+    ``"*"``, a string other than ``deny`` (``allow``/``ask``), or any other type is a GRANT."""
+    if isinstance(value, str):
+        return value == "deny"
+    if isinstance(value, dict):
+        if not value:
+            return False
+        # A granular map must explicitly deny the catch-all (unlisted patterns default to
+        # allow otherwise) AND deny every other listed pattern.
+        if value.get("*") != "deny":
+            return False
+        return all(_permission_value_is_fully_denied(v) for v in value.values())
+    return False
+
+
+def _agent_is_strictly_readonly(text: str) -> bool:
+    """True only if the agent definition's permission block is at-least-as-strict as the
+    canonical deny-all set — i.e. it grants NO write/exec capability.
+
+    Strict on purpose (a stale/tampered global agent is the threat in review-cli#40):
+      * the frontmatter must parse to a mapping with a ``permission`` mapping;
+      * EVERY key we require (``_READONLY_AGENT_DENIED_PERMISSIONS``) must be present and
+        fully denied — a missing key defaults to opencode's permissive behaviour, so a
+        partial block is treated as permissive;
+      * EVERY key actually present (including extra capabilities we don't enumerate, e.g.
+        a future ``network``) must ALSO be fully denied. A single grant on ANY key — known
+        or unknown, scalar or nested — means we reject it and rewrite the canonical def.
+    "Fully denied" accepts BOTH the scalar ``deny`` and a granular per-action map whose
+    every leaf is ``deny`` (so a legitimately hardened granular config is NOT clobbered).
+    Extra keys that are themselves fully denied are ACCEPTED (a user who hardened the agent
+    with more denies is at least as safe as canonical — we must not downgrade them by
+    rewriting). Anything with a grant, a missing required key, or an unparseable frontmatter
+    is rejected so the caller rewrites the canonical safe definition.
+
+    NOTE: this enforces "no capability is granted", NOT "exactly the canonical key set".
+    The known-safe set is the FLOOR (all must be denied); extra denies only raise it."""
+    front = _agent_frontmatter(text)
+    if front is None:
+        return False
+    perms = front.get("permission")
+    if not isinstance(perms, dict):
+        return False
+    # Floor: every capability we know must be present and fully denied (a missing one
+    # falls back to opencode's permissive default, so a partial block is permissive).
+    if any(name not in perms for name in _READONLY_AGENT_DENIED_PERMISSIONS):
+        return False
+    # And nothing present (extras included) may grant anything: every value must be denied.
+    return all(_permission_value_is_fully_denied(value) for value in perms.values())
+
+
 def _ensure_opencode_readonly_agent(_project: Path, _oc_model: str) -> None:
+    """Guarantee the GLOBAL read-only-reviewer opencode agent is the safe deny-all def.
+
+    SECURITY (review-cli#40): a pre-existing global agent file is NOT trusted blindly. A
+    stale or tampered ``read-only-reviewer.md`` that ALLOWS bash/edit/write/etc would
+    silently give the "read-only" reviewer write/exec capability on the user's repo,
+    defeating the guarantee the whole agentic-opencode path leans on. So we VALIDATE an
+    existing file and REWRITE the canonical safe definition (loudly) if it is not strictly
+    read-only — never run agentically against a permissive agent. Idempotent: a file that
+    already matches the canonical deny-all set is left untouched (no spurious writes)."""
     agent = Path.home() / ".config" / "opencode" / "agents" / "read-only-reviewer.md"
     if agent.is_file():
-        return
+        try:
+            existing = agent.read_text(encoding="utf-8")
+        except OSError:
+            existing = ""
+        if _agent_is_strictly_readonly(existing):
+            return  # already the trusted deny-all definition
+        print(
+            f"[review-cli] opencode: the global read-only-reviewer agent at {agent} is "
+            "not strictly read-only (its permissions grant or omit a deny for a write/exec "
+            "capability); rewriting it to the canonical deny-all definition for safety.",
+            file=sys.stderr, flush=True,
+        )
     agent.parent.mkdir(parents=True, exist_ok=True)
-    agent.write_text(
-        textwrap.dedent(
-            """\
-            ---
-            description: Read-only code reviewer for diff inspection.
-            mode: primary
-            permission:
-              bash: deny
-              edit: deny
-              write: deny
-              webfetch: deny
-              task: deny
-              todowrite: deny
-              websearch: deny
-              lsp: deny
-              skill: deny
-            ---
-            You are a read-only code reviewer. Do not edit files, write files, run
-            shell commands, or ask questions. Return only actionable findings.
-            """
-        ),
-        encoding="utf-8",
-    )
+    _atomic_write_text(agent, _READONLY_AGENT_MARKDOWN)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` ATOMICALLY: a concurrent reader sees either the old file or
+    the complete new one, never a truncated mid-write file.
+
+    The default board runs SEVERAL agentic opencode seats in parallel, each calling
+    `_ensure_opencode_readonly_agent`. A plain `write_text` (truncate-then-write) lets one
+    seat's opencode read this agent while another seat is rewriting it — the reader could
+    get an empty/partial markdown, lose the frontmatter, and fall back to opencode's
+    PERMISSIVE defaults (bash/edit/write). Writing to a temp file in the SAME directory and
+    `os.replace`-ing it in is atomic on POSIX, so the read-only guarantee holds under
+    concurrency. The temp file is cleaned up on any write failure."""
+    fd, tmp_name = tempfile.mkstemp(prefix=".read-only-reviewer.", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)  # atomic on POSIX: reader never sees a partial file
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # Project-local opencode config paths that opencode merges when run with `--dir <cwd>`.
