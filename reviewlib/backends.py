@@ -1328,40 +1328,49 @@ def effective_provider(model: str) -> str:
 
 
 def default_routes_live(model: str) -> bool:
-    """True iff `model` is safe to ship as a DEFAULT (flat panel or board seat): its EFFECTIVE
-    provider BOTH names a real backend AND is not known-dead.
+    """True iff `model` is safe to ship as a DEFAULT (flat panel or board seat): the FULL id
+    takes a real named route AND its effective provider is not known-dead.
 
-    This is the #25 anti-rot guard's single check, and it tests the PROVIDER underneath any
-    transport — `oc:`/`opencode:` is just an agentic wrapper, so the bare provider after the
-    prefix is what must be live (codex review):
-      * `_match_named_backend(effective_provider(model))` must be non-None — the provider is
-        a deliberate, named route, NOT something that only `resolve_backend`'s opencode
-        catch-all would accept. This catches a typo BOTH in a flat default (`comandcode:...`)
-        AND in an agentic one (`oc:comandcode/...`): the bare `comandcode` matches no named
-        backend, so the transport can't mask the typo and let it rot silently at runtime —
-        the exact silent-degradation #25 is about.
-      * `effective_provider(model)` must not be in `_DEAD_PROVIDERS` — this catches a
-        provider that IS a named backend but has since gone dead. (Today `fireworks` is not
-        a named backend, so the dead `oc:fireworks/...` default is already rejected by the
-        routing check above; the denylist is the forward-looking half — when a CURRENTLY
-        named provider like `commandcode` is suspended, add it here and its defaults trip
-        immediately, without waiting for someone to also remove its `_match_named_backend`
-        branch.)
-    Both must hold. It checks named routing of the under-transport provider + a curated
-    dead-provider denylist, NOT live network reachability — a probe would need keys and
-    can't run in CI.
+    This is the #25 anti-rot guard's single check. It validates the WHOLE id against the
+    SAME matcher the dispatcher uses, not just the collapsed provider token (codex review):
+      * `_match_named_backend(model)` must be non-None — the full id resolves to a named
+        backend, NOT `resolve_backend`'s opencode catch-all. This is the real test: it
+        mirrors what `resolve_backend` does (minus the fallthrough), so a default whose full
+        id only the catch-all would accept fails. This is why checking the COLLAPSED provider
+        is not enough: `gemini-api:gemini-2.5-flash` collapses to the named token
+        `gemini-api`, but `resolve_backend` matches gemini only as the bare `gemini-api` or a
+        `gemini:` prefix — the `gemini-api:` form falls through to opencode, so the full-id
+        check is what catches it (the silent-rot #25 is about).
+      * For an `oc:`/`opencode:` AGENTIC id the matcher returns `review_opencode` for ANY
+        under-provider, so the full-id check alone can't see a dead/typo'd provider beneath
+        the transport. So the provider UNDER the transport (`effective_provider`) must ALSO
+        name a backend (rejects `oc:comandcode/...`) — checked only when a transport prefix
+        is present, since for a flat id the full-id check already covers it.
+      * `effective_provider(model)` must not be in `_DEAD_PROVIDERS` — the forward-looking
+        half: when a CURRENTLY named provider (e.g. `commandcode`) is suspended, add it here
+        and its defaults trip immediately, without also editing `_match_named_backend`.
+    It checks real named routing + a curated dead-provider denylist, NOT live network
+    reachability — a probe would need keys and can't run in CI.
 
-    CONTRACT + scope: this is enforced ONLY by the CI guard test
+    CONTRACT + scope: enforced ONLY by the CI guard test
     (`test_every_default_model_routes_live`), not at runtime — `resolve_backend` still sends
     an unknown id to opencode (back-compat). So the guard is the single line of defense, and
-    it constrains DEFAULTS to providers `_match_named_backend` knows by name: an opencode-only
-    provider that is valid at runtime but not a named branch would get a (false) `False`
+    it constrains DEFAULTS to ids `_match_named_backend` resolves to a named backend: an
+    opencode-only provider valid at runtime but not a named branch gets a (false) `False`
     here. That is intentional — every shipped default routes through a named provider today,
-    and adding one on a new provider means giving it a named branch (and the bare-token
-    contract pinned by `test_every_named_provider_bare_token_is_recognized`)."""
-    provider = effective_provider(model)
-    if _match_named_backend(provider) is None:
+    and adding one on a new provider means giving it a named branch."""
+    # Lowercase ONCE and use it for every check, so the guard mirrors `resolve_backend`
+    # (which dispatches on `model.lower()`) exactly — a mixed-case id can't pass the guard
+    # while routing differently at runtime (codex review of #49).
+    lowered = model.lower()
+    if _match_named_backend(lowered) is None:
         return False
+    provider = effective_provider(lowered)
+    if lowered.startswith(("oc:", "opencode:")):
+        # Agentic transport: the full id matched only the opencode branch, so verify the
+        # provider UNDER the transport is itself a named backend (not a dead/typo'd one).
+        if _match_named_backend(provider) is None:
+            return False
     return provider not in _DEAD_PROVIDERS
 
 

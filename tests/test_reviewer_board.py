@@ -215,6 +215,30 @@ def test_default_routes_live_catches_dead_and_typo_defaults_through_the_transpor
     assert backends.default_routes_live("opencode:comandcode/moonshotai/Kimi-K2.7-Code") is False
     # A stale default whose id names no route at all.
     assert backends.default_routes_live("totally-bogus-model-xyz") is False
+    # A bare-alias provider + model suffix that resolve_backend does NOT match on the full
+    # id (it accepts gemini only as the bare `gemini-api` or a `gemini:` prefix, never the
+    # `gemini-api:` form) and so falls through to opencode at runtime. The guard must agree:
+    # checking the COLLAPSED provider token would wrongly bless it, so the guard validates
+    # the FULL id route (codex review of #49). Same for the `claude-p:` form.
+    assert backends.resolve_backend("gemini-api:gemini-2.5-flash") is backends.review_opencode
+    assert backends.default_routes_live("gemini-api:gemini-2.5-flash") is False
+    assert backends.resolve_backend("claude-p:claude-opus-4-8") is backends.review_opencode
+    assert backends.default_routes_live("claude-p:claude-opus-4-8") is False
+    # ...but the spellings resolve_backend DOES match on the full id still pass.
+    assert backends.default_routes_live("gemini:gemini-2.5-flash") is True
+    assert backends.default_routes_live("zai:glm-5.2") is True
+    # Mixed case: the guard lowercases exactly like resolve_backend, so a mixed-case id gets
+    # the SAME verdict as its lowercase form (the guard must mirror the dispatcher, codex #49).
+    assert backends.resolve_backend("Codex") is backends.resolve_backend("codex")
+    assert backends.default_routes_live("Codex") is True
+    assert backends.default_routes_live("OC:Commandcode/moonshotai/Kimi-K2.7-Code") is True
+    assert backends.default_routes_live("OC:Fireworks/x/y") is False  # dead, mixed case
+    # Intentional flat-vs-agentic asymmetry: `oc:gemini-api/model` passes because the agentic
+    # opencode transport DOES route an arbitrary `provider/model` (gemini-api is a real
+    # opencode provider), whereas the flat keyed-HTTP `gemini-api:model` does not — they have
+    # different runtime routes, and the guard tracks each (not a bug).
+    assert backends.resolve_backend("oc:gemini-api/gemini-2.5-flash") is backends.review_opencode
+    assert backends.default_routes_live("oc:gemini-api/gemini-2.5-flash") is True
     # The live defaults pass, via every transport spelling (flat, `oc:`, `opencode:`).
     assert backends.default_routes_live(KIMI_SEAT) is True
     assert backends.default_routes_live(_agentic(KIMI_SEAT)) is True
@@ -258,15 +282,16 @@ def test_dead_provider_denylist_is_load_bearing_in_the_guard():
 
 
 def test_every_named_provider_bare_token_is_recognized():
-    """`default_routes_live` checks `_match_named_backend(effective_provider(model))`, i.e.
-    the BARE provider token (`commandcode`, `zai`, ...), not the full `provider:model` id.
-    That only works if every named provider's resolve_backend branch matches the bare token,
-    not just the `provider:`-prefixed form — otherwise a legitimate default on a
-    bare-token-unmatched provider would get a false `False` from the guard.
+    """For an AGENTIC `oc:`/`opencode:` default, `default_routes_live` checks the bare
+    provider token under the transport (`_match_named_backend(effective_provider(model))`,
+    e.g. `commandcode`/`zai` from `oc:commandcode/...`). That only works if every named
+    provider's resolve_backend branch matches the bare token, not just the `provider:`-prefixed
+    form — otherwise a legitimate agentic default on a bare-token-unmatched provider would get
+    a false `False`.
 
     This pins that contract across ALL named providers the defaults use: each bare token
     must resolve to its backend. If a future provider is added with a branch that matches
-    only `startswith('newprov:')`, this test (and the iterating guard above) goes red — the
+    only `startswith('newprov:')`, an `oc:newprov/...` default (and this test) goes red — the
     fix is to make the branch accept the bare token too, so the #25 guard keeps working."""
     bare_to_backend = {
         "codex": backends.review_codex,
