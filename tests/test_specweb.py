@@ -593,12 +593,16 @@ def test_server_unreferenced_asset_not_served():
             # referenced figure -> 200
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
             c.request("GET", "/asset/fig.svg")
-            r = c.getresponse(); r.read(); c.close()
+            r = c.getresponse()
+            r.read()
+            c.close()
             assert r.status == 200, r.status
             # unreferenced file in the same dir -> 404
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
             c.request("GET", "/asset/private-notes.txt")
-            r = c.getresponse(); body = r.read(); c.close()
+            r = c.getresponse()
+            body = r.read()
+            c.close()
             assert r.status == 404, (r.status, body)
             assert b"CONFIDENTIAL-PAYLOAD" not in body
         finally:
@@ -819,7 +823,9 @@ def test_server_origin_guard_loopback_foreign_contenttype():
             # wrong content-type REJECTED (415) even from loopback
             c = s.conn()
             c.request("POST", "/api/comments", body=b"body=x", headers={"Content-Type": "text/plain"})
-            r = c.getresponse(); r.read(); c.close()
+            r = c.getresponse()
+            r.read()
+            c.close()
             assert r.status == 415, r.status
         finally:
             s.stop()
@@ -1551,7 +1557,7 @@ def test_store_concurrent_draft_writes_highest_token_always_wins():
     import random
 
     with _TempStoreEnv():
-        store = SpecStore(FIXTURE)
+        SpecStore(FIXTURE)  # create the store area; threads below open their own handles
         tokens = list(range(1, 51))
         random.shuffle(tokens)  # fire them in a random order across threads
 
@@ -1620,7 +1626,8 @@ def _run_specweb_until_submit(spec, posts):
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
         c.request("POST", path, body=json.dumps(obj).encode("utf-8"),
                   headers={"Content-Type": "application/json", "Origin": "http://127.0.0.1:%d" % port})
-        c.getresponse().read(); c.close()
+        c.getresponse().read()
+        c.close()
     th.join(timeout=10)
     assert not th.is_alive(), ("run_specweb did not return after submit", buf.getvalue())
     return buf.getvalue(), holder.get("rc")

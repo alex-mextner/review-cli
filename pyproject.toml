@@ -51,3 +51,14 @@ include = ["reviewlib*"]
 [tool.setuptools.package-data]
 "reviewlib.dashboard" = ["assets/*.html", "assets/*.js", "assets/*.css"]
 "reviewlib.specweb" = ["static/*.html", "static/*.css", "static/*.js"]
+
+# Lint config. The default rule set (pyflakes `F` + a pycodestyle `E`/`W` subset) is kept
+# deliberately — it is exactly what surfaced the latent F401/F541/F841/E702 errors this
+# config + the CI `lint` job now keep out. `target-version` is pinned to the project's Python
+# floor (requires-python = ">=3.9") so that IF a version-gated rule family (e.g. UP, parts of
+# B) is adopted later it is judged against the right Python; with TODAY's default set there
+# are no version-gated rules, so target-version is latent, not active. The CI job pins the
+# ruff VERSION (see .github/workflows/ci.yml) so a new ruff release can't flip a green PR red
+# on its own; bump both together when intentionally adopting newer rules.
+[tool.ruff]
+target-version = "py39"

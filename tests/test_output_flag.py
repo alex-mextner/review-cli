@@ -23,7 +23,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from reviewlib import cli  # noqa: E402
 from reviewlib.cli import _extract_output_path, main  # noqa: E402
 
 
@@ -101,6 +100,22 @@ def test_extract_does_not_steal_value_of_value_taking_flag():
     out, rest = _extract_output_path(["--prompt", "Q", "-o", "real.md"])
     assert out == Path("real.md"), out
     assert rest == ["--prompt", "Q"], rest
+
+
+def test_extract_does_not_steal_retry_value():
+    # `--retry` is a diff-mode int option (reviewlib/modes/review.py) listed in
+    # _VALUE_TAKING_OPTS. The pre-scan must skip its argument, so an `-o`-shaped retry
+    # value is NOT mis-read as the output flag — and a real `-o` that follows still wins.
+    # This guards the exact regression the _VALUE_TAKING_OPTS entry prevents: a future
+    # refactor dropping `--retry` from the set would silently fail this case.
+    # `-o…`-shaped value after --retry is its argument, not the output flag.
+    out, rest = _extract_output_path(["--retry", "-osmth", "-o", "out.md"])
+    assert out == Path("out.md"), out
+    assert rest == ["--retry", "-osmth"], rest
+    # A legitimate `--retry N -o FILE` still resolves the output to FILE.
+    out, rest = _extract_output_path(["--retry", "3", "-o", "out.md"])
+    assert out == Path("out.md"), out
+    assert rest == ["--retry", "3"], rest
 
 
 def test_extract_absent_returns_none_and_unchanged():
