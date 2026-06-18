@@ -834,6 +834,17 @@ pool fills from the next reserve); a missing **provider auth** (opencode present
 reserve backfill. (The diff-only `commandcode:`/`zai:` keyed-HTTP backends are still there
 for explicit `-m cc`/`-m glm` and config boards on hosts without opencode.)
 
+**In-seat retry before reserve-replace.** A seat that fails is first re-tried *on the same
+model* when the failure looks **transient** — a `429` rate-limit, a `529`/5xx overload, a
+provider timeout, an "overloaded"/"service unavailable" notice — with exponential backoff +
+jitter, before any reserve is promoted. The same model usually answers on the next try a
+moment later, so a brief throttle spike no longer burns a reserve seat. A **seat-fatal**
+failure (auth / bad model / `501` not-implemented / a refusal) is **never** retried — no
+retry can fix it — so it falls straight to the reserve. The retry budget is configurable via
+`--retry N` (or `$REVIEW_RETRY_COUNT`; default 2, `0` disables it). Every retry and every
+reserve promotion is recorded **durably** in the run-log dir (not just stderr), so a
+post-mortem or the dashboard can reconstruct exactly how a seat recovered or fell over.
+
 **To re-rank** the board, reorder the priority list (`DEFAULT_BOARD` in
 `reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the
 highest priority. The role lens you attach to each model is independent of its priority.
@@ -849,6 +860,8 @@ review --show-board        # priority order + which 4 are the live pool + reserv
 review diff                # default failover pool: the top 4 AVAILABLE seats by priority
 review diff --pool 8       # run all 8 available seats (--pool 0 also means "all available")
 review diff --pool 2       # run the top 2 available seats (with failover)
+review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
+review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
 review diff -m codex -m gemini   # an explicit -m bypasses the board entirely (exact models)
 ```
 

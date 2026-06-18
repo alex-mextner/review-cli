@@ -110,6 +110,11 @@ higher-priority but unavailable seat is skipped, the next pulled up); **mid-run 
 replaces a seat that fails DURING the run (backend error, timeout, empty output, or an
 "unavailable" reply such as a paywalled model) with the next-priority **reserve**, until 4
 working verdicts are produced or the reserve is exhausted (then it degrades and says so).
+Before promoting a reserve, a failed seat is first **retried on the same model** when the
+failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "overloaded" /
+"service unavailable") with backoff + jitter; a **seat-fatal** failure (auth / bad model /
+501 / refusal) is never retried and falls straight to the reserve. `--retry N` (or
+`$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
 `--pool N` sizes the pool (top-N available, same failover); `--pool 0`/`--pool 8` runs all
 available. The board is **never disabled** — there is **no `--no-board` flag**. An explicit
 `-m` (or a `models:` list in config.yaml) bypasses the board and runs exactly those models.
