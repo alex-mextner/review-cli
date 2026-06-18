@@ -55,6 +55,7 @@ from .modes.registry import (
 from .modes.review import mode_review
 from .panel import begin_call_tally, end_call_tally, pick_moderators
 from .process import _run
+from .retry import max_retry_count, retry_default
 from .stats import announce_eta, record_run
 
 if TYPE_CHECKING:
@@ -1047,6 +1048,15 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             "never off — --pool only sizes it. N<=0 means all seats."
         ),
     )
+    parser.add_argument(
+        "--retry", type=int, default=None, metavar="N",
+        help=(
+            "in-seat retries on a TRANSIENT failure (429/529/5xx/timeout/overloaded) "
+            "before falling to the reserve (default from $REVIEW_RETRY_COUNT, else "
+            f"{retry_default()}). A SEAT-FATAL failure (auth/bad-model/501/refusal) is "
+            "never retried. 0 disables in-seat retry."
+        ),
+    )
 
 
 def _add_visual_options(parser: argparse.ArgumentParser) -> None:
@@ -1489,6 +1499,15 @@ def _dispatch(argv: list[str] | None = None) -> int:
         parser = _build_top_level_parser()
 
     args = parser.parse_args(rest)
+
+    # `--retry N` is wired by EXPORTING $REVIEW_RETRY_COUNT for the rest of this process, so
+    # the single in-seat-retry reader (reviewlib.retry.retry_count, called deep in the panel)
+    # honours flag, env, and default with ONE precedence rule — the flag wins over a
+    # pre-existing env, an unset flag leaves the env (or the built-in default) in force. The
+    # board path never has to thread the value through every panel signature. Clamped to the
+    # ceiling so a stray `--retry 9999` can't pin a dead seat for minutes.
+    if getattr(args, "retry", None) is not None:
+        os.environ["REVIEW_RETRY_COUNT"] = str(max(0, min(args.retry, max_retry_count())))
 
     config = load_config()
 

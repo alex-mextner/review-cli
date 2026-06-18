@@ -262,6 +262,25 @@ def test_failover_pool_listing():
     assert_fails("--no-board", "--show-board")
 
 
+def test_retry_flag_surface_and_export():
+    """`--retry` is on the diff surface, documents the transient/seat-fatal split, and the CLI
+    export+clamp path accepts an out-of-range value (clamped, never an argparse error)."""
+    diff_help = review_out("diff", "--help")
+    assert_in("--retry", diff_help)
+    assert_in("transient", diff_help.lower())
+    assert_in("REVIEW_RETRY_COUNT", diff_help)
+    # An out-of-range `--retry` must be ACCEPTED (clamped), not rejected: the export path runs
+    # at parse time, before any backend call. With no staged diff the run exits 1 ("No diff to
+    # review") — a CLEAN, non-argparse exit (argparse usage errors are exit 2). So the flag
+    # parsed and clamped fine; assert it is NOT a usage error.
+    empty = _tmp()
+    subprocess.run(["git", "init", "-q"], cwd=empty, check=True)
+    for val in ("9999", "-4", "0", "3"):
+        p = run("diff", "--staged", "--retry", val, "-C", empty)
+        if p.returncode == 2:
+            raise SmokeError(f"--retry {val} was an argparse usage error (should clamp):\n{p.stderr}")
+
+
 def test_output_flag():
     top = review_out("--help")
     assert_in("-o FILE", top)
@@ -390,6 +409,7 @@ _UNIT_FILES = [
     ("test_reviewer_board.py", {}),
     ("test_review_marker.py", {}),
     ("test_failover_pool.py", {}),
+    ("test_inseat_retry.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_brainstorm_diff.py", {}),
     ("test_brainstorm_dead_panel.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_mode_subcommands.py", {}),

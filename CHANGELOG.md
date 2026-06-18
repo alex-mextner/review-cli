@@ -5,6 +5,34 @@ semantic versioning.
 
 ## Unreleased
 
+- **In-seat retry before reserve-replace, with retryable/seat-fatal classification.** The
+  failover board now retries a failed seat *on the same model* when the failure is
+  **transient** — a `429` rate-limit, a `529`/5xx overload, a provider timeout (exit 124), an
+  "overloaded"/"service unavailable"/"too many requests"/quota/throttle notice — with
+  **exponential backoff + jitter**, BEFORE promoting a reserve. A **seat-fatal** failure
+  (auth/`401`/`403`, an invalid/unknown model, `501` not-implemented, a refusal) is never
+  retried and falls straight to the reserve, so the retry budget is spent only where a retry
+  can help. The transient/fatal classifier is **mirrored from the agent-tools fallback
+  contract** (`lib/contracts/models.yaml` + `model-error-fallback`'s transient regex), reading
+  the error CHANNEL only — a long review body that merely mentions "503"/"rate limit" is not
+  misread, and the short rc=0 "currently unavailable" sentinel still counts. New `--retry N`
+  flag (and `$REVIEW_RETRY_COUNT`; default 2, `0` disables, clamped to a ceiling) — it applies
+  to BOTH the failover board and an explicit `-m` panel. Three independent caps bound the cost
+  so a slow-failing seat can't pin the run: the retry COUNT, a TIMEOUT sub-cap (a process
+  timeout, exit 124, gets one extra attempt — each retry costs a whole per-call timeout), and a
+  WALL-CLOCK cap (`$REVIEW_RETRY_MAX_SECONDS`, default 90s) — the backstop for a SLOW transient
+  (a 503 returned just shy of the per-call timeout, rc != 124) the timeout sub-cap can't see. An exhausted **quota /
+  billing** limit is seat-fatal for in-seat retry (the same key won't replenish in the retry
+  window — unlike the cross-harness chain, which can fall to a different provider's quota).
+  Every retry, seat-fatal short-circuit, timeout-exhausted cap, and reserve promotion is logged
+  **durably** to the run-log dir (a `*-retry.log` event file, each `kind=` distinct), not
+  stderr-only. Fail-loud-on-empty is preserved: an unrecovered seat is handed back to the
+  reserve/degrade path unchanged, never fabricated into a verdict.
+  New `tests/test_inseat_retry.py` (classification matrix, channel discipline, transient-then-
+  recovers, fatal-zero-retries, budget respected, durable log, backoff growth + jitter, and the
+  panel integration: retry keeps the pool full without touching the reserve; fatal falls
+  through; retry-then-reserve on an unrecoverable transient).
+
 - **Dashboard overhaul — real model brand logos, an interactive Errors recovery view, and a
   Python smoke suite.** Five changes:
   - **Per-model BRAND LOGOS, not emoji.** Every seat / participant / model chip across the

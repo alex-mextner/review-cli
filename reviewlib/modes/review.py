@@ -31,6 +31,7 @@ from ..panel import (
     format_result,
     run_board_with_failover,
 )
+from ..retry import run_seat_with_retry
 from .contract import ModeContext, ModeSpec
 
 
@@ -50,21 +51,29 @@ def mode_review(
             diff_from_stdin,
         )
 
+    # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets in-seat
+    # retry on a transient failure (`--retry` / $REVIEW_RETRY_COUNT) — not just the board path.
+    # Each seat's per-attempt dispatch goes through `resolve_backend` (kept as THIS module's
+    # name so existing tests that stub `review.resolve_backend` still drive the fakes), wrapped
+    # in `run_seat_with_retry` which retries the same seat on a transient class and returns the
+    # final outcome. The per-call run-stats tally records that final outcome once per seat.
     results: list[ReviewResult] = []
+
+    def _run_seat_with_retry(model: str) -> ReviewResult:
+        return run_seat_with_retry(
+            model, lambda: resolve_backend(model)(model, prompt, diff, cwd, timeout)
+        )
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
-        futures = {
-            pool.submit(resolve_backend(model), model, prompt, diff, cwd, timeout): model
-            for model in models
-        }
+        futures = {pool.submit(_run_seat_with_retry, model): model for model in models}
         for future in concurrent.futures.as_completed(futures):
             model = futures[future]
             try:
                 results.append(future.result())
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - report, never crash the panel
                 results.append(ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc)))
-            # Feed the run-stats per-call tally (no-op outside a CLI-driven run). This
-            # plain `-m` path runs its own executor instead of run_panel, so it must
-            # tally here for the recorded ok/fail counts to be accurate.
+            # One tally per logical seat (its FINAL outcome after any retry). No-op outside a
+            # CLI-driven run; this flat path runs its own executor, so it tallies here.
             _tally_result(results[-1].returncode)
 
     by_model = {result.model: result for result in results}

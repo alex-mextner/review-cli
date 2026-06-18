@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .backends import ReviewResult, backend_available, resolve_backend
 from .config import MODERATOR_CANDIDATES, BoardReviewer
+from .process import write_retry_log
 
 # A backend can report rc=0 with a NON-empty body that is actually an "unavailable"
 # notice rather than a real answer (e.g. the paywalled Fable returns rc=0 with
@@ -50,6 +51,13 @@ _call_tally: dict[str, int] | None = None
 # candidate loop and tallies exactly ONE outcome with the moderator success criterion
 # (rc 0 AND non-empty stdout), so an empty-but-rc0 candidate the mode REJECTS is not
 # miscounted as ok and failed fallbacks aren't over-counted (codex P2).
+#
+# INVARIANT this module-global relies on: only ONE top-level panel operation
+# (run_panel / run_panel_with_retry / run_board_with_failover / run_moderator) runs at a time
+# per process. Every mode invokes them SEQUENTIALLY; the parallelism is WITHIN a single panel
+# call (its worker threads), and the suppress toggle is set ONCE on the calling thread around
+# that call, never by the workers — so the workers never race it. Two CONCURRENT top-level
+# panels would; no mode does that. Move the flag to a contextvar before adding one that does.
 _suppress_autotally = False
 
 
@@ -344,7 +352,13 @@ def run_board_with_failover(
         current = list(pool)
         while current:
             jobs = [build_board_job(r, base_prompt, diff) for r in current]
-            round_results = run_panel(jobs, cwd, timeout)
+            # In-seat retry FIRST: each seat retries the SAME model on a TRANSIENT failure
+            # (429/529/5xx/timeout/overloaded) with backoff+jitter, before we fall to the
+            # reserve below. A SEAT-FATAL failure (auth/bad-model/501/refusal) skips the
+            # retries and returns at once, so the reserve backfill stays immediate for the
+            # class no retry can fix. run_panel_with_retry preserves job order, so the zip
+            # below still lines each result up with its reviewer.
+            round_results = run_panel_with_retry(jobs, cwd, timeout)
             # run_panel preserves job order, so each result lines up with its reviewer —
             # zip recovers the BoardReviewer (and its bare model id) behind a labelled
             # result. `strict=True` is a real guard (NOT a stripped-under-`-O` assert): if
@@ -366,6 +380,13 @@ def run_board_with_failover(
                         print(f"[review-cli] board: {result.model} failed — promoting "
                               f"reserve {promoted.display} [{promoted.role or 'general'}] "
                               f"({promoted.model})", file=sys.stderr, flush=True)
+                        # Durable record of the promotion (not stderr-only): a post-mortem /
+                        # the dashboard can reconstruct WHICH seat failed and WHICH reserve
+                        # backfilled it, with the failing seat's exit code + error channel.
+                        write_retry_log(
+                            f"{result.model}->{promoted.model}", kind="promote",
+                            attempt=0, max_attempts=1, delay=0.0, result=result,
+                        )
                         next_round.append(promoted)
             current = next_round
     finally:
@@ -407,6 +428,79 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
             except Exception as exc:  # noqa: BLE001 - report, never crash the panel
                 results[index] = ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc))
             _tally_result(results[index].returncode)
+    return [r for r in results if r is not None]
+
+
+def run_panel_with_retry(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResult]:
+    """Run jobs in parallel like `run_panel`, but each seat RETRIES itself on a transient
+    failure before giving up — same-order results out.
+
+    Each job is dispatched on its own pool thread, and inside that thread the seat is run via
+    `reviewlib.retry.run_seat_with_retry`: it calls the seat, and on a TRANSIENT failure
+    (429/529/5xx/timeout/overloaded) sleeps a jittered backoff and retries the SAME model, up
+    to the configured budget (`REVIEW_RETRY_COUNT` / `--retry`). A SEAT-FATAL failure (auth /
+    bad model / 501 / refusal) returns immediately so the board's reserve-replace can take
+    over without burning the retry budget. The seat's per-call dispatch reuses `run_panel`
+    (one job), so the live per-call log files and label-wrapping are unchanged; only the
+    retry orchestration is added.
+
+    The retry import is LAZY (function-local) to avoid an import cycle: `reviewlib.retry`
+    imports `panel.result_is_usable`, so importing it at module top would be circular.
+
+    The inner per-attempt `run_panel([job])` calls would each auto-tally; that is suppressed
+    ONCE around the whole parallel dispatch (a single-threaded toggle, NOT a per-thread one —
+    the parallel seats must never race on the `_suppress_autotally` global). The caller
+    (`run_board_with_failover` / a future direct user) owns the one-per-logical-seat tally;
+    when NOT already suppressed, each seat's FINAL outcome is tallied once below, matching
+    `run_panel`'s one-call-one-tally contract."""
+    from .retry import run_seat_with_retry  # lazy: breaks the panel<->retry import cycle
+
+    if not jobs:
+        return []
+    results: list[ReviewResult | None] = [None] * len(jobs)
+
+    def _seat(job: PanelJob) -> ReviewResult:
+        # The per-attempt runner: ONE dispatch of this seat. Auto-tally is already suppressed
+        # (single-threaded) by the wrapper below, so retries are never each counted — this
+        # closure does NOT touch the global, so parallel seats can't race on it.
+        def _once() -> ReviewResult:
+            return run_panel([job], cwd, timeout)[0]
+
+        return run_seat_with_retry(job.label or job.model, _once)
+
+    # Suppress the inner auto-tally ONCE, on THIS thread, around the whole parallel run, then
+    # tally each seat's final outcome once afterward. A single toggle here (vs one per worker
+    # thread) is the whole point: the parallel `_once` dispatches must not toggle the shared
+    # global concurrently. Restored in `finally` so a direct caller's tally state is intact.
+    global _suppress_autotally
+    with _TALLY_LOCK:
+        prev_suppress = _suppress_autotally
+        _suppress_autotally = True
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {pool.submit(_seat, job): index for index, job in enumerate(jobs)}
+            for future in concurrent.futures.as_completed(futures):
+                index = futures[future]
+                model = jobs[index].label or jobs[index].model
+                try:
+                    results[index] = future.result()
+                except Exception as exc:  # noqa: BLE001 - report, never crash the panel
+                    results[index] = ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc))
+    finally:
+        with _TALLY_LOCK:
+            _suppress_autotally = prev_suppress
+
+    # Tally each seat's FINAL outcome once, AFTER restoring the suppression state. Two callers,
+    # two owners of the count:
+    #   * run_board_with_failover sets _suppress_autotally=True for its WHOLE loop, so this
+    #     `_tally_result` is suppressed (a no-op) and the failover loop counts each logical seat
+    #     itself via _tally_ok(result_is_usable(...)) — that is the {"ok":N,"fail":M} the tests
+    #     assert. The board owns the tally.
+    #   * a DIRECT caller (suppression off) gets one real count per seat here, matching
+    #     run_panel's one-call-one-tally contract.
+    for result in results:
+        if result is not None:
+            _tally_result(result.returncode)
     return [r for r in results if r is not None]
 
 

@@ -218,6 +218,80 @@ def write_sidecar_log(
     return path
 
 
+# How much of the failing error channel a retry/promotion log records. Enough to see the
+# provider's throttle string ("429 Too Many Requests", "529 overloaded") without persisting a
+# whole partial body (which may carry prompt/diff fragments). Logs are 0600 regardless.
+_RETRY_LOG_DETAIL_MAX = 2000
+
+# A process-wide monotonic counter that disambiguates retry-log filenames. The microsecond
+# stamp alone can collide when two events for the SAME model land in the same microsecond —
+# possible under a zero/near-zero backoff (tests, or a future 0-delay config) where one
+# O_TRUNC open would overwrite the other. Appending this counter (lock-guarded) guarantees a
+# unique filename per event regardless of clock resolution.
+_RETRY_LOG_SEQ_LOCK = threading.Lock()
+_retry_log_seq = 0
+
+
+def _next_retry_log_seq() -> int:
+    global _retry_log_seq
+    with _RETRY_LOG_SEQ_LOCK:
+        _retry_log_seq += 1
+        return _retry_log_seq
+
+
+def write_retry_log(
+    model: str,
+    *,
+    kind: str,
+    attempt: int,
+    max_attempts: int,
+    delay: float,
+    result,
+) -> Path:
+    """Durably record ONE in-seat retry / seat-fatal / reserve-promotion event.
+
+    The board's in-seat retry (`reviewlib.retry`) and reserve-replace failover must leave a
+    DURABLE trail — not stderr-only, which is lost the moment the terminal scrolls or a CI
+    step discards it. This writes a small ``{stamp}-{backend}-retry.log`` next to the per-call
+    logs under ``log_dir()`` so a post-mortem (or the dashboard) can reconstruct exactly how
+    many times a seat was retried, why, and whether a reserve was promoted.
+
+    ``kind`` is one of ``retry`` (a transient failure is about to be retried), ``seat-fatal``
+    (a non-retryable failure went straight to the reserve), or ``promote`` (a reserve seat was
+    pulled up to backfill a failed pool seat). ``attempt``/``max_attempts`` are the 1-based
+    retry index and the total attempt budget; ``delay`` is the backoff slept (0 for a
+    non-retry event). The failing ``result`` contributes its exit code + a TRIMMED error
+    channel. File perms 0600 (the channel may echo a fragment of a reviewed prompt/diff).
+
+    Returns the log path. Best-effort: any OS error is swallowed (a log we couldn't write must
+    never break the review) — durability is a goal, not a gate."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    # The seq discriminator makes the filename unique even when two events for the same model
+    # share a microsecond stamp (zero-backoff path) — without it the second O_TRUNC open would
+    # clobber the first event's log.
+    seq = _next_retry_log_seq()
+    path = log_dir() / f"{stamp}-{_safe_backend(model)}-retry-{seq:04d}.log"
+    rc = getattr(result, "returncode", "?")
+    detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+    detail = detail[:_RETRY_LOG_DETAIL_MAX]
+    # The attempt fraction is only meaningful for a `retry` event (the Nth of `budget`
+    # retries). A `promote` / `seat-fatal` event has no retry index, so it omits the fraction
+    # rather than printing a meaningless `0/0`.
+    attempt_field = f" attempt={attempt}/{max_attempts - 1}" if kind == "retry" else ""
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(
+                f"[review-cli] RETRY-EVENT kind={kind} model={model}"
+                f"{attempt_field} delay={delay:.2f}s exit={rc}\n"
+            )
+            for line in detail.splitlines():
+                fh.write("[detail] " + line + "\n")
+    except OSError as exc:  # noqa: BLE001 - a log we can't write must not break the review
+        print(f"[review-cli] could not write retry log ({exc})", file=sys.stderr, flush=True)
+    return path
+
+
 def _kill_tree(proc: subprocess.Popen, pgid: int | None) -> None:
     """Best-effort terminate→kill of the child's whole process group.
 
