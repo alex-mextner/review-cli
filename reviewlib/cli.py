@@ -55,7 +55,7 @@ from .modes.registry import (
 from .modes.review import mode_review
 from .panel import begin_call_tally, end_call_tally, pick_moderators
 from .process import _run
-from .retry import max_retry_count, retry_default
+from .retry import max_retry_count
 from .stats import announce_eta, record_run
 
 if TYPE_CHECKING:
@@ -1048,15 +1048,11 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             "never off — --pool only sizes it. N<=0 means all seats."
         ),
     )
-    parser.add_argument(
-        "--retry", type=int, default=None, metavar="N",
-        help=(
-            "in-seat retries on a TRANSIENT failure (429/529/5xx/timeout/overloaded) "
-            "before falling to the reserve (default from $REVIEW_RETRY_COUNT, else "
-            f"{retry_default()}). A SEAT-FATAL failure (auth/bad-model/501/refusal) is "
-            "never retried. 0 disables in-seat retry."
-        ),
-    )
+    # NOTE: `--retry` is NOT global — it only applies to the diff REVIEW path (the failover
+    # board + the flat `-m` panel), not brainstorm/quorum/just-ask (which call run_panel and
+    # never use the retry wrapper). It lives on the diff mode's own option surface
+    # (modes/review.py `_add_arguments`), so the top-level help isn't padded with a no-op flag
+    # (AGENTS.md: the global list is only truly-global options). codex P1 on #46.
 
 
 def _add_visual_options(parser: argparse.ArgumentParser) -> None:
@@ -1126,7 +1122,7 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
 _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
     "--diff", "--staged", "--prompt", "--moderator", "--rounds", "--max-rounds",
     "--visual", "--before", "--intent", "--expect", "--check", "--json", "--strict",
-    "--no-ai", "--no-local-model", "--vision-timeout", "--project",
+    "--no-ai", "--no-local-model", "--vision-timeout", "--project", "--retry",
 })
 
 # The BARE management subcommands `_dispatch` handles directly (NOT mode verbs in

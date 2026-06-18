@@ -31,7 +31,7 @@ from ..panel import (
     format_result,
     run_board_with_failover,
 )
-from ..retry import run_seat_with_retry
+from ..retry import retry_default, run_seat_with_retry
 from .contract import ModeContext, ModeSpec
 
 
@@ -155,9 +155,21 @@ def _mode_review_board(
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
-    """The review mode adds NO unique positional/option arguments — it reviews the diff
-    using only the shared options (-m / -C / --pool / --prompt / --staged / --visual …),
-    which the CLI adds to every mode's parser."""
+    """Diff-mode-only options. `--retry` lives HERE, not on the global surface: in-seat retry
+    applies only to the diff review path (the failover board + the flat `-m` panel), NOT to
+    brainstorm/quorum/just-ask (which call run_panel and never use the retry wrapper). Keeping
+    it off the top-level help avoids advertising a no-op flag outside diff review (AGENTS.md:
+    the global list is only truly-global options; codex P1 on #46). The other shared options
+    (-m / -C / --pool / --prompt / --staged / --visual …) come from the CLI's global surface."""
+    parser.add_argument(
+        "--retry", type=int, default=None, metavar="N",
+        help=(
+            "in-seat retries on a TRANSIENT failure (429/529/5xx/timeout/overloaded) before "
+            "falling to the reserve (default from $REVIEW_RETRY_COUNT, else "
+            f"{retry_default()}); applies to the failover board AND the flat -m panel. A "
+            "SEAT-FATAL failure (auth/bad-model/501/refusal) is never retried. 0 disables it."
+        ),
+    )
 
 
 def _handler(ctx: ModeContext) -> int:
