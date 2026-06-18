@@ -163,6 +163,156 @@ def test_default_models_routes_kimi_through_commandcode():
     assert _split_models(list(DEFAULT_MODELS)) == ["codex", "gemini", KIMI_SEAT]
 
 
+def test_every_default_model_routes_live():
+    """Every entry in the flat DEFAULT_MODELS panel AND every DEFAULT_BOARD seat must pass
+    `backends.default_routes_live` (review-cli#25): the id BOTH takes an explicitly-named
+    backend route AND its underlying provider is not known-dead.
+
+    This is the anti-rot guard. The original #25 bug was a default
+    `oc:fireworks/.../kimi-k2p6-turbo` on the suspended `glide` account: resolve_backend has
+    a permissive opencode catch-all, so a stale default degrades SILENTLY at runtime rather
+    than erroring. `default_routes_live` closes that by checking the provider UNDER any
+    `oc:`/`opencode:` transport (not the wrapper): that provider must name a real backend
+    (`_match_named_backend`, so a typo'd provider — flat `comandcode:...` OR agentic
+    `oc:comandcode/...` — fails, since the bare `comandcode` names nothing) AND must not be
+    in the dead-provider denylist (the forward-looking half for a once-live provider that
+    later dies). A future stale default trips this in CI instead of rotting at runtime. It
+    checks named ROUTING of the under-transport provider + the dead-provider denylist, not
+    live network reachability — a probe would need keys and can't run in CI."""
+    for model in _all_default_model_strings():
+        assert backends.default_routes_live(model), (
+            f"default model {model!r} is not safe to ship: its under-transport provider "
+            f"{backends.effective_provider(model)!r} either names no backend (would rot via "
+            f"the opencode catch-all) or is in the dead-provider denylist "
+            f"(this is the #25 silent-rot guard)"
+        )
+
+
+def test_default_routes_live_catches_dead_and_typo_defaults_through_the_transport():
+    """`default_routes_live` is not a no-op: it REJECTS the dead default #25 removed AND a
+    typo'd provider — in BOTH the flat and the agentic `oc:` form, because the check is on
+    the provider UNDER any transport, not on the `oc:` wrapper.
+
+    Holes closed:
+      * the dead `oc:fireworks/.../kimi-k2p6-turbo`: `effective_provider` peels to
+        `fireworks`, which names no backend (and is in `_DEAD_PROVIDERS`), so it is rejected;
+      * a typo'd provider in the FLAT form (`comandcode:...`) — the bare `comandcode` names
+        no backend, rejected;
+      * a typo'd provider in the AGENTIC form (`oc:comandcode/...`) — the `oc:` transport
+        does NOT mask the typo, because the check peels to `comandcode`, which names no
+        backend, rejected. This is the agentic hole the first cut missed (codex review);
+      * a bogus bare id (`totally-bogus-model-xyz`) — names no backend, rejected.
+    The live commandcode Kimi seat passes via BOTH transports."""
+    dead = "oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo"
+    assert backends.effective_provider(dead) == "fireworks"
+    assert "fireworks" in backends._DEAD_PROVIDERS
+    assert backends.default_routes_live(dead) is False
+    # Typo'd provider — caught in the flat form AND in BOTH agentic spellings (`oc:` and the
+    # `opencode:` alias). The agentic case is the one a name-only `_match_named_backend(model)`
+    # check would have missed; both transports are checked for symmetry.
+    assert backends.default_routes_live("comandcode:moonshotai/Kimi-K2.7-Code") is False
+    assert backends.default_routes_live("oc:comandcode/moonshotai/Kimi-K2.7-Code") is False
+    assert backends.default_routes_live("opencode:comandcode/moonshotai/Kimi-K2.7-Code") is False
+    # A stale default whose id names no route at all.
+    assert backends.default_routes_live("totally-bogus-model-xyz") is False
+    # A bare-alias provider + model suffix that resolve_backend does NOT match on the full
+    # id (it accepts gemini only as the bare `gemini-api` or a `gemini:` prefix, never the
+    # `gemini-api:` form) and so falls through to opencode at runtime. The guard must agree:
+    # checking the COLLAPSED provider token would wrongly bless it, so the guard validates
+    # the FULL id route (codex review of #49). Same for the `claude-p:` form.
+    assert backends.resolve_backend("gemini-api:gemini-2.5-flash") is backends.review_opencode
+    assert backends.default_routes_live("gemini-api:gemini-2.5-flash") is False
+    assert backends.resolve_backend("claude-p:claude-opus-4-8") is backends.review_opencode
+    assert backends.default_routes_live("claude-p:claude-opus-4-8") is False
+    # ...but the spellings resolve_backend DOES match on the full id still pass.
+    assert backends.default_routes_live("gemini:gemini-2.5-flash") is True
+    assert backends.default_routes_live("zai:glm-5.2") is True
+    # Mixed case: the guard lowercases exactly like resolve_backend, so a mixed-case id gets
+    # the SAME verdict as its lowercase form (the guard must mirror the dispatcher, codex #49).
+    assert backends.resolve_backend("Codex") is backends.resolve_backend("codex")
+    assert backends.default_routes_live("Codex") is True
+    assert backends.default_routes_live("OC:Commandcode/moonshotai/Kimi-K2.7-Code") is True
+    assert backends.default_routes_live("OC:Fireworks/x/y") is False  # dead, mixed case
+    # Intentional flat-vs-agentic asymmetry: `oc:gemini-api/model` passes because the agentic
+    # opencode transport DOES route an arbitrary `provider/model` (gemini-api is a real
+    # opencode provider), whereas the flat keyed-HTTP `gemini-api:model` does not — they have
+    # different runtime routes, and the guard tracks each (not a bug).
+    assert backends.resolve_backend("oc:gemini-api/gemini-2.5-flash") is backends.review_opencode
+    assert backends.default_routes_live("oc:gemini-api/gemini-2.5-flash") is True
+    # The live defaults pass, via every transport spelling (flat, `oc:`, `opencode:`).
+    assert backends.default_routes_live(KIMI_SEAT) is True
+    assert backends.default_routes_live(_agentic(KIMI_SEAT)) is True
+    assert backends.default_routes_live("opencode:zai/glm-5.2") is True
+    assert backends.effective_provider(KIMI_SEAT) == "commandcode"
+    assert backends.effective_provider(_agentic(KIMI_SEAT)) == "commandcode"
+
+
+def test_effective_provider_peels_transport_and_splits_on_first_separator():
+    """`effective_provider` peels the `oc:`/`opencode:` AGENTIC prefix, then takes the first
+    segment before `:` or `/` — so the provider UNDER an agentic seat is what's checked, not
+    the literal "opencode" transport. Covers the spellings the defaults actually use."""
+    assert backends.effective_provider("codex") == "codex"
+    assert backends.effective_provider("commandcode:moonshotai/Kimi-K2.7-Code") == "commandcode"
+    assert backends.effective_provider("oc:commandcode/moonshotai/Kimi-K2.7-Code") == "commandcode"
+    assert backends.effective_provider("opencode:zai/glm-5.2") == "zai"
+    assert backends.effective_provider("zai:glm-5.2") == "zai"
+    assert backends.effective_provider("oc:fireworks/x/y") == "fireworks"
+
+
+def test_dead_provider_denylist_is_load_bearing_in_the_guard():
+    """The `_DEAD_PROVIDERS` denylist actually CHANGES the verdict — it is not dead weight
+    behind the named-route check. With `codex` forced into the denylist, `default_routes_live`
+    rejects it even though `_match_named_backend('codex')` is non-None (a live named route).
+    This exercises the denylist branch directly, so it can't silently stop mattering.
+
+    Patches the module global manually with try/finally (NOT the pytest `monkeypatch`
+    fixture): this file's `test_*` functions also run argument-less under the standalone
+    `__main__` runner, where a fixture parameter would be an unfilled positional and the
+    test would error. Same save/restore pattern the other tests here use."""
+    assert backends._match_named_backend("codex") is not None  # codex IS a named route
+    assert backends.default_routes_live("codex") is True       # ...and live by default
+    saved = backends._DEAD_PROVIDERS
+    backends._DEAD_PROVIDERS = frozenset({"codex"})
+    try:
+        assert backends.default_routes_live("codex") is False  # denylist flips the verdict
+    finally:
+        backends._DEAD_PROVIDERS = saved
+    # Restored — the guard is back to its real verdict for the rest of the suite.
+    assert backends.default_routes_live("codex") is True
+
+
+def test_every_named_provider_bare_token_is_recognized():
+    """For an AGENTIC `oc:`/`opencode:` default, `default_routes_live` checks the bare
+    provider token under the transport (`_match_named_backend(effective_provider(model))`,
+    e.g. `commandcode`/`zai` from `oc:commandcode/...`). That only works if every named
+    provider's resolve_backend branch matches the bare token, not just the `provider:`-prefixed
+    form — otherwise a legitimate agentic default on a bare-token-unmatched provider would get
+    a false `False`.
+
+    This pins that contract across ALL named providers the defaults use: each bare token
+    must resolve to its backend. If a future provider is added with a branch that matches
+    only `startswith('newprov:')`, an `oc:newprov/...` default (and this test) goes red — the
+    fix is to make the branch accept the bare token too, so the #25 guard keeps working."""
+    bare_to_backend = {
+        "codex": backends.review_codex,
+        "gemini": backends.review_gemini,
+        "gemini-api": backends.review_gemini,
+        "zai": backends.review_zai,
+        "z.ai": backends.review_zai,
+        "zhipu": backends.review_zai,
+        "glm": backends.review_zai,
+        "commandcode": backends.review_commandcode,
+        "claude": backends.review_claude,
+        "claude-p": backends.review_claude,
+        "fable": backends.review_claude,
+    }
+    for token, backend in bare_to_backend.items():
+        assert backends._match_named_backend(token) is backend, token
+    # And the live agentic z.ai/GLM board seat passes the full guard (not just
+    # effective_provider) — the bare-token contract is what makes that work.
+    assert backends.default_routes_live("oc:zai/glm-5.2") is True
+
+
 def test_agentic_helper_rewrites_provider_seat_idempotent_and_canonical():
     """`_agentic` flips a diff-only `provider:model` seat to its agentic `oc:provider/model`
     opencode form, and a colonless seat (e.g. `codex`) to `oc:<seat>`. It is IDEMPOTENT
