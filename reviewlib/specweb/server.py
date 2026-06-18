@@ -46,7 +46,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import render as srender
-from .store import DEFAULT_KIND, NEW_DRAFT_SLOT, SpecStore, _as_int, edit_draft_slot, store_dir
+from .store import DEFAULT_KIND, NEW_DRAFT_SLOT, SpecStore, _as_int, _as_token, edit_draft_slot, store_dir
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _ALLOWED_STATIC = {"app.js", "app.css"}
@@ -136,12 +136,14 @@ class SpecWebHandler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     # ---- response helpers ------------------------------------------------- #
-    def _send_json(self, obj, status: int = 200) -> None:
+    def _send_json(self, obj, status: int = 200, *, extra_headers: dict | None = None) -> None:
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -271,7 +273,14 @@ class SpecWebHandler(BaseHTTPRequestHandler):
             if path == "/api/comments":
                 return self._send_json(self._store.all_comments())
             if path == "/api/drafts":
-                return self._send_json(self._store.all_drafts())
+                # The seed header lets the client start its per-session write counter above
+                # the durable high-water-mark, so a reloaded session's autosaves aren't
+                # rejected as stale against old tombstones (review-cli#30). The body shape
+                # (slot -> draft map) is unchanged.
+                return self._send_json(
+                    self._store.all_drafts(),
+                    extra_headers={"X-Draft-Token-Seed": str(self._store.max_draft_token())},
+                )
             return self._error(404, f"not found: {path}")
         except BrokenPipeError:
             pass
@@ -353,7 +362,13 @@ class SpecWebHandler(BaseHTTPRequestHandler):
     def _save_draft(self, slot: str, body: dict) -> None:
         """Autosave an in-progress composer draft (the debounced client write). An EMPTY
         body clears the slot (returns {ok, draft: null}); a non-empty one stores it. The
-        slot id comes from the URL (``new`` or ``edit:<id>``) and is required."""
+        slot id comes from the URL (``new`` or ``edit:<id>``) and is required.
+
+        ORDERING (review-cli#30): an optional ``token`` (the client's monotonic per-session
+        send sequence) makes the write order-safe. The store rejects a token <= the slot's
+        last applied one; on rejection the response carries ``stale: true`` and the CURRENT
+        slot draft, so a late autosave that lost the race can't clobber a newer write and the
+        client mirror stays authoritative. A token-less write keeps legacy behaviour."""
         slot = (slot or "").strip()
         if not slot:
             return self._error(404, "expected /api/drafts/<slot>")
@@ -361,7 +376,7 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         if not isinstance(text, str):
             return self._error(400, "draft 'body' must be a string")
         try:
-            draft = self._store.save_draft(
+            result = self._store.save_draft_result(
                 slot,
                 body=text,
                 kind=body.get("kind") if isinstance(body.get("kind"), str) else DEFAULT_KIND,
@@ -370,12 +385,21 @@ class SpecWebHandler(BaseHTTPRequestHandler):
                 section_title=body.get("section_title", "") if isinstance(body.get("section_title"), str) else "",
                 start=_as_int(body.get("start")),
                 end=_as_int(body.get("end")),
+                token=_as_token(body.get("token")),
             )
         except ValueError as exc:
             return self._error(400, str(exc))
-        # An empty body cleared the slot -> draft is {} -> report null so the client knows
-        # there is nothing to restore for this slot.
-        return self._send_json({"ok": True, "draft": draft or None})
+        # `applied` is decided inside the store lock, so `stale` needs no second read (no
+        # TOCTOU). A rejected stale write returns the authoritative current slot state, not
+        # the client's own body — its mirror stays correct. An empty/cleared slot -> {} ->
+        # report null so the client knows there is nothing to restore. The seed header rides
+        # EVERY write response so the client re-seeds its counter from the server's current
+        # high-water-mark — a counter that fell behind (lost boot-seed, a second tab, a token
+        # collision) self-heals on the next write instead of silently rejecting forever (#30).
+        return self._send_json(
+            {"ok": True, "draft": result.draft or None, "stale": not result.applied},
+            extra_headers={"X-Draft-Token-Seed": str(self._store.max_draft_token())},
+        )
 
     def _comment_action(self, cid: str, action: str, body: dict) -> None:
         if action == "reply":

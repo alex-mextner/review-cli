@@ -158,7 +158,17 @@
   // so a reload never loses a half-typed note. Fetched on boot; the newest one is restored
   // into the composer (see restoreDraftOnLoad).
   function loadDrafts() {
-    return api('GET', '/api/drafts')
+    // Fetch drafts directly (not via api()) so we can read the X-Draft-Token-Seed response
+    // header and seed the per-session write counter ABOVE the server's durable high-water
+    // mark (review-cli#30). The tombstones outlive a page reload, but draftWriteSeq restarts
+    // at 0 each load — without this seed, the first autosaves of a reloaded session would be
+    // <= the old tombstone and get silently rejected as stale, so autosave would look broken.
+    return fetch('/api/drafts')
+      .then(function (r) {
+        seedDraftToken(r.headers.get('X-Draft-Token-Seed'));
+        if (!r.ok) throw new Error(r.statusText); // mirror api(): don't parse an error body as drafts
+        return r.json();
+      })
       .then(function (map) {
         state.drafts = map && typeof map === 'object' ? map : {};
       })
@@ -529,6 +539,29 @@
   // selection context rides along for a new note so the composer can be re-opened anchored.
   var draftSaveTimer = null;
   var draftSaveAbort = null; // AbortController for an in-flight autosave POST
+  // Monotonic per-session draft write sequence (review-cli#30). EVERY draft write (autosave
+  // OR the trailing clear) carries the next value, so the server can reject a stale write
+  // that arrives out of order. The trailing clearDraftOnServer is reached only AFTER
+  // cancelPendingDraftSave() (which clears the debounce timer AND aborts the in-flight
+  // autosave — so no later autosave is scheduled), so the clear's token is the highest for
+  // the slot and a still-in-flight autosave that lands after it is rejected (token <= last
+  // applied). cancelDraftSave handles the debounce timer + a recallable abort; this
+  // server-authoritative token closes the one window an abort cannot — a request already on
+  // the wire that the server processes out of acquisition order.
+  var draftWriteSeq = 0;
+  function nextDraftToken() {
+    draftWriteSeq += 1;
+    return draftWriteSeq;
+  }
+  // Raise the counter to the server's highest durable token (review-cli#30), so the next
+  // autosave outranks every persisted tombstone. Only ever RAISES it — a header that is
+  // absent (null), non-numeric (NaN), or lower than the current value is ignored, so a stale
+  // or missing seed can never lower the counter mid-session. The header is server-generated
+  // (a plain integer), so the lenient parseInt is fine here.
+  function seedDraftToken(headerValue) {
+    var n = parseInt(headerValue, 10);
+    if (!isNaN(n) && n > draftWriteSeq) draftWriteSeq = n;
+  }
   function cancelDraftSave() {
     if (draftSaveTimer) {
       clearTimeout(draftSaveTimer);
@@ -548,7 +581,10 @@
     }
   }
   function draftPayload(slot, body) {
-    var p = { body: body, kind: state.pendingKind };
+    // `token` is the monotonic send-sequence stamp the server uses to reject a stale,
+    // out-of-order write (review-cli#30). Assigned at SEND time (here) so it reflects the
+    // order requests leave the client, which is the order the server must honour.
+    var p = { body: body, kind: state.pendingKind, token: nextDraftToken() };
     // A NEW note's draft carries its selection anchor so restore can re-open it in place.
     if (slot === NEW_DRAFT_SLOT && state.pendingSelection) {
       var sel = state.pendingSelection;
@@ -560,12 +596,38 @@
     }
     return p;
   }
-  function persistDraft(slot, body) {
+  // POST a draft write and RE-SEED the counter from the response's X-Draft-Token-Seed header
+  // (review-cli#30), so a counter that fell behind the server's high-water-mark (a lost
+  // boot-seed, a second tab, a token collision) self-heals on the next write rather than
+  // having its autosaves silently rejected as stale forever. Returns the parsed JSON body.
+  function postDraft(slot, payload, signal) {
+    var opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
+    if (signal) opts.signal = signal;
+    return fetch('/api/drafts/' + encodeURIComponent(slot), opts).then(function (r) {
+      seedDraftToken(r.headers.get('X-Draft-Token-Seed'));
+      if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || r.statusText); });
+      return r.json();
+    });
+  }
+  function persistDraft(slot, body, isRetry) {
     var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
     draftSaveAbort = ctrl;
-    api('POST', '/api/drafts/' + encodeURIComponent(slot), draftPayload(slot, body), ctrl && ctrl.signal)
+    postDraft(slot, draftPayload(slot, body), ctrl && ctrl.signal)
       .then(function (r) {
         if (draftSaveAbort === ctrl) draftSaveAbort = null;
+        // A stale rejection means this tab's counter was behind the server high-water-mark.
+        // postDraft already RE-SEEDED the counter from the response header, so a single retry
+        // now carries a winning token and actually persists the user's text (review-cli#30).
+        // Without it, a behind-counter tab would silently lose the just-typed draft if the
+        // user stopped typing after this first autosave (codex review of #50). Guarded:
+        // retry ONCE (no isRetry recursion), and only while THIS write is still the latest
+        // for THIS slot — a newer save/clear having started (draftSaveAbort !== null, or the
+        // active slot moved) means a fresher write already owns the slot, so we must not
+        // resurrect this body over it.
+        if (r && r.stale && !isRetry && draftSaveAbort === null && state.activeDraftSlot === slot) {
+          persistDraft(slot, body, true);
+          return;
+        }
         // Mirror the server's view locally so a same-session re-open sees the latest text
         // (and a cleared slot drops it). r.draft is null when the body was emptied.
         if (r && r.draft) state.drafts[slot] = r.draft;
@@ -582,7 +644,10 @@
   // slipped through, the LAST write to the slot is this delete — the slot ends up empty and
   // restoreDraftOnLoad can never reopen a composer over an already-saved note.
   function clearDraftOnServer(slot) {
-    return api('POST', '/api/drafts/' + encodeURIComponent(slot), { body: '' })
+    // Carry the next token too (review-cli#30): this trailing clear fires after any autosave
+    // for the slot, so its token is the highest and it becomes the slot's tombstone — a late
+    // autosave that arrives after it is rejected as stale and can't resurrect the draft.
+    return postDraft(slot, { body: '', token: nextDraftToken() })
       .then(function () {
         delete state.drafts[slot];
       })
