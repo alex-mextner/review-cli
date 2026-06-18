@@ -1241,3 +1241,15 @@ function boot() {
 }
 
 document.addEventListener('DOMContentLoaded', boot);
+
+// --- test hook (browser no-op) ----------------------------------------------
+// In the browser `module` is undefined, so this whole block is skipped — the SPA is
+// unaffected. Under Node (`node --test`) it exposes the PURE resolution/filter functions
+// (and the `state` object the filter reads) so they can be unit-tested without a DOM.
+// The test harness stubs `window`/`document` before requiring this file so the two
+// top-level browser calls above (`window.onImgError = …`, `document.addEventListener`)
+// are harmless no-ops. Keeping the export here (not a separate module) means the tests
+// exercise the EXACT code the browser runs — no copy that can drift.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { resolveModel, filteredRuns, monogram, cap, state };
+}
