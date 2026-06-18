@@ -43,7 +43,7 @@ import queue
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 from . import render as srender
 from .store import DEFAULT_KIND, NEW_DRAFT_SLOT, SpecStore, _as_int, _as_token, edit_draft_slot, store_dir

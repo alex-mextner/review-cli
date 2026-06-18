@@ -647,7 +647,8 @@ def test_flat_m_path_retries_transient_seat(tmp_log):
     try:
         def _resolve(_model):
             def _b(model, prompt, diff, cwd, timeout, round_no=0):
-                i = counts["m1"]; counts["m1"] += 1
+                i = counts["m1"]
+                counts["m1"] += 1
                 if model == "m1" and i == 0:
                     return ReviewResult(model, "fake", 1, "", "429 rate limit")
                 return ReviewResult(model, "fake", 0, f"verdict {model}", "")

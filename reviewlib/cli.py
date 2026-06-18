@@ -759,6 +759,10 @@ _VALUE_TAKING_OPTS = frozenset({
     "--pool", "--moderator", "--rounds", "--max-rounds",
     "--visual", "--before", "--intent", "--expect", "--check",
     "--vision-timeout", "--project",
+    # `--retry N` is a diff-mode-only int option (reviewlib/modes/review.py). It consumes a
+    # value, so the `-o` pre-scan must skip its argument — otherwise `--retry -o…`-shaped input
+    # would have the retry count mis-read as the output flag.
+    "--retry",
     # `review spec-web reply <id> <answer> --spec <path>`: the value after --spec is a spec
     # path that could look like an option (e.g. `--spec -odd-name.md`); list it so the `-o`
     # pre-scan never steals it.
