@@ -966,6 +966,132 @@ def test_store_draft_save_restore_and_clear():
         assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT) is None
 
 
+# === draft ordering token / tombstone (review-cli#30) ========================
+# The store rejects a token-carrying write that is OLDER than the slot's last applied token,
+# so a late out-of-order autosave can't clobber a newer write/clear regardless of the order
+# the per-slot lock is acquired. A token-less write keeps legacy last-writer-wins.
+
+def test_store_draft_rejects_out_of_order_token_write():
+    # An older token (a late autosave that lost the race) is rejected; the newer write stands.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.save_draft(NEW_DRAFT_SLOT, body="newer text", token=5)
+        # A stale autosave with a LOWER token arrives after -> rejected, slot unchanged.
+        out = store.save_draft(NEW_DRAFT_SLOT, body="stale older text", token=3)
+        assert out.get("body") == "newer text", "stale write must not overwrite the newer draft"
+        assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)["body"] == "newer text"
+        # The equal token is also stale (a re-delivery of the already-applied write).
+        store.save_draft(NEW_DRAFT_SLOT, body="dup of token 5", token=5)
+        assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)["body"] == "newer text"
+        # A strictly HIGHER token is applied.
+        store.save_draft(NEW_DRAFT_SLOT, body="newest text", token=6)
+        assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)["body"] == "newest text"
+
+
+def test_store_draft_tombstone_survives_clear_and_blocks_late_write():
+    # The tombstone OUTLIVES the draft: after a clear at a high token, a late autosave with a
+    # lower token (sent before the clear, arriving after) is rejected — no resurrection.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.save_draft(NEW_DRAFT_SLOT, body="half-typed", token=10)
+        # The trailing clear wins with a higher token and leaves a tombstone.
+        assert store.save_draft(NEW_DRAFT_SLOT, body="", token=11) == {}
+        assert store.get_draft_token(NEW_DRAFT_SLOT) == 11
+        # A stale autosave (token 10, sent before the clear) lands late -> rejected.
+        out = store.save_draft(NEW_DRAFT_SLOT, body="resurrected stale text", token=10)
+        assert out == {}, "tombstone must reject a late write after the clear"
+        assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT) is None, "no resurrection"
+        # A genuinely NEW draft (a fresh higher token) is still accepted on the same slot.
+        store.save_draft(NEW_DRAFT_SLOT, body="a brand-new note", token=12)
+        assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)["body"] == "a brand-new note"
+
+
+def test_store_draft_tokenless_write_keeps_legacy_last_writer_wins():
+    # A token-less write (legacy client) opts out of the ordering check entirely: it always
+    # applies, and it does not record a tombstone that could block a later token-less write.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.save_draft(NEW_DRAFT_SLOT, body="first", token=9)
+        # No token -> applied regardless of the existing high token (legacy behaviour).
+        store.save_draft(NEW_DRAFT_SLOT, body="legacy overwrite")
+        assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)["body"] == "legacy overwrite"
+
+
+def test_store_draft_malformed_token_is_ignored():
+    # A malformed token (negative, bool, str, float, or an absurdly huge value) is treated as
+    # token-less, not as a real ordering value — so it can neither forge a low/high water-mark,
+    # park the tombstone at ~maxint, nor crash the store. Each applies as a legacy write
+    # (last-writer-wins) and leaves the real tombstone untouched.
+    from reviewlib.specweb.store import _MAX_DRAFT_TOKEN
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.save_draft(NEW_DRAFT_SLOT, body="real", token=4)
+        for bad in (-1, True, "5", 5.5, _MAX_DRAFT_TOKEN + 1):
+            store.save_draft(NEW_DRAFT_SLOT, body=f"bad-{bad!r}", token=bad)
+            assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)["body"] == f"bad-{bad!r}"
+            assert store.get_draft_token(NEW_DRAFT_SLOT) == 4, f"malformed {bad!r} must not move the tombstone"
+
+
+def test_store_draft_legacy_token_mix_semantics_on_one_slot():
+    # MIXING a token-less (legacy) write with token-carrying ones on the SAME slot: the
+    # token-less write applies (legacy last-writer-wins) but deliberately does NOT move the
+    # tombstone, so the ordering high-water-mark is unaffected. This is intended: a token-less
+    # client opted out of ordering, and a later LOWER-token write is still correctly rejected
+    # against the prior tombstone. (Real clients are all-token or all-legacy; this pins the
+    # documented semantics for the contrived mix.)
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        store.save_draft(NEW_DRAFT_SLOT, body="tokened", token=5)      # tombstone -> 5
+        store.save_draft(NEW_DRAFT_SLOT, body="legacy overwrite")      # applies, tombstone stays 5
+        assert store.get_draft_token(NEW_DRAFT_SLOT) == 5
+        assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)["body"] == "legacy overwrite"
+        # a later write with token <= 5 is still rejected against the standing tombstone
+        out = store.save_draft(NEW_DRAFT_SLOT, body="stale token 4", token=4)
+        assert out["body"] == "legacy overwrite", "tombstone still rejects a stale tokened write"
+
+
+def test_store_max_draft_token_seeds_above_all_tombstones():
+    # max_draft_token() is the highest token across ALL slots — the client seeds its
+    # per-session counter above it so a reloaded session outranks every durable tombstone.
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        assert store.max_draft_token() == 0, "no tokens yet -> 0"
+        store.save_draft(NEW_DRAFT_SLOT, body="a", token=3)
+        store.save_draft("edit:c1", body="b", token=7)
+        store.save_draft(NEW_DRAFT_SLOT, body="", token=8)  # clear leaves an 8 tombstone
+        assert store.max_draft_token() == 8
+
+
+def test_store_reloaded_session_seeded_above_tombstone_is_not_rejected():
+    # Regression for the ephemeral-counter-vs-durable-tombstone bug (review-cli#30 review):
+    # a prior session left a high tombstone; a reloaded session that SEEDS its counter from
+    # max_draft_token() and writes ABOVE it is accepted (autosave keeps working after reload).
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        # session 1: type, then the trailing clear bumps the tombstone to 11
+        store.save_draft(NEW_DRAFT_SLOT, body="old", token=10)
+        store.save_draft(NEW_DRAFT_SLOT, body="", token=11)
+        # session 2 (page reload): seed the counter above the durable high-water-mark
+        seed = store.max_draft_token()
+        assert seed == 11
+        store.save_draft(NEW_DRAFT_SLOT, body="new session text", token=seed + 1)
+        assert SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)["body"] == "new session text", \
+            "a seeded reloaded session must NOT be rejected as stale"
+
+
+def test_store_delete_comment_drops_edit_draft_tombstone():
+    # Deleting a comment sweeps its edit draft AND its ordering tombstone, so tombstones for
+    # gone (never-reused) edit slots don't accumulate unbounded in the store file (#30).
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        c = store.add_comment(quote="q", body="original")
+        slot = edit_draft_slot(c["id"])
+        store.save_draft(slot, body="mid-edit", token=5)
+        assert store.get_draft_token(slot) == 5
+        store.delete_comment(c["id"])
+        assert store.get_draft_token(slot) is None, "deleting a comment must drop its tombstone"
+
+
 def test_store_edit_draft_slot_and_delete():
     # An edit-in-progress draft is keyed per comment; deleting the comment drops its draft.
     with _TempStoreEnv():
@@ -1041,6 +1167,129 @@ def test_server_trailing_clear_wins_over_stale_draft_after_create():
             st, body, _ = s.post("/api/drafts/new", {"body": ""})
             assert st == 200 and json.loads(body)["draft"] is None
             assert "new" not in json.loads(s.get("/api/drafts")[1]), "trailing clear must win the race"
+        finally:
+            s.stop()
+
+
+def test_server_draft_token_rejects_late_write_after_clear():
+    # The #30 server-authoritative fix: a stale autosave that arrives AFTER a higher-token
+    # clear is REJECTED, so it can't resurrect the draft — unlike the client's best-effort
+    # ordering, this holds regardless of lock-acquisition order. Drives the genuine
+    # out-of-order ARRIVAL (clear lands first, the older-token autosave lands after).
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            # autosave (token 1) then the trailing clear (token 2) — the clear wins + tombstones.
+            s.post("/api/drafts/new", {"body": "half-typed", "token": 1})
+            st, body, _ = s.post("/api/drafts/new", {"body": "", "token": 2})
+            assert st == 200 and json.loads(body)["draft"] is None and json.loads(body)["stale"] is False
+            # A late STALE autosave (token 1) reaches the server AFTER the clear -> rejected.
+            st, body, _ = s.post("/api/drafts/new", {"body": "stale resurrect", "token": 1})
+            assert st == 200, st
+            payload = json.loads(body)
+            assert payload["stale"] is True, "late lower-token write must be reported stale"
+            assert payload["draft"] is None, "rejected write returns the current (empty) slot"
+            assert "new" not in json.loads(s.get("/api/drafts")[1]), "tombstone must block resurrection"
+        finally:
+            s.stop()
+
+
+def test_server_draft_token_higher_write_applies_and_reports_not_stale():
+    # The happy path: a strictly higher token is applied and reported not-stale; a same-or-
+    # lower token afterwards is rejected as stale (the slot keeps the higher-token body).
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, _ = s.post("/api/drafts/new", {"body": "v1", "token": 1})
+            assert json.loads(body)["stale"] is False
+            st, body, _ = s.post("/api/drafts/new", {"body": "v2", "token": 2})
+            assert json.loads(body)["stale"] is False and json.loads(body)["draft"]["body"] == "v2"
+            # an out-of-order lower token is rejected; the body stays v2
+            st, body, _ = s.post("/api/drafts/new", {"body": "late v1b", "token": 1})
+            assert json.loads(body)["stale"] is True
+            assert json.loads(body)["draft"]["body"] == "v2", "stale write must not overwrite v2"
+            assert json.loads(s.get("/api/drafts")[1])["new"]["body"] == "v2"
+        finally:
+            s.stop()
+
+
+def test_server_draft_tokenless_write_is_never_stale():
+    # A legacy client (no token field) keeps last-writer-wins and is never flagged stale.
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, _ = s.post("/api/drafts/new", {"body": "legacy"})
+            assert json.loads(body)["stale"] is False, "token-less write opts out of ordering"
+            assert json.loads(body)["draft"]["body"] == "legacy"
+        finally:
+            s.stop()
+
+
+def test_server_draft_malformed_token_in_body_is_treated_as_tokenless():
+    # The HTTP path coerces the body's `token` via _as_token: a str/float/bool/negative is
+    # treated as token-less (legacy last-writer-wins, never flagged stale), so a regression in
+    # the request parsing can't silently turn a malformed token into a real ordering value.
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            for bad in ("abc", 5.0, True, -3):
+                st, body, _ = s.post("/api/drafts/new", {"body": "x", "token": bad})
+                assert st == 200, (bad, st)
+                assert json.loads(body)["stale"] is False, f"malformed token {bad!r} must be token-less"
+        finally:
+            s.stop()
+
+
+def test_server_drafts_get_sends_token_seed_header():
+    # GET /api/drafts carries X-Draft-Token-Seed = the highest durable token, so a reloaded
+    # client seeds its counter above every tombstone and its autosaves aren't rejected (#30).
+    # The body shape (slot -> draft map) is unchanged.
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, hdrs = s.get("/api/drafts")
+            assert st == 200 and hdrs.get("X-Draft-Token-Seed") == "0", hdrs
+            s.post("/api/drafts/new", {"body": "x", "token": 5})
+            s.post("/api/drafts/new", {"body": "", "token": 9})  # clear -> tombstone 9
+            st, body, hdrs = s.get("/api/drafts")
+            assert hdrs.get("X-Draft-Token-Seed") == "9", hdrs
+            assert json.loads(body) == {}, "body is still the bare slot->draft map"
+        finally:
+            s.stop()
+
+
+def test_server_draft_post_response_carries_seed_header_for_selfheal():
+    # The seed header rides EVERY write response (not just the GET), so a client whose counter
+    # fell behind re-seeds on the next write and self-heals instead of rejecting forever (#30).
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            _, _, hdrs = s.post("/api/drafts/new", {"body": "x", "token": 7})
+            assert hdrs.get("X-Draft-Token-Seed") == "7", hdrs
+            # even a REJECTED stale write reports the current high-water-mark, so the client
+            # can re-seed above it and its next write wins.
+            _, body, hdrs = s.post("/api/drafts/new", {"body": "stale", "token": 3})
+            assert json.loads(body)["stale"] is True
+            assert hdrs.get("X-Draft-Token-Seed") == "7", "stale response still carries the seed"
+        finally:
+            s.stop()
+
+
+def test_server_reload_seeded_autosave_survives_old_tombstone():
+    # End-to-end of the #30 reload fix: a prior session leaves a high tombstone; a reloaded
+    # client reads the seed header and writes ABOVE it -> accepted (autosave keeps working).
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            s.post("/api/drafts/new", {"body": "old", "token": 10})
+            s.post("/api/drafts/new", {"body": "", "token": 11})  # trailing clear, tombstone 11
+            _, _, hdrs = s.get("/api/drafts")
+            seed = int(hdrs["X-Draft-Token-Seed"])
+            assert seed == 11
+            # the reloaded session's first autosave uses seed+1 and is accepted (not stale)
+            st, body, _ = s.post("/api/drafts/new", {"body": "after reload", "token": seed + 1})
+            assert json.loads(body)["stale"] is False
+            assert json.loads(s.get("/api/drafts")[1])["new"]["body"] == "after reload"
         finally:
             s.stop()
 
@@ -1265,6 +1514,31 @@ def test_store_guarded_writes_create_lockfile_and_lose_nothing():
             list(ex.map(_add, range(40)))
         # every concurrent write landed (no lost update from a load-modify-write race)
         assert len(SpecStore(FIXTURE).all_comments()) == 41, "all concurrent writes must persist"
+
+
+def test_store_concurrent_draft_writes_highest_token_always_wins():
+    # The CORE #30 race: threads write the same slot CONCURRENTLY with shuffled tokens, so the
+    # per-slot lock is acquired in an order unrelated to token order — exactly "lock-acquisition
+    # order != send order". Whatever the interleaving, the slot must end on the HIGHEST-token
+    # body (every lower-token write that lands after it is rejected by the tombstone). This is
+    # what the client's best-effort abort cannot guarantee and the server token does.
+    import concurrent.futures
+    import random
+
+    with _TempStoreEnv():
+        store = SpecStore(FIXTURE)
+        tokens = list(range(1, 51))
+        random.shuffle(tokens)  # fire them in a random order across threads
+
+        def _write(tok):
+            SpecStore(FIXTURE).save_draft(NEW_DRAFT_SLOT, body=f"body-{tok}", token=tok)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_write, tokens))
+        # The highest token (50) must have won regardless of arrival/lock order.
+        final = SpecStore(FIXTURE).get_draft(NEW_DRAFT_SLOT)
+        assert final is not None and final["body"] == "body-50", final
+        assert SpecStore(FIXTURE).get_draft_token(NEW_DRAFT_SLOT) == 50
 
 
 def test_store_guard_serialises_across_processes():

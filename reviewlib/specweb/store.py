@@ -44,6 +44,7 @@ import os
 import tempfile
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -123,6 +124,41 @@ def _as_int(value) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+# Upper bound for a draft ordering token (review-cli#30). The client counter is a per-session
+# send sequence — realistically a few thousand writes — so any value beyond this is a
+# malformed/forged token. Clamping it out (treated as token-less) stops a single absurd value
+# from parking the slot's tombstone at ~maxint and rejecting every legitimate write after it
+# (a trusted-localhost tool, so this is cheap belt-and-braces, not a real threat model).
+_MAX_DRAFT_TOKEN = 2**31 - 1
+
+
+def _as_token(value) -> int | None:
+    """A draft ORDERING token (review-cli#30) coerced to an int in ``[0, _MAX_DRAFT_TOKEN]``,
+    or None when the write carries no usable token. A token is the client's monotonic
+    per-session send sequence; the store rejects a write whose token is <= the slot's last
+    applied one.
+
+    Reuses ``_as_int`` (so a bool is rejected — a JSON ``true`` must not read as token 1; a
+    str/float is rejected too) and additionally rejects out-of-range values: a token is a
+    counter, never below zero, and an absurdly large one is forged/malformed (see
+    ``_MAX_DRAFT_TOKEN``). A missing/invalid token -> None, which makes ``save_draft`` skip
+    the ordering check entirely (legacy clients keep working — they just don't get the
+    out-of-order protection)."""
+    n = _as_int(value)
+    return n if n is not None and 0 <= n <= _MAX_DRAFT_TOKEN else None
+
+
+@dataclass(frozen=True)
+class DraftWriteResult:
+    """Outcome of a draft write (review-cli#30). ``draft`` is the authoritative slot state
+    after the call (the stored draft, or ``{}`` for a cleared/rejected slot). ``applied`` is
+    False ONLY when a token-carrying write was rejected as stale (out-of-order) — decided
+    inside the store lock, so the HTTP layer reports staleness without a second read."""
+
+    draft: dict
+    applied: bool
+
+
 class SpecStore:
     """Persistence for ONE spec's review thread, keyed by the spec's absolute path."""
 
@@ -171,7 +207,19 @@ class SpecStore:
 
     # ---- raw load / save -------------------------------------------------- #
     def _empty(self) -> dict:
-        return {"version": 1, "spec_path": self.spec_path, "comments": [], "drafts": {}}
+        return {
+            "version": 1,
+            "spec_path": self.spec_path,
+            "comments": [],
+            "drafts": {},
+            # Per-slot ordering tombstone (review-cli#30): slot -> the highest write token
+            # that has been APPLIED to that slot. A write whose token is <= the recorded one
+            # is a stale, out-of-order arrival and is rejected. It OUTLIVES the draft (a
+            # cleared slot keeps its high-water-mark token), so a late autosave that lands
+            # after the trailing clear cannot resurrect the draft. Token-less writes (legacy
+            # clients) skip the check and never touch this map.
+            "draft_tokens": {},
+        }
 
     def load(self) -> dict:
         if not self.path.exists():
@@ -188,6 +236,11 @@ class SpecStore:
         # reads as no drafts rather than crashing the comment reads that share this load().
         if not isinstance(data.get("drafts"), dict):
             data["drafts"] = {}
+        # `draft_tokens` is the slot->token ordering tombstone (review-cli#30). A legacy file
+        # has none; a tampered non-dict reads as empty — either way the ordering check just
+        # treats every slot as fresh, which is correct (no recorded high-water-mark yet).
+        if not isinstance(data.get("draft_tokens"), dict):
+            data["draft_tokens"] = {}
         return data
 
     def _write(self, data: dict) -> None:
@@ -323,8 +376,12 @@ class SpecStore:
             if len(data["comments"]) == before:
                 return False
             # A deleted comment can't have an outstanding edit-draft; drop it so a stale
-            # draft for a gone comment never gets restored into the composer.
-            data["drafts"].pop(edit_draft_slot(comment_id), None)
+            # draft for a gone comment never gets restored into the composer. Drop its
+            # ordering tombstone too — the slot id (``edit:<gone-id>``) is never reused, so a
+            # retained tombstone would only accumulate unbounded in the store file (#30).
+            slot = edit_draft_slot(comment_id)
+            data["drafts"].pop(slot, None)
+            data["draft_tokens"].pop(slot, None)
             self._write(data)
             return True
 
@@ -338,6 +395,39 @@ class SpecStore:
         with _LOCK:
             return self.load()["drafts"].get(slot)
 
+    def get_draft_token(self, slot: str) -> int | None:
+        """The slot's last applied ordering token (review-cli#30), or None if none recorded.
+        Exposed for the HTTP layer (to report whether a write was accepted) and tests."""
+        with _LOCK:
+            return _as_token(self.load()["draft_tokens"].get(slot))
+
+    def max_draft_token(self) -> int:
+        """The highest ordering token recorded across ALL slots, or 0 if none (review-cli#30).
+
+        The client seeds its per-session write counter ABOVE this on page load, so every new
+        autosave outranks the durable cross-session tombstones. Without the seed, a reloaded
+        page would restart its counter at 0 and have every autosave silently rejected as stale
+        until the counter clawed back past the old high-water-mark — i.e. autosave would
+        appear broken after a reload. The seed makes the per-session counter monotonic across
+        sessions for every slot at once."""
+        with _LOCK:
+            tokens = [t for t in (_as_token(v) for v in self.load()["draft_tokens"].values()) if t is not None]
+            return max(tokens, default=0)
+
+    def _is_stale_token(self, data: dict, slot: str, token: int | None) -> bool:
+        """True when a token-carrying write is OLDER than the slot's last applied write and
+        must be rejected (review-cli#30). A ``None`` token (legacy/token-less write) is never
+        stale — the ordering check only applies when the client opts in by sending a token.
+
+        Compares against ``draft_tokens[slot]`` (the high-water-mark that OUTLIVES the draft
+        via the tombstone), rejecting ``token <= last``: ``<`` is plainly older, and ``==``
+        is a duplicate of the already-applied write (the client increments per send, so equal
+        tokens are a re-delivery, not new content) — neither should overwrite a newer state."""
+        if token is None:
+            return False
+        last = _as_token(data.get("draft_tokens", {}).get(slot))
+        return last is not None and token <= last
+
     def save_draft(
         self,
         slot: str,
@@ -349,37 +439,88 @@ class SpecStore:
         section_title: str = "",
         start: int | None = None,
         end: int | None = None,
+        token: int | None = None,
     ) -> dict:
-        """Autosave an in-progress composer buffer to disk under ``slot``.
+        """Autosave an in-progress composer buffer; returns the resulting draft (or ``{}`` on
+        a clear / a rejected stale write). Back-compat thin wrapper over ``save_draft_result``;
+        callers that need to know whether the write was APPLIED use that method instead."""
+        return self.save_draft_result(
+            slot, body=body, kind=kind, quote=quote, section_id=section_id,
+            section_title=section_title, start=start, end=end, token=token,
+        ).draft
+
+    def save_draft_result(
+        self,
+        slot: str,
+        *,
+        body: str,
+        kind: str = DEFAULT_KIND,
+        quote: str = "",
+        section_id: str = "",
+        section_title: str = "",
+        start: int | None = None,
+        end: int | None = None,
+        token: int | None = None,
+    ) -> DraftWriteResult:
+        """Autosave an in-progress composer buffer to disk under ``slot``, returning
+        ``(draft, applied)``.
 
         A draft is the recoverable composer text + (for a new note) the selection context
         needed to re-open it; it is NOT a comment and never enters the review. An EMPTY
         body deletes the slot (clearing a draft is the same call with an empty body — the
-        composer emptied to nothing has nothing to recover). Returns the stored draft, or
-        ``{}`` when an empty body cleared the slot."""
+        composer emptied to nothing has nothing to recover). ``draft`` is the stored draft,
+        or ``{}`` when the body was empty (a clear) OR the write was rejected as stale.
+
+        ORDERING (review-cli#30): an optional monotonic ``token`` (the client's send sequence)
+        makes the write order-safe. A write whose token is <= the slot's last applied token is
+        a stale, out-of-order arrival: it is REJECTED (``applied=False``), the slot is left
+        untouched, and the CURRENT draft (or ``{}``) is returned so the client mirrors the
+        authoritative state. An accepted token is recorded as a tombstone that outlives the
+        draft. ``applied`` is decided INSIDE the lock, so the caller never needs a second read
+        to learn the outcome (no TOCTOU). A ``None`` token keeps the legacy last-writer-wins
+        behaviour (always applied, no tombstone), so older clients are unaffected."""
         slot = (slot or "").strip()
         if not slot:
             raise ValueError("draft 'slot' is required")
         text = body or ""
+        token = _as_token(token)
         with self._guard():
             data = self.load()
-            if not text.strip():
-                data["drafts"].pop(slot, None)
-                self._write(data)
-                return {}
-            draft = {
-                "slot": slot,
-                "body": text,
-                "kind": _norm_kind(kind),
-                "quote": (quote or ""),
-                "section_id": (section_id or ""),
-                "section_title": (section_title or ""),
-                "start": _as_int(start),
-                "end": _as_int(end),
-                "updated": _now(),
-            }
-            data["drafts"][slot] = draft
+            if self._is_stale_token(data, slot, token):
+                # Out-of-order: a newer write already won this slot. Leave it untouched and
+                # report what is actually there, so the client mirrors the authoritative state.
+                return DraftWriteResult(draft=dict(data["drafts"].get(slot) or {}), applied=False)
+            draft = self._apply_draft_write(
+                data, slot, text, kind, quote, section_id, section_title, start, end,
+            )
+            if token is not None:
+                data["draft_tokens"][slot] = token
             self._write(data)
+        return DraftWriteResult(draft=draft, applied=True)
+
+    def _apply_draft_write(
+        self, data: dict, slot: str, text: str, kind: str, quote: str,
+        section_id: str, section_title: str, start, end,
+    ) -> dict:
+        """Mutate ``data`` for an ACCEPTED draft write: an empty body pops the slot (clear,
+        returns ``{}``); a non-empty body stores the draft record (returns it). Does NOT
+        write to disk or touch the tombstone — ``save_draft`` owns the token bookkeeping and
+        the ``_write``. Split out only to keep ``save_draft`` readable."""
+        if not text.strip():
+            data["drafts"].pop(slot, None)
+            return {}
+        draft = {
+            "slot": slot,
+            "body": text,
+            "kind": _norm_kind(kind),
+            "quote": (quote or ""),
+            "section_id": (section_id or ""),
+            "section_title": (section_title or ""),
+            "start": _as_int(start),
+            "end": _as_int(end),
+            "updated": _now(),
+        }
+        data["drafts"][slot] = draft
         return draft
 
     def delete_draft(self, slot: str) -> bool:
