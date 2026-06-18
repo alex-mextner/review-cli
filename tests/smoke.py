@@ -341,14 +341,22 @@ def test_dashboard_managed_surface_and_lib_absent_fallback():
             raise SmokeError(f"dashboard status (nothing running) expected exit 3, got {p.returncode}")
         assert_not_in("Traceback (most recent call last)", p.stdout + p.stderr)
     else:
-        # A genuine lifecycle action without the lib: stable exit 4 + actionable error, no traceback.
-        p = run("dashboard", "status")
-        if p.returncode != 4:
-            raise SmokeError(f"lib-absent dashboard status expected exit 4, got {p.returncode}")
-        out = p.stdout + p.stderr
-        assert_in("agenttools_service", out)
-        assert_in("pip install", out.lower())
-        assert_not_in("Traceback (most recent call last)", out)
+        # A genuine lifecycle action without the lib: stable exit 4 + actionable error, no
+        # traceback. EVERY managed action (not just `status`) must take the same actionable
+        # exit-4 path — a regression where one action slipped to a raw ImportError (exit 1,
+        # the review-cli#45 symptom) would otherwise pass a status-only check. `run` is the
+        # ad-hoc foreground server (it works WITHOUT the lib) and is excluded here.
+        for action in ("status", "start", "stop", "enable", "disable"):
+            p = run("dashboard", action)
+            if p.returncode != 4:
+                raise SmokeError(
+                    f"lib-absent `dashboard {action}` expected exit 4, got {p.returncode}\n"
+                    f"{p.stdout}\n{p.stderr}"
+                )
+            out = p.stdout + p.stderr
+            assert_in("agenttools_service", out, what=f"(dashboard {action})")
+            assert_in("pip install", out.lower(), what=f"(dashboard {action})")
+            assert_not_in("Traceback (most recent call last)", out, what=f"(dashboard {action})")
         # The bare-HELP contract does NOT depend on the lib: bare `review dashboard` AND a
         # help-only `review dashboard --help` print help + launch nothing (exit 0), advertising
         # every action — this is the lib-absent fallback the CI gate exercises.
@@ -362,6 +370,57 @@ def test_dashboard_managed_surface_and_lib_absent_fallback():
         if help_out.returncode != 0:
             raise SmokeError(f"lib-absent `dashboard --help` expected exit 0, got {help_out.returncode}")
         assert_in("status", help_out.stdout + help_out.stderr)
+
+
+# --- dashboard SPA pure-logic JS unit tests -------------------------------------------------
+def _node_supports_test_runner() -> str | None:
+    """The path to a `node` whose built-in test runner (`node --test`, stable since Node 18)
+    is available, or None if node is absent / too old. We must SKIP — not FAIL — on an old
+    node, so the "skip loudly when the optional dep is missing" contract holds even when node
+    exists but predates `--test`."""
+    import shutil
+
+    node = shutil.which("node")
+    if not node:
+        return None
+    try:
+        out = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    # `node --version` prints e.g. `v20.11.0`; the test runner is stable from major >= 18.
+    ver = out.stdout.strip().lstrip("v")
+    try:
+        major = int(ver.split(".", 1)[0])
+    except (ValueError, IndexError):
+        return None
+    return node if major >= 18 else None
+
+
+def test_dashboard_js_unit():
+    """The dashboard SPA's pure resolution/filter logic (resolveModel / filteredRuns in
+    reviewlib/dashboard/assets/app.js) has node-based unit tests (review-cli#45). Run them
+    with Node's built-in runner. `node` (>= 18) is present on the GitHub runner (and most dev
+    boxes), so this actually executes in CI; where node is absent OR too old for `--test` it
+    SKIPs loudly (the JS tests are not a runtime requirement of the Python CLI). The exit code
+    IS the assertion — a failing JS test makes `node --test` exit non-zero -> this check fails."""
+    node = _node_supports_test_runner()
+    if node is None:
+        msg = "dashboard JS unit tests: need `node` >= 18 on PATH (built-in `node --test` runner)"
+        if pytest is not None and os.environ.get("PYTEST_CURRENT_TEST"):
+            pytest.skip(msg)
+        raise _SkipCheck(msg)
+    js_test = REPO / "tests" / "dashboard_app.test.js"
+    try:
+        p = subprocess.run(
+            [node, "--test", str(js_test)],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SmokeError(f"dashboard JS unit tests timed out: {exc}") from exc
+    if p.returncode != 0:
+        raise SmokeError(f"dashboard JS unit tests failed (node exit {p.returncode})\n{p.stdout}\n{p.stderr}")
 
 
 # --- resumable sessions listing (against a temp log dir) ------------------------------------

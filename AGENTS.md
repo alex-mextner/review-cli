@@ -130,6 +130,15 @@ The visual-verification suite needs ImageMagick v7 (`magick`) + Pillow; without 
 self-skips loudly and the core suite still runs. Mode-subcommand + registry coverage is
 in `tests/test_mode_subcommands.py`.
 
+The dashboard SPA's pure JS logic (`resolveModel` / `filteredRuns` in
+`reviewlib/dashboard/assets/app.js`) has node-based unit tests in
+`tests/dashboard_app.test.js`, run by `smoke.py`'s `test_dashboard_js_unit` via Node's
+built-in runner (`node --test`). Node is present on the GitHub runner, so they execute in
+CI; where `node` is absent the check self-skips loudly. Run them directly with
+`node --test tests/dashboard_app.test.js`. The functions are exposed to Node via a guarded
+`module.exports` footer in `app.js` (a no-op in the browser), so the tests exercise the
+exact code the SPA runs — no drifting copy.
+
 When a test needs to stub a mode handler, patch it **where it is defined** (e.g.
 `reviewlib.modes.brainstorm.mode_brainstorm`), NOT as a `cli.<fn>` attribute — dispatch
 goes through `modes/registry`, so a `cli.mode_*` rebind has no effect.
