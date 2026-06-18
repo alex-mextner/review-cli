@@ -609,12 +609,25 @@
       return r.json();
     });
   }
-  function persistDraft(slot, body) {
+  function persistDraft(slot, body, isRetry) {
     var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
     draftSaveAbort = ctrl;
     postDraft(slot, draftPayload(slot, body), ctrl && ctrl.signal)
       .then(function (r) {
         if (draftSaveAbort === ctrl) draftSaveAbort = null;
+        // A stale rejection means this tab's counter was behind the server high-water-mark.
+        // postDraft already RE-SEEDED the counter from the response header, so a single retry
+        // now carries a winning token and actually persists the user's text (review-cli#30).
+        // Without it, a behind-counter tab would silently lose the just-typed draft if the
+        // user stopped typing after this first autosave (codex review of #50). Guarded:
+        // retry ONCE (no isRetry recursion), and only while THIS write is still the latest
+        // for THIS slot — a newer save/clear having started (draftSaveAbort !== null, or the
+        // active slot moved) means a fresher write already owns the slot, so we must not
+        // resurrect this body over it.
+        if (r && r.stale && !isRetry && draftSaveAbort === null && state.activeDraftSlot === slot) {
+          persistDraft(slot, body, true);
+          return;
+        }
         // Mirror the server's view locally so a same-session re-open sees the latest text
         // (and a cleared slot drops it). r.draft is null when the body was emptied.
         if (r && r.draft) state.drafts[slot] = r.draft;

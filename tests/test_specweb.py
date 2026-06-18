@@ -1275,6 +1275,31 @@ def test_server_draft_post_response_carries_seed_header_for_selfheal():
             s.stop()
 
 
+def test_server_behind_counter_reseeded_retry_persists_text():
+    # The self-heal RETRY path (review-cli#30, codex review of #50): a tab whose counter is
+    # BEHIND the server high-water-mark sends a stale autosave; the response says stale:true
+    # AND carries the seed header. The client re-seeds and RETRIES with a winning token — this
+    # test drives that sequence at the HTTP layer and asserts the retry actually persists the
+    # user's text (not just mirrors the server's stale view).
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            # establish a high tombstone (e.g. a prior session left token 5 on the slot)
+            s.post("/api/drafts/new", {"body": "prior", "token": 5})
+            # behind-counter tab's first autosave (token 2) -> rejected as stale
+            st, body, hdrs = s.post("/api/drafts/new", {"body": "my new text", "token": 2})
+            assert json.loads(body)["stale"] is True
+            seed = int(hdrs["X-Draft-Token-Seed"])
+            assert seed == 5, "stale response carries the high-water-mark so the client re-seeds"
+            # the client re-seeds to 5 and retries with seed+1 -> accepted, text persisted
+            st, body, _ = s.post("/api/drafts/new", {"body": "my new text", "token": seed + 1})
+            assert json.loads(body)["stale"] is False
+            assert json.loads(s.get("/api/drafts")[1])["new"]["body"] == "my new text", \
+                "the re-seeded retry must persist the user's text"
+        finally:
+            s.stop()
+
+
 def test_server_reload_seeded_autosave_survives_old_tombstone():
     # End-to-end of the #30 reload fix: a prior session leaves a high tombstone; a reloaded
     # client reads the seed header and writes ABOVE it -> accepted (autosave keeps working).
