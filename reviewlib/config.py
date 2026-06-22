@@ -91,6 +91,11 @@ CONFIG_PATH = Path.home() / ".config" / "review-cli" / "config.yaml"
 
 # Short default for the interactive multi-call modes; classic review keeps 1200s.
 PANEL_TIMEOUT_DEFAULT = 240
+# qa (the agent-as-tester mode) carve-out: a tester run boots a SUT and drives a whole
+# suite with an un-caged agent — tens of minutes, NOT the 4-minute chat-panel default. It
+# gets its own long per-run default (45 min) and still leans on the <=4h run backstop, so a
+# real qa run is never cut off by the short panel cap (review-qa.md §3 timeout carve-out).
+QA_TIMEOUT_DEFAULT = 2700
 # Moderator priority for --quorum/--brainstorm. opus first now that the headless
 # claude backend works reliably (deterministic workspace auto-trust); codex and
 # gemini are the fallbacks. pick_moderators() filters this to available backends

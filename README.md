@@ -1,6 +1,12 @@
 # review-cli
 
-**multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic.**
+**multi-model code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. CLI-first, harness-agnostic.**
+
+> The review/quorum/brainstorm/just-ask/visual modes are **read-only** (the agents are
+> caged — they cannot edit, run shell, or hit the network). The **`qa`** mode is the one
+> exception: it runs an **un-caged write/exec tester** that drives a System-Under-Test (see
+> [QA — agent-as-tester](#qa--agent-as-tester-review-qa) for the safety model). Don't assume
+> every subcommand is read-only.
 
 Runs your git diff through multiple AI backends **in parallel**, collects their findings,
 and prints them side by side. Core review modes let you go from a quick pre-commit
@@ -245,6 +251,43 @@ review brainstorm "API shape for the cache layer" \
 
 ---
 
+### QA — agent-as-tester (`review qa`)
+
+The first mode that needs a **write/exec** agent, not a read-only reviewer. `review qa`
+brings up a System-Under-Test (SUT), drives it against **human-authored prose test
+suites**, and reports bugs **with proof** (logs / exit codes / expected-vs-actual). It is
+**report-only**: a found bug never fails the build (it prints findings and exits 0); only
+"couldn't run the tester" / `BLOCKED` is non-zero, and `--strict` flips any finding to 10.
+
+Suites live at `docs/tests/suites/*.md` (relative to the SUT). Each `*.md` is a suite;
+each `## Case:` block is one case the tester must exercise and verdict PASS / FAIL /
+BLOCKED. With **no** authored suite, qa fails the no-suites gate (exit 6) and teaches you
+how to author one — a green qa run with zero cases is a lie.
+
+```bash
+review qa <sut> --suites docs/tests/suites/*.md       # default: claude tester, isolated worktree, 1 case
+review qa <sut> --kind backend --max-cases 5          # cap the run (cost control); 0 = full suite
+review qa <sut> --in-place                            # run in the SUT tree (riskier; opt-in)
+REVIEW_QA_TESTER=codex review qa <sut>                # use the codex write/exec seat instead of claude
+```
+
+**Safety — read this.** qa is the first review-cli mode that runs an **un-caged** agent
+(bash + write, no permission gate — claude runs `--permission-mode bypassPermissions`, codex
+`--full-auto`). It runs WITH its working directory set to a throwaway `git worktree` of the
+SUT by default, so an agent that stays in its cwd writes only into a disposable tree. **But
+the worktree is NOT an OS sandbox.** An un-caged shell with absolute paths can **read AND
+write anywhere on the filesystem** (other repos, `~/.ssh`, system files) and reach the
+**network** — the worktree only bounds the *default* working directory, not what the agent
+*can* touch. The only real write/exec boundary would be a container/VM, which qa does not yet
+provide. **Run qa only against SUTs and suites you fully trust** (a malicious suite file or
+SUT README could prompt-inject the un-caged agent), prefer the (default) worktree over
+`--in-place`, and treat it like handing a shell to an LLM. `--in-place` is refused over a
+tree with uncommitted/unknown git state (for BOTH the claude and codex seats). **Single-seat**
+(one tester driving one SUT; the panel/`--pool` are ignored for qa), with a **long timeout**
+default (not the short chat-panel cap) and token/wall accounting in the report.
+
+---
+
 ### When to use which
 
 | Subcommand | Reach for it when... |
@@ -253,6 +296,7 @@ review brainstorm "API shape for the cache layer" \
 | `just-ask` | Quick multi-model second opinion on any question |
 | `quorum` | A contested decision that needs cited evidence to settle |
 | `brainstorm` | An open design space you want to explore across multiple rounds (optionally grounded in a diff — pass `--diff` / `--staged` or have an uncommitted diff to brainstorm about a specific change) |
+| `qa` | Acting as a tester: bring up a running system and drive it against authored `## Case:` suites, reporting bugs with proof (report-only) |
 
 ---
 

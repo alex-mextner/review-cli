@@ -418,7 +418,7 @@ def test_value_taking_opts_are_all_value_taking():
     brainstorm_only = {"--rounds", "--max-rounds"}
     specweb_only = {"--spec"}        # lives ONLY on the `spec-web reply` subparser
     moderator_only = {"--moderator"}  # lives on quorum / brainstorm, NOT the diff review
-    qa_only = {"--suites"}            # lives ONLY on the `qa` subparser (modes/qa.py)
+    qa_only = {"--suites", "--kind", "--report", "--max-cases"}  # ONLY on the `qa` subparser (modes/qa.py)
     for opt in sorted(_VALUE_TAKING_OPTS):
         if opt in ("-o", "--output"):
             continue  # handled by the pre-scan, covered by other tests
