@@ -218,6 +218,91 @@ def test_dead_round_after_productive_rounds_does_not_abort(capfd=None):
     assert "idea from m1 r1" in out, "round-1 productive content must survive into the output"
 
 
+def test_midrun_collapse_stops_on_dead_round_not_min_rounds():
+    """A mid-run collapse STOPS the loop on the dead round and synthesizes the good rounds —
+    it must NOT keep hammering the now-dead backends for the remaining min_rounds (the
+    "~20 min wasted on dead backends" the CTO hit).
+
+    Round 1 alive, round 2 dead, with rounds>=5. Before the fix the loop ignored the dead
+    round and ran to round 5 (min_rounds) before STOP could fire — 5 rounds x 3 seats of dead
+    backends. After the fix the dead round 2 itself ends the loop: exactly round 1 (3 seats)
+    + round 2 (3 dead seats) = 6 persona calls, then a synthesis over round 1."""
+    rc, out, stub = _run_brainstorm("alive", rounds=5, max_rounds=8, dead_from_round=2)
+    assert rc == 0, f"the collapse must synthesize the good round and exit 0, got {rc}"
+    assert "# Final synthesis" in out, "the good round 1 must still be synthesized"
+    # The dead round ends the loop — round 1 (3) + the dead round 2 (3) only. NOT 5 min-rounds
+    # (15) of dead backends.
+    assert stub.persona_calls == 6, (
+        f"a mid-run collapse must stop on the dead round, not run to min_rounds; expected "
+        f"6 persona calls (round 1 + dead round 2), got {stub.persona_calls}"
+    )
+    # The moderator is NOT consulted on the dead round (round 2). The stub counts a moderator
+    # call for BOTH a per-round summary AND the final synthesis, so a clean collapse is exactly
+    # 2: round 1's summary + the final synthesis. A round-2 moderator turn would make it 3 —
+    # so this pins "no moderator on the dead round" (the rubber-stamp-STOP vector is gone).
+    assert stub.moderator_calls == 2, (
+        f"the moderator must not be called on the dead round (expected 2 = round-1 summary + "
+        f"final synthesis), got {stub.moderator_calls}"
+    )
+
+
+def test_midrun_collapse_not_hollow_even_if_moderator_would_stop_over_dead_round():
+    """The hollow-STOP vector (CTO 2026-06-16): the moderator stamps DECISION: STOP over a
+    DEAD round and the run "converges" on a transcript of "(no output)". The fix removes the
+    moderator from the dead-round decision entirely — the dead round itself ends the loop
+    BEFORE any moderator turn — so even a STOP-happy moderator cannot manufacture a hollow
+    convergence. Proven here with a moderator that ALWAYS says STOP."""
+    with tempfile.TemporaryDirectory() as tmp:
+        old_log = os.environ.get("REVIEW_LOG_DIR")
+        os.environ["REVIEW_LOG_DIR"] = tmp
+        buf = io.StringIO()
+        try:
+            stub = _StubBackends("alive", dead_from_round=2)
+            # Override the moderator to ALWAYS stamp STOP (the rubber-stamp moderator).
+            orig_enter = stub.__enter__
+
+            def _enter_stop_happy(_self=stub, _orig=orig_enter):
+                _orig()
+                from reviewlib.modes.brainstorm import (
+                    MODERATOR_PROMPT_LEADIN,
+                    SYNTHESIS_PROMPT_MARKER,
+                )
+
+                def _fake(model, prompt, diff, cwd, timeout, round_no=0):
+                    if SYNTHESIS_PROMPT_MARKER in prompt:
+                        _self.moderator_calls += 1
+                        return _result(model, stdout="FINAL SYNTHESIS: ship idea-A.")
+                    if MODERATOR_PROMPT_LEADIN in prompt:
+                        _self.moderator_calls += 1
+                        return _result(model, stdout="Summary.\nDECISION: STOP")
+                    _self.persona_calls += 1
+                    if round_no >= 2:
+                        return _result(model, stdout="")  # dead from round 2
+                    return _result(model, stdout=f"idea from {model} r{round_no}")
+
+                panel.resolve_backend = lambda _m: _fake
+                return _self
+
+            stub.__enter__ = _enter_stop_happy  # type: ignore[method-assign]
+            with stub, redirect_stdout(buf):
+                rc = mode_brainstorm("topic", ["m1", "m2", "m3"], REPO_ROOT, 5, ["mod"],
+                                     rounds=5, max_rounds=8)
+        finally:
+            if old_log is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = old_log
+    out = buf.getvalue()
+    # The run still completes with a synthesis over the REAL round 1 (rc 0) — not a dead-panel
+    # abort (round 1 was productive) and not a hollow synthesis.
+    assert rc == 0, f"a productive round 1 + dead round 2 must synthesize and exit 0, got {rc}"
+    assert "# Final synthesis" in out
+    assert "idea from m1 r1" in out, "the real round-1 ideas must be in the synthesized output"
+    # Crucially, the loop stopped on the dead round 2, NOT after a moderator STOP-over-dead —
+    # only round 1's persona+moderator and round 2's dead personas ran.
+    assert "# Round 3" not in out, "the dead round must end the loop, not let STOP run more rounds"
+
+
 def test_dead_panel_writes_partial_discussion_log():
     """The dead round we DID run must be on disk (diagnosable + resumable), and the log must
     record the abort — not silently vanish."""
