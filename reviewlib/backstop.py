@@ -105,8 +105,28 @@ def _fire(seconds: int, stream) -> None:
         kill_live_children()
     except Exception:  # noqa: BLE001 — best-effort; the deadman + os._exit are the guarantee
         pass
-    # Announce LAST among the fallible steps: a full undrained stderr pipe could block
-    # this print, but children are already reaped and the deadman guarantees the exit.
+    # Reap any pending qa SUT env (hook/compose) BEFORE the announce. os._exit below BYPASSES
+    # atexit, so without this a wedged qa run leaks the daemonized SUT env the backstop's
+    # subprocess-group SIGKILL cannot reach (codex P2). Order matters: RESOURCE SAFETY (don't
+    # leak the env) ranks ABOVE observability (printing the line). The announce can BLOCK on a
+    # full, undrained stderr pipe — and a full pipe is one of the wedge scenarios — so if it
+    # ran first and blocked, the deadman would force-exit mid-print and this sweep would never
+    # run, leaking the very env it exists to reap. Sweeping first guarantees the env is reaped
+    # whenever the sweep itself completes within the deadman grace. Costs of this call: it is
+    # idempotent, never raises, and a no-op when nothing is pending — but it is NOT free for a
+    # plain review run that never imported qa.env, where it triggers a one-time module import at
+    # the worst moment (the deadman bounds even that). It is also NOT instantaneous: each
+    # teardown is a synchronous `down` spawn bounded by its own timeout, so a long sweep can be
+    # cut off mid-flight by the deadman (acceptable last-resort; a re-run's atexit hook or a
+    # manual `down` reaps the remainder).
+    try:
+        from .qa.env import sweep_pending_teardowns
+
+        sweep_pending_teardowns()
+    except Exception:  # noqa: BLE001 — best-effort; the deadman + os._exit are the guarantee
+        pass
+    # Announce LAST among the fallible steps: a full undrained stderr pipe could block this
+    # print, but children + the qa env are already reaped and the deadman guarantees the exit.
     try:
         print(
             f"[review] INTERNAL BACKSTOP fired after {seconds}s "

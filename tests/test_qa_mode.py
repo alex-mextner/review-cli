@@ -205,6 +205,71 @@ def test_authored_suite_fail_verdict_is_report_only_zero_but_strict_blocks():
         assert rc_strict == 10, (rc_strict, err2)
 
 
+def _add_setup_hook(sut: str, *, up_rc: int = 0) -> Path:
+    """Add an executable ``qa/setup.sh`` hook to a SUT dir that writes UP/DOWN markers, so a
+    handler-level run can assert the Phase-3 env layer brought it up + tore it down."""
+    qadir = Path(sut) / "qa"
+    qadir.mkdir(parents=True, exist_ok=True)
+    hook = qadir / "setup.sh"
+    hook.write_text(
+        "#!/bin/sh\n"
+        'cd "$(dirname "$0")/.." || exit 1\n'
+        "case \"$1\" in\n"
+        f"  up) touch UP; exit {up_rc} ;;\n"
+        "  down) rm -f UP; touch DOWN; exit 0 ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    return hook
+
+
+def test_handler_brings_env_up_and_tears_it_down_around_executor():
+    """Phase-3 wiring through the REAL `review qa` dispatch: a SUT with a `qa/setup.sh` hook
+    has its env brought up (UP marker) BEFORE the (mocked) executor runs and torn down (DOWN
+    marker) on exit — proving env.bring_up_env + the guaranteed teardown are wired into the
+    handler, not just unit-tested in isolation (review finding: the real handler wiring was
+    uncovered)."""
+    sut = _sut_with_suite(["a case the tester runs"])
+    _git_init_commit(sut)  # commit BEFORE adding the hook so the worktree HEAD is clean
+    _add_setup_hook(sut)
+    with _fake_tester_env(verdict="PASS"):
+        rc, _out, err = _run(["qa", sut])
+    assert rc == 0, (rc, err)
+    assert "VERDICT=PASS" in err, err
+    assert (Path(sut) / "DOWN").exists(), "the hook env must be torn down on exit"
+    assert not (Path(sut) / "UP").exists(), "teardown removed the UP marker"
+    assert "env=none" in err, ("the agent was told the env is already up", err)
+
+
+def test_handler_no_env_declared_skips_bringup():
+    """A SUT with NO stage / hook / config skips Phase-3 bring-up gracefully — the executor
+    still runs (the agent does its own local bring-up), no env is owned, no marker is written.
+    Proves env bring-up is SKIPPED for pure unit-style SUTs (the task's graceful-skip case)."""
+    sut = _sut_with_suite(["a case"])
+    _git_init_commit(sut)
+    with _fake_tester_env(verdict="PASS"):
+        rc, _out, err = _run(["qa", sut])
+    assert rc == 0, (rc, err)
+    assert "env=" not in err, ("no env layer engaged for a bare SUT", err)
+    assert not (Path(sut) / "DOWN").exists()
+
+
+def test_handler_malformed_config_is_usage_error():
+    """A malformed qa.yaml is a clean usage error (exit 2) from the handler, not a traceback."""
+    sut = _sut_with_suite(["a case"])
+    _git_init_commit(sut)
+    cfgdir = Path(sut) / "docs" / "tests"
+    (cfgdir / "qa.yaml").write_text(
+        "sut:\n  health:\n    - { name: bad, url: http://x, compose_service: db }\n",
+        encoding="utf-8")
+    with _fake_tester_env(verdict="PASS"):
+        rc, _out, err = _run(["qa", sut])
+    assert rc == 2, (rc, err)
+    assert "EXACTLY one" in err, err
+
+
 def test_non_repo_sut_blocked_exit_when_isolation_fails():
     """A SUT that is NOT a git repo can't be isolated into a worktree, so the run is BLOCKED
     (EXIT_QA_SUT_BOOT_FAILED) — distinct from a finding. No backend is spawned (the isolation

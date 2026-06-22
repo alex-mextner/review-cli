@@ -200,6 +200,58 @@ def test_backstop_reaps_registered_backend_children_before_exit():
             raise AssertionError(f"backend pid {backend_pid} survived the backstop fire")
 
 
+# A child that brings up a REAL qa hook env (registered in the qa pending-teardown registry),
+# then wedges under a 1s backstop. `_fire` calls `os._exit(124)`, which BYPASSES atexit — so
+# unless `_fire` itself invokes the qa sweep, the env's `down` never runs and the SUT leaks
+# (codex P2). The child's hook writes a DOWN marker on `down`; the OUTER test asserts that
+# marker exists after the fire, proving `_fire` ran the sweep through the real import path
+# (the wiring, not just the sweep function in isolation).
+_CHILD_REGISTERS_QA_ENV = (
+    "import sys; sys.path.insert(0, %r)\n"
+    "import time\n"
+    "from pathlib import Path\n"
+    "from reviewlib.qa import config as cfg\n"
+    "from reviewlib.qa.env import bring_up_env\n"
+    "from reviewlib.backstop import run_backstop\n"
+    "sut = Path(sys.argv[1])\n"
+    "(sut / 'qa').mkdir(parents=True, exist_ok=True)\n"
+    "hook = sut / 'qa' / 'setup.sh'\n"
+    "hook.write_text('#!/bin/sh\\n'\n"
+    "  'cd \"$(dirname \"$0\")/..\" || exit 1\\n'\n"
+    "  'case \"$1\" in\\n'\n"
+    "  '  up) touch UP; exit 0 ;;\\n'\n"
+    "  '  down) rm -f UP; touch DOWN; exit 0 ;;\\n'\n"
+    "  '  *) exit 2 ;;\\n'\n"
+    "  'esac\\n')\n"
+    "hook.chmod(0o755)\n"
+    "h = bring_up_env(sut_path=sut, config=cfg.SutConfig(), stage_url_override=None,\n"
+    "                 exit_no_env=7, exit_unhealthy=9)\n"
+    "with run_backstop(1):\n"
+    "    time.sleep(30)\n"
+)
+
+
+def test_backstop_fire_sweeps_pending_qa_env():
+    """codex P2 wiring: `_fire` must run the qa pending-teardown sweep before its `os._exit`,
+    or a wedged qa run leaks its SUT env (os._exit skips atexit). Bring up a real hook env in a
+    child, wedge under a 1s backstop, and assert the hook's `down` ran (DOWN marker)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        sut = os.path.join(d, "sut")
+        os.mkdir(sut)
+        proc = subprocess.run(
+            [sys.executable, "-c", _CHILD_REGISTERS_QA_ENV % str(REPO_ROOT), sut],
+            capture_output=True, text=True, timeout=20,
+        )
+        assert proc.returncode == 124, (proc.returncode, proc.stderr)
+        assert (Path(sut) / "DOWN").exists(), (
+            "the backstop fire must have swept the pending qa env (run its `down`); "
+            f"stderr={proc.stderr}"
+        )
+        assert not (Path(sut) / "UP").exists(), "the swept env's UP marker must be gone"
+
+
 # A registered backend that IGNORES SIGTERM (traps it) — exactly codex's concern: a polite
 # SIGTERM-then-wait reap could be preempted by the deadman before SIGKILL lands, leaving
 # the backend alive. The kill-first `kill_live_children` sends SIGKILL straight away, so an
