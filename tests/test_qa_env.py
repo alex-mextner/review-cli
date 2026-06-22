@@ -231,15 +231,26 @@ def test_hook_env_with_no_health_check_is_trusted():
 
 def test_hook_up_failure_is_env_error():
     """A hook whose ``up`` exits non-zero is a boot failure → EnvError (unhealthy code), and
-    nothing is left registered for teardown (the up never succeeded)."""
+    nothing is left registered for teardown (the up never succeeded).
+
+    The failing ``up`` here STARTS resources (touches UP) before exiting non-zero — a stand-in
+    for a hook that wraps compose / a dev server and dies after starting it. The matching
+    ``down`` MUST run on the failure path so that partially-created env is reaped (codex P2: a
+    failed hook up previously left it running). With ``_hook_sut``'s script, ``down`` removes UP
+    + touches DOWN, so DOWN-present + UP-gone proves the cleanup ran."""
     sut = _hook_sut(up_rc=3)
     try:
-        bring_up_env(sut_path=sut, config=cfg.SutConfig(), stage_url_override=None,
-                     exit_no_env=EXIT_NO_ENV, exit_unhealthy=EXIT_UNHEALTHY)
-        raise AssertionError("expected EnvError for a failing hook up")
-    except EnvError as exc:
-        assert exc.exit_code == EXIT_UNHEALTHY, exc.exit_code
-        assert "exited 3" in str(exc)
+        try:
+            bring_up_env(sut_path=sut, config=cfg.SutConfig(), stage_url_override=None,
+                         exit_no_env=EXIT_NO_ENV, exit_unhealthy=EXIT_UNHEALTHY)
+            raise AssertionError("expected EnvError for a failing hook up")
+        except EnvError as exc:
+            assert exc.exit_code == EXIT_UNHEALTHY, exc.exit_code
+            assert "exited 3" in str(exc)
+        assert (sut / "DOWN").exists(), "the hook's `down` must run after a failed `up`"
+        assert not (sut / "UP").exists(), "the failed-up env must be cleaned up"
+        with envmod._PENDING_LOCK:
+            assert not envmod._PENDING_TEARDOWNS, "a never-registered env stays out of the registry"
     finally:
         shutil.rmtree(sut, ignore_errors=True)
 
@@ -647,6 +658,125 @@ def test_compose_service_check_on_hook_env_fails_fast():
         # the env was torn down (the check failed before the gate could pass)
         assert (sut / "DOWN").exists()
     finally:
+        shutil.rmtree(sut, ignore_errors=True)
+
+
+def test_hook_up_timeout_runs_down_and_fails():
+    """The MOST COMMON hook leak is a HUNG ``up`` (a dev server that never returns), not a
+    clean non-zero exit. ``_run_env_command`` normalizes a timeout to returncode 124, so the
+    same down-on-failure cleanup must fire (codex P5: confirm the timeout case is covered). A
+    hook whose ``up`` touches UP then sleeps past a short timeout → EnvError + ``down`` ran."""
+    sut = Path(tempfile.mkdtemp(prefix="qa-env-hook-hang-"))
+    (sut / "qa").mkdir(parents=True)
+    script = (
+        "#!/bin/sh\n"
+        'cd "$(dirname "$0")/.." || exit 1\n'
+        "case \"$1\" in\n"
+        "  up) touch UP; sleep 30 ;;\n"          # hangs well past the patched 1s timeout
+        "  down) rm -f UP; touch DOWN; exit 0 ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n"
+    )
+    hook = sut / "qa" / "setup.sh"
+    hook.write_text(script, encoding="utf-8")
+    hook.chmod(0o755)
+    old_timeout = envmod._HOOK_TIMEOUT_S
+    envmod._HOOK_TIMEOUT_S = 1  # force the up to time out fast
+    try:
+        try:
+            bring_up_env(sut_path=sut, config=cfg.SutConfig(), stage_url_override=None,
+                         exit_no_env=EXIT_NO_ENV, exit_unhealthy=EXIT_UNHEALTHY)
+            raise AssertionError("expected EnvError for a hung hook up")
+        except EnvError as exc:
+            assert exc.exit_code == EXIT_UNHEALTHY, exc.exit_code
+            assert "exited 124" in str(exc), str(exc)  # timeout normalized to 124
+        assert (sut / "DOWN").exists(), "a hung `up` must still run `down` (the common leak case)"
+        assert not (sut / "UP").exists()
+    finally:
+        envmod._HOOK_TIMEOUT_S = old_timeout
+        shutil.rmtree(sut, ignore_errors=True)
+
+
+def test_compose_service_healthy_fallback_when_no_compose_args():
+    """Defensive fallback: when no ``compose_args`` prefix was threaded (should not happen for a
+    real compose env) but a ``project_name`` is set, the probe still runs a bare
+    ``-p <project> ps`` rather than crashing (codex coverage gap)."""
+    captured: dict[str, list[str]] = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = '{"Service":"db","State":"running","Health":"healthy"}'
+
+    def _fake_run(argv, *, cwd, timeout):  # noqa: ARG001 — signature match
+        captured["argv"] = list(argv)
+        return _Proc()
+
+    old_run = envmod._run
+    envmod._run = _fake_run
+    try:
+        ok = envmod._compose_service_healthy("review-qa-test", "db", cwd=Path("/tmp"))
+        assert ok is True
+        assert captured["argv"][:4] == ["docker", "compose", "-p", "review-qa-test"], captured
+        assert "-f" not in captured["argv"], "no file to thread → bare -p prefix"
+    finally:
+        envmod._run = old_run
+
+
+def test_compose_service_health_probe_reuses_the_compose_file_prefix():
+    """A ``compose_service`` health probe must run ``ps`` with the SAME ``-p <project> -f <file>``
+    prefix the bring-up used — a bare ``-p <project> ps`` re-discovers a default compose file
+    from cwd and FAILS for an out-of-root layout (codex P2: docs/tests/env/...). Capture the
+    argv ``_compose_service_healthy`` runs and assert it carries the threaded ``-f`` file."""
+    captured: dict[str, list[str]] = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = '{"Service":"db","State":"running","Health":"healthy"}'
+
+    def _fake_run(argv, *, cwd, timeout):  # noqa: ARG001 — signature match
+        captured["argv"] = list(argv)
+        return _Proc()
+
+    old_run = envmod._run
+    envmod._run = _fake_run
+    try:
+        compose_args = ["docker", "compose", "-p", "review-qa-test",
+                        "-f", "docs/tests/env/docker-compose.qa.yml"]
+        ok = envmod._compose_service_healthy(
+            "review-qa-test", "db", cwd=Path("/tmp"), compose_args=compose_args)
+        assert ok is True, "a healthy service must read as up"
+        argv = captured["argv"]
+        assert "-f" in argv and "docs/tests/env/docker-compose.qa.yml" in argv, argv
+        assert argv[:6] == compose_args, "ps must reuse the full bring-up prefix"
+        assert argv[6:8] == ["ps", "--format"], argv
+    finally:
+        envmod._run = old_run
+
+
+def test_backstop_sweep_reaps_pending_env():
+    """``backstop._fire`` force-exits with ``os._exit``, which BYPASSES atexit — so it calls
+    ``sweep_pending_teardowns`` first to reap a pending qa env that would otherwise leak (codex
+    P2). Register a hook env, run the sweep, and assert its ``down`` ran + it left the registry."""
+    sut = _hook_sut()
+    try:
+        handle = bring_up_env(sut_path=sut, config=cfg.SutConfig(), stage_url_override=None,
+                              exit_no_env=EXIT_NO_ENV, exit_unhealthy=EXIT_UNHEALTHY)
+        assert handle.mode == EnvMode.HOOK
+        with envmod._PENDING_LOCK:
+            assert handle in envmod._PENDING_TEARDOWNS
+        # the entry point the backstop calls instead of relying on atexit (which os._exit skips)
+        envmod.sweep_pending_teardowns()
+        assert (sut / "DOWN").exists(), "the sweep must run the hook's down"
+        assert not (sut / "UP").exists()
+        with envmod._PENDING_LOCK:
+            assert not envmod._PENDING_TEARDOWNS, "the swept env must leave the registry"
+    finally:
+        # NEVER leave a real handle in the global registry if an assert above failed — it would
+        # point at a deleted dir and could flake an unrelated test that reads the registry
+        # (codex test-hygiene finding). The happy path already empties it; this is the failure
+        # backstop.
+        with envmod._PENDING_LOCK:
+            envmod._PENDING_TEARDOWNS.clear()
         shutil.rmtree(sut, ignore_errors=True)
 
 

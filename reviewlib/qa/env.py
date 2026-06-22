@@ -109,12 +109,17 @@ class EnvHandle:
     this run brought up (a no-op for ``REUSED_STAGE``/``NONE`` — the ownership rule). It is
     idempotent (safe to call from the normal finally AND the atexit/signal hook). ``endpoints``
     surfaces the resolved base URL(s) for the tester prompt/log. ``project_name`` records the
-    ``-p`` namespace for a compose env (the handle the global teardown registry keys on)."""
+    ``-p`` namespace for a compose env (the handle the global teardown registry keys on).
+    ``compose_args`` is the FULL ``docker compose -p <project> -f <file> [--env-file …]`` prefix
+    used for ``up``/``down`` — a ``compose_service`` health probe MUST reuse it so its ``ps``
+    discovers the SAME compose file (a file outside the SUT root is invisible to a bare
+    ``-p <project> ps`` that re-discovers from cwd)."""
 
     mode: EnvMode
     teardown: Callable[[], None]
     endpoints: dict[str, str] = field(default_factory=dict)
     project_name: str | None = None
+    compose_args: list[str] | None = None
     _torn_down: bool = field(default=False, repr=False)
 
     def tear_down(self) -> None:
@@ -206,6 +211,26 @@ def _run_pending_teardowns() -> None:
         snapshot = list(_PENDING_TEARDOWNS)  # reentrant window: GIL-atomic copy, no deadlock
     for handle in snapshot:
         handle.tear_down()
+
+
+def sweep_pending_teardowns() -> None:
+    """Public, best-effort reap of every still-pending owned env — the entry point the run
+    BACKSTOP calls before its ``os._exit(124)``.
+
+    ``backstop._fire`` force-exits with ``os._exit``, which BYPASSES ``atexit`` (codex P2): a
+    qa tester that wedges until the backstop after a hook/compose env was brought up would
+    otherwise leak the daemonized SUT, defeating this layer's whole guarantee. The backstop
+    only knows how to SIGKILL registered subprocess GROUPS — it cannot reach a daemonized
+    container. So it calls this sweep first, which runs the same idempotent, never-raising
+    teardown the atexit/signal path uses. A no-op when nothing is pending (no qa env was ever
+    brought up), so a plain ``review`` run pays nothing.
+
+    The registry SNAPSHOT is taken under a non-blocking lock (no deadlock with a concurrent
+    signal-path teardown), but each ``tear_down`` is a SYNCHRONOUS ``down`` spawn bounded by
+    its own timeout — so this can take up to (pending envs x teardown timeout). On the backstop
+    path that is fine: the deadman armed in ``_fire`` is the hard exit guarantee and will cut a
+    long sweep off mid-flight."""
+    _run_pending_teardowns()
 
 
 def _register_pending(handle: EnvHandle) -> None:
@@ -393,7 +418,7 @@ def _gate_health_or_teardown(
     any declared checks."""
     try:
         _health_gate(checks, sut_path=sut_path, project_name=handle.project_name,
-                     exit_unhealthy=exit_unhealthy)
+                     compose_args=handle.compose_args, exit_unhealthy=exit_unhealthy)
     except EnvError:
         if keep_env:
             # Leave the env up for triage, but DROP it from the pending registry so the atexit
@@ -452,17 +477,25 @@ def _bring_up_hook(*, sut_path: Path, hook: Path, exit_unhealthy: int) -> EnvHan
     ``down``. The hook owns its OWN lifecycle (it may start compose, a dev server, seed data)
     — qa just calls ``up``/``down`` and trusts the exit code. A non-zero ``up`` is a boot
     failure (``EnvError`` → the handler's BLOCKED/unhealthy class)."""
+    def _down() -> None:
+        _run_env_command([str(hook), "down"], cwd=sut_path, timeout=_TEARDOWN_TIMEOUT_S)
+
     print(f"[review-cli] qa: bringing the SUT up via {hook} up", file=sys.stderr, flush=True)
     proc = _run_env_command([str(hook), "up"], cwd=sut_path, timeout=_HOOK_TIMEOUT_S)
     if proc.returncode != 0:
+        # Run a best-effort `down` before erroring — a hook that wraps compose / a dev server
+        # can have STARTED resources before its `up` exited non-zero, and we own them the moment
+        # we ran `up`. Symmetric with the compose `up`-failure path (codex P2: a failed hook up
+        # otherwise leaked the partially-created env). `down` is the hook's own idempotent reaper.
+        try:
+            _down()
+        except Exception:  # noqa: BLE001 — best-effort cleanup; surface the original boot failure
+            pass
         raise EnvError(
             f"the SUT setup hook `{hook} up` exited {proc.returncode} — could not bring the "
             f"env up.\n{_tail(proc.stderr or proc.stdout)}",
             exit_code=exit_unhealthy,
         )
-
-    def _down() -> None:
-        _run_env_command([str(hook), "down"], cwd=sut_path, timeout=_TEARDOWN_TIMEOUT_S)
 
     return EnvHandle(mode=EnvMode.HOOK, teardown=_down)
 
@@ -505,7 +538,8 @@ def _bring_up_compose(*, sut_path: Path, bringup: BringupConfig, exit_unhealthy:
     def _down() -> None:
         _compose_down(argv, cwd=sut_path)
 
-    return EnvHandle(mode=EnvMode.COMPOSE, teardown=_down, project_name=project)
+    return EnvHandle(mode=EnvMode.COMPOSE, teardown=_down, project_name=project,
+                     compose_args=argv)
 
 
 def _compose_down(base_argv: list[str], *, cwd: Path) -> None:
@@ -522,7 +556,8 @@ def _health_checks(config: SutConfig | None) -> list[HealthCheck]:
 
 
 def _health_gate(
-    checks: list[HealthCheck], *, sut_path: Path, project_name: str | None, exit_unhealthy: int,
+    checks: list[HealthCheck], *, sut_path: Path, project_name: str | None,
+    exit_unhealthy: int, compose_args: list[str] | None = None,
 ) -> None:
     """Poll EVERY declared health check until it passes within its ``timeout_s``; ALL must
     pass before any test runs. The first one that times out raises ``EnvError`` with the
@@ -542,7 +577,8 @@ def _health_gate(
                 "or declare a compose bringup.",
                 exit_code=exit_unhealthy,
             )
-        if not _poll_one_check(check, sut_path=sut_path, project_name=project_name):
+        if not _poll_one_check(check, sut_path=sut_path, project_name=project_name,
+                               compose_args=compose_args):
             raise EnvError(
                 f"health check {check.name!r} did not pass within {check.timeout_s}s — the env "
                 "came up but never became healthy. Not running tests against an unhealthy env.",
@@ -550,13 +586,17 @@ def _health_gate(
             )
 
 
-def _poll_one_check(check: HealthCheck, *, sut_path: Path, project_name: str | None) -> bool:
+def _poll_one_check(
+    check: HealthCheck, *, sut_path: Path, project_name: str | None,
+    compose_args: list[str] | None = None,
+) -> bool:
     """Poll a single check (HTTP endpoint or compose-service health) with bounded exponential
     backoff until it passes or ``timeout_s`` elapses. Returns True on a pass, False on timeout."""
     deadline = time.monotonic() + check.timeout_s
     delay = 0.5
     while True:
-        if _check_passes_once(check, sut_path=sut_path, project_name=project_name):
+        if _check_passes_once(check, sut_path=sut_path, project_name=project_name,
+                              compose_args=compose_args):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -564,19 +604,33 @@ def _poll_one_check(check: HealthCheck, *, sut_path: Path, project_name: str | N
         delay = min(delay * 2, 5.0)
 
 
-def _check_passes_once(check: HealthCheck, *, sut_path: Path, project_name: str | None) -> bool:
+def _check_passes_once(
+    check: HealthCheck, *, sut_path: Path, project_name: str | None,
+    compose_args: list[str] | None = None,
+) -> bool:
     """One immediate evaluation of a check (no waiting). HTTP: a matching status code.
     compose: the service reports ``healthy`` (or ``running`` when it declares no healthcheck)."""
     if check.url:
         return _http_ok(check.url, expect_status=check.expect_status, timeout_s=5)
-    return _compose_service_healthy(project_name, check.compose_service, cwd=sut_path)
+    return _compose_service_healthy(project_name, check.compose_service, cwd=sut_path,
+                                    compose_args=compose_args)
 
 
-def _compose_service_healthy(project_name: str | None, service: str | None, *, cwd: Path) -> bool:
-    """True when ``docker compose -p <project> ps`` reports ``service`` as healthy/running.
-    A compose-service check only makes sense for a compose bring-up; with no project name
-    (a hook env) it cannot be evaluated and returns False (the gate then times out with a
-    clear message rather than silently passing).
+def _compose_service_healthy(
+    project_name: str | None, service: str | None, *, cwd: Path,
+    compose_args: list[str] | None = None,
+) -> bool:
+    """True when ``docker compose -p <project> -f <file> ps`` reports ``service`` as
+    healthy/running. A compose-service check only makes sense for a compose bring-up; with no
+    project name (a hook env) it cannot be evaluated and returns False (the gate then times out
+    with a clear message rather than silently passing).
+
+    Reuses the bring-up's FULL ``compose_args`` prefix (``-p <project> -f <file> [--env-file …]``)
+    so ``ps`` reads the SAME compose file as ``up``/``down``. A bare ``-p <project> ps`` re-
+    discovers a default compose file from ``cwd`` and FAILS for the recommended out-of-root
+    layout (``docs/tests/env/docker-compose.qa.yml``), so the check could never pass and the
+    swallowed failure timed the gate out (codex P2). Falls back to ``-p <project>`` only if no
+    prefix was threaded (defensive — should not happen for a real compose env).
 
     Parses the JSON-lines ``--format json`` output, NOT a space-separated template: a service
     WITHOUT a healthcheck has an EMPTY ``Health`` column, and a positional ``line.split()``
@@ -585,9 +639,10 @@ def _compose_service_healthy(project_name: str | None, service: str | None, *, c
     out (review finding). JSON keys are unambiguous regardless of empty fields."""
     if not project_name or not service:
         return False
+    base = compose_args if compose_args else ["docker", "compose", "-p", project_name]
     try:
         proc = _run(
-            ["docker", "compose", "-p", project_name, "ps", "--format", "json"],
+            [*base, "ps", "--format", "json"],
             cwd=cwd, timeout=15,
         )
     except (subprocess.SubprocessError, OSError):
