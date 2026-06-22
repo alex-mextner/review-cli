@@ -29,6 +29,7 @@ from .config import (
     DEFAULT_PROMPT,
     MODERATOR_CANDIDATES,
     PANEL_TIMEOUT_DEFAULT,
+    QA_TIMEOUT_DEFAULT,
     BoardConfigError,
     _expand_alias,
     _effective_pool_size,
@@ -92,15 +93,21 @@ EXIT_GIT_DIFF_FAILED = 4
 # the later qa env classes (NO_ENV / ENV_UNHEALTHY / SUT_BOOT_FAILED) continue from 7 in
 # Phase 2/3 (the spec's 5/6/7/8 block shifts up by one for the brainstorm collision).
 EXIT_QA_NO_SUITES = 6
-# qa Phase 1 has NO executor yet (the write/exec tester is Phase 2). When suites DO resolve,
-# the handler can't run them — and returning 0 would be the very lie the no-suites gate
-# exists to prevent (cases authored, ZERO executed, but CI reads exit 0 = "qa passed", and
-# WORSE than no-suites because the author believes the tests ran). So the suites-resolved-
-# but-no-executor branch returns this distinct NON-ZERO code: a pipeline that wires `review
-# qa` today fails loudly ("not implemented") instead of getting a silent green. This is a
-# TRANSIENT Phase-1 scaffold code — it goes away the moment the executor lands (Phase 2),
-# so it is parked well clear of the qa env-class block (7/8/9) at 70 (EX_SOFTWARE-adjacent,
-# "the command itself isn't done yet"), distinct from every stable class above.
+# qa env classes (review-qa.md §6, shifted +1 from the spec's 5/6/7/8 because code 5 is
+# brainstorm's EXIT_DEAD_PANEL — qa's own block starts at EXIT_QA_NO_SUITES=6). Phase 2
+# lands the executor; the only env class it needs is "could not bring the SUT up at all"
+# (the agent emitted VERDICT: BLOCKED) — distinct from a real finding (which is report-only)
+# and from no-suites (6), so CI tells "infra broke" apart from "a bug was found". The
+# NO_ENV / ENV_UNHEALTHY classes belong to the (later) compose env harness — reserved here
+# as 7/9 so the executor's BLOCKED code (8) sits between them in the same coherent block.
+EXIT_QA_NO_ENV = 7          # no stage AND no bring-up config for a backend/bot SUT (env harness, later)
+EXIT_QA_SUT_BOOT_FAILED = 8  # the tester could not bring the SUT up at all (VERDICT: BLOCKED)
+EXIT_QA_ENV_UNHEALTHY = 9   # bring-up succeeded but the health gate timed out (env harness, later)
+
+# RETIRED Phase-1 scaffold code. Phase 1 returned 70 from the suites-resolved-but-no-executor
+# branch ("not implemented yet"). Phase 2 lands the executor, so that branch is GONE — the
+# constant is kept (and pointed at the real executor path) only so a stale caller/import does
+# not break; nothing in the live code returns it anymore.
 EXIT_QA_NOT_IMPLEMENTED = 70
 
 
@@ -789,9 +796,11 @@ _VALUE_TAKING_OPTS = frozenset({
     # path that could look like an option (e.g. `--spec -odd-name.md`); list it so the `-o`
     # pre-scan never steals it.
     "--spec",
-    # `review qa --suites <glob/dir/file>` (modes/qa.py): the value is a suite path that could
-    # look like an option; list it so the `-o` pre-scan passes it through untouched.
-    "--suites",
+    # The qa mode's VALUE-taking flags (modes/qa.py): `--suites <glob/dir/file>`,
+    # `--kind <shape>`, `--report <path>`, `--max-cases <N>`. Their values can look like an
+    # option (a path, `-1`), so the `-o` pre-scan must skip each one's argument. `--in-place`
+    # is a boolean flag (no value) and is deliberately NOT listed.
+    "--suites", "--kind", "--report", "--max-cases",
 })
 
 
@@ -1017,6 +1026,12 @@ def _model_default_help(mode: ModeSpec | None) -> str:
             return f"your config.yaml models: {_fmt(config_models)}"
         return f"{_fmt(default_models)} (the built-in defaults)"
 
+    # qa is SINGLE-SEAT and does NOT use the panel / config `models:` / DEFAULT_MODELS — it
+    # selects ONE write/exec tester (claude default, codex via REVIEW_QA_TESTER / `-m codex`).
+    # So its `--model` help must NOT advertise the panel defaults (review finding).
+    if mode is not None and mode.name == "qa":
+        return "claude (the qa tester; use `-m codex` or REVIEW_QA_TESTER=codex for the codex seat)"
+
     # just-ask / quorum: models > DEFAULT_MODELS (no board).
     if mode is not None and mode.name not in ("review",):
         if config_models:
@@ -1065,7 +1080,11 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
     )
     parser.add_argument(
         "--timeout", type=int, default=None,
-        help="per-call timeout seconds (default 1200 for review, 240 for panel modes)",
+        help=(
+            "per-call timeout seconds (default 1200 for review, 240 for the chat panel "
+            f"modes, {QA_TIMEOUT_DEFAULT} for qa — a tester run boots a SUT and drives a "
+            "whole suite)"
+        ),
     )
     parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
     parser.add_argument("--show-board", action="store_true", help="print the active reviewer board (model -> role, availability) and exit")
@@ -1152,9 +1171,9 @@ _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
     "--diff", "--staged", "--prompt", "--moderator", "--rounds", "--max-rounds",
     "--visual", "--before", "--intent", "--expect", "--check", "--json", "--strict",
     "--no-ai", "--no-local-model", "--vision-timeout", "--project", "--retry",
-    # `--suites` is the qa mode's own flag (modes/qa.py); a verb-less `review --suites …`
-    # must get the friendly "use the subcommand" pointer, not argparse's opaque error.
-    "--suites",
+    # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
+    # etc. must get the friendly "use the subcommand" pointer, not argparse's opaque error.
+    "--suites", "--kind", "--in-place", "--report", "--max-cases",
 })
 
 # The BARE management subcommands `_dispatch` handles directly (NOT mode verbs in
@@ -1619,7 +1638,19 @@ def _dispatch(argv: list[str] | None = None) -> int:
         models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
 
     visual_mode = args.visual is not None
-    timeout = args.timeout if args.timeout is not None else (PANEL_TIMEOUT_DEFAULT if panel_mode else 1200)
+    # Timeout default by mode. qa is the carve-out: it is technically a "panel mode" (non-
+    # review), but a tester run boots a SUT and drives a whole suite with an un-caged agent —
+    # tens of minutes, not the short PANEL_TIMEOUT_DEFAULT (240s) the chat panels use. Give it
+    # its OWN long default (it leans on the <=4h backstop, not a 4-minute cap). Review keeps
+    # 1200s; the other panel modes (brainstorm/just-ask/quorum) keep the short panel default.
+    if args.timeout is not None:
+        timeout = args.timeout
+    elif mode.name == "qa":
+        timeout = QA_TIMEOUT_DEFAULT
+    elif panel_mode:
+        timeout = PANEL_TIMEOUT_DEFAULT
+    else:
+        timeout = 1200
 
     # Reviewer board (HYP-741): the default plain-review panel assigns each model its
     # own role/lens. Precedence is COST-SAFETY first — the board runs only when the user
@@ -1752,6 +1783,19 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # is flagged before any model call). -----------------------------------------
     visual_ctx = None
     if visual_mode:
+        # qa does NOT consume --visual: the tester drives a LIVE system and produces its OWN
+        # proof (screenshots/logs), so an input image has no place in its prompt. Reject it
+        # HERE — before the (paid) vision pipeline runs — rather than letting cli.py spend a
+        # vision call and the qa handler silently drop the result (review finding). This is a
+        # tiny mode-aware guard, not mode-dispatch surgery.
+        if mode.name == "qa":
+            print(
+                "[review-cli] qa: --visual is not supported (the tester produces its OWN "
+                "visual proof by driving the SUT). Drop --visual.",
+                file=sys.stderr, flush=True,
+            )
+            return 2
+
         from .features.visual.compose import build_mode_visual_context
 
         # STANDALONE: --visual with no companion mode AND no diff → the verdict pipeline.
@@ -1850,6 +1894,19 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return _run_mode_with_stats(
             mode.stats_mode, brainstorm_pool(models),
             lambda: mode.handler(ctx),
+        )
+
+    if mode.name == "qa":
+        # qa is SINGLE-SEAT: the handler runs exactly ONE write/exec tester (claude default /
+        # codex via REVIEW_QA_TESTER / -m), ignoring --pool and the panel. Record its run-stats
+        # / ETA under a pool of ONE — not len(DEFAULT_MODELS) — so the ETA store isn't polluted
+        # with a fake multi-model pool size (review finding). The recorded seat is the ACTUAL
+        # resolved backend, not a model alias.
+        from .qa.executor import resolved_tester_backend
+
+        qa_seat = [resolved_tester_backend(_split_models(args.model or []))]
+        return _run_mode_with_stats(
+            mode.stats_mode, qa_seat, lambda: mode.handler(ctx),
         )
 
     if mode.name != "review":

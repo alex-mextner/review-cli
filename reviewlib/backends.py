@@ -96,6 +96,17 @@ def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int, ro
 # must be kept in sync with opencode's permission surface; it is the floor, not a proof
 # that opencode exposes nothing else. (opencode has no documented deny-by-default/wildcard
 # we can lean on instead, so an explicit, maintained key list is the available mitigation.)
+#
+# DELIBERATE WRITE/EXEC EXCEPTION — DO NOT clamp qa to this boundary. The `review qa` mode
+# (the agent-as-tester, `reviewlib/qa/executor.py`) is review-cli's ONE intentionally
+# UN-CAGED agent: a tester MUST run bash + write to bring a SUT up and drive it. It does
+# NOT ride this read-only path, does NOT call `_ensure_opencode_readonly_agent`, and spawns
+# claude/codex with WRITE/EXEC enabled — by design (review-qa.md §1/§9). Its SUT-MUTATION
+# blast radius is fenced by running inside a throwaway `git worktree` of the SUT (see
+# `IsolatedSut`) — that bounds writes to a disposable tree, but it is NOT an OS sandbox (an
+# un-caged shell can still read elsewhere / hit the network). If a future hardening pass
+# tightens the read-only boundary, leave qa's write/exec spawn alone — "restoring" a
+# read-only flag there silently neuters the tester.
 _READONLY_AGENT_DENIED_PERMISSIONS = (
     "bash",
     "edit",

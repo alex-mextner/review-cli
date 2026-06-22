@@ -483,6 +483,11 @@ _UNIT_FILES = [
     # ETA/log store on the way to the early return — give it a FRESH temp log dir so the
     # run never writes into the dev's default log dir (matches the other log-touching tests).
     ("test_qa_mode.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # The Phase-2 executor: prompt/parser/exit units + the MOCKED-tester DoD (the buggy SUT
+    # verdicts FAIL, the good one PASS) — all deterministic, no backend. The fake tester
+    # streams a fake transcript via the same plumbing, so give it a FRESH temp log dir. The
+    # LIVE-backend DoD inside this file is gated on REVIEW_QA_LIVE=1 and skips in CI.
+    ("test_qa_executor.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
