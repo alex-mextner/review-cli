@@ -236,16 +236,22 @@ def test_board_flags_and_listing():
     board = review_out("--show-board")
     for needle in (
         "architect", "claude:claude-fable-5", "claude:claude-opus-4-8",
-        "oc:commandcode/deepseek/deepseek-v4-pro", "oc:zai/glm-5.2", "contracts", "8 seats", "#1",
+        "oc:commandcode/deepseek/deepseek-v4-pro", "oc:zai/glm-5.2", "contracts", "9 seats", "#1",
+        # The CTO-directed GLM-5.2-via-commandcode seat (priority 3, diff-only keyed HTTP).
+        "commandcode:zai-org/GLM-5.2", "GLM-cc",
     ):
         assert_in(needle, board, "in --show-board")
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())
-    # Seat 3 is the agentic codex route.
+    # The codex seat is agentic (now priority 4, after the GLM-cc seat).
     codex_line = next((ln for ln in board.splitlines() if "Codex" in ln), "")
     assert_in("codex", codex_line)
     assert_in("agentic", codex_line)
+    # The GLM-cc seat sits directly under Opus (#2) at #3 and is diff-only.
+    glmcc_line = next((ln for ln in board.splitlines() if "GLM-cc" in ln), "")
+    assert_in("#3", glmcc_line)
+    assert_in("diff-only", glmcc_line)
 
 
 def test_failover_pool_listing():

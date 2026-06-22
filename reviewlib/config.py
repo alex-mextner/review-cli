@@ -26,6 +26,17 @@ DEFAULT_PROMPT = (
 # the board was kept current (the flat panel rotted on the dead Fireworks route).
 KIMI_SEAT = "commandcode:moonshotai/Kimi-K2.7-Code"
 
+# Canonical GLM-5.2-via-commandcode seat — the SINGLE source of truth for "GLM 5.2 routed
+# through the Command Code gateway" (as opposed to the z.ai-subscription route used by the
+# lower-priority `oc:zai/glm-5.2` seat). It is the priority-3 board seat (directly under
+# Opus, per the CTO directive). The wire id is byte-exact against the commandcode gateway
+# /models catalog (`zai-org/GLM-5.2`), verified live. This is DIFF-ONLY (a stateless keyed-
+# HTTP POST through review_commandcode, like Gemini): opencode's `commandcode` provider does
+# NOT register this model, so the agentic `oc:commandcode/zai-org/GLM-5.2` form errors — the
+# diff-only route is the one that actually reaches it. Read-only by construction (it POSTs
+# only the diff; no repo access, no tools, no exec), so it needs no `-s read-only` cage.
+GLM_COMMANDCODE_SEAT = "commandcode:zai-org/GLM-5.2"
+
 
 def _agentic(seat: str) -> str:
     """Turn a diff-only keyed-HTTP seat (`provider:model`) into its AGENTIC opencode
@@ -191,7 +202,7 @@ class BoardReviewer:
         return REVIEW_ROLES.get(self.role, "")
 
 
-# DEFAULT_BOARD: the out-of-the-box 8-seat board, so the board works WITHOUT a config
+# DEFAULT_BOARD: the out-of-the-box 9-seat board, so the board works WITHOUT a config
 # file. The board is ordered by *priority* — strongest model first, weakest last — NOT
 # by role. Priority drives the FAILOVER pool: a plain `review` runs the top-N AVAILABLE
 # seats (default 4), skipping a higher-priority seat whose backend isn't reachable and
@@ -207,19 +218,23 @@ class BoardReviewer:
 # To RE-RANK the board, just reorder this tuple (top = highest priority). Model ids are
 # byte-exact against the provider catalogs (commandcode gateway /models, z.ai Coding-Plan)
 # — do not alter the strings. Each is the TOP available version of its model family
-# (fable-5, opus-4-8, codex/GPT-5.5, Kimi-K2.7, glm-5.2, Qwen3.7-Max, deepseek-v4-pro).
+# (fable-5, opus-4-8, GLM-5.2-via-gateway, codex/GPT-5.5, Kimi-K2.7, glm-5.2-via-z.ai,
+# Qwen3.7-Max, deepseek-v4-pro).
 #
 # AGENTIC BY DEFAULT (review-cli#24): every board seat that CAN read the repo does. The
 # two claude seats run via the agentic claude CLI; Codex via the codex CLI
-# (`codex exec -s read-only -C <cwd>`); Kimi/GLM/Qwen/DeepSeek through opencode
+# (`codex exec -s read-only -C <cwd>`); Kimi/z.ai-GLM/Qwen/DeepSeek through opencode
 # (`oc:provider/model`, built by `_agentic()` from the diff-only constant) so they ALSO
 # run read-only inside `-C` and can open ANY project file — not just the diff in the
 # prompt. The board has a reserve, so an `oc:` seat that opencode can't reach on a given
 # host probes UNAVAILABLE and is backfilled (startup or mid-run failover) — the board
-# degrades gracefully rather than blocking. Only Gemini stays diff-only: it has no agentic
-# transport (a workspace-less keyed-HTTP REST call). The diff-only `commandcode:`/`zai:`
-# REST backends stay available for `-m cc`/`-m glm` and config boards on hosts without
-# opencode; the board just prefers the agentic transport when it can.
+# degrades gracefully rather than blocking. Two seats stay diff-only stateless HTTP calls:
+# Gemini (no agentic transport) and the priority-3 GLM-5.2-via-commandcode seat
+# (`GLM_COMMANDCODE_SEAT` — opencode's commandcode provider does not register this GLM id, so
+# the agentic form errors; the keyed-HTTP route is the one that reaches it). Both are read-
+# only by construction (they POST only the diff). The diff-only `commandcode:`/`zai:` REST
+# backends stay available for `-m cc`/`-m glm` and config boards on hosts without opencode;
+# the board just prefers the agentic transport when one exists.
 #
 # The FLAT DEFAULT_MODELS panel deliberately keeps the diff-only commandcode Kimi seat
 # (KIMI_SEAT): that panel has NO reserve/failover, so an opencode-less host would silently
@@ -237,20 +252,32 @@ DEFAULT_BOARD = (
     BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
     # priority 2 — Opus 4.8. Also the moderator (MODERATOR_CANDIDATES[0]).
     BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
-    # priority 3 — Codex: the agentic codex CLI route (reads the whole repo), NOT the
+    # priority 3 — GLM-5.2 via the Command Code gateway (CTO directive: directly under Opus).
+    # DIFF-ONLY (keyed HTTP through review_commandcode, like Gemini): opencode's commandcode
+    # provider does NOT register `zai-org/GLM-5.2`, so the agentic `oc:commandcode/...` form
+    # errors — the diff-only route is the one that actually reaches it. Read-only by
+    # construction (POSTs only the diff; no repo/tools/exec). Distinct from the lower-priority
+    # `oc:zai/glm-5.2` seat (same model FAMILY, different provider/transport: z.ai vs gateway).
+    # ROLE: `performance` — NOT `correctness` (which would duplicate Opus's lens). Inserting
+    # this seat at #3 pushes Kimi (the old `performance` seat) to #5/reserve, so GLM-cc carries
+    # `performance` to keep the default top-4 pool's lens coverage intact
+    # (architect/correctness/performance/consistency), instead of dropping performance from a
+    # plain `review diff` and duplicating correctness (review of #57).
+    BoardReviewer(GLM_COMMANDCODE_SEAT, "performance", "GLM-cc"),
+    # priority 4 — Codex: the agentic codex CLI route (reads the whole repo), NOT the
     # diff-only `commandcode:gpt-5.5` HTTP route. GPT-5.5 is codex; the agentic route wins.
     BoardReviewer("codex", "consistency", "Codex"),
-    # priority 4 — Kimi K2.7, AGENTIC through opencode (reads the repo). Same model id as
+    # priority 5 — Kimi K2.7, AGENTIC through opencode (reads the repo). Same model id as
     # the flat panel's KIMI_SEAT (one source of truth via `_agentic`); transport-only diff.
     BoardReviewer(_agentic(KIMI_SEAT), "performance", "Kimi"),
-    # priority 5 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
+    # priority 6 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
     # opencode's `zai` provider (reads the repo) instead of the diff-only z.ai REST call.
     BoardReviewer(_agentic("zai:glm-5.2"), "quality", "GLM"),
-    # priority 6 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
+    # priority 7 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(_agentic("commandcode:Qwen/Qwen3.7-Max"), "security", "Qwen"),
-    # priority 7 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
+    # priority 8 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(_agentic("commandcode:deepseek/deepseek-v4-pro"), "tests", "DeepSeek"),
-    # priority 8 — Gemini.
+    # priority 9 — Gemini.
     BoardReviewer("gemini", "contracts", "Gemini"),
 )
 

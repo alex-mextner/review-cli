@@ -314,7 +314,7 @@ def test_cli_review_run_records_stat_and_announces_eta():
 
 
 def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
-    """Run a default board `review` (all 8 seats available) with `extra_argv` appended,
+    """Run a default board `review` (all 9 seats available) with `extra_argv` appended,
     returning the single run-stats record + the captured stderr under key "_stderr".
     The board is pinned to DEFAULT_BOARD and config to {} so the test is independent of
     the dev machine's config.yaml; backends are stubbed (no model call)."""
@@ -328,7 +328,7 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
         # Force EVERY seat available in all three namespaces that probe it: the CLI
         # (planned-pool ETA slice), panel.build_board_jobs, and the failover pool's
         # startup split inside modes.review (which imports backend_available into its
-        # own namespace, like resolve_backend). All 8 seats available -> the top-4
+        # own namespace, like resolve_backend). All 9 seats available -> the top-4
         # priority pool fills cleanly with no startup/mid-run failover.
         saved_avail_b = _backends.backend_available
         saved_avail_p = _panel.backend_available
@@ -365,17 +365,17 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
 
 def test_cli_default_board_run_records_pool_size_four():
     """A default `review` (no -m, no config models) runs the board sized to the default
-    pool (4 seats); the run-stats record must report pool_size == 4, NOT the full 8
+    pool (4 seats); the run-stats record must report pool_size == 4, NOT the full 9
     (the slice must feed run-stats, not the pre-slice board)."""
     r = _run_board_review_and_get_record([])  # default pool = 4
     assert r["mode"] == "review"
-    assert r["pool_size"] == 4, r  # the SLICED board, not the full 8
+    assert r["pool_size"] == 4, r  # the SLICED board, not the full 9
     assert len(r["models"]) == 4, r
     assert "[review] pool=4 (review)" in r["_stderr"]
 
 
 def test_cli_board_run_records_explicit_pool_size():
-    """`--pool 2` must record pool_size == 2 (not 4, not 8): the slice feeds run-stats
+    """`--pool 2` must record pool_size == 2 (not 4, not 9): the slice feeds run-stats
     at arbitrary sizes, not just the default (GLM finding 23)."""
     r = _run_board_review_and_get_record(["--pool", "2"])
     assert r["mode"] == "review"
@@ -386,7 +386,7 @@ def test_cli_board_run_records_explicit_pool_size():
 
 def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
     """Like _run_board_review_and_get_record but with a custom resolve_backend stub (so a
-    seat can be made to FAIL and trigger failover). All 8 seats are env-available, so the
+    seat can be made to FAIL and trigger failover). All 9 seats are env-available, so the
     startup pool fills cleanly and the mid-run failover does the backfilling. Returns the
     single run-stats record + captured stderr under "_stderr"; tolerates exit 1 (the
     degraded path)."""
@@ -432,8 +432,9 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
 def test_cli_failover_backfill_records_actual_models_not_planned():
     """When a startup-pool seat FAILS mid-run, the CLI must record the models that
     ACTUALLY produced verdicts (a backfilled reserve under its real id), not the planned
-    pool. The top priority seat (Fable) fails -> GLM (the 5th, first reserve) backfills,
-    so the recorded models include glm-5.2 and EXCLUDE fable, pool_size stays 4, exit 0."""
+    pool. The default pool of 4 is now [Fable, Opus, GLM-cc, Codex]; the top seat (Fable)
+    fails -> the first reserve, Kimi (#5, `oc:commandcode/...`), backfills, so the recorded
+    models include the agentic Kimi id and EXCLUDE fable, pool_size stays 4, exit 0."""
     # Fable (priority #1, in the default pool of 4) fails; everything else succeeds.
     resolver = _stub_resolve_backend({"claude:claude-fable-5": 1})
     r = _run_board_review_with_resolver([], resolver)
@@ -441,7 +442,11 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
     assert r["mode"] == "review"
     assert r["pool_size"] == 4, r            # backfilled back up to 4
     assert "claude:claude-fable-5" not in r["models"], r
-    assert "oc:zai/glm-5.2" in r["models"], r   # the promoted reserve (agentic GLM), by its real id
+    # The promoted reserve is the first reserve seat (Kimi, #5), recorded by its real id.
+    assert "oc:commandcode/moonshotai/Kimi-K2.7-Code" in r["models"], r
+    # The priority-3 GLM-cc seat is in the planned pool itself (it didn't fail), so it is
+    # recorded directly — proving the new seat participates in a default run.
+    assert "commandcode:zai-org/GLM-5.2" in r["models"], r
     assert "[review] pool=4 (review)" in r["_stderr"]  # ETA still keys on the planned 4
     assert "promoting reserve" in r["_stderr"]          # failover actually fired
 
