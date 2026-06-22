@@ -275,15 +275,20 @@ DEFAULT_BOARD = (
     # priority 5 — Kimi K2.7, AGENTIC through opencode (reads the repo). Same model id as
     # the flat panel's KIMI_SEAT (one source of truth via `_agentic`); transport-only diff.
     BoardReviewer(_agentic(KIMI_SEAT), "performance", "Kimi"),
-    # priority 6 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
-    # opencode's `zai` provider (reads the repo) instead of the diff-only z.ai REST call.
-    BoardReviewer(_agentic("zai:glm-5.2"), "quality", "GLM"),
-    # priority 7 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
+    # priority 6 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(_agentic("commandcode:Qwen/Qwen3.7-Max"), "security", "Qwen"),
-    # priority 8 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
+    # priority 7 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(_agentic("commandcode:deepseek/deepseek-v4-pro"), "tests", "DeepSeek"),
-    # priority 9 — Gemini.
+    # priority 8 — Gemini.
     BoardReviewer("gemini", "contracts", "Gemini"),
+    # priority 9 (LAST-RESORT reserve) — GLM-5.2 (his z.ai subscription, the newest GLM),
+    # AGENTIC through opencode's `zai` provider. DELIBERATELY DEPRIORITIZED to the bottom of
+    # the reserve (review-cli#65): this seat is observed to be PATHOLOGICALLY SLOW under load,
+    # so promoting it onto the failover critical path stalls the pool's path to a verdict. It
+    # stays on the board (still backfills when every faster reserve is also exhausted), but it
+    # no longer blocks a fast verdict — Qwen / DeepSeek / Gemini are promoted before it. To
+    # re-rank, move this line up; its position IS its priority.
+    BoardReviewer(_agentic("zai:glm-5.2"), "quality", "GLM"),
 )
 
 

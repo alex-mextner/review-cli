@@ -475,6 +475,9 @@ _UNIT_FILES = [
     ("test_reviewer_board.py", {}),
     ("test_review_marker.py", {}),
     ("test_failover_pool.py", {}),
+    # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
+    # give it a FRESH temp log dir like the other log-touching tests (review-cli#65).
+    ("test_concurrency_cap.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_inseat_retry.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_brainstorm_diff.py", {}),
     ("test_brainstorm_dead_panel.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

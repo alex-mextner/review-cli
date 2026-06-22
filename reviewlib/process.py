@@ -16,6 +16,80 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ── memory-aware concurrency cap (board resilience under swarm load, review-cli#65) ───────
+# Each heavy backend (codex / claude / opencode) spawns a model-runner subprocess, and a
+# `review` invocation runs the whole pool in PARALLEL (panel.run_panel uses
+# ThreadPoolExecutor(max_workers=len(jobs)) — one thread per seat, NO upper bound). Under
+# swarm load (a high `--pool`, or many seats backfilled by the failover) that fans out into
+# as many concurrent model subprocesses as there are seats. Each child is a fat agent CLI
+# (hundreds of MB resident); enough of them at once and the box OOM-kills a seat mid-review
+# — the live failure that motivated this (an Opus seat "died mid-review, exit 1").
+#
+# This semaphore bounds the number of heavy backend subprocesses THIS PROCESS runs at once,
+# regardless of how many seats the pool/failover wants in flight. A seat blocked on the
+# semaphore simply WAITS for a slot (it does not fail or drop) — the per-call timeout clock
+# only starts once the child is actually spawned (the wait is BEFORE Popen), so a queued
+# seat is never falsely timed out. The default cap is small enough that a single high-`--pool`
+# run can't exhaust memory, while the common single-seat gate (`--pool 1`) and the default
+# pool of 4 are unaffected (4 <= the cap). Overridable via $REVIEW_MAX_CONCURRENCY; <= 0
+# disables the cap (unbounded, the legacy behaviour) for a box that can sustain it.
+#
+# NOTE: this is a PER-PROCESS cap. A swarm of N separate `review` processes is N independent
+# caps — the cross-process lever is the per-seat timeout (a stalled seat frees its slot fast)
+# plus deprioritizing the known-slow reserve seat, both also part of #65. A per-process cap
+# still bounds the worst single-invocation fan-out (a `--pool 9` board, or a cascade of
+# reserve backfills) that one process can create.
+_DEFAULT_MAX_CONCURRENCY = 4
+_MAX_CONCURRENCY_CEILING = 64  # a typo'd env can't pin an absurd number of children
+
+# Built lazily + cached: read $REVIEW_MAX_CONCURRENCY once on first spawn so a test can set
+# the env before importing/using the module, and so every seat in a run shares ONE semaphore
+# (a per-call build would never actually limit anything). Guarded by its own lock; None until
+# first built. A value <= 0 means "no cap", represented by a None semaphore (the acquire path
+# is then a no-op).
+_CONCURRENCY_LOCK = threading.Lock()
+_concurrency_sem: threading.BoundedSemaphore | None = None
+_concurrency_built = False
+
+
+def max_concurrency() -> int:
+    """The configured cap on concurrent heavy backend subprocesses, read from
+    $REVIEW_MAX_CONCURRENCY (a missing/blank/non-integer value falls back to the default; a
+    value above the ceiling clamps down; <= 0 disables the cap). Read at build time so a run
+    can pin it via the env before the first spawn."""
+    raw = os.environ.get("REVIEW_MAX_CONCURRENCY")
+    if raw is None or not raw.strip():
+        return _DEFAULT_MAX_CONCURRENCY
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_MAX_CONCURRENCY
+    if value <= 0:
+        return 0  # disabled
+    return min(value, _MAX_CONCURRENCY_CEILING)
+
+
+def _get_concurrency_sem() -> threading.BoundedSemaphore | None:
+    """The process-wide spawn semaphore, built once and cached. None means the cap is
+    disabled ($REVIEW_MAX_CONCURRENCY <= 0) — the acquire/release path then no-ops."""
+    global _concurrency_sem, _concurrency_built
+    with _CONCURRENCY_LOCK:
+        if not _concurrency_built:
+            cap = max_concurrency()
+            _concurrency_sem = threading.BoundedSemaphore(cap) if cap > 0 else None
+            _concurrency_built = True
+        return _concurrency_sem
+
+
+def _reset_concurrency_sem_for_tests() -> None:
+    """Drop the cached semaphore so a test can change $REVIEW_MAX_CONCURRENCY and rebuild.
+    Test-only; production builds the semaphore once per process and never resets it."""
+    global _concurrency_sem, _concurrency_built
+    with _CONCURRENCY_LOCK:
+        _concurrency_sem = None
+        _concurrency_built = False
+
+
 # Registry of LIVE backend subprocesses, so the run backstop (reviewlib.backstop) can
 # reap them before its hard `os._exit`. Each backend child is started in its OWN session
 # (`start_new_session=True`), so it is NOT in the CLI's process group and survives a plain
@@ -365,6 +439,12 @@ def _run_streamed(
     proc: subprocess.Popen | None = None
     pgid: int | None = None
     child_handle: tuple[subprocess.Popen, int | None] | None = None
+    # The process-wide spawn semaphore (review-cli#65): acquired BEFORE Popen so the count of
+    # concurrent heavy backend children is bounded, released in the finally once this child is
+    # reaped. None when the cap is disabled. `sem_acquired` guards a double-release on a path
+    # that raised between acquire and Popen.
+    concurrency_sem = _get_concurrency_sem()
+    sem_acquired = False
     # Last char written to the log, so the trailing `EXIT {code}` footer can be put on
     # its own line even when the subprocess flushed stdout without a trailing newline
     # (codex P2: an unanchored footer is unparsable). The header ends with "\n".
@@ -380,6 +460,29 @@ def _run_streamed(
         # binary path (e.g. opencode's `opencode -m <provider/model>`), so the dashboard
         # can attribute the call to its board seat — it must still contain NO prompt/diff.
         header = header_argv0 or (argv[0] if argv else "?")
+
+        # Acquire a concurrency slot BEFORE spawning, so the number of heavy backend
+        # subprocesses in flight is capped (review-cli#65). This BLOCKS until a slot frees —
+        # but only the SPAWN waits; the per-call `timeout` (proc.wait below) starts after
+        # Popen, so a queued seat is never falsely timed out for waiting on the cap. A
+        # disabled cap (None) makes this a no-op.
+        #
+        # The header is written AFTER the slot is acquired so a seat parked in the cap queue
+        # is NOT logged as "started" (header but no EXIT) — which a post-mortem / the
+        # dashboard would otherwise misread as a hung/running call. When the cap actually has
+        # to block (a non-blocking try fails), we log a distinct WAITING marker first so the
+        # queued state is visible-but-distinguishable from a live spawn (codex observability
+        # finding). The common path (a slot is free) writes only the header, unchanged.
+        if concurrency_sem is not None:
+            if concurrency_sem.acquire(blocking=False):
+                sem_acquired = True
+            else:
+                log_fh.write(f"[review-cli] {backend}: waiting for a concurrency slot "
+                             f"(cap {max_concurrency()})\n")
+                log_fh.flush()
+                concurrency_sem.acquire()
+                sem_acquired = True
+
         log_fh.write(f"[review-cli] {backend}: {header} (args redacted)\n")
         log_fh.flush()
 
@@ -561,5 +664,12 @@ def _run_streamed(
         # ran, so the backstop must not try to re-reap a (possibly recycled) pid.
         if child_handle is not None:
             _unregister_child(child_handle)
+        # Release the concurrency slot LAST — after the child is reaped (`_kill_tree` above)
+        # — so a freed slot really means a freed model subprocess, not one still resident.
+        # Guarded by `sem_acquired` so an early raise (between acquire and Popen) still
+        # releases exactly once, and a disabled cap never touches it (review-cli#65).
+        if sem_acquired and concurrency_sem is not None:
+            sem_acquired = False
+            concurrency_sem.release()
         with log_lock:
             log_fh.close()
