@@ -584,12 +584,16 @@ def test_fallback_resolves_for_real_call_resolved_gateway_ids():
         fb = p._fallback_seat_for(b.model)
         assert fb is not None, f"{b.model} (priority {idx + 1}) should have a fallback"
         assert fb["model"] == board_ids[idx + 1], (b.model, fb)
-    # The gateway-routed seats a failing Kimi / GLM call carries (the board's exact ids — agentic
-    # `oc:` form today) resolve a real fallback, not None — the production failing-seat case.
+    # The gateway-routed seat a failing Kimi call carries (the board's exact id — agentic `oc:`
+    # form today) resolves a real fallback, not None — the production failing-seat case.
     kimi_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Kimi")
-    glm_seat = next(b.model for b in DEFAULT_BOARD if b.display == "GLM")
     assert p._fallback_seat_for(kimi_seat) is not None
-    assert p._fallback_seat_for(glm_seat) is not None
+    # The z.ai GLM seat is now the LAST-RESORT reserve (deprioritized, review-cli#65), so by
+    # construction it has no next-priority fallback — None is the correct hint for the lowest
+    # seat (the general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
+    glm_seat = next(b.model for b in DEFAULT_BOARD if b.display == "GLM")
+    assert glm_seat == DEFAULT_BOARD[-1].model, glm_seat  # pin: GLM is the last seat
+    assert p._fallback_seat_for(glm_seat) is None
 
 
 def test_to_summary_exposes_enriched_errors_for_the_errors_tab():

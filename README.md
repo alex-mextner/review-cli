@@ -860,10 +860,10 @@ fully-keyed environment):
 | 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
 | 4 | pool | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
 | 5 | reserve | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (z.ai-less host backfill for the GLM-cc lens) |
-| 6 | reserve | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom (z.ai subscription route) |
-| 7 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| 8 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
-| 9 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+| 6 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| 7 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| 8 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+| 9 | reserve (last) | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom (z.ai subscription route; **deprioritized to last-resort — pathologically slow under load**, review-cli#65) |
 
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
 the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
@@ -893,6 +893,19 @@ retry can fix it — so it falls straight to the reserve. The retry budget is co
 `--retry N` (or `$REVIEW_RETRY_COUNT`; default 2, `0` disables it). Every retry and every
 reserve promotion is recorded **durably** in the run-log dir (not just stderr), so a
 post-mortem or the dashboard can reconstruct exactly how a seat recovered or fell over.
+
+**Memory-aware concurrency cap.** Each heavy seat (codex / claude / opencode) spawns a fat
+model-runner subprocess, and a `review` runs its whole pool in parallel — so a high `--pool`
+or a cascade of reserve backfills can fan out into enough concurrent agent subprocesses to
+**OOM-kill** a seat mid-review under load. A process-wide cap bounds how many heavy backend
+subprocesses run at once (default **4**, overridable via `$REVIEW_MAX_CONCURRENCY`; `<= 0`
+disables it, and a value above **64** is clamped to that ceiling so a typo can't pin an
+absurd number of children). A seat over the cap simply **waits** for a slot — it is never dropped, and its
+per-call timeout starts only once it actually spawns, so queueing on the cap can't falsely
+time it out. The common single-seat gate (`--pool 1`) and the default pool of 4 are
+unaffected (both `<=` the cap). This is a *per-process* cap; a swarm of separate `review`
+processes also leans on the per-seat timeout (a stalled seat frees its slot fast) and on the
+slow `oc:zai/glm-5.2` seat being **deprioritized to last-resort reserve** (review-cli#65).
 
 **To re-rank** the board, reorder the priority list (`DEFAULT_BOARD` in
 `reviewlib/config.py`, or a `board:` list in `config.yaml`) — the top entry is the

@@ -66,12 +66,14 @@ def test_default_board_matches_directive_table():
         # Seats 5-8 route through opencode (`oc:`) so they run AGENTICALLY (read the repo
         # read-only), not the diff-only commandcode/z.ai REST call (review-cli#24).
         ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "performance", "Kimi"),
-        # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
-        # from the seat-3 commandcode GLM: same model family, different provider/transport.
-        ("oc:zai/glm-5.2", "quality", "GLM"),
         ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
         ("oc:commandcode/deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
         ("gemini", "contracts", "Gemini"),
+        # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
+        # from the seat-3 commandcode GLM: same model family, different provider/transport.
+        # DEPRIORITIZED to LAST-RESORT reserve (review-cli#65): it is pathologically slow
+        # under load, so it is the last seat promoted — Qwen/DeepSeek/Gemini go first.
+        ("oc:zai/glm-5.2", "quality", "GLM"),
     ]
     got = [(r.model, r.role, r.display) for r in DEFAULT_BOARD]
     assert got == expected, got
@@ -79,19 +81,20 @@ def test_default_board_matches_directive_table():
 
 def test_default_board_is_priority_ordered():
     """The CTO's priority sketch (strongest first): Fable, Opus, GLM-5.2-via-commandcode,
-    Codex, Kimi, GLM-5.2-via-z.ai, Qwen, DeepSeek, Gemini. Re-ranking = reordering
-    DEFAULT_BOARD; this pins the order. Seats 5-8 are the AGENTIC opencode (`oc:`) routes
-    (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP."""
+    Codex, Kimi, Qwen, DeepSeek, Gemini, GLM-5.2-via-z.ai. Re-ranking = reordering
+    DEFAULT_BOARD; this pins the order. Seats 5-9 are the AGENTIC opencode (`oc:`) routes
+    (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. The z.ai GLM seat is
+    DEPRIORITIZED to last (review-cli#65) — pathologically slow under load, so last-resort."""
     assert [r.model for r in DEFAULT_BOARD] == [
         "claude:claude-fable-5",
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
         "codex",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "oc:zai/glm-5.2",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
+        "oc:zai/glm-5.2",
     ]
 
 
@@ -448,12 +451,14 @@ def test_select_pool_default_picks_first_four_seats():
         "commandcode:zai-org/GLM-5.2",
         "codex",
     ]
-    # The reserve is exactly the remainder (priority order): the four agentic opencode
-    # routes (review-cli#24) plus the diff-only Gemini.
+    # The reserve is exactly the remainder (priority order): the agentic opencode routes
+    # (review-cli#24) plus the diff-only Gemini. The slow z.ai GLM seat is now LAST-RESORT
+    # (review-cli#65 deprioritization), so it sits at the bottom of the reserve.
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
-    assert reserve == ["oc:commandcode/moonshotai/Kimi-K2.7-Code", "oc:zai/glm-5.2",
+    assert reserve == ["oc:commandcode/moonshotai/Kimi-K2.7-Code",
                        "oc:commandcode/Qwen/Qwen3.7-Max",
-                       "oc:commandcode/deepseek/deepseek-v4-pro", "gemini"]
+                       "oc:commandcode/deepseek/deepseek-v4-pro", "gemini",
+                       "oc:zai/glm-5.2"]
 
 
 def test_select_pool_zero_or_negative_means_all_seats():
