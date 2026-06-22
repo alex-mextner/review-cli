@@ -25,6 +25,7 @@ from .brainstorm import MODE as _BRAINSTORM_MODE
 from .brainstorm import brainstorm_pool
 from .contract import ModeSpec
 from .just_ask import MODE as _JUST_ASK_MODE
+from .qa import MODE as _QA_MODE
 from .quorum import MODE as _QUORUM_MODE
 from .review import MODE as _REVIEW_MODE
 
@@ -36,6 +37,7 @@ MODES: tuple[ModeSpec, ...] = (
     _BRAINSTORM_MODE,
     _JUST_ASK_MODE,
     _QUORUM_MODE,
+    _QA_MODE,
 )
 
 # The diff-review mode's stable `name` (its run-stats key / dispatch identity). Its
