@@ -267,6 +267,11 @@ def mode_brainstorm(
 
     persona_index = seed_persona_index
     completed = start_round - 1
+    # How many rounds produced REAL persona ideas (vs a dead/empty round). A dead round is
+    # never appended to the transcript (the dead-round handler in the loop breaks/aborts before
+    # the append), so on RESUME every seeded block was a usable round — seed the counter with
+    # them. Reported in the mid-run-collapse notice ("synthesizing the N usable round(s)").
+    usable_rounds = len(transcript_blocks)
     synth = None
     try:
         for round_no in range(start_round, loop_end + 1):
@@ -301,44 +306,73 @@ def mode_brainstorm(
             )
             out.append(f"\n# Round {round_no}\n" + "\n\n---\n\n".join(format_result(r) for r in round_results))
 
-            # FAIL LOUD on a dead panel (see _round_is_dead): abort before recording the round
-            # as COMPLETED, so a dead round is never appended to the transcript / counted in
-            # `completed` / given a structural sentinel — a resume re-runs it rather than seeding
-            # its "(no output)" (codex P2). The round is still logged below for diagnosis.
+            # Did THIS round's panel actually produce ideas? (`_round_is_dead`: a strict
+            # majority of seats unusable.) The dead-round handler just below uses this to abort
+            # (no usable round yet) or to stop-and-synthesize (a mid-run collapse) BEFORE the
+            # moderator is consulted — so a `DECISION: STOP` can never be stamped over, and
+            # mistaken as convergence on, a dead round (the hollow-STOP bug). `dead_models` names
+            # the seats that came back empty/errored for the operator-facing message.
+            round_dead = _round_is_dead(round_results)
+            dead_models = [r.model for r in round_results if not result_is_usable(r)]
+
+            # A DEAD round (see _round_is_dead) is handled HERE, before it is appended to the
+            # transcript / counted in `completed` / given a structural sentinel — a dead round
+            # is never seeded, so a resume re-runs it rather than continuing past its "(no
+            # output)" (codex P2). The dead round IS logged below for diagnosis. Two cases:
             #
-            # ONLY when NO usable round has accumulated yet (`not transcript_blocks`): that is
-            # the bug this guards — every seat dead from round 1 (keyless/suspended backends),
-            # which used to print a hollow synthesis and exit 0. If earlier rounds WERE
-            # productive and a later round flakes (a transient rate-limit on a couple of
-            # seats), we must NOT throw away the good rounds — fall through and synthesize what
-            # we have, the pre-existing graceful behavior (claude-opus review). Mid-run
-            # transient-failure resilience (retry/reserve-swap) is a separate ROADMAP item.
-            if not transcript_blocks and _round_is_dead(round_results):
+            #   * NO usable round yet (`not transcript_blocks`): every seat dead from round 1
+            #     (keyless / suspended backends). FAIL LOUD with a what/why/how-to-fix error and
+            #     the stable EXIT_DEAD_PANEL — never the hollow STOP+synthesis that exited 0 (CTO
+            #     2026-06-16). The moderator is NOT consulted on this round (no wasted call).
+            #
+            #   * A round dead AFTER good rounds (mid-run collapse — the panel went credential-
+            #     less / rate-limited partway in): STOP the loop and synthesize the good rounds we
+            #     already have (the documented partial-success behavior). Crucially we do NOT keep
+            #     hammering the now-dead backends for the remaining rounds (the "~20 min wasted on
+            #     dead backends" the CTO hit), and we do NOT consult the moderator — a moderator
+            #     rubber-stamping `DECISION: STOP` over a dead round was the hollow-STOP vector;
+            #     here the dead round itself, not the moderator, ends the loop. The min_rounds
+            #     floor is bypassed for a collapse: forcing 5 rounds of dead backends only wastes
+            #     time. Mid-run transient-failure resilience (retry/reserve-swap) is a separate
+            #     ROADMAP item.
+            if round_dead:
                 usable = sum(1 for r in round_results if result_is_usable(r))
-                msg = (
-                    f"[review-cli] brainstorm aborted: round {round_no} produced no usable output "
-                    f"({usable}/{len(round_results)} panel seats answered).\n"
-                    "  most/all backends are dead or credential-less (empty output, an error, or an "
-                    "'unavailable' notice) — continuing would only print a hollow synthesis.\n"
-                    f"  panel: {', '.join(panel)}\n"
-                    "  fix: check the backends are reachable (keys present, CLIs installed, provider "
-                    "not suspended), then re-run — or pass a working panel with `-m`."
-                )
-                print(msg, file=sys.stderr, flush=True)
                 # Correct the run-stats tally: run_panel auto-counted each rc=0 seat as ok, but a
                 # dead seat (rc=0, empty/"unavailable") is not a real verdict — reclassify it to
                 # fail so the recorded run is honest and doesn't poison the ETA average (codex P2).
                 recount_round_by_usability(round_results)
                 # Diagnosis-only: log the dead round WITHOUT a structural round sentinel, so the
                 # session parser does NOT count it as a completed round (a resume re-runs it).
+                # "ABORTED" marks the round the run ended on — whether by a round-1 abort or a
+                # mid-run collapse-stop; both end the run on this dead round.
                 _disc(f"\n# Round {round_no} (ABORTED: dead panel — "
                       f"{usable}/{len(round_results)} seats usable)\n{round_text}\n")
-                # Surface the partial output we DID gather so a human sees the dead seats.
-                if out:
-                    print("\n\n".join(out))
-                if disc is not None:
-                    print(f"[review-cli] partial discussion log: {disc_path}", file=sys.stderr, flush=True)
-                return EXIT_DEAD_PANEL
+                if not transcript_blocks:
+                    msg = (
+                        f"[review-cli] brainstorm aborted: round {round_no} produced no usable "
+                        f"output ({usable}/{len(round_results)} panel seats answered).\n"
+                        "  most/all backends are dead or credential-less (empty output, an error, "
+                        "or an 'unavailable' notice) — continuing would only print a hollow "
+                        "synthesis.\n"
+                        f"  dead seats: {', '.join(dead_models) or '(none)'}\n"
+                        f"  panel: {', '.join(panel)}\n"
+                        "  fix: check the backends are reachable (keys present, CLIs installed, "
+                        "provider not suspended), then re-run — or pass a working panel with `-m`."
+                    )
+                    print(msg, file=sys.stderr, flush=True)
+                    # Surface the partial output we DID gather so a human sees the dead seats.
+                    if out:
+                        print("\n\n".join(out))
+                    if disc is not None:
+                        print(f"[review-cli] partial discussion log: {disc_path}",
+                              file=sys.stderr, flush=True)
+                    return EXIT_DEAD_PANEL
+                # Good rounds exist: stop on the collapse and synthesize what we have.
+                print(f"[review-cli] brainstorm: round {round_no} came back dead "
+                      f"(dead seats: {', '.join(dead_models) or '(none)'}); the panel collapsed "
+                      f"mid-run — synthesizing the {usable_rounds} usable round(s) so far instead "
+                      "of continuing on dead backends.", file=sys.stderr, flush=True)
+                break
 
             transcript_blocks.append(f"## Round {round_no}\n{round_text}")
             # The nonce'd `<!-- review:round N nonce=... -->` sentinel on its own line right
@@ -351,6 +385,9 @@ def mode_brainstorm(
             round_sentinel = f"{_ROUND_SENTINEL.format(n=round_no, nonce=nonce)}\n" if nonce else ""
             _disc(f"\n# Round {round_no}\n{round_sentinel}{round_text}\n")
             completed = round_no
+            # Reached only for a NON-dead round (a dead round breaks/aborts above before the
+            # append), so every round counted here produced real ideas.
+            usable_rounds += 1
 
             # Moderator summary + continue/stop decision (cannot stop before min_rounds).
             mod_prompt = (
