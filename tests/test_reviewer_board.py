@@ -33,6 +33,7 @@ from reviewlib.config import (  # noqa: E402
     DEFAULT_BOARD,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
+    GLM_COMMANDCODE_SEAT,
     KIMI_SEAT,
     REVIEW_ROLES,
     BoardConfigError,
@@ -54,12 +55,19 @@ def test_default_board_matches_directive_table():
     expected = [
         ("claude:claude-fable-5", "architect", "Fable"),
         ("claude:claude-opus-4-8", "correctness", "Opus"),
-        # Seat 3 is the agentic codex CLI route (see config.py / CHANGELOG for rationale).
+        # Seat 3 (CTO directive): GLM-5.2 via the Command Code gateway, directly under Opus.
+        # DIFF-ONLY keyed HTTP (review_commandcode) — opencode's commandcode provider does
+        # not register this GLM id, so the agentic form errors; read-only by construction.
+        # Role `performance` (NOT correctness) so it doesn't duplicate Opus's lens — it takes
+        # over the performance lens that Kimi (now #5) used to carry in the default pool.
+        ("commandcode:zai-org/GLM-5.2", "performance", "GLM-cc"),
+        # Seat 4 is the agentic codex CLI route (see config.py / CHANGELOG for rationale).
         ("codex", "consistency", "Codex"),
-        # Seats 4-7 route through opencode (`oc:`) so they run AGENTICALLY (read the repo
+        # Seats 5-8 route through opencode (`oc:`) so they run AGENTICALLY (read the repo
         # read-only), not the diff-only commandcode/z.ai REST call (review-cli#24).
         ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "performance", "Kimi"),
-        # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic.
+        # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
+        # from the seat-3 commandcode GLM: same model family, different provider/transport.
         ("oc:zai/glm-5.2", "quality", "GLM"),
         ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
         ("oc:commandcode/deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
@@ -70,12 +78,14 @@ def test_default_board_matches_directive_table():
 
 
 def test_default_board_is_priority_ordered():
-    """The CTO's priority sketch (strongest first): Fable, Opus, Codex, Kimi, GLM-5.2,
-    Qwen, DeepSeek, Gemini. Re-ranking = reordering DEFAULT_BOARD; this pins the order.
-    Seats 4-7 are the AGENTIC opencode (`oc:`) routes (review-cli#24)."""
+    """The CTO's priority sketch (strongest first): Fable, Opus, GLM-5.2-via-commandcode,
+    Codex, Kimi, GLM-5.2-via-z.ai, Qwen, DeepSeek, Gemini. Re-ranking = reordering
+    DEFAULT_BOARD; this pins the order. Seats 5-8 are the AGENTIC opencode (`oc:`) routes
+    (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP."""
     assert [r.model for r in DEFAULT_BOARD] == [
         "claude:claude-fable-5",
         "claude:claude-opus-4-8",
+        "commandcode:zai-org/GLM-5.2",
         "codex",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
         "oc:zai/glm-5.2",
@@ -85,8 +95,94 @@ def test_default_board_is_priority_ordered():
     ]
 
 
-def test_default_board_has_eight_seats():
-    assert len(DEFAULT_BOARD) == 8, len(DEFAULT_BOARD)
+def test_glm_commandcode_seat_sits_directly_under_opus():
+    """The CTO directive: GLM 5.2 via commandcode must sit IMMEDIATELY after Opus, so the
+    pool tries Opus first, then this GLM. Pin the adjacency by index so a future re-rank that
+    pulls them apart trips here. Uses the canonical constant (one source of truth)."""
+    models = [r.model for r in DEFAULT_BOARD]
+    opus_i = models.index("claude:claude-opus-4-8")
+    glm_i = models.index(GLM_COMMANDCODE_SEAT)
+    assert glm_i == opus_i + 1, (opus_i, glm_i, models)
+    # And it is exactly priority 3 (index 2), per the directive.
+    assert glm_i == 2, glm_i
+
+
+def test_glm_commandcode_seat_is_the_canonical_constant():
+    """The seat's model string is GLM_COMMANDCODE_SEAT byte-exact, and it is the verified-
+    live commandcode gateway id (`zai-org/GLM-5.2`), not the z.ai-route `glm-5.2` id."""
+    assert GLM_COMMANDCODE_SEAT == "commandcode:zai-org/GLM-5.2"
+    seat = next(r for r in DEFAULT_BOARD if r.model == GLM_COMMANDCODE_SEAT)
+    assert seat.display == "GLM-cc"
+
+
+def test_glm_commandcode_seat_routes_readonly_through_review_commandcode():
+    """The seat resolves to review_commandcode (a stateless keyed-HTTP REST backend that
+    POSTs ONLY the diff — read-only by construction, no repo/tools/exec), NOT to an agentic
+    opencode/codex/claude transport. This is what makes it caged without an `-s read-only`
+    flag: a REST POST has no workspace to write to."""
+    assert backends.resolve_backend(GLM_COMMANDCODE_SEAT) is backends.review_commandcode
+    # It passes the #25 default-routing guard (named backend, provider not dead).
+    assert backends.default_routes_live(GLM_COMMANDCODE_SEAT) is True
+    assert backends.effective_provider(GLM_COMMANDCODE_SEAT) == "commandcode"
+
+
+def test_glm_commandcode_seat_degrades_gracefully_without_a_key():
+    """When COMMANDCODE_API_KEY is absent the seat must NOT report available (so the pool
+    backfills it from the reserve) — graceful degradation, never a hard failure. Mirrors how
+    every other key-gated backend behaves when its credential is missing.
+
+    Patches the module globals manually with try/finally (NOT the pytest `monkeypatch`
+    fixture), so the test runs unchanged under the standalone `__main__` runner where a
+    fixture parameter would be an unfilled positional arg."""
+    import reviewlib.backends as b
+
+    saved_resolve = b._resolve_key
+    saved_mode = os.environ.pop("REVIEW_COMMANDCODE_MODE", None)
+    saved_fake = os.environ.pop("REVIEW_FAKE_BACKEND", None)
+    # Also drop COMMANDCODE_API_KEY from the live env for the duration: a dev/CI host that
+    # exports the real key would otherwise let any os.environ-direct read inside
+    # backend_available see it and make this a false-green (review of #57). Stubbing
+    # _resolve_key alone only covers the resolver path; popping the env var makes the
+    # "no key anywhere" precondition explicit and resolver-independent.
+    saved_key = os.environ.pop("COMMANDCODE_API_KEY", None)
+    # Force the key resolver to find nothing (no env, no shared .env file).
+    b._resolve_key = lambda *a, **k: ""
+    try:
+        assert backends.backend_available(GLM_COMMANDCODE_SEAT) is False
+    finally:
+        b._resolve_key = saved_resolve
+        if saved_mode is not None:
+            os.environ["REVIEW_COMMANDCODE_MODE"] = saved_mode
+        if saved_fake is not None:
+            os.environ["REVIEW_FAKE_BACKEND"] = saved_fake
+        if saved_key is not None:
+            os.environ["COMMANDCODE_API_KEY"] = saved_key
+
+
+def test_glm_commandcode_seat_carries_performance_not_a_duplicate_role():
+    """GLM-cc must NOT reuse Opus's `correctness` lens — that would duplicate a role in the
+    default top-4 pool and silently drop the `performance` lens from a plain `review diff`
+    (review of #57). It carries `performance` (the lens Kimi held before being pushed to the
+    reserve at #5), so inserting this seat is a pure priority change, not a coverage loss."""
+    glmcc = next(r for r in DEFAULT_BOARD if r.model == GLM_COMMANDCODE_SEAT)
+    opus = next(r for r in DEFAULT_BOARD if r.model == "claude:claude-opus-4-8")
+    assert glmcc.role == "performance", glmcc.role
+    assert glmcc.role != opus.role, (glmcc.role, opus.role)
+
+
+def test_default_pool_roles_are_distinct_no_lens_lost():
+    """The default top-4 pool (DEFAULT_POOL_SIZE seats) must have FOUR DISTINCT roles, so a
+    plain `review diff` always covers four non-overlapping lenses — no seat wasted on a
+    duplicate lens. Pins the coverage the GLM-cc insertion preserved: architect, correctness,
+    performance, consistency (the same four roles the pre-#57 pool had)."""
+    pool = [r for r in DEFAULT_BOARD[:DEFAULT_POOL_SIZE]]
+    roles = [r.role for r in pool]
+    assert len(set(roles)) == len(roles), f"duplicate role in default pool: {roles}"
+    assert set(roles) == {"architect", "correctness", "performance", "consistency"}, roles
+
+
+def test_default_board_has_nine_seats():
+    assert len(DEFAULT_BOARD) == 9, len(DEFAULT_BOARD)
 
 
 # === No dead Fireworks/glide provider in the defaults (review-cli#25) ============
@@ -341,14 +437,22 @@ def test_default_pool_size_is_four():
 
 def test_select_pool_default_picks_first_four_seats():
     """Default pool (no availability predicate) = the FIRST 4 seats by priority of the
-    8-seat board (the rest are reserve)."""
+    9-seat board (the rest are reserve). The pool now leads with Fable, Opus, the
+    GLM-5.2-via-commandcode seat (CTO directive, priority 3), then Codex."""
     pool = select_pool(list(DEFAULT_BOARD), DEFAULT_POOL_SIZE)
     assert len(pool) == 4
     assert [r.model for r in pool] == [r.model for r in DEFAULT_BOARD[:4]]
-    # The reserve is exactly the remainder (priority order). Seats 5-7 are the agentic
-    # opencode routes (review-cli#24); only Gemini stays diff-only.
+    assert [r.model for r in pool] == [
+        "claude:claude-fable-5",
+        "claude:claude-opus-4-8",
+        "commandcode:zai-org/GLM-5.2",
+        "codex",
+    ]
+    # The reserve is exactly the remainder (priority order): the four agentic opencode
+    # routes (review-cli#24) plus the diff-only Gemini.
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
-    assert reserve == ["oc:zai/glm-5.2", "oc:commandcode/Qwen/Qwen3.7-Max",
+    assert reserve == ["oc:commandcode/moonshotai/Kimi-K2.7-Code", "oc:zai/glm-5.2",
+                       "oc:commandcode/Qwen/Qwen3.7-Max",
                        "oc:commandcode/deepseek/deepseek-v4-pro", "gemini"]
 
 
@@ -405,27 +509,42 @@ def test_glm_seat_routes_agentically_via_opencode_zai_provider():
 
 
 def test_all_repo_capable_default_seats_are_agentic():
-    """review-cli#24 acceptance: every DEFAULT_BOARD seat that CAN read the repo routes to
-    an AGENTIC backend (the codex CLI, opencode, or the claude CLI) — not a stateless
-    diff-only REST/keyed-HTTP call. Only Gemini stays diff-only (it has no agentic
-    transport: a workspace-less REST API).
+    """review-cli#24 acceptance, as amended by the GLM-5.2-via-commandcode seat: every
+    DEFAULT_BOARD seat that HAS an agentic transport uses it (the codex CLI, opencode, or the
+    claude CLI) — not a stateless diff-only REST/keyed-HTTP call. Exactly TWO seats stay
+    diff-only, each because NO agentic transport reaches them:
+      * Gemini — a workspace-less REST API, no agentic CLI/opencode provider; and
+      * GLM-cc (`commandcode:zai-org/GLM-5.2`, priority 3) — opencode's `commandcode`
+        provider does NOT register this GLM id, so `oc:commandcode/zai-org/GLM-5.2` errors;
+        the keyed-HTTP route is the only one that reaches it (verified live).
 
-    This pins the agentic-by-default contract: Kimi/GLM/Qwen/DeepSeek go through opencode
-    (`oc:`), Codex through the codex CLI, the two Anthropic seats through claude. A future
-    edit that silently reverts a seat to the diff-only commandcode/z.ai REST route fails
-    here. (claude is agentic via its CLI path; resolve_backend returns review_claude for
-    both, and the board's claude seats run the CLI on a normal host.)"""
+    This still pins the agentic-by-default contract for the seats that CAN be agentic:
+    Kimi/z.ai-GLM/Qwen/DeepSeek go through opencode (`oc:`), Codex through the codex CLI, the
+    two Anthropic seats through claude. A future edit that silently reverts one of THOSE to
+    the diff-only REST route fails here. (claude is agentic via its CLI path; resolve_backend
+    returns review_claude for both, and the board's claude seats run the CLI on a normal
+    host.)"""
     agentic = {backends.review_codex, backends.review_opencode, backends.review_claude}
+    # The seats that are legitimately diff-only (no agentic transport exists), keyed by the
+    # backend they MUST route to. Any OTHER seat falling to a diff-only backend is the
+    # silent regression #24 guards against.
+    allowed_diff_only = {
+        "Gemini": backends.review_gemini,
+        "GLM-cc": backends.review_commandcode,
+    }
     for seat in DEFAULT_BOARD:
         backend = backends.resolve_backend(seat.model)
-        if seat.display == "Gemini":
-            assert backend is backends.review_gemini, seat.model
+        if seat.display in allowed_diff_only:
+            assert backend is allowed_diff_only[seat.display], seat.model
             continue
         assert backend in agentic, f"{seat.display} ({seat.model}) is not agentic"
-    # Belt-and-suspenders: NO default board seat uses the diff-only commandcode/z.ai REST
-    # backends anymore (those are reserved for explicit `-m cc`/`-m glm` and config boards).
-    diff_only = {backends.review_commandcode, backends.review_zai}
-    assert not any(backends.resolve_backend(s.model) in diff_only for s in DEFAULT_BOARD)
+    # Belt-and-suspenders: the ONLY diff-only commandcode/z.ai REST seat on the default board
+    # is the deliberate priority-3 GLM-cc one; every other seat is agentic (or Gemini). A
+    # second keyed-HTTP commandcode/z.ai seat slipping in is the regression to catch.
+    diff_only_backends = {backends.review_commandcode, backends.review_zai}
+    rest_seats = [s.display for s in DEFAULT_BOARD
+                  if backends.resolve_backend(s.model) in diff_only_backends]
+    assert rest_seats == ["GLM-cc"], rest_seats
 
 
 def test_install_skill_text_documents_agentic_default_board(  ):
@@ -1102,7 +1221,7 @@ def test_show_board_honors_pool_flag_tagging():
 def test_show_board_startup_failover_skips_unavailable_top_seat():
     """The live pool is the top-N AVAILABLE seats by priority: an unavailable higher
     priority seat is tagged `unavail` and the next available seat fills the pool."""
-    # Fable (#1) unavailable -> the pool of 2 is Opus (#2) + Codex (#3); Fable is unavail.
+    # Fable (#1) unavailable -> the pool of 2 is Opus (#2) + GLM-cc (#3); Fable is unavail.
     avail = {r.model for r in DEFAULT_BOARD if r.model != "claude:claude-fable-5"}
     seat_lines = [ln for ln in _show_board_lines(2, available=avail)
                   if "[pool" in ln or "[reserve]" in ln or "[unavail]" in ln]
@@ -1115,7 +1234,7 @@ def test_show_board_startup_failover_skips_unavailable_top_seat():
     assert len(by_tier["pool"]) == 2, by_tier["pool"]
     assert "Fable" in by_tier["unavail"][0], by_tier["unavail"]
     assert "Opus" in by_tier["pool"][0]
-    assert "Codex" in by_tier["pool"][1]
+    assert "GLM-cc" in by_tier["pool"][1]
 
 
 def test_show_board_pool_zero_marks_all_seats_pool():

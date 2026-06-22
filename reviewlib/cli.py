@@ -1628,7 +1628,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # So a configured `models:` gets exactly those (the flat panel), NOT the board. The
     # board applies on the DEFAULT diff review (no panel mode) with neither -m nor config
     # models. The board is NEVER disabled — `--pool N` only sizes how many of its seats
-    # run (default 4 of the 8-seat board; the rest are a reserve). `use_board` is a cheap
+    # run (default 4 of the 9-seat board; the rest are a reserve). `use_board` is a cheap
     # boolean gate computed now; the actual load_board + cost-safety validation (and the
     # --pool slice) runs LATER (validate_board, below) — after the standalone-visual path
     # has had its chance to short-circuit, so a malformed `board:` never blocks the

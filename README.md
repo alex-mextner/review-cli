@@ -813,19 +813,24 @@ fully-keyed environment):
 |---|---|---|---|---|---|
 | 1 | pool | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries |
 | 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
-| 3 | pool | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
-| 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 |
-| 5 | reserve | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom |
-| 6 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| 7 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
-| 8 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+| 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
+| 4 | pool | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| 5 | reserve | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (z.ai-less host backfill for the GLM-cc lens) |
+| 6 | reserve | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom (z.ai subscription route) |
+| 7 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| 8 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| 9 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
 
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
 the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
 Anthropic API only on a host that lacks the CLI but has an API key), Codex via the codex
-CLI, and Kimi/GLM/Qwen/DeepSeek through opencode (`oc:provider/model`) — all run read-only
-*inside* `-C` and can open any project file, not just the diff. **Gemini** is always
-diff-only (it has no agentic transport). `review --show-board` shows each seat's live
+CLI, and Kimi/z.ai-GLM/Qwen/DeepSeek through opencode (`oc:provider/model`) — all run
+read-only *inside* `-C` and can open any project file, not just the diff. Two seats are
+always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-3
+**GLM-cc** seat (`commandcode:zai-org/GLM-5.2` — opencode's `commandcode` provider does not
+register this GLM id, so the agentic form errors; the keyed-HTTP route is the one that
+reaches it). Both are read-only by construction (they POST only the diff).
+`review --show-board` shows each seat's live
 `agentic`/`diff-only` scope for the current host. The board has
 a reserve, so an `oc:` seat that opencode can't reach is backfilled rather than blocking:
 a missing opencode **binary** is detected at startup (the seat probes unavailable and the
@@ -887,7 +892,7 @@ Override the board itself in `config.yaml` with a `board:` list — each entry i
 order** (the first entry is the highest priority); the failover pool fills from the top.
 An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
 warning); a single malformed entry is skipped (the valid ones are kept). With **no**
-`board:` configured, the built-in 8-seat priority board above applies. A `board:` that is
+`board:` configured, the built-in 9-seat priority board above applies. A `board:` that is
 **present but has no usable entry at all** is a hard error (non-zero exit) — it never
 silently falls back to the paid default board.
 
@@ -906,7 +911,7 @@ board:
   - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
 ```
 
-**Optional heavyweight seats** (NOT enabled by default — the board stays at 8). Add
+**Optional heavyweight seats** (NOT enabled by default — the board stays at 9). Add
 either to your `board:` list for an extra 1M-context resilience / holistic-senior
 pass; both run agentically through opencode's commandcode provider (needs opencode +
 `opencode auth login`, like the default `oc:` seats):

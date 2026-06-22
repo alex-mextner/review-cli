@@ -5,6 +5,37 @@ semantic versioning.
 
 ## Unreleased
 
+- **GLM 5.2 via the Command Code gateway added as the priority-3 board seat (directly under
+  Opus).** A new default-board seat `commandcode:zai-org/GLM-5.2` (display `GLM-cc`, role
+  `performance`) sits immediately after Opus, so a plain `review diff` runs Fable, Opus,
+  GLM-5.2-via-commandcode, Codex as its top-4 pool. It carries the `performance` lens (NOT a
+  second `correctness` — that would duplicate Opus's lens): inserting it at #3 pushes Kimi,
+  the old performance seat, to #5/reserve, so GLM-cc takes over `performance` and the default
+  pool keeps its four distinct lenses (architect/correctness/performance/consistency) — a
+  pure priority change, no *lens* lost. TRADE-OFF (named explicitly): the default top-4 pool
+  used to be fully agentic; now the `performance` lens in a plain `review diff` is served by
+  this **diff-only** GLM-cc seat instead of the repo-aware Kimi (pushed to reserve #5), so
+  that lens no longer reads the whole repo in a default run — a deliberate consequence of
+  ranking GLM-5.2's model strength above transport capability, per the directive, not an
+  oversight. When GLM-cc itself is unavailable, the pool backfills with Kimi (#5,
+  `performance`) and ends as `[Fable, Opus, Codex, Kimi]` — the SAME four distinct lenses the
+  pre-#57 board had, so the new seat costs no lens diversity when it is the one missing (test
+  `test_glm_cc_unavailable_keeps_four_distinct_lenses`). Whether that backfill is *agentic*
+  depends on the host: review-cli's `COMMANDCODE_API_KEY` gates only the diff-only GLM-cc
+  seat, NOT opencode's `commandcode` provider (which carries its own auth from `opencode auth
+  login`, independent of that env var — verified: opencode's provider config has no `apiKey`
+  bound to it), so a host missing only review-cli's key still has the agentic Kimi reserve.
+  The seat is **diff-only** (a stateless
+  keyed-HTTP POST through `review_commandcode`, like Gemini) and therefore **read-only by
+  construction** — no repo access, tools, or exec, so it needs no `-s read-only` cage. It is
+  diff-only on purpose: opencode's `commandcode` provider does not register this GLM id, so
+  the agentic `oc:commandcode/zai-org/GLM-5.2` route errors; the keyed-HTTP route is the only
+  one that reaches it (verified live). It is **distinct** from the existing lower-priority
+  `oc:zai/glm-5.2` seat (display `GLM`): same model family, different provider/transport
+  (Command Code gateway vs the z.ai Coding-Plan subscription). It degrades gracefully when
+  `COMMANDCODE_API_KEY` is absent (the pool backfills it from the reserve), exactly like every
+  other key-gated backend. The board is now 9 seats. (Canonical id: `GLM_COMMANDCODE_SEAT`.)
+
 - **In-seat retry before reserve-replace, with retryable/seat-fatal classification.** The
   failover board now retries a failed seat *on the same model* when the failure is
   **transient** — a `429` rate-limit, a `529`/5xx overload, a provider timeout (exit 124), an

@@ -328,6 +328,57 @@ def test_commandcode_base_url_and_model_override():
     assert captured["body"]["model"] == "deepseek/deepseek-coder"
 
 
+def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
+    """The priority-3 GLM-5.2 board seat (`commandcode:zai-org/GLM-5.2`) must POST the
+    byte-exact gateway model id `zai-org/GLM-5.2` — INCLUDING the embedded slash. The id has
+    TWO `/`-free segments around a single `/` plus the `commandcode:` provider prefix, so a
+    naive split could truncate it; this pins that `review_commandcode` strips ONLY the
+    provider prefix (`split(":", 1)[1]`) and sends the whole `zai-org/GLM-5.2` selector. The
+    'byte-exact against the gateway /models catalog' claim in the board comments/CHANGELOG is
+    only load-bearing if the wire actually carries it (review of #57)."""
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "x"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_secret"
+        os.environ.pop("COMMANDCODE_BASE_URL", None)
+        os.environ.pop("COMMANDCODE_MODEL", None)
+        try:
+            backends.review_commandcode("commandcode:zai-org/GLM-5.2", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured["body"]["model"] == "zai-org/GLM-5.2", captured["body"]
+    # And it goes to the default Command Code gateway, not z.ai's host.
+    assert captured["url"] == "https://api.commandcode.ai/provider/v1/chat/completions", captured["url"]
+
+
+def test_commandcode_glm_seat_id_beats_commandcode_model_env():
+    """The priority-3 GLM-cc seat id WINS over a `COMMANDCODE_MODEL` env override — so a host
+    that exports `COMMANDCODE_MODEL` (a legitimate override for the bare `-m cc` path) can NOT
+    silently hijack the default-board seat into POSTing a different model. `review_commandcode`
+    only consults `COMMANDCODE_MODEL` for a BARE `commandcode` id (no suffix); a suffixed seat
+    like `commandcode:zai-org/GLM-5.2` takes `model.split(':',1)[1]` unconditionally. This pins
+    the production case (env PRESENT, NOT popped) — refuting the concern that the seat's
+    byte-exact id could be overridden by env on a real host (review of #57)."""
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "x"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_secret"
+        # Hostile env: a COMMANDCODE_MODEL that MUST be ignored for the suffixed seat id.
+        os.environ["COMMANDCODE_MODEL"] = "deepseek/deepseek-v4-flash"
+        os.environ.pop("COMMANDCODE_BASE_URL", None)
+        try:
+            backends.review_commandcode("commandcode:zai-org/GLM-5.2", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured["body"]["model"] == "zai-org/GLM-5.2", captured["body"]
+    # The env value did NOT leak into the wire payload.
+    assert captured["body"]["model"] != "deepseek/deepseek-v4-flash", captured["body"]
+
+
 # === API-only mode contract (a forced cli mode is a hard error) =================
 def test_commandcode_forced_cli_mode_is_a_dead_backend_not_a_silent_post():
     """REVIEW_COMMANDCODE_MODE=cli is a config error (no commandcode CLI exists). It
