@@ -80,6 +80,28 @@ EXIT_NOT_A_REPO = 3
 # corrupt index) — distinct from EXIT_NOT_A_REPO (you ARE in a repo) and argparse-2. The
 # REQUIRED review path catches the RuntimeError `_git_diff` raises so this never tracebacks.
 EXIT_GIT_DIFF_FAILED = 4
+# qa mode (review-qa.md §4/§6): "qa ran but no test-case suites/cases are authored for the
+# target" — a CONTRACT failure (a green qa run with zero authored cases is a lie), distinct
+# from a real finding, so CI can tell "you didn't author any suites" apart from "a test
+# failed". The qa handler's no-suites gate returns this BEFORE any agent/docker/browser.
+#
+# Value is 6, NOT the 5 the spec's §6 first proposed: code 5 is already taken at the
+# PROCESS-exit level by brainstorm's EXIT_DEAD_PANEL (modes/brainstorm.py), and structured
+# exit codes must stay per-class distinct, so a script seeing 5 can't tell "brainstorm dead
+# panel" from "qa no suites". qa's own codes therefore start at the next free integer (6);
+# the later qa env classes (NO_ENV / ENV_UNHEALTHY / SUT_BOOT_FAILED) continue from 7 in
+# Phase 2/3 (the spec's 5/6/7/8 block shifts up by one for the brainstorm collision).
+EXIT_QA_NO_SUITES = 6
+# qa Phase 1 has NO executor yet (the write/exec tester is Phase 2). When suites DO resolve,
+# the handler can't run them — and returning 0 would be the very lie the no-suites gate
+# exists to prevent (cases authored, ZERO executed, but CI reads exit 0 = "qa passed", and
+# WORSE than no-suites because the author believes the tests ran). So the suites-resolved-
+# but-no-executor branch returns this distinct NON-ZERO code: a pipeline that wires `review
+# qa` today fails loudly ("not implemented") instead of getting a silent green. This is a
+# TRANSIENT Phase-1 scaffold code — it goes away the moment the executor lands (Phase 2),
+# so it is parked well clear of the qa env-class block (7/8/9) at 70 (EX_SOFTWARE-adjacent,
+# "the command itself isn't done yet"), distinct from every stable class above.
+EXIT_QA_NOT_IMPLEMENTED = 70
 
 
 def _is_git_repo(cwd: Path) -> bool:
@@ -767,6 +789,9 @@ _VALUE_TAKING_OPTS = frozenset({
     # path that could look like an option (e.g. `--spec -odd-name.md`); list it so the `-o`
     # pre-scan never steals it.
     "--spec",
+    # `review qa --suites <glob/dir/file>` (modes/qa.py): the value is a suite path that could
+    # look like an option; list it so the `-o` pre-scan passes it through untouched.
+    "--suites",
 })
 
 
@@ -1127,6 +1152,9 @@ _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
     "--diff", "--staged", "--prompt", "--moderator", "--rounds", "--max-rounds",
     "--visual", "--before", "--intent", "--expect", "--check", "--json", "--strict",
     "--no-ai", "--no-local-model", "--vision-timeout", "--project", "--retry",
+    # `--suites` is the qa mode's own flag (modes/qa.py); a verb-less `review --suites …`
+    # must get the friendly "use the subcommand" pointer, not argparse's opaque error.
+    "--suites",
 })
 
 # The BARE management subcommands `_dispatch` handles directly (NOT mode verbs in

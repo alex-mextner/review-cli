@@ -418,6 +418,7 @@ def test_value_taking_opts_are_all_value_taking():
     brainstorm_only = {"--rounds", "--max-rounds"}
     specweb_only = {"--spec"}        # lives ONLY on the `spec-web reply` subparser
     moderator_only = {"--moderator"}  # lives on quorum / brainstorm, NOT the diff review
+    qa_only = {"--suites"}            # lives ONLY on the `qa` subparser (modes/qa.py)
     for opt in sorted(_VALUE_TAKING_OPTS):
         if opt in ("-o", "--output"):
             continue  # handled by the pre-scan, covered by other tests
@@ -428,6 +429,10 @@ def test_value_taking_opts_are_all_value_taking():
             argv = ["spec-web", "reply", "cid", "ans", opt]
         elif opt in moderator_only:
             argv = ["quorum", "q", opt]  # --moderator is a quorum/brainstorm flag
+        elif opt in qa_only:
+            # --suites lives only on the qa parser; lead with --timeout so the parser
+            # reaches the bare opt at the end without running anything.
+            argv = ["qa", "--timeout", "100", opt]
         else:
             # Everything else (global + the review-only --prompt + the visual group) lives
             # on the `diff` subcommand parser. Lead with --timeout (global, value-taking) so

@@ -473,6 +473,10 @@ _UNIT_FILES = [
     ("test_brainstorm_diff.py", {}),
     ("test_brainstorm_dead_panel.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_mode_subcommands.py", {}),
+    # qa is declared with announce_logs/stats_mode, so its dispatcher path can touch the
+    # ETA/log store on the way to the early return — give it a FRESH temp log dir so the
+    # run never writes into the dev's default log dir (matches the other log-touching tests).
+    ("test_qa_mode.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
