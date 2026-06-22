@@ -797,10 +797,11 @@ _VALUE_TAKING_OPTS = frozenset({
     # pre-scan never steals it.
     "--spec",
     # The qa mode's VALUE-taking flags (modes/qa.py): `--suites <glob/dir/file>`,
-    # `--kind <shape>`, `--report <path>`, `--max-cases <N>`. Their values can look like an
-    # option (a path, `-1`), so the `-o` pre-scan must skip each one's argument. `--in-place`
-    # is a boolean flag (no value) and is deliberately NOT listed.
-    "--suites", "--kind", "--report", "--max-cases",
+    # `--kind <shape>`, `--report <path>`, `--max-cases <N>`, plus the Phase-3 env flags
+    # `--stage-url <URL>` and `--config <path>`. Their values can look like an option (a path,
+    # `-1`), so the `-o` pre-scan must skip each one's argument. `--in-place` / `--keep-env`
+    # are boolean flags (no value) and are deliberately NOT listed.
+    "--suites", "--kind", "--report", "--max-cases", "--stage-url", "--config",
 })
 
 
@@ -1173,7 +1174,9 @@ _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
     "--no-ai", "--no-local-model", "--vision-timeout", "--project", "--retry",
     # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
     # etc. must get the friendly "use the subcommand" pointer, not argparse's opaque error.
+    # Phase 3 adds the SUT-env flags `--stage-url` / `--config` / `--keep-env`.
     "--suites", "--kind", "--in-place", "--report", "--max-cases",
+    "--stage-url", "--config", "--keep-env",
 })
 
 # The BARE management subcommands `_dispatch` handles directly (NOT mode verbs in

@@ -199,32 +199,147 @@ def _sut_path(ctx: ModeContext) -> Path:
 
 
 def _handler(ctx: ModeContext) -> int:
-    """Phase 2 handler: resolve suites (no-suites gate), then run the write/exec TESTER.
+    """qa handler: resolve suites (no-suites gate), bring the SUT env up (Phase 3), then run
+    the write/exec TESTER (Phase 2) against the up env, with GUARANTEED env teardown.
 
-    The no-suites gate (Phase 1) still runs FIRST, BEFORE any agent spawn — a write/exec
-    agent must never launch for an empty run. When suites resolve, the handler builds the
-    tester prompt from the (max-cases-capped) suites + the detected kind, then hands it to
-    the single-seat write/exec launcher (``reviewlib/qa/executor.run_tester``) — NOT
-    ``run_panel``, NOT the read-only board. The agent's evidence-backed ``VERDICT:`` maps to
-    the exit code (report-only: a found bug exits 0 with findings printed; only "couldn't
-    run the tester" / BLOCKED is non-zero, plus the ``--strict`` finding flip)."""
+    The no-suites gate (Phase 1) still runs FIRST, BEFORE any agent spawn OR any env bring-up
+    — a write/exec agent must never launch, and no container/dev-server must come up, for an
+    empty run. When suites resolve, the handler:
+      * (Phase 3) stands the SUT env up via ``reviewlib/qa/env.py`` — stage-detect → reuse /
+        ``qa/setup.sh`` hook / compose bring-up → health-gate — when an env is declared; a
+        SUT that needs no env (no stage, no hook, no config) skips this gracefully and the
+        agent does its own local bring-up per the runbook;
+      * (Phase 2) builds the tester prompt + hands it to the single-seat write/exec launcher;
+      * tears the env down on EVERY exit path (success / finding / error / timeout) — but
+        ONLY what THIS run brought up (a reused stage is never torn down).
+    The agent's evidence-backed ``VERDICT:`` maps to the exit code (report-only; only
+    "couldn't run the tester" / BLOCKED / an env failure is non-zero, plus the --strict flip)."""
     # Imported here (not at module top) so the qa module stays import-light and does not
     # create a circular import with cli (cli imports the registry which imports this mode).
-    from ..cli import EXIT_QA_NO_SUITES, EXIT_QA_SUT_BOOT_FAILED
+    from ..cli import (
+        EXIT_QA_ENV_UNHEALTHY,
+        EXIT_QA_NO_ENV,
+        EXIT_QA_NO_SUITES,
+        EXIT_QA_SUT_BOOT_FAILED,
+    )
 
     sut_path = _sut_path(ctx)
     suites = resolve_suites(sut_path, ctx.args.suites)
     if not suites:
         return _fail_no_suites(sut_path, ctx.args.suites, exit_code=EXIT_QA_NO_SUITES)
 
-    return _run_executor(ctx, sut_path, suites, exit_blocked=EXIT_QA_SUT_BOOT_FAILED)
+    return _run_with_env(
+        ctx, sut_path, suites,
+        exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
+        exit_no_env=EXIT_QA_NO_ENV,
+        exit_unhealthy=EXIT_QA_ENV_UNHEALTHY,
+    )
 
 
-def _run_executor(ctx: ModeContext, sut_path: Path, suites: list[Path], *, exit_blocked: int) -> int:
+def _run_with_env(
+    ctx: ModeContext, sut_path: Path, suites: list[Path], *,
+    exit_blocked: int, exit_no_env: int, exit_unhealthy: int,
+) -> int:
+    """Phase 3 wrapper: bring the SUT env up (when one is declared), run the executor against
+    it, and GUARANTEE teardown of what we brought up on every exit path.
+
+    The env layer plugs in BEFORE the executor: ``bring_up_env`` does the deterministic
+    detect/reuse/bring-up/health-gate, returning an ``EnvHandle`` whose ``tear_down`` reaps
+    EXACTLY what this run owns (a no-op for a reused stage). The try/finally here is the
+    NORMAL teardown path; the env module ALSO registers an atexit/signal hook so an abnormal
+    exit (Ctrl-C, crash, backstop fire) still reaps a daemonized container backstop cannot
+    reach. A SUT that needs no env (no stage / no hook / no config) short-circuits via
+    ``_env_declared`` ABOVE — it never enters bring-up, the agent does its own local bring-up
+    per the runbook (the Phase-2 behavior)."""
+    import sys
+
+    from ..qa.config import QaConfigError, load_qa_config
+    from ..qa.env import EnvError, EnvMode, bring_up_env
+
+    try:
+        config = load_qa_config(sut_path, ctx.args.config)
+    except QaConfigError as exc:
+        print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
+        return 2
+
+    if not _env_declared(sut_path, config, ctx.args.stage_url):
+        # No env declared anywhere — the agent does its own local bring-up per the runbook
+        # (the Phase-2 behavior). Nothing for the deterministic env layer to own.
+        return _run_executor(ctx, sut_path, suites, exit_blocked=exit_blocked, endpoints={})
+
+    # --keep-env (the flag) OR sut.teardown.keep_on_failure (the config) keeps an unhealthy
+    # env up for triage. Both are honored — the config docstring + the --keep-env help both
+    # promise "or the config field", so a SUT declaring keep_on_failure: true must take effect
+    # without the flag (review finding: the config field was dead).
+    keep_env = bool(ctx.args.keep_env) or (config is not None and config.teardown.keep_on_failure)
+    try:
+        handle = bring_up_env(
+            sut_path=sut_path, config=config, stage_url_override=ctx.args.stage_url,
+            exit_no_env=exit_no_env, exit_unhealthy=exit_unhealthy,
+            keep_env=keep_env,
+        )
+    except EnvError as exc:
+        print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
+        return exc.exit_code
+
+    # REUSED_STAGE → the agent tests against the already-up stage; HOOK/COMPOSE → the env is
+    # already up, the agent must NOT boot a second copy ("none"); NONE → no env was owned (a
+    # stale ambient stage var that fell through), so the agent does its own Phase-2 local
+    # bring-up ("local"), exactly as if no env had been declared.
+    if handle.mode == EnvMode.REUSED_STAGE:
+        bring_up = "stage"
+    elif handle.mode == EnvMode.NONE:
+        bring_up = "local"
+    else:
+        bring_up = "none"
+    try:
+        return _run_executor(
+            ctx, sut_path, suites, exit_blocked=exit_blocked,
+            endpoints=handle.endpoints, bring_up=bring_up,
+        )
+    finally:
+        # GUARANTEED teardown on EVERY exit path (return, finding, exception, timeout). Only
+        # tears down what THIS run brought up — a reused stage's teardown is a no-op (ownership
+        # rule). ``tear_down`` self-unregisters from the global atexit registry and is
+        # idempotent, so the atexit/signal hook's call after this one is a no-op.
+        handle.tear_down()
+
+
+def _env_declared(sut_path: Path, config: object | None, stage_url: str | None) -> bool:
+    """True when SOME SUT env is declared and the deterministic env layer should own bring-up:
+    an explicit ``--stage-url``, a ``qa.yaml`` config (stage or bringup), or a ``setup.sh``
+    hook. False means "no env declared" — the agent does its own local bring-up (Phase 2), so
+    no container/dev-server is owned by qa. ``REVIEW_QA_STAGE_URL`` in the environment also
+    counts (the env layer honors it)."""
+    import os
+
+    from ..qa.config import SutConfig
+    from ..qa.env import _find_setup_hook
+
+    if stage_url or os.environ.get("REVIEW_QA_STAGE_URL", "").strip():
+        return True
+    if isinstance(config, SutConfig) and (config.stage is not None or config.bringup is not None):
+        return True
+    return _find_setup_hook(sut_path) is not None
+
+
+def _run_executor(
+    ctx: ModeContext, sut_path: Path, suites: list[Path], *,
+    exit_blocked: int, endpoints: dict | None = None, bring_up: str = "local",
+) -> int:
     """Build the tester prompt + run the single-seat write/exec launcher, then map the
     parsed verdict to an exit code. Split from ``_handler`` so the gate stays the first,
-    obvious thing the handler does and the (heavier) executor wiring is one call away."""
+    obvious thing the handler does and the (heavier) executor wiring is one call away.
+
+    ``endpoints`` (resolved by the Phase-3 env layer) + ``bring_up`` thread the ALREADY-UP
+    env into the tester prompt: a reused stage passes ``bring_up="stage"`` + the stage URL so
+    the agent tests AGAINST it rather than booting; a hook/compose env passes ``bring_up="none"``
+    (the deterministic layer already brought it up — the agent must NOT boot a second copy).
+    No env declared → ``bring_up="local"`` (the agent does its own bring-up, the Phase-2
+    behavior)."""
     import sys
+
+    endpoints = endpoints or {}
 
     # Lazy-imported (heavy: pulls the qa package) so the mode stays import-light and the
     # no-suites gate above never pays for the executor.
@@ -261,7 +376,8 @@ def _run_executor(ctx: ModeContext, sut_path: Path, suites: list[Path], *, exit_
     kind = _detect_kind(sut_path) if ctx.args.kind == "auto" else ctx.args.kind
     # max_cases == 0 means "no cap" (run all); a positive N caps to the first N cases.
     max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
-    suites_text = load_suites_text(suites, max_cases=max_cases)
+    suites_text = _with_endpoint_note(load_suites_text(suites, max_cases=max_cases),
+                                      bring_up=bring_up, endpoints=endpoints)
     strict = bool(getattr(ctx.args, "strict", False))
 
     # SECURITY: build the prompt at the ACTUAL run cwd, not sut_path. The prompt fences the
@@ -269,10 +385,12 @@ def _run_executor(ctx: ModeContext, sut_path: Path, suites: list[Path], *, exit_
     # --in-place) the agent actually runs in — building it with the user's real checkout
     # would point the un-caged agent at the real repo by absolute path (review finding). The
     # executor invokes this closure with the resolved cwd after the worktree exists.
+    stage_url = endpoints.get("stage") if bring_up == "stage" else None
+
     def _prompt_builder(run_cwd: Path) -> str:
         return build_tester_prompt(
-            kind=kind, suites_text=suites_text, sut_path=run_cwd, bring_up="local",
-            strict=strict, in_place=ctx.args.in_place,
+            kind=kind, suites_text=suites_text, sut_path=run_cwd, bring_up=bring_up,
+            stage_url=stage_url, strict=strict, in_place=ctx.args.in_place,
         )
 
     report_path = _report_path(ctx, sut_path)
@@ -286,9 +404,10 @@ def _run_executor(ctx: ModeContext, sut_path: Path, suites: list[Path], *, exit_
     # — NOT ``ctx.models`` (the shared DEFAULT panel list whose first entry is codex, which
     # would make bare `review qa` pick codex over the documented claude default — review).
     backend = resolved_tester_backend(explicit_models)
+    env_note = f", env={bring_up}" if bring_up != "local" else ""
     print(
         f"[review-cli] qa: testing SUT {sut_path} (kind={kind}, backend={backend}, "
-        f"isolation={'in-place' if ctx.args.in_place else 'worktree'}, cases<= "
+        f"isolation={'in-place' if ctx.args.in_place else 'worktree'}{env_note}, cases<= "
         f"{ctx.args.max_cases or 'all'}). Report -> {report_path}",
         file=sys.stderr, flush=True,
     )
@@ -313,6 +432,22 @@ def _run_executor(ctx: ModeContext, sut_path: Path, suites: list[Path], *, exit_
     return verdict_to_exit_code(
         outcome.verdict, findings=outcome.findings, strict=strict, exit_blocked=exit_blocked,
     )
+
+
+def _with_endpoint_note(suites_text: str, *, bring_up: str, endpoints: dict) -> str:
+    """Prepend a one-line ENDPOINT note to the suites text when the deterministic env layer
+    already brought the env up (``bring_up="none"``) and knows its base address. The tester is
+    told "the env is ready, do NOT boot anything" — without the address it would be left
+    hunting for the port (review finding). A reused stage already gets its URL via the
+    ``stage`` bring-up path; ``local`` (no env declared) has no machine-known endpoint."""
+    base = endpoints.get("base")
+    if bring_up != "none" or not base:
+        return suites_text
+    note = (
+        f"ENV ENDPOINT: the SUT env is ALREADY UP and reachable at `{base}` — drive the "
+        "cases against it; do NOT boot a second copy.\n\n"
+    )
+    return note + suites_text
 
 
 def _warn_if_dirty_worktree_run(ctx: ModeContext, sut_path: Path) -> None:
@@ -443,10 +578,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     """The qa-mode-unique arguments. The shared ``-C`` / ``-m`` / ``--pool`` / ``--timeout``
     / visual flags come from the CLI's ``_add_global_options`` / ``_add_mode_options``.
 
-    Phase 2 adds the EXECUTOR flags (``--kind``, ``--in-place``, ``--report``,
-    ``--max-cases``). The env/harness flags (``--stage-url``, ``--bring-up``, ``--config``,
-    ``--harness``, ``--keep-env``, ``--scaffold-env``, ``--out`` artifact sink) arrive with
-    their owning phases."""
+    Phase 2 added the EXECUTOR flags (``--kind``, ``--in-place``, ``--report``,
+    ``--max-cases``). Phase 3 adds the SUT-ENV flags (``--stage-url``, ``--config``,
+    ``--keep-env``) — the deterministic detect/reuse/bring-up/health-gate/teardown layer
+    (``reviewlib/qa/env.py``) that stands the env up BEFORE the executor drives it. The
+    remaining flags (``--bring-up``, ``--harness``, ``--scaffold-env``, ``--out`` artifact
+    sink) arrive with their owning phases."""
     parser.add_argument(
         "sut_path", nargs="?", default=None,
         help="path to the System-Under-Test repo/checkout (default: the -C value, else cwd)",
@@ -479,6 +616,24 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         help="cap the number of cases exercised this run (cost control). Default 1 (a "
         "cheap smoke); pass a larger N or 0 for 'no cap' to run the full suite. Negative "
         "values are rejected.",
+    )
+    parser.add_argument(
+        "--stage-url", default=None, metavar="URL",
+        help="an EXISTING stage/preview env to test against instead of booting locally. If "
+        "reachable, qa REUSES it and never tears it down (you own it). Overrides any "
+        "sut.stage in the qa config.",
+    )
+    parser.add_argument(
+        "--config", default=None, metavar="PATH",
+        help="env-harness config for the SUT bring-up (default: docs/tests/qa.yaml, relative "
+        "to the SUT). Declares the stage / compose bring-up / health gate. Absent is fine — "
+        "qa then uses a qa/setup.sh hook if present, else skips env bring-up.",
+    )
+    parser.add_argument(
+        "--keep-env", action="store_true",
+        help="on an UNHEALTHY bring-up, skip teardown and leave the env up for triage, "
+        "printing the exact manual `down` command (a reused stage is never torn down "
+        "regardless).",
     )
 
 

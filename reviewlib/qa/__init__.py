@@ -1,11 +1,13 @@
-"""qa: the write/exec agentic TESTER subsystem (Phase 2 of ``review qa``).
+"""qa: the write/exec agentic TESTER subsystem (Phases 2+3 of ``review qa``).
 
 WHAT THIS PACKAGE IS. ``reviewlib/modes/qa.py`` is the thin MODE (CLI surface + the
-no-suites gate). This package is the ENGINE behind it: the write/exec launcher that
-spawns ONE un-caged backend (claude default, codex alternate) inside an isolated
+no-suites gate). This package is the ENGINE behind it: (Phase 2) the write/exec launcher
+that spawns ONE un-caged backend (claude default, codex alternate) inside an isolated
 ``git worktree`` of the System-Under-Test, the tester SYSTEM PROMPT builder, and the
-``## QA RESULTS`` tail parser that maps the agent's evidence-backed verdict to an exit
-code. See ``docs/specs/review-qa.md`` §8/§9.
+``## QA RESULTS`` tail parser; and (Phase 3) the deterministic SUT-ENV lifecycle
+(``env.py`` + ``config.py``) that stands the env up BEFORE the executor drives it —
+stage-detect → reuse / ``qa/setup.sh`` hook / compose bring-up → health-gate → GUARANTEED
+teardown of only what this run brought up. See ``docs/specs/review-qa.md`` §7.2/§8/§9.
 
 WHY IT IS A SEPARATE PACKAGE FROM THE READ-ONLY BOARD. Every other review backend is
 read-only BY CONSTRUCTION — codex ``-s read-only``, the claude ``--disallowedTools``
@@ -21,6 +23,8 @@ returned a non-empty suite list — a write/exec agent must never spawn for an e
 """
 from __future__ import annotations
 
+from .config import QaConfigError, SutConfig, load_qa_config
+from .env import EnvError, EnvHandle, EnvMode, bring_up_env
 from .executor import (
     DirtyInPlaceError,
     QaRunOutcome,
@@ -33,9 +37,16 @@ from .executor import (
 
 __all__ = [
     "DirtyInPlaceError",
+    "EnvError",
+    "EnvHandle",
+    "EnvMode",
+    "QaConfigError",
     "QaRunOutcome",
+    "SutConfig",
     "SutIsolationError",
+    "bring_up_env",
     "build_tester_prompt",
+    "load_qa_config",
     "parse_qa_results",
     "run_tester",
     "verdict_to_exit_code",

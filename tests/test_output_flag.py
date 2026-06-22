@@ -418,7 +418,9 @@ def test_value_taking_opts_are_all_value_taking():
     brainstorm_only = {"--rounds", "--max-rounds"}
     specweb_only = {"--spec"}        # lives ONLY on the `spec-web reply` subparser
     moderator_only = {"--moderator"}  # lives on quorum / brainstorm, NOT the diff review
-    qa_only = {"--suites", "--kind", "--report", "--max-cases"}  # ONLY on the `qa` subparser (modes/qa.py)
+    # ONLY on the `qa` subparser (modes/qa.py): the Phase-2 executor flags + the Phase-3
+    # SUT-env value-taking flags (--stage-url / --config).
+    qa_only = {"--suites", "--kind", "--report", "--max-cases", "--stage-url", "--config"}
     for opt in sorted(_VALUE_TAKING_OPTS):
         if opt in ("-o", "--output"):
             continue  # handled by the pre-scan, covered by other tests

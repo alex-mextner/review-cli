@@ -491,6 +491,12 @@ _UNIT_FILES = [
     # streams a fake transcript via the same plumbing, so give it a FRESH temp log dir. The
     # LIVE-backend DoD inside this file is gated on REVIEW_QA_LIVE=1 and skips in CI.
     ("test_qa_executor.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # The Phase-3 SUT-env lifecycle: stage-reuse / setup.sh-hook bring-up / health-gate /
+    # GUARANTEED teardown (incl. on a throw + via the atexit hook) + config parsing. All
+    # deterministic — a stdlib HTTP server for stage/health, shell setup.sh hooks for
+    # bring-up/teardown, no docker, no model. The live docker-compose bring-up test inside
+    # this file is gated on REVIEW_QA_DOCKER=1 and skips in CI.
+    ("test_qa_env.py", {}),
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
