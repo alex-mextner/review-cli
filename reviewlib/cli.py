@@ -55,7 +55,7 @@ from .modes.registry import (
 )
 from .modes.review import mode_review
 from .panel import begin_call_tally, end_call_tally, pick_moderators
-from .process import _run
+from .process import _run, git_repo_env
 from .retry import max_retry_count
 from .stats import announce_eta, record_run
 
@@ -122,7 +122,8 @@ def _is_git_repo(cwd: Path) -> bool:
     rev-parse` -> `_run` forwards `timeout=` straight to subprocess.run, which raises). `_run`
     is `text=True, stdout=PIPE`, so `proc.stdout` is always a str (never None)."""
     try:
-        proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd, timeout=10)
+        proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd,
+                    env=git_repo_env(), timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0 and proc.stdout.strip().lower() == "true"
@@ -165,12 +166,18 @@ def _git_diff(cwd: Path, staged: bool) -> str:
     brainstorm / panel --diff|--staged) catch it and degrade to "". The REQUIRED review path
     is gated by `_is_git_repo` first, so the common non-repo case is handled gracefully
     there; a RARE in-repo `git diff` failure (a wedge, a corrupt repo) on that path still
-    surfaces as the RuntimeError above — a clean one-line error, not a silent wrong result."""
-    args = ["git", "diff", "--no-ext-diff"]
+    surfaces as the RuntimeError above — a clean one-line error, not a silent wrong result.
+
+    The diff is anchored to `cwd` TWICE — `git -C <cwd>` AND `env=git_repo_env()` (the repo-
+    pinning git vars stripped) — so a `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` leaked from a
+    parent (a git hook spawning `review`, a stale export) can't silently divert the diff to an
+    UNRELATED repo. Without the env strip, `git -C /repoB diff --cached` reads the env's repo,
+    not repoB — the review-gate then reviews the wrong (or empty) diff (review-cli#71)."""
+    args = ["git", "-C", str(cwd), "diff", "--no-ext-diff"]
     if staged:
         args.append("--cached")
     try:
-        proc = _run(args, cwd=cwd, timeout=120)
+        proc = _run(args, cwd=cwd, env=git_repo_env(), timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"git diff could not run: {exc}") from exc
     if proc.returncode != 0:
@@ -205,9 +212,13 @@ def _effective_cwd(raw: str, *, warn: bool = True) -> Path:
         # (just-ask / quorum / brainstorm) that must "work anywhere". So the git spawn here
         # must NEVER leak a raw traceback: a missing git binary (OSError -> FileNotFoundError)
         # or a wedged `git rev-parse` (TimeoutExpired) degrades to "review the dir as-is",
-        # exactly like a non-repo dir — same defensive catch as `_is_git_repo`.
+        # exactly like a non-repo dir — same defensive catch as `_is_git_repo`. The rev-parse
+        # is anchored to `resolved` AND runs with the repo-pinning git env stripped
+        # (git_repo_env) so a leaked GIT_DIR/GIT_WORK_TREE can't resolve the toplevel to an
+        # UNRELATED repo — the same #71 footgun the diff probe guards against.
         try:
-            proc = _run(["git", "rev-parse", "--show-toplevel"], cwd=resolved, timeout=10)
+            proc = _run(["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
+                        cwd=resolved, env=git_repo_env(), timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             proc = None
         if proc is not None and proc.returncode == 0 and proc.stdout.strip():

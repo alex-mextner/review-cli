@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .process import _run, _run_streamed, write_sidecar_log
+from .process import _run, _run_streamed, git_repo_env, write_sidecar_log
 
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
@@ -333,7 +333,8 @@ def _opencode_runs_in_repo(cwd: Path) -> bool:
     # wedged `git rev-parse` (TimeoutExpired) must degrade to "not a repo" (False), never a
     # raw traceback — same defensive catch as cli._is_git_repo.
     try:
-        proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd, timeout=10)
+        proc = _run(["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"], cwd=cwd,
+                    env=git_repo_env(), timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return False
     if not (proc.returncode == 0 and proc.stdout.strip() == "true"):
@@ -393,7 +394,10 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
     command = f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
     with tempfile.TemporaryDirectory(prefix="review-cli-opencode-") as tmp_raw:
         tmp = Path(tmp_raw)
-        _run(["git", "init", "-q"], cwd=tmp, timeout=30)
+        # Strip the repo-pinning git env (git_repo_env): a leaked GIT_DIR/GIT_WORK_TREE would
+        # make `git init` operate on the LEAKED repo instead of this isolated temp dir,
+        # defeating the read-only sandbox (review-cli#71).
+        _run(["git", "init", "-q"], cwd=tmp, env=git_repo_env(), timeout=30)
         if diff.strip():
             message = (
                 f"{prompt}\n\nYou are running outside the source repo; do not edit files. "

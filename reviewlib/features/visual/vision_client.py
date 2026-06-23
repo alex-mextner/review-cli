@@ -740,7 +740,9 @@ def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schem
         # Reuse review_opencode's READ-ONLY reviewer agent (bash/edit/write/webfetch
         # denied): the screenshot prompt is untrusted, so the model must not gain tool
         # powers. The `-f` image attach is the model's input, not a tool call.
-        backends._run(["git", "init", "-q"], cwd=tmp, timeout=30)
+        # Strip the repo-pinning git env so a leaked GIT_DIR doesn't divert this isolated
+        # sandbox `git init` to the leaked repo (review-cli#71); mirrors review_opencode.
+        backends._run(["git", "init", "-q"], cwd=tmp, env=backends.git_repo_env(), timeout=30)
         backends._ensure_opencode_readonly_agent(tmp, oc_model)
         prompt = f"{system}\n\n{_prompt_text(blocks, schema)}"
         # Message FIRST (positional), then flags: the -f array flag is greedy and would

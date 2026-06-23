@@ -516,11 +516,20 @@ exit 1
 def _write_review_stamp(cwd: Path, diff: str) -> None:
     """Record that this exact diff was reviewed, so the optional pre-commit gate
     can verify it. Uses `git rev-parse --git-path` so worktrees / pointer-file
-    .git resolve correctly. Best-effort: never breaks a review on failure."""
+    .git resolve correctly. Best-effort: never breaks a review on failure.
+
+    The rev-parse is anchored to `cwd` (`git -C`) AND runs with the repo-pinning git env
+    stripped (`git_repo_env`), matching the diff probe in cli._git_diff: a leaked
+    GIT_DIR/GIT_WORK_TREE must not write the stamp into an UNRELATED repo while the diff was
+    read from `cwd`. The stamp and the diff it stamps stay anchored to the SAME `-C` repo
+    (the #18 stamp/tool alignment, kept under the #71 env-leak fix)."""
     import hashlib
+
+    from .process import git_repo_env
     try:
         p = subprocess.run(
-            ["git", "rev-parse", "--git-path", "review-stamp"], cwd=cwd, capture_output=True, text=True
+            ["git", "-C", str(cwd), "rev-parse", "--git-path", "review-stamp"],
+            cwd=cwd, env=git_repo_env(), capture_output=True, text=True,
         )
         if p.returncode != 0:
             return

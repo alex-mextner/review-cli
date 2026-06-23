@@ -466,6 +466,7 @@ _UNIT_FILES = [
     ("test_shim_bootstrap.py", {}),
     ("test_install_shadow_warning.py", {}),
     ("test_no_git_repo.py", {}),
+    ("test_staged_diff_honors_c_repo.py", {}),
     ("test_output_flag.py", {}),
     ("test_opencode_realrepo.py", {}),
     ("test_readonly_agent.py", {}),

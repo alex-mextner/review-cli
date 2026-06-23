@@ -182,6 +182,31 @@ def _run(
     )
 
 
+# Git env vars that PIN git to a specific repository regardless of the `cwd` / `-C` it is
+# invoked with. Git itself exports these into hook/alias contexts (a pre-commit hook spawning
+# `review` inherits a GIT_DIR/GIT_INDEX_FILE pointing at the COMMITTING repo), and a stale
+# shell export carries them into any later `review`. With one set, `git -C /repoB diff
+# --cached` silently reads the env's repo (an UNRELATED worktree), not repoB — so every diff /
+# rev-parse anchored to the review's `-C` repo must run with these stripped (review-cli#71).
+_GIT_REPO_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+
+
+def git_repo_env() -> dict[str, str]:
+    """The current environment with the repo-pinning git vars REMOVED, so a git call anchored
+    via `cwd` / `-C` actually targets that repo and not one leaked through the environment.
+
+    Returns a fresh dict (never mutates `os.environ`); pass it as `env=` to `_run` for any git
+    invocation whose repo must be `cwd`/`-C`, not whatever a parent process exported."""
+    return {k: v for k, v in os.environ.items() if k not in _GIT_REPO_ENV_VARS}
+
+
 def log_dir() -> Path:
     """Predictable dir for per-call live logs (and the brainstorm discussion log)
     that an external `tail -f` can watch.
