@@ -1,0 +1,7 @@
+sut:
+  kind: bot
+  bot:
+    driver: mock                 # hermetic Tier-1 fake-Telegram driver
+    command:                     # argv that boots the bot's poller (run with TG_API_BASE -> fake)
+      - python3
+      - bot.py

@@ -211,7 +211,11 @@ _RUNBOOKS: dict[str, str] = {
         "1): a local mock Bot-API server the bot polls via `TG_API_BASE`; POST synthetic "
         "`getUpdates` and assert captured `sendMessage` calls. NEVER use the real "
         "chat/account; fail closed if the configured chat id is the real one. Per case: "
-        "send the trigger, assert the reply text/buttons/media, probe bad input."
+        "send the trigger, assert the reply text/buttons/media, probe bad input. NOTE: when "
+        "the SUT ships a `sut.bot` mock config in its qa.yaml, `review qa --kind bot` runs the "
+        "DETERMINISTIC hermetic harness (fake Telegram + inject/capture) FOR you and never "
+        "reaches this un-caged path — this runbook is the fallback for a bot WITHOUT that "
+        "config, where you must stand a mock up by hand."
     ),
 }
 

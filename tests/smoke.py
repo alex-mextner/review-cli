@@ -497,6 +497,13 @@ _UNIT_FILES = [
     # bring-up/teardown, no docker, no model. The live docker-compose bring-up test inside
     # this file is gated on REVIEW_QA_DOCKER=1 and skips in CI.
     ("test_qa_env.py", {}),
+    # The bot Tier-1 HERMETIC harness: the fake-Telegram server + suite parser + classifier
+    # units, plus the 2-fixture DoD (the good bot verdicts PASS, the buggy one FAIL with a
+    # finding) driven through the real harness (fake server + a real stdlib subprocess bot +
+    # inject/capture). Deterministic, no network/token/model; the per-case waits are shrunk via
+    # REVIEW_QA_BOT_*_TIMEOUT_S inside the file. Give it a FRESH temp log dir for consistency
+    # with the other qa-touching files.
+    ("test_qa_bot.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

@@ -575,9 +575,26 @@ Smallest shippable first; each increment is independently mergeable and adds ver
 - `gh repo create alex-mextner/vscode-playwright --private`, seed by SELECTIVE COPY from `hyperide/hyper-ext-e2e` `e2e/` (generalize `launchVSCode` settings, drop HyperIDE specifics — human curation pass), add `qa-runner.ts` + `install.sh` + a discovery skill. (Gated on the CTO curation decision.)
 - NEW `reviewlib/qa/harness.py`: discover `vscode-playwright-qa` (else `EXIT_QA_SUT_BOOT_FAILED=8`), shell to the TS runner with a JSON job; web→agent-browser, ext→Playwright/CDP. Activate the web/ext runbook + driver-selection in the prompt. `rig doctor` verifies the harness.
 
-**Increment 5 (PREREQUISITE + harness) — bot, Tier-1 hermetic only.**
-- tg-cli prerequisite PR: make the `tg` outbound sender honor `TG_API_BASE` (currently hardcoded `tg:610`).
-- Mock Bot-API compose service; SUT polls it via `TG_API_BASE` (`tg-ctl` already honors it); POST synthetic `getUpdates`, assert captured `sendMessage`; detect an un-patched sender and fail the gate with the `tg:610` pointer. Fail-closed on real `TG_CHAT_ID`. Activate the bot runbook (Tier 1).
+**Increment 5 (PREREQUISITE + harness) — bot, Tier-1 hermetic only. SHIPPED (review-cli #67).**
+- SHIPPED: an IN-PROCESS hermetic fake Telegram Bot-API server (`reviewlib/qa/bot_harness.py`,
+  stdlib `http.server`, loopback-only) instead of a compose service — it accepts
+  `getUpdates`/`sendMessage`/handshake methods, lets the driver inject synthetic updates and
+  capture outbound sends, with zero docker/network. The SUT bot is booted (the `sut.bot.command`
+  in `qa.yaml`) with `TG_API_BASE` pointed at the fake, so it long-polls the fake; the
+  DETERMINISTIC driver (`reviewlib/qa/bot_driver.py`) parses each `## Case:` block's
+  `Send:`/`Expect:`/`Expect-no:`/`Expect-silent` grammar, injects the update, captures the reply,
+  classifies PASS/FAIL, and emits the SAME `## QA RESULTS` contract the executor parser reads. A
+  POSITIVE CAPABILITY PROBE (inject + require any outbound within the window) turns an un-patched
+  sender into a LOUD BLOCKED with the `TG_API_BASE` pointer — closing the "zero sends false-pass"
+  footgun. Fail-closed on a real-looking `TG_CHAT_ID`. The 2-fixture DoD
+  (`tests/fixtures/qa/bot-{good,buggy}`) proves a good bot → PASS and a buggy bot → FAIL with a
+  finding, deterministic in normal CI. NOTE: bot Tier-1 runs DETERMINISTICALLY (no un-caged
+  agent) — the hermetic "send update → assert reply" assertion needs no write/exec agent, so it
+  stays off the agent-cage blast radius entirely.
+- The tg-cli `TG_API_BASE` outbound-sender fix is the prerequisite for testing tg-cli ITSELF as a
+  bot SUT (a bot whose sender hardcodes `api.telegram.org` is detected by the probe and BLOCKED),
+  but the harness ships independent of it — any bot whose sender honors `TG_API_BASE` is testable
+  today. Tracked as a separate tg-cli PR.
 - Tier 2 (Telethon MTProto + agent-browser Telegram Web, dedicated test account, test DC) DEFERRED behind a `requires_live_telegram` tag until credentials are provisioned.
 
 Dependencies: 2 needs 1; 3 needs 2; 4 and the tg-cli fix in 5 can start in parallel with 1–3 (separate repos). k3s, YAML-frontmatter suite schema, and N-seat parallel testers are explicitly v2.

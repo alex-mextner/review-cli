@@ -115,6 +115,37 @@ class TeardownConfig:
 
 
 @dataclass(frozen=True)
+class BotConfig:
+    """The ``sut.bot`` block — how to run a CHAT-BOT SUT hermetically (spec §7.3, Tier 1).
+
+    ``driver`` is ``mock`` (the hermetic fake-Telegram default; ``mtproto``/Tier 2 is deferred
+    to v2). ``command`` is the argv that boots the bot's poller — it is run with ``TG_API_BASE``
+    pointed at the fake, so the bot long-polls the fake instead of api.telegram.org. ``env`` is
+    extra NON-SECRET environment for the bot (a config flag, a feature toggle); secrets stay in
+    host env. ``skip_probe`` opts out of the positive capability probe ONLY for a bot that
+    legitimately never sends on the probe update (the default is to require the probe so a
+    never-reached fake fails loud instead of false-passing on zero sends)."""
+
+    driver: str = "mock"
+    command: tuple[str, ...] = ()
+    env: dict[str, str] = field(default_factory=dict)
+    skip_probe: bool = False
+
+    def __post_init__(self) -> None:
+        if self.driver not in ("mock",):
+            raise QaConfigError(
+                f"sut.bot.driver={self.driver!r} is not supported in v1 (only 'mock', the "
+                "hermetic Tier-1 fake-Telegram driver; the live MTProto Tier-2 driver is "
+                "deferred to v2)."
+            )
+        if not self.command:
+            raise QaConfigError(
+                "sut.bot.command is required for the hermetic mock bot driver — it is the argv "
+                "that boots the bot's poller (run with TG_API_BASE pointed at the fake)."
+            )
+
+
+@dataclass(frozen=True)
 class SutConfig:
     """The parsed ``sut:`` block — everything ``env.py`` needs to run the lifecycle.
 
@@ -129,6 +160,7 @@ class SutConfig:
     health: list[HealthCheck] = field(default_factory=list)
     seed: list[str] = field(default_factory=list)
     teardown: TeardownConfig = field(default_factory=TeardownConfig)
+    bot: BotConfig | None = None
 
 
 def load_qa_config(sut_path: Path, config_arg: str | None) -> SutConfig | None:
@@ -181,6 +213,7 @@ def _sut_from_mapping(sut: dict, path: Path) -> SutConfig:
         health=_healthchecks_from(sut.get("health"), path),
         seed=_str_list(sut.get("seed"), "sut.seed", path),
         teardown=_teardown_from(sut.get("teardown")),
+        bot=_bot_from(sut.get("bot"), path),
     )
 
 
@@ -251,6 +284,52 @@ def _teardown_from(block: object) -> TeardownConfig:
     if block is None or not isinstance(block, dict):
         return TeardownConfig()
     return TeardownConfig(keep_on_failure=bool(block.get("keep_on_failure", False)))
+
+
+def _bot_from(block: object, path: Path) -> BotConfig | None:
+    """Parse the ``sut.bot`` block into a ``BotConfig`` (or ``None`` when absent). ``command``
+    is a list of argv strings; ``env`` is a string->string mapping. The dataclass's own
+    ``__post_init__`` validates the driver + required command, so this only shapes the YAML."""
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise QaConfigError(f"{path}: sut.bot must be a mapping.")
+    return BotConfig(
+        driver=str(block.get("driver", "mock")),
+        command=tuple(_str_list(block.get("command"), "sut.bot.command", path)),
+        env=_str_env(block.get("env"), path),
+        skip_probe=_require_bool(block.get("skip_probe", False), "sut.bot.skip_probe", path),
+    )
+
+
+def _require_bool(val: object, label: str, path: Path) -> bool:
+    """Coerce a YAML scalar to a real ``bool`` for a SAFETY flag, rejecting the ambiguous cases
+    ``bool()`` gets wrong. ``skip_probe`` disables the unwired-sender safety net, so a typo must
+    NOT silently flip it on: ``bool("false")`` is ``True`` in Python, so a quoted
+    ``skip_probe: "false"`` would disable the probe (review finding). Accept a native YAML bool,
+    or the conventional truthy/falsy strings, and reject anything else as a clean config error."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("true", "yes", "on", "1"):
+            return True
+        if s in ("false", "no", "off", "0", ""):
+            return False
+    raise QaConfigError(
+        f"{path}: {label} must be a boolean (true/false), got {val!r}."
+    )
+
+
+def _str_env(block: object, path: Path) -> dict[str, str]:
+    """A YAML mapping coerced to a ``dict[str, str]`` (empty when absent). Used for
+    ``sut.bot.env`` — non-secret extra environment for the bot. Values are stringified so a
+    bare ``FEATURE_X: 1`` does not crash the typed access."""
+    if block is None:
+        return {}
+    if not isinstance(block, dict):
+        raise QaConfigError(f"{path}: sut.bot.env must be a mapping of string keys to values.")
+    return {str(k): str(v) for k, v in block.items()}
 
 
 def _str_list(block: object, label: str, path: Path) -> list[str]:
