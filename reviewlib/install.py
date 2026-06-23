@@ -529,7 +529,7 @@ def _write_review_stamp(cwd: Path, diff: str) -> None:
     try:
         p = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--git-path", "review-stamp"],
-            cwd=cwd, env=git_repo_env(), capture_output=True, text=True,
+            cwd=cwd, env=git_repo_env(cwd), capture_output=True, text=True,
         )
         if p.returncode != 0:
             return

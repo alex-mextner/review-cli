@@ -334,7 +334,7 @@ def _opencode_runs_in_repo(cwd: Path) -> bool:
     # raw traceback — same defensive catch as cli._is_git_repo.
     try:
         proc = _run(["git", "-C", str(cwd), "rev-parse", "--is-inside-work-tree"], cwd=cwd,
-                    env=git_repo_env(), timeout=10)
+                    env=git_repo_env(cwd), timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return False
     if not (proc.returncode == 0 and proc.stdout.strip() == "true"):
@@ -394,10 +394,11 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
     command = f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
     with tempfile.TemporaryDirectory(prefix="review-cli-opencode-") as tmp_raw:
         tmp = Path(tmp_raw)
-        # Strip the repo-pinning git env (git_repo_env): a leaked GIT_DIR/GIT_WORK_TREE would
-        # make `git init` operate on the LEAKED repo instead of this isolated temp dir,
-        # defeating the read-only sandbox (review-cli#71).
-        _run(["git", "init", "-q"], cwd=tmp, env=git_repo_env(), timeout=30)
+        # Strip the repo-pinning git env: a leaked GIT_DIR/GIT_WORK_TREE would make `git init`
+        # operate on the LEAKED repo instead of this isolated temp dir, defeating the read-only
+        # sandbox (review-cli#71). `tmp` is a fresh empty dir (not yet a repo), so git_repo_env
+        # resolves no target git dir and drops every set var — exactly the isolation wanted.
+        _run(["git", "init", "-q"], cwd=tmp, env=git_repo_env(tmp), timeout=30)
         if diff.strip():
             message = (
                 f"{prompt}\n\nYou are running outside the source repo; do not edit files. "

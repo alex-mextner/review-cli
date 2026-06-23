@@ -144,6 +144,62 @@ def test_just_ask_staged_honors_c_repo_despite_git_env_leak():
         assert "AAAAA repoA" not in diff, f"leaked repoA's diff: {diff!r}"
 
 
+def _git(path: Path, *args: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "t"
+    env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "t@t"
+    return subprocess.run(["git", "-C", str(path), *args], env=env, check=True,
+                          capture_output=True, text=True)
+
+
+def test_git_diff_preserves_target_repos_own_index_partial_commit():
+    """A LEGITIMATE pre-commit hook of the TARGET repo sets GIT_INDEX_FILE to a temporary
+    `next-index` (a `git commit <pathspec>` partial commit) that scopes `git diff --cached` to
+    ONLY the files being committed. The #71 env-strip must NOT drop that (it belongs to the
+    target repo) — else `_git_diff` reads the full default index and reviews files NOT in the
+    commit, and the stamp hash won't match the hook's own index (codex P2 on PR #72).
+
+    Build a real repo with TWO staged files, write a partial-index containing only one of them,
+    point GIT_INDEX_FILE at it (as git's partial-commit hook would), and assert `_git_diff`
+    honors that scoped index — only `keep.txt`, not `extra.txt`."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+        (repo / "keep.txt").write_text("KEEP committed file\n", encoding="utf-8")
+        (repo / "extra.txt").write_text("EXTRA not-in-this-commit\n", encoding="utf-8")
+        _git(repo, "add", "keep.txt", "extra.txt")  # both in the DEFAULT index
+        # Build a partial index containing only keep.txt, like git's `next-index` for a
+        # `git commit keep.txt`. GIT_INDEX_FILE must be RELATIVE-resolvable and belong to .git.
+        partial = repo / ".git" / "next-index-test"
+        saved_idx = os.environ.get("GIT_INDEX_FILE")
+        saved_dir = os.environ.get("GIT_DIR")
+        try:
+            # Stage ONLY keep.txt into the partial index (the `next-index` git builds for a
+            # `git commit keep.txt`), basing it on HEAD so it doesn't carry extra.txt.
+            _git_partial = dict(os.environ)
+            _git_partial["GIT_INDEX_FILE"] = str(partial)
+            subprocess.run(["git", "-C", str(repo), "read-tree", "HEAD"],
+                           env=_git_partial, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(repo), "add", "keep.txt"],
+                           env=_git_partial, check=True, capture_output=True, text=True)
+            # Now invoke _git_diff WITH the target repo's own GIT_INDEX_FILE set (the hook env).
+            os.environ["GIT_INDEX_FILE"] = str(partial)
+            os.environ["GIT_DIR"] = str((repo / ".git").resolve())
+            diff = cli._git_diff(repo, staged=True)
+        finally:
+            for k, v in (("GIT_INDEX_FILE", saved_idx), ("GIT_DIR", saved_dir)):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        assert "keep.txt" in diff, f"target repo's own partial index was dropped: {diff!r}"
+        assert "extra.txt" not in diff, (
+            f"the partial-commit index scope was lost — reviewed a file not in the commit: {diff!r}"
+        )
+
+
 if __name__ == "__main__":
     failures = 0
     for _name, _fn in list(globals().items()):

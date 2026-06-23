@@ -186,8 +186,9 @@ def _run(
 # invoked with. Git itself exports these into hook/alias contexts (a pre-commit hook spawning
 # `review` inherits a GIT_DIR/GIT_INDEX_FILE pointing at the COMMITTING repo), and a stale
 # shell export carries them into any later `review`. With one set, `git -C /repoB diff
-# --cached` silently reads the env's repo (an UNRELATED worktree), not repoB — so every diff /
-# rev-parse anchored to the review's `-C` repo must run with these stripped (review-cli#71).
+# --cached` silently reads the env's repo (an UNRELATED worktree), not repoB — so a git call
+# anchored to the review's `-C` repo must drop these when they belong to a DIFFERENT repo
+# (review-cli#71).
 _GIT_REPO_ENV_VARS = (
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -198,13 +199,69 @@ _GIT_REPO_ENV_VARS = (
 )
 
 
-def git_repo_env() -> dict[str, str]:
-    """The current environment with the repo-pinning git vars REMOVED, so a git call anchored
-    via `cwd` / `-C` actually targets that repo and not one leaked through the environment.
+def _resolve_git_dir(cwd: Path) -> Path | None:
+    """The absolute `.git` dir of the repo at `cwd`, resolved with EVERY git-repo env var
+    stripped so a leaked GIT_DIR can't answer for `cwd`. None when `cwd` is not a git repo
+    (or git is missing / wedged) — the caller then treats any set env var as foreign."""
+    stripped = {k: v for k, v in os.environ.items() if k not in _GIT_REPO_ENV_VARS}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--absolute-git-dir"],
+            cwd=str(cwd), env=stripped, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return Path(proc.stdout.strip()).resolve()
+    except OSError:
+        return None
 
-    Returns a fresh dict (never mutates `os.environ`); pass it as `env=` to `_run` for any git
-    invocation whose repo must be `cwd`/`-C`, not whatever a parent process exported."""
-    return {k: v for k, v in os.environ.items() if k not in _GIT_REPO_ENV_VARS}
+
+def git_repo_env(cwd: Path) -> dict[str, str]:
+    """The current environment with the repo-pinning git vars dropped IFF they point at a repo
+    OTHER than the one at `cwd` — so a git call anchored to `cwd`/`-C` targets that repo, not a
+    foreign repo leaked through the environment (review-cli#71).
+
+    The subtlety (codex P2 on PR #72): a LEGITIMATE pre-commit hook of the TARGET repo sets
+    GIT_DIR/GIT_INDEX_FILE pointing at THAT repo — and for a PARTIAL commit (`git commit
+    <pathspec>`) GIT_INDEX_FILE is a temporary `next-index` that scopes `git diff --cached` to
+    only the files being committed. Stripping that unconditionally would (a) widen the review to
+    files not in the commit and (b) break the stamp-hash match against the hook's own index. So
+    only FOREIGN env vars (resolving outside `cwd`'s git dir) are dropped; the target repo's own
+    hook env is preserved. When `cwd` is not a repo, every set var is treated as foreign and
+    dropped (a leak must not divert a non-repo target). Returns a fresh dict; never mutates
+    os.environ."""
+    target_git_dir = _resolve_git_dir(cwd)
+    env = dict(os.environ)
+    for var in _GIT_REPO_ENV_VARS:
+        raw = env.get(var)
+        if raw is None:
+            continue
+        if target_git_dir is None or not _path_belongs_to(raw, target_git_dir):
+            del env[var]
+    return env
+
+
+def _path_belongs_to(raw: str, git_dir: Path) -> bool:
+    """True iff the env-var path `raw` is inside (or equal to) the target repo's `.git` dir or
+    its parent work tree — i.e. it belongs to the target repo, not a foreign one. The work-tree
+    parent is included so GIT_WORK_TREE (the checkout, the .git's parent) also counts as
+    belonging. A path that does not resolve (e.g. a temp lock already gone) is treated as
+    foreign (dropped) — conservatively favouring correctness of the anchored target."""
+    try:
+        p = Path(raw).resolve()
+    except OSError:
+        return False
+    work_tree = git_dir.parent
+    for anchor in (git_dir, work_tree):
+        if p == anchor:
+            return True
+        if anchor in p.parents:
+            return True
+    return False
 
 
 def log_dir() -> Path:
