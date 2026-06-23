@@ -504,6 +504,14 @@ _UNIT_FILES = [
     # REVIEW_QA_BOT_*_TIMEOUT_S inside the file. Give it a FRESH temp log dir for consistency
     # with the other qa-touching files.
     ("test_qa_bot.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # The web Tier-1 DETERMINISTIC harness: the case-grammar parser + driver (goto/click/fill +
+    # DOM assertions) + the Playwright gate + the dev-server health gate, plus the 2-fixture DoD
+    # (the good web app verdicts PASS, the buggy one FAIL with a finding) driven through the REAL
+    # driver against the fixtures' real HTML. Deterministic, NO browser needed (the driver speaks
+    # a small PageDriver protocol an in-memory HTTP-backed fake page implements); the LIVE-browser
+    # DoD inside the file is gated on REVIEW_QA_PLAYWRIGHT=1 and SKIPs without Chromium. Give it a
+    # FRESH temp log dir for consistency with the other qa-touching files.
+    ("test_qa_web.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

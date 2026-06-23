@@ -242,6 +242,20 @@ def _handler(ctx: ModeContext) -> int:
             exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
         )
 
+    # WEB TIER-1 DETERMINISTIC FAST PATH. A web SUT with a declared `sut.web` config runs the
+    # DETERMINISTIC headless-browser harness (Playwright bring-up + drive the DOM + assert), NOT
+    # the un-caged executor: "goto -> click -> expect text/url" needs no write/exec agent, so it
+    # stays off the agent-cage blast radius (mirroring the bot path). Routed here, before
+    # _run_with_env, as a clean self-contained branch. A web SUT WITHOUT a sut.web config (or
+    # --kind not web) falls through to the normal env+executor flow, where the prose web runbook
+    # still tells an agent to drive the site by hand (the Phase-2 behavior).
+    web_route = _resolve_deterministic_web(ctx, sut_path)
+    if web_route is not None:
+        return _run_web_deterministic(
+            ctx, sut_path, suites, web_config=web_route,
+            exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
+        )
+
     return _run_with_env(
         ctx, sut_path, suites,
         exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
@@ -280,6 +294,31 @@ def _kind_is_bot(ctx: ModeContext, sut_path: Path, config: object | None) -> boo
     """Whether the effective kind is ``bot`` (uses the shared ``_resolve_kind`` so the hermetic
     routing decision and the executor's runbook selection agree on what ``sut.kind`` means)."""
     return _resolve_kind(ctx, sut_path, config) == "bot"
+
+
+def _resolve_deterministic_web(ctx: ModeContext, sut_path: Path):
+    """Return the ``WebConfig`` when this run should take the deterministic Tier-1 web path, else
+    ``None``. The path activates when the effective kind is ``web`` AND the SUT declares a
+    ``sut.web`` config — that config (its ``base_url`` + optional dev-server ``command``) is what
+    makes a deterministic headless-browser run possible. A web SUT with no such config, or any
+    other kind, returns ``None`` (the normal env+executor flow, where the prose web runbook tells
+    an un-caged agent to drive the site by hand).
+
+    Kind resolution mirrors the bot path: an explicit ``--kind`` wins; under ``--kind auto`` the
+    SUT's declared ``sut.kind`` in qa.yaml ALSO counts as web. A config-parse error is NOT
+    swallowed here — it returns ``None`` so the normal flow's ``_run_with_env`` reports the same
+    error once, in one place."""
+    from ..qa.config import QaConfigError, load_qa_config
+
+    try:
+        config = load_qa_config(sut_path, ctx.args.config)
+    except QaConfigError:
+        return None  # let _run_with_env surface the parse error once
+    if _resolve_kind(ctx, sut_path, config) != "web":
+        return None
+    if config is not None and config.web is not None and config.web.driver == "playwright":
+        return config.web
+    return None
 
 
 def _effective_kind(ctx: ModeContext, sut_path: Path) -> str:
@@ -425,6 +464,209 @@ def _write_bot_report(report_path: Path, transcript: str, *, sut_path: Path, in_
     except OSError as exc:
         print(f"[review-cli] qa: could not write bot report to {report_path}: {exc}",
               file=sys.stderr, flush=True)
+
+
+def _run_web_deterministic(
+    ctx: ModeContext, sut_path: Path, suites: list[Path], *, web_config, exit_blocked: int,
+) -> int:
+    """Drive the web Tier-1 DETERMINISTIC harness: bring the app's dev server up, health-gate it
+    reachable, open a headless Chromium page, run each case's goto/click/fill + DOM assertions,
+    classify, and map the verdict to an exit code — the SAME report-only verdict->exit mapping the
+    executor + bot driver use (a found bug is report-only; only a BLOCKED bring-up / the --strict
+    finding flip are non-zero).
+
+    Playwright is gated: when ``REVIEW_QA_PLAYWRIGHT`` is off (the default) or the browser is not
+    installed, the run is a controlled BLOCKED with the exact install command — never a crash. The
+    PURE logic (parser, action mapping, QA RESULTS emission) is unit-tested with no browser via a
+    fake page, so it still gates in normal CI.
+
+    Isolation: like every other kind, the dev server boots inside an isolated ``git worktree`` of
+    the SUT by default (so it serves the committed tree); ``--in-place`` boots it in the SUT
+    directly. The harness owns its server + browser teardown (try/finally), so no env handle is
+    needed."""
+    import sys
+
+    from ..qa.executor import (
+        DirtyInPlaceError,
+        SutIsolationError,
+        has_uncommitted_changes,
+        is_git_worktree,
+        parse_qa_results,
+        verdict_to_exit_code,
+    )
+    from ..qa.suites import load_suites_text
+    from ..qa.web_harness import playwright_available
+
+    if ctx.args.max_cases is not None and ctx.args.max_cases < 0:
+        print("[review-cli] qa: --max-cases must be >= 0 (got "
+              f"{ctx.args.max_cases}); 0 means 'no cap'.", file=sys.stderr, flush=True)
+        return 2
+    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    suite_text = load_suites_text(suites, max_cases=max_cases)
+    strict = bool(getattr(ctx.args, "strict", False))
+    report_path = _report_path(ctx, sut_path)
+
+    print(
+        f"[review-cli] qa: testing WEB SUT {sut_path} (kind=web, driver=playwright, "
+        f"base_url={web_config.base_url}, "
+        f"isolation={'in-place' if ctx.args.in_place else 'worktree'}, "
+        f"cases<= {ctx.args.max_cases or 'all'}). Report -> {report_path}",
+        file=sys.stderr, flush=True,
+    )
+    if not ctx.args.in_place and is_git_worktree(sut_path) and has_uncommitted_changes(sut_path):
+        print("[review-cli] qa: WARNING — the SUT has uncommitted changes, but the default "
+              "isolated worktree serves committed HEAD, not your working-tree edits. "
+              "Commit/stash, or use --in-place to serve the working tree.",
+              file=sys.stderr, flush=True)
+
+    # Gate the heavy Playwright dependency up front so an un-installed browser is a clear,
+    # actionable BLOCKED (with the install command) rather than a crash mid-run.
+    available, reason = playwright_available()
+    if not available:
+        return _emit_web_blocked(report_path, sut_path, web_config, reason, exit_blocked,
+                                 strict=strict, in_place=ctx.args.in_place)
+
+    try:
+        transcript = _drive_web_in_isolation(
+            sut_path=sut_path, suite_text=suite_text, web_config=web_config,
+            report_path=report_path, in_place=ctx.args.in_place, exit_blocked=exit_blocked,
+        )
+    except DirtyInPlaceError as exc:
+        print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
+        return 2
+    except SutIsolationError as exc:
+        print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
+        return exit_blocked
+
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place)
+    verdict, findings, max_sev, cases = parse_qa_results(transcript)
+    print(
+        f"[review-cli] qa: VERDICT={verdict} findings={findings}"
+        f"{f' (worst {max_sev})' if max_sev else ''}; backend=playwright-web; "
+        f"report={report_path}",
+        file=sys.stderr, flush=True,
+    )
+    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+
+
+def _emit_web_blocked(
+    report_path: Path, sut_path: Path, web_config, reason: str, exit_blocked: int,
+    *, strict: bool, in_place: bool,
+) -> int:
+    """Emit a controlled BLOCKED for a web run that cannot use a real browser (Playwright off /
+    not installed). Writes the same ``## QA RESULTS`` contract (so the report is consistent) and
+    maps BLOCKED to the boot-failed exit class. NOT a crash — the operator gets the install
+    command and a stable exit code."""
+    import sys
+
+    from ..qa.executor import parse_qa_results, verdict_to_exit_code
+    from ..qa.web_driver import WebRunResult
+
+    print(f"[review-cli] qa: web run BLOCKED — {reason}", file=sys.stderr, flush=True)
+    transcript = WebRunResult(blocked_reason=reason).to_qa_results(
+        sut_path=sut_path, base_url=web_config.base_url)
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place)
+    verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
+    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+
+
+def _drive_web_in_isolation(
+    *, sut_path: Path, suite_text: str, web_config, report_path: Path, in_place: bool,
+    exit_blocked: int,
+) -> str:
+    """Run the deterministic web test in the SUT (``--in-place``) or an isolated worktree
+    (default). Refuses ``--in-place`` over a dirty tree (consistent with the bot/executor refusal
+    — the dev server would serve the user's uncommitted state surprisingly). Returns the
+    ``## QA RESULTS`` transcript."""
+    from ..qa.executor import IsolatedSut, _guard_in_place
+
+    out_dir = _web_out_dir(report_path)
+    if in_place:
+        _guard_in_place(backend="playwright-web", in_place=True, sut_path=sut_path)
+        return _bring_up_and_drive_web(
+            cwd=sut_path, sut_path=sut_path, suite_text=suite_text, web_config=web_config,
+            out_dir=out_dir, exit_blocked=exit_blocked,
+        )
+    with IsolatedSut(sut_path) as worktree:
+        return _bring_up_and_drive_web(
+            cwd=worktree, sut_path=sut_path, suite_text=suite_text, web_config=web_config,
+            out_dir=out_dir, exit_blocked=exit_blocked,
+        )
+
+
+def _bring_up_and_drive_web(
+    *, cwd: Path, sut_path: Path, suite_text: str, web_config, out_dir: Path | None,
+    exit_blocked: int,
+) -> str:
+    """Bring the dev server up (when a ``command`` is declared), ALWAYS health-gate the target
+    reachable, then drive the suite against ``base_url`` in a headless browser — with GUARANTEED
+    server teardown. A boot failure / an unreachable target yields a BLOCKED transcript (never a
+    traceback, never a silent report-only FAIL on a down stage); the browser session itself is
+    owned by ``run_web_test``'s page factory (also try/finally)."""
+    import sys
+
+    from ..qa.web_driver import WebRunResult, run_web_test
+    from ..qa.web_harness import WebHarnessError, boot_web_server, wait_until_reachable
+
+    server = None
+    try:
+        if web_config.command:
+            try:
+                server = boot_web_server(
+                    command=list(web_config.command), cwd=cwd, extra_env=web_config.env,
+                    exit_boot_failed=exit_blocked,
+                )
+            except WebHarnessError as exc:
+                return WebRunResult(blocked_reason=str(exc)).to_qa_results(
+                    sut_path=sut_path, base_url=web_config.base_url)
+        # ALWAYS health-gate before driving — for BOTH the just-booted dev server AND the
+        # command-omitted "already-running base_url" path (README). A down target must BLOCK
+        # (infra failure, exit 8), not become a report-only navigation FAIL (exit 0) that callers
+        # can't tell from a found bug (codex PR review P1). When a server was booted, a crash
+        # tail is attached; for an already-running target the message names it as unreachable.
+        ready_url = web_config.base_url + web_config.ready_path
+        if not wait_until_reachable(
+            ready_url, timeout_s=web_config.ready_timeout_s, server=server,
+        ):
+            return WebRunResult(
+                blocked_reason=_unreachable_reason(ready_url, web_config, server),
+            ).to_qa_results(sut_path=sut_path, base_url=web_config.base_url)
+        return run_web_test(
+            suite_text=suite_text, base_url=web_config.base_url, sut_path=sut_path,
+            out_dir=out_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 — any unexpected error becomes a controlled BLOCKED
+        print(f"[review-cli] qa: web harness error: {exc}", file=sys.stderr, flush=True)
+        return WebRunResult(blocked_reason=f"unexpected web harness error: {exc}").to_qa_results(
+            sut_path=sut_path, base_url=web_config.base_url)
+    finally:
+        if server is not None:
+            server.reap()
+
+
+def _unreachable_reason(ready_url: str, web_config, server) -> str:
+    """The BLOCKED reason for a target that never answered the health gate. A just-booted dev
+    server attaches its output tail (so a boot crash is diagnosable); an already-running target
+    (no command) is named as simply unreachable — the stage/dev server the SUT pointed at is
+    down, which is infra, not a bug in the app."""
+    timeout = web_config.ready_timeout_s
+    if server is not None:
+        return (
+            f"the web dev server did not become reachable at {ready_url!r} within {timeout}s "
+            f"(it may have crashed on boot). Output tail:\n{server.output_tail()}"
+        )
+    return (
+        f"the already-running web target at {ready_url!r} (no sut.web.command — qa did NOT boot "
+        f"it) did not answer within {timeout}s. The stage / dev server the SUT points at is "
+        "down or unreachable; bring it up (or set sut.web.command so qa boots it) and re-run."
+    )
+
+
+def _web_out_dir(report_path: Path) -> Path:
+    """The directory FAIL screenshots are written to: a sibling ``<report-stem>-out/`` of the
+    report file, OUTSIDE the SUT tree (the report already lives in the log dir by default, so a
+    clean checkout stays clean). Created lazily by the screenshot writer."""
+    return report_path.with_name(report_path.stem + "-out")
 
 
 def _run_with_env(
@@ -792,7 +1034,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         help="SUT shape; drives which runbook the tester prompt activates. 'auto' (default) "
         "runs cheap stdlib detection and falls back to 'backend' when inconclusive. 'bot' with "
         "a sut.bot mock config runs the DETERMINISTIC Tier-1 hermetic harness (fake Telegram + "
-        "inject/capture, no un-caged agent, no real token/network).",
+        "inject/capture, no un-caged agent, no real token/network). 'web' with a sut.web config "
+        "runs the DETERMINISTIC Tier-1 headless-browser harness (Playwright drives the DOM + "
+        "asserts; gated behind REVIEW_QA_PLAYWRIGHT=1, no un-caged agent).",
     )
     parser.add_argument(
         "--in-place", action="store_true",
@@ -820,8 +1064,10 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "--config", default=None, metavar="PATH",
         help="env-harness config for the SUT bring-up (default: docs/tests/qa.yaml, relative "
         "to the SUT). Declares the stage / compose bring-up / health gate, OR (kind=bot) a "
-        "sut.bot mock block that drives the hermetic Tier-1 bot harness. Absent is fine — "
-        "qa then uses a qa/setup.sh hook if present, else skips env bring-up.",
+        "sut.bot mock block that drives the hermetic Tier-1 bot harness, OR (kind=web) a "
+        "sut.web block (base_url + dev-server command) that drives the deterministic Tier-1 "
+        "browser harness. Absent is fine — qa then uses a qa/setup.sh hook if present, else "
+        "skips env bring-up.",
     )
     parser.add_argument(
         "--keep-env", action="store_true",
