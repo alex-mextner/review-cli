@@ -1,0 +1,12 @@
+sut:
+  kind: web
+  web:
+    driver: playwright            # deterministic Tier-1 headless-Chromium driver
+    base_url: http://127.0.0.1:8099
+    ready_path: /index.html
+    command:                      # argv that boots the static dev server (PORT injected by the harness env)
+      - python3
+      - serve.py
+    env:
+      PORT: "8099"
+    ready_timeout_s: 20

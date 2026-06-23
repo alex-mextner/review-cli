@@ -286,6 +286,43 @@ tree with uncommitted/unknown git state (for BOTH the claude and codex seats). *
 (one tester driving one SUT; the panel/`--pool` are ignored for qa), with a **long timeout**
 default (not the short chat-panel cap) and token/wall accounting in the report.
 
+**Deterministic Tier-1 harnesses (no un-caged agent).** Two SUT shapes have a **deterministic**
+path that needs NO write/exec agent — "send input → assert output" is mechanical once the SUT is
+up, so it runs as plain Python, off the agent-cage blast radius and reproducible in CI with zero
+model spend:
+
+- **`--kind bot`** (with a `sut.bot` mock config): a hermetic fake Telegram Bot-API server. The
+  bot polls the fake via `TG_API_BASE`; the driver injects synthetic `getUpdates` and asserts the
+  captured `sendMessage` calls against each `## Case:`'s `Send:` / `Expect:` / `Expect-no:` /
+  `Expect-silent` grammar.
+- **`--kind web`** (with a `sut.web` config): a real headless browser. The harness boots the app's
+  dev server (`sut.web.command`), health-gates it reachable at `base_url`, then drives it in
+  Playwright/Chromium against each `## Case:`'s `Goto:` / `Click:` / `Fill:` / `Expect-text:` /
+  `Expect-no:` / `Expect-url:` grammar, classifying PASS/FAIL with a screenshot on failure. The
+  browser is heavy, so it is **gated behind `REVIEW_QA_PLAYWRIGHT=1`** — off (or with Chromium not
+  installed) a web run is a clear `BLOCKED` with the install command, not a crash. (Install once:
+  `pip install playwright && python -m playwright install chromium`.)
+
+```yaml
+# docs/tests/qa.yaml — web Tier-1
+sut:
+  kind: web
+  web:
+    driver: playwright
+    base_url: http://127.0.0.1:8080
+    command: [npm, run, dev]      # or any dev server; omit for an already-running base_url
+    ready_path: /
+```
+
+```bash
+REVIEW_QA_PLAYWRIGHT=1 review qa <web-sut> --kind web   # deterministic headless-browser run
+```
+
+Both emit the SAME `## QA RESULTS` contract the un-caged tester does, so the verdict→exit mapping
+is identical. Both guarantee teardown (the bot/fake, the dev server, the browser). A bot/web SUT
+WITHOUT the matching config falls back to the un-caged tester, whose prose runbook tells the agent
+to stand a mock / drive the site by hand.
+
 ---
 
 ### When to use which

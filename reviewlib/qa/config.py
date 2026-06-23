@@ -146,6 +146,49 @@ class BotConfig:
 
 
 @dataclass(frozen=True)
+class WebConfig:
+    """The ``sut.web`` block — how to run a WEB-APP SUT deterministically (spec §7.1, Tier 1).
+
+    The web Tier-1 harness brings the app up locally, health-gates it reachable, then drives it
+    in a headless browser (Playwright/Chromium) against the suite's ``Goto:``/``Click:``/… case
+    grammar — a fully deterministic "drive the DOM, assert the DOM" run that needs no un-caged
+    agent (the counterpart of the hermetic bot path).
+
+    ``driver`` is ``playwright`` (the headless-Chromium default; an agent-browser / visual Tier-2
+    driver is deferred to v2). ``command`` is the argv that boots the app's dev server (run from
+    the SUT cwd) — e.g. ``[python3, -m, http.server, 8080]`` or ``[npm, run, dev]``; omit it for a
+    SUT already reachable at ``base_url`` (a stage / already-running server). ``base_url`` is the
+    address the browser navigates to (a relative ``Goto: /login`` resolves against it); its
+    PRESENCE is what makes a hermetic run possible — without it the harness has nowhere to point
+    the browser. ``ready_path`` is the path the health gate polls for an HTTP 2xx/3xx before any
+    case runs (default ``/``). ``env`` is extra NON-SECRET environment for the dev server; secrets
+    stay in host env. ``ready_timeout_s`` bounds the health gate."""
+
+    driver: str = "playwright"
+    base_url: str = ""
+    command: tuple[str, ...] = ()
+    ready_path: str = "/"
+    env: dict[str, str] = field(default_factory=dict)
+    ready_timeout_s: int = 30
+
+    def __post_init__(self) -> None:
+        if self.driver not in ("playwright",):
+            raise QaConfigError(
+                f"sut.web.driver={self.driver!r} is not supported in v1 (only 'playwright', the "
+                "deterministic Tier-1 headless-Chromium driver; an agent-browser / visual Tier-2 "
+                "driver is deferred to v2)."
+            )
+        if not self.base_url:
+            raise QaConfigError(
+                "sut.web.base_url is required for the web driver — it is the address the headless "
+                "browser navigates to (a relative `Goto: /path` resolves against it). Set it to "
+                "the dev server's URL (e.g. http://127.0.0.1:8080)."
+            )
+        if self.ready_timeout_s <= 0:
+            raise QaConfigError("sut.web.ready_timeout_s must be > 0.")
+
+
+@dataclass(frozen=True)
 class SutConfig:
     """The parsed ``sut:`` block — everything ``env.py`` needs to run the lifecycle.
 
@@ -161,6 +204,7 @@ class SutConfig:
     seed: list[str] = field(default_factory=list)
     teardown: TeardownConfig = field(default_factory=TeardownConfig)
     bot: BotConfig | None = None
+    web: WebConfig | None = None
 
 
 def load_qa_config(sut_path: Path, config_arg: str | None) -> SutConfig | None:
@@ -214,6 +258,7 @@ def _sut_from_mapping(sut: dict, path: Path) -> SutConfig:
         seed=_str_list(sut.get("seed"), "sut.seed", path),
         teardown=_teardown_from(sut.get("teardown")),
         bot=_bot_from(sut.get("bot"), path),
+        web=_web_from(sut.get("web"), path),
     )
 
 
@@ -299,6 +344,26 @@ def _bot_from(block: object, path: Path) -> BotConfig | None:
         command=tuple(_str_list(block.get("command"), "sut.bot.command", path)),
         env=_str_env(block.get("env"), path),
         skip_probe=_require_bool(block.get("skip_probe", False), "sut.bot.skip_probe", path),
+    )
+
+
+def _web_from(block: object, path: Path) -> WebConfig | None:
+    """Parse the ``sut.web`` block into a ``WebConfig`` (or ``None`` when absent). ``command``
+    is a list of argv strings (the dev-server boot, optional); ``env`` is a string->string
+    mapping. The dataclass's own ``__post_init__`` validates the driver + required base_url, so
+    this only shapes the YAML."""
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise QaConfigError(f"{path}: sut.web must be a mapping.")
+    return WebConfig(
+        driver=str(block.get("driver", "playwright")),
+        base_url=str(block.get("base_url", "")).rstrip("/"),
+        command=tuple(_str_list(block.get("command"), "sut.web.command", path)),
+        ready_path=str(block.get("ready_path", "/")),
+        env=_str_env(block.get("env"), path),
+        ready_timeout_s=_require_int(block.get("ready_timeout_s", 30),
+                                     "sut.web.ready_timeout_s", path),
     )
 
 
