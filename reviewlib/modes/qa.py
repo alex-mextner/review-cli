@@ -228,12 +228,203 @@ def _handler(ctx: ModeContext) -> int:
     if not suites:
         return _fail_no_suites(sut_path, ctx.args.suites, exit_code=EXIT_QA_NO_SUITES)
 
+    # BOT TIER-1 HERMETIC FAST PATH. A bot SUT with a declared mock-driver `sut.bot` config runs
+    # the DETERMINISTIC hermetic harness (fake Telegram + inject/capture), NOT the un-caged
+    # executor: "send this update -> expect this reply" needs no write/exec agent and no compose
+    # env, so it stays off both the agent-cage blast radius and the env layer. Routed here, before
+    # _run_with_env, so the bot path is a clean, self-contained branch. A bot SUT WITHOUT a mock
+    # config (or --kind not bot) falls through to the normal env+executor flow, where the prose
+    # bot runbook still tells an agent to stand a mock up by hand (the Phase-2 behavior).
+    bot_route = _resolve_hermetic_bot(ctx, sut_path)
+    if bot_route is not None:
+        return _run_bot_hermetic(
+            ctx, sut_path, suites, bot_config=bot_route,
+            exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
+        )
+
     return _run_with_env(
         ctx, sut_path, suites,
         exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
         exit_no_env=EXIT_QA_NO_ENV,
         exit_unhealthy=EXIT_QA_ENV_UNHEALTHY,
     )
+
+
+def _resolve_hermetic_bot(ctx: ModeContext, sut_path: Path):
+    """Return the ``BotConfig`` when this run should take the hermetic Tier-1 bot path, else
+    ``None``. The path activates when the effective kind is ``bot`` AND the SUT declares a
+    ``sut.bot`` mock-driver config — that config is what makes a hermetic run possible (it
+    names the bot command to boot against the fake). A bot SUT with no such config, or any
+    other kind, returns ``None`` (the normal env+executor flow).
+
+    Kind resolution: an explicit ``--kind`` wins; under ``--kind auto`` the SUT's declared
+    ``sut.kind`` in qa.yaml ALSO counts as bot (not just package-marker detection) — a bot
+    configured purely via qa.yaml, with no telegram dependency marker, must still take the
+    hermetic path under the default ``auto`` rather than falling through to the un-caged backend
+    runbook (review finding). A config-parse error is NOT swallowed here — it returns ``None`` so
+    the normal flow's ``_run_with_env`` reports the same error once, in one place."""
+    from ..qa.config import QaConfigError, load_qa_config
+
+    try:
+        config = load_qa_config(sut_path, ctx.args.config)
+    except QaConfigError:
+        return None  # let _run_with_env surface the parse error once
+    if not _kind_is_bot(ctx, sut_path, config):
+        return None
+    if config is not None and config.bot is not None and config.bot.driver == "mock":
+        return config.bot
+    return None
+
+
+def _kind_is_bot(ctx: ModeContext, sut_path: Path, config: object | None) -> bool:
+    """Whether the effective kind is ``bot`` (uses the shared ``_resolve_kind`` so the hermetic
+    routing decision and the executor's runbook selection agree on what ``sut.kind`` means)."""
+    return _resolve_kind(ctx, sut_path, config) == "bot"
+
+
+def _effective_kind(ctx: ModeContext, sut_path: Path) -> str:
+    """The effective ``--kind`` for the EXECUTOR (fallback) path. Loads the SUT's qa.yaml so a
+    YAML-declared ``sut.kind`` is honored under ``--kind auto`` — otherwise a config-declared
+    plain bot with no ``sut.bot`` mock config would get the BACKEND runbook from package-marker
+    detection alone (review finding: the fallback path ignored sut.kind). A parse error falls
+    back to detection (the env layer reports the error separately)."""
+    from ..qa.config import QaConfigError, load_qa_config
+
+    try:
+        config = load_qa_config(sut_path, ctx.args.config)
+    except QaConfigError:
+        config = None
+    return _resolve_kind(ctx, sut_path, config)
+
+
+def _resolve_kind(ctx: ModeContext, sut_path: Path, config: object | None) -> str:
+    """The single source of truth for resolving the SUT kind: an explicit ``--kind`` wins;
+    under ``auto`` the config's declared ``sut.kind`` counts FIRST (qa.yaml is an explicit
+    author signal), then the cheap package-marker detection. Used by BOTH the hermetic-routing
+    decision and the executor's runbook selection so they can never disagree."""
+    if ctx.args.kind != "auto":
+        return ctx.args.kind
+    from ..qa.config import SutConfig
+
+    if isinstance(config, SutConfig) and config.kind in ("web", "ext", "backend", "bot"):
+        return config.kind
+    return _detect_kind(sut_path)
+
+
+def _run_bot_hermetic(
+    ctx: ModeContext, sut_path: Path, suites: list[Path], *, bot_config, exit_blocked: int,
+) -> int:
+    """Drive the bot Tier-1 HERMETIC harness: start the fake Telegram, boot the SUT bot against
+    it, inject/capture per case, classify, and map the verdict to an exit code — the SAME
+    report-only verdict->exit mapping the executor uses (a found bug is report-only; only a
+    BLOCKED bring-up / the --strict finding flip are non-zero).
+
+    Isolation: like every other kind, the bot boots inside an isolated ``git worktree`` of the
+    SUT by default (so it sees the committed tree, not the dirty working tree); ``--in-place``
+    boots it in the SUT directly. The hermetic driver itself owns its fake + bot teardown
+    (try/finally inside ``run_hermetic_bot_test``), so no env handle is needed."""
+    import sys
+
+    from ..qa.executor import (
+        DirtyInPlaceError,
+        SutIsolationError,
+        has_uncommitted_changes,
+        is_git_worktree,
+        parse_qa_results,
+        verdict_to_exit_code,
+    )
+    from ..qa.suites import load_suites_text
+
+    if ctx.args.max_cases is not None and ctx.args.max_cases < 0:
+        print("[review-cli] qa: --max-cases must be >= 0 (got "
+              f"{ctx.args.max_cases}); 0 means 'no cap'.", file=sys.stderr, flush=True)
+        return 2
+    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    suite_text = load_suites_text(suites, max_cases=max_cases)
+    strict = bool(getattr(ctx.args, "strict", False))
+    report_path = _report_path(ctx, sut_path)
+
+    print(
+        f"[review-cli] qa: testing BOT SUT {sut_path} (kind=bot, driver=hermetic-mock, "
+        f"isolation={'in-place' if ctx.args.in_place else 'worktree'}, "
+        f"cases<= {ctx.args.max_cases or 'all'}). Report -> {report_path}",
+        file=sys.stderr, flush=True,
+    )
+    if not ctx.args.in_place and is_git_worktree(sut_path) and has_uncommitted_changes(sut_path):
+        print("[review-cli] qa: WARNING — the SUT has uncommitted changes, but the default "
+              "isolated worktree boots the bot from committed HEAD, not your working-tree "
+              "edits. Commit/stash, or use --in-place to boot the working tree.",
+              file=sys.stderr, flush=True)
+
+    try:
+        transcript = _drive_bot_in_isolation(
+            sut_path=sut_path, suite_text=suite_text, bot_config=bot_config,
+            in_place=ctx.args.in_place, exit_blocked=exit_blocked,
+        )
+    except DirtyInPlaceError as exc:
+        print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
+        return 2
+    except SutIsolationError as exc:
+        print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
+        return exit_blocked
+
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place)
+    verdict, findings, max_sev, cases = parse_qa_results(transcript)
+    print(
+        f"[review-cli] qa: VERDICT={verdict} findings={findings}"
+        f"{f' (worst {max_sev})' if max_sev else ''}; backend=hermetic-bot; "
+        f"report={report_path}",
+        file=sys.stderr, flush=True,
+    )
+    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+
+
+def _drive_bot_in_isolation(
+    *, sut_path: Path, suite_text: str, bot_config, in_place: bool, exit_blocked: int,
+) -> str:
+    """Run the hermetic bot test in the SUT (``--in-place``) or an isolated worktree (default).
+    Refuses ``--in-place`` over a dirty tree (an un-caged-equivalent runaway guard is moot here
+    since the driver only spawns the configured bot, but a dirty in-place run still boots
+    against the user's uncommitted state surprisingly — keep it consistent with the executor's
+    refusal). Returns the ``## QA RESULTS`` transcript."""
+    from ..qa.bot_driver import run_hermetic_bot_test
+    from ..qa.executor import IsolatedSut, _guard_in_place
+
+    if in_place:
+        _guard_in_place(backend="hermetic-bot", in_place=True, sut_path=sut_path)
+        return run_hermetic_bot_test(
+            suite_text=suite_text, bot_config=bot_config, cwd=sut_path, sut_path=sut_path,
+            exit_boot_failed=exit_blocked,
+        )
+    with IsolatedSut(sut_path) as worktree:
+        return run_hermetic_bot_test(
+            suite_text=suite_text, bot_config=bot_config, cwd=worktree, sut_path=sut_path,
+            exit_boot_failed=exit_blocked,
+        )
+
+
+def _write_bot_report(report_path: Path, transcript: str, *, sut_path: Path, in_place: bool) -> None:
+    """Persist the bot run's ``## QA RESULTS`` transcript to ``--report`` (0600, mirroring the
+    executor's report write). Best-effort: a write failure is surfaced but never fails the run."""
+    import os
+    import sys
+
+    footer = (
+        f"\n\n---\n[review-cli qa] SUT: {sut_path}   backend: hermetic-bot   "
+        f"isolation: {'in-place' if in_place else 'worktree'}\n"
+    )
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(report_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(transcript + footer)
+    except OSError as exc:
+        print(f"[review-cli] qa: could not write bot report to {report_path}: {exc}",
+              file=sys.stderr, flush=True)
 
 
 def _run_with_env(
@@ -373,7 +564,7 @@ def _run_executor(
         print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
         return 2
 
-    kind = _detect_kind(sut_path) if ctx.args.kind == "auto" else ctx.args.kind
+    kind = _effective_kind(ctx, sut_path)
     # max_cases == 0 means "no cap" (run all); a positive N caps to the first N cases.
     max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
     suites_text = _with_endpoint_note(load_suites_text(suites, max_cases=max_cases),
@@ -599,7 +790,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--kind", choices=("web", "ext", "backend", "bot", "auto"), default="auto",
         help="SUT shape; drives which runbook the tester prompt activates. 'auto' (default) "
-        "runs cheap stdlib detection and falls back to 'backend' when inconclusive.",
+        "runs cheap stdlib detection and falls back to 'backend' when inconclusive. 'bot' with "
+        "a sut.bot mock config runs the DETERMINISTIC Tier-1 hermetic harness (fake Telegram + "
+        "inject/capture, no un-caged agent, no real token/network).",
     )
     parser.add_argument(
         "--in-place", action="store_true",
@@ -626,7 +819,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config", default=None, metavar="PATH",
         help="env-harness config for the SUT bring-up (default: docs/tests/qa.yaml, relative "
-        "to the SUT). Declares the stage / compose bring-up / health gate. Absent is fine — "
+        "to the SUT). Declares the stage / compose bring-up / health gate, OR (kind=bot) a "
+        "sut.bot mock block that drives the hermetic Tier-1 bot harness. Absent is fine — "
         "qa then uses a qa/setup.sh hook if present, else skips env bring-up.",
     )
     parser.add_argument(
