@@ -598,10 +598,11 @@ def _bring_up_and_drive_web(
     *, cwd: Path, sut_path: Path, suite_text: str, web_config, out_dir: Path | None,
     exit_blocked: int,
 ) -> str:
-    """Bring the dev server up (when a ``command`` is declared), health-gate it reachable, then
-    drive the suite against ``base_url`` in a headless browser — with GUARANTEED server teardown.
-    A boot failure / an unreachable server yields a BLOCKED transcript (never a traceback); the
-    browser session itself is owned by ``run_web_test``'s page factory (also try/finally)."""
+    """Bring the dev server up (when a ``command`` is declared), ALWAYS health-gate the target
+    reachable, then drive the suite against ``base_url`` in a headless browser — with GUARANTEED
+    server teardown. A boot failure / an unreachable target yields a BLOCKED transcript (never a
+    traceback, never a silent report-only FAIL on a down stage); the browser session itself is
+    owned by ``run_web_test``'s page factory (also try/finally)."""
     import sys
 
     from ..qa.web_driver import WebRunResult, run_web_test
@@ -618,16 +619,18 @@ def _bring_up_and_drive_web(
             except WebHarnessError as exc:
                 return WebRunResult(blocked_reason=str(exc)).to_qa_results(
                     sut_path=sut_path, base_url=web_config.base_url)
-            ready_url = web_config.base_url + web_config.ready_path
-            if not wait_until_reachable(
-                ready_url, timeout_s=web_config.ready_timeout_s, server=server,
-            ):
-                tail = server.output_tail()
-                return WebRunResult(blocked_reason=(
-                    f"the web dev server did not become reachable at {ready_url!r} within "
-                    f"{web_config.ready_timeout_s}s (it may have crashed on boot). Output "
-                    f"tail:\n{tail}"
-                )).to_qa_results(sut_path=sut_path, base_url=web_config.base_url)
+        # ALWAYS health-gate before driving — for BOTH the just-booted dev server AND the
+        # command-omitted "already-running base_url" path (README). A down target must BLOCK
+        # (infra failure, exit 8), not become a report-only navigation FAIL (exit 0) that callers
+        # can't tell from a found bug (codex PR review P1). When a server was booted, a crash
+        # tail is attached; for an already-running target the message names it as unreachable.
+        ready_url = web_config.base_url + web_config.ready_path
+        if not wait_until_reachable(
+            ready_url, timeout_s=web_config.ready_timeout_s, server=server,
+        ):
+            return WebRunResult(
+                blocked_reason=_unreachable_reason(ready_url, web_config, server),
+            ).to_qa_results(sut_path=sut_path, base_url=web_config.base_url)
         return run_web_test(
             suite_text=suite_text, base_url=web_config.base_url, sut_path=sut_path,
             out_dir=out_dir,
@@ -639,6 +642,24 @@ def _bring_up_and_drive_web(
     finally:
         if server is not None:
             server.reap()
+
+
+def _unreachable_reason(ready_url: str, web_config, server) -> str:
+    """The BLOCKED reason for a target that never answered the health gate. A just-booted dev
+    server attaches its output tail (so a boot crash is diagnosable); an already-running target
+    (no command) is named as simply unreachable — the stage/dev server the SUT pointed at is
+    down, which is infra, not a bug in the app."""
+    timeout = web_config.ready_timeout_s
+    if server is not None:
+        return (
+            f"the web dev server did not become reachable at {ready_url!r} within {timeout}s "
+            f"(it may have crashed on boot). Output tail:\n{server.output_tail()}"
+        )
+    return (
+        f"the already-running web target at {ready_url!r} (no sut.web.command — qa did NOT boot "
+        f"it) did not answer within {timeout}s. The stage / dev server the SUT points at is "
+        "down or unreachable; bring it up (or set sut.web.command so qa boots it) and re-run."
+    )
 
 
 def _web_out_dir(report_path: Path) -> Path:

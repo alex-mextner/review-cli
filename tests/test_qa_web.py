@@ -434,6 +434,25 @@ def test_routing_non_web_kind_does_not_take_web_path():
     assert _resolve_deterministic_web(_Ctx(_Args(kind="backend")), sut) is None
 
 
+def test_command_omitted_unreachable_target_blocks_not_fails():
+    """The command-omitted 'already-running base_url' path MUST health-gate the target first: a
+    DOWN target BLOCKS (infra, exit 8), it does NOT silently drive the browser into a report-only
+    navigation FAIL (exit 0) that callers can't tell from a found bug (codex PR review P1)."""
+    from reviewlib.modes.qa import _bring_up_and_drive_web
+    from reviewlib.qa.config import WebConfig
+
+    # No command + a base_url nothing listens on -> the gate must fail and BLOCK.
+    cfg = WebConfig(base_url="http://127.0.0.1:1", command=(), ready_path="/", ready_timeout_s=1)
+    transcript = _bring_up_and_drive_web(
+        cwd=_FIXTURES, sut_path=_FIXTURES, suite_text="## Case: x\nGoto: /\nExpect-text: hi\n",
+        web_config=cfg, out_dir=None, exit_blocked=8,
+    )
+    verdict, _findings, _sev, _cases = parse_qa_results(transcript)
+    assert verdict == "BLOCKED", transcript
+    assert "already-running" in transcript or "did not answer" in transcript
+    assert verdict_to_exit_code(verdict, findings=0, strict=False, exit_blocked=8) == 8
+
+
 # --- the 2-fixture DoD (deterministic, no browser): good -> PASS, buggy -> FAIL -------
 def _run_fixture_deterministic(name: str) -> str:
     """Drive a fixture's site through the REAL driver against a fake page backed by the fixture's
