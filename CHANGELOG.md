@@ -5,6 +5,20 @@ semantic versioning.
 
 ## Unreleased
 
+- **The `claude:claude-opus-4-8` review seat (the PRIMARY review-gate seat) now runs through
+  `claude --print` directly instead of the `claude-p` TUI-scraper, fixing a recurring corrupted/
+  empty verdict (review-cli#76).** `claude-p` spawns the interactive fullscreen `claude` under a
+  PTY and screen-scrapes the result — a lossy redraw surface: spinner frames and cursor redraws
+  smear into the captured output, and the scrape frequently fails outright (`assistant_output_
+  timeout` → empty stdout), blanking or garbling the opus seat so agents fell back to gemini/codex.
+  The CLI path now prefers `claude --print --output-format text` (genuine headless print mode — no
+  PTY, no TUI, clean stdout) and only falls back to `claude-p` when the `claude` binary is absent.
+  The child is spawned with a decoration-hostile env (`TERM=dumb` / `NO_COLOR=1` / `CI=1`), and the
+  captured verdict is run through a shared ANSI/OSC/control-sequence stripper (`strip_control_
+  sequences`, now the single source for both this path and the `-o` output file) as
+  belt-and-suspenders so a stray escape can never corrupt the parsed `## … [ok]/[needs-changes]`
+  line. Other seats and the API path are unchanged.
+
 - **GLM 5.2 via the Command Code gateway added as the priority-3 board seat (directly under
   Opus).** A new default-board seat `commandcode:zai-org/GLM-5.2` (display `GLM-cc`, role
   `performance`) sits immediately after Opus, so a plain `review diff` runs Fable, Opus,

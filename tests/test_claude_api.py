@@ -84,20 +84,27 @@ def _hdrs(req):
 
 # ---- dispatch -------------------------------------------------------------
 
+def _which_cli(cli_present: bool):
+    """A _which_optional stub: report the claude CLI binaries present-or-absent. The claude
+    dispatch + availability resolve the CLI via backends._which_optional (review-cli#76), so
+    the presence of a CLI seat is simulated here — patching the backends-local indirection,
+    NOT the stdlib shutil.which globally."""
+    def which(name):
+        if name in ("claude", "claude-p"):
+            return f"/bin/{name}" if cli_present else None
+        return None
+    return which
+
+
 def _mark_dispatch(cli_present: bool):
-    """Stub both sub-backends (return 'API'/'CLI' markers) AND claude-p presence."""
-    saved_api, saved_cli, saved_which = b.review_claude_api, b.review_claude_cli, b._which
+    """Stub both sub-backends (return 'API'/'CLI' markers) AND claude CLI presence."""
+    saved_api, saved_cli, saved_which = b.review_claude_api, b.review_claude_cli, b._which_optional
     b.review_claude_api = lambda *a, **k: ReviewResult("api", "api", 0, "API", "")
     b.review_claude_cli = lambda *a, **k: ReviewResult("cli", "cli", 0, "CLI", "")
-
-    def which(name):
-        if cli_present:
-            return "/bin/claude-p"
-        raise RuntimeError(f"{name} not found")
-    b._which = which
+    b._which_optional = _which_cli(cli_present)
 
     def restore():
-        b.review_claude_api, b.review_claude_cli, b._which = saved_api, saved_cli, saved_which
+        b.review_claude_api, b.review_claude_cli, b._which_optional = saved_api, saved_cli, saved_which
     return restore
 
 
@@ -206,43 +213,32 @@ def test_api_no_key_returns_error_not_crash():
 
 def test_backend_available_with_key_and_no_cli():
     with _Env(ANTHROPIC_API_KEY="user_x"):
-        saved = b._which
-
-        def no_cli(name):
-            raise RuntimeError(f"{name} not found")
-        b._which = no_cli
+        saved = b._which_optional
+        b._which_optional = _which_cli(cli_present=False)
         try:
             assert b.backend_available("claude:claude-opus-4-8") is True
         finally:
-            b._which = saved
+            b._which_optional = saved
 
 
 def test_backend_available_false_without_key_or_cli():
     with _Env():
-        saved = b._which
-
-        def no_cli(name):
-            raise RuntimeError(f"{name} not found")
-        b._which = no_cli
+        saved = b._which_optional
+        b._which_optional = _which_cli(cli_present=False)
         try:
             assert b.backend_available("claude:claude-opus-4-8") is False
         finally:
-            b._which = saved
+            b._which_optional = saved
 
 
 def _avail_with(cli_present, **env):
     with _Env(**env):
-        saved = b._which
-
-        def which(name):
-            if cli_present:
-                return "/bin/claude-p"
-            raise RuntimeError(f"{name} not found")
-        b._which = which
+        saved = b._which_optional
+        b._which_optional = _which_cli(cli_present)
         try:
             return b.backend_available("claude:claude-opus-4-8")
         finally:
-            b._which = saved
+            b._which_optional = saved
 
 
 def test_backend_available_mirrors_forced_mode():

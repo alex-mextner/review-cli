@@ -154,11 +154,12 @@ def test_forces_onboarding_true_on_partial_untrusted_entry():
             assert entry["hasCompletedProjectOnboarding"] is True
 
 
-def test_review_claude_does_not_trust_when_claude_p_is_missing():
-    # The binary is resolved before trust is touched, so a missing claude-p must
-    # raise WITHOUT permanently trusting the repo in the user's global config.
-    def _raise_missing(name):
-        raise RuntimeError(f"{name} not found on PATH")
+def test_review_claude_does_not_trust_when_claude_cli_is_missing():
+    # The binary is resolved before trust is touched, so a host with NEITHER `claude`
+    # nor `claude-p` must raise WITHOUT permanently trusting the repo in the user's
+    # global config. Mock backends._which_optional (the new resolution path) to report both absent.
+    def _which_none(name):
+        return None  # neither claude nor claude-p on PATH
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -168,21 +169,21 @@ def test_review_claude_does_not_trust_when_claude_p_is_missing():
             proj = tmp / "repo"
             proj.mkdir()
             before = cfg.read_text()
-            old_which = _backends._which
-            _backends._which = _raise_missing
+            old_which = _backends._which_optional
+            _backends._which_optional = _which_none
             try:
                 raised = False
                 try:
                     # CLI variant specifically: review_claude() is now a dispatcher
-                    # that can route to the API backend; the claude-p CLI path is
-                    # the one that must resolve the binary before touching trust.
+                    # that can route to the API backend; the CLI path is the one that
+                    # must resolve the binary before touching trust.
                     _backends.review_claude_cli("claude:opus", "p", "", proj, 5)
                 except RuntimeError:
                     raised = True
-                assert raised, "review_claude_cli must raise when claude-p is missing"
+                assert raised, "review_claude_cli must raise when no claude CLI is present"
             finally:
-                _backends._which = old_which
-            # No trust granted on a run that never launched claude-p.
+                _backends._which_optional = old_which
+            # No trust granted on a run that never launched the CLI.
             assert cfg.read_text() == before
 
 
