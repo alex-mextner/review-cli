@@ -1,0 +1,8 @@
+{
+  "_comment": "The DETERMINISTIC-CI fake automation reads this to mirror the BUGGY extension's observable behavior WITHOUT launching VS Code. myext.hello pushes the WRONG notification, so the smoke suite's Expect-notification: Hello / from myext both miss -> FAIL. Kept in sync with src/extension.js.",
+  "commands": {
+    "myext.hello": {
+      "notifications": ["Goodbye, cruel world"]
+    }
+  }
+}

@@ -256,6 +256,20 @@ def _handler(ctx: ModeContext) -> int:
             exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
         )
 
+    # EXT TIER-1 DETERMINISTIC FAST PATH. A VS-code-extension SUT with a declared `sut.ext` config
+    # runs the DETERMINISTIC isolated-VS-Code harness (launchVSCode-over-CDP + run command + assert
+    # window state), NOT the un-caged executor: "Command: -> Expect-notification:/editor-text/
+    # webview" needs no write/exec agent, so it stays off the agent-cage blast radius (mirroring
+    # the bot + web paths). Routed here, before _run_with_env, as a clean self-contained branch. An
+    # ext SUT WITHOUT a sut.ext config (or --kind not ext) falls through to the normal env+executor
+    # flow, where the prose ext runbook still tells an agent to drive VS Code by hand (Phase 2).
+    ext_route = _resolve_deterministic_ext(ctx, sut_path)
+    if ext_route is not None:
+        return _run_ext_deterministic(
+            ctx, sut_path, suites, ext_config=ext_route,
+            exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
+        )
+
     return _run_with_env(
         ctx, sut_path, suites,
         exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
@@ -318,6 +332,31 @@ def _resolve_deterministic_web(ctx: ModeContext, sut_path: Path):
         return None
     if config is not None and config.web is not None and config.web.driver == "playwright":
         return config.web
+    return None
+
+
+def _resolve_deterministic_ext(ctx: ModeContext, sut_path: Path):
+    """Return the ``ExtConfig`` when this run should take the deterministic Tier-1 ext path, else
+    ``None``. The path activates when the effective kind is ``ext`` AND the SUT declares a
+    ``sut.ext`` config — that config (its ``extension_path`` + ``workspace``) is what makes a
+    deterministic isolated-VS-Code run possible. An ext SUT with no such config, or any other
+    kind, returns ``None`` (the normal env+executor flow, where the prose ext runbook tells an
+    un-caged agent to drive VS Code by hand).
+
+    Kind resolution mirrors the bot + web paths: an explicit ``--kind`` wins; under ``--kind
+    auto`` the SUT's declared ``sut.kind`` in qa.yaml ALSO counts as ext. A config-parse error is
+    NOT swallowed here — it returns ``None`` so the normal flow's ``_run_with_env`` reports the
+    same error once, in one place."""
+    from ..qa.config import QaConfigError, load_qa_config
+
+    try:
+        config = load_qa_config(sut_path, ctx.args.config)
+    except QaConfigError:
+        return None  # let _run_with_env surface the parse error once
+    if _resolve_kind(ctx, sut_path, config) != "ext":
+        return None
+    if config is not None and config.ext is not None and config.ext.driver == "vscode":
+        return config.ext
     return None
 
 
@@ -667,6 +706,175 @@ def _web_out_dir(report_path: Path) -> Path:
     report file, OUTSIDE the SUT tree (the report already lives in the log dir by default, so a
     clean checkout stays clean). Created lazily by the screenshot writer."""
     return report_path.with_name(report_path.stem + "-out")
+
+
+def _run_ext_deterministic(
+    ctx: ModeContext, sut_path: Path, suites: list[Path], *, ext_config, exit_blocked: int,
+) -> int:
+    """Drive the ext Tier-1 DETERMINISTIC harness: launch an isolated VS Code with the extension
+    on ``--extensionDevelopmentPath``, connect over CDP, run each case's commands/opens + window
+    assertions (notification / editor text / webview body), classify, and map the verdict to an
+    exit code — the SAME report-only verdict->exit mapping the executor + bot + web drivers use (a
+    found bug is report-only; only a BLOCKED launch / the --strict finding flip are non-zero).
+
+    The VS Code launch is gated: when ``REVIEW_QA_VSCODE`` is off (the default) or no node/tsx
+    runtime is present, the run is a controlled BLOCKED with the exact enable/install command —
+    never a crash. The PURE logic (parser, action mapping, QA RESULTS emission) is unit-tested with
+    NO VS Code via a fake automation, so it still gates in normal CI.
+
+    Isolation: like every other kind, VS Code opens an isolated ``git worktree`` of the SUT by
+    default (so it loads the committed extension, not the dirty working tree); ``--in-place``
+    launches against the SUT directly. The harness owns its VS Code + runner teardown (try/finally),
+    so no env handle is needed."""
+    import sys
+
+    from ..qa.executor import (
+        DirtyInPlaceError,
+        SutIsolationError,
+        has_uncommitted_changes,
+        is_git_worktree,
+        parse_qa_results,
+        verdict_to_exit_code,
+    )
+    from ..qa.ext_harness import vscode_available
+    from ..qa.suites import load_suites_text
+
+    if ctx.args.max_cases is not None and ctx.args.max_cases < 0:
+        print("[review-cli] qa: --max-cases must be >= 0 (got "
+              f"{ctx.args.max_cases}); 0 means 'no cap'.", file=sys.stderr, flush=True)
+        return 2
+    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    suite_text = load_suites_text(suites, max_cases=max_cases)
+    strict = bool(getattr(ctx.args, "strict", False))
+    report_path = _report_path(ctx, sut_path)
+
+    print(
+        f"[review-cli] qa: testing EXT SUT {sut_path} (kind=ext, driver=vscode, "
+        f"extension_path={ext_config.extension_path}, "
+        f"isolation={'in-place' if ctx.args.in_place else 'worktree'}, "
+        f"cases<= {ctx.args.max_cases or 'all'}). Report -> {report_path}",
+        file=sys.stderr, flush=True,
+    )
+    if not ctx.args.in_place and is_git_worktree(sut_path) and has_uncommitted_changes(sut_path):
+        print("[review-cli] qa: WARNING — the SUT has uncommitted changes, but the default "
+              "isolated worktree loads the extension from committed HEAD, not your working-tree "
+              "edits. Commit/stash, or use --in-place to test the working tree.",
+              file=sys.stderr, flush=True)
+
+    # Gate the heavy VS Code launch up front so an un-enabled / un-installed runtime is a clear,
+    # actionable BLOCKED (with the enable/install command) rather than a crash mid-run.
+    available, reason = vscode_available()
+    if not available:
+        return _emit_ext_blocked(report_path, sut_path, ext_config, reason, exit_blocked,
+                                 strict=strict, in_place=ctx.args.in_place)
+
+    try:
+        transcript = _drive_ext_in_isolation(
+            sut_path=sut_path, suite_text=suite_text, ext_config=ext_config,
+            report_path=report_path, in_place=ctx.args.in_place, exit_blocked=exit_blocked,
+        )
+    except DirtyInPlaceError as exc:
+        print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
+        return 2
+    except SutIsolationError as exc:
+        print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
+        return exit_blocked
+
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place)
+    verdict, findings, max_sev, cases = parse_qa_results(transcript)
+    print(
+        f"[review-cli] qa: VERDICT={verdict} findings={findings}"
+        f"{f' (worst {max_sev})' if max_sev else ''}; backend=vscode-ext; "
+        f"report={report_path}",
+        file=sys.stderr, flush=True,
+    )
+    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+
+
+def _emit_ext_blocked(
+    report_path: Path, sut_path: Path, ext_config, reason: str, exit_blocked: int,
+    *, strict: bool, in_place: bool,
+) -> int:
+    """Emit a controlled BLOCKED for an ext run that cannot launch a real VS Code (REVIEW_QA_VSCODE
+    off / no node runtime). Writes the same ``## QA RESULTS`` contract (so the report is consistent)
+    and maps BLOCKED to the boot-failed exit class. NOT a crash — the operator gets the enable/
+    install command and a stable exit code."""
+    import sys
+
+    from ..qa.executor import parse_qa_results, verdict_to_exit_code
+    from ..qa.ext_driver import ExtRunResult
+
+    print(f"[review-cli] qa: ext run BLOCKED — {reason}", file=sys.stderr, flush=True)
+    transcript = ExtRunResult(blocked_reason=reason).to_qa_results(
+        sut_path=sut_path, extension_path=ext_config.extension_path)
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place)
+    verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
+    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+
+
+def _drive_ext_in_isolation(
+    *, sut_path: Path, suite_text: str, ext_config, report_path: Path, in_place: bool,
+    exit_blocked: int,
+) -> str:
+    """Run the deterministic ext test in the SUT (``--in-place``) or an isolated worktree
+    (default). Refuses ``--in-place`` over a dirty tree (consistent with the bot/web/executor
+    refusal — VS Code would load the user's uncommitted extension surprisingly). Returns the
+    ``## QA RESULTS`` transcript.
+
+    NOTE on the extension_path: it is resolved RELATIVE to the run cwd (the worktree or the SUT),
+    so the isolated run loads the committed extension from the worktree, not the user's checkout —
+    the same isolation discipline the un-caged executor uses for the agent's blast radius."""
+    from ..qa.executor import IsolatedSut, _guard_in_place
+
+    out_dir = _web_out_dir(report_path)
+    if in_place:
+        _guard_in_place(backend="vscode-ext", in_place=True, sut_path=sut_path)
+        return _launch_and_drive_ext(
+            cwd=sut_path, sut_path=sut_path, suite_text=suite_text, ext_config=ext_config,
+            out_dir=out_dir, exit_blocked=exit_blocked,
+        )
+    with IsolatedSut(sut_path) as worktree:
+        return _launch_and_drive_ext(
+            cwd=worktree, sut_path=sut_path, suite_text=suite_text, ext_config=ext_config,
+            out_dir=out_dir, exit_blocked=exit_blocked,
+        )
+
+
+def _launch_and_drive_ext(
+    *, cwd: Path, sut_path: Path, suite_text: str, ext_config, out_dir: Path | None,
+    exit_blocked: int,
+) -> str:
+    """Launch the isolated VS Code (extension on ``--extensionDevelopmentPath``), drive the suite,
+    and return the ``## QA RESULTS`` transcript — with GUARANTEED VS Code teardown (the session
+    context manager). A launch failure yields a BLOCKED transcript (never a traceback). The
+    extension_path / workspace are resolved against the actual run cwd so the isolated run loads
+    the committed extension."""
+    import sys
+
+    from ..qa.ext_driver import ExtRunResult, run_ext_test
+
+    workspace = (cwd / ext_config.workspace).resolve()
+    extension_path = str((cwd / ext_config.extension_path).resolve())
+    try:
+        return run_ext_test(
+            suite_text=suite_text, extension_path=extension_path, sut_path=sut_path,
+            out_dir=out_dir, automation_factory=_ext_automation_factory(
+                extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked),
+        )
+    except Exception as exc:  # noqa: BLE001 — any unexpected error becomes a controlled BLOCKED
+        print(f"[review-cli] qa: ext harness error: {exc}", file=sys.stderr, flush=True)
+        return ExtRunResult(blocked_reason=f"unexpected ext harness error: {exc}").to_qa_results(
+            sut_path=sut_path, extension_path=ext_config.extension_path)
+
+
+def _ext_automation_factory(*, extension_path: str, workspace: Path, exit_blocked: int):
+    """The real isolated-VS-Code automation context manager bound to this run's resolved
+    extension_path + workspace. Split out so the run cwd (worktree / SUT) is threaded into the VS
+    Code launch, mirroring how the executor builds its prompt at the actual run cwd."""
+    from ..qa.ext_harness import vscode_session
+
+    return vscode_session(
+        extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked)
 
 
 def _run_with_env(
@@ -1036,7 +1244,10 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "a sut.bot mock config runs the DETERMINISTIC Tier-1 hermetic harness (fake Telegram + "
         "inject/capture, no un-caged agent, no real token/network). 'web' with a sut.web config "
         "runs the DETERMINISTIC Tier-1 headless-browser harness (Playwright drives the DOM + "
-        "asserts; gated behind REVIEW_QA_PLAYWRIGHT=1, no un-caged agent).",
+        "asserts; gated behind REVIEW_QA_PLAYWRIGHT=1, no un-caged agent). 'ext' with a sut.ext "
+        "config runs the DETERMINISTIC Tier-1 isolated-VS-Code harness (launchVSCode-over-CDP "
+        "runs commands + asserts notification/editor-text/webview; gated behind REVIEW_QA_VSCODE=1, "
+        "no un-caged agent).",
     )
     parser.add_argument(
         "--in-place", action="store_true",
@@ -1066,8 +1277,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "to the SUT). Declares the stage / compose bring-up / health gate, OR (kind=bot) a "
         "sut.bot mock block that drives the hermetic Tier-1 bot harness, OR (kind=web) a "
         "sut.web block (base_url + dev-server command) that drives the deterministic Tier-1 "
-        "browser harness. Absent is fine — qa then uses a qa/setup.sh hook if present, else "
-        "skips env bring-up.",
+        "browser harness, OR (kind=ext) a sut.ext block (extension_path + workspace) that drives "
+        "the deterministic Tier-1 isolated-VS-Code harness. Absent is fine — qa then uses a "
+        "qa/setup.sh hook if present, else skips env bring-up.",
     )
     parser.add_argument(
         "--keep-env", action="store_true",
