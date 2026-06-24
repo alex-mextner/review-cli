@@ -1,0 +1,15 @@
+{
+  "name": "myext-good",
+  "displayName": "QA ext fixture (good)",
+  "description": "A tiny VS Code extension fixture: the myext.hello command shows a 'Hello' notification.",
+  "version": "0.0.1",
+  "publisher": "review-qa",
+  "engines": { "vscode": "^1.80.0" },
+  "main": "./src/extension.js",
+  "activationEvents": ["onCommand:myext.hello"],
+  "contributes": {
+    "commands": [
+      { "command": "myext.hello", "title": "MyExt: Hello" }
+    ]
+  }
+}

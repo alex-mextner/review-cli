@@ -1,0 +1,8 @@
+{
+  "_comment": "The DETERMINISTIC-CI fake automation reads this to mirror the live extension's observable behavior WITHOUT launching VS Code. It is kept in sync with src/extension.js so the deterministic DoD verdicts the same thing the live VS Code leg does. Each command id maps to the notification(s) it pushes, the editor text it sets, and the webview body it renders.",
+  "commands": {
+    "myext.hello": {
+      "notifications": ["Hello from myext"]
+    }
+  }
+}

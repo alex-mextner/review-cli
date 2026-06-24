@@ -1,0 +1,15 @@
+{
+  "name": "myext-buggy",
+  "displayName": "QA ext fixture (buggy)",
+  "description": "The BUGGY fixture: the myext.hello command shows the WRONG notification, so the harness verdicts FAIL.",
+  "version": "0.0.1",
+  "publisher": "review-qa",
+  "engines": { "vscode": "^1.80.0" },
+  "main": "./src/extension.js",
+  "activationEvents": ["onCommand:myext.hello"],
+  "contributes": {
+    "commands": [
+      { "command": "myext.hello", "title": "MyExt: Hello" }
+    ]
+  }
+}

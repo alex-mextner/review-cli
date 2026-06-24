@@ -1,0 +1,6 @@
+sut:
+  kind: ext
+  ext:
+    driver: vscode            # deterministic Tier-1 isolated-VS-Code-over-CDP driver
+    extension_path: .         # the SUT itself is the extension under test
+    workspace: .              # VS Code opens the SUT folder; a relative `Open:` resolves here

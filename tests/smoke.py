@@ -513,6 +513,15 @@ _UNIT_FILES = [
     # DoD inside the file is gated on REVIEW_QA_PLAYWRIGHT=1 and SKIPs without Chromium. Give it a
     # FRESH temp log dir for consistency with the other qa-touching files.
     ("test_qa_web.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # The ext (VS Code extension) Tier-1 DETERMINISTIC harness: the case-grammar parser + driver
+    # (Command/Open + notification/editor-text/webview assertions) + the VS Code gate + the JSON
+    # runner protocol, plus the 2-fixture DoD (the good extension verdicts PASS, the buggy one FAIL
+    # with a finding) driven through the REAL driver against a fake automation backed by each
+    # fixture's behavior.json. Deterministic, NO VS Code needed (the driver speaks a small
+    # ExtAutomation protocol an in-memory behavior-backed fake implements); the LIVE-VS-Code DoD
+    # inside the file is gated on REVIEW_QA_VSCODE=1 and SKIPs without node + a VS Code binary. Give
+    # it a FRESH temp log dir for consistency with the other qa-touching files.
+    ("test_qa_ext.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

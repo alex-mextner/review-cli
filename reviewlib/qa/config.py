@@ -189,6 +189,37 @@ class WebConfig:
 
 
 @dataclass(frozen=True)
+class ExtConfig:
+    """The ``sut.ext`` block — how to run a VS-CODE-EXTENSION SUT deterministically (spec §7.1,
+    Tier 1, ext kind).
+
+    The ext Tier-1 harness launches an isolated VS Code with the extension on
+    ``--extensionDevelopmentPath``, connects over CDP, then drives it against the suite's
+    ``Command:``/``Open:``/``Expect-notification:``/… case grammar — a fully deterministic "run a
+    command, assert the window state" run that needs no un-caged agent (the counterpart of the
+    hermetic bot and the deterministic web paths).
+
+    ``driver`` is ``vscode`` (the isolated-VS-Code-over-CDP default; a visual Tier-2 driver is
+    deferred to v2). ``extension_path`` is the directory passed to ``--extensionDevelopmentPath``
+    (the extension under test; default ``.`` = the SUT itself is the extension). ``workspace`` is
+    the folder VS Code opens (default ``.`` = the SUT); a relative ``Open: file`` resolves against
+    it. ``env`` is extra NON-SECRET environment for the runner; secrets stay in host env."""
+
+    driver: str = "vscode"
+    extension_path: str = "."
+    workspace: str = "."
+    env: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.driver not in ("vscode",):
+            raise QaConfigError(
+                f"sut.ext.driver={self.driver!r} is not supported in v1 (only 'vscode', the "
+                "deterministic Tier-1 isolated-VS-Code-over-CDP driver; a visual Tier-2 driver "
+                "is deferred to v2)."
+            )
+
+
+@dataclass(frozen=True)
 class SutConfig:
     """The parsed ``sut:`` block — everything ``env.py`` needs to run the lifecycle.
 
@@ -205,6 +236,7 @@ class SutConfig:
     teardown: TeardownConfig = field(default_factory=TeardownConfig)
     bot: BotConfig | None = None
     web: WebConfig | None = None
+    ext: ExtConfig | None = None
 
 
 def load_qa_config(sut_path: Path, config_arg: str | None) -> SutConfig | None:
@@ -259,6 +291,7 @@ def _sut_from_mapping(sut: dict, path: Path) -> SutConfig:
         teardown=_teardown_from(sut.get("teardown")),
         bot=_bot_from(sut.get("bot"), path),
         web=_web_from(sut.get("web"), path),
+        ext=_ext_from(sut.get("ext"), path),
     )
 
 
@@ -364,6 +397,23 @@ def _web_from(block: object, path: Path) -> WebConfig | None:
         env=_str_env(block.get("env"), path),
         ready_timeout_s=_require_int(block.get("ready_timeout_s", 30),
                                      "sut.web.ready_timeout_s", path),
+    )
+
+
+def _ext_from(block: object, path: Path) -> ExtConfig | None:
+    """Parse the ``sut.ext`` block into an ``ExtConfig`` (or ``None`` when absent). ``env`` is a
+    string->string mapping. The dataclass's own ``__post_init__`` validates the driver, so this
+    only shapes the YAML. ``extension_path`` / ``workspace`` default to ``.`` (the SUT is itself
+    the extension and the workspace)."""
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise QaConfigError(f"{path}: sut.ext must be a mapping.")
+    return ExtConfig(
+        driver=str(block.get("driver", "vscode")),
+        extension_path=str(block.get("extension_path", ".")),
+        workspace=str(block.get("workspace", ".")),
+        env=_str_env(block.get("env"), path),
     )
 
 
