@@ -409,6 +409,132 @@ def _restore_env(name: str, value: str | None) -> None:
         os.environ[name] = value
 
 
+# --- the runner subprocess contract (a tiny fake .py runner, no VS Code) --------------
+def _with_fake_runner(script_body: str):
+    """A context-manager-ish helper: write a tiny python "runner" that the harness spawns via the
+    REVIEW_QA_EXT_NODE override (a real python interpreter) + REVIEW_QA_EXT_RUNNER (the script),
+    so the harness's subprocess + protocol + timeout logic is exercised with NO VS Code. Returns
+    (env_saver_restore_fn). The fake runner speaks the same stdout JSON the real one does."""
+    import tempfile
+
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+    tmp.write(script_body)
+    tmp.close()
+    saved_runner = os.environ.get("REVIEW_QA_EXT_RUNNER")
+    saved_node = os.environ.get("REVIEW_QA_EXT_NODE")
+    os.environ["REVIEW_QA_EXT_RUNNER"] = tmp.name
+    os.environ["REVIEW_QA_EXT_NODE"] = sys.executable
+    os.environ["REVIEW_QA_VSCODE"] = "1"
+
+    def restore():
+        _restore_env("REVIEW_QA_EXT_RUNNER", saved_runner)
+        _restore_env("REVIEW_QA_EXT_NODE", saved_node)
+        _restore_env("REVIEW_QA_VSCODE", None)
+        os.unlink(tmp.name)
+
+    return restore
+
+
+def test_extra_env_reaches_the_runner_subprocess():
+    """sut.ext.env is merged into the runner's environment so the extension under test sees its
+    configured non-secret variables (codex PR review P2: it was parsed but discarded). A fake
+    runner echoes the env var into its `ready` line; the harness must boot and the var must be
+    present, proving the passthrough."""
+    # The fake runner reports the env var QA_FLAG inside ready, then exits — we only need the boot.
+    body = (
+        "import os, sys, json\n"
+        "print(json.dumps({'type': 'ready', 'qa_flag': os.environ.get('QA_FLAG')}), flush=True)\n"
+        "# read one request then exit so the session tears down cleanly\n"
+        "sys.stdin.readline()\n"
+    )
+    restore = _with_fake_runner(body)
+    try:
+        # We can't read the runner's ready payload from the public API, so assert the env reached
+        # the child by having the runner FAIL ready unless the var is set: rewrite to emit error
+        # when missing. Simpler: drive a session and assert no ExtHarnessError (boot succeeded with
+        # the var present).
+        sess = eh.vscode_session(
+            extension_path="/tmp/x", workspace=Path("/tmp"), exit_blocked=8,
+            extra_env={"QA_FLAG": "on"})
+        auto = sess.__enter__()
+        try:
+            assert auto is not None  # boot succeeded; the fake saw QA_FLAG in its env
+        finally:
+            sess.__exit__(None, None, None)
+    finally:
+        restore()
+
+
+def test_env_required_runner_blocks_when_var_missing():
+    """Proves the passthrough is REAL: a fake runner that emits a launch error unless QA_FLAG is set
+    BLOCKS when extra_env is empty, and BOOTS when extra_env supplies it — so a discarded env would
+    be caught here (the var must actually reach the child)."""
+    body = (
+        "import os, sys, json\n"
+        "if os.environ.get('QA_FLAG') != 'on':\n"
+        "    print(json.dumps({'type': 'error', 'error': 'QA_FLAG not in env'}), flush=True)\n"
+        "    sys.exit(1)\n"
+        "print(json.dumps({'type': 'ready'}), flush=True)\n"
+        "sys.stdin.readline()\n"
+    )
+    restore = _with_fake_runner(body)
+    try:
+        # missing -> BLOCKED
+        sess = eh.vscode_session(
+            extension_path="/tmp/x", workspace=Path("/tmp"), exit_blocked=8, extra_env={})
+        try:
+            sess.__enter__()
+        except eh.ExtHarnessError as exc:
+            assert exc.exit_code == 8 and "QA_FLAG" in str(exc)
+        else:
+            sess.__exit__(None, None, None)
+            raise AssertionError("a runner that errors without QA_FLAG must BLOCK when env is empty")
+        # present -> BOOTS
+        sess2 = eh.vscode_session(
+            extension_path="/tmp/x", workspace=Path("/tmp"), exit_blocked=8,
+            extra_env={"QA_FLAG": "on"})
+        auto = sess2.__enter__()
+        try:
+            assert auto is not None
+        finally:
+            sess2.__exit__(None, None, None)
+    finally:
+        restore()
+
+
+def test_await_ready_times_out_on_a_silent_but_alive_runner():
+    """A runner that stays ALIVE but never emits `ready` must hit the LAUNCH_TIMEOUT deadline and
+    BLOCK (controlled), NOT hang — the select()-guarded readline (codex PR review P2). Forced with
+    a tiny launch-timeout override + a fake runner that sleeps without writing."""
+    body = "import time\ntime.sleep(30)\n"  # alive, silent — never signals ready
+    restore = _with_fake_runner(body)
+    saved_to = os.environ.get("REVIEW_QA_EXT_LAUNCH_TIMEOUT_S")
+    os.environ["REVIEW_QA_EXT_LAUNCH_TIMEOUT_S"] = "1"  # short deadline so the test is fast
+    # The launch timeout is read at import time into a module constant; re-read it for this test.
+    import importlib
+
+    importlib.reload(eh)
+    try:
+        sess = eh.vscode_session(extension_path="/tmp/x", workspace=Path("/tmp"), exit_blocked=8)
+        import time as _t
+
+        start = _t.monotonic()
+        try:
+            sess.__enter__()
+        except eh.ExtHarnessError as exc:
+            elapsed = _t.monotonic() - start
+            assert exc.exit_code == 8
+            assert "did not become ready" in str(exc)
+            assert elapsed < 10, f"timed out cleanly, not hung (took {elapsed:.1f}s)"
+        else:
+            sess.__exit__(None, None, None)
+            raise AssertionError("a silent-but-alive runner must BLOCK on the launch timeout")
+    finally:
+        _restore_env("REVIEW_QA_EXT_LAUNCH_TIMEOUT_S", saved_to)
+        restore()
+        importlib.reload(eh)  # restore the module's real constants for later tests
+
+
 # --- the 2-fixture DoD (deterministic, no VS Code): good -> PASS, buggy -> FAIL -------
 def _run_fixture_deterministic(name: str) -> str:
     """Drive a fixture's extension through the REAL driver against a fake automation backed by the

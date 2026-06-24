@@ -40,7 +40,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -163,6 +163,11 @@ async function main(): Promise<void> {
     await workbench.waitForLoadState('domcontentloaded');
     // Let the extension host activate.
     await new Promise((r) => setTimeout(r, 2_000));
+    // Map command id -> display title from the extension's package.json contributes.commands, so
+    // run_command can drive the command palette by the TITLE it actually matches on (the palette
+    // selects by title, not id — typing a bare id can fail to invoke a contributed command;
+    // codex PR review P1). Falls back to the id when no title is declared (a built-in command).
+    const titleMap = buildCommandTitleMap(extensionPath);
     emit({ type: 'ready' });
 
     const notifications: string[] = [];
@@ -177,7 +182,7 @@ async function main(): Promise<void> {
         continue;
       }
       try {
-        const result = await handle(req, workbench, workspace, notifications);
+        const result = await handle(req, workbench, workspace, notifications, titleMap);
         emit({ id: req.id, ok: true, result });
       } catch (err) {
         emit({ id: req.id, ok: false, error: String(err) });
@@ -190,26 +195,80 @@ async function main(): Promise<void> {
   }
 }
 
+/**
+ * Build a command-id -> display-title map from the extension's package.json
+ * `contributes.commands`. The VS Code command palette matches and selects by the command's
+ * displayed TITLE (optionally `category: title`), NOT its id, so driving the palette with a bare
+ * id can silently fail to invoke a contributed command. Resolving the id to its title up front
+ * makes `Command: <id>` reliably reach the extension on the live leg.
+ */
+function buildCommandTitleMap(extensionPath: string): Map<string, string> {
+  const map = new Map<string, string>();
+  try {
+    const pkg = JSON.parse(readFileSync(join(extensionPath, 'package.json'), 'utf8'));
+    const nls = readNlsBundle(extensionPath);
+    const cmds = pkg?.contributes?.commands;
+    if (Array.isArray(cmds)) {
+      for (const c of cmds) {
+        if (!c?.command || !c?.title) continue;
+        const title = resolveNls(c.title, nls);
+        const category = c.category ? resolveNls(c.category, nls) : '';
+        // Skip an UNRESOLVED localization key (a `%nls.key%` with no package.nls.json entry) —
+        // it would never match the palette's displayed title; falling back to the id is more
+        // likely to work than typing a literal `%key%` (codex PR review P1 follow-up).
+        if (title.startsWith('%') && title.endsWith('%')) continue;
+        map.set(c.command, category ? `${category}: ${title}` : title);
+      }
+    }
+  } catch {
+    /* no package.json / no contributes — fall back to driving by id */
+  }
+  return map;
+}
+
+/** Read package.nls.json (the default-locale NLS bundle) next to the extension, or {} if absent. */
+function readNlsBundle(extensionPath: string): Record<string, string> {
+  try {
+    const raw = JSON.parse(readFileSync(join(extensionPath, 'package.nls.json'), 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Resolve a `%nls.key%` placeholder against the NLS bundle; a plain string passes through. */
+function resolveNls(value: string, nls: Record<string, string>): string {
+  if (value.startsWith('%') && value.endsWith('%')) {
+    const key = value.slice(1, -1);
+    return nls[key] ?? value; // unresolved key kept as-is so the caller can skip it
+  }
+  return value;
+}
+
 async function handle(
   req: Request,
   page: import('playwright').Page,
   workspace: string,
   notifications: string[],
+  titleMap: Map<string, string>,
 ): Promise<unknown> {
   switch (req.op) {
     case 'run_command': {
-      // Drive the command palette: open it, type the command title path is brittle, so prefer
-      // the keybinding-free `workbench.action.quickOpen` with `>command` is also brittle. Most
-      // robust over CDP: run the command via the VS Code "Run command" through the page's
-      // built-in API surface is not exposed; fall back to the command palette.
-      await runCommandViaPalette(page, req.command ?? '');
+      // Drive the command palette by the command's TITLE (resolved from the extension's
+      // package.json), falling back to the id for a built-in / untitled command. The palette
+      // matches on title, so typing the title is the reliable way to invoke a contributed command
+      // over CDP without a companion test extension (codex PR review P1).
+      const id = req.command ?? '';
+      await runCommandViaPalette(page, titleMap.get(id) ?? id);
       // Capture any notification that appeared as a result.
       await harvestNotifications(page, notifications);
       return null;
     }
     case 'open_file': {
       const abs = req.path?.startsWith('/') ? req.path : join(workspace, req.path ?? '');
-      await runCommandViaPalette(page, 'workbench.action.quickOpen');
+      // Open the Go-to-File quick open directly (Cmd/Ctrl+P), not via the command palette.
+      await page.keyboard.press('ControlOrMeta+KeyP');
+      await page.waitForTimeout(300);
       await page.keyboard.type(abs);
       await page.keyboard.press('Enter');
       await page.waitForTimeout(500);
@@ -242,15 +301,14 @@ async function handle(
   }
 }
 
-async function runCommandViaPalette(page: import('playwright').Page, commandId: string): Promise<void> {
-  if (!commandId) return;
-  // Open the command palette and run the command by its id. `>` prefixes a command search; VS
-  // Code accepts the command ID as the query for most commands, but the palette matches by
-  // TITLE, so this is best-effort for the live leg — a robust implementation would register a
-  // helper command. For the reference runner we drive the palette directly.
+async function runCommandViaPalette(page: import('playwright').Page, query: string): Promise<void> {
+  if (!query) return;
+  // Open the command palette (F1) and type the command's TITLE (resolved from package.json by the
+  // caller; falls back to the id for a built-in). The palette matches and selects on the title, so
+  // typing the title reliably invokes a contributed command; Enter runs the top match.
   await page.keyboard.press('F1');
   await page.waitForTimeout(200);
-  await page.keyboard.type(commandId);
+  await page.keyboard.type(query);
   await page.waitForTimeout(300);
   await page.keyboard.press('Enter');
   await page.waitForTimeout(500);

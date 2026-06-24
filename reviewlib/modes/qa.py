@@ -859,7 +859,8 @@ def _launch_and_drive_ext(
         return run_ext_test(
             suite_text=suite_text, extension_path=extension_path, sut_path=sut_path,
             out_dir=out_dir, automation_factory=_ext_automation_factory(
-                extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked),
+                extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked,
+                extra_env=dict(ext_config.env)),
         )
     except Exception as exc:  # noqa: BLE001 — any unexpected error becomes a controlled BLOCKED
         print(f"[review-cli] qa: ext harness error: {exc}", file=sys.stderr, flush=True)
@@ -867,14 +868,20 @@ def _launch_and_drive_ext(
             sut_path=sut_path, extension_path=ext_config.extension_path)
 
 
-def _ext_automation_factory(*, extension_path: str, workspace: Path, exit_blocked: int):
+def _ext_automation_factory(
+    *, extension_path: str, workspace: Path, exit_blocked: int,
+    extra_env: dict[str, str] | None = None,
+):
     """The real isolated-VS-Code automation context manager bound to this run's resolved
     extension_path + workspace. Split out so the run cwd (worktree / SUT) is threaded into the VS
-    Code launch, mirroring how the executor builds its prompt at the actual run cwd."""
+    Code launch, mirroring how the executor builds its prompt at the actual run cwd. ``extra_env``
+    is the SUT's declared NON-SECRET sut.ext.env, passed through so the extension under test sees
+    its configured variables (codex PR review P2)."""
     from ..qa.ext_harness import vscode_session
 
     return vscode_session(
-        extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked)
+        extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked,
+        extra_env=extra_env)
 
 
 def _run_with_env(

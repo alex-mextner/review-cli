@@ -333,10 +333,14 @@ class _VSCodeSession:
     whole VS Code tree is reaped — an ext run leaks no Electron process. A launch failure (the
     runner never signals ``ready``) raises ``ExtHarnessError`` (a controlled BLOCKED)."""
 
-    def __init__(self, *, extension_path: str, workspace: Path, exit_blocked: int):
+    def __init__(
+        self, *, extension_path: str, workspace: Path, exit_blocked: int,
+        extra_env: dict[str, str] | None = None,
+    ):
         self._extension_path = extension_path
         self._workspace = workspace
         self._exit_blocked = exit_blocked
+        self._extra_env = extra_env or {}
         self._proc: subprocess.Popen | None = None
         self._stderr_tail: _StderrTail | None = None
 
@@ -354,7 +358,14 @@ class _VSCodeSession:
                 exit_code=self._exit_blocked,
             )
         env = dict(os.environ)
-        # Reuse the proven EXTENSION_PATH convention the e2e harness keys on.
+        # The SUT's declared NON-SECRET sut.ext.env (a feature flag, a config toggle) must reach
+        # the extension under test — without it a configured SUT's activation / command assertions
+        # would run with the wrong environment (codex PR review P2: env was parsed but discarded,
+        # unlike the web path which passes web_config.env). Secrets stay in host env (inherited via
+        # os.environ above), so the SUT-declared map only ADDS non-secret config.
+        env.update(self._extra_env)
+        # Reuse the proven EXTENSION_PATH convention the e2e harness keys on. Set AFTER the SUT env
+        # so a SUT cannot accidentally override the extension-under-test path.
         env["EXTENSION_PATH"] = self._extension_path
         try:
             self._proc = subprocess.Popen(  # noqa: S603 — runtime + script resolved above
@@ -386,7 +397,14 @@ class _VSCodeSession:
                     f"stderr tail:\n{self._stderr_tail.text()}",
                     exit_code=self._exit_blocked,
                 )
-            line = stdout.readline() if stdout is not None else ""
+            # select() so a runner that stays ALIVE but emits no stdout before `ready` (a wedged
+            # VS Code launch, a custom REVIEW_QA_EXT_RUNNER that hangs) cannot block ``readline``
+            # past the deadline — without this the LAUNCH_TIMEOUT_S check would never be reached on
+            # a silent-but-alive runner (the case poll() does NOT catch), so `review qa` would hang
+            # instead of a controlled BLOCKED + process-group teardown (codex PR review P2).
+            if stdout is None or not select.select([stdout], [], [], 0.05)[0]:
+                continue
+            line = stdout.readline()
             if not line:
                 time.sleep(0.05)
                 continue
@@ -428,12 +446,18 @@ class _VSCodeSession:
         _terminate_group(proc)
 
 
-def vscode_session(*, extension_path: str, workspace: Path, exit_blocked: int) -> _VSCodeSession:
+def vscode_session(
+    *, extension_path: str, workspace: Path, exit_blocked: int,
+    extra_env: dict[str, str] | None = None,
+) -> _VSCodeSession:
     """A context manager yielding a real ``ShellRunnerAutomation`` and guaranteeing VS Code
-    teardown. Call ``vscode_available()`` FIRST — this assumes the runtime is present (it is only
-    reached on the real path)."""
+    teardown. ``extra_env`` is the SUT's declared NON-SECRET ``sut.ext.env`` map, merged into the
+    runner's environment so the extension under test sees its configured variables. Call
+    ``vscode_available()`` FIRST — this assumes the runtime is present (it is only reached on the
+    real path)."""
     return _VSCodeSession(
-        extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked)
+        extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked,
+        extra_env=extra_env)
 
 
 # --- process-group reaping (mirrors web_harness; shared shape) -------------------------
