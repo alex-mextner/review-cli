@@ -12,7 +12,6 @@ import argparse
 import contextlib
 import io
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -55,7 +54,7 @@ from .modes.registry import (
 )
 from .modes.review import mode_review
 from .panel import begin_call_tally, end_call_tally, pick_moderators
-from .process import _run, git_repo_env
+from .process import _run, git_repo_env, strip_control_sequences
 from .retry import max_retry_count
 from .stats import announce_eta, record_run
 
@@ -879,18 +878,6 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
     return out, rest
 
 
-# Strip ANSI/VT100 escape sequences from the captured text before it lands in the `-o`
-# file. review-cli emits plain text today, but a backend's passed-through output (or
-# future coloured formatting on a TTY — the tee delegates isatty to the real stdout)
-# could carry escapes; the saved file must stay clean markdown regardless, while the
-# LIVE stream keeps whatever it had. Covers both CSI sequences (`\x1b[ … m`, colours /
-# cursor moves) and OSC sequences (`\x1b] … BEL/ST`, e.g. hyperlinks / window titles).
-_ANSI_ESCAPE_RE = re.compile(
-    r"\x1b\[[0-9;?]*[ -/]*[@-~]"        # CSI: ESC [ … final-byte
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: ESC ] … (BEL | ST)
-)
-
-
 def _write_output_file(path: Path, text: str) -> None:
     """Persist captured stdout to `path` via Python `open(...,"w")` — which bypasses
     the shell entirely, so it NEVER trips zsh `noclobber` the way `review … > FILE`
@@ -899,7 +886,7 @@ def _write_output_file(path: Path, text: str) -> None:
     an existing file is overwritten (that is the point). A bad path raises a clear
     OSError that the caller turns into a non-zero exit with an actionable message."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_ANSI_ESCAPE_RE.sub("", text), encoding="utf-8")
+    path.write_text(strip_control_sequences(text), encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:

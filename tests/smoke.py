@@ -460,6 +460,7 @@ _UNIT_FILES = [
     ("test_dashboard_service.py", {}),
     ("test_dashboard.py", {}),
     ("test_streaming.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    ("test_claude_seat_robust.py", {}),
     ("test_workspace_trust.py", {}),
     ("test_moderator.py", {}),
     ("test_cwd.py", {}),

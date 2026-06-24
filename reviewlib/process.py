@@ -9,12 +9,44 @@ from __future__ import annotations
 
 import codecs
 import os
+import re
 import signal
 import subprocess
 import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Single source of truth for stripping terminal control noise out of captured
+# backend output. A backend can leak ANSI/VT100 escapes into its stdout — colour
+# codes, cursor moves, OSC hyperlinks — and an interactive-TUI-scraper backend (the
+# `claude` seat historically ran through `claude-p`, which drives the fullscreen
+# `claude` TUI under a PTY and screen-scrapes it) can additionally bleed spinner
+# redraws and bare C0 control bytes into the pipe. Either corrupts the parsed
+# `## <model> [ok]/[needs-changes]` verdict, so the captured text is sanitised before
+# it reaches the verdict pipeline AND the `-o` output file. cli._ANSI_ESCAPE_RE
+# (output-file path) and the claude backend both delegate here so the rules never drift.
+_CSI_OSC_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"          # CSI: ESC [ … final-byte (colours / cursor moves)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: ESC ] … (BEL | ST) (hyperlinks / titles)
+    r"|\x1b[ -/]*[@-~]"                    # other 2+-byte ESC seqs incl. ESC c (RIS), ESC M
+)
+# C0 control chars to drop after CSI/OSC removal — everything below 0x20 (plus DEL)
+# EXCEPT newline (\n) and tab (\t), the whitespace that carries real verdict structure.
+# Carriage return (\r) IS dropped: in a TUI-scraper transcript it is the line-OVERWRITE
+# byte, so a stray CR could splice an old redraw fragment into a verdict line — we never
+# want carriage-return overwrite semantics in parsed text, only the resulting characters.
+_C0_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # 0x00–0x1F minus \t (0x09) & \n (0x0A), plus 0x7F
+
+
+def strip_control_sequences(text: str) -> str:
+    """Remove ANSI/OSC escape sequences and stray C0 control bytes from `text`.
+
+    Belt-and-suspenders against terminal noise (colours, cursor moves, TUI spinner
+    redraws) corrupting a parsed verdict. Keeps newlines and tabs so line structure
+    survives; drops carriage returns (the TUI line-overwrite byte). Idempotent and safe
+    on text that has no control bytes."""
+    return _C0_CONTROL_RE.sub("", _CSI_OSC_RE.sub("", text))
 
 # ── memory-aware concurrency cap (board resilience under swarm load, review-cli#65) ───────
 # Each heavy backend (codex / claude / opencode) spawns a model-runner subprocess, and a

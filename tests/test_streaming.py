@@ -308,73 +308,82 @@ def test_log_file_is_private():
     assert mode & 0o077 == 0, f"log file is group/other-readable (mode {oct(mode)})"
 
 
-def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
-    captured: dict[str, list[str]] = {}
-    # review_claude resolves `_which` / `_run_streamed` from the reviewlib.backends
-    # module namespace, so patch THAT module (not the façade) for the override to bite.
-    old_which = review_backends._which
+_CLAUDE_READONLY_TOOLS = (
+    "Edit", "MultiEdit", "Write", "Bash", "Read", "Grep", "Glob", "NotebookEdit",
+    "SlashCommand", "Task", "TodoWrite", "ExitPlanMode", "WebFetch", "WebSearch",
+)
+
+
+def _run_claude_cli_capture(which_fn):
+    """Drive review_claude_cli with the backend boundary stubbed and the binary resolver
+    (`backends._which_optional`) forced by `which_fn`, returning the captured argv/kwargs.
+    Restores all globals."""
+    captured: dict[str, object] = {}
+    old_which = review_backends._which_optional
     old_run_streamed = review_backends._run_streamed
     old_trust = review_backends._ensure_workspace_trusted
 
-    def fake_which(name: str) -> str:
-        assert name == "claude-p"
-        return "/bin/claude-p"
-
-    def fake_run_streamed(argv: list[str], **kwargs):
+    def fake_run_streamed(argv, **kwargs):
         captured["argv"] = argv
         captured["kwargs"] = kwargs
         return review.subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
     try:
-        review_backends._which = fake_which
+        review_backends._which_optional = which_fn
         review_backends._run_streamed = fake_run_streamed
-        # Stub the auto-trust helper: it writes ~/.claude.json, and this unit
-        # test must not touch the real developer/CI config (cwd here is REPO_ROOT).
+        # Stub auto-trust: it writes ~/.claude.json; this unit test must not touch the
+        # real developer/CI config (cwd here is REPO_ROOT).
         review_backends._ensure_workspace_trusted = lambda _cwd: None
-        # Target the CLI variant directly: review_claude() is now a dispatcher that
-        # routes to the API backend when a key is configured, so calling it here
-        # would be env-dependent. This test pins the claude-p argv specifically.
+        # Target the CLI variant directly: review_claude() is a dispatcher that routes
+        # to the API backend when a key is configured, so calling it would be env-dependent.
         result = review_backends.review_claude_cli("claude:opus", "prompt", "diff", REPO_ROOT, 10)
     finally:
-        review_backends._which = old_which
+        review_backends._which_optional = old_which
         review_backends._run_streamed = old_run_streamed
         review_backends._ensure_workspace_trusted = old_trust
+    captured["result"] = result
+    return captured
 
-    assert result.returncode == 0
-    argv = captured["argv"]
+
+def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
+    # Default path: the real `claude` binary in genuine print mode (no PTY/TUI scrape).
+    cap = _run_claude_cli_capture(lambda name: "/bin/claude" if name == "claude" else None)
+    assert cap["result"].returncode == 0
+    argv = cap["argv"]
+    # Genuine headless print mode — no fullscreen TUI to bleed into the captured pipe.
+    assert "--print" in argv
+    assert argv[argv.index("--output-format") + 1] == "text"
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
-    assert "--tools" in argv
+    # Read-only via an EMPTY tool allowlist (all built-in tools off) — stronger and more
+    # future-proof than a denylist, and it avoids real `claude` warning on claude-p tool names.
     assert argv[argv.index("--tools") + 1] == ""
+    assert "--disallowedTools" not in argv  # the empty allowlist already forbids everything
     assert "--strict-mcp-config" in argv
     assert "--disable-slash-commands" in argv
     assert "--safe-mode" in argv
     assert "--append-system-prompt" in argv
     assert "Do not use tools" in argv[argv.index("--append-system-prompt") + 1]
-    blocked = argv[argv.index("--disallowedTools") + 1 : argv.index("--timeout-sec")]
-    for tool in (
-        "Edit",
-        "MultiEdit",
-        "Write",
-        "Bash",
-        "Read",
-        "Grep",
-        "Glob",
-        "NotebookEdit",
-        "SlashCommand",
-        "Task",
-        "TodoWrite",
-        "ExitPlanMode",
-        "WebFetch",
-        "WebSearch",
-    ):
-        assert tool in blocked
     assert argv[argv.index("--model") + 1] == "opus"
-    # The payload is fed over STDIN, not a `-p <payload>` argv arg: a brainstorm
-    # round's growing transcript (or a big diff) as a command-line argument blows
-    # past ARG_MAX → execve E2BIG → the call dies with no output. `-p` stays the
-    # trailing print flag; the prompt arrives via input_text (stdin).
+    # The decoration-hostile env is wired so no renderer emits colour/cursor noise.
+    assert cap["kwargs"]["env"]["TERM"] == "dumb"
+    # The payload is fed over STDIN, not a `-p <payload>` argv arg: a brainstorm round's
+    # growing transcript (or a big diff) as an argument blows past ARG_MAX → execve E2BIG.
+    assert cap["kwargs"]["input_text"] == "prompt\n\n```diff\ndiff\n```"
+
+
+def test_claude_backend_falls_back_to_claude_p_when_claude_absent():
+    # A host that ships only the legacy `claude-p` TUI-scraper still gets a working seat,
+    # with its wrapper-specific surface (--cwd / --tools '' / --timeout-sec / -p) intact.
+    cap = _run_claude_cli_capture(lambda name: "/bin/claude-p" if name == "claude-p" else None)
+    assert cap["result"].returncode == 0
+    argv = cap["argv"]
+    assert "--print" not in argv  # claude-p has no --print
+    assert argv[argv.index("--tools") + 1] == ""
+    assert "--timeout-sec" in argv
     assert argv[-1] == "-p"
-    assert captured["kwargs"]["input_text"] == "prompt\n\n```diff\ndiff\n```"
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    for tool in _CLAUDE_READONLY_TOOLS:
+        assert tool in argv
 
 
 def test_run_streamed_feeds_large_input_over_stdin_without_deadlock():
@@ -391,6 +400,25 @@ def test_run_streamed_feeds_large_input_over_stdin_without_deadlock():
         proc = review._run_streamed(["cat"], cwd=Path(tmp), input_text=payload, timeout=30)
     assert proc.returncode == 0
     assert proc.stdout == payload
+
+
+def test_run_streamed_forwards_env_to_the_child_process():
+    """The REAL _run_streamed (not a stub) must pass `env` through to the child — else the
+    claude seat's decoration-hostile env (TERM=dumb/NO_COLOR=1/CI=1) is silently a no-op.
+    This pins the contract review_claude_cli relies on (review-cli#76), on the genuine
+    function, by reading an env var BACK out of the child's stdout."""
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["REVIEW_LOG_DIR"] = tmp
+        child_env = {**os.environ, "TERM": "dumb", "REVIEW_ENV_PROBE": "probe-value-42"}
+        proc = review._run_streamed(
+            ["sh", "-c", "printf '%s|%s' \"$TERM\" \"$REVIEW_ENV_PROBE\""],
+            cwd=Path(tmp), env=child_env, timeout=30,
+        )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "dumb|probe-value-42", proc.stdout
 
 
 def test_log_dir_uses_os_standard_locations():
