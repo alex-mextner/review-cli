@@ -370,18 +370,129 @@ class BoardConfigError(ValueError):
     must get a clear error, not an unexpected 8-model paid run (cost-safety)."""
 
 
+def _resolve_capability_model(spec: str) -> str | None:
+    """Resolve a board entry's `capability:` value to a concrete review-cli seat from the
+    shared `models.yaml` manifest, or `None` when it can't be resolved (no manifest on this
+    host / unknown capability / role with no review-cli route).
+
+    Two forms, both ADDITIVE to the literal `model:` form:
+      * `capability: role:reasoning` (or any `roles:` key — architect/vision/code/fast) ->
+        the manifest's `roles:` map resolves the symbolic lens to a concrete pinned id;
+      * `capability: vision` (a bare capability tag) -> the strongest manifest entry carrying
+        that tag.
+
+    The manifest is the ecosystem source of truth (rig-cli#8); when it isn't reachable this
+    returns `None` and the caller skips the entry with a warning — the board keeps working off
+    its literal-`model:` entries / the hardcoded DEFAULT_BOARD, never a crash."""
+    from . import manifest as _manifest
+
+    spec = spec.strip()
+    if spec.startswith("role:"):
+        return _manifest.resolve_role(spec[len("role:"):].strip())
+    return _manifest.resolve_capability(spec)
+
+
+def _matching_role_name(spec: str, manifest_mod) -> str | None:
+    """The CANONICAL manifest role name a bare `capability:` value names (case-insensitive), or
+    `None` when it isn't a role name. A `role:`-prefixed spec is not a bare-capability collision,
+    so it returns None. Returns the manifest's own casing so a hint/lookup never dead-ends on a
+    case mismatch (`Vision` -> `vision`)."""
+    if spec.startswith("role:"):
+        return None
+    lowered = spec.lower()
+    for name in manifest_mod.role_names():
+        if name.lower() == lowered:
+            return name
+    return None
+
+
+def _capability_fail_reason(capability: str) -> str:
+    """A clear reason string for an unresolved `capability:` entry. The common footgun is a
+    BARE value that is a ROLE name (`reasoning`/`architect`/`fast`) rather than a capability
+    TAG — the two namespaces overlap, so `capability: reasoning` scans tags (not the `roles:`
+    map) and `capability: architect` resolves to nothing. Detect that and hint `role:<x>`."""
+    from . import manifest as _manifest
+
+    spec = capability.strip()
+    # Only hint `role:<x>` when the value is PURELY a role name — NOT a real capability tag.
+    # `vision`/`reasoning`/`code` are BOTH tags and roles; if `capability: vision` failed it's
+    # because no model carries the tag (a manifest gap), so claiming "vision is a ROLE name, not
+    # a tag" would be factually wrong. A pure role (`architect`/`fast`) genuinely isn't a tag.
+    if spec.lower() not in _manifest.KNOWN_CAPABILITIES:
+        role_match = _matching_role_name(spec, _manifest)
+        if role_match is not None:
+            # Suggest the role's CANONICAL casing (the manifest key), so the hint never dead-ends
+            # on a case mismatch (`capability: Architect` -> hint `role:architect`, which resolves).
+            return (f"capability {spec!r} is a ROLE name, not a capability tag — write "
+                    f"'capability: role:{role_match}' to use the manifest's role map")
+    return (f"capability {spec!r} could not be resolved from the model manifest "
+            "(unknown capability tag / no model carries the tag / unknown role / no manifest "
+            "reachable — is agent-tools lib/contracts/models.yaml present?)")
+
+
+def _resolve_entry_model(entry: dict) -> str | None:
+    """The concrete seat string for one board entry, from EITHER a literal `model:` or a
+    manifest-resolved `capability:` (mutually exclusive; `model:` wins if both are present).
+    Returns `None` (with a warning) when neither yields a usable seat, so the caller skips
+    the entry — the board degrades, never crashes."""
+    model = entry.get("model")
+    if isinstance(model, str) and model.strip():
+        return _expand_alias(model.strip())
+    capability = entry.get("capability")
+    if isinstance(capability, str) and capability.strip():
+        resolved = _resolve_capability_model(capability)
+        if resolved is None:
+            print(f"[review-cli] board entry ignored ({_capability_fail_reason(capability)}): "
+                  f"{entry!r}", file=sys.stderr, flush=True)
+            return None
+        # Run the resolved seat through the SAME alias normalization the literal `model:` path
+        # uses, so an equivalent value (e.g. a manifest id that happens to be an alias) can't
+        # behave differently between the two paths.
+        return _expand_alias(resolved)
+    print(f"[review-cli] board entry ignored (missing 'model' or 'capability'): {entry!r}",
+          file=sys.stderr, flush=True)
+    return None
+
+
+def _parse_board_entry(entry: object) -> BoardReviewer | None:
+    """Parse ONE config `board:` entry into a BoardReviewer, or `None` (with a warning) when
+    it's unusable so `load_board` skips it. A seat comes from a literal `model:` or a
+    capability-resolved `capability:` (rig-cli#8)."""
+    if not isinstance(entry, dict):
+        print(f"[review-cli] board entry ignored (not a mapping): {entry!r}",
+              file=sys.stderr, flush=True)
+        return None
+    model = _resolve_entry_model(entry)
+    if model is None:
+        return None
+    role = entry.get("role")
+    role = role.strip() if isinstance(role, str) else ""
+    if role and role not in REVIEW_ROLES:
+        print(f"[review-cli] board reviewer {model!r}: unknown role {role!r} — "
+              f"using the generic review prompt (known roles: "
+              f"{', '.join(sorted(REVIEW_ROLES))})", file=sys.stderr, flush=True)
+    name = entry.get("name")
+    display = name.strip() if isinstance(name, str) and name.strip() else _display_name(model)
+    return BoardReviewer(model=model, role=role, display=display)
+
+
 def load_board(config: dict | None = None) -> list[BoardReviewer]:
     """Resolve the active reviewer board.
 
-    A `board:` key in config.yaml (a list of `{model, role[, name]}` mappings)
-    overrides the built-in DEFAULT_BOARD. Validation degrades gracefully but is
-    cost-safe — it never silently substitutes the paid default board for a board
-    the user explicitly configured:
+    A `board:` key in config.yaml (a list of `{model | capability, role[, name]}`
+    mappings) overrides the built-in DEFAULT_BOARD. A seat names its model EITHER
+    literally (`model: claude:claude-opus-4-8`) OR by CAPABILITY resolved from the
+    shared `models.yaml` manifest (`capability: vision` / `capability: role:reasoning`,
+    rig-cli#8) — the latter degrades to "skip this entry with a warning" when the
+    manifest isn't reachable, so a manifest-less host still runs its literal seats.
+    Validation degrades gracefully but is cost-safe — it never silently substitutes
+    the paid default board for a board the user explicitly configured:
       * an ABSENT / non-list / empty `board:`  -> fall back to DEFAULT_BOARD
         (no preference expressed, the default is intended);
       * a PRESENT non-empty `board:` with SOME valid entries -> keep the valid
         ones; each bad entry is skipped with a warning;
-      * an entry without a usable `model` -> skipped with a warning;
+      * an entry with neither a usable `model` nor a resolvable `capability` ->
+        skipped with a warning;
       * an unknown `role` -> kept, but the reviewer uses the generic prompt
         (role_lens == "") and a warning is logged — the board degrades;
       * a PRESENT non-empty `board:` whose entries are ALL malformed (no usable
@@ -395,33 +506,23 @@ def load_board(config: dict | None = None) -> list[BoardReviewer]:
         return list(DEFAULT_BOARD)
     board: list[BoardReviewer] = []
     for entry in raw:
-        if not isinstance(entry, dict):
-            print(f"[review-cli] board entry ignored (not a mapping): {entry!r}",
-                  file=sys.stderr, flush=True)
-            continue
-        model = entry.get("model")
-        if not isinstance(model, str) or not model.strip():
-            print(f"[review-cli] board entry ignored (missing 'model'): {entry!r}",
-                  file=sys.stderr, flush=True)
-            continue
-        model = _expand_alias(model.strip())
-        role = entry.get("role")
-        role = role.strip() if isinstance(role, str) else ""
-        if role and role not in REVIEW_ROLES:
-            print(f"[review-cli] board reviewer {model!r}: unknown role {role!r} — "
-                  f"using the generic review prompt (known roles: "
-                  f"{', '.join(sorted(REVIEW_ROLES))})", file=sys.stderr, flush=True)
-        name = entry.get("name")
-        display = name.strip() if isinstance(name, str) and name.strip() else _display_name(model)
-        board.append(BoardReviewer(model=model, role=role, display=display))
+        reviewer = _parse_board_entry(entry)
+        if reviewer is not None:
+            board.append(reviewer)
+    # NOTE: duplicate models across seats are INTENTIONALLY allowed (the show-board path tags
+    # per-SEAT, not per-model — a duplicate model in the reserve must read `reserve`, not
+    # `pool`; see test_show_board_tags_by_seat_not_model_for_duplicate_models). Capability
+    # resolution can make a collision likelier, but de-duping here would override that
+    # deliberate, tested behavior — so a board with two identical seats is kept as-is.
     if not board:
         # `board:` was present and non-empty but nothing parsed. Do NOT fall back
         # to the paid DEFAULT_BOARD — error loudly so the user fixes the config.
         raise BoardConfigError(
             f"config.yaml `board:` has {len(raw)} entr"
             f"{'y' if len(raw) == 1 else 'ies'} but none is usable (every entry "
-            "is malformed — not a mapping, or missing a 'model'). Fix the board "
-            "entries, or remove the `board:` key to use the default reviewer board."
+            "is malformed — not a mapping, or missing a 'model' / a resolvable "
+            "'capability'). Fix the board entries, or remove the `board:` key to "
+            "use the default reviewer board."
         )
     return board
 

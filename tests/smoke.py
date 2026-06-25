@@ -475,6 +475,10 @@ _UNIT_FILES = [
     ("test_claude_api.py", {}),
     ("test_provider_keys.py", {}),
     ("test_reviewer_board.py", {}),
+    # Capability-aware seat resolution from the shared models.yaml manifest (rig-cli#8 consumer
+    # side). All offline — writes a fixture manifest to a temp file + points $REVIEW_MODELS_MANIFEST
+    # at it; no network, no real agent-tools checkout, no model call.
+    ("test_manifest_capability.py", {}),
     ("test_review_marker.py", {}),
     ("test_failover_pool.py", {}),
     # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
