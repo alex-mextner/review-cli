@@ -5,6 +5,18 @@ semantic versioning.
 
 ## Unreleased
 
+- **The reviewer board can now resolve a seat by CAPABILITY or ROLE from the shared
+  `agent-tools/lib/contracts/models.yaml` manifest (rig-cli#8 consumer side, review-cli#78).**
+  The new `reviewlib/manifest.py` reads the ecosystem's single source of truth for per-model
+  capability tags (`vision`/`reasoning`/`code`) + the `roles:` map, and a config `board:` entry
+  can name its seat by `capability: vision` (the strongest model carrying that tag) or
+  `capability: role:reasoning` (the manifest's symbolic lens) instead of a literal `model:`.
+  Manifest provider tokens map to review-cli seat strings (`anthropic`->`claude:`, `openai`->the
+  agentic `codex` route, `gemini`, `commandcode:`, `zai:`). **Fully additive + backward-
+  compatible:** existing `-m <model>` and literal `model:` board entries are untouched, and a host
+  with no manifest reachable degrades gracefully — a `capability:` entry is skipped with a warning
+  and the board runs its literal seats / the hardcoded `DEFAULT_BOARD`, never a crash. The manifest
+  is located via `$REVIEW_MODELS_MANIFEST` / `$AGENT_TOOLS_DIR` / a few conventional checkout paths.
 - **The `claude:claude-opus-4-8` review seat (the PRIMARY review-gate seat) now runs through
   `claude --print` directly instead of the `claude-p` TUI-scraper, fixing a recurring corrupted/
   empty verdict (review-cli#76).** `claude-p` spawns the interactive fullscreen `claude` under a
