@@ -339,6 +339,8 @@ def test_dispatch_live_bot_emits_blocked_not_executor():
     assert "## QA RESULTS" in text
     assert "BLOCKED" in text
     assert "REVIEW_QA_BOT_LIVE" in text
+    # The report FOOTER carries the live backend label, not the bot Tier-1 hermetic default.
+    assert "backend: bot-live" in text and "hermetic-bot" not in text
     # BLOCKED bring-up maps to the boot-failed exit class, not 0 (a clean pass).
     assert code == 8, code
 
@@ -353,6 +355,7 @@ def test_dispatch_live_web_emits_blocked():
         text = report.read_text(encoding="utf-8")
     assert "## QA RESULTS" in text and "BLOCKED" in text
     assert "REVIEW_QA_WEB_LIVE" in text
+    assert "backend: web-live" in text and "hermetic-bot" not in text
     assert code == 8
 
 
@@ -366,7 +369,74 @@ def test_dispatch_live_ext_emits_blocked():
         text = report.read_text(encoding="utf-8")
     assert "## QA RESULTS" in text and "BLOCKED" in text
     assert "REVIEW_QA_EXT_LIVE" in text
+    assert "backend: ext-live" in text and "hermetic-bot" not in text
     assert code == 8
+
+
+def test_tier1_web_ext_blocked_report_backend_label():
+    """The report FOOTER ``backend:`` label must match the run's actual backend: a Tier-1 web
+    BLOCKED report reads ``playwright-web`` and a Tier-1 ext BLOCKED report reads ``vscode-ext``,
+    never the bot default ``hermetic-bot``. Guards completion of the label fix — the LIVE paths
+    were relabelled first, but these Tier-1 web/ext sites shared the same mislabel (the saved
+    footer contradicted the run's own ``backend=…`` stderr until fixed)."""
+    from reviewlib.modes.qa import _emit_ext_blocked, _emit_web_blocked
+
+    web_cfg = WebConfig(driver="playwright", base_url="http://127.0.0.1:8080")
+    ext_cfg = ExtConfig(driver="vscode")
+    with _scratch() as out:
+        wreport = out / "w.md"
+        _emit_web_blocked(wreport, out, web_cfg, "playwright off", 8, strict=False, in_place=False)
+        wtext = wreport.read_text(encoding="utf-8")
+        ereport = out / "e.md"
+        _emit_ext_blocked(ereport, out, ext_cfg, "vscode off", 8, strict=False, in_place=False)
+        etext = ereport.read_text(encoding="utf-8")
+    assert "backend: playwright-web" in wtext and "hermetic-bot" not in wtext, wtext
+    assert "backend: vscode-ext" in etext and "hermetic-bot" not in etext, etext
+
+
+def test_tier1_web_ext_pass_report_backend_label():
+    """The HAPPY-path (non-blocked) Tier-1 web/ext report footer must ALSO carry the run's real
+    backend — ``playwright-web`` / ``vscode-ext`` — not the bot default. Stubs the gate available
+    and the isolation-drive as a PASS transcript (no real browser / VS Code), then reads the saved
+    footer. Pins the non-blocked label sites the BLOCKED-helper test doesn't reach (codex P2): a
+    re-hardcode of those two call sites to ``hermetic-bot`` would otherwise pass green."""
+    import reviewlib.modes.qa as qamode
+    import reviewlib.qa.ext_harness as ext_harness
+    import reviewlib.qa.web_harness as web_harness
+
+    pass_tail = (
+        "ran it.\n## QA RESULTS\nSUT: /s   KIND: web   BRING-UP: local\n"
+        "CASES: 1 run, 1 passed, 0 failed, 0 blocked\n\n"
+        "### FINDINGS\nno findings\n\n### BLOCKED\nnone\n\nVERDICT: PASS\n"
+    )
+    saved = {
+        (web_harness, "playwright_available"): web_harness.playwright_available,
+        (ext_harness, "vscode_available"): ext_harness.vscode_available,
+        (qamode, "_drive_web_in_isolation"): qamode._drive_web_in_isolation,
+        (qamode, "_drive_ext_in_isolation"): qamode._drive_ext_in_isolation,
+    }
+    web_harness.playwright_available = lambda: (True, "")
+    ext_harness.vscode_available = lambda: (True, "")
+    qamode._drive_web_in_isolation = lambda **_k: pass_tail
+    qamode._drive_ext_in_isolation = lambda **_k: pass_tail
+    try:
+        web_cfg = WebConfig(driver="playwright", base_url="http://127.0.0.1:8080")
+        with _scratch() as out, _env(**_ALL_LIVE_VARS):
+            args = _FullArgs(kind="web")
+            args.report = str(out / "w.md")
+            qamode._run_web_deterministic(_Ctx(args), out, [], web_config=web_cfg, exit_blocked=8)
+            wtext = Path(args.report).read_text(encoding="utf-8")
+        ext_cfg = ExtConfig(driver="vscode")
+        with _scratch() as out, _env(**_ALL_LIVE_VARS):
+            args = _FullArgs(kind="ext")
+            args.report = str(out / "e.md")
+            qamode._run_ext_deterministic(_Ctx(args), out, [], ext_config=ext_cfg, exit_blocked=8)
+            etext = Path(args.report).read_text(encoding="utf-8")
+    finally:
+        for (mod, name), real in saved.items():
+            setattr(mod, name, real)
+    assert "backend: playwright-web" in wtext and "hermetic-bot" not in wtext, wtext
+    assert "backend: vscode-ext" in etext and "hermetic-bot" not in etext, etext
 
 
 # --- the SELECTOR routes a tier:live block to the live path (not None → not the executor) ------
@@ -492,6 +562,60 @@ def test_handler_routes_live_ext_to_blocked_not_executor():
     assert "BLOCKED" in text and "REVIEW_QA_EXT_LIVE" in text
 
 
+def test_handler_live_short_circuits_before_suite_load():
+    """Finding #4 regression: each tier:live HANDLER must take its ``is_live`` short-circuit BEFORE
+    loading the Tier-1 suite. The live path never reads the suite, so a suite-stage failure must
+    not be mis-attributed to (or block) a live run that was going to SKIP-LOUD on creds. We patch
+    ``load_suites_text`` to EXPLODE and pass a bogus suite path: on the correct order the loader is
+    never reached and the handler still BLOCKs cleanly; on the old order (suite-load first) the
+    handler would blow up on the loader before ever seeing ``is_live``.
+
+    The handlers import ``load_suites_text`` IN-FUNCTION (``from ..qa.suites import …`` inside each
+    def), so they resolve it off ``reviewlib.qa.suites`` at call time — patching that source binding
+    is what makes ``_boom`` fire. We ALSO patch any module-level alias on ``reviewlib.modes.qa``
+    defensively, so this guard survives a future hoist of the import to module scope (whichever
+    binding the handler reads, the explode is wired). Verified to FAIL on the pre-fix order."""
+    import reviewlib.modes.qa as qamode
+    import reviewlib.qa.suites as suites_mod
+    from reviewlib.modes.qa import (
+        _run_bot_hermetic,
+        _run_ext_deterministic,
+        _run_web_deterministic,
+    )
+
+    cases = [
+        (_run_bot_hermetic, "bot_config",
+         BotConfig(driver=lt.BOT_LIVE_DRIVER, command=("python3", "b.py")), "REVIEW_QA_BOT_LIVE"),
+        (_run_web_deterministic, "web_config",
+         WebConfig(driver=lt.WEB_LIVE_DRIVER), "REVIEW_QA_WEB_LIVE"),
+        (_run_ext_deterministic, "ext_config",
+         ExtConfig(driver=lt.EXT_LIVE_DRIVER), "REVIEW_QA_EXT_LIVE"),
+    ]
+
+    def _boom(*_a, **_k):
+        raise AssertionError("suite-load ran before the is_live short-circuit (finding #4)")
+
+    # Patch every binding the handler could resolve: the source module (in-function import, current)
+    # plus a module-level alias on reviewlib.modes.qa if one ever exists (hoisted import, future).
+    targets = [suites_mod] + ([qamode] if hasattr(qamode, "load_suites_text") else [])
+    saved = {mod: mod.load_suites_text for mod in targets}
+    for mod in targets:
+        mod.load_suites_text = _boom
+    try:
+        for handler, cfg_kw, cfg, flag in cases:
+            with _scratch() as out, _env(**_ALL_LIVE_VARS):
+                args = _FullArgs(kind="auto")
+                args.report = str(out / "r.md")
+                code = handler(_Ctx(args), out, [Path("does-not-exist.md")],
+                               exit_blocked=8, **{cfg_kw: cfg})
+                text = Path(args.report).read_text(encoding="utf-8")
+            assert code == 8, (handler.__name__, code)
+            assert "BLOCKED" in text and flag in text, handler.__name__
+    finally:
+        for mod, real in saved.items():
+            mod.load_suites_text = real
+
+
 def test_dispatch_creds_present_blocks_on_82_not_fake_pass():
     """When the gate is SATISFIED (flag + all creds + a safe chat, telethon stubbed present), the
     dispatch does NOT fake a pass — it reaches ``live_driver_for(...).connect()`` which raises the
@@ -509,6 +633,46 @@ def test_dispatch_creds_present_blocks_on_82_not_fake_pass():
     assert code == 8, code
     assert "BLOCKED" in text
     assert "#82" in text, "a creds-present live run must BLOCK on the #82 not-yet-implemented path"
+
+
+def test_dispatch_web_creds_present_blocks_on_82_not_fake_pass():
+    """Web analogue of the bot #82 test (closes the web half of the creds-present gap): flag + a
+    base URL + a browser runtime stubbed present → the web gate is SATISFIED, so the dispatch
+    reaches ``live_driver_for("web").connect()`` which raises the not-yet-implemented ``#82``
+    message — a BLOCKED reason, NOT a fake pass."""
+    from reviewlib.modes.qa import _run_web_live
+
+    cfg = WebConfig(driver=lt.WEB_LIVE_DRIVER)
+    env = {**_ALL_LIVE_VARS, "REVIEW_QA_WEB_LIVE": "1",
+           "REVIEW_QA_WEB_BASE_URL": "https://stage.example.test"}
+    with _scratch() as out, _env(**env), _stub_playwright():
+        report = out / "r.md"
+        code = _run_web_live(report, out, cfg, strict=False, exit_blocked=8, in_place=False)
+        text = report.read_text(encoding="utf-8")
+    assert code == 8, code
+    assert "BLOCKED" in text
+    assert "#82" in text, "a creds-present web live run must BLOCK on the #82 not-yet-implemented path"
+
+
+def test_dispatch_ext_creds_present_blocks_on_82_not_fake_pass():
+    """Ext analogue (closes the ext half of the gap): flag + the VS Code gate stubbed satisfied +
+    a baseline dir + ``magick`` stubbed present → the ext gate is SATISFIED, so the dispatch
+    reaches ``live_driver_for("ext").connect()`` which raises the ``#82`` message — BLOCKED, not a
+    fake pass."""
+    import tempfile
+
+    from reviewlib.modes.qa import _run_ext_live
+
+    cfg = ExtConfig(driver=lt.EXT_LIVE_DRIVER)
+    with tempfile.TemporaryDirectory() as base:
+        env = {**_ALL_LIVE_VARS, "REVIEW_QA_EXT_LIVE": "1", "REVIEW_QA_EXT_BASELINE_DIR": base}
+        with _scratch() as out, _env(**env), _stub_vscode_gate(True), _stub_magick(True):
+            report = out / "r.md"
+            code = _run_ext_live(report, out, cfg, strict=False, exit_blocked=8, in_place=False)
+            text = report.read_text(encoding="utf-8")
+    assert code == 8, code
+    assert "BLOCKED" in text
+    assert "#82" in text, "a creds-present ext live run must BLOCK on the #82 not-yet-implemented path"
 
 
 # --- creds doc / gate-message consistency ---------------------------------------------------

@@ -428,19 +428,23 @@ def _run_bot_hermetic(
         print("[review-cli] qa: --max-cases must be >= 0 (got "
               f"{ctx.args.max_cases}); 0 means 'no cap'.", file=sys.stderr, flush=True)
         return 2
-    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
-    suite_text = load_suites_text(suites, max_cases=max_cases)
     strict = bool(getattr(ctx.args, "strict", False))
     report_path = _report_path(ctx, sut_path)
 
-    # TIER-2 LIVE branch: a `driver: mtproto` bot block drives a REAL test Telegram account, gated
-    # behind test-account creds. When the creds gate is not satisfied the run SKIPs LOUD (a
-    # controlled BLOCKED naming the exact missing creds); when it is, the live driver is invoked
-    # (today it raises LiveTierUnavailable → BLOCKED, the live run is tracked in #82). Either way
-    # the run NEVER silently falls through to the un-caged executor or fakes a pass.
+    # TIER-2 LIVE branch — short-circuited BEFORE the Tier-1 suite-load. A `driver: mtproto` bot
+    # block drives a REAL test Telegram account, gated behind test-account creds. When the creds
+    # gate is not satisfied the run SKIPs LOUD (a controlled BLOCKED naming the exact missing
+    # creds); when it is, the live driver is invoked (today it raises LiveTierUnavailable →
+    # BLOCKED, the live run is tracked in #82). The live path NEVER reads the Tier-1 suite, so it
+    # is gated ahead of load_suites_text — otherwise a suite-stage failure would be mis-attributed
+    # to a live run that was going to BLOCK on creds regardless. Either way the run NEVER silently
+    # falls through to the un-caged executor or fakes a pass.
     if bot_config.is_live:
         return _run_bot_live(report_path, sut_path, strict=strict, exit_blocked=exit_blocked,
                              in_place=ctx.args.in_place)
+
+    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    suite_text = load_suites_text(suites, max_cases=max_cases)
 
     print(
         f"[review-cli] qa: testing BOT SUT {sut_path} (kind=bot, driver=hermetic-mock, "
@@ -501,14 +505,23 @@ def _drive_bot_in_isolation(
         )
 
 
-def _write_bot_report(report_path: Path, transcript: str, *, sut_path: Path, in_place: bool) -> None:
-    """Persist the bot run's ``## QA RESULTS`` transcript to ``--report`` (0600, mirroring the
-    executor's report write). Best-effort: a write failure is surfaced but never fails the run."""
+def _write_bot_report(
+    report_path: Path, transcript: str, *, sut_path: Path, in_place: bool,
+    backend: str = "hermetic-bot",
+) -> None:
+    """Persist a run's ``## QA RESULTS`` transcript to ``--report`` (0600, mirroring the
+    executor's report write). Despite the ``_bot_`` name this is the shared report writer for
+    every kind; ``backend`` is the footer's backend label and EACH caller passes its own so the
+    saved footer matches the run's stderr ``VERDICT`` line: bot Tier-1 keeps the default
+    ``hermetic-bot``, web Tier-1 passes ``playwright-web``, ext Tier-1 passes ``vscode-ext``, and
+    the Tier-2 LIVE paths pass ``bot-live`` / ``web-live`` / ``ext-live`` — so no web/ext or live
+    report is ever mislabelled ``hermetic-bot``. Best-effort: a write failure is surfaced but
+    never fails the run."""
     import os
     import sys
 
     footer = (
-        f"\n\n---\n[review-cli qa] SUT: {sut_path}   backend: hermetic-bot   "
+        f"\n\n---\n[review-cli qa] SUT: {sut_path}   backend: {backend}   "
         f"isolation: {'in-place' if in_place else 'worktree'}\n"
     )
     try:
@@ -560,19 +573,23 @@ def _run_web_deterministic(
         print("[review-cli] qa: --max-cases must be >= 0 (got "
               f"{ctx.args.max_cases}); 0 means 'no cap'.", file=sys.stderr, flush=True)
         return 2
-    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
-    suite_text = load_suites_text(suites, max_cases=max_cases)
     strict = bool(getattr(ctx.args, "strict", False))
     report_path = _report_path(ctx, sut_path)
 
-    # TIER-2 LIVE branch: a `driver: agent-browser` web block drives a REAL browser against a
-    # deployed test site, gated behind REVIEW_QA_WEB_LIVE + REVIEW_QA_WEB_BASE_URL. When the gate
-    # is not satisfied the run SKIPs LOUD (a controlled BLOCKED naming the exact missing creds);
-    # when it is, the live driver is invoked (today it raises LiveTierUnavailable → BLOCKED, the
-    # live run is tracked in #82). It NEVER falls through to the un-caged executor or fakes a pass.
+    # TIER-2 LIVE branch — short-circuited BEFORE the Tier-1 suite-load. A `driver: agent-browser`
+    # web block drives a REAL browser against a deployed test site, gated behind REVIEW_QA_WEB_LIVE
+    # + REVIEW_QA_WEB_BASE_URL. When the gate is not satisfied the run SKIPs LOUD (a controlled
+    # BLOCKED naming the exact missing creds); when it is, the live driver is invoked (today it
+    # raises LiveTierUnavailable → BLOCKED, the live run is tracked in #82). The live path NEVER
+    # reads the Tier-1 suite, so it is gated ahead of load_suites_text — otherwise a suite-stage
+    # failure would be mis-attributed to a live run that BLOCKs on creds regardless. It NEVER falls
+    # through to the un-caged executor or fakes a pass.
     if web_config.is_live:
         return _run_web_live(report_path, sut_path, web_config, strict=strict,
                              exit_blocked=exit_blocked, in_place=ctx.args.in_place)
+
+    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    suite_text = load_suites_text(suites, max_cases=max_cases)
 
     print(
         f"[review-cli] qa: testing WEB SUT {sut_path} (kind=web, driver=playwright, "
@@ -606,7 +623,8 @@ def _run_web_deterministic(
         print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
         return exit_blocked
 
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place)
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place,
+                      backend="playwright-web")
     verdict, findings, max_sev, cases = parse_qa_results(transcript)
     print(
         f"[review-cli] qa: VERDICT={verdict} findings={findings}"
@@ -633,7 +651,8 @@ def _emit_web_blocked(
     print(f"[review-cli] qa: web run BLOCKED — {reason}", file=sys.stderr, flush=True)
     transcript = WebRunResult(blocked_reason=reason).to_qa_results(
         sut_path=sut_path, base_url=web_config.base_url)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place)
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
+                      backend="playwright-web")
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
     return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
 
@@ -676,7 +695,8 @@ def _run_bot_live(
     reason = _live_blocked_reason("bot", exit_blocked)
     print(f"[review-cli] qa: bot Tier-2 LIVE run BLOCKED — {reason}", file=sys.stderr, flush=True)
     transcript = BotRunResult(blocked_reason=reason).to_qa_results(sut_path=sut_path)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place)
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
+                      backend="bot-live")
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
     return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
 
@@ -702,7 +722,8 @@ def _run_web_live(
     live_url = os.environ.get("REVIEW_QA_WEB_BASE_URL", "").strip() or web_config.base_url
     transcript = WebRunResult(blocked_reason=reason).to_qa_results(
         sut_path=sut_path, base_url=live_url)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place)
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
+                      backend="web-live")
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
     return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
 
@@ -723,7 +744,8 @@ def _run_ext_live(
     print(f"[review-cli] qa: ext Tier-2 LIVE run BLOCKED — {reason}", file=sys.stderr, flush=True)
     transcript = ExtRunResult(blocked_reason=reason).to_qa_results(
         sut_path=sut_path, extension_path=ext_config.extension_path)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place)
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
+                      backend="ext-live")
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
     return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
 
@@ -862,20 +884,24 @@ def _run_ext_deterministic(
         print("[review-cli] qa: --max-cases must be >= 0 (got "
               f"{ctx.args.max_cases}); 0 means 'no cap'.", file=sys.stderr, flush=True)
         return 2
-    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
-    suite_text = load_suites_text(suites, max_cases=max_cases)
     strict = bool(getattr(ctx.args, "strict", False))
     report_path = _report_path(ctx, sut_path)
 
-    # TIER-2 LIVE branch: a `driver: vscode-visual` ext block launches a REAL VS Code and DIFFs
-    # window screenshots against a baseline (issue #82's core ask), gated behind REVIEW_QA_EXT_LIVE
-    # + the VS Code gate + a baseline dir. When the gate is not satisfied the run SKIPs LOUD (a
-    # controlled BLOCKED naming the exact missing creds/infra); when it is, the live driver is
-    # invoked (today it raises LiveTierUnavailable → BLOCKED, the live run is tracked in #82). It
-    # NEVER falls through to the un-caged executor or fakes a pass.
+    # TIER-2 LIVE branch — short-circuited BEFORE the Tier-1 suite-load. A `driver: vscode-visual`
+    # ext block launches a REAL VS Code and DIFFs window screenshots against a baseline (issue
+    # #82's core ask), gated behind REVIEW_QA_EXT_LIVE + the VS Code gate + a baseline dir. When
+    # the gate is not satisfied the run SKIPs LOUD (a controlled BLOCKED naming the exact missing
+    # creds/infra); when it is, the live driver is invoked (today it raises LiveTierUnavailable →
+    # BLOCKED, the live run is tracked in #82). The live path NEVER reads the Tier-1 suite, so it
+    # is gated ahead of load_suites_text — otherwise a suite-stage failure would be mis-attributed
+    # to a live run that BLOCKs on creds regardless. It NEVER falls through to the un-caged
+    # executor or fakes a pass.
     if ext_config.is_live:
         return _run_ext_live(report_path, sut_path, ext_config, strict=strict,
                              exit_blocked=exit_blocked, in_place=ctx.args.in_place)
+
+    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    suite_text = load_suites_text(suites, max_cases=max_cases)
 
     print(
         f"[review-cli] qa: testing EXT SUT {sut_path} (kind=ext, driver=vscode, "
@@ -909,7 +935,8 @@ def _run_ext_deterministic(
         print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
         return exit_blocked
 
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place)
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place,
+                      backend="vscode-ext")
     verdict, findings, max_sev, cases = parse_qa_results(transcript)
     print(
         f"[review-cli] qa: VERDICT={verdict} findings={findings}"
@@ -936,7 +963,8 @@ def _emit_ext_blocked(
     print(f"[review-cli] qa: ext run BLOCKED — {reason}", file=sys.stderr, flush=True)
     transcript = ExtRunResult(blocked_reason=reason).to_qa_results(
         sut_path=sut_path, extension_path=ext_config.extension_path)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place)
+    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
+                      backend="vscode-ext")
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
     return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
 

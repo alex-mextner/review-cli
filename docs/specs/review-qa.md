@@ -427,6 +427,12 @@ opt-in flag (the flag mirrors `REVIEW_QA_PLAYWRIGHT` / `REVIEW_QA_VSCODE`):
   the test account), `TG_TEST_SESSION` (a Telethon StringSession for the test USER account),
   `TG_TEST_CHAT_ID` (the test chat id — MUST NOT equal the real `TG_CHAT_ID`; the gate fails
   CLOSED if it does).
+- **Gate limit (operator responsibility):** the safety gate only compares `TG_TEST_CHAT_ID`
+  against `TG_CHAT_ID` by string equality (after trimming surrounding whitespace) — it CANNOT
+  verify that `TG_TEST_SESSION` is a throwaway
+  account rather than your real one (a session string is opaque; the gate never opens it). A
+  dedicated test account is YOUR responsibility, not something the gate can prove. Never point
+  `TG_TEST_SESSION` at your real account's session even if the chat ids differ.
 - Dep: `pip install telethon` (a qa-harness dep, NOT a tg-cli dep).
 
 **web (real browser, live site):**
