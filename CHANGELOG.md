@@ -5,6 +5,19 @@ semantic versioning.
 
 ## Unreleased
 
+- **`review qa --kind auto` now detects a PYTHON Telegram bot, and `review help config`
+  documents qa's model selection (review-cli#61).** `_looks_like_bot` previously only read
+  `package.json` deps, so a normal Python bot (no `package.json`) fell through to the `backend`
+  runbook. It now also parses `requirements.txt` + `pyproject.toml` (PEP 621 `[project]` and
+  Poetry `[tool.poetry.dependencies]`) for the Python bot markers (`python-telegram-bot`,
+  `aiogram`, `pyrogram`, `telethon`, `pyTelegramBotAPI`) — names matched in PEP 503 canonical
+  form so `python_telegram_bot` (underscores) also hits. Best-effort, never crashing detection.
+  The pyproject path uses the stdlib `tomllib` (3.11+) and falls back to `tomli` if installed;
+  on a bare 3.9/3.10 host with neither, a pyproject-ONLY Python bot is not auto-detected (pass
+  `--kind bot`). `requirements.txt` detection works on all supported runtimes. The deep
+  `review help config` SELECTION CASCADE now has a `review qa` row noting
+  it IGNORES `models:`/`brainstorm_models:`/the defaults and selects one tester via
+  `REVIEW_QA_TESTER` / a bare `-m claude|codex`.
 - **The reviewer board can now resolve a seat by CAPABILITY or ROLE from the shared
   `agent-tools/lib/contracts/models.yaml` manifest (rig-cli#8 consumer side, review-cli#78).**
   The new `reviewlib/manifest.py` reads the ecosystem's single source of truth for per-model

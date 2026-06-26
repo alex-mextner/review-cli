@@ -60,6 +60,10 @@ def test_help_config_prints_the_config_reference():
     assert str(CONFIG_PATH) in out, out
     assert "models:" in out and "brainstorm_models:" in out and "board:" in out, out
     assert "SELECTION CASCADE" in out, out
+    # qa is in the cascade and is documented as IGNORING models:/defaults, using
+    # REVIEW_QA_TESTER / a bare -m codex|claude (review-cli#61).
+    assert "review qa" in out, out
+    assert "REVIEW_QA_TESTER" in out, out
     assert "COMMANDCODE_API_KEY" in out and "GEMINI_API_KEY" in out, out
     assert "review --show-board" in out, out
     # The board-entry shape must name the keys load_board ACTUALLY reads (model/role/name),
