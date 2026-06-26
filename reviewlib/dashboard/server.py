@@ -891,6 +891,36 @@ def _reachable_urls(host: str, port: int) -> list[str]:
     return urls
 
 
+def _prewarm_cache(gap: float) -> None:
+    """Parse + aggregate the log dir once at ``gap`` so the dir-signature memos in `parser`
+    are warm before the first request lands. The cold parse of the real 434MB / 35k-file log
+    dir is ~30s; without this the first `/api/runs` + `/api/stats` (and the panel's "Loading…")
+    eat it. Any failure is swallowed — the next real request just parses normally — so a broken
+    prewarm can never crash or block the server."""
+    try:
+        ld = log_dir()
+        sessions = dparser.load_sessions_cached(ld, gap_seconds=gap)
+        dparser.compute_stats_cached(sessions, ld, gap_seconds=gap)
+    except Exception:  # noqa: BLE001 — prewarm is best-effort; never propagate
+        return
+
+
+def _spawn_prewarm(*, verbose: bool = False) -> threading.Thread:
+    """Start the cache prewarm on a DAEMON thread so it runs in parallel with `serve_forever`
+    and never blocks the bind/serve — and dies with the process. Uses the front-end default gap
+    (`DEFAULT_SESSION_GAP_SECONDS`, 90s) so the common default-gap page load hits a warm cache."""
+    if verbose:
+        print("[review dashboard] prewarming session cache…", flush=True)
+    t = threading.Thread(
+        target=_prewarm_cache,
+        args=(dparser.DEFAULT_SESSION_GAP_SECONDS,),
+        name="dashboard-prewarm",
+        daemon=True,
+    )
+    t.start()
+    return t
+
+
 def run_dashboard(
     port: int | None = None,
     *,
@@ -920,6 +950,10 @@ def run_dashboard(
               "Reads open; writes allowed from loopback + the Tailscale host. Ctrl-C to stop.", flush=True)
     else:
         print("[review dashboard] loopback-only. Pass --host 0.0.0.0 to expose over Tailscale. Ctrl-C to stop.", flush=True)
+    # Warm the session/stats cache in the background so the FIRST page load isn't cold (the real
+    # log dir is a ~30s parse). Daemon thread — runs in parallel, never blocks the bind/serve, and
+    # dies with the process; a prewarm failure is swallowed inside _prewarm_cache.
+    _spawn_prewarm(verbose=verbose)
     if open_browser:
         def _open() -> None:
             import webbrowser

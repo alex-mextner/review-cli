@@ -600,6 +600,99 @@ def test_invalidate_sessions_cache_also_clears_stats():
             p.invalidate_sessions_cache()
 
 
+def test_prewarm_cache_warms_sessions_and_stats_so_first_load_is_not_cold():
+    """A launchd-started dashboard binds and serves instantly, but the FIRST `/api/runs` +
+    `/api/stats` still pay the cold ~30s parse of the 434MB / 35k-file log dir, during which the
+    panel shows "Loading…" (looks empty). ``server._prewarm_cache`` runs that parse in a daemon
+    thread at startup, so by the time the user opens the default-gap page both caches are warm
+    and the first request is a HIT — no re-parse, no re-aggregation.
+
+    Spying on the pure ``parse_call_log`` / ``compute_stats``: after a prewarm at the front-end
+    default gap (90s), a subsequent ``load_sessions_cached`` / ``compute_stats_cached`` on the
+    SAME dir must NOT do any further per-file parse or aggregation.
+    """
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server as srv
+
+    parse_calls = {"n": 0}
+    compute_calls = {"n": 0}
+    real_parse_call_log = p.parse_call_log
+    real_compute_stats = p.compute_stats
+
+    def _counting_parse(path):
+        parse_calls["n"] += 1
+        return real_parse_call_log(path)
+
+    def _counting_compute(sessions):
+        compute_calls["n"] += 1
+        return real_compute_stats(sessions)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.parse_call_log = _counting_parse
+        p.compute_stats = _counting_compute
+        # Point log_dir() at the temp dir so the prewarm helper warms THIS dir.
+        prev_log_dir = os.environ.get("REVIEW_LOG_DIR")
+        os.environ["REVIEW_LOG_DIR"] = str(ld)
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+
+            # Prewarm parses + aggregates exactly once at the default gap.
+            srv._prewarm_cache(p.DEFAULT_SESSION_GAP_SECONDS)
+            after_prewarm_parse = parse_calls["n"]
+            after_prewarm_compute = compute_calls["n"]
+            assert after_prewarm_parse >= 2, "prewarm did not parse the logs"
+            assert after_prewarm_compute == 1, "prewarm did not aggregate stats"
+
+            # The first real default-gap page load must be a WARM hit on both caches.
+            sessions = p.load_sessions_cached(ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS)
+            assert parse_calls["n"] == after_prewarm_parse, (
+                f"cold first load: re-parsed despite prewarm "
+                f"({parse_calls['n']} > {after_prewarm_parse})"
+            )
+            p.compute_stats_cached(sessions, ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS)
+            assert compute_calls["n"] == after_prewarm_compute, (
+                f"cold first load: re-aggregated despite prewarm "
+                f"({compute_calls['n']} > {after_prewarm_compute})"
+            )
+        finally:
+            p.parse_call_log = real_parse_call_log
+            p.compute_stats = real_compute_stats
+            if prev_log_dir is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = prev_log_dir
+            p.invalidate_sessions_cache()
+
+
+def test_prewarm_cache_swallows_errors_and_never_raises():
+    """A prewarm failure must NEVER crash or block the server — the next real request just parses
+    normally. ``_prewarm_cache`` wraps its body in a broad log-and-ignore guard, so even if the
+    parse blows up it returns silently instead of propagating."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server as srv
+
+    real_load = p.load_sessions_cached
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("synthetic parse failure")
+
+    prev_log_dir = os.environ.get("REVIEW_LOG_DIR")
+    try:
+        p.load_sessions_cached = _boom  # type: ignore[assignment]
+        # Must not raise even though the parse blows up.
+        srv._prewarm_cache(p.DEFAULT_SESSION_GAP_SECONDS)
+    finally:
+        p.load_sessions_cached = real_load
+        if prev_log_dir is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = prev_log_dir
+        p.invalidate_sessions_cache()
+
+
 def test_panel_session_surfaces_recorded_invocations_as_prompt():
     """A non-brainstorm panel run has no topic; Session.invocations must surface the DISTINCT
     recorded argv0 lines and to_summary must expose them as `invocations`, so the Prompts panel
