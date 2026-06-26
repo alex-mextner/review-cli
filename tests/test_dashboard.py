@@ -600,6 +600,138 @@ def test_invalidate_sessions_cache_also_clears_stats():
             p.invalidate_sessions_cache()
 
 
+def test_load_sessions_cached_single_flight_collapses_concurrent_cold_misses():
+    """A COLD cache (server just started) or a moving dir signature (a live ``review`` run is
+    streaming its `.log`, so `_dir_signature` keeps shifting) made EVERY concurrent request MISS
+    the cache and launch its OWN full ~30s parse of the 434MB / 35k-file log dir — a cache
+    stampede / thundering herd. Observed live: the ThreadingHTTPServer pegged at 103% CPU with a
+    dozen concurrent 30s parses, every request timed out, and the dashboard stayed empty under
+    realistic conditions (active reviews + multiple tabs/requests each firing runs+stats+SSE).
+
+    ``load_sessions_cached`` must be SINGLE-FLIGHT per key: when a parse for a (dir, gap) key is
+    already in progress, every other caller asking for the SAME key must WAIT for that in-flight
+    result instead of launching a duplicate parse. This test spawns N threads that hit a cold
+    cache simultaneously (a Barrier starts them together) against a deliberately SLOW parse, and
+    asserts the underlying per-file parse ran EXACTLY ONCE — not N times.
+    """
+    import time as _time
+
+    from reviewlib.dashboard import parser as p
+
+    n_threads = 8
+    parse_calls = {"n": 0}
+    count_lock = threading.Lock()
+    real_parse_call_log = p.parse_call_log
+
+    def _slow_counting_parse(path):  # SLOW so the N cold misses genuinely overlap in time
+        with count_lock:
+            parse_calls["n"] += 1
+        _time.sleep(0.3)
+        return real_parse_call_log(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.parse_call_log = _slow_counting_parse
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+
+            barrier = threading.Barrier(n_threads)
+            results: list[list] = []
+            results_lock = threading.Lock()
+
+            def _hammer():
+                barrier.wait()  # release all threads at once onto the COLD cache
+                got = p.load_sessions_cached(ld, gap_seconds=90)
+                with results_lock:
+                    results.append(got)
+
+            threads = [threading.Thread(target=_hammer) for _ in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            assert not any(t.is_alive() for t in threads), "a hammer thread hung — possible deadlock"
+
+            # Per-file parse work counts the per-call-log parses. With 2 logs, ONE single-flight
+            # parse touches each file once -> 2. Without single-flight, N concurrent cold parses
+            # each touch both files -> 2 * n_threads. We assert exactly one parse cycle ran.
+            assert parse_calls["n"] == 2, (
+                f"cache stampede: {n_threads} concurrent cold misses each ran a full parse "
+                f"(parse_calls={parse_calls['n']}, expected 2 = one single-flight parse of 2 logs)"
+            )
+            # Every waiter got the same correct clustering (one panel session), not an empty stale.
+            assert len(results) == n_threads
+            for got in results:
+                assert [s.session_id for s in got] == [s.session_id for s in results[0]]
+            assert len(results[0]) == 1, results[0]
+        finally:
+            p.parse_call_log = real_parse_call_log
+            p.invalidate_sessions_cache()
+
+
+def test_compute_stats_cached_single_flight_collapses_concurrent_cold_misses():
+    """Same thundering-herd hazard as the session parse, on the stats aggregate: a cold/moving
+    signature made every concurrent `/api/stats` re-run the multi-second ``compute_stats`` (which
+    fans into ``compute_model_health``) in parallel, saturating CPU. ``compute_stats_cached`` must
+    be single-flight per key too: concurrent cold misses for the SAME (dir, gap) collapse to one
+    aggregation. Asserts the heavy pure ``compute_stats`` ran EXACTLY ONCE under N concurrent
+    callers, not N times.
+    """
+    import time as _time
+
+    from reviewlib.dashboard import parser as p
+
+    n_threads = 8
+    compute_calls = {"n": 0}
+    count_lock = threading.Lock()
+    real_compute_stats = p.compute_stats
+
+    def _slow_counting_compute(sessions):  # SLOW so the N cold misses overlap
+        with count_lock:
+            compute_calls["n"] += 1
+        _time.sleep(0.3)
+        return real_compute_stats(sessions)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.compute_stats = _slow_counting_compute
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+            sessions = p.load_sessions_cached(ld, gap_seconds=90)
+
+            barrier = threading.Barrier(n_threads)
+            results: list[dict] = []
+            results_lock = threading.Lock()
+
+            def _hammer():
+                barrier.wait()
+                got = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+                with results_lock:
+                    results.append(got)
+
+            threads = [threading.Thread(target=_hammer) for _ in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            assert not any(t.is_alive() for t in threads), "a hammer thread hung — possible deadlock"
+
+            assert compute_calls["n"] == 1, (
+                f"stats stampede: {n_threads} concurrent cold misses each re-aggregated "
+                f"(compute_calls={compute_calls['n']}, expected 1 single-flight aggregation)"
+            )
+            assert len(results) == n_threads
+            for got in results:
+                assert got["session_count"] == results[0]["session_count"] == 1
+        finally:
+            p.compute_stats = real_compute_stats
+            p.invalidate_sessions_cache()
+
+
 def test_prewarm_cache_warms_sessions_and_stats_so_first_load_is_not_cold():
     """A launchd-started dashboard binds and serves instantly, but the FIRST `/api/runs` +
     `/api/stats` still pay the cold ~30s parse of the 434MB / 35k-file log dir, during which the
