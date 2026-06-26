@@ -36,6 +36,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from reviewlib.modes import qa as _qa_mod  # noqa: E402
 from reviewlib.qa import ext_driver as ed  # noqa: E402
 from reviewlib.qa import ext_harness as eh  # noqa: E402
 from reviewlib.qa.config import ExtConfig, QaConfigError, load_qa_config  # noqa: E402
@@ -533,6 +534,169 @@ def test_await_ready_times_out_on_a_silent_but_alive_runner():
         _restore_env("REVIEW_QA_EXT_LAUNCH_TIMEOUT_S", saved_to)
         restore()
         importlib.reload(eh)  # restore the module's real constants for later tests
+
+
+def test_stdout_line_reader_delivers_lines_and_eof():
+    """The _StdoutLineReader unit: lines drain in order, next_line() returns None on timeout
+    (not a block), and at_eof flips once the stream closes and the queue is empty."""
+    import io
+    import time as _t
+
+    stream = io.StringIO('{"a":1}\n{"b":2}\n')
+    reader = eh._StdoutLineReader(stream)
+    # The daemon drains the (finite) StringIO and hits EOF; both lines arrive in order.
+    assert json.loads(reader.next_line(1.0)) == {"a": 1}
+    assert json.loads(reader.next_line(1.0)) == {"b": 2}
+    # No more lines: next_line returns None within ~its timeout (bounded, not a hang).
+    start = _t.monotonic()
+    assert reader.next_line(0.1) is None
+    assert _t.monotonic() - start < 1.0
+    # The finite stream closed and the queue drained -> at_eof.
+    deadline = _t.monotonic() + 2.0
+    while not reader.at_eof and _t.monotonic() < deadline:
+        _t.sleep(0.02)
+    assert reader.at_eof
+
+
+def test_stdout_line_reader_none_stream_is_immediate_eof():
+    reader = eh._StdoutLineReader(None)
+    assert reader.at_eof
+    assert reader.next_line(0.05) is None
+
+
+def test_read_reply_times_out_on_a_booted_but_silent_runner():
+    """A runner that boots (`ready`) then NEVER answers an action must hit the per-action deadline
+    and raise ExtActionError (a FAIL for the case), NOT hang — the buffered-readline fix (#75).
+    Forced with a tiny action-timeout override + a fake runner that ignores requests."""
+    body = (
+        "import sys, json\n"
+        "print(json.dumps({'type': 'ready'}), flush=True)\n"
+        "import time\n"
+        "time.sleep(30)\n"  # alive, never reads/answers the request
+    )
+    restore = _with_fake_runner(body)
+    saved_to = os.environ.get("REVIEW_QA_EXT_ACTION_TIMEOUT_S")
+    os.environ["REVIEW_QA_EXT_ACTION_TIMEOUT_S"] = "1"
+    import importlib
+    import time as _t
+
+    importlib.reload(eh)
+    try:
+        sess = eh.vscode_session(extension_path="/tmp/x", workspace=Path("/tmp"), exit_blocked=8)
+        auto = sess.__enter__()
+        try:
+            start = _t.monotonic()
+            raised = False
+            try:
+                auto.run_command("noop.command")
+            except eh.ExtActionError as exc:
+                raised = True
+                assert "did not answer" in str(exc)
+            elapsed = _t.monotonic() - start
+            assert raised, "a silent-but-alive runner must time the action out, not hang"
+            assert elapsed < 10, f"timed out cleanly, not hung (took {elapsed:.1f}s)"
+        finally:
+            sess.__exit__(None, None, None)
+    finally:
+        _restore_env("REVIEW_QA_EXT_ACTION_TIMEOUT_S", saved_to)
+        restore()
+        importlib.reload(eh)
+
+
+def test_read_reply_detects_a_runner_that_dies_mid_reply():
+    """A runner that boots then EXITS before answering must raise ExtActionError naming the
+    exit (not hang on the deadline) once its stdout drains."""
+    body = (
+        "import sys, json\n"
+        "print(json.dumps({'type': 'ready'}), flush=True)\n"
+        "sys.stdin.readline()\n"  # consume the request, then exit WITHOUT replying
+    )
+    restore = _with_fake_runner(body)
+    import importlib
+
+    importlib.reload(eh)
+    try:
+        sess = eh.vscode_session(extension_path="/tmp/x", workspace=Path("/tmp"), exit_blocked=8)
+        auto = sess.__enter__()
+        try:
+            raised = False
+            try:
+                auto.run_command("noop.command")
+            except eh.ExtActionError as exc:
+                raised = True
+                assert "exited before answering" in str(exc)
+            assert raised, "a runner that dies mid-reply must raise, not hang"
+        finally:
+            sess.__exit__(None, None, None)
+    finally:
+        restore()
+        importlib.reload(eh)
+
+
+def test_read_reply_skips_noise_and_out_of_order_ids():
+    """The reply reader ignores non-JSON log lines AND an out-of-order id, returning only the
+    matching reply — the stated resilience logic, now over the queue-backed reader."""
+    body = (
+        "import sys, json\n"
+        "print(json.dumps({'type': 'ready'}), flush=True)\n"
+        "line = sys.stdin.readline()\n"
+        "req = json.loads(line)\n"
+        "print('a non-JSON log line from the runner', flush=True)\n"
+        "print(json.dumps({'id': 999, 'ok': True, 'result': 'stale'}), flush=True)\n"  # wrong id
+        "print(json.dumps({'id': req['id'], 'ok': True, 'result': ['note-A']}), flush=True)\n"
+        "sys.stdin.readline()\n"
+    )
+    restore = _with_fake_runner(body)
+    import importlib
+
+    importlib.reload(eh)
+    try:
+        sess = eh.vscode_session(extension_path="/tmp/x", workspace=Path("/tmp"), exit_blocked=8)
+        auto = sess.__enter__()
+        try:
+            assert auto.notifications() == ["note-A"]  # skipped the noise + the stale id
+        finally:
+            sess.__exit__(None, None, None)
+    finally:
+        restore()
+        importlib.reload(eh)
+
+
+def test_abs_ext_path_warns_about_escaping_the_worktree():
+    """An ABSOLUTE sut.ext extension_path/workspace under the default (worktree) run silently
+    escapes isolation (`cwd / abs` drops cwd); _warn_abs_path_escapes_worktree surfaces it. Under
+    --in-place it is expected (no warning) (review-cli#75)."""
+    import contextlib
+    import io
+    import types
+
+    cfg = types.SimpleNamespace(extension_path="/abs/ext", workspace="rel/ws")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        _qa_mod._warn_abs_path_escapes_worktree(Path("/tmp/review-qa-wt-x"), False, cfg)
+    msg = err.getvalue()
+    assert "OUTSIDE" in msg and "extension_path" in msg and "not isolated" in msg.lower(), msg
+    # --in-place: no warning (an absolute path is expected against the real checkout).
+    err2 = io.StringIO()
+    with contextlib.redirect_stderr(err2):
+        _qa_mod._warn_abs_path_escapes_worktree(Path("/tmp/review-qa-wt-x"), True, cfg)
+    assert err2.getvalue() == ""
+    # A `..` TRAVERSAL also escapes the worktree and warns (not just absolute paths).
+    trav_cfg = types.SimpleNamespace(extension_path="../../other/ext", workspace="ws")
+    err_t = io.StringIO()
+    with contextlib.redirect_stderr(err_t):
+        _qa_mod._warn_abs_path_escapes_worktree(Path("/tmp/review-qa-wt-x"), False, trav_cfg)
+    assert "OUTSIDE" in err_t.getvalue(), err_t.getvalue()
+    # A purely-relative config that STAYS inside the worktree warns about nothing.
+    rel_cfg = types.SimpleNamespace(extension_path="ext", workspace="sub/ws")
+    err3 = io.StringIO()
+    with contextlib.redirect_stderr(err3):
+        _qa_mod._warn_abs_path_escapes_worktree(Path("/tmp/wt"), False, rel_cfg)
+    assert err3.getvalue() == ""
+    # The _path_escapes predicate directly.
+    assert _qa_mod._path_escapes(Path("/tmp/wt"), "/abs")
+    assert _qa_mod._path_escapes(Path("/tmp/wt"), "../up")
+    assert not _qa_mod._path_escapes(Path("/tmp/wt"), "in/side")
 
 
 # --- the 2-fixture DoD (deterministic, no VS Code): good -> PASS, buggy -> FAIL -------

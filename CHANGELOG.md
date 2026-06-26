@@ -5,6 +5,20 @@ semantic versioning.
 
 ## Unreleased
 
+- **qa ext harness hardening: a queue-backed stdout reader + an absolute-path isolation
+  warning (review-cli#75).** The ext runner's stdout is now drained by a dedicated reader
+  THREAD into a thread-safe queue (`_StdoutLineReader`), replacing the `select` + text-mode
+  `readline` in `_await_ready` / `_read_reply`. A text-mode pipe buffers ABOVE the OS fd, so
+  `select` could report "nothing to read" while a full line sat decoded in the buffer (a false
+  timeout) and `readline` could block past the deadline — the new reader always drains complete
+  lines and the consumer polls with its own deadline, so a silent-but-alive or mid-reply-dying
+  runner is bounded by the timeout, not the buffering. Separately, an ABSOLUTE `sut.ext`
+  `extension_path`/`workspace` silently escaped the isolated worktree (`cwd / abs` drops `cwd`)
+  while the docstring promised "relative to the run cwd"; `review qa` now WARNS that the ext run
+  is not isolated under the default (worktree) run (silent under `--in-place`, where an absolute
+  path is expected). Tests cover the reader unit, the `_read_reply` timeout/runner-death/noise-skip
+  paths against a fake runner, and the absolute-path warning. (Tier-2 visual screenshot-diffing
+  remains deferred — it needs screenshot-capture infra and is tracked in #75.)
 - **`review qa` now FORWARDS a `-m claude:<model>` / `-m codex:<model>` suffix to the tester
   spawn, and reaps the ephemeral-worktree trust entry it seeds (review-cli#60).** A model suffix
   used to be REJECTED as "not yet forwarded"; now `resolved_tester_model` extracts it (precedence:

@@ -831,28 +831,65 @@ def _drive_ext_in_isolation(
         _guard_in_place(backend="vscode-ext", in_place=True, sut_path=sut_path)
         return _launch_and_drive_ext(
             cwd=sut_path, sut_path=sut_path, suite_text=suite_text, ext_config=ext_config,
-            out_dir=out_dir, exit_blocked=exit_blocked,
+            out_dir=out_dir, exit_blocked=exit_blocked, in_place=True,
         )
     with IsolatedSut(sut_path) as worktree:
         return _launch_and_drive_ext(
             cwd=worktree, sut_path=sut_path, suite_text=suite_text, ext_config=ext_config,
-            out_dir=out_dir, exit_blocked=exit_blocked,
+            out_dir=out_dir, exit_blocked=exit_blocked, in_place=False,
         )
+
+
+def _path_escapes(cwd: Path, raw: str) -> bool:
+    """True iff resolving ``raw`` against ``cwd`` lands OUTSIDE ``cwd`` — i.e. it breaks the
+    worktree isolation. Catches BOTH an absolute path (``cwd / abs`` drops ``cwd``) AND a ``..``
+    traversal (``cwd / '../x'`` climbs out), so the check matches the real escape set, not just
+    the absolute case (review-cli#75)."""
+    try:
+        resolved = (cwd / raw).resolve()
+        root = cwd.resolve()
+    except (OSError, ValueError):
+        return False
+    return resolved != root and root not in resolved.parents
+
+
+def _warn_abs_path_escapes_worktree(cwd: Path, in_place: bool, ext_config) -> None:
+    """Warn when a ``sut.ext`` ``extension_path``/``workspace`` silently escapes the isolated
+    worktree — an ABSOLUTE path (``cwd / abs`` drops ``cwd``) OR a ``..`` traversal out of it.
+    Either resolves OUTSIDE the worktree even though the docstring promises "relative to the run
+    cwd", so VS Code would load the extension from the user's real checkout, not the isolated copy.
+    Only meaningful for the default (worktree) run; ``--in-place`` already runs in the SUT, so such
+    a path there is expected (review-cli#75)."""
+    import sys
+
+    if in_place:
+        return
+    for label, raw in (("extension_path", ext_config.extension_path),
+                       ("workspace", ext_config.workspace)):
+        if raw and _path_escapes(cwd, raw):
+            print(
+                f"[review-cli] qa: WARNING — sut.ext {label}={raw!r} resolves OUTSIDE the isolated "
+                f"worktree ({cwd}), so the ext run is NOT isolated (VS Code loads it from the real "
+                "path, not the worktree copy). Use a path relative to the SUT that stays inside it, "
+                "or pass --in-place if you intend to run against the real checkout.",
+                file=sys.stderr, flush=True,
+            )
 
 
 def _launch_and_drive_ext(
     *, cwd: Path, sut_path: Path, suite_text: str, ext_config, out_dir: Path | None,
-    exit_blocked: int,
+    exit_blocked: int, in_place: bool = False,
 ) -> str:
     """Launch the isolated VS Code (extension on ``--extensionDevelopmentPath``), drive the suite,
     and return the ``## QA RESULTS`` transcript — with GUARANTEED VS Code teardown (the session
     context manager). A launch failure yields a BLOCKED transcript (never a traceback). The
     extension_path / workspace are resolved against the actual run cwd so the isolated run loads
-    the committed extension."""
+    the committed extension; an ABSOLUTE config path escapes that isolation and is warned about."""
     import sys
 
     from ..qa.ext_driver import ExtRunResult, run_ext_test
 
+    _warn_abs_path_escapes_worktree(cwd, in_place, ext_config)
     workspace = (cwd / ext_config.workspace).resolve()
     extension_path = str((cwd / ext_config.extension_path).resolve())
     try:
