@@ -394,49 +394,72 @@ def test_tier1_web_ext_blocked_report_backend_label():
     assert "backend: vscode-ext" in etext and "hermetic-bot" not in etext, etext
 
 
-def test_tier1_web_ext_pass_report_backend_label():
-    """The HAPPY-path (non-blocked) Tier-1 web/ext report footer must ALSO carry the run's real
-    backend — ``playwright-web`` / ``vscode-ext`` — not the bot default. Stubs the gate available
-    and the isolation-drive as a PASS transcript (no real browser / VS Code), then reads the saved
-    footer. Pins the non-blocked label sites the BLOCKED-helper test doesn't reach (codex P2): a
-    re-hardcode of those two call sites to ``hermetic-bot`` would otherwise pass green."""
+def test_tier1_pass_report_backend_label():
+    """The HAPPY-path (non-blocked) Tier-1 report footer carries the run's real backend — bot
+    ``hermetic-bot``, web ``playwright-web``, ext ``vscode-ext`` — and never another kind's label.
+    For each kind: stub the availability gate present and the isolation-drive to return a PASS
+    transcript (no real bot / browser / VS Code), then assert the drive was ACTUALLY reached — a
+    per-kind called-flag + ``code == 0`` + the PASS marker — so the footer assertion can't be
+    satisfied by an accidental fall-through to the BLOCKED helper (which now writes the same web/ext
+    labels — codex P2). Covers the non-blocked label sites for all three kinds (claude #2); the
+    BLOCKED helpers are covered by ``test_tier1_web_ext_blocked_report_backend_label``."""
     import reviewlib.modes.qa as qamode
     import reviewlib.qa.ext_harness as ext_harness
     import reviewlib.qa.web_harness as web_harness
 
     pass_tail = (
-        "ran it.\n## QA RESULTS\nSUT: /s   KIND: web   BRING-UP: local\n"
+        "ran it.\n## QA RESULTS\nSUT: /s   KIND: x   BRING-UP: local\n"
         "CASES: 1 run, 1 passed, 0 failed, 0 blocked\n\n"
         "### FINDINGS\nno findings\n\n### BLOCKED\nnone\n\nVERDICT: PASS\n"
     )
+    called = {"bot": False, "web": False, "ext": False}
+
+    def _stub_drive(kind):
+        def _drive(**_k):
+            called[kind] = True
+            return pass_tail
+        return _drive
+
     saved = {
         (web_harness, "playwright_available"): web_harness.playwright_available,
         (ext_harness, "vscode_available"): ext_harness.vscode_available,
+        (qamode, "_drive_bot_in_isolation"): qamode._drive_bot_in_isolation,
         (qamode, "_drive_web_in_isolation"): qamode._drive_web_in_isolation,
         (qamode, "_drive_ext_in_isolation"): qamode._drive_ext_in_isolation,
     }
     web_harness.playwright_available = lambda: (True, "")
     ext_harness.vscode_available = lambda: (True, "")
-    qamode._drive_web_in_isolation = lambda **_k: pass_tail
-    qamode._drive_ext_in_isolation = lambda **_k: pass_tail
+    qamode._drive_bot_in_isolation = _stub_drive("bot")
+    qamode._drive_web_in_isolation = _stub_drive("web")
+    qamode._drive_ext_in_isolation = _stub_drive("ext")
+
+    # Tier-1 configs (is_live is False — driver-determined, not env-determined — so no live env is
+    # needed or set here).
+    runs = [
+        ("bot", qamode._run_bot_hermetic, "bot_config",
+         BotConfig(driver="mock", command=("x",)), "hermetic-bot"),
+        ("web", qamode._run_web_deterministic, "web_config",
+         WebConfig(driver="playwright", base_url="http://127.0.0.1:8080"), "playwright-web"),
+        ("ext", qamode._run_ext_deterministic, "ext_config",
+         ExtConfig(driver="vscode"), "vscode-ext"),
+    ]
+    all_labels = {"hermetic-bot", "playwright-web", "vscode-ext"}
     try:
-        web_cfg = WebConfig(driver="playwright", base_url="http://127.0.0.1:8080")
-        with _scratch() as out, _env(**_ALL_LIVE_VARS):
-            args = _FullArgs(kind="web")
-            args.report = str(out / "w.md")
-            qamode._run_web_deterministic(_Ctx(args), out, [], web_config=web_cfg, exit_blocked=8)
-            wtext = Path(args.report).read_text(encoding="utf-8")
-        ext_cfg = ExtConfig(driver="vscode")
-        with _scratch() as out, _env(**_ALL_LIVE_VARS):
-            args = _FullArgs(kind="ext")
-            args.report = str(out / "e.md")
-            qamode._run_ext_deterministic(_Ctx(args), out, [], ext_config=ext_cfg, exit_blocked=8)
-            etext = Path(args.report).read_text(encoding="utf-8")
+        for kind, handler, cfg_kw, cfg, label in runs:
+            with _scratch() as out:
+                args = _FullArgs(kind=kind)
+                args.report = str(out / "r.md")
+                code = handler(_Ctx(args), out, [], exit_blocked=8, **{cfg_kw: cfg})
+                text = Path(args.report).read_text(encoding="utf-8")
+            assert called[kind], f"{kind} happy-path drive not reached (fell through to BLOCKED?)"
+            assert code == 0, (kind, code)
+            assert "ran it." in text and "VERDICT: PASS" in text, kind  # the PASS path, not BLOCKED
+            assert f"backend: {label}" in text, (kind, text)
+            for other in all_labels - {label}:
+                assert f"backend: {other}" not in text, (kind, other)
     finally:
         for (mod, name), real in saved.items():
             setattr(mod, name, real)
-    assert "backend: playwright-web" in wtext and "hermetic-bot" not in wtext, wtext
-    assert "backend: vscode-ext" in etext and "hermetic-bot" not in etext, etext
 
 
 # --- the SELECTOR routes a tier:live block to the live path (not None → not the executor) ------
