@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import json
 import os
-import select
 import shutil
 import signal
 import subprocess
@@ -203,9 +202,12 @@ class ShellRunnerAutomation:
     ``ready``, yields this automation, and ALWAYS terminates the runner's process GROUP (reaping
     the Electron tree). A launch failure raises ``ExtHarnessError`` (a controlled BLOCKED)."""
 
-    def __init__(self, proc: subprocess.Popen, stderr_tail: _StderrTail):
+    def __init__(
+        self, proc: subprocess.Popen, stderr_tail: _StderrTail, stdout_reader: _StdoutLineReader,
+    ):
         self._proc = proc
         self._stderr_tail = stderr_tail
+        self._stdout_reader = stdout_reader
         self._next_id = 0
         self._lock = threading.Lock()
 
@@ -263,26 +265,21 @@ class ShellRunnerAutomation:
         The runner is expected to answer in order, so a generous per-action timeout bounds a hung
         extension without flakiness."""
         deadline = time.monotonic() + ACTION_TIMEOUT_S
-        stdout = self._proc.stdout
-        if stdout is None:
-            raise ExtActionError("the VS Code runner has no stdout to read the reply from")
         while time.monotonic() < deadline:
-            if self._proc.poll() is not None:
+            # A runner that exited AND whose stdout is fully drained can never answer — fail now
+            # rather than wait out the timeout. We require at_eof too: the runner may have written
+            # the reply and exited, with the line still buffered in the reader's queue.
+            if self._proc.poll() is not None and self._stdout_reader.at_eof:
                 raise ExtActionError(
                     f"the VS Code runner exited before answering {op!r}. "
                     f"stderr tail:\n{self._stderr_tail.text()}"
                 )
-            # select() so a runner that holds the pipe OPEN but never replies (a hung extension,
-            # not a crash) cannot block ``readline`` past the deadline — without this the loop's
-            # deadline check would never be reached on a silent-but-alive runner (the case poll()
-            # does NOT catch). A short per-wait keeps the loop responsive to both the deadline and
-            # a mid-run runner death.
-            ready, _, _ = select.select([stdout], [], [], 0.2)
-            if not ready:
-                continue
-            line = stdout.readline()
-            if not line:
-                time.sleep(0.02)
+            # The reader THREAD owns stdout and drains complete lines into a queue; next_line()
+            # blocks at most its timeout, so a runner that holds the pipe OPEN but never replies (a
+            # hung extension, not a crash) is bounded by the per-action deadline — without the text-
+            # mode select/readline buffering footgun this used to have (review-cli#75).
+            line = self._stdout_reader.next_line(0.2)
+            if line is None:
                 continue
             try:
                 msg = json.loads(line)
@@ -327,6 +324,56 @@ class _StderrTail:
         return text[-limit:] or "(no runner output captured)"
 
 
+class _StdoutLineReader:
+    """Drains the runner's stdout in a daemon thread into a thread-safe queue, one line per item.
+
+    Why a reader THREAD and not ``select`` + ``readline`` on the stream: the runner's stdout is a
+    TEXT-mode pipe (``text=True``). ``select`` watches the OS-level fd, but Python's text wrapper
+    has its OWN buffer ABOVE that fd — a full line can already sit decoded in that buffer while
+    ``select`` reports "nothing to read" (a false timeout), and a ``readline`` issued anyway can
+    block past the deadline waiting on the OS pipe. A dedicated thread doing blocking ``readline``
+    sidesteps both: it always drains complete lines, and the consumer polls the queue with its OWN
+    deadline (``next_line(timeout)``) — so a silent-but-alive runner is bounded by the timeout, not
+    by the buffering (review-cli#75). EOF (runner stdout closed) is recorded so a consumer can stop
+    waiting. Mirrors ``_StderrTail``'s drain-in-a-daemon-thread shape."""
+
+    def __init__(self, stream):
+        import queue
+
+        self._q: "queue.Queue[str]" = queue.Queue()
+        self._eof = threading.Event()
+        self._thread = threading.Thread(target=self._drain, args=(stream,), daemon=True)
+        if stream is not None:
+            self._thread.start()
+        else:
+            self._eof.set()
+
+    def _drain(self, stream) -> None:
+        try:
+            for line in stream:  # blocking readline loop — complete lines only
+                self._q.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._eof.set()
+
+    def next_line(self, timeout: float) -> "str | None":
+        """The next stdout line, or ``None`` when none arrives within ``timeout`` seconds. Does
+        NOT raise on EOF — the caller checks ``proc.poll()`` to distinguish a dead runner from a
+        merely-quiet one (the queue may still hold buffered lines after EOF)."""
+        import queue
+
+        try:
+            return self._q.get(timeout=max(timeout, 0.0))
+        except queue.Empty:
+            return None
+
+    @property
+    def at_eof(self) -> bool:
+        """True once the stdout stream has closed AND every drained line has been consumed."""
+        return self._eof.is_set() and self._q.empty()
+
+
 class _VSCodeSession:
     """Owns the TS runner subprocess (and through it the Electron VS Code) for one ext run.
     Created via ``vscode_session``; ``__exit__`` terminates the runner's process GROUP so the
@@ -343,6 +390,7 @@ class _VSCodeSession:
         self._extra_env = extra_env or {}
         self._proc: subprocess.Popen | None = None
         self._stderr_tail: _StderrTail | None = None
+        self._stdout_reader: _StdoutLineReader | None = None
 
     def __enter__(self) -> ShellRunnerAutomation:
         runner_cmd = _runner_command()
@@ -379,8 +427,11 @@ class _VSCodeSession:
                 exit_code=self._exit_blocked,
             ) from exc
         self._stderr_tail = _StderrTail(self._proc.stderr)
+        # One stdout reader for the whole session — used by _await_ready AND handed to the
+        # automation, so a single thread owns the stream (two readers would race on readline).
+        self._stdout_reader = _StdoutLineReader(self._proc.stdout)
         self._await_ready()
-        return ShellRunnerAutomation(self._proc, self._stderr_tail)
+        return ShellRunnerAutomation(self._proc, self._stderr_tail, self._stdout_reader)
 
     def _await_ready(self) -> None:
         """Block (bounded by ``LAUNCH_TIMEOUT_S``) until the runner emits ``{"type":"ready"}`` on
@@ -388,25 +439,22 @@ class _VSCodeSession:
         ready raises ``ExtHarnessError`` with its stderr tail, so a launch crash is a diagnosable
         BLOCKED, not a hang."""
         assert self._proc is not None and self._stderr_tail is not None
+        assert self._stdout_reader is not None
         deadline = time.monotonic() + LAUNCH_TIMEOUT_S
-        stdout = self._proc.stdout
         while time.monotonic() < deadline:
-            if self._proc.poll() is not None:
+            if self._proc.poll() is not None and self._stdout_reader.at_eof:
                 raise ExtHarnessError(
                     "the VS Code runner exited before signalling ready (launch failed). "
                     f"stderr tail:\n{self._stderr_tail.text()}",
                     exit_code=self._exit_blocked,
                 )
-            # select() so a runner that stays ALIVE but emits no stdout before `ready` (a wedged
-            # VS Code launch, a custom REVIEW_QA_EXT_RUNNER that hangs) cannot block ``readline``
-            # past the deadline — without this the LAUNCH_TIMEOUT_S check would never be reached on
-            # a silent-but-alive runner (the case poll() does NOT catch), so `review qa` would hang
-            # instead of a controlled BLOCKED + process-group teardown (codex PR review P2).
-            if stdout is None or not select.select([stdout], [], [], 0.05)[0]:
-                continue
-            line = stdout.readline()
-            if not line:
-                time.sleep(0.05)
+            # A reader THREAD drains stdout into a queue, so a runner that stays ALIVE but emits no
+            # stdout before `ready` (a wedged VS Code launch, a custom REVIEW_QA_EXT_RUNNER that
+            # hangs) cannot block past the deadline — next_line() returns None on its own timeout and
+            # the LAUNCH_TIMEOUT_S check fires, giving a controlled BLOCKED + process-group teardown
+            # instead of a hang (codex PR review P2 + the buffered-readline fix, review-cli#75).
+            line = self._stdout_reader.next_line(0.05)
+            if line is None:
                 continue
             try:
                 msg = json.loads(line)
