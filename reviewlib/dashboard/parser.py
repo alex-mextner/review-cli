@@ -789,6 +789,12 @@ _CACHE_LOCK = threading.Lock()
 # key -> (signature, sessions). Key = (resolved dir str, gap). Bounded implicitly: one entry
 # per (dir, gap) the server actually serves — a handful in practice (default gap + any ?gap=).
 _SESSIONS_CACHE: dict[tuple[str, float], tuple[tuple[int, float], list[Session]]] = {}
+# Same key/signature scheme as _SESSIONS_CACHE, holding the PURE `compute_stats` aggregate. The
+# `/api/stats` handler's per-request `compute_stats` re-aggregated ~590 sessions / ~30k calls
+# (and fans out into `compute_model_health`) on a warm session cache — ~8.5s every load, which
+# `loadAll()`'s Promise.all blocked render on. Memoised on the same signature so the stats
+# invalidate EXACTLY when the sessions do. Cleared together by `invalidate_sessions_cache`.
+_STATS_CACHE: dict[tuple[str, float], tuple[tuple[int, float], dict]] = {}
 
 
 def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
@@ -841,10 +847,47 @@ def load_sessions_cached(
     return sessions
 
 
+def compute_stats_cached(
+    sessions: list[Session],
+    log_dir_path: Path,
+    gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS,
+) -> dict:
+    """Cached wrapper over `compute_stats`, keyed identically to `load_sessions_cached`:
+    (resolved dir, gap) + the cheap stat-only dir signature. Returns the memoised aggregate when
+    the dir is unchanged, re-aggregating only when the signature moves — so stats invalidate
+    exactly when the sessions they summarise do. Thread-safe (the dashboard's ThreadingHTTPServer
+    serves many threads); the multi-second aggregation runs OUTSIDE the lock like the session
+    parse does. `sessions` must be the SAME parse returned by `load_sessions_cached` for this
+    (dir, gap) — they share the signature contract.
+
+    The `/api/stats` handler layers per-request annotation counts (conscious_count /
+    feedback_count) on top of the result. To keep the cached aggregate pristine no matter how a
+    caller treats the return value, this hands back a SHALLOW COPY each call — top-level keys
+    only, microseconds, nowhere near the multi-second aggregation — so adding/overwriting a
+    top-level key can never accumulate into the shared cache. Nested values are shared (the
+    handler only adds new scalar keys, never mutates nested ones)."""
+    key = (str(log_dir_path.resolve()), gap_seconds)
+    signature = _dir_signature(log_dir_path)
+    with _CACHE_LOCK:
+        cached = _STATS_CACHE.get(key)
+        if cached is not None and cached[0] == signature:
+            return dict(cached[1])
+    # Aggregate OUTSIDE the lock: a cold compute is multi-second (it re-walks every call and
+    # fans into compute_model_health). Holding the lock would serialise all stat requests
+    # behind it. A concurrent duplicate compute on a cold cache is wasteful but correct.
+    stats = compute_stats(sessions)
+    with _CACHE_LOCK:
+        _STATS_CACHE[key] = (signature, stats)
+    return dict(stats)
+
+
 def invalidate_sessions_cache() -> None:
-    """Drop all memoised sessions. For tests and for a future explicit-refresh affordance."""
+    """Drop all memoised sessions AND their derived stats. Clearing both keeps the two caches
+    coherent (a stale stats aggregate must never outlive the sessions it summarised). For tests
+    and for a future explicit-refresh affordance."""
     with _CACHE_LOCK:
         _SESSIONS_CACHE.clear()
+        _STATS_CACHE.clear()
 
 
 def compute_stats(sessions: list[Session]) -> dict:

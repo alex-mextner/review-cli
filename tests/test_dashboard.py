@@ -505,6 +505,101 @@ def test_load_sessions_cached_parses_once_then_invalidates_on_change():
             p.invalidate_sessions_cache()
 
 
+def test_compute_stats_cached_aggregates_once_then_invalidates_on_change():
+    """`/api/stats` was STILL ~8.5s on a warm session cache: the sessions came back fast, but the
+    handler then re-ran the PURE ``compute_stats`` (re-aggregating ~590 sessions / ~30k calls,
+    which also fans out into ``compute_model_health``) on EVERY request. ``compute_stats_cached``
+    memoises the aggregate on the SAME (resolved dir, gap) + cheap dir signature as
+    ``load_sessions_cached``, so repeated stat requests on an unchanged dir reuse the aggregate,
+    yet a new/grown/removed log invalidates both caches together (live activity stays honest).
+    """
+    from reviewlib.dashboard import parser as p
+
+    compute_calls = {"n": 0}
+    real_compute_stats = p.compute_stats
+
+    def _counting_compute(sessions):  # spy on the heavy pure aggregation
+        compute_calls["n"] += 1
+        return real_compute_stats(sessions)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.compute_stats = _counting_compute
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+
+            sessions = p.load_sessions_cached(ld, gap_seconds=90)
+
+            first = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 1, f"expected one aggregation, got {compute_calls['n']}"
+            assert first["session_count"] == 1, first
+
+            # Second call on the UNCHANGED dir must hit the cache: no further aggregation.
+            second = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 1, (
+                f"cache miss: re-aggregated on an unchanged dir ({compute_calls['n']} > 1)"
+            )
+            assert second["session_count"] == first["session_count"]
+
+            # The handler layers annotation counts ON TOP of the returned stats. That mutation
+            # must NOT pollute the cached aggregate across requests (no key accumulation / no
+            # leaked counts). Simulate the handler twice on the SAME cached dict identity.
+            handler_view_1 = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            handler_view_1["conscious_count"] = 3
+            handler_view_1["feedback_count"] = 7
+            handler_view_2 = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert "conscious_count" not in handler_view_2, (
+                "cached stats polluted: handler annotation leaked into the cache"
+            )
+            assert "feedback_count" not in handler_view_2, (
+                "cached stats polluted: handler annotation leaked into the cache"
+            )
+            assert compute_calls["n"] == 1, "annotation layering forced a needless re-aggregation"
+
+            # A NEW log (a live review streaming in) must change the cheap signature and force a
+            # fresh aggregation — stats must invalidate exactly when sessions do.
+            _write_call_log(ld, "20260601T120000_000000", "claude", 0, "later run\n", exit_code=0)
+            fresh_sessions = p.load_sessions_cached(ld, gap_seconds=90)
+            third = p.compute_stats_cached(fresh_sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 2, "stats cache failed to invalidate after a new log"
+            assert third["session_count"] == 2, third
+        finally:
+            p.compute_stats = real_compute_stats
+            p.invalidate_sessions_cache()
+
+
+def test_invalidate_sessions_cache_also_clears_stats():
+    """``invalidate_sessions_cache`` must drop BOTH the sessions and the stats memo, so an
+    explicit refresh / a test reset leaves no stale aggregate behind (coherence)."""
+    from reviewlib.dashboard import parser as p
+
+    compute_calls = {"n": 0}
+    real_compute_stats = p.compute_stats
+
+    def _counting_compute(sessions):
+        compute_calls["n"] += 1
+        return real_compute_stats(sessions)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.compute_stats = _counting_compute
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            sessions = p.load_sessions_cached(ld, gap_seconds=90)
+            p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 1
+            # Explicit invalidation must force a re-aggregation on the next call.
+            p.invalidate_sessions_cache()
+            p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 2, "stats cache survived invalidate_sessions_cache()"
+        finally:
+            p.compute_stats = real_compute_stats
+            p.invalidate_sessions_cache()
+
+
 def test_panel_session_surfaces_recorded_invocations_as_prompt():
     """A non-brainstorm panel run has no topic; Session.invocations must surface the DISTINCT
     recorded argv0 lines and to_summary must expose them as `invocations`, so the Prompts panel

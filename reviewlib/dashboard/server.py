@@ -594,6 +594,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # render slow even with /api/runs cached. Copy before layering store rollups so
                 # the per-request annotation counts never mutate the memoized stats dict.
                 stats = dict(_cached_stats(self._gap(qs)))
+                # Tasks/overseer rollups come from the store, layered on top of stats.
                 anns = dstore.all_annotations()
                 stats["conscious_count"] = sum(1 for a in anns.values() if a.get("conscious"))
                 stats["feedback_count"] = sum(1 for a in anns.values() if a.get("feedback"))
