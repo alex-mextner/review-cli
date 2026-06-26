@@ -1144,6 +1144,84 @@ def _ensure_workspace_trusted(cwd: Path) -> None:
                 lock.close()
 
 
+# The exact flag set `_ensure_workspace_trusted` seeds. An entry holding ONLY these (a subset is
+# fine) is one review created and nothing else enriched — safe to reap. Any EXTRA key means a
+# real claude session touched it, so we leave it.
+_REVIEW_SEEDED_TRUST_KEYS = frozenset({"hasTrustDialogAccepted", "hasCompletedProjectOnboarding"})
+
+
+def _is_review_seeded_trust_entry(entry: object) -> bool:
+    """True iff ``entry`` looks like an entry review SEEDED and nothing else enriched: a dict
+    whose keys are a subset of the trust/onboarding flags review writes. A larger entry (extra
+    keys from a real interactive session) returns False so we never delete a user's real data."""
+    return isinstance(entry, dict) and set(entry).issubset(_REVIEW_SEEDED_TRUST_KEYS)
+
+
+def _remove_workspace_trust(cwd: Path) -> None:
+    """Remove a previously-seeded workspace-trust entry for ``cwd`` from ~/.claude.json.
+
+    The inverse of ``_ensure_workspace_trusted``: qa seeds a trust entry for each EPHEMERAL
+    throwaway worktree it spawns the claude tester in (a fresh worktree is untrusted and the
+    headless gate blocks on it). The worktree is deleted on exit, but its persisted
+    ``projects[<realpath>]`` trust entry is NOT — so over many default qa runs ~/.claude.json
+    accumulates trusted ``/tmp/review-qa-wt-*`` paths that no longer exist (review-cli#60). Call
+    this after the run to drop the one entry, keyed by the SAME realpath the seed used.
+
+    Best-effort and conservative (mirrors the seed): only ever removes the ONE project key, uses
+    the same flock + atomic os.replace, and silently degrades on any error. It removes the entry
+    ONLY when it still holds just the flags review seeds — if a later real interactive claude
+    session enriched it, the entry is LEFT intact so we reap only what we created."""
+    cfg = Path.home() / ".claude.json"
+    if not cfg.exists():
+        return
+    key = os.path.realpath(str(cwd))
+    lock = None
+    flock_mod = None
+    try:
+        try:
+            import fcntl as flock_mod
+        except ImportError:
+            flock_mod = None
+        if flock_mod is not None:
+            try:
+                lock = open(cfg.with_name(".claude.json.review-trust.lock"), "w")
+                flock_mod.flock(lock.fileno(), flock_mod.LOCK_EX)
+            except OSError:
+                if lock is not None:
+                    lock.close()
+                lock = None
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        projects = data.get("projects")
+        if not isinstance(projects, dict) or key not in projects:
+            return  # nothing seeded for this path — nothing to reap
+        if not _is_review_seeded_trust_entry(projects.get(key)):
+            return  # the entry grew beyond what review seeds — leave it untouched
+        del projects[key]
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=str(cfg.parent), prefix=".claude.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, cfg)
+        except Exception:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    except Exception:
+        return
+    finally:
+        if lock is not None:
+            try:
+                if flock_mod is not None:
+                    flock_mod.flock(lock.fileno(), flock_mod.LOCK_UN)
+            finally:
+                lock.close()
+
+
 # Tools the read-only review seat must never invoke. Shared by the direct `claude`
 # argv and the legacy `claude-p` argv so the two can't drift.
 _CLAUDE_DISALLOWED_TOOLS = (

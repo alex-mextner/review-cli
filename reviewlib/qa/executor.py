@@ -408,6 +408,20 @@ def _git_argv(*args: str) -> list[str]:
     return [_which("git"), "-c", "core.hooksPath=/dev/null", *args]
 
 
+# The mkdtemp prefix for an EPHEMERAL qa worktree. Used both to mint the worktree (IsolatedSut)
+# and to recognise one when deciding whether to reap its seeded trust entry — so the reap only
+# ever touches a throwaway dir review created, NEVER the user's real `--in-place` checkout.
+_QA_WORKTREE_PREFIX = "review-qa-wt-"
+
+
+def _is_ephemeral_qa_worktree(cwd: Path) -> bool:
+    """True iff ``cwd`` lives under an ephemeral qa worktree (a ``review-qa-wt-*`` temp dir).
+    The seed/reap of the claude trust entry must only act on these throwaway dirs — under
+    ``--in-place`` the cwd is the user's REAL checkout, whose trust entry we must never delete
+    (review-cli#60)."""
+    return any(part.startswith(_QA_WORKTREE_PREFIX) for part in cwd.parts)
+
+
 class IsolatedSut:
     """A throwaway ``git worktree`` of the SUT, removed on every exit path.
 
@@ -445,7 +459,7 @@ class IsolatedSut:
         rel = self._sut_relpath_in_repo()
         parent = self.base_dir or Path(tempfile.gettempdir())
         parent.mkdir(parents=True, exist_ok=True)
-        self.worktree_path = Path(tempfile.mkdtemp(prefix="review-qa-wt-", dir=str(parent)))
+        self.worktree_path = Path(tempfile.mkdtemp(prefix=_QA_WORKTREE_PREFIX, dir=str(parent)))
         # mkdtemp made the dir; `git worktree add` needs it to NOT exist, so remove it first.
         shutil.rmtree(self.worktree_path, ignore_errors=True)
         # `_run(timeout=120)` can RAISE TimeoutExpired (a wedged git) — NOT just return
@@ -627,6 +641,29 @@ def resolved_tester_backend(models: "list[str] | None" = None) -> str:
     return "claude"
 
 
+def resolved_tester_model(models: "list[str] | None" = None) -> "str | None":
+    """The concrete MODEL id to pass to the resolved tester backend, or ``None`` for the
+    backend's own default.
+
+    Precedence mirrors the backend resolution: ``REVIEW_QA_TESTER_MODEL`` env (the documented
+    primary) > a ``-m claude:<model>`` / ``-m codex:<model>`` SUFFIX matching the resolved
+    backend > ``None`` (the backend default). So ``review qa -m claude:claude-opus-4-8`` runs
+    the claude tester ON opus instead of silently dropping the suffix (review-cli#60), and
+    ``REVIEW_QA_TESTER=codex REVIEW_QA_TESTER_MODEL=gpt-5.5`` pins codex's model. A suffix on a
+    `-m` whose backend is NOT the resolved one (e.g. `-m codex:x` while the env forces claude)
+    does not apply — the env-chosen backend wins and the mismatched suffix is ignored, matching
+    the backend-precedence rule above."""
+    backend = resolved_tester_backend(models)
+    env_model = os.environ.get("REVIEW_QA_TESTER_MODEL", "").strip()
+    if env_model:
+        return env_model
+    for m in models or []:
+        head, _, suffix = m.partition(":")
+        if head.strip().lower() == backend and suffix.strip():
+            return suffix.strip()
+    return None
+
+
 _SUPPORTED_TESTERS = ("claude", "codex")
 
 
@@ -653,21 +690,20 @@ def validate_tester_choice(models: "list[str] | None" = None) -> None:
                 f"-m {m!r} names {head!r}, which qa cannot use as a tester. "
                 f"qa supports only: {', '.join(_SUPPORTED_TESTERS)} (opencode is not in v1)."
             )
-        # A model SUFFIX (`-m claude:claude-opus-4-8`) is not yet forwarded to the qa spawn
-        # (tracked as a follow-up). Reject it rather than SILENTLY running the backend's
-        # default model — a surprising model/cost decision (review finding). `-m claude` /
-        # `-m codex` (no suffix) is the supported form.
-        if ":" in m:
-            raise UnsupportedTesterError(
-                f"-m {m!r}: qa does not yet forward a model suffix to the tester. Use the "
-                f"bare seat ({head!r}) — `-m {head}` — or set REVIEW_QA_TESTER={head}."
-            )
+        # A model SUFFIX (`-m claude:claude-opus-4-8`) IS forwarded to the spawn now
+        # (review-cli#60): `claude --model <m>` / `codex -m <m>`. A suffix on a supported backend
+        # is valid; a suffix on an unsupported one is already rejected by the head check above.
 
 
-def _spawn_claude_writeexec(prompt: str, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
+def _spawn_claude_writeexec(
+    prompt: str, cwd: Path, timeout: int, model: str | None = None,
+) -> subprocess.CompletedProcess:
     """Spawn Claude Code headless UN-CAGED in ``cwd`` — the deliberate inverse of the
     read-only ``review_claude_cli`` spawn (``backends.py:1175``). NO ``--disallowedTools``,
     NO ``--tools ''``: the tester needs bash + write to bring a SUT up and drive it.
+
+    ``model`` (review-cli#60): when given, ``--model <model>`` pins the tester's model (e.g.
+    ``review qa -m claude:claude-opus-4-8``); ``None`` uses claude-p's own default model.
 
     Permission mode. A headless agent cannot answer an interactive tool-approval prompt, so a
     mode that still GATES bash (``acceptEdits`` auto-accepts only file edits) deadlocks the
@@ -685,7 +721,7 @@ def _spawn_claude_writeexec(prompt: str, cwd: Path, timeout: int) -> subprocess.
     # headless safety gate BLOCKS on an untrusted folder — so without this, bare
     # `review qa` (default claude seat) could hang/fail on the trust prompt before testing
     # (review P1). qa makes a new temp worktree every run, so this is load-bearing here.
-    from ..backends import _ensure_workspace_trusted
+    from ..backends import _ensure_workspace_trusted, _remove_workspace_trust
 
     _ensure_workspace_trusted(cwd)
     argv = [
@@ -722,12 +758,23 @@ def _spawn_claude_writeexec(prompt: str, cwd: Path, timeout: int) -> subprocess.
         # plumbing deterministically regardless of which live backend is installed.
         "--output-format", "json",
         "--timeout-sec", str(timeout),
+        # Forward an explicit model when one was requested (`-m claude:<model>` /
+        # REVIEW_QA_TESTER_MODEL); otherwise claude-p uses its own default (review-cli#60).
+        *(["--model", model] if model else []),
         "-p",
     ]
-    proc = _run_streamed(
-        argv, cwd=cwd, input_text=prompt, timeout=timeout + 30,
-        backend="qa-claude", round_no=0, announce=True,
-    )
+    try:
+        proc = _run_streamed(
+            argv, cwd=cwd, input_text=prompt, timeout=timeout + 30,
+            backend="qa-claude", round_no=0, announce=True,
+        )
+    finally:
+        # Reap the trust entry we seeded — but ONLY for an EPHEMERAL `review-qa-wt-*` worktree, so
+        # ~/.claude.json doesn't accumulate dead paths (review-cli#60). Under `--in-place` the cwd
+        # is the user's REAL checkout; reaping there would delete the trust THEY rely on, so it is
+        # skipped. In `finally` so a crashed / timed-out tester still cleans up. Best-effort.
+        if _is_ephemeral_qa_worktree(cwd):
+            _remove_workspace_trust(cwd)
     return _completed_with_text(proc, _extract_claude_final_text(proc.stdout))
 
 
@@ -779,18 +826,24 @@ def _result_text_from_json(data: object) -> str | None:
     return None
 
 
-def _spawn_codex_writeexec(prompt: str, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
+def _spawn_codex_writeexec(
+    prompt: str, cwd: Path, timeout: int, model: str | None = None,
+) -> subprocess.CompletedProcess:
     """Spawn codex UN-CAGED in ``cwd`` — ``codex exec -s workspace-write --full-auto``, the
     explicit opposite of ``review_codex``'s ``-s read-only`` (``backends.py:74``). The
     prompt goes on stdin (``-``). codex has no internal ``--timeout-sec`` flag, so the
     wall-clock budget is the ``_run_streamed`` timeout; give it the same ``+30`` grace the
     claude spawn gets so a long run isn't SIGKILLed exactly at the budget WHILE the agent is
-    writing its final ``## QA RESULTS`` block (review finding)."""
+    writing its final ``## QA RESULTS`` block (review finding).
+
+    ``model`` (review-cli#60): when given, ``-m <model>`` pins codex's model (e.g.
+    ``review qa -m codex:gpt-5.5``); ``None`` uses codex's own default."""
     # --ephemeral, like the read-only codex backend (backends.py:74): a qa prompt carries
     # suite text, logs, and SUT details — without ephemeral mode the run persists in codex
     # session state and could contaminate a later run (review security finding).
     argv = [
         _which("codex"), "exec", "-s", "workspace-write", "--full-auto", "--ephemeral",
+        *(["-m", model] if model else []),
         "-C", str(cwd), "-",
     ]
     return _run_streamed(
@@ -879,6 +932,7 @@ def run_tester(
     in_place: bool = False,
     report_path: Path | None = None,
     backend: str | None = None,
+    model: str | None = None,
 ) -> QaRunOutcome:
     """Run ONE write/exec tester against the SUT and return the parsed outcome.
 
@@ -907,11 +961,11 @@ def run_tester(
     started = time.monotonic()
     try:
         if in_place:
-            proc = _dispatch_tester(backend, prompt_builder(sut_path), sut_path, timeout)
+            proc = _dispatch_tester(backend, prompt_builder(sut_path), sut_path, timeout, model)
         else:
             with IsolatedSut(sut_path) as worktree:
-                proc = _dispatch_tester(backend, prompt_builder(worktree), worktree, timeout)
-        outcome = _build_outcome(proc, backend=backend, wall=time.monotonic() - started)
+                proc = _dispatch_tester(backend, prompt_builder(worktree), worktree, timeout, model)
+        outcome = _build_outcome(proc, backend=backend, wall=time.monotonic() - started, model=model)
     except (RuntimeError, OSError) as exc:
         # The backend could not be LAUNCHED (missing `claude-p`/`codex` -> `_which` RuntimeError;
         # a Popen/exec OSError). "Couldn't run the tester" must be a controlled non-zero qa
@@ -998,22 +1052,29 @@ def _guard_in_place(*, backend: str, in_place: bool, sut_path: Path) -> None:
         )
 
 
-def _dispatch_tester(backend: str, prompt: str, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
+def _dispatch_tester(
+    backend: str, prompt: str, cwd: Path, timeout: int, model: str | None = None,
+) -> subprocess.CompletedProcess:
     if _fake_tester_enabled():
         return _fake_tester_run(prompt, cwd)
     if backend == "codex":
-        return _spawn_codex_writeexec(prompt, cwd, timeout)
-    return _spawn_claude_writeexec(prompt, cwd, timeout)
+        return _spawn_codex_writeexec(prompt, cwd, timeout, model)
+    return _spawn_claude_writeexec(prompt, cwd, timeout, model)
 
 
-def _build_outcome(proc: subprocess.CompletedProcess, *, backend: str, wall: float) -> QaRunOutcome:
+def _build_outcome(
+    proc: subprocess.CompletedProcess, *, backend: str, wall: float, model: str | None = None,
+) -> QaRunOutcome:
     transcript = proc.stdout or ""
     verdict, findings, max_sev, cases = parse_qa_results(transcript)
     cases_run = cases.get("run")
     verdict = _honor_pass_only_with_cases(verdict, cases_run)
     verdict = _reconcile_pass_with_case_tally(verdict, cases)
     verdict = _downgrade_on_backend_failure(verdict, proc.returncode)
-    model = "codex" if backend == "codex" else "claude"
+    # The recorded model: the forwarded suffix (`claude:claude-opus-4-8` -> `claude-opus-4-8`)
+    # when one was passed, else the backend's own default label. Keeps the run-stats/report
+    # honest about which model actually ran (review-cli#60).
+    model = model or ("codex" if backend == "codex" else "claude")
     return QaRunOutcome(
         verdict=verdict, findings=findings, max_severity=max_sev,
         transcript=transcript, backend=backend, model=model,

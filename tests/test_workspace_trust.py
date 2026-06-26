@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib import backends as _backends  # noqa: E402
-from reviewlib.backends import _ensure_workspace_trusted  # noqa: E402
+from reviewlib.backends import _ensure_workspace_trusted, _remove_workspace_trust  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -185,6 +185,68 @@ def test_review_claude_does_not_trust_when_claude_cli_is_missing():
                 _backends._which_optional = old_which
             # No trust granted on a run that never launched the CLI.
             assert cfg.read_text() == before
+
+
+def test_remove_trust_reaps_a_review_seeded_entry():
+    """The seed/reap round-trip: _ensure_workspace_trusted adds an entry, _remove_workspace_trust
+    drops it — so an ephemeral qa worktree leaves no dead trust path behind (review-cli#60)."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        with _home(tmp) as home:
+            cfg = home / ".claude.json"
+            cfg.write_text(json.dumps({"projects": {}}))
+            proj = tmp / "wt"
+            proj.mkdir()
+            key = os.path.realpath(str(proj))
+            _ensure_workspace_trusted(proj)
+            assert key in json.loads(cfg.read_text())["projects"]
+            _remove_workspace_trust(proj)
+            assert key not in json.loads(cfg.read_text())["projects"]
+
+
+def test_remove_trust_leaves_an_enriched_entry_intact():
+    """If a real interactive claude session enriched the entry (extra keys beyond the trust
+    flags review seeds), reap LEAVES it — we only delete what we created (no data loss)."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        with _home(tmp) as home:
+            proj = tmp / "wt"
+            proj.mkdir()
+            key = os.path.realpath(str(proj))
+            cfg = home / ".claude.json"
+            enriched = {"hasTrustDialogAccepted": True, "history": ["x"], "mcpServers": {}}
+            cfg.write_text(json.dumps({"projects": {key: enriched}}))
+            _remove_workspace_trust(proj)
+            assert json.loads(cfg.read_text())["projects"][key] == enriched
+
+
+def test_remove_trust_is_noop_when_absent_or_no_config():
+    """Reap is best-effort: no ~/.claude.json, or no entry for the path, is a silent no-op."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        with _home(tmp) as home:
+            proj = tmp / "wt"
+            proj.mkdir()
+            # No config file at all -> no-op, no crash.
+            _remove_workspace_trust(proj)
+            # Config with an UNRELATED entry -> the unrelated entry is untouched.
+            cfg = home / ".claude.json"
+            other = os.path.realpath(str(tmp / "other"))
+            cfg.write_text(json.dumps({"projects": {other: {"hasTrustDialogAccepted": True}}}))
+            _remove_workspace_trust(proj)
+            assert other in json.loads(cfg.read_text())["projects"]
+
+
+def test_is_review_seeded_trust_entry_predicate():
+    """The reap-safety predicate: only an entry whose keys are a subset of the seeded flags
+    qualifies; anything richer (or a non-dict) does not."""
+    assert _backends._is_review_seeded_trust_entry({"hasTrustDialogAccepted": True})
+    assert _backends._is_review_seeded_trust_entry(
+        {"hasTrustDialogAccepted": True, "hasCompletedProjectOnboarding": True})
+    assert _backends._is_review_seeded_trust_entry({})  # empty subset
+    assert not _backends._is_review_seeded_trust_entry(
+        {"hasTrustDialogAccepted": True, "history": []})
+    assert not _backends._is_review_seeded_trust_entry("nope")
 
 
 if __name__ == "__main__":

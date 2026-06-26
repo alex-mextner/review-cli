@@ -998,6 +998,7 @@ def _run_executor(
         UnsupportedTesterError,
         build_tester_prompt,
         resolved_tester_backend,
+        resolved_tester_model,
         run_tester,
         validate_tester_choice,
         verdict_to_exit_code,
@@ -1052,9 +1053,11 @@ def _run_executor(
     # — NOT ``ctx.models`` (the shared DEFAULT panel list whose first entry is codex, which
     # would make bare `review qa` pick codex over the documented claude default — review).
     backend = resolved_tester_backend(explicit_models)
+    model = resolved_tester_model(explicit_models)
     env_note = f", env={bring_up}" if bring_up != "local" else ""
+    model_note = f":{model}" if model else ""
     print(
-        f"[review-cli] qa: testing SUT {sut_path} (kind={kind}, backend={backend}, "
+        f"[review-cli] qa: testing SUT {sut_path} (kind={kind}, backend={backend}{model_note}, "
         f"isolation={'in-place' if ctx.args.in_place else 'worktree'}{env_note}, cases<= "
         f"{ctx.args.max_cases or 'all'}). Report -> {report_path}",
         file=sys.stderr, flush=True,
@@ -1064,7 +1067,7 @@ def _run_executor(
     try:
         outcome = run_tester(
             prompt_builder=_prompt_builder, sut_path=sut_path, timeout=ctx.timeout,
-            in_place=ctx.args.in_place, report_path=report_path, backend=backend,
+            in_place=ctx.args.in_place, report_path=report_path, backend=backend, model=model,
         )
     except DirtyInPlaceError as exc:
         # A user/usage error (you asked for --in-place over a dirty tree), NOT an infra/boot

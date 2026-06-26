@@ -261,6 +261,21 @@ def test_nonzero_backend_exit_downgrades_pass_to_unknown():
     assert ex._build_outcome(crashed, backend="claude", wall=1.0).verdict == ex.VERDICT_UNKNOWN
 
 
+def test_build_outcome_records_forwarded_model():
+    """`_build_outcome` records the FORWARDED model (so run-stats/report are honest about which
+    model ran), falling back to the backend label when none was forwarded (review-cli#60)."""
+    import subprocess as sp
+
+    pass_tail = "## QA RESULTS\nCASES: 1 run, 1 passed, 0 failed, 0 blocked\nVERDICT: PASS\n"
+    proc = sp.CompletedProcess(args=["x"], returncode=0, stdout=pass_tail, stderr="")
+    # A forwarded model is recorded verbatim.
+    assert ex._build_outcome(proc, backend="claude", wall=1.0, model="claude-opus-4-8").model == "claude-opus-4-8"
+    assert ex._build_outcome(proc, backend="codex", wall=1.0, model="gpt-5.5").model == "gpt-5.5"
+    # No forwarded model -> the backend's default label (the pre-#60 behavior).
+    assert ex._build_outcome(proc, backend="claude", wall=1.0).model == "claude"
+    assert ex._build_outcome(proc, backend="codex", wall=1.0).model == "codex"
+
+
 def test_verdict_with_single_pipe_in_reason_is_not_over_skipped():
     """A REAL verdict whose free-text reason contains a pipe — 'VERDICT: FAIL | reproduced
     with sh add.sh 2 2' — names exactly ONE verdict word and must parse as FAIL. Only the
@@ -481,32 +496,154 @@ def test_codex_spawn_includes_ephemeral():
         ex._spawn_codex_writeexec("prompt", Path("/tmp/sut"), 60)
         assert "--ephemeral" in captured["argv"], captured["argv"]
         assert "workspace-write" in captured["argv"] and "--full-auto" in captured["argv"]
+        # No model -> NO `-m` flag.
+        assert "-m" not in captured["argv"], captured["argv"]
+        # A model -> `-m <model>` after the exec subcommand (matching review_codex's convention).
+        ex._spawn_codex_writeexec("prompt", Path("/tmp/sut"), 60, "gpt-5.5")
+        argv = captured["argv"]
+        assert "-m" in argv and argv[argv.index("-m") + 1] == "gpt-5.5", argv
+        assert argv.index("exec") < argv.index("-m"), "codex -m must follow the exec subcommand"
     finally:
         ex._run_streamed = old_streamed  # type: ignore[assignment]
         ex._which = old_which  # type: ignore[assignment]
 
 
-def test_suffixed_tester_is_rejected():
-    """A model SUFFIX on the qa tester (`-m claude:some-model`, or an alias like `fable` that
-    expands to `claude:claude-fable-5`) is rejected — qa does not forward the model, so it
-    must NOT silently run the default seat's model (review finding)."""
+def test_claude_spawn_forwards_model_flag():
+    """The claude qa spawn passes `--model <m>` when a model is given, and omits it otherwise
+    (review-cli#60)."""
+    captured: dict = {}
+
+    def _fake_streamed(argv, **_kw):
+        captured["argv"] = argv
+        import subprocess as sp
+        return sp.CompletedProcess(args=argv, returncode=0, stdout="{}", stderr="")
+
+    old_streamed, old_which = ex._run_streamed, ex._which
+    # Stub the trust seed/reap so the test never touches a real ~/.claude.json.
+    import reviewlib.backends as _b
+    old_seed, old_reap = _b._ensure_workspace_trusted, _b._remove_workspace_trust
+    ex._run_streamed = _fake_streamed  # type: ignore[assignment]
+    ex._which = lambda name: f"/usr/bin/{name}"  # type: ignore[assignment]
+    _b._ensure_workspace_trusted = lambda _cwd: None  # type: ignore[assignment]
+    _b._remove_workspace_trust = lambda _cwd: None  # type: ignore[assignment]
+    try:
+        ex._spawn_claude_writeexec("prompt", Path("/tmp/review-qa-wt-x"), 60, "claude-opus-4-8")
+        argv = captured["argv"]
+        assert "--model" in argv and argv[argv.index("--model") + 1] == "claude-opus-4-8", argv
+        ex._spawn_claude_writeexec("prompt", Path("/tmp/review-qa-wt-x"), 60, None)
+        assert "--model" not in captured["argv"], captured["argv"]
+    finally:
+        ex._run_streamed, ex._which = old_streamed, old_which  # type: ignore[assignment]
+        _b._ensure_workspace_trusted, _b._remove_workspace_trust = old_seed, old_reap  # type: ignore[assignment]
+
+
+def test_claude_spawn_reaps_trust_only_for_ephemeral_worktree_even_on_crash():
+    """The trust reap fires in `finally` (so a crashed tester still cleans up) but ONLY for an
+    ephemeral `review-qa-wt-*` cwd — never the user's real --in-place checkout (review-cli#60)."""
+    reaped: list = []
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("tester crashed mid-run")
+
+    import reviewlib.backends as _b
+    old_streamed, old_which = ex._run_streamed, ex._which
+    old_seed, old_reap = _b._ensure_workspace_trusted, _b._remove_workspace_trust
+    ex._run_streamed = _boom  # type: ignore[assignment]
+    ex._which = lambda name: f"/usr/bin/{name}"  # type: ignore[assignment]
+    _b._ensure_workspace_trusted = lambda _cwd: None  # type: ignore[assignment]
+    _b._remove_workspace_trust = lambda cwd: reaped.append(cwd)  # type: ignore[assignment]
+    try:
+        # Ephemeral worktree: the crash propagates, but reap STILL ran (finally).
+        try:
+            ex._spawn_claude_writeexec("p", Path("/tmp/review-qa-wt-abc"), 60)
+        except RuntimeError:
+            pass
+        assert reaped == [Path("/tmp/review-qa-wt-abc")], reaped
+        # A real --in-place checkout (no ephemeral prefix): reap must NOT run.
+        reaped.clear()
+        try:
+            ex._spawn_claude_writeexec("p", Path("/home/me/realrepo"), 60)
+        except RuntimeError:
+            pass
+        assert reaped == [], "must NOT reap the user's real --in-place checkout trust"
+    finally:
+        ex._run_streamed, ex._which = old_streamed, old_which  # type: ignore[assignment]
+        _b._ensure_workspace_trusted, _b._remove_workspace_trust = old_seed, old_reap  # type: ignore[assignment]
+
+
+def test_is_ephemeral_qa_worktree_predicate():
+    assert ex._is_ephemeral_qa_worktree(Path("/tmp/review-qa-wt-abc/pkg"))
+    assert ex._is_ephemeral_qa_worktree(Path("/var/folders/x/review-qa-wt-9/sub"))
+    assert not ex._is_ephemeral_qa_worktree(Path("/home/me/realrepo"))
+    assert not ex._is_ephemeral_qa_worktree(Path("/tmp/some-other-dir"))
+
+
+def test_suffixed_tester_is_accepted_and_forwarded():
+    """A model SUFFIX on the qa tester (`-m claude:claude-opus-4-8`, or an alias like `fable`
+    that expands to `claude:claude-fable-5`) is now ACCEPTED, and `resolved_tester_model`
+    extracts the model so the spawn forwards `--model`/`-m` (review-cli#60)."""
     from reviewlib.config import _split_models
 
     old = os.environ.get("REVIEW_QA_TESTER")
+    old_model = os.environ.get("REVIEW_QA_TESTER_MODEL")
     os.environ.pop("REVIEW_QA_TESTER", None)
+    os.environ.pop("REVIEW_QA_TESTER_MODEL", None)
     try:
+        # A supported backend WITH a suffix validates (no raise).
+        ex.validate_tester_choice(_split_models(["claude:claude-opus-4-8"]))
+        ex.validate_tester_choice(_split_models(["codex:gpt-5.5"]))
+        ex.validate_tester_choice(_split_models(["claude"]))  # bare seat still fine
+        # The suffix is resolved to the concrete model, and the backend matches.
+        opus = _split_models(["claude:claude-opus-4-8"])
+        assert ex.resolved_tester_backend(opus) == "claude"
+        assert ex.resolved_tester_model(opus) == "claude-opus-4-8"
+        codex_m = _split_models(["codex:gpt-5.5"])
+        assert ex.resolved_tester_backend(codex_m) == "codex"
+        assert ex.resolved_tester_model(codex_m) == "gpt-5.5"
+        # The `fable` alias expands to claude:claude-fable-5 and forwards that model.
+        fable = _split_models(["fable"])
+        assert ex.resolved_tester_backend(fable) == "claude"
+        assert ex.resolved_tester_model(fable) == "claude-fable-5"
+        # A bare seat (no suffix) forwards NO model (backend default).
+        assert ex.resolved_tester_model(_split_models(["claude"])) is None
+        # An UNSUPPORTED backend (even with a suffix) is still rejected.
         raised = False
         try:
-            ex.validate_tester_choice(_split_models(["claude:claude-opus-4-8"]))
+            ex.validate_tester_choice(_split_models(["gemini:x"]))
         except ex.UnsupportedTesterError:
             raised = True
-        assert raised, "a model suffix must be rejected"
-        # A bare seat is fine.
-        ex.validate_tester_choice(_split_models(["claude"]))
-        ex.validate_tester_choice(_split_models(["codex"]))
+        assert raised, "-m gemini:x must still be rejected (unsupported backend)"
     finally:
-        if old is not None:
-            os.environ["REVIEW_QA_TESTER"] = old
+        for var, val in (("REVIEW_QA_TESTER", old), ("REVIEW_QA_TESTER_MODEL", old_model)):
+            if val is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = val
+
+
+def test_resolved_tester_model_precedence():
+    """REVIEW_QA_TESTER_MODEL beats a `-m` suffix; a suffix on a NON-resolved backend is ignored
+    (the env-chosen backend wins, matching the backend-precedence rule)."""
+    from reviewlib.config import _split_models
+
+    saved = {k: os.environ.get(k) for k in ("REVIEW_QA_TESTER", "REVIEW_QA_TESTER_MODEL")}
+    for k in saved:
+        os.environ.pop(k, None)
+    try:
+        # Env model wins over the -m suffix.
+        os.environ["REVIEW_QA_TESTER_MODEL"] = "env-model"
+        assert ex.resolved_tester_model(_split_models(["claude:claude-opus-4-8"])) == "env-model"
+        os.environ.pop("REVIEW_QA_TESTER_MODEL")
+        # Env forces claude; a codex:<model> suffix does NOT apply (backend mismatch).
+        os.environ["REVIEW_QA_TESTER"] = "claude"
+        assert ex.resolved_tester_backend(_split_models(["codex:gpt-5.5"])) == "claude"
+        assert ex.resolved_tester_model(_split_models(["codex:gpt-5.5"])) is None
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_pass_contradicting_case_tally_is_downgraded():
