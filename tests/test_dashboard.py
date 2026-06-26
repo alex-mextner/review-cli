@@ -451,6 +451,60 @@ def test_cluster_sessions_and_modes():
         assert len(bs.roles()) >= 2
 
 
+def test_load_sessions_cached_parses_once_then_invalidates_on_change():
+    """The dashboard handlers (`/api/runs`, `/api/stats`, the SSE loop) used to call the pure
+    ``load_sessions`` on EVERY request, re-reading + re-parsing the whole log dir each time.
+    With a 35k-file / 434MB real log dir that is ~6s of CPU per request, two of which fire on
+    every page load (runs + stats via Promise.all) — the threaded server saturated CPU, the
+    fetch exceeded the proxy timeout, and the dashboard rendered EMPTY (stuck on "Loading…").
+
+    ``load_sessions_cached`` memoises by (resolved dir, gap) keyed on a CHEAP directory
+    signature (entry count + max mtime, stat-only, no file reads), so repeated calls within a
+    page load reuse the parse — yet a new/grown/removed log changes the signature and forces a
+    fresh parse, preserving live-activity correctness.
+    """
+    from reviewlib.dashboard import parser as p
+
+    parse_calls = {"n": 0}
+    real_parse_call_log = p.parse_call_log
+
+    def _counting_parse(path):  # spy: counts the per-file parse work the loader does
+        parse_calls["n"] += 1
+        return real_parse_call_log(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.parse_call_log = _counting_parse
+        try:
+            # Reset any module-level cache state so this test is order-independent.
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+
+            first = p.load_sessions_cached(ld, gap_seconds=90)
+            after_first = parse_calls["n"]
+            assert after_first >= 2, f"expected to parse the 2 logs at least once, got {after_first}"
+            assert len(first) == 1, first  # one clustered panel session
+
+            # Second call with the dir UNCHANGED must hit the cache: no further per-file parses.
+            second = p.load_sessions_cached(ld, gap_seconds=90)
+            assert parse_calls["n"] == after_first, (
+                f"cache miss: re-parsed on an unchanged dir ({parse_calls['n']} > {after_first})"
+            )
+            # Returns the same clustering, not a stale empty.
+            assert [s.session_id for s in second] == [s.session_id for s in first]
+
+            # A NEW log (a fresh review run streaming in) must change the cheap signature and
+            # force a re-parse — live activity must not be hidden behind the cache.
+            _write_call_log(ld, "20260601T120000_000000", "claude", 0, "later run\n", exit_code=0)
+            third = p.load_sessions_cached(ld, gap_seconds=90)
+            assert parse_calls["n"] > after_first, "cache failed to invalidate after a new log was written"
+            assert len(third) == 2, third  # the >90s-later call clusters as a new session
+        finally:
+            p.parse_call_log = real_parse_call_log
+            p.invalidate_sessions_cache()
+
+
 def test_panel_session_surfaces_recorded_invocations_as_prompt():
     """A non-brainstorm panel run has no topic; Session.invocations must surface the DISTINCT
     recorded argv0 lines and to_summary must expose them as `invocations`, so the Prompts panel

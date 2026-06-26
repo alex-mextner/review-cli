@@ -27,7 +27,9 @@ empty/`null` field with a note rather than faked.
 """
 from __future__ import annotations
 
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import cached_property, lru_cache
@@ -771,6 +773,78 @@ def load_sessions(log_dir_path: Path, gap_seconds: float = DEFAULT_SESSION_GAP_S
             if b:
                 brainstorms.append(b)
     return cluster_sessions(calls, brainstorms, gap_seconds)
+
+
+# ---- request-time session cache --------------------------------------------------------
+# WHY: every dashboard page load fires `/api/runs` AND `/api/stats` together (the front-end's
+# `loadAll()` Promise.all), and each handler called the PURE `load_sessions` above — a full
+# read + parse of EVERY artifact in `log_dir()`. On a real, long-lived install that dir grows
+# to tens of thousands of files / hundreds of MB; one parse is ~6s of CPU. Two-plus full
+# re-parses per page load saturated the single (threaded) server, the `/api/runs` fetch blew
+# past the browser/Tailscale-proxy timeout, never resolved, and the panel stayed stuck on
+# "Loading…" — i.e. an EMPTY dashboard. The fix is a short-lived memo of the parsed sessions,
+# invalidated by a CHEAP directory signature so live activity is never hidden behind a stale
+# cache. `load_sessions` itself stays PURE (no caching) so tests keep deterministic parses.
+_CACHE_LOCK = threading.Lock()
+# key -> (signature, sessions). Key = (resolved dir str, gap). Bounded implicitly: one entry
+# per (dir, gap) the server actually serves — a handful in practice (default gap + any ?gap=).
+_SESSIONS_CACHE: dict[tuple[str, float], tuple[tuple[int, float], list[Session]]] = {}
+
+
+def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
+    """A cheap (entry-count, max-mtime) fingerprint of the log dir — STAT-ONLY, no file reads.
+
+    Computing this must be orders of magnitude cheaper than parsing (which opens + reads every
+    file), so a single `os.scandir` pass using the stat already cached on each `DirEntry` is the
+    whole budget. A new/grown/removed/touched artifact moves either the count or the max mtime,
+    so the signature changes exactly when a re-parse is warranted (e.g. a live review streaming
+    its `.log`). Missing dir -> (0, 0.0), a stable signature distinct from any populated dir."""
+    count = 0
+    max_mtime = 0.0
+    try:
+        with os.scandir(log_dir_path) as it:
+            for entry in it:
+                count += 1
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    # A racing unlink between scandir and stat: skip it; the next request's
+                    # changed count/mtime will re-sync. Don't let one vanished file crash parse.
+                    continue
+                if mtime > max_mtime:
+                    max_mtime = mtime
+    except (FileNotFoundError, NotADirectoryError):
+        return (0, 0.0)
+    return (count, max_mtime)
+
+
+def load_sessions_cached(
+    log_dir_path: Path, gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS
+) -> list[Session]:
+    """Cached wrapper over `load_sessions`, keyed on (resolved dir, gap) + a stat-only dir
+    signature. Returns the memoised parse when the dir is unchanged since the last call; re-parses
+    (and refreshes the cache) when the signature moves. Thread-safe (the dashboard's
+    ThreadingHTTPServer serves on many threads). Use this from request handlers; use the pure
+    `load_sessions` where deterministic re-parsing is required (tests)."""
+    key = (str(log_dir_path.resolve()), gap_seconds)
+    signature = _dir_signature(log_dir_path)
+    with _CACHE_LOCK:
+        cached = _SESSIONS_CACHE.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+    # Parse OUTSIDE the lock: a cold parse is multi-second; holding the lock would serialise
+    # every request behind it. A concurrent duplicate parse on a cold cache is wasteful but
+    # correct (both compute the same sessions); the common warm path above is already cheap.
+    sessions = load_sessions(log_dir_path, gap_seconds=gap_seconds)
+    with _CACHE_LOCK:
+        _SESSIONS_CACHE[key] = (signature, sessions)
+    return sessions
+
+
+def invalidate_sessions_cache() -> None:
+    """Drop all memoised sessions. For tests and for a future explicit-refresh affordance."""
+    with _CACHE_LOCK:
+        _SESSIONS_CACHE.clear()
 
 
 def compute_stats(sessions: list[Session]) -> dict:
