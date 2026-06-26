@@ -1207,9 +1207,113 @@ def _looks_like_web(sut_path: Path, pkg: dict) -> bool:
     return any(sut_path.glob("playwright.config.*"))
 
 
+# Bot-framework dependency markers, by ecosystem. The JS ones live in package.json deps; the
+# Python ones (a normal Python bot has NO package.json) live in requirements.txt / pyproject.toml.
+# `auto` only SEEDS the runbook — the agent is the real detector and the user can pass `--kind
+# bot` — so this just has to recognize the common case, not be exhaustive.
+_JS_BOT_MARKERS = frozenset({"telegraf", "grammy"})
+# Python distribution names, in PEP 503-CANONICAL form (lower-case, separators collapsed to a
+# single `-`). `pytelegrambotapi` is the PyPI distribution of the "telebot" import package — the
+# common one — so the dist name, not the import name, is what a requirements file carries.
+_PY_BOT_MARKERS = frozenset({
+    "python-telegram-bot", "aiogram", "pyrogram", "telethon", "pytelegrambotapi",
+})
+
+
+def _canon_dist(name: str) -> str:
+    """PEP 503 canonical form of a distribution name: lower-case with runs of `-`/`_`/`.`
+    collapsed to a single `-`. `python_telegram_bot` and `Python.Telegram.Bot` both canonicalize
+    to `python-telegram-bot`, so a marker match is separator-insensitive."""
+    return re.sub(r"[-_.]+", "-", name.strip().lower())
+
+
 def _looks_like_bot(sut_path: Path, pkg: dict) -> bool:
-    deps = _all_deps(pkg)
-    return bool(deps & {"telegraf", "grammy", "python-telegram-bot", "aiogram"})
+    if _all_deps(pkg) & _JS_BOT_MARKERS:
+        return True
+    return bool(_python_deps(sut_path) & _PY_BOT_MARKERS)
+
+
+def _python_deps(sut_path: Path) -> set[str]:
+    """The set of Python distribution names a SUT declares, lower-cased, from
+    ``requirements.txt`` + ``pyproject.toml`` (both PEP 621 ``project.dependencies`` and a
+    Poetry ``tool.poetry.dependencies`` table). Best-effort + stdlib-only: a parse failure or
+    an absent file contributes nothing. Used by the bot detector so a Python Telegram bot (no
+    package.json) is recognised by ``--kind auto`` instead of falling through to ``backend``."""
+    return _requirements_deps(sut_path) | _pyproject_deps(sut_path)
+
+
+def _requirements_deps(sut_path: Path) -> set[str]:
+    """Distribution names from ``requirements.txt`` (the leading name token of each non-comment
+    line, before any version/extras/marker), lower-cased. Best-effort; never raises."""
+    path = sut_path / "requirements.txt"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    out: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "-")):  # skip blanks, comments, `-r`/`-e`/options
+            continue
+        name = _dist_name(line)
+        if name:
+            out.add(name)
+    return out
+
+
+def _pyproject_deps(sut_path: Path) -> set[str]:
+    """Distribution names from ``pyproject.toml`` — PEP 621 ``[project].dependencies`` plus a
+    Poetry ``[tool.poetry.dependencies]`` table — canonicalized. Prefers the stdlib ``tomllib``
+    (3.11+), falling back to ``tomli`` when it happens to be installed on an older runtime; with
+    NEITHER available (a bare 3.9/3.10 host) it contributes nothing — a pyproject-ONLY Python bot
+    is then not auto-detected (the user can pass ``--kind bot``). Best-effort: a parse failure
+    contributes nothing."""
+    toml_loads = _toml_loader()
+    if toml_loads is None:
+        return set()
+    path = sut_path / "pyproject.toml"
+    try:
+        data = toml_loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return set()
+    out: set[str] = set()
+    project = data.get("project")
+    if isinstance(project, dict):
+        deps = project.get("dependencies")
+        if isinstance(deps, list):
+            out |= {n for n in (_dist_name(str(d)) for d in deps) if n}
+    poetry = (data.get("tool") or {}).get("poetry") if isinstance(data.get("tool"), dict) else None
+    if isinstance(poetry, dict) and isinstance(poetry.get("dependencies"), dict):
+        # Poetry keys ARE the distribution names (the value is the version constraint).
+        out |= {_canon_dist(k) for k in poetry["dependencies"] if _canon_dist(k) != "python"}
+    return out
+
+
+def _toml_loader():
+    """The best available ``loads(str) -> dict`` TOML parser: stdlib ``tomllib`` (3.11+), else
+    ``tomli`` if installed, else ``None``. Lets the pyproject path work on a 3.9/3.10 host that
+    happens to have ``tomli`` without making it a hard dependency (review keeps a minimal dep set)."""
+    try:
+        import tomllib
+        return tomllib.loads
+    except ImportError:
+        pass
+    try:
+        import tomli
+        return tomli.loads
+    except ImportError:
+        return None
+
+
+def _dist_name(spec: str) -> str:
+    """The bare distribution name from a PEP 508 / requirements spec — the leading name token,
+    stripped of an extras group, version constraint, environment marker, or URL — in PEP 503
+    CANONICAL form (lower-case, separators collapsed). `aiogram[fast]>=3,<4 ; python_version>'3.8'`
+    -> `aiogram`; `python_telegram_bot>=20` -> `python-telegram-bot`. `""` when no name."""
+    head = re.split(r"[\s;]", spec.strip(), maxsplit=1)[0]  # drop markers / trailing tokens
+    head = head.split("@", 1)[0]            # drop a direct URL reference (`name @ url`)
+    head = re.split(r"[<>=!~\[\(]", head, maxsplit=1)[0]  # drop extras / version constraint
+    return _canon_dist(head) if head.strip() else ""
 
 
 def _all_deps(pkg: dict) -> set[str]:

@@ -418,6 +418,84 @@ def test_detect_kind_bot_from_telegram_dep():
     assert _qa_mod._detect_kind(sut) == "bot"
 
 
+def test_detect_kind_bot_from_python_requirements():
+    """A Python Telegram bot (NO package.json) is detected from requirements.txt — without this
+    it falls through to `backend` and the wrong runbook (review-cli#61)."""
+    sut = _sut_with_files({
+        "requirements.txt": "# a bot\npython-telegram-bot>=20.0\nrequests==2.31.0\n",
+        "bot.py": "print('bot')",
+    })
+    assert _qa_mod._detect_kind(sut) == "bot"
+
+
+def test_detect_kind_bot_from_pyproject_pep621():
+    """A PEP 621 pyproject.toml `[project].dependencies` Telegram marker classifies as bot."""
+    sut = _sut_with_files({
+        "pyproject.toml": (
+            '[project]\nname = "mybot"\n'
+            'dependencies = ["aiogram[fast]>=3,<4", "httpx"]\n'
+        ),
+    })
+    assert _qa_mod._detect_kind(sut) == "bot"
+
+
+def test_detect_kind_bot_from_pyproject_poetry():
+    """A Poetry `[tool.poetry.dependencies]` Telegram marker classifies as bot (the table keys
+    ARE the distribution names)."""
+    sut = _sut_with_files({
+        "pyproject.toml": (
+            '[tool.poetry.dependencies]\npython = "^3.11"\npyrogram = "^2.0"\n'
+        ),
+    })
+    assert _qa_mod._detect_kind(sut) == "bot"
+
+
+def test_detect_kind_python_non_bot_is_backend():
+    """A Python project whose deps carry NO bot marker stays `backend` (no false positive)."""
+    sut = _sut_with_files({"requirements.txt": "flask\nsqlalchemy\n", "app.py": "x = 1"})
+    assert _qa_mod._detect_kind(sut) == "backend"
+
+
+def test_detect_kind_pyproject_no_marker_is_backend():
+    """A pyproject.toml with non-bot deps stays `backend` (the pyproject equivalent of the
+    requirements.txt no-marker case)."""
+    sut = _sut_with_files({
+        "pyproject.toml": '[project]\nname = "svc"\ndependencies = ["fastapi", "uvicorn"]\n',
+    })
+    assert _qa_mod._detect_kind(sut) == "backend"
+
+
+def test_detect_kind_bot_separator_insensitive():
+    """PEP 503 canonicalization: `python_telegram_bot` (underscores) matches the canonical
+    `python-telegram-bot` marker — the same false-negative class the fix closes."""
+    sut = _sut_with_files({"requirements.txt": "python_telegram_bot>=20\n"})
+    assert _qa_mod._detect_kind(sut) == "bot"
+
+
+def test_detect_kind_bot_pytelegrambotapi_dist():
+    """The 'telebot' import package ships on PyPI as `pyTelegramBotAPI` — the DIST name in a
+    requirements file. It is recognised (case + canonical form)."""
+    sut = _sut_with_files({"requirements.txt": "pyTelegramBotAPI==4.14\n"})
+    assert _qa_mod._detect_kind(sut) == "bot"
+    assert _qa_mod._canon_dist("python_telegram_bot") == "python-telegram-bot"
+    assert _qa_mod._canon_dist("Py.Telegram.Bot.API") == "py-telegram-bot-api"
+
+
+def test_python_dep_parsing_is_robust():
+    """The Python dep parser is best-effort: a broken requirements.txt / pyproject.toml, an
+    options line, and an unreadable file never crash detection."""
+    sut = _sut_with_files({
+        "requirements.txt": "-r other.txt\n--index-url https://x\naiogram ; python_version>'3.8'\n",
+        "pyproject.toml": "this is [not valid toml",
+    })
+    # The `aiogram` line (with an env marker) is still recognised despite the noise.
+    assert _qa_mod._detect_kind(sut) == "bot"
+    assert _qa_mod._dist_name("aiogram[fast]>=3,<4 ; python_version>'3.8'") == "aiogram"
+    assert _qa_mod._dist_name("python-telegram-bot @ https://example/x.whl") == "python-telegram-bot"
+    assert _qa_mod._dist_name("Telethon==1.0") == "telethon"  # lower-cased
+    assert _qa_mod._dist_name("") == ""
+
+
 def test_detect_kind_falls_back_to_backend_when_inconclusive():
     """No package.json / no markers → backend (the agent is the real detector; the Python
     pass only seeds the runbook). A broken/invalid package.json must NOT crash detection."""

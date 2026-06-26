@@ -1250,6 +1250,10 @@ SELECTION CASCADE (what runs when you do NOT pass -m), by mode:
   review diff           : explicit -m  >  config `models:`  >  the active reviewer BOARD.
   review brainstorm     : explicit -m  >  `brainstorm_models:`  >  `models:`  >  defaults.
   review just-ask/quorum: explicit -m  >  `models:`  >  the built-in defaults.
+  review qa             : IGNORES config `models:` / `brainstorm_models:` / the defaults.
+                          It picks ONE write/exec tester: `REVIEW_QA_TESTER=claude|codex`  >
+                          a bare `-m claude|codex`  >  the `claude` default. (opencode is not
+                          in v1.) The panel/board cascade does not apply to qa.
   Built-in defaults: {", ".join(_expand_alias(x) for x in DEFAULT_MODELS)}.
   See the live default for each subcommand in `review <mode> --help` (the --model line).
 
