@@ -208,6 +208,109 @@ def test_ext_gate_all_green_when_everything_present():
     assert gate.ok, gate.reason
 
 
+# --- the baseline-dir VALIDATION (codex P2): a non-empty value is not enough — it must be a
+#     writable dir OR a creatable path, else a controlled BLOCKED, not an ok gate that explodes
+#     on the first baseline write outside the availability gate ----------------------------------
+def _ext_gate_with_baseline(baseline: str):
+    """Run ext_live_available with the flag on, the VS Code gate + magick stubbed present, and
+    REVIEW_QA_EXT_BASELINE_DIR=baseline — so the baseline-dir branch is the only thing under test."""
+    env = {**_ALL_LIVE_VARS, "REVIEW_QA_EXT_LIVE": "1", "REVIEW_QA_EXT_BASELINE_DIR": baseline}
+    with _env(**env), _stub_vscode_gate(True), _stub_magick(True):
+        return lt.ext_live_available()
+
+
+def test_ext_gate_baseline_is_a_file_blocked():
+    """REVIEW_QA_EXT_BASELINE_DIR pointing at an existing FILE (not a dir) → controlled BLOCKED
+    naming the var, never an ok gate (the first baseline write would fail outside the gate)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as parent:
+        f = Path(parent) / "baseline.png"
+        f.write_text("not a dir", encoding="utf-8")
+        gate = _ext_gate_with_baseline(str(f))
+    assert not gate.ok
+    assert "REVIEW_QA_EXT_BASELINE_DIR" in gate.reason
+
+
+def test_ext_gate_baseline_unwritable_dir_blocked():
+    """An existing-but-UNWRITABLE baseline dir → controlled BLOCKED (the first run could not record
+    a baseline there). ``os.access`` is stubbed to deny write so the branch fires on ANY uid — a real
+    chmod can't revoke write from root, which would silently no-op this case in a root CI env."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d, _deny_write_access():
+        gate = _ext_gate_with_baseline(d)
+    assert not gate.ok
+    assert "REVIEW_QA_EXT_BASELINE_DIR" in gate.reason
+
+
+def test_ext_gate_baseline_dangling_symlink_blocked():
+    """A baseline path that is a DANGLING symlink (target missing) → BLOCKED: ``exists()`` is False
+    but the path is occupied, so the first-run ``mkdir`` would fail — exactly the explode-outside-
+    the-gate class the validation closes."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as parent:
+        link = Path(parent) / "link"
+        os.symlink(Path(parent) / "nonexistent-target", link)
+        gate = _ext_gate_with_baseline(str(link))
+    assert not gate.ok
+    assert "REVIEW_QA_EXT_BASELINE_DIR" in gate.reason
+
+
+def test_ext_gate_baseline_symlink_to_writable_dir_ok():
+    """A baseline path that is a symlink to an EXISTING writable directory is ACCEPTED — it goes
+    through the ``exists()``/``is_dir()`` branch (not the dangling-symlink branch), so a live
+    symlink is NOT blocked. Locks the distinction from test_ext_gate_baseline_dangling_symlink."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as parent:
+        target = Path(parent) / "real"
+        target.mkdir()
+        link = Path(parent) / "link"
+        os.symlink(target, link)
+        gate = _ext_gate_with_baseline(str(link))
+    assert gate.ok, gate.reason
+
+
+def test_ext_gate_baseline_uncreatable_parent_blocked():
+    """A not-yet-existing baseline path whose PARENT is also missing → can't be created on the
+    first run → controlled BLOCKED, not an ok gate."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as parent:
+        target = Path(parent) / "missing" / "nested" / "baselines"  # parent dir does not exist
+        gate = _ext_gate_with_baseline(str(target))
+    assert not gate.ok
+    assert "REVIEW_QA_EXT_BASELINE_DIR" in gate.reason
+
+
+def test_ext_gate_baseline_unwritable_parent_blocked():
+    """A not-yet-existing baseline path whose PARENT exists but is NOT writable → can't be created
+    → BLOCKED. Covers the ``os.access(parent, W_OK)`` sub-branch — the uncreatable-parent test
+    above uses a MISSING parent, which only exercises the ``not parent.is_dir()`` half."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as parent:
+        target = Path(parent) / "baselines"  # parent exists; denied write makes it uncreatable
+        with _deny_write_access():
+            gate = _ext_gate_with_baseline(str(target))
+    assert not gate.ok
+    assert "REVIEW_QA_EXT_BASELINE_DIR" in gate.reason
+
+
+def test_ext_gate_baseline_creatable_path_ok():
+    """A not-yet-existing baseline dir whose PARENT exists and is writable is ACCEPTED (the first
+    run creates it) → the gate is ok (the live RUN is still #82). The other half of the happy path
+    alongside test_ext_gate_all_green_when_everything_present (which uses an existing dir)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as parent:
+        target = Path(parent) / "baselines"  # parent exists + writable, target absent → creatable
+        gate = _ext_gate_with_baseline(str(target))
+    assert gate.ok, gate.reason
+
+
 # --- the heavy-dep-ABSENT SKIP branches (the ones that actually fire in CI) ------------------
 def test_bot_gate_telethon_absent_names_the_dep():
     """Flag on + telethon NOT importable → the SKIP message names `telethon` + the install. This
@@ -809,6 +912,22 @@ def _stub_vscode_gate(ok: bool):
         yield
     finally:
         lt._vscode_gate = real
+
+
+@contextmanager
+def _deny_write_access():
+    """Make ``os.access(path, W_OK)`` report False (other modes pass through) for the body, so the
+    gate's writability branches fire deterministically regardless of the test user's uid — a real
+    ``chmod`` can't revoke write from root, so this is the uid-independent way to exercise the
+    unwritable-dir/parent BLOCKED paths. ``lt.os`` is the shared ``os`` module, so this swaps
+    ``os.access`` PROCESS-WIDE for the body (fine for this short, single-threaded test, which
+    restores the original immediately on exit)."""
+    real = lt.os.access
+    lt.os.access = lambda path, mode, *a, **k: False if mode == os.W_OK else real(path, mode, *a, **k)
+    try:
+        yield
+    finally:
+        lt.os.access = real
 
 
 @contextmanager

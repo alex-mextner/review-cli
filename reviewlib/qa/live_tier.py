@@ -212,6 +212,9 @@ def ext_live_available() -> LiveTierGate:
             "REVIEW_QA_EXT_BASELINE_DIR to a writable dir (first run records baselines, later runs "
             "diff against them). See docs/specs/review-qa.md §7.4."
         ))
+    baseline_problem = _baseline_dir_problem(baseline)
+    if baseline_problem is not None:
+        return LiveTierGate(False, baseline_problem)
     if not _perceptual_diff_available():
         return LiveTierGate(False, (
             "the ext Tier-2 LIVE run needs ImageMagick v7 (`magick`) for the perceptual diff "
@@ -259,6 +262,52 @@ def _perceptual_diff_available() -> bool:
     import shutil
 
     return shutil.which("magick") is not None
+
+
+def _baseline_dir_problem(baseline: str) -> str | None:
+    """Why ``REVIEW_QA_EXT_BASELINE_DIR`` can't serve as the baseline-screenshot store, or ``None``
+    when it can. The ext live run WRITES baselines on the first run and DIFFS on later runs, so the
+    dir must be writable BEFORE the live screenshot path is reached — otherwise the availability
+    gate reports ok and the first baseline write blows up OUTSIDE the gate (codex P2). Usable means
+    an existing WRITABLE directory, OR a not-yet-existing path whose PARENT exists and is writable
+    (so the first run can create it). Anything else — a path that is a FILE, a DANGLING symlink, an
+    UNWRITABLE dir, or a path whose parent is missing/unwritable — is a controlled BLOCKED with the
+    actionable fix.
+
+    BEST-EFFORT: the writability check is ``os.access(.., W_OK)`` (the same idiom as the rest of
+    this gate), which is judged by the real uid/gid and so can't see a read-only mount, a restrictive
+    ACL, or an immutable flag — those would still fail at the actual write. This catches the common
+    cases (a file, a 0-perm dir, a missing parent) at the gate; it is a guard, not a proof that the
+    first write WILL succeed."""
+    path = Path(baseline)
+    if path.is_symlink() and not path.exists():
+        return (
+            f"REVIEW_QA_EXT_BASELINE_DIR ({baseline!r}) is a dangling symlink (its target is "
+            "missing); the path is occupied, so the first baseline write would fail. Point it at an "
+            "existing writable dir or a creatable path. See docs/specs/review-qa.md §7.4."
+        )
+    if path.exists():
+        if not path.is_dir():
+            return (
+                f"REVIEW_QA_EXT_BASELINE_DIR ({baseline!r}) is not a directory; it must be a "
+                "writable directory for baseline screenshots (first run records, later runs diff). "
+                "Point it at a directory or a creatable path. See docs/specs/review-qa.md §7.4."
+            )
+        if not os.access(path, os.W_OK):
+            return (
+                f"REVIEW_QA_EXT_BASELINE_DIR ({baseline!r}) is not writable; the ext live run "
+                "records/updates baseline screenshots there. Make it writable or point it at a "
+                "writable dir. See docs/specs/review-qa.md §7.4."
+            )
+        return None
+    parent = path.parent
+    if not parent.is_dir() or not os.access(parent, os.W_OK):
+        return (
+            f"REVIEW_QA_EXT_BASELINE_DIR ({baseline!r}) does not exist and can't be created: its "
+            f"parent ({str(parent)!r}) is missing or not writable. Point it at an existing writable "
+            "dir or a creatable path (a writable parent). See docs/specs/review-qa.md §7.4."
+        )
+    return None
 
 
 # --- the live-driver SKELETONS (wired behind the Tier-1 protocol seams; live run = #82) -------
