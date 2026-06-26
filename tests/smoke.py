@@ -527,6 +527,14 @@ _UNIT_FILES = [
     # inside the file is gated on REVIEW_QA_VSCODE=1 and SKIPs without node + a VS Code binary. Give
     # it a FRESH temp log dir for consistency with the other qa-touching files.
     ("test_qa_ext.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # The Tier-2 (LIVE tier) SCAFFOLDING: the per-SUT availability GATEs (each naming the exact
+    # missing creds), the SKIP-LOUD path, the bot fail-closed safety, the config acceptance of the
+    # live driver values, the live-driver skeletons (connect BLOCKS until #82), the dispatch
+    # routing a tier:live block to a controlled BLOCKED (never the un-caged executor), and the
+    # creds-doc/spec consistency. All deterministic — NO creds, NO Telegram, NO browser, NO VS
+    # Code, NO network; heavy deps (telethon/playwright) are stubbed in-process. Fresh log dir for
+    # consistency with the other qa-touching files.
+    ("test_qa_live.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

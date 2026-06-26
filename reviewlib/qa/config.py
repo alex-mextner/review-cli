@@ -116,15 +116,20 @@ class TeardownConfig:
 
 @dataclass(frozen=True)
 class BotConfig:
-    """The ``sut.bot`` block — how to run a CHAT-BOT SUT hermetically (spec §7.3, Tier 1).
+    """The ``sut.bot`` block — how to run a CHAT-BOT SUT (spec §7.3).
 
-    ``driver`` is ``mock`` (the hermetic fake-Telegram default; ``mtproto``/Tier 2 is deferred
-    to v2). ``command`` is the argv that boots the bot's poller — it is run with ``TG_API_BASE``
-    pointed at the fake, so the bot long-polls the fake instead of api.telegram.org. ``env`` is
-    extra NON-SECRET environment for the bot (a config flag, a feature toggle); secrets stay in
-    host env. ``skip_probe`` opts out of the positive capability probe ONLY for a bot that
-    legitimately never sends on the probe update (the default is to require the probe so a
-    never-reached fake fails loud instead of false-passing on zero sends)."""
+    ``driver`` is ``mock`` (the hermetic fake-Telegram Tier-1 default) or ``mtproto`` (the Tier-2
+    LIVE driver — a real test Telegram account; gated behind creds, see ``live_tier``).
+    ``command`` is the argv that boots the bot's poller — for the mock driver it is run with
+    ``TG_API_BASE`` pointed at the fake, so the bot long-polls the fake instead of
+    api.telegram.org. ``env`` is extra NON-SECRET environment for the bot (a config flag, a
+    feature toggle); secrets stay in host env. ``skip_probe`` opts out of the positive capability
+    probe ONLY for a bot that legitimately never sends on the probe update (the default is to
+    require the probe so a never-reached fake fails loud instead of false-passing on zero sends).
+
+    The LIVE (``mtproto``) tier still needs ``command`` (the SUT bot's poller boots either way).
+    Whether the live run can actually RUN is decided at dispatch by ``live_tier.bot_live_available``
+    (the test-account creds gate) — config only accepts the driver name; it never proves creds."""
 
     driver: str = "mock"
     command: tuple[str, ...] = ()
@@ -132,17 +137,26 @@ class BotConfig:
     skip_probe: bool = False
 
     def __post_init__(self) -> None:
-        if self.driver not in ("mock",):
+        from .live_tier import BOT_LIVE_DRIVER
+
+        if self.driver not in ("mock", BOT_LIVE_DRIVER):
             raise QaConfigError(
-                f"sut.bot.driver={self.driver!r} is not supported in v1 (only 'mock', the "
-                "hermetic Tier-1 fake-Telegram driver; the live MTProto Tier-2 driver is "
-                "deferred to v2)."
+                f"sut.bot.driver={self.driver!r} is not supported (use 'mock', the hermetic "
+                f"Tier-1 fake-Telegram driver, or {BOT_LIVE_DRIVER!r}, the Tier-2 LIVE driver "
+                "that drives a real test Telegram account — gated behind test-account creds)."
             )
         if not self.command:
             raise QaConfigError(
-                "sut.bot.command is required for the hermetic mock bot driver — it is the argv "
-                "that boots the bot's poller (run with TG_API_BASE pointed at the fake)."
+                "sut.bot.command is required for the bot driver — it is the argv that boots the "
+                "bot's poller (the mock driver runs it with TG_API_BASE pointed at the fake)."
             )
+
+    @property
+    def is_live(self) -> bool:
+        """Whether this block selects the Tier-2 LIVE driver (vs the hermetic mock)."""
+        from .live_tier import BOT_LIVE_DRIVER
+
+        return self.driver == BOT_LIVE_DRIVER
 
 
 @dataclass(frozen=True)
@@ -154,15 +168,19 @@ class WebConfig:
     grammar — a fully deterministic "drive the DOM, assert the DOM" run that needs no un-caged
     agent (the counterpart of the hermetic bot path).
 
-    ``driver`` is ``playwright`` (the headless-Chromium default; an agent-browser / visual Tier-2
-    driver is deferred to v2). ``command`` is the argv that boots the app's dev server (run from
-    the SUT cwd) — e.g. ``[python3, -m, http.server, 8080]`` or ``[npm, run, dev]``; omit it for a
-    SUT already reachable at ``base_url`` (a stage / already-running server). ``base_url`` is the
-    address the browser navigates to (a relative ``Goto: /login`` resolves against it); its
-    PRESENCE is what makes a hermetic run possible — without it the harness has nowhere to point
-    the browser. ``ready_path`` is the path the health gate polls for an HTTP 2xx/3xx before any
-    case runs (default ``/``). ``env`` is extra NON-SECRET environment for the dev server; secrets
-    stay in host env. ``ready_timeout_s`` bounds the health gate."""
+    ``driver`` is ``playwright`` (the Tier-1 headless-Chromium-against-a-locally-booted-app
+    default) or ``agent-browser`` (the Tier-2 LIVE driver — a real browser against a deployed
+    test site; gated behind ``REVIEW_QA_WEB_LIVE`` + a site URL, see ``live_tier``). ``command``
+    is the argv that boots the app's dev server (run from the SUT cwd) — e.g.
+    ``[python3, -m, http.server, 8080]`` or ``[npm, run, dev]``; omit it for a SUT already
+    reachable at ``base_url`` (a stage / already-running server). ``base_url`` is the address the
+    browser navigates to (a relative ``Goto: /login`` resolves against it); its PRESENCE is what
+    makes a Tier-1 run possible — without it the harness has nowhere to point the browser. The
+    LIVE tier instead takes its site URL from ``REVIEW_QA_WEB_BASE_URL`` (the deployed test site,
+    distinct from the locally-booted ``base_url``). ``ready_path`` is the path the health gate
+    polls for an HTTP 2xx/3xx before any case runs (default ``/``). ``env`` is extra NON-SECRET
+    environment for the dev server; secrets stay in host env. ``ready_timeout_s`` bounds the
+    health gate."""
 
     driver: str = "playwright"
     base_url: str = ""
@@ -172,20 +190,34 @@ class WebConfig:
     ready_timeout_s: int = 30
 
     def __post_init__(self) -> None:
-        if self.driver not in ("playwright",):
+        from .live_tier import WEB_LIVE_DRIVER
+
+        if self.driver not in ("playwright", WEB_LIVE_DRIVER):
             raise QaConfigError(
-                f"sut.web.driver={self.driver!r} is not supported in v1 (only 'playwright', the "
-                "deterministic Tier-1 headless-Chromium driver; an agent-browser / visual Tier-2 "
-                "driver is deferred to v2)."
+                f"sut.web.driver={self.driver!r} is not supported (use 'playwright', the Tier-1 "
+                f"headless-Chromium driver, or {WEB_LIVE_DRIVER!r}, the Tier-2 LIVE driver that "
+                "drives a real browser against a deployed test site — gated behind "
+                "REVIEW_QA_WEB_LIVE + REVIEW_QA_WEB_BASE_URL)."
             )
-        if not self.base_url:
+        # The Tier-1 driver needs a local base_url to point the browser at; the LIVE driver takes
+        # its site URL from REVIEW_QA_WEB_BASE_URL (checked at the gate, not here), so a live block
+        # may legitimately omit base_url.
+        if not self.base_url and self.driver != WEB_LIVE_DRIVER:
             raise QaConfigError(
-                "sut.web.base_url is required for the web driver — it is the address the headless "
-                "browser navigates to (a relative `Goto: /path` resolves against it). Set it to "
-                "the dev server's URL (e.g. http://127.0.0.1:8080)."
+                "sut.web.base_url is required for the Tier-1 web driver — it is the address the "
+                "headless browser navigates to (a relative `Goto: /path` resolves against it). Set "
+                "it to the dev server's URL (e.g. http://127.0.0.1:8080). The Tier-2 LIVE driver "
+                "instead reads the site URL from REVIEW_QA_WEB_BASE_URL."
             )
         if self.ready_timeout_s <= 0:
             raise QaConfigError("sut.web.ready_timeout_s must be > 0.")
+
+    @property
+    def is_live(self) -> bool:
+        """Whether this block selects the Tier-2 LIVE driver (vs the Tier-1 headless Chromium)."""
+        from .live_tier import WEB_LIVE_DRIVER
+
+        return self.driver == WEB_LIVE_DRIVER
 
 
 @dataclass(frozen=True)
@@ -199,11 +231,14 @@ class ExtConfig:
     command, assert the window state" run that needs no un-caged agent (the counterpart of the
     hermetic bot and the deterministic web paths).
 
-    ``driver`` is ``vscode`` (the isolated-VS-Code-over-CDP default; a visual Tier-2 driver is
-    deferred to v2). ``extension_path`` is the directory passed to ``--extensionDevelopmentPath``
-    (the extension under test; default ``.`` = the SUT itself is the extension). ``workspace`` is
-    the folder VS Code opens (default ``.`` = the SUT); a relative ``Open: file`` resolves against
-    it. ``env`` is extra NON-SECRET environment for the runner; secrets stay in host env."""
+    ``driver`` is ``vscode`` (the Tier-1 isolated-VS-Code-over-CDP default) or ``vscode-visual``
+    (the Tier-2 LIVE driver — real VS Code plus window-screenshot visual diffing against a
+    baseline; gated behind ``REVIEW_QA_EXT_LIVE`` + the VS Code gate + a baseline dir, see
+    ``live_tier`` and issue #82). ``extension_path`` is the directory passed to
+    ``--extensionDevelopmentPath`` (the extension under test; default ``.`` = the SUT itself is the
+    extension). ``workspace`` is the folder VS Code opens (default ``.`` = the SUT); a relative
+    ``Open: file`` resolves against it. ``env`` is extra NON-SECRET environment for the runner;
+    secrets stay in host env."""
 
     driver: str = "vscode"
     extension_path: str = "."
@@ -211,12 +246,22 @@ class ExtConfig:
     env: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.driver not in ("vscode",):
+        from .live_tier import EXT_LIVE_DRIVER
+
+        if self.driver not in ("vscode", EXT_LIVE_DRIVER):
             raise QaConfigError(
-                f"sut.ext.driver={self.driver!r} is not supported in v1 (only 'vscode', the "
-                "deterministic Tier-1 isolated-VS-Code-over-CDP driver; a visual Tier-2 driver "
-                "is deferred to v2)."
+                f"sut.ext.driver={self.driver!r} is not supported (use 'vscode', the Tier-1 "
+                f"isolated-VS-Code-over-CDP driver, or {EXT_LIVE_DRIVER!r}, the Tier-2 LIVE driver "
+                "that adds window-screenshot visual diffing — gated behind REVIEW_QA_EXT_LIVE + "
+                "the VS Code gate + a baseline dir)."
             )
+
+    @property
+    def is_live(self) -> bool:
+        """Whether this block selects the Tier-2 LIVE driver (vs the Tier-1 CDP runner)."""
+        from .live_tier import EXT_LIVE_DRIVER
+
+        return self.driver == EXT_LIVE_DRIVER
 
 
 @dataclass(frozen=True)

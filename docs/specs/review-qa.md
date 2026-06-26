@@ -396,6 +396,65 @@ gitleaks-scanned config (`~/.config/tg-cli-qa/.env`), never committed, never log
 from artifacts. Prefer Telegram's TEST data center where the SUT can register there.
 Cleanup created test messages/topics after a run.
 
+### 7.4 Tier-2 (the LIVE tier) — SCAFFOLDING shipped, CREDS the CTO must provision (#82/#84)
+
+Tier-1 (the deterministic / hermetic harnesses) ships and gates in CI with no creds. Tier-2 is
+the LIVE tier: it swaps the in-process fake / local boot for a REAL external system. The
+**scaffolding** is built and unit-tested without creds (`reviewlib/qa/live_tier.py`): the
+`tier: live` config path (a per-SUT `driver:` value), a per-SUT availability GATE that names the
+EXACT missing creds, the live-driver SKELETON wired behind the SAME protocol seam the Tier-1
+driver speaks, and the dispatch that SKIPs LOUD (a controlled BLOCKED, never a fake pass) when
+creds are absent. **The actual live run is tracked in #82** — it needs the credentials/infra
+below. Until then, a `tier: live` block runs to a BLOCKED that names exactly what to provide.
+
+**How a live tier is selected.** Set the SUT block's `driver:` to the live value AND set the
+opt-in flag (the flag mirrors `REVIEW_QA_PLAYWRIGHT` / `REVIEW_QA_VSCODE`):
+
+| SUT | `driver:` (qa.yaml) | opt-in flag | gate |
+| --- | --- | --- | --- |
+| bot | `mtproto` | `REVIEW_QA_BOT_LIVE=1` | `live_tier.bot_live_available()` |
+| web | `agent-browser` | `REVIEW_QA_WEB_LIVE=1` | `live_tier.web_live_available()` |
+| ext | `vscode-visual` | `REVIEW_QA_EXT_LIVE=1` | `live_tier.ext_live_available()` |
+
+**Credentials / infra the CTO must provision for the live run (per SUT):**
+
+**bot (real Telegram, MTProto):**
+- A DEDICATED throwaway test Telegram USER account (its own phone / virtual number) — NEVER the
+  real account. MTProto user-account automation risks a Telegram ToS BAN; burn a throwaway.
+- A test BOT (its own token from @BotFather) and a DEDICATED test chat containing ONLY the test
+  account + test bot (never the real chat).
+- Env: `REVIEW_QA_BOT_LIVE=1`, `TG_TEST_API_ID`, `TG_TEST_API_HASH` (my.telegram.org app creds of
+  the test account), `TG_TEST_SESSION` (a Telethon StringSession for the test USER account),
+  `TG_TEST_CHAT_ID` (the test chat id — MUST NOT equal the real `TG_CHAT_ID`; the gate fails
+  CLOSED if it does).
+- **Gate limit (operator responsibility):** the safety gate only compares `TG_TEST_CHAT_ID`
+  against `TG_CHAT_ID` by string equality (after trimming surrounding whitespace) — it CANNOT
+  verify that `TG_TEST_SESSION` is a throwaway
+  account rather than your real one (a session string is opaque; the gate never opens it). A
+  dedicated test account is YOUR responsibility, not something the gate can prove. Never point
+  `TG_TEST_SESSION` at your real account's session even if the chat ids differ.
+- Dep: `pip install telethon` (a qa-harness dep, NOT a tg-cli dep).
+
+**web (real browser, live site):**
+- A deployed test SITE URL to drive (a stage, NOT production).
+- Env: `REVIEW_QA_WEB_LIVE=1`, `REVIEW_QA_WEB_BASE_URL` (the test site URL, e.g.
+  `https://stage.example.test`).
+- Runtime: Playwright + a browser (`pip install playwright && python -m playwright install
+  chromium`) OR the `agent-browser` CLI on PATH.
+
+**ext (real VS Code, window-screenshot visual diffing — #82's core ask):**
+- Env: `REVIEW_QA_EXT_LIVE=1`, `REVIEW_QA_VSCODE=1` (the underlying Tier-1 ext gate),
+  `REVIEW_QA_EXT_BASELINE_DIR` (a writable dir — first run records baselines, later runs
+  perceptual-diff against them with a threshold gate).
+- Runtime: node/tsx (NOT bun — bun hangs Electron launch on macOS), a VS Code binary
+  (`VSCODE_PATH` or `code` on PATH), and ImageMagick v7 (`magick`) for the perceptual diff (the
+  same tool the visual-verification suite uses).
+
+**How to run Tier-2 once provisioned.** Set the block's `driver:` to the live value, export the
+flag + creds above, then run the usual `review qa --kind <bot|web|ext> --suites …`. The dispatch
+routes the block to its live gate; with creds present it drives the real SUT (the live run, #82),
+with creds absent it BLOCKS and prints exactly which var is missing.
+
 ## 8. The tester-agent SYSTEM PROMPT (core deliverable)
 
 Built in `qa.py` (`_build_tester_prompt(kind, suites_text, sut_path, stage_url, bring_up,
