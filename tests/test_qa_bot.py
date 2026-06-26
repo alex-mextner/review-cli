@@ -601,16 +601,19 @@ def test_bot_config_skip_probe_string_false_is_false():
         shutil.rmtree(sut, ignore_errors=True)
 
 
-def test_bot_config_rejects_unsupported_driver():
-    """The mtproto Tier-2 driver is deferred to v2 — a config naming it fails loud, not a
-    silent fall-through to the hermetic driver."""
+def test_bot_config_accepts_live_mtproto_driver_flags_is_live():
+    """The mtproto Tier-2 LIVE driver is now ACCEPTED (the scaffolding landed — #84) and flagged
+    is_live; the live RUN is still gated behind creds at dispatch. A genuinely-unknown driver is
+    still rejected loud."""
     from reviewlib.qa.config import BotConfig, QaConfigError
 
+    cfg = BotConfig(driver="mtproto", command=("python3", "bot.py"))
+    assert cfg.is_live
     try:
-        BotConfig(driver="mtproto", command=("python3", "bot.py"))
-        raise AssertionError("expected QaConfigError for the mtproto driver")
+        BotConfig(driver="garbage", command=("python3", "bot.py"))
+        raise AssertionError("expected QaConfigError for an unknown driver")
     except QaConfigError as exc:
-        assert "v2" in str(exc) or "not supported" in str(exc)
+        assert "not supported" in str(exc)
 
 
 # --- the handler routing (_resolve_hermetic_bot) --------------------------------------

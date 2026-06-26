@@ -292,13 +292,19 @@ def test_web_config_requires_base_url():
         raise AssertionError("empty base_url must raise QaConfigError")
 
 
-def test_web_config_rejects_unknown_driver():
+def test_web_config_accepts_live_agent_browser_driver_flags_is_live():
+    """The agent-browser Tier-2 LIVE driver is now ACCEPTED (the scaffolding landed — #84) and
+    flagged is_live (and may omit base_url, which it reads from REVIEW_QA_WEB_BASE_URL at the
+    gate); the live RUN is still gated behind creds at dispatch. A genuinely-unknown driver is
+    still rejected loud."""
+    cfg = WebConfig(driver="agent-browser")  # no base_url -> allowed for the live driver
+    assert cfg.is_live
     try:
-        WebConfig(base_url="http://x", driver="agent-browser")
+        WebConfig(base_url="http://x", driver="garbage")
     except QaConfigError:
         pass
     else:
-        raise AssertionError("an unsupported driver must raise QaConfigError")
+        raise AssertionError("an unknown driver must raise QaConfigError")
 
 
 def test_web_config_parsed_from_fixture_yaml():
