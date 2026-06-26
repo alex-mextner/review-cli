@@ -33,6 +33,7 @@ import json
 import os
 import threading
 import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -125,9 +126,270 @@ def allowed_hosts() -> set[str]:
     return _LOOPBACK_HOSTS | _discover_tailscale_hosts() | _extra_allowed_hosts()
 
 
+def _log_dir_fingerprint(ld: Path) -> tuple[int, float, int]:
+    """A cheap stat-only signature of the log dir: (file_count, max_mtime, total_size).
+
+    Re-reading + re-clustering 33k+ artifacts and computing `to_summary()` over ~600
+    sessions costs ~28s (the O(calls^2) recovery scan in `Session.errors`, exposed by every
+    summary). That can't run per-request, so the summary list is cached across requests and
+    keyed by this fingerprint. A new/changed run bumps the mtime, size, or count, so the
+    cache self-invalidates without any explicit wiring — the same stat-only heuristic the
+    SSE watcher already uses (`_snapshot_logs`) to notice activity. Stat-only = no file is
+    opened, so the fingerprint itself is cheap enough to compute on every request."""
+    count = 0
+    max_mtime = 0.0
+    total_size = 0
+    try:
+        entries = list(ld.iterdir())
+    except OSError:
+        return (0, 0.0, 0)
+    for entry in entries:
+        if entry.suffix not in (".log", ".md"):
+            continue
+        try:
+            st = entry.stat()
+        except OSError:
+            continue
+        count += 1
+        total_size += st.st_size
+        if st.st_mtime > max_mtime:
+            max_mtime = st.st_mtime
+    return (count, max_mtime, total_size)
+
+
+# Recompute the parsed session list at most once per this window, even while the log dir keeps
+# changing. The full parse + `to_summary()` scan is ~28s; a `review` run appends call logs
+# every few seconds, so invalidating on EVERY file change would thrash the cache — each request
+# would find a fresh fingerprint and pay the 28s scan again, leaving the dashboard perpetually
+# cold (the exact symptom: an active review session writing logs faster than one scan
+# completes). A min-recompute window bounds the scan to once per interval; the live SSE stream
+# (`_emit_activity`) keeps the open page current with the newest sessions in the meantime, so
+# the list/stats only need to be fresh-ENOUGH, not bleeding-edge. A new run still appears within
+# one window (and immediately over SSE), so this is a small, bounded staleness — not a stale
+# cache.
+#
+# The window MUST comfortably exceed the scan cost: if it were < the ~28s scan, a recompute
+# would already be past the window the instant it finished, so the very next request under
+# continuous writes would recompute again and the cache would never catch up (perpetually
+# cold — observed live with a 20s window against a 28s scan). 120s gives a wide margin over
+# the worst-case scan and still surfaces a new run within ~2min on the list (instantly over SSE
+# on an open page), which is the right freshness for a history view.
+_SUMMARY_MIN_RECOMPUTE_SECONDS = 120.0
+# Floor the production window must clear: it has to exceed the worst-case scan (~28s) by a wide
+# margin, or it re-introduces the perpetual-cold thrash. A test asserts the constant stays above
+# this so a future tweak back down can't silently regress.
+_SUMMARY_MIN_RECOMPUTE_FLOOR_SECONDS = 30.0
+
+
+class _SessionCache:
+    """Cross-request, single-flight, TTL-bounded cache of the parsed `Session` LIST.
+
+    `load_sessions()` parses + clusters ~33k log artifacts, and the per-session `to_summary()`
+    /`errors` recovery scan over ~600 sessions costs ~28s cold in total. The SPA's FIRST paint
+    fires `/api/runs` AND `/api/stats` together (`app.js` does a `Promise.all`), and every
+    feedback/conscious/links write does an existence check — all of which used to call
+    `load_sessions()` fresh. So without a shared cache EVERY one of those paid the parse, and
+    because the dashboard is a `ThreadingHTTPServer`, N concurrent cold loads STAMPEDED it in
+    parallel before any memoized — the first render timed out / came back empty.
+
+    Caching the parsed `Session` list (not just the summary dicts) is what lets `/api/runs`,
+    `/api/stats`, the detail lookup, and the write existence-check all share ONE parse. Three
+    protections, together:
+      * single-flight — the first caller computes under the lock while every concurrent caller
+        blocks on the SAME lock and then reads the freshly-stored value: one computation shared
+        by all, never a stampede;
+      * fingerprint invalidation — a changed log dir (new/grown run) recomputes, so a new run
+        shows up without a manual cache bust;
+      * a min-recompute window (`_SUMMARY_MIN_RECOMPUTE_SECONDS`) — the scan runs at most once
+        per window even while the dir keeps changing, so an active review session appending logs
+        every few seconds can't thrash a 28s scan into running back-to-back. The open page stays
+        current via the live SSE stream, so a few seconds of staleness is invisible.
+
+    Summaries/stats are derived from the cached `Session` objects on demand; `Session` exposes
+    `to_summary()`/`errors` as `cached_property`, so the per-session scan also memoizes on the
+    cached instance and is not re-run while the list is warm. Annotations are merged per-request
+    from the store (cheap) so a feedback/conscious/links write stays instantly visible without
+    invalidating the expensive parse."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # Lineage = (gap, log-dir path). The min-recompute window only ever debounces churn
+        # WITHIN one lineage; a different gap or a different log dir must never be served from
+        # another lineage's cache (matters for tests, which point each case at its own temp
+        # dir — in production the log dir is fixed for the process's life).
+        self._lineage: tuple[float, str] | None = None
+        self._fingerprint: tuple[int, float, int] | None = None
+        self._sessions: list[dparser.Session] | None = None
+        self._computed_at = 0.0
+        # Bumped on every reparse. Memoized DERIVED values (e.g. the ~8s compute_stats result,
+        # which does NOT memoize on its own) are tagged with the generation they were built from
+        # and discarded the moment the session list is recomputed — so /api/stats is fast and
+        # never serves a derivation built from a previous parse.
+        self._generation = 0
+        self._derived: dict[object, tuple[int, object]] = {}
+        self._refreshing = False  # a background reparse is in flight (don't start a second)
+
+    def get(self, gap: float, *, force: bool = False) -> list[dparser.Session]:
+        """The cached parsed `Session` list for ``gap``.
+
+        Computes synchronously only when there is nothing servable yet (cold cache, a different
+        gap/log dir, or ``force`` for the startup prewarm). When a usable list is already cached
+        but the log dir changed past the min-recompute window, it serves the current (slightly
+        stale) list IMMEDIATELY and refreshes on a background thread — so no request ever blocks
+        ~28s on a reparse. The SSE stream keeps an open page current in the meantime.
+
+        The returned list and its `Session` objects are the SHARED cached objects — callers must
+        treat them as read-only and derive fresh dicts from them (`to_summary()`/`to_detail()`
+        build new dicts; `_merge_annotation` copies before mutating)."""
+        with self._lock:
+            self._ensure_fresh_locked(gap, force=force)
+            return self._sessions  # type: ignore[return-value]  # set by _ensure_fresh_locked
+
+    def get_derived(self, gap: float, key: object, factory: Callable[[list[dparser.Session]], object]) -> object:
+        """A value derived from the cached session list, memoized until the list is reparsed.
+
+        ``key`` identifies the derivation (e.g. ``"stats"``); ``factory`` builds it from the
+        session list. The result is cached against the current generation and reused for every
+        request until the next reparse bumps the generation — this is what makes the ~8s
+        un-memoizing ``compute_stats`` cheap on /api/stats without re-running it per request.
+        Computed under the same lock, so concurrent callers share one build (single-flight)."""
+        with self._lock:
+            self._ensure_fresh_locked(gap, force=False)
+            cached = self._derived.get(key)
+            if cached is None or cached[0] != self._generation:
+                value = factory(self._sessions)  # type: ignore[arg-type]
+                self._derived[key] = (self._generation, value)
+                return value
+            return cached[1]
+
+    def _ensure_fresh_locked(self, gap: float, *, force: bool) -> None:
+        """Serve-stale-while-revalidate (caller holds the lock).
+
+        Blocks for a synchronous reparse ONLY when there is nothing usable to serve; otherwise
+        kicks a background refresh and returns immediately so the request is never slow."""
+        ld = log_dir()
+        lineage = (gap, str(ld))
+        fingerprint = _log_dir_fingerprint(ld)
+        if self._must_block(lineage, force=force):
+            # Cold / different lineage / explicit force — no stale data to serve, so compute now.
+            self._reparse_locked(gap, ld, lineage, fingerprint)
+        elif self._should_refresh(lineage, fingerprint):
+            # Usable data exists but the dir changed past the window — serve it and refresh async.
+            self._start_background_refresh(gap, lineage)
+
+    def _reparse_locked(
+        self,
+        gap: float,
+        ld: Path,
+        lineage: tuple[float, str],
+        fingerprint: tuple[int, float, int],
+    ) -> None:
+        """Run the expensive parse and install the result (caller holds the lock)."""
+        self._sessions = dparser.load_sessions(ld, gap_seconds=gap)
+        self._lineage = lineage
+        self._fingerprint = fingerprint
+        self._computed_at = time.monotonic()
+        self._generation += 1
+        self._derived.clear()  # derivations from the previous parse are now stale
+
+    def _must_block(self, lineage: tuple[float, str], *, force: bool) -> bool:
+        """True iff there is no servable cached list — a sync reparse is unavoidable."""
+        if self._sessions is None or force:
+            return True  # nothing cached yet, or an explicit prewarm/refresh
+        # Different gap or log dir: serving another lineage's data would be wrong, so block.
+        return self._lineage != lineage
+
+    def _should_refresh(self, lineage: tuple[float, str], fingerprint: tuple[int, float, int]) -> bool:
+        """True iff the cached (same-lineage) list is stale enough to refresh in the background."""
+        if self._refreshing:
+            return False  # a refresh is already in flight — don't pile on
+        if self._fingerprint == fingerprint:
+            return False  # unchanged dir — nothing to refresh
+        # Same lineage, fingerprint changed. Refresh only once the cache is older than the
+        # window; otherwise keep serving the current list — this is what stops an active
+        # log-writing session from kicking a reparse on every single request.
+        return (time.monotonic() - self._computed_at) >= _SUMMARY_MIN_RECOMPUTE_SECONDS
+
+    def _start_background_refresh(self, gap: float, lineage: tuple[float, str]) -> None:
+        """Kick a single background reparse (caller holds the lock). Serves stale until it lands."""
+        self._refreshing = True
+
+        def _run() -> None:
+            try:
+                ld = log_dir()
+                # Re-read the lineage/fingerprint at run time: the dir may have grown more since
+                # the refresh was scheduled, and we want the freshest snapshot.
+                fresh_lineage = (gap, str(ld))
+                fresh_fp = _log_dir_fingerprint(ld)
+                sessions = dparser.load_sessions(ld, gap_seconds=gap)
+                with self._lock:
+                    # Only install if still the relevant lineage (a gap/dir change since scheduling
+                    # would already have been handled by a blocking reparse on that request).
+                    if self._lineage is None or self._lineage == lineage or self._lineage == fresh_lineage:
+                        self._sessions = sessions
+                        self._lineage = fresh_lineage
+                        self._fingerprint = fresh_fp
+                        self._computed_at = time.monotonic()
+                        self._generation += 1
+                        self._derived.clear()
+            except Exception as exc:  # noqa: BLE001 — a failed refresh keeps the last good data
+                print(f"[review dashboard] background cache refresh failed "
+                      f"({type(exc).__name__}: {exc}); serving last good data", flush=True)
+            finally:
+                with self._lock:
+                    self._refreshing = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+
+_session_cache = _SessionCache()
+
+
+def _cached_sessions(gap: float) -> list[dparser.Session]:
+    """The shared, warm, parsed `Session` list for ``gap`` — the single source every read
+    endpoint (`/api/runs`, `/api/stats`, detail, write existence-check) derives from."""
+    return _session_cache.get(gap)
+
+
+def _cached_stats(gap: float) -> dict:
+    """The `/api/stats` aggregate, memoized until the session list is reparsed.
+
+    `compute_stats` is ~8s over ~600 sessions and does NOT memoize on its own, so an uncached
+    call here would keep /api/stats slow even with the parse shared. Memoizing it against the
+    cache generation makes it cheap and auto-invalidate on the next reparse. Store rollups
+    (conscious/feedback counts) are layered on per-request since annotations change independently
+    of the parse."""
+    return _session_cache.get_derived(gap, "stats", dparser.compute_stats)  # type: ignore[return-value]
+
+
+def _summaries_for_gap(gap: float) -> list[dict]:
+    """Annotation-merged run summaries for ``gap`` — the `/api/runs` payload, cached + warm."""
+    return [_merge_annotation(s.to_summary(), s.session_id) for s in _cached_sessions(gap)]
+
+
+def prewarm_summary_cache(gap: float = dparser.DEFAULT_SESSION_GAP_SECONDS) -> None:
+    """Parse + warm the session list once at startup so the FIRST page load is already warm.
+
+    Without this the first browser hit — which fires `/api/runs` AND `/api/stats` together, plus
+    the SSE stream — arrives cold and stampedes the ~28s scan, the empty/timing-out render the
+    user saw. Run on a background thread from `run_dashboard` so binding the port isn't delayed;
+    by the time a human's first request lands, the cache for the default gap is populated. Also
+    touch `to_summary()` on each session so the per-session `cached_property` scan is warm too,
+    not just the parse, and prewarm the ~8s `/api/stats` aggregate so BOTH halves of the SPA's
+    first-paint Promise.all are warm. Best-effort: a parse regression must not crash startup, but
+    it IS logged (a silently-cold cache would present as the very 'dashboard still empty' symptom
+    this fixes)."""
+    try:
+        for s in _session_cache.get(gap, force=True):
+            s.to_summary()  # warm the per-session cached_property (errors/recovery scan) too
+        _cached_stats(gap)  # warm the /api/stats aggregate (the other half of the first paint)
+    except Exception as exc:  # noqa: BLE001 — prewarm is best-effort; never crash startup
+        print(f"[review dashboard] prewarm failed ({type(exc).__name__}: {exc}); "
+              "first load will be cold", flush=True)
+
+
 def _session_index(gap: float) -> dict[str, dparser.Session]:
-    sessions = dparser.load_sessions(log_dir(), gap_seconds=gap)
-    return {s.session_id: s for s in sessions}
+    return {s.session_id: s for s in _cached_sessions(gap)}
 
 
 def _merge_annotation(summary: dict, session_id: str) -> dict:
@@ -310,9 +572,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "version": self.server_version,
                 })
             if path == "/api/runs":
-                gap = self._gap(qs)
-                sessions = dparser.load_sessions(log_dir(), gap_seconds=gap)
-                return self._send_json([_merge_annotation(s.to_summary(), s.session_id) for s in sessions])
+                # Derived from the cross-request, single-flight session cache: the ~28s parse +
+                # summary scan over the full log dir runs once per log-dir change, not once per
+                # request, so the first (and every concurrent) page load is fast instead of
+                # stampeding and rendering empty. Annotations are merged here per-request so a
+                # feedback/conscious write stays instantly visible.
+                return self._send_json(_summaries_for_gap(self._gap(qs)))
             if path.startswith("/api/runs/"):
                 sid = path[len("/api/runs/"):]
                 idx = _session_index(self._gap(qs))
@@ -323,9 +588,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 detail = _merge_annotation(detail, sid)
                 return self._send_json(detail)
             if path == "/api/stats":
-                sessions = dparser.load_sessions(log_dir(), gap_seconds=self._gap(qs))
-                stats = dparser.compute_stats(sessions)
-                # Tasks/overseer rollups come from the store, layered on top of stats.
+                # Shares the SAME cached parse as /api/runs AND memoizes the ~8s compute_stats
+                # against the cache generation. The SPA fires runs+stats together on first paint
+                # (a Promise.all), so an uncached/un-memoized stats call here would keep the first
+                # render slow even with /api/runs cached. Copy before layering store rollups so
+                # the per-request annotation counts never mutate the memoized stats dict.
+                stats = dict(_cached_stats(self._gap(qs)))
                 anns = dstore.all_annotations()
                 stats["conscious_count"] = sum(1 for a in anns.values() if a.get("conscious"))
                 stats["feedback_count"] = sum(1 for a in anns.values() if a.get("feedback"))
@@ -658,6 +926,11 @@ def run_dashboard(
             except Exception:  # noqa: BLE001
                 pass
         threading.Timer(0.4, _open).start()
+    # Warm the summary cache off-thread so the FIRST page load hits a populated cache instead
+    # of a cold ~28s `to_summary()` scan (the empty/timing-out render this fixes). Daemon so
+    # it never holds up shutdown; binding/serving has already started, so a slow prewarm only
+    # delays the first request's speedup, never the bind.
+    threading.Thread(target=prewarm_summary_cache, daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

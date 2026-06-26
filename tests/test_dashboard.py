@@ -85,6 +85,19 @@ def _seed_logs(log_dir: Path) -> None:
     _write_brainstorm(log_dir, "20260601T120020_000000", "How to decompose a CLI", "codex,gemini", "codex")
 
 
+def _wait_for_cache_refresh(cache, *, timeout: float = 5.0) -> None:
+    """Block until the session cache's background refresh (serve-stale-while-revalidate) has
+    landed — i.e. no refresh is in flight. The cache serves the current list immediately and
+    reparses off-thread, so a test that asserts the POST-reparse state must wait for it."""
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    # Give the refresh thread a beat to even start, then wait for it to clear the flag.
+    _time.sleep(0.05)
+    while getattr(cache, "_refreshing", False) and _time.monotonic() < deadline:
+        _time.sleep(0.02)
+
+
 # --- parser tests -----------------------------------------------------------
 def test_parse_call_log_basic():
     from reviewlib.dashboard import parser as p
@@ -660,6 +673,317 @@ def test_invocations_endpoint_returns_populated_prompt_for_panel():
                 httpd.shutdown()
                 httpd.server_close()
         finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_session_cache_is_single_flight_and_invalidates_on_new_run():
+    """The parsed session list is computed ONCE per log-dir change, shared across concurrent
+    callers (single-flight, no stampede), and recomputed only when a new run appears. This is
+    the fix for the empty/slow dashboard: the parse + `to_summary()` over the full log dir is
+    ~28s cold, and before the cache EVERY request (and N concurrent first-paint requests) paid
+    it in parallel, so the page rendered empty/timed out. Here we wrap the expensive loader so
+    we can COUNT how many times it actually runs."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        # Count real computations by wrapping the expensive loader; a small sleep makes the
+        # eight worker threads genuinely overlap inside the lock window, so a NON-single-flight
+        # implementation would record >1 compute.
+        import time as _time
+
+        calls = {"n": 0}
+        orig_load = p.load_sessions
+
+        def _counted(*a, **k):
+            calls["n"] += 1
+            _time.sleep(0.2)
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()  # fresh cache for a clean count
+        p.load_sessions = _counted
+        # Drop the min-recompute window to 0 for THIS test so a new fingerprint recomputes
+        # immediately (the windowing-suppresses-thrash behaviour is its own test below).
+        orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
+        server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
+        try:
+            results: list[int] = []
+
+            def _worker() -> None:
+                results.append(len(server._summaries_for_gap(90.0)))
+
+            workers = [threading.Thread(target=_worker) for _ in range(8)]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+
+            # Single-flight: eight concurrent cold callers => exactly ONE computation.
+            assert calls["n"] == 1, f"expected single-flight (1 compute), got {calls['n']}"
+            assert set(results) == {1}, results  # all saw the same one run
+
+            # Unchanged log dir => served from cache, no recompute. /api/stats shares the SAME
+            # cached parse, so requesting it must not trigger a second load_sessions.
+            server._summaries_for_gap(90.0)
+            server.dparser.compute_stats(server._cached_sessions(90.0))
+            assert calls["n"] == 1, f"unchanged dir + stats must not recompute, got {calls['n']}"
+
+            # A new run changes the fingerprint. With window=0 the cache serves the CURRENT
+            # (stale, 1-row) list immediately and kicks a single background reparse — no request
+            # blocks. The stale read still shows the old count until the refresh lands.
+            _write_call_log(ld, "20260601T200000_000000", "gemini", 0, "ok\n", exit_code=0)
+            stale = server._summaries_for_gap(90.0)
+            assert len(stale) == 1, f"must serve stale immediately, got {len(stale)}"
+            # Exactly one background reparse runs; after it lands the new run shows.
+            _wait_for_cache_refresh(server._session_cache)
+            assert calls["n"] == 2, f"new run must reparse once (in background), got {calls['n']}"
+            runs = server._summaries_for_gap(90.0)
+            assert len(runs) == 2, runs
+            # Annotation keys are still merged onto the cached summaries (live store read).
+            assert all("feedback" in r and "conscious" in r and "links" in r for r in runs)
+        finally:
+            server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_session_cache_window_suppresses_thrash_under_active_writes():
+    """An active review session appends call logs every few seconds. Invalidating the ~28s
+    parse on EVERY new file would thrash it (each request finds a fresh fingerprint and pays the
+    full scan), leaving the dashboard perpetually cold — the live failure mode. The
+    min-recompute window bounds the scan to once per window: a new run that lands inside the
+    window is served from the (slightly stale) cache, not recomputed."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        calls = {"n": 0}
+        orig_load = p.load_sessions
+
+        def _counted(*a, **k):
+            calls["n"] += 1
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        p.load_sessions = _counted
+        # A long window so the just-written new logs all fall INSIDE it (no real sleeping).
+        orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
+        server._SUMMARY_MIN_RECOMPUTE_SECONDS = 3600.0
+        try:
+            # First call computes once and caches.
+            assert len(server._summaries_for_gap(90.0)) == 1
+            assert calls["n"] == 1
+
+            # Simulate the active writer: several new logs land, each bumping the fingerprint.
+            for i in range(5):
+                _write_call_log(ld, f"20260601T20000{i}_000000", "gemini", 0, "ok\n", exit_code=0)
+                server._summaries_for_gap(90.0)
+
+            # All within the window => NO extra scans; the cached (stale) list is served.
+            assert calls["n"] == 1, f"window must suppress recompute under writes, got {calls['n']}"
+        finally:
+            server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_stats_are_memoized_until_session_list_reparses():
+    """`compute_stats` is ~8s and does NOT memoize on its own. The cache's derived-value memo
+    must run it ONCE per parse generation (so /api/stats is fast on every paint) and rebuild it
+    exactly once when a new run forces a reparse."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        stat_calls = {"n": 0}
+        orig_stats = p.compute_stats
+
+        def _counted_stats(sessions):
+            stat_calls["n"] += 1
+            return orig_stats(sessions)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        p.compute_stats = _counted_stats
+        # Window 0 so a new run reparses immediately (isolates the memo from the window logic).
+        orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
+        server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
+        try:
+            server._cached_stats(90.0)
+            server._cached_stats(90.0)
+            server._cached_stats(90.0)
+            assert stat_calls["n"] == 1, f"stats must be memoized per parse, got {stat_calls['n']}"
+
+            # A new run triggers a background reparse (serve-stale-while-revalidate). Touch the
+            # cache to kick it, wait for it to land, then the next read rebuilds stats once for
+            # the new generation.
+            _write_call_log(ld, "20260601T200000_000000", "gemini", 0, "ok\n", exit_code=0)
+            server._cached_stats(90.0)  # serves stale, kicks the async reparse
+            _wait_for_cache_refresh(server._session_cache)
+            s = server._cached_stats(90.0)
+            assert stat_calls["n"] == 2, f"reparse must rebuild stats once, got {stat_calls['n']}"
+            assert s["session_count"] == 2, s
+        finally:
+            server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
+            p.compute_stats = orig_stats
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_stale_read_returns_immediately_and_refreshes_in_background():
+    """Serve-stale-while-revalidate: once a usable list is cached, a request that finds the log
+    dir changed past the window must NOT block on the ~28s reparse — it returns the current
+    (stale) list at once and reparses off-thread. This is what stops one unlucky request per
+    window from eating the full reparse synchronously (observed live: a 20-30s spike)."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        import time as _time
+
+        orig_load = p.load_sessions
+        slow = {"on": False}
+
+        def _maybe_slow(*a, **k):
+            if slow["on"]:
+                _time.sleep(1.0)  # stand in for the ~28s reparse
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        p.load_sessions = _maybe_slow
+        orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
+        server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
+        try:
+            # Warm the cache (this first call IS synchronous — nothing to serve yet).
+            assert len(server._summaries_for_gap(90.0)) == 1
+            # Now make the reparse slow and add a new run; the stale read must come back fast.
+            slow["on"] = True
+            _write_call_log(ld, "20260601T200000_000000", "gemini", 0, "ok\n", exit_code=0)
+            t0 = _time.monotonic()
+            stale = server._summaries_for_gap(90.0)
+            elapsed = _time.monotonic() - t0
+            assert elapsed < 0.5, f"stale read must not block on the reparse, took {elapsed:.2f}s"
+            assert len(stale) == 1, "must serve the pre-reparse (stale) list immediately"
+            # The background refresh lands shortly after and the new run then appears.
+            _wait_for_cache_refresh(server._session_cache, timeout=5.0)
+            assert len(server._summaries_for_gap(90.0)) == 2, "refresh must pick up the new run"
+        finally:
+            server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_production_recompute_window_clears_the_scan_floor():
+    """The shipped window must stay well above the worst-case ~28s scan, or it re-introduces
+    the perpetual-cold thrash (a recompute already past a too-short window => the next write
+    recomputes again, forever). A test guards the constant so a future tweak back down fails
+    here instead of silently regressing the live dashboard."""
+    from reviewlib.dashboard import server
+
+    assert server._SUMMARY_MIN_RECOMPUTE_SECONDS > server._SUMMARY_MIN_RECOMPUTE_FLOOR_SECONDS, (
+        f"production window {server._SUMMARY_MIN_RECOMPUTE_SECONDS}s must exceed the "
+        f"{server._SUMMARY_MIN_RECOMPUTE_FLOOR_SECONDS}s scan floor"
+    )
+
+
+def test_served_summary_does_not_share_mutable_state_with_cache():
+    """`_summaries_for_gap` must return dicts that don't alias the cached `Session` objects, so
+    a future mutation of a served response can't corrupt every subsequent request. `to_summary()`
+    builds a fresh dict and `_merge_annotation` copies it; this regression-guards that contract."""
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        try:
+            a = server._summaries_for_gap(90.0)
+            b = server._summaries_for_gap(90.0)
+            assert a and b
+            # Two separate calls must hand back distinct dict objects (not the same shared dict),
+            # and the cached Session's own to_summary() dict must not be the served object.
+            assert a[0] is not b[0], "each request must get its own summary dict"
+            cached_session = server._cached_sessions(90.0)[0]
+            assert a[0] is not cached_session.to_summary(), "served dict must not be the cache's"
+            # Mutating a served response must not leak into the next request.
+            a[0]["feedback"] = "scribble"
+            c = server._summaries_for_gap(90.0)
+            assert c[0]["feedback"] is None, "mutation of a served dict leaked into the cache"
+        finally:
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_prewarm_populates_session_cache_before_first_request():
+    """`prewarm_summary_cache()` (run off-thread at startup) parses + warms the session list so
+    the first real `/api/runs` AND `/api/stats` are already warm instead of paying the cold scan
+    and rendering empty."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        calls = {"n": 0}
+        orig_load = p.load_sessions
+
+        def _counted(*a, **k):
+            calls["n"] += 1
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        p.load_sessions = _counted
+        try:
+            server.prewarm_summary_cache(90.0)
+            assert calls["n"] == 1, "prewarm should parse once"
+            # Both /api/runs and /api/stats after prewarm are served from cache — no extra parse.
+            runs = server._summaries_for_gap(90.0)
+            server.dparser.compute_stats(server._cached_sessions(90.0))
+            assert calls["n"] == 1, f"requests after prewarm must hit cache, got {calls['n']}"
+            assert len(runs) == 1, runs
+        finally:
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
             os.environ.pop("REVIEW_LOG_DIR", None)
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
 
