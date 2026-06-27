@@ -695,7 +695,7 @@ def _parse_openai_usage(payload: object) -> tuple[int, int]:
 def _openai_compatible_request(
     *, model: str, api_model: str, label: str, base_url: str, key: str,
     prompt: str, diff: str, timeout: int, backend: str, round_no: int = 0,
-    extra_body: dict | None = None,
+    extra_body: dict | None = None, extra_headers: dict | None = None,
 ) -> ReviewResult:
     """POST an OpenAI-compatible chat/completions request and return a ReviewResult.
 
@@ -714,8 +714,21 @@ def _openai_compatible_request(
     recorded as a TIMEOUT, not a generic error, keeping the timeout metric consistent.
 
     `extra_body` merges provider-specific request fields into the body while keeping the
-    shared OpenAI wire shape generic. Both current callers (z.ai, commandcode) pass None;
-    the hook stays for any future provider that needs a non-standard field.
+    shared OpenAI wire shape generic. z.ai/commandcode/openrouter all pass None today; the
+    hook stays for any future provider that needs a non-standard field.
+
+    `extra_headers` merges provider-specific HTTP headers onto the shared
+    Content-Type/Authorization pair (used by OpenRouter for its OPTIONAL leaderboard
+    attribution headers HTTP-Referer / X-Title). It can never override the credential:
+    any case-insensitive `authorization`/`content-type` key in `extra_headers` is dropped
+    BEFORE the canonical pair is written, so a stray (even lower-cased) Authorization can't
+    shadow the real bearer key — the defense is explicit, not a reliance on urllib's header
+    capitalization. (Note: urllib normalizes header NAMES on the wire, e.g. `HTTP-Referer`
+    → `Http-referer`; HTTP header names are case-insensitive so this is cosmetic.)
+    This helper does NOT sanitize `extra_headers` VALUES — a value with a CR/LF or a
+    non-latin-1 char would make http.client.putheader raise mid-send (caught here as a
+    malformed-request ValueError, but a wasted call). The caller is responsible for passing
+    safe values; OpenRouter's wrapper validates via `_header_value_is_safe` and drops bad ones.
 
     `base_url` is the endpoint root (e.g. https://api.z.ai/api/paas/v4); the
     /chat/completions suffix is appended here so callers pass the same value users
@@ -735,12 +748,15 @@ def _openai_compatible_request(
     if extra_body:
         body.update(extra_body)
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-    )
+    # Drop any caller-supplied credential/content-type header (case-insensitively) BEFORE
+    # writing the canonical pair, so a stray `extra_headers` entry — even a lower-cased
+    # `authorization` that would be a DISTINCT dict key — can never shadow the real bearer
+    # key or content type. The canonical pair is then the only authority for those names.
+    _reserved = {"authorization", "content-type"}
+    headers = {str(k): str(v) for k, v in (extra_headers or {}).items() if str(k).lower() not in _reserved}
+    headers["Content-Type"] = "application/json"
+    headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
@@ -901,6 +917,109 @@ def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: i
     return _openai_compatible_request(
         model=model, api_model=cc_model, label="commandcode", base_url=base_url, key=key,
         prompt=prompt, diff=diff, timeout=timeout, backend="commandcode", round_no=round_no,
+    )
+
+
+# OpenRouter — an OpenAI-compatible API AGGREGATOR (https://openrouter.ai) that fronts 400+
+# models across providers (anthropic/openai/google/meta/...) behind ONE key and ONE
+# OpenAI-shaped /chat/completions endpoint. So it is a keyed-HTTP backend exactly like z.ai
+# and commandcode, NOT a subprocess (no OpenRouter CLI exists — API-only).
+#   base   https://openrouter.ai/api/v1
+#   POST   /chat/completions      (OpenAI request/response shape)
+#   auth   Authorization: Bearer $OPENROUTER_API_KEY   (keys look like sk-or-v1-...)
+# The wire model id is the OpenRouter slug `<provider>/<model>` (e.g. anthropic/claude-3.5-
+# sonnet, openai/gpt-4o), optionally with a `:variant` suffix (`:free`, `:beta`, `:nitro`).
+# A bare `openrouter` seat defaults to OpenRouter's OWN auto-router (`openrouter/auto`),
+# which picks a suitable model server-side — a never-stale default, since the concrete pick
+# is OpenRouter's job, not a literal we'd have to bump. Override the model with an
+# `openrouter:<slug>` seat suffix or OPENROUTER_MODEL, and the base with OPENROUTER_BASE_URL.
+OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_DEFAULT_MODEL = "openrouter/auto"
+OPENROUTER_SUPPORTED_MODES = ("api",)  # API-only — no OpenRouter CLI exists.
+
+
+def _openrouter_key() -> str:
+    # ONLY OPENROUTER_API_KEY. Like commandcode's `user_...` token, an OpenRouter key is a
+    # provider-specific `sk-or-v1-...` credential; accepting a foreign alias (e.g. a raw
+    # OpenAI/Anthropic key) would silently POST that credential to openrouter.ai — a wrong
+    # host and a cross-provider key leak. So the canonical name is the only one that resolves.
+    key = _resolve_key(("OPENROUTER_API_KEY",), "OPENROUTER_API_KEY")
+    if key:
+        return key
+    raise RuntimeError(
+        "OPENROUTER_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
+    )
+
+
+def _openrouter_extra_headers() -> dict:
+    """OpenRouter's OPTIONAL leaderboard-attribution headers, built from env. Empty when
+    unset, so the backend works with nothing configured (the headers only affect how the
+    app appears on openrouter.ai rankings — never the review result). HTTP-Referer / X-Title
+    are the documented header names; the env vars mirror them for discoverability.
+
+    A value containing a control character (CR/LF/etc.) is DROPPED, not sent: http.client's
+    putheader would raise a ValueError on a newline mid-send, turning a stray env value into
+    a crash AND it would be a header-injection vector. Dropping the bad value keeps the
+    backend on its "any failure is a graceful dead-backend, never a raw exception" contract
+    and refuses to smuggle attacker/typo CRLF into the request."""
+    headers: dict[str, str] = {}
+    referer = os.environ.get("OPENROUTER_HTTP_REFERER", "").strip()
+    if referer and _header_value_is_safe(referer):
+        headers["HTTP-Referer"] = referer
+    title = os.environ.get("OPENROUTER_X_TITLE", "").strip()
+    if title and _header_value_is_safe(title):
+        headers["X-Title"] = title
+    return headers
+
+
+def _header_value_is_safe(value: str) -> bool:
+    """True iff `value` is safe to send as an HTTP header value, on two counts:
+
+    * it is encodable as **latin-1** — http.client encodes header values as latin-1, so a
+      non-encodable char (emoji, CJK, …) would raise UnicodeEncodeError mid-send; and
+    * it carries **no control character** — C0 (0x00-0x1F, except tab), DEL (0x7F), or C1
+      (0x80-0x9F) — which could break HTTP header framing (CR/LF injection) or be mangled.
+
+    A value failing either is DROPPED by the caller, keeping an optional attribution header
+    from ever crashing or corrupting the request. Printable ASCII + printable latin-1
+    (e.g. accented letters, 0xA0-0xFF) + tab are allowed."""
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        return False
+    return not any((ord(ch) < 0x20 and ch != "\t") or 0x7F <= ord(ch) <= 0x9F for ch in value)
+
+
+def review_openrouter(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+    # API-only: a forced REVIEW_OPENROUTER_MODE=cli is a config error (no OpenRouter CLI),
+    # surfaced as a dead-backend result, never a silent api POST. `round_no` is accepted so
+    # the panel's uniform 6-arg dispatch does not raise (see review_zai for the rationale).
+    # A forced-mode config error or a missing key both produce a NON-zero result AND a
+    # sidecar log so a failed run is visible in the dashboard, not an invisible internal 127.
+    try:
+        resolve_backend_mode("openrouter", OPENROUTER_SUPPORTED_MODES, "api")
+        key = _openrouter_key()
+    except RuntimeError as exc:
+        _emit_rest_log("openrouter", "openrouter", round_no=round_no, returncode=1, stdout="", stderr=str(exc))
+        return ReviewResult(model=model, command="openrouter", returncode=1, stdout="", stderr=str(exc))
+    # `split(":", 1)[1]` strips ONLY the `openrouter:` prefix, preserving both the slug's
+    # `/` AND any trailing `:variant` colon (e.g. openrouter:anthropic/claude-3.5-sonnet:beta
+    # → anthropic/claude-3.5-sonnet:beta). The suffix is `.strip()`ed and used ONLY when
+    # non-empty: a bare `openrouter`, an EMPTY suffix (`openrouter:` / `openrouter: `) all fall
+    # back to OPENROUTER_MODEL, then the auto-router default — never POST `"model": ""` (a
+    # guaranteed 400) just because a stray colon was present.
+    # Both env overrides are `.strip()`ed and used only when non-empty, symmetric with the
+    # suffix discipline above: a whitespace-only OPENROUTER_MODEL / OPENROUTER_BASE_URL must
+    # NOT win (it would POST `"model": "   "` / build a broken URL — the same 400 the empty
+    # suffix guards against), so it falls through to the next source / the default.
+    suffix = model.split(":", 1)[1].strip() if ":" in model else ""
+    env_model = os.environ.get("OPENROUTER_MODEL", "").strip()
+    or_model = suffix or env_model or OPENROUTER_DEFAULT_MODEL
+    base_url = os.environ.get("OPENROUTER_BASE_URL", "").strip() or OPENROUTER_DEFAULT_BASE_URL
+    return _openai_compatible_request(
+        model=model, api_model=or_model, label="openrouter", base_url=base_url, key=key,
+        prompt=prompt, diff=diff, timeout=timeout, backend="openrouter", round_no=round_no,
+        extra_headers=_openrouter_extra_headers(),
     )
 
 
@@ -1437,6 +1556,12 @@ def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
          "common-code:", "commoncode:", "common_code:")
     ):
         return review_commandcode
+    # OpenRouter — OpenAI-compatible API aggregator (keyed HTTP). `openrouter` plus
+    # `openrouter:<provider>/<model>` (e.g. openrouter:anthropic/claude-3.5-sonnet). Does NOT
+    # collide with opencode's `oc:`/`opencode:` prefixes — `openrouter:` shares no prefix with
+    # either, so the order relative to the opencode catch-all below is irrelevant.
+    if lowered == "openrouter" or lowered.startswith("openrouter:"):
+        return review_openrouter
     # fable IS claude-p. Route any fable form to review_claude defensively, so an
     # unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
     # default (which would hit fireworks — the wrong provider entirely).
@@ -1567,6 +1692,12 @@ def backend_available(model: str) -> bool:
             # probe must reflect that instead of selecting a backend that only fails.
             resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
             _commandcode_key()
+            return True
+        if backend is review_openrouter:
+            # Same api-only contract: a forced REVIEW_OPENROUTER_MODE=cli is unrunnable, so
+            # the probe reports unavailable rather than selecting a backend that only fails.
+            resolve_backend_mode("openrouter", OPENROUTER_SUPPORTED_MODES, "api")
+            _openrouter_key()
             return True
         if backend is review_codex:
             _which("codex")

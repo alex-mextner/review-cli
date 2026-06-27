@@ -51,6 +51,13 @@ _KEY_ENV_NAMES = (
     "COMMANDCODE_BASE_URL",
     "REVIEW_COMMANDCODE_MODE",
     "REVIEW_ZAI_MODE",
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_MODEL",
+    "OPENROUTER_BASE_URL",
+    "OPENROUTER_HTTP_REFERER",
+    "OPENROUTER_X_TITLE",
+    "REVIEW_OPENROUTER_MODE",
     "GEMINI_ENV_FILE",
 )
 
@@ -896,6 +903,427 @@ def test_zai_malformed_json_maps_to_returncode():
     assert res.returncode == 1, res.returncode
     assert res.stdout == ""
     assert "malformed" in res.stderr.lower()
+
+
+# === OpenRouter (OpenAI-compatible aggregator) ==================================
+def test_resolve_backend_routes_openrouter():
+    for name in ("openrouter", "OpenRouter", "OPENROUTER"):
+        assert backends.resolve_backend(name) is backends.review_openrouter, name
+    assert backends.resolve_backend("openrouter:anthropic/claude-3.5-sonnet") is backends.review_openrouter
+    assert backends.resolve_backend("openrouter:openai/gpt-4o") is backends.review_openrouter
+    # OpenRouter must NOT steal opencode's `oc:`/`opencode:` agentic routing.
+    assert backends.resolve_backend("oc:fireworks/x") is backends.review_opencode
+    assert backends.resolve_backend("opencode:provider/model") is backends.review_opencode
+
+
+def test_openrouter_request_is_openai_shape():
+    captured: dict = {}
+    payload = {
+        "choices": [{"message": {"content": "review from openrouter"}}],
+        "usage": {"prompt_tokens": 9, "completion_tokens": 4},
+    }
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-secret"
+        try:
+            res = backends.review_openrouter("openrouter", "say hi", "", REPO_ROOT, 30)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions", captured["url"]
+    assert captured["method"] == "POST"
+    body = captured["body"]
+    assert "messages" in body and "contents" not in body, body
+    # Bare `openrouter` → OPENROUTER_DEFAULT_MODEL (the never-stale auto-router).
+    assert body["model"] == "openrouter/auto", body
+    assert body["messages"][0]["role"] == "user"
+    assert body["messages"][0]["content"] == "say hi"
+    assert body["stream"] is False
+    assert captured["headers"].get("authorization") == "Bearer sk-or-v1-secret"
+    assert "x-goog-api-key" not in captured["headers"]
+    assert res.returncode == 0
+    assert "review from openrouter" in res.stdout
+    assert "prompt_tokens=9 output_tokens=4" in res.stdout
+
+
+def test_openrouter_model_suffix_preserves_slug_and_variant():
+    """`split(':',1)[1]` must strip ONLY the `openrouter:` prefix — preserving the slug's
+    embedded `/` AND any trailing `:variant` colon (OpenRouter's :free/:beta/:nitro)."""
+    cases = (
+        ("openrouter:anthropic/claude-3.5-sonnet", "anthropic/claude-3.5-sonnet"),
+        ("openrouter:openai/gpt-4o", "openai/gpt-4o"),
+        ("openrouter:anthropic/claude-3.5-sonnet:beta", "anthropic/claude-3.5-sonnet:beta"),
+        ("openrouter:meta-llama/llama-3.1-70b-instruct:free", "meta-llama/llama-3.1-70b-instruct:free"),
+    )
+    for seat, wire in cases:
+        captured: dict = {}
+        payload = {"choices": [{"message": {"content": "x"}}], "usage": {}}
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen(captured, payload)
+        with _EnvSandbox():
+            os.environ["OPENROUTER_API_KEY"] = "k"
+            try:
+                res = backends.review_openrouter(seat, "q", "", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert captured["body"]["model"] == wire, (seat, captured["body"])
+        # ReviewResult.model is the REQUESTED string (mode_review keys on it), not the wire id.
+        assert res.model == seat, res.model
+        assert wire in res.command, res.command
+
+
+def test_openrouter_diff_is_fenced_in_message():
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        try:
+            backends.review_openrouter("openrouter", "review this", "+added line", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    content = captured["body"]["messages"][0]["content"]
+    assert "review this" in content
+    assert "```diff" in content and "+added line" in content
+
+
+def test_openrouter_base_url_and_model_env_override():
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "x"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        os.environ["OPENROUTER_BASE_URL"] = "https://proxy.example.test/v1"
+        os.environ["OPENROUTER_MODEL"] = "google/gemini-flash-1.5"
+        try:
+            backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured["url"] == "https://proxy.example.test/v1/chat/completions", captured["url"]
+    assert captured["body"]["model"] == "google/gemini-flash-1.5", captured["body"]
+
+
+def test_openrouter_suffix_beats_model_env():
+    """A `openrouter:<slug>` seat takes the suffix UNCONDITIONALLY — a host's
+    OPENROUTER_MODEL (a legit override for the bare seat) must NOT hijack a suffixed seat."""
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "x"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        os.environ["OPENROUTER_MODEL"] = "should/be-ignored"
+        try:
+            backends.review_openrouter("openrouter:openai/gpt-4o", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured["body"]["model"] == "openai/gpt-4o", captured["body"]
+
+
+def test_openrouter_optional_attribution_headers_from_env():
+    """HTTP-Referer / X-Title are sent ONLY when their env vars are set, and are absent by
+    default — they affect openrouter.ai leaderboard attribution, never the review."""
+    # Unset → absent.
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        try:
+            backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert "http-referer" not in captured["headers"], captured["headers"]
+    assert "x-title" not in captured["headers"], captured["headers"]
+    # Set → present, verbatim.
+    captured2: dict = {}
+    urllib.request.urlopen = _fake_urlopen(captured2, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        os.environ["OPENROUTER_HTTP_REFERER"] = "https://review.example"
+        os.environ["OPENROUTER_X_TITLE"] = "review-cli"
+        try:
+            backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured2["headers"].get("http-referer") == "https://review.example", captured2["headers"]
+    assert captured2["headers"].get("x-title") == "review-cli", captured2["headers"]
+    # The bearer auth is untouched by the optional headers.
+    assert captured2["headers"].get("authorization") == "Bearer k"
+
+
+def test_openrouter_extra_headers_cannot_shadow_authorization():
+    """A hostile/stray Authorization in extra_headers must NOT override the real bearer key —
+    _openai_compatible_request drops any case-insensitive authorization/content-type from
+    extra_headers before writing the canonical pair. Covers BOTH a capitalized `Authorization`
+    AND a lower-cased `authorization` (a distinct dict key that the explicit filter must catch,
+    not a reliance on urllib's header capitalization)."""
+    for stray in ("Authorization", "authorization", "AUTHORIZATION"):
+        captured: dict = {}
+        payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen(captured, payload)
+        try:
+            backends._openai_compatible_request(
+                model="openrouter", api_model="openrouter/auto", label="openrouter",
+                base_url="https://openrouter.ai/api/v1", key="real-key",
+                prompt="q", diff="", timeout=10, backend="openrouter",
+                extra_headers={stray: "Bearer STOLEN", "content-type": "text/evil", "X-Title": "t"},
+            )
+        finally:
+            urllib.request.urlopen = old_open
+        # _fake_urlopen lower-cases every captured header name, so a single normalized
+        # `authorization`/`content-type` entry proves the stray was dropped (no duplicate).
+        assert captured["headers"].get("authorization") == "Bearer real-key", (stray, captured["headers"])
+        assert captured["headers"].get("content-type") == "application/json", (stray, captured["headers"])
+        assert captured["headers"].get("x-title") == "t", (stray, captured["headers"])
+
+
+def test_openrouter_empty_suffix_falls_back_to_default():
+    """An EMPTY suffix (`openrouter:` / `openrouter: `) must NOT POST `model: ""` (a 400) —
+    it falls back to OPENROUTER_MODEL, then the auto-router default."""
+    # Empty suffix, no env → auto-router default.
+    for seat in ("openrouter:", "openrouter: "):
+        captured: dict = {}
+        payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen(captured, payload)
+        with _EnvSandbox():
+            os.environ["OPENROUTER_API_KEY"] = "k"
+            try:
+                backends.review_openrouter(seat, "q", "", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert captured["body"]["model"] == "openrouter/auto", (seat, captured["body"])
+    # Empty suffix WITH OPENROUTER_MODEL set → the env model (not "" and not the default).
+    captured2: dict = {}
+    payload2 = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    urllib.request.urlopen = _fake_urlopen(captured2, payload2)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        os.environ["OPENROUTER_MODEL"] = "openai/gpt-4o"
+        try:
+            backends.review_openrouter("openrouter:", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured2["body"]["model"] == "openai/gpt-4o", captured2["body"]
+
+
+def test_openrouter_whitespace_env_falls_back_to_default():
+    """Symmetric with the empty-suffix guard: a whitespace-only OPENROUTER_MODEL /
+    OPENROUTER_BASE_URL must NOT win (it would POST `model:"   "` / build a broken URL) — it
+    falls through to the default, never POSTing the blank value."""
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        os.environ["OPENROUTER_MODEL"] = "   "
+        os.environ["OPENROUTER_BASE_URL"] = "   "
+        try:
+            backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured["body"]["model"] == "openrouter/auto", captured["body"]
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions", captured["url"]
+
+
+def test_openrouter_control_char_attribution_header_is_dropped():
+    """A CR/LF in OPENROUTER_HTTP_REFERER / OPENROUTER_X_TITLE must be DROPPED, not sent —
+    it would be a header-injection vector and would make http.client raise mid-send. The
+    request still goes out (the headers are optional); only the unsafe header is omitted."""
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        os.environ["OPENROUTER_HTTP_REFERER"] = "https://evil\r\nX-Injected: 1"
+        os.environ["OPENROUTER_X_TITLE"] = "ok-title"  # clean → kept
+        try:
+            res = backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 0, res
+    assert "http-referer" not in captured["headers"], captured["headers"]
+    assert "x-injected" not in captured["headers"], captured["headers"]
+    assert captured["headers"].get("x-title") == "ok-title", captured["headers"]
+
+
+def test_openrouter_non_latin1_attribution_header_is_dropped():
+    """A non-latin-1 value (emoji/CJK) must be DROPPED, not sent — http.client encodes
+    header values as latin-1, so it would raise UnicodeEncodeError mid-send. The request
+    still succeeds (the attribution header is optional); only the unencodable header is
+    omitted. A latin-1-printable accented value (é) is still allowed."""
+    captured: dict = {}
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        os.environ["OPENROUTER_X_TITLE"] = "review-cli ☕"  # ☕ — not latin-1
+        os.environ["OPENROUTER_HTTP_REFERER"] = "https://café.example"  # é — latin-1 OK
+        try:
+            res = backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 0, res
+    assert "x-title" not in captured["headers"], captured["headers"]
+    assert captured["headers"].get("http-referer") == "https://café.example", captured["headers"]
+
+
+def test_openrouter_missing_key_is_a_dead_backend_result():
+    """The no-key path through review_openrouter itself (the `except RuntimeError` branch):
+    a missing OPENROUTER_API_KEY must yield a NON-zero ReviewResult (not raise out of the
+    panel as an internal 127), and must not POST."""
+    def _should_not_be_called(req, timeout=None):  # pragma: no cover - asserted unreached
+        raise AssertionError("api path POSTed despite a missing key")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _should_not_be_called
+    with _EnvSandbox():
+        # No OPENROUTER_API_KEY anywhere (sandbox points the .env fallback at /nonexistent).
+        try:
+            res = backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 1, res
+    assert res.stdout == "", res.stdout
+    assert "OPENROUTER_API_KEY" in res.stderr, res.stderr
+
+
+def test_openrouter_key_is_canonical_only():
+    """SECURITY: OpenRouter must require OPENROUTER_API_KEY ONLY. A foreign OPENAI_API_KEY
+    must NOT resolve here — otherwise an OpenAI credential would be POSTed to openrouter.ai
+    (cross-provider key leak), and the backend would falsely report available."""
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen({}, payload)
+    with _EnvSandbox():
+        os.environ["OPENAI_API_KEY"] = "sk-openai-secret"
+        try:
+            assert backends.backend_available("openrouter") is False
+            raised = False
+            try:
+                backends._openrouter_key()
+            except RuntimeError:
+                raised = True
+            assert raised, "openrouter must not resolve a foreign OPENAI_API_KEY"
+        finally:
+            urllib.request.urlopen = old_open
+
+
+def test_backend_available_reflects_openrouter_key():
+    with _EnvSandbox():
+        assert backends.backend_available("openrouter") is False
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-present"
+        assert backends.backend_available("openrouter") is True
+        assert backends.backend_available("openrouter:anthropic/claude-3.5-sonnet") is True
+
+
+def test_backend_available_false_for_forced_openrouter_cli_mode():
+    """REVIEW_OPENROUTER_MODE=cli (an unrunnable forced mode) → unavailable even with a key,
+    so the moderator/brainstorm filter never selects a backend that can only fail."""
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-present"
+        assert backends.backend_available("openrouter") is True
+        os.environ["REVIEW_OPENROUTER_MODE"] = "cli"
+        assert backends.backend_available("openrouter") is False
+
+
+def test_openrouter_forced_cli_mode_is_a_dead_backend():
+    """OpenRouter is api-only: REVIEW_OPENROUTER_MODE=cli must fail loudly, never POST."""
+    def _should_not_be_called(req, timeout=None):  # pragma: no cover - asserted unreached
+        raise AssertionError("api path POSTed despite a forced cli mode")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _should_not_be_called
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        os.environ["REVIEW_OPENROUTER_MODE"] = "cli"
+        try:
+            res = backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 1, res
+    assert "cli" in res.stderr and "openrouter" in res.stderr
+
+
+def test_openrouter_no_content_2xx_fails_closed():
+    """A 2xx with no assistant content must map to a NON-zero result (not let mode_review
+    write a 'reviewed' stamp on an empty review). Shares the type-guarded parse with z.ai."""
+    for payload in (
+        {"choices": []},
+        {"choices": [{"message": {"content": ""}}]},
+        {"choices": [{"message": {"content": None}}]},
+        {"error": {"message": "rate limited"}},
+    ):
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen({}, payload)
+        with _EnvSandbox():
+            os.environ["OPENROUTER_API_KEY"] = "k"
+            try:
+                res = backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert res.returncode == 1, (payload, res)
+        assert "no assistant content" in res.stderr, (payload, res.stderr)
+
+
+def test_openrouter_http_error_maps_to_returncode():
+    import urllib.error
+
+    def _raise(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url, 401, "Unauthorized", hdrs=None,
+            fp=__import__("io").BytesIO(b'{"error":"invalid key"}'),
+        )
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _raise
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        try:
+            res = backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 401, res.returncode
+    assert "invalid key" in res.stderr
+    assert res.stdout == ""
+
+
+def test_openrouter_key_resolves_from_temp_env_file():
+    import tempfile
+
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as d:
+            env_path = Path(d) / ".env"
+            env_path.write_text("OPENROUTER_API_KEY=or-from-file\n", encoding="utf-8")
+            os.environ["GEMINI_ENV_FILE"] = str(env_path)
+            assert backends._openrouter_key() == "or-from-file"
+
+
+def test_mode_review_includes_an_openrouter_seat_without_keyerror():
+    """A board/panel diff-review must format an openrouter seat result without KeyError —
+    proves the seat is dispatchable alongside the other backends (panels reuse this path)."""
+    from reviewlib.modes.review import mode_review
+
+    payload = {"choices": [{"message": {"content": "openrouter says ok"}}], "usage": {}}
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen({}, payload)
+    with _EnvSandbox():
+        os.environ["OPENROUTER_API_KEY"] = "k"
+        try:
+            rc = mode_review(
+                ["openrouter:anthropic/claude-3.5-sonnet"], "review", "+added", REPO_ROOT, 10, False
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert rc == 0, rc
 
 
 if __name__ == "__main__":

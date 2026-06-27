@@ -1125,6 +1125,14 @@ def test_model_attribution_splits_shared_backends_and_claude():
         glm_rest = p.parse_call_log(_write_call_log(
             ld, "20260601T100220_000000", "z.ai", 0, "x\n",
             argv0="z.ai API glm-5.2", exit_code=0))
+        # OpenRouter is another keyed-HTTP gateway (`openrouter API <slug>`): each model slug
+        # must split into its own `openrouter:<slug>` row, not collapse into one `openrouter`.
+        or_claude = p.parse_call_log(_write_call_log(
+            ld, "20260601T100230_000000", "openrouter", 0, "x\n",
+            argv0="openrouter API anthropic/claude-3.5-sonnet", exit_code=0))
+        or_gpt = p.parse_call_log(_write_call_log(
+            ld, "20260601T100240_000000", "openrouter", 0, "x\n",
+            argv0="openrouter API openai/gpt-4o:beta", exit_code=0))
         codex = p.parse_call_log(_write_call_log(
             ld, "20260601T100300_000000", "codex", 0, "x\n",
             argv0="/opt/homebrew/bin/codex", exit_code=0))
@@ -1138,6 +1146,9 @@ def test_model_attribution_splits_shared_backends_and_claude():
         # The diff-only REST backends still split into their gateway model ids.
         assert p.model_id_for_call(kimi_rest) == "commandcode:moonshotai/Kimi-K2.7-Code"
         assert p.model_id_for_call(glm_rest) == "zai:glm-5.2"
+        # OpenRouter splits per slug (the `/` and any `:variant` survive intact).
+        assert p.model_id_for_call(or_claude) == "openrouter:anthropic/claude-3.5-sonnet"
+        assert p.model_id_for_call(or_gpt) == "openrouter:openai/gpt-4o:beta"
         assert p.model_id_for_call(codex) == "codex"
         # claude wrapper is identical on disk; the body splits Fable (paywall) from Opus.
         assert p.model_id_for_call(fable) == "claude:claude-fable-5"
