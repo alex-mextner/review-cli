@@ -247,6 +247,10 @@ def test_ask_handle_reads_answer_then_caches():
         ask_command=[sys.executable, "-c", "import sys; sys.stdout.write('ANSWER:'+sys.stdin.read())"],
         cwd=Path.cwd(), env=dict(os.environ), payload="Ship it",
     )
+    # emit_question detaches the closed stdin (proc.stdin = None) so await_answer's communicate()
+    # never flushes a closed stream — a version-independent pin for the CPython <3.13 crash the CI
+    # matrix caught (the flush-on-closed ValueError), which a 3.13+ dev box would not reproduce.
+    assert handle.proc.stdin is None
     assert handle.await_answer(timeout=10) == "ANSWER:Ship it"
     assert handle.await_answer(timeout=10) == "ANSWER:Ship it"  # cached, no re-read
 

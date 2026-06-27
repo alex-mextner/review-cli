@@ -853,6 +853,15 @@ def emit_question(
             proc.stdin.close()
         except (OSError, BrokenPipeError):
             pass
+        # Detach the (now-closed) stdin from the Popen so a later ``communicate()`` in
+        # ``await_answer`` never touches it. CPython's threaded ``_communicate`` (the path taken when
+        # both stdout and stderr are captured) calls ``self.stdin.flush()`` before draining, and a
+        # flush on a CLOSED stream raises ``ValueError: I/O operation on closed file``. Observed: this
+        # crashed the AskHandle/DoD tests on the CI matrix's 3.10/3.11/3.12 and passed on 3.13/3.14
+        # (the newer flush no longer trips on it). Nulling the attribute makes communicate skip stdin
+        # on every version — the fd is already closed at the OS level, which is what delivers EOF to
+        # the hook client's ``sys.stdin.read()`` so it can proceed.
+        proc.stdin = None
     return AskHandle(proc=proc)
 
 
