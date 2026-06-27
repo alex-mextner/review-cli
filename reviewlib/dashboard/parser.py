@@ -125,7 +125,10 @@ _OPENCODE_MODEL_RE = re.compile(r"-m\s+(?P<model>\S+)")
 _CLAUDE_API_MODEL_RE = re.compile(r"^Anthropic API\s+(?P<model>\S+)")
 # z.ai's board seat id is `zai:<model>` (config DEFAULT_BOARD), but the log backend/header
 # spell it `z.ai`. Normalise the header model to the board prefix so attribution lines up.
-_BACKEND_BOARD_PREFIX = {"commandcode": "commandcode", "z.ai": "zai"}
+# openrouter's backend name AND board prefix are both `openrouter` (seat `openrouter:<slug>`);
+# its `openrouter API <slug>` argv0 carries the per-model slug, so mapping it here keeps each
+# openrouter model a distinct dashboard row instead of collapsing them into one `openrouter`.
+_BACKEND_BOARD_PREFIX = {"commandcode": "commandcode", "z.ai": "zai", "openrouter": "openrouter"}
 
 
 def _parse_stamp(date_part: str, micros: str) -> datetime:
