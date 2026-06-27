@@ -741,14 +741,15 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | `gemini` / `gemini:<model>` | api | Gemini REST API (`gemini-2.5-flash` by default) |
 | `zai:<model>` / `glm` / `glm52` … | api | z.ai (GLM) OpenAI-compatible REST API — needs `ZAI_API_KEY` |
 | `commandcode:<model>` / `cc` | api | Command Code OpenAI-compatible Provider API — needs `COMMANDCODE_API_KEY` |
+| `openrouter:<model>` / `openrouter` | api | OpenRouter OpenAI-compatible aggregator (400+ models) — needs `OPENROUTER_API_KEY` (bare `openrouter` → `openrouter/auto`) |
 | `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer --dir <repo>` (reads the real repo, read-only) |
 | anything else | cli | Treated as an opencode model id |
 
 **Transport split.** Each backend declares which transports it supports — `cli`, `api`,
 or both — shown in the *Transport* column above. `REVIEW_<NAME>_MODE` forces one; forcing
 a mode a backend doesn't support is a hard error, never a silent fall-through. (Today:
-codex/opencode are cli-only, gemini/z.ai/commandcode are api-only, claude does both and
-auto-picks — CLI if the binary is present, API when it isn't and a key is set.)
+codex/opencode are cli-only, gemini/z.ai/commandcode/openrouter are api-only, claude does
+both and auto-picks — CLI if the binary is present, API when it isn't and a key is set.)
 
 The opencode backend is **agentic and read-only**: it runs in the **real `-C`
 repository** (via `opencode run --dir <repo>`), exactly like the codex backend, so an
@@ -1062,6 +1063,20 @@ reasoning text when the answer is empty (e.g. a low output-token budget). This k
 only the **diff-only** `zai:` path (`-m glm` / an explicit `zai:` config seat) — the
 **default** GLM board seat is the agentic `oc:zai/glm-5.2` (role `quality`) and
 authenticates via opencode, not `ZAI_API_KEY`. The key is only read, never written.
+
+**`OPENROUTER_API_KEY` (diff-only `-m openrouter:<model>` + config boards):** set
+`OPENROUTER_API_KEY` (an `sk-or-v1-...` token) in the environment or
+`~/.config/review-cli/.env` to use the **diff-only** OpenRouter backend — an
+OpenAI-compatible aggregator that fronts 400+ models behind one key. Select the model with a
+seat suffix, `-m openrouter:anthropic/claude-3.5-sonnet` / `-m openrouter:openai/gpt-4o`
+(slugs keep their `/` and any `:free`/`:beta`/`:nitro` variant); a bare `-m openrouter`
+defaults to OpenRouter's own auto-router (`openrouter/auto`), overridable with
+`OPENROUTER_MODEL`. Point at a proxy with `OPENROUTER_BASE_URL` (default
+`https://openrouter.ai/api/v1`). The OPTIONAL `OPENROUTER_HTTP_REFERER` / `OPENROUTER_X_TITLE`
+env vars set OpenRouter's leaderboard-attribution headers (`HTTP-Referer` / `X-Title`) and
+never affect the review. Like the other keyed-HTTP backends it is **api-only** (no OpenRouter
+CLI; a forced `REVIEW_OPENROUTER_MODE=cli` is a hard error) and the key is only read, never
+written.
 
 ---
 

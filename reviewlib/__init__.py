@@ -22,6 +22,7 @@ from .backends import (
     _commandcode_key,
     _ensure_opencode_readonly_agent,
     _gemini_key,
+    _openrouter_key,
     _payload,
     _which,
     _zai_key,
@@ -33,6 +34,7 @@ from .backends import (
     review_commandcode,
     review_gemini,
     review_opencode,
+    review_openrouter,
     review_zai,
 )
 from .config import (
@@ -108,6 +110,7 @@ __all__ = [
     "_gemini_key",
     "_zai_key",
     "_commandcode_key",
+    "_openrouter_key",
     "_ensure_opencode_readonly_agent",
     "review_codex",
     "review_gemini",
@@ -115,6 +118,7 @@ __all__ = [
     "review_opencode",
     "review_zai",
     "review_commandcode",
+    "review_openrouter",
     "resolve_backend",
     "resolve_backend_mode",
     "backend_available",
