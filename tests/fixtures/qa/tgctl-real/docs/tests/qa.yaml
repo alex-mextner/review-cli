@@ -1,0 +1,26 @@
+sut:
+  kind: bot
+  bot:
+    driver: mock                       # hermetic Tier-1 fake-Telegram driver (no real network)
+    # AGENT-SIDE tier against the REAL tg-ctl. {sut_dir} is the tg-cli checkout passed to
+    # `review qa <tg-cli-checkout>`; the daemon + hook client are tg-ctl itself, driven against
+    # the in-process fake Telegram. This is the suite the RED->GREEN proof runs (see README.md):
+    # GREEN on tg-ctl >= 1.19.2 (the #98 fix), RED on pre-#98 tg-ctl (the duplicate-card bug).
+    command:
+      - bun
+      - "{sut_dir}/tg-ctl"
+      - run
+    ask_command:
+      - bun
+      - "{sut_dir}/tg-ctl"
+      - ask
+      - --agent
+      - claude
+    owner_id: 424242                   # a synthetic Telegram user id (the tap sender / bridge target)
+    ready_file: "{config_dir}/tg-ctl.{bot_id}.sock"   # tg-ctl's hook socket = the readiness signal
+    seed:                              # tg-ctl matches the hook client's cwd against this registration
+      - path: "config/tg-ctl.{bot_id}.registration.json"
+        content: '[{"cwd": "{cwd}", "registeredAt": 0}]'
+    env:
+      TG_BOT_TOKEN: "123456:hermetic-qa-token"   # numeric head -> bot id; never a real token
+      TG_CTL_UNSCOPED_TIMEOUT_MS: "120000"        # keep the unscoped-question backstop generous

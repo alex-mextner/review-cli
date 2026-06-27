@@ -608,6 +608,16 @@ def boot_bot(
     env.setdefault("BOT_TOKEN", "123456:hermetic-qa-test-token")
     env.setdefault("TG_BOT_TOKEN", env["BOT_TOKEN"])
     _refuse_real_telegram(env, exit_boot_failed=exit_boot_failed)
+    return _spawn_bot_process(command, cwd=cwd, env=env, exit_boot_failed=exit_boot_failed)
+
+
+def _spawn_bot_process(
+    command: list[str], *, cwd: Path, env: dict[str, str], exit_boot_failed: int,
+) -> BotProcess:
+    """Spawn ``command`` in its OWN process group (so the whole tree can be reaped), piping output
+    into the bounded drain. Shared by ``boot_bot`` (the inbound SUT poller) and
+    ``boot_agent_daemon`` (the agent-side bridge daemon) so spawn + reap + drain live in one place.
+    Raises ``BotHarnessError(exit_boot_failed)`` if the process cannot be launched."""
     try:
         proc = subprocess.Popen(  # noqa: S603 — command resolved from the SUT's own qa.yaml
             command, cwd=str(cwd), env=env, start_new_session=True,
@@ -661,3 +671,287 @@ def probe_reachable(fake: FakeTelegram, *, timeout: float = _PROBE_TIMEOUT_S) ->
 
 # A high update_id for the probe so it never collides with a suite's case update ids.
 _PROBE_UPDATE_ID = 900000001
+
+
+# --- the AGENT-SIDE seam (a bridge bot: agent emits a question -> tap -> answer) -------
+# WHY a SECOND path beside inject/capture. A bridge bot (tg-ctl) is never driven inbound: the
+# AGENT emits an AskUserQuestion/permission via a hook client that reads a payload on stdin, the
+# daemon forwards ONE inline-button CARD to Telegram, the user TAPS, and the answer flows back to
+# the hook client's STDOUT. The Tier-1 inject/capture path cannot reach that loop — it has no way
+# to (a) emit the agent's question or (b) read the answer the agent receives. The pieces below are
+# exactly (a)+(b): emit_question runs the hook client and keeps its handle; AskHandle.await_answer
+# reads the answer off its stdout (a hang / None is the tap-loss bug, assertable); cards_captured
+# filters the fake's outbound to inline-button cards; tap injects a synthetic callback_query so the
+# daemon delivers the answer. FakeTelegram itself is UNCHANGED — these only read fake.outbound and
+# call fake.inject, the same surface the inbound path uses.
+
+# How long the agent-side daemon has to create its readiness file (e.g. its hook socket) before the
+# first question is emitted. A cold bun/node daemon + first long-poll can take a few seconds.
+_DAEMON_READY_TIMEOUT_S = float(os.environ.get("REVIEW_QA_BOT_DAEMON_READY_TIMEOUT_S", "20"))
+# The fixed boot grace used when no ready_file is configured (a generic bridge bot whose readiness
+# signal the harness can't name): wait this long after boot before the first emit.
+_DAEMON_BOOT_GRACE_S = float(os.environ.get("REVIEW_QA_BOT_DAEMON_BOOT_GRACE_S", "3"))
+# How long to wait for a question's card(s) to land after emitting it.
+_CARD_TIMEOUT_S = float(os.environ.get("REVIEW_QA_BOT_CARD_TIMEOUT_S", "15"))
+# How long to confirm NO new card lands (the #98 re-fire assertion: an answered re-ask must post
+# nothing). A daemon that was going to post does so within a beat, so this stays short.
+_NO_CARD_CONFIRM_S = float(os.environ.get("REVIEW_QA_BOT_NO_CARD_TIMEOUT_S", "3"))
+# How long to wait for the hook client to print the answer after a tap (or a replay). A miss /
+# hang here IS the tap-loss bug — the answer never reached the agent.
+_ANSWER_TIMEOUT_S = float(os.environ.get("REVIEW_QA_BOT_ANSWER_TIMEOUT_S", "20"))
+
+
+def make_agent_tap_update(update_id: int, data: str, *, from_id: int) -> dict:
+    """A synthetic inbound callback-query update for the AGENT-SIDE tap: the owner taps an inline
+    button whose ``callback_data`` is ``data``. ``from.id`` is ``from_id`` (a bridge bot gates a
+    tap on the owner id — a tap from any other id is dropped). Carries NO ``message`` field on
+    purpose: a bridge daemon then skips the host-message-id match, so the tap lands without the
+    harness having to thread the card's server-assigned message id back in."""
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": str(update_id),
+            "from": {"id": from_id, "is_bot": False, "first_name": "QA"},
+            "data": data,
+        },
+    }
+
+
+def _reply_markup_dict(payload: dict) -> dict | None:
+    """The ``reply_markup`` of an outbound call AS A DICT, or ``None`` when absent/unparseable.
+
+    A bot may send Bot-API requests as ``application/json`` (reply_markup is already a nested object)
+    OR as ``application/x-www-form-urlencoded`` / multipart (python-telegram-bot, a curl ``-d``), in
+    which case the fake's form decoder leaves ``reply_markup`` as the JSON STRING the bot put in the
+    form field. So decode a string value before inspecting it — else a perfectly valid inline-keyboard
+    card posted via the form encoding would read as zero cards (and its ``Tap:`` labels as missing)."""
+    markup = payload.get("reply_markup")
+    if isinstance(markup, (str, bytes)):  # str (form/multipart-text); bytes is a defensive belt
+        try:
+            markup = json.loads(markup)
+        except (ValueError, TypeError):
+            return None
+    return markup if isinstance(markup, dict) else None
+
+
+def cards_captured(fake: FakeTelegram) -> list[OutboundCall]:
+    """Every NEW inline-button CARD the bridge bot POSTED — a ``sendMessage`` whose
+    ``reply_markup.inline_keyboard`` is non-empty. This is the question card the user taps; a
+    re-fire that posts a SECOND one is the #98 duplicate bug.
+
+    Deliberately ONLY ``sendMessage`` (NOT ``editMessageText``/``editMessageReplyMarkup``): an edit
+    MUTATES an existing card, it does not post a new one, so counting an edit as a 'new card' would
+    false-FAIL the ``Expect-card: 0`` re-fire assertion for a bridge that legitimately edits the
+    card after answering. The duplicate the #98 class produces is a fresh ``sendMessage``."""
+    out: list[OutboundCall] = []
+    for c in fake.outbound:
+        if c.method != "sendMessage":
+            continue
+        markup = _reply_markup_dict(c.payload)
+        if markup is not None and markup.get("inline_keyboard"):
+            out.append(c)
+    return out
+
+
+def card_button_data(card: OutboundCall, button_label: str) -> str | None:
+    """The ``callback_data`` of the button labelled ``button_label`` on ``card`` (case-insensitive,
+    trimmed), or ``None`` when no such button exists. The label match is what a suite's ``Tap:``
+    directive resolves against."""
+    markup = _reply_markup_dict(card.payload)
+    if markup is None:
+        return None
+    want = button_label.strip().lower()
+    for row in markup.get("inline_keyboard", []):
+        for btn in row:
+            if isinstance(btn, dict) and str(btn.get("text", "")).strip().lower() == want:
+                data = btn.get("callback_data")
+                return str(data) if data is not None else None
+    return None
+
+
+def card_button_labels(card: OutboundCall) -> list[str]:
+    """Every button label on ``card`` (row-major) — for an error message when a ``Tap:`` names a
+    button the card does not have."""
+    markup = _reply_markup_dict(card.payload)
+    labels: list[str] = []
+    if markup is not None:
+        for row in markup.get("inline_keyboard", []):
+            labels += [str(b.get("text", "")) for b in row if isinstance(b, dict)]
+    return labels
+
+
+def tap(fake: FakeTelegram, card: OutboundCall, button_label: str, *, from_id: int) -> bool:
+    """Inject the user's TAP of the ``button_label`` button on ``card``: extract that button's
+    ``callback_data`` and queue a synthetic ``callback_query`` from ``from_id``. Returns True when
+    the button was found and the tap injected, False when ``card`` has no such button (the caller
+    fails the case with the available labels). The daemon delivers the answer down the hook client
+    on the next poll."""
+    data = card_button_data(card, button_label)
+    if data is None:
+        return False
+    fake.inject(make_agent_tap_update(_next_tap_update_id(), data, from_id=from_id))
+    return True
+
+
+# A monotonic update-id counter for injected TAPS, starting above the probe id so a daemon that
+# acked the probe (offset past it) still receives the tap (a lower id would be filtered as acked).
+_TAP_UPDATE_ID = _PROBE_UPDATE_ID + 5000
+
+
+def _next_tap_update_id() -> int:
+    global _TAP_UPDATE_ID
+    _TAP_UPDATE_ID += 1
+    return _TAP_UPDATE_ID
+
+
+@dataclass
+class AskHandle:
+    """A running hook-client (``ask_command``) subprocess that emitted ONE question. The agent is
+    blocked on this process until the answer comes back on its stdout — so reading that stdout IS
+    reading what the agent receives. ``await_answer`` returns the answer text (possibly ``""`` if it
+    exited silently), or ``None`` when the process hangs past the timeout (the tap never reached the
+    agent — the tap-loss bug)."""
+
+    proc: subprocess.Popen
+    _answer: str | None = None
+    _read: bool = False
+
+    def await_answer(self, *, timeout: float = _ANSWER_TIMEOUT_S) -> str | None:
+        """Wait up to ``timeout`` for the hook client to EXIT and return its stdout (the answer the
+        agent received) — ``""`` if it exited with no stdout, ``None`` if it never exits in time (a
+        hang = the answer was lost / tap-loss). Uses ``communicate`` so BOTH stdout AND stderr are
+        drained while waiting: a real bridge (bun/node ``tg-ctl``) may log to stderr, and a naive
+        ``wait`` + later ``read`` would deadlock the moment that output exceeds the ~64 KiB pipe
+        buffer (the bot blocks on ``write``, never exits → a false ``None``). On a hang the process
+        GROUP is reaped (it may have forked children) and its pipes drained so nothing leaks.
+        Idempotent — caches the first read."""
+        if self._read:
+            return self._answer
+        self._read = True
+        try:
+            out, _err = self.proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._terminate()
+            try:  # drain the now-dead process's pipes so they close (no leak)
+                self.proc.communicate(timeout=3)
+            except (subprocess.TimeoutExpired, ValueError, OSError):
+                pass
+            self._answer = None
+            return None
+        self._answer = (out or "").strip()
+        return self._answer
+
+    def _terminate(self) -> None:
+        """SIGTERM->SIGKILL the hook client's whole process GROUP (it is spawned in its own session
+        in ``emit_question``, so a forked child can't outlive it). Best-effort; never raises."""
+        _terminate_group(self.proc)
+
+    def reap(self) -> None:
+        """Kill the hook client if it is still running (guaranteed teardown). Never raises."""
+        if self.proc.poll() is None:
+            self._terminate()
+
+
+def emit_question(
+    *, ask_command: list[str], cwd: Path, env: dict[str, str], payload: str,
+    exit_boot_failed: int = 1,
+) -> AskHandle:
+    """Run the hook client (``ask_command``) that emits ONE agent question: spawn it in its OWN
+    session (so a forked child can be reaped with the group) from ``cwd``, write ``payload`` (the
+    raw hook payload JSON) to its stdin and close it, and return the handle whose stdout carries the
+    answer. The daemon, seeing the request on its socket, forwards a card to the fake; the answer
+    flows back to this process's stdout once the tap is injected.
+
+    A hook client that cannot be SPAWNED (a typo'd / unavailable ``ask_command`` binary) raises
+    ``BotHarnessError`` — mirroring ``_spawn_bot_process`` — so the caller maps it to a controlled
+    BLOCKED case with a stable exit class, never an uncaught ``OSError`` traceback."""
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — ask_command resolved from the SUT's own qa.yaml
+            ask_command, cwd=str(cwd), env=env, start_new_session=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except (OSError, ValueError, IndexError) as exc:
+        # OSError/ValueError: a missing/typo'd binary or a bad argv. IndexError: an EMPTY argv
+        # (``Popen([])`` indexes ``args[0]``) — defensive, since a config with no ask_command is not
+        # agent-side, but emit_question must never traceback on a degenerate argv.
+        raise BotHarnessError(
+            f"could not launch the agent-side hook client {ask_command!r} in {cwd}: {exc}",
+            exit_code=exit_boot_failed,
+        ) from exc
+    if proc.stdin is not None:
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+        except (OSError, BrokenPipeError):
+            pass
+        # Detach the (now-closed) stdin from the Popen so a later ``communicate()`` in
+        # ``await_answer`` never touches it. CPython's threaded ``_communicate`` (the path taken when
+        # both stdout and stderr are captured) calls ``self.stdin.flush()`` before draining, and a
+        # flush on a CLOSED stream raises ``ValueError: I/O operation on closed file``. Observed: this
+        # crashed the AskHandle/DoD tests on the CI matrix's 3.10/3.11/3.12 and passed on 3.13/3.14
+        # (the newer flush no longer trips on it). Nulling the attribute makes communicate skip stdin
+        # on every version — the fd is already closed at the OS level, which is what delivers EOF to
+        # the hook client's ``sys.stdin.read()`` so it can proceed.
+        proc.stdin = None
+    return AskHandle(proc=proc)
+
+
+def wait_for_file(target: Path, *, timeout: float) -> bool:
+    """Poll up to ``timeout`` for ``target`` to exist — the agent-side daemon's readiness signal
+    (e.g. its hook socket). Returns True the moment it appears, False on timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if target.exists():
+            return True
+        time.sleep(_WAIT_POLL_S)
+    return target.exists()
+
+
+def build_agent_env(
+    *, api_base: str, owner_id: int, token: str, config_dir: Path, home: Path,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """The env SHARED by the agent-side daemon and the hook client (they must agree on the config
+    dir so the client finds the daemon's socket). Fully harness-controlled so nothing real leaks:
+    ``TG_API_BASE`` -> the loopback fake, ``TG_CHAT_ID`` -> the synthetic ``owner_id``,
+    ``TG_BOT_TOKEN`` -> the hermetic ``token``, ``TG_CTL_CONFIG_DIR`` / ``HOME`` -> the run's
+    throwaway dirs. ``TMUX``/``TMUX_PANE`` are stripped so a forwarded question stays UNSCOPED (it
+    would otherwise bind to this harness's own pane). ``extra_env`` (the SUT's ``sut.bot.env``) is
+    applied first; the core hermetic overrides always win."""
+    env = dict(os.environ)
+    env.update(extra_env or {})
+    # Strip TMUX AFTER the merge so a forwarded question stays UNSCOPED no matter the source (an
+    # inherited TMUX from the harness's own pane, or an stray one in sut.bot.env).
+    for k in ("TMUX", "TMUX_PANE"):
+        env.pop(k, None)
+    env["TG_API_BASE"] = api_base
+    env["TG_CHAT_ID"] = str(owner_id)
+    env["TG_BOT_TOKEN"] = token
+    env["BOT_TOKEN"] = token
+    env["TG_CTL_CONFIG_DIR"] = str(config_dir)
+    env["HOME"] = str(home)
+    return env
+
+
+def boot_agent_daemon(
+    *, command: list[str], cwd: Path, env: dict[str, str], exit_boot_failed: int,
+) -> BotProcess:
+    """Boot the agent-side bridge DAEMON (the long-poller, e.g. ``tg-ctl run``) against the fake,
+    using the harness-built ``env`` (see ``build_agent_env``). The hermetic guarantee is the
+    ``TG_API_BASE`` loopback override in that env (a synthetic owner is fine here — unlike the
+    inbound path it is the bridge target, not an inherited real chat), so the inbound
+    ``_refuse_real_telegram`` guard is not applied; the ``TG_API_BASE`` host is asserted loopback
+    instead so a misbuilt env can never point the daemon at the real Telegram."""
+    api_base = env.get("TG_API_BASE", "")
+    if not _is_loopback(api_base):
+        raise BotHarnessError(
+            f"agent-side daemon refuses a non-loopback TG_API_BASE ({api_base!r}); the fake must "
+            "bind 127.0.0.1 so the run stays hermetic.",
+            exit_code=exit_boot_failed,
+        )
+    return _spawn_bot_process(command, cwd=cwd, env=env, exit_boot_failed=exit_boot_failed)
+
+
+def _is_loopback(api_base: str) -> bool:
+    host = urlparse(api_base).hostname or ""
+    return host in ("127.0.0.1", "localhost", "::1")

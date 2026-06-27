@@ -115,6 +115,21 @@ class TeardownConfig:
 
 
 @dataclass(frozen=True)
+class SeedFile:
+    """One pre-boot file the agent-side bot harness writes before the daemon starts (spec §7.3,
+    AGENT-SIDE tier). ``path`` is resolved relative to the harness-allocated workdir and MUST stay
+    inside it (a ``..`` escape or an out-of-tree absolute path is rejected at write time — the run
+    is hermetic); ``content`` is the file body. Both support the harness's template tokens
+    (``{config_dir}`` / ``{cwd}`` / ``{owner_id}`` / ``{sender_id}`` / ``{bot_id}`` / ``{home}`` /
+    ``{workdir}`` / ``{api_base}``) so a precondition can reference the run's allocated paths — e.g.
+    tg-ctl needs a ``tg-ctl.<bot_id>.registration.json`` whose ``cwd`` matches the ask process's
+    cwd, written into the run's config dir before the daemon boots."""
+
+    path: str
+    content: str = ""
+
+
+@dataclass(frozen=True)
 class BotConfig:
     """The ``sut.bot`` block — how to run a CHAT-BOT SUT (spec §7.3).
 
@@ -127,6 +142,20 @@ class BotConfig:
     probe ONLY for a bot that legitimately never sends on the probe update (the default is to
     require the probe so a never-reached fake fails loud instead of false-passing on zero sends).
 
+    THE AGENT-SIDE TIER (``ask_command`` set). A *bridge* bot (tg-ctl) is not driven inbound:
+    the AGENT emits an AskUserQuestion/permission via a hook client that reads a payload on stdin,
+    the bot forwards ONE inline-button card to Telegram, the user TAPS, and the answer flows back
+    to the hook client's stdout. The inbound (``Send:``/``Expect:``) path cannot reach that loop —
+    it has no way to inject the agent's question or read the answer. So when ``ask_command`` is set
+    the harness runs the AGENT-SIDE flow instead: it boots ``command`` as the long-poll daemon
+    against the fake, runs ``ask_command`` (the hook client) to emit each question, asserts the
+    card count, injects the tap, and reads the answer off the hook client's stdout (the
+    ``Ask-question:``/``Expect-card:``/``Tap:``/``Expect-answer:`` grammar). ``seed`` writes the
+    daemon's preconditions first (e.g. tg-ctl's registration file). ``owner_id`` is the Telegram
+    user the bot bridges to (the daemon's ``TG_CHAT_ID``); ``sender_id`` is the ``from.id`` stamped
+    on an injected tap — it defaults to ``owner_id`` because a bridge bot gates a tap on the owner,
+    so a tap from any other id is silently dropped.
+
     The LIVE (``mtproto``) tier still needs ``command`` (the SUT bot's poller boots either way).
     Whether the live run can actually RUN is decided at dispatch by ``live_tier.bot_live_available``
     (the test-account creds gate) — config only accepts the driver name; it never proves creds."""
@@ -135,6 +164,11 @@ class BotConfig:
     command: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     skip_probe: bool = False
+    ask_command: tuple[str, ...] = ()
+    seed: tuple[SeedFile, ...] = ()
+    owner_id: int | None = None
+    sender_id: int | None = None
+    ready_file: str = ""
 
     def __post_init__(self) -> None:
         from .live_tier import BOT_LIVE_DRIVER
@@ -150,6 +184,24 @@ class BotConfig:
                 "sut.bot.command is required for the bot driver — it is the argv that boots the "
                 "bot's poller (the mock driver runs it with TG_API_BASE pointed at the fake)."
             )
+        if self.is_agent_side and self.owner_id is None:
+            raise QaConfigError(
+                "sut.bot.owner_id is required when sut.bot.ask_command is set — the AGENT-SIDE "
+                "tier bridges to a specific Telegram user, and a bridge bot gates an inbound tap "
+                "on that owner id (a tap from any other id is dropped). Set it to a synthetic test "
+                "id (e.g. 424242)."
+            )
+        if self.is_agent_side and self.is_live:
+            # The AGENT-SIDE routing lives ONLY on the mock (hermetic) path
+            # (run_hermetic_bot_test). A driver=mtproto block with an ask_command would dispatch to
+            # the LIVE inbound path and SILENTLY ignore ask_command — the author thinks they are
+            # running the agent-side loop but are not. Reject the combination loudly instead.
+            raise QaConfigError(
+                "sut.bot.ask_command (the AGENT-SIDE tier) requires driver: mock — it is a "
+                "hermetic-only flow. A driver: mtproto block with ask_command would run the LIVE "
+                "inbound path and silently ignore ask_command. Drop ask_command for a live inbound "
+                "run, or set driver: mock for the agent-side loop."
+            )
 
     @property
     def is_live(self) -> bool:
@@ -157,6 +209,19 @@ class BotConfig:
         from .live_tier import BOT_LIVE_DRIVER
 
         return self.driver == BOT_LIVE_DRIVER
+
+    @property
+    def is_agent_side(self) -> bool:
+        """Whether this block selects the AGENT-SIDE tier (a hook-client ``ask_command`` drives the
+        agent→bridge→Telegram→tap→answer loop) vs the inbound ``Send:``/``Expect:`` path."""
+        return bool(self.ask_command)
+
+    @property
+    def effective_sender_id(self) -> int | None:
+        """The ``from.id`` stamped on an injected tap: the explicit ``sender_id`` if set, else the
+        ``owner_id`` (a bridge bot gates a tap on the owner, so defaulting the sender to the owner
+        is what makes the tap land)."""
+        return self.sender_id if self.sender_id is not None else self.owner_id
 
 
 @dataclass(frozen=True)
@@ -422,7 +487,43 @@ def _bot_from(block: object, path: Path) -> BotConfig | None:
         command=tuple(_str_list(block.get("command"), "sut.bot.command", path)),
         env=_str_env(block.get("env"), path),
         skip_probe=_require_bool(block.get("skip_probe", False), "sut.bot.skip_probe", path),
+        ask_command=tuple(_str_list(block.get("ask_command"), "sut.bot.ask_command", path)),
+        seed=_bot_seed_from(block.get("seed"), path),
+        owner_id=_opt_int(block.get("owner_id"), "sut.bot.owner_id", path),
+        sender_id=_opt_int(block.get("sender_id"), "sut.bot.sender_id", path),
+        ready_file=str(block.get("ready_file", "")),
     )
+
+
+def _bot_seed_from(block: object, path: Path) -> tuple[SeedFile, ...]:
+    """Parse ``sut.bot.seed`` into ``SeedFile`` tuples (empty when absent). Each entry is a
+    mapping with a required ``path`` (resolved relative to the run's workdir) and an optional
+    ``content`` body; both carry the harness's template tokens, substituted at run time."""
+    if block is None:
+        return ()
+    if not isinstance(block, list):
+        raise QaConfigError(f"{path}: sut.bot.seed must be a list of {{path, content}} mappings.")
+    seeds: list[SeedFile] = []
+    for i, entry in enumerate(block):
+        if not isinstance(entry, dict):
+            raise QaConfigError(f"{path}: sut.bot.seed[{i}] must be a mapping.")
+        fpath = entry.get("path")
+        if not fpath or not isinstance(fpath, str):
+            raise QaConfigError(
+                f"{path}: sut.bot.seed[{i}].path is required and must be a string.")
+        seeds.append(SeedFile(path=fpath, content=str(entry.get("content", ""))))
+    return tuple(seeds)
+
+
+def _opt_int(val: object, label: str, path: Path) -> int | None:
+    """Coerce a YAML scalar to ``int`` (or ``None`` when absent) — an owner/sender id. A
+    non-numeric value is a clean config error, not a bare ``ValueError`` deep in the run."""
+    if val is None:
+        return None
+    try:
+        return int(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise QaConfigError(f"{path}: {label} must be an integer (got {val!r}).") from None
 
 
 def _web_from(block: object, path: Path) -> WebConfig | None:

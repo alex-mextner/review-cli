@@ -373,6 +373,41 @@ approximated. Two tiers, declared in `qa.yaml sut.bot.driver`:
   tg-cli**, not assumed. The harness must DETECT an un-patched sender (mock sees zero
   `sendMessage`) and fail the health gate with the precise `tg:610` pointer rather than
   silently passing on zero captured sends.
+- **Tier 1 — AGENT-SIDE driver (a BRIDGE bot: the agent is the human-side caller).** A bridge
+  bot like `tg-ctl` is NOT driven inbound — its load-bearing flow is the opposite direction: the
+  AGENT emits an `AskUserQuestion` / permission via a hook client (`tg-ctl ask`) that reads a hook
+  payload on stdin → a Unix socket → the daemon forwards ONE inline-button CARD to Telegram → the
+  user TAPS → the answer flows back to the hook client's STDOUT (which is what unblocks the agent).
+  The inbound inject/capture path cannot reach this loop: it has no seam to (a) emit the agent's
+  question or (b) read the answer the agent receives. The agent-side tier adds exactly that seam,
+  reusing the SAME hermetic fake Telegram (UNCHANGED) for the Telegram side:
+  - **Config (`sut.bot`):** `ask_command` (the hook-client argv — its presence selects this tier),
+    `seed` (pre-boot files the daemon needs, e.g. `tg-ctl`'s `registration.json` whose `cwd` must
+    match the hook client's — written via the run's template tokens), `owner_id` (the Telegram user
+    the bot bridges to — the daemon's `TG_CHAT_ID`), `sender_id` (the `from.id` stamped on an
+    injected tap; defaults to `owner_id` because a bridge bot gates a tap on the owner), and
+    `ready_file` (a templated path the daemon creates when listening, e.g. its hook socket — the
+    readiness gate; absent → a fixed boot grace). Template tokens substituted into seed/env/argv:
+    `{workdir}` `{config_dir}` `{cwd}` `{home}` `{owner_id}` `{sender_id}` `{bot_id}` `{api_base}`
+    `{sut_dir}`. `{cwd}` is the REALPATH of the run's project dir (a process reports its realpath
+    via `cwd()`, and a bridge bot matches a registration's cwd literally), while the socket stays
+    under the SHORT unresolved `{config_dir}` (the AF_UNIX path length limit on macOS).
+  - **Grammar (inside a `## Case:` block):** `Ask-question:` / `Ask-permission:` (the raw hook
+    payload JSON written to the hook client's stdin) · `Expect-card: N` (how many NEW inline cards
+    this emit must post; 1 by default) · `Tap: <label>` (inject the tap of that button) ·
+    `Expect-answer: <substr>` (a substring the answer reaching the agent must contain). A re-`Ask:`
+    of the SAME question with `Expect-card: 0` + `Expect-answer:` is the **tg-cli#98** regression:
+    an already-answered re-fire must REPLAY the stored answer and post NO second (superseded) card.
+    A `Tap:` whose answer never returns (the hook client hangs) is the tap-loss / lost-answer bug.
+  - **Order:** seed preconditions → boot the daemon vs the fake (`TG_API_BASE`) → wait-ready →
+    per case: emit the question → assert the card count → inject the tap → read the answer off the
+    hook client's stdout → (re-fire) assert no new card + a replayed answer. Guaranteed teardown
+    reaps the hook clients + daemon and stops the fake.
+  - **Proof:** the same suite verdicts PASS against the current `tg-ctl` (the #98 fix: one card,
+    tap reaches the agent, re-fire replays) and FAIL against pre-#98 `tg-ctl` (the re-fire posts a
+    duplicate card). A hermetic 2-config fixture (`tests/fixtures/qa/tgctl-agentside`) makes that
+    RED→GREEN permanent in CI. Tier-2 real-tap (a real MTProto inline-button tap) is the bullet
+    below — out of scope for this hermetic tier (#82/#84).
 - **Tier 2 — real MTProto user account + agent-browser (high fidelity, OPT-IN).** For suites
   tagged `requires_live_telegram` (real delivery semantics, voice notes, inline buttons,
   forum topics): drive a DEDICATED test USER account via MTProto (Telethon — NOT installed,

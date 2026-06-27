@@ -510,6 +510,15 @@ _UNIT_FILES = [
     # REVIEW_QA_BOT_*_TIMEOUT_S inside the file. Give it a FRESH temp log dir for consistency
     # with the other qa-touching files.
     ("test_qa_bot.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # The bot AGENT-SIDE tier: a bridge bot (tg-ctl) driven by the agent's hook client — the suite
+    # parser (Ask-question/Expect-card/Tap/Expect-answer), the new sut.bot knobs (ask_command/seed/
+    # owner_id/sender_id/ready_file), the harness seam (emit_question/cards/tap/await_answer), and
+    # the 2-config DoD (a faithful miniature bridge bot verdicts PASS replaying an answered re-fire,
+    # FAILs under SUT_DUP_BUG=1 — the tg-cli#98 duplicate-card class) driven through the REAL harness
+    # (fake Telegram + a real subprocess daemon + a real Unix-socket hook client). Deterministic, no
+    # network/token/model; waits shrunk via REVIEW_QA_BOT_*_S in the file. Fresh temp log dir for
+    # consistency with the other qa-touching files.
+    ("test_qa_bot_agent_side.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     # The web Tier-1 DETERMINISTIC harness: the case-grammar parser + driver (goto/click/fill +
     # DOM assertions) + the Playwright gate + the dev-server health gate, plus the 2-fixture DoD
     # (the good web app verdicts PASS, the buggy one FAIL with a finding) driven through the REAL
