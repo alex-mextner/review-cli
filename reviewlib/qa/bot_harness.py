@@ -717,6 +717,23 @@ def make_agent_tap_update(update_id: int, data: str, *, from_id: int) -> dict:
     }
 
 
+def _reply_markup_dict(payload: dict) -> dict | None:
+    """The ``reply_markup`` of an outbound call AS A DICT, or ``None`` when absent/unparseable.
+
+    A bot may send Bot-API requests as ``application/json`` (reply_markup is already a nested object)
+    OR as ``application/x-www-form-urlencoded`` / multipart (python-telegram-bot, a curl ``-d``), in
+    which case the fake's form decoder leaves ``reply_markup`` as the JSON STRING the bot put in the
+    form field. So decode a string value before inspecting it — else a perfectly valid inline-keyboard
+    card posted via the form encoding would read as zero cards (and its ``Tap:`` labels as missing)."""
+    markup = payload.get("reply_markup")
+    if isinstance(markup, (str, bytes)):  # str (form/multipart-text); bytes is a defensive belt
+        try:
+            markup = json.loads(markup)
+        except (ValueError, TypeError):
+            return None
+    return markup if isinstance(markup, dict) else None
+
+
 def cards_captured(fake: FakeTelegram) -> list[OutboundCall]:
     """Every NEW inline-button CARD the bridge bot POSTED — a ``sendMessage`` whose
     ``reply_markup.inline_keyboard`` is non-empty. This is the question card the user taps; a
@@ -730,8 +747,8 @@ def cards_captured(fake: FakeTelegram) -> list[OutboundCall]:
     for c in fake.outbound:
         if c.method != "sendMessage":
             continue
-        markup = c.payload.get("reply_markup")
-        if isinstance(markup, dict) and markup.get("inline_keyboard"):
+        markup = _reply_markup_dict(c.payload)
+        if markup is not None and markup.get("inline_keyboard"):
             out.append(c)
     return out
 
@@ -740,8 +757,8 @@ def card_button_data(card: OutboundCall, button_label: str) -> str | None:
     """The ``callback_data`` of the button labelled ``button_label`` on ``card`` (case-insensitive,
     trimmed), or ``None`` when no such button exists. The label match is what a suite's ``Tap:``
     directive resolves against."""
-    markup = card.payload.get("reply_markup")
-    if not isinstance(markup, dict):
+    markup = _reply_markup_dict(card.payload)
+    if markup is None:
         return None
     want = button_label.strip().lower()
     for row in markup.get("inline_keyboard", []):
@@ -755,9 +772,9 @@ def card_button_data(card: OutboundCall, button_label: str) -> str | None:
 def card_button_labels(card: OutboundCall) -> list[str]:
     """Every button label on ``card`` (row-major) — for an error message when a ``Tap:`` names a
     button the card does not have."""
-    markup = card.payload.get("reply_markup")
+    markup = _reply_markup_dict(card.payload)
     labels: list[str] = []
-    if isinstance(markup, dict):
+    if markup is not None:
         for row in markup.get("inline_keyboard", []):
             labels += [str(b.get("text", "")) for b in row if isinstance(b, dict)]
     return labels
@@ -837,16 +854,30 @@ class AskHandle:
 
 def emit_question(
     *, ask_command: list[str], cwd: Path, env: dict[str, str], payload: str,
+    exit_boot_failed: int = 1,
 ) -> AskHandle:
     """Run the hook client (``ask_command``) that emits ONE agent question: spawn it in its OWN
     session (so a forked child can be reaped with the group) from ``cwd``, write ``payload`` (the
     raw hook payload JSON) to its stdin and close it, and return the handle whose stdout carries the
     answer. The daemon, seeing the request on its socket, forwards a card to the fake; the answer
-    flows back to this process's stdout once the tap is injected."""
-    proc = subprocess.Popen(  # noqa: S603 — ask_command resolved from the SUT's own qa.yaml
-        ask_command, cwd=str(cwd), env=env, start_new_session=True,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
+    flows back to this process's stdout once the tap is injected.
+
+    A hook client that cannot be SPAWNED (a typo'd / unavailable ``ask_command`` binary) raises
+    ``BotHarnessError`` — mirroring ``_spawn_bot_process`` — so the caller maps it to a controlled
+    BLOCKED case with a stable exit class, never an uncaught ``OSError`` traceback."""
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — ask_command resolved from the SUT's own qa.yaml
+            ask_command, cwd=str(cwd), env=env, start_new_session=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except (OSError, ValueError, IndexError) as exc:
+        # OSError/ValueError: a missing/typo'd binary or a bad argv. IndexError: an EMPTY argv
+        # (``Popen([])`` indexes ``args[0]``) — defensive, since a config with no ask_command is not
+        # agent-side, but emit_question must never traceback on a degenerate argv.
+        raise BotHarnessError(
+            f"could not launch the agent-side hook client {ask_command!r} in {cwd}: {exc}",
+            exit_code=exit_boot_failed,
+        ) from exc
     if proc.stdin is not None:
         try:
             proc.stdin.write(payload)

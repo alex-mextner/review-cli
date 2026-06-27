@@ -206,11 +206,81 @@ def test_cards_captured_ignores_edits():
     assert len(bh.cards_captured(fake)) == 1  # only the sendMessage
 
 
+def test_cards_captured_decodes_form_encoded_json_markup():
+    """A bot posting via application/x-www-form-urlencoded leaves reply_markup as a JSON STRING (the
+    fake's form decoder doesn't parse it). cards_captured + card_button_data must decode it, else a
+    valid inline card reads as zero cards and its Tap: labels as missing."""
+    markup_json = json.dumps({"inline_keyboard": [[{"text": "Ship it", "callback_data": "cb:0"}]]})
+    fake = bh.FakeTelegram()
+    fake.outbound.append(bh.OutboundCall(
+        "sendMessage", {"chat_id": 1, "text": "q", "reply_markup": markup_json}, time.monotonic()))
+    cards = bh.cards_captured(fake)
+    assert len(cards) == 1, "a form-encoded (JSON-string) reply_markup must still count as a card"
+    assert bh.card_button_data(cards[0], "ship it") == "cb:0"
+    assert bh.card_button_labels(cards[0]) == ["Ship it"]
+
+
+def test_reply_markup_dict_rejects_broken_and_non_dict():
+    """_reply_markup_dict returns None for a non-dict markup so a malformed value reads as 'no card'
+    rather than crashing: a broken JSON string, a JSON value that decodes to a non-dict (a list), and
+    an absent markup. (str covers both the form-urlencoded and multipart-text decoders; neither emits
+    bytes.)"""
+    assert bh._reply_markup_dict({"reply_markup": "{not json"}) is None
+    assert bh._reply_markup_dict({"reply_markup": "[1, 2, 3]"}) is None  # valid JSON, not a dict
+    assert bh._reply_markup_dict({"reply_markup": 42}) is None
+    assert bh._reply_markup_dict({}) is None
+    assert bh._reply_markup_dict({"reply_markup": {"inline_keyboard": []}}) == {"inline_keyboard": []}
+
+
+def test_emit_question_missing_binary_is_blocked_not_traceback():
+    """A typo'd / unavailable ask_command binary raises a controlled BotHarnessError (mapped to a
+    BLOCKED case), never an uncaught OSError traceback that kills the whole agent-side run."""
+    try:
+        bh.emit_question(
+            ask_command=["/no/such/hook-client-binary"], cwd=Path.cwd(),
+            env=dict(os.environ), payload="{}", exit_boot_failed=8)
+        raise AssertionError("expected a BotHarnessError for a missing ask_command binary")
+    except bh.BotHarnessError as exc:
+        assert exc.exit_code == 8 and "hook client" in str(exc)
+
+
+def test_emit_question_empty_argv_is_blocked_not_traceback():
+    """An EMPTY ask_command (Popen([]) raises IndexError, not OSError) is still a controlled
+    BotHarnessError — the defensive IndexError branch, so a degenerate argv never tracebacks."""
+    try:
+        bh.emit_question(
+            ask_command=[], cwd=Path.cwd(), env=dict(os.environ), payload="{}", exit_boot_failed=8)
+        raise AssertionError("expected a BotHarnessError for an empty ask_command")
+    except bh.BotHarnessError as exc:
+        assert exc.exit_code == 8
+
+
+def test_agent_side_missing_ask_command_blocks_the_case():
+    """End-to-end: a daemon that boots fine but a MISSING ask_command yields a BLOCKED case (with the
+    launch error), not a crash — the run stays honest about what it could not drive."""
+    suite = (
+        "## Case: q\n"
+        'Ask-question: {"tool_input": {"questions": [{"question": "x", "options": [{"label": "A"}]}]}}\n'
+        "Expect-card: 1\nTap: A\nExpect-answer: A\n"
+    )
+    cfg = BotConfig(
+        driver="mock",
+        command=("python3", "-c", "import time; time.sleep(5)"),
+        ask_command=("/no/such/hook-client-binary",),
+        owner_id=424242,
+    )
+    transcript = bd.run_hermetic_bot_test(
+        suite_text=suite, bot_config=cfg, cwd=Path.cwd(), sut_path=Path.cwd(), exit_boot_failed=8)
+    assert "VERDICT: BLOCKED" in transcript, transcript
+    assert "hook client" in transcript, transcript
+
+
 def test_do_tap_with_no_card_fails_cleanly():
     """A Tap: with no card to tap (e.g. Expect-card: 0 + Tap:) FAILs honestly — no IndexError."""
     fake = bh.FakeTelegram()
     ctx = bd._AgentRunCtx(
-        fake=fake, ask_command=[], cwd=Path.cwd(), env={}, sender_id=1, handles=[])
+        fake=fake, ask_command=[], cwd=Path.cwd(), env={}, sender_id=1, handles=[],
+        exit_boot_failed=8)
     case = bd.AgentCase(title="t", payload="{}", expect_card=0, tap="Allow")
     result = bd._do_tap(case, ctx)
     assert result is not None and result.status == bd.FAIL and "no card to tap" in result.detail

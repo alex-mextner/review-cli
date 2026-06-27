@@ -562,6 +562,7 @@ class _AgentRunCtx:
     env: dict[str, str]
     sender_id: int
     handles: list[bh.AskHandle]
+    exit_boot_failed: int = 1  # default so a new call-site can't break; real runs pass the QA class
 
 
 @dataclass
@@ -736,6 +737,7 @@ def run_agent_side_bot_test(
         run_ctx = _AgentRunCtx(
             fake=fake, ask_command=[_substitute(a, variables) for a in bot_config.ask_command],
             cwd=ws.project, env=env, sender_id=sender, handles=handles,
+            exit_boot_failed=exit_boot_failed,
         )
         results = [_drive_agent_case(c, run_ctx) for c in cases]
         return BotRunResult(results=results).to_qa_results(sut_path=sut_path)
@@ -792,8 +794,19 @@ def _drive_agent_case(case: AgentCase, ctx: _AgentRunCtx) -> CaseResult:
                    "script to drive it.",
         )
     baseline = len(bh.cards_captured(ctx.fake))
-    handle = bh.emit_question(
-        ask_command=ctx.ask_command, cwd=ctx.cwd, env=ctx.env, payload=case.payload or "")
+    try:
+        handle = bh.emit_question(
+            ask_command=ctx.ask_command, cwd=ctx.cwd, env=ctx.env, payload=case.payload or "",
+            exit_boot_failed=ctx.exit_boot_failed)
+    except bh.BotHarnessError as exc:
+        # The hook client could not be SPAWNED (a typo'd/unavailable ask_command). Report a
+        # controlled BLOCKED case, not an uncaught traceback that kills the whole run. A missing
+        # binary fails EVERY case identically → an all-BLOCKED run, and BotRunResult.verdict rolls
+        # that up to VERDICT BLOCKED, which the qa handler maps to the non-zero exit_boot_failed
+        # class — so a misconfigured ask_command never passes as a green run. (The exit class is
+        # carried on the BotHarnessError too, but the per-case BLOCKED path reports via the verdict,
+        # not that code, so the run-level mapping is what makes the exit non-zero.)
+        return CaseResult(case.title, BLOCKED, str(exc))
     ctx.handles.append(handle)
     timeout = bh._CARD_TIMEOUT_S if case.expect_card > 0 else bh._NO_CARD_CONFIRM_S
     new_cards = _observe_new_cards(ctx.fake, baseline, want=case.expect_card, timeout=timeout)
