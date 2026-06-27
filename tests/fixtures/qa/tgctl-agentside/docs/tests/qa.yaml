@@ -1,0 +1,21 @@
+sut:
+  kind: bot
+  bot:
+    driver: mock                       # hermetic Tier-1 fake-Telegram driver
+    # AGENT-SIDE tier: ask_command is set, so the harness drives the
+    # agent -> bridge -> Telegram card -> tap -> answer loop (not the inbound Send:/Expect: path).
+    command:                           # the long-poll DAEMON (run from the throwaway project cwd)
+      - python3
+      - "{sut_dir}/sut.py"             # absolute via {sut_dir}: the daemon runs in {cwd}, not here
+      - run
+    ask_command:                       # the agent's hook client that emits one question on stdin
+      - python3
+      - "{sut_dir}/sut.py"
+      - ask
+    owner_id: 424242                   # the synthetic Telegram user the bot bridges to / taps as
+    ready_file: "{config_dir}/tg-ctl.{bot_id}.sock"   # wait for the daemon's hook socket
+    seed:                              # the daemon's precondition: a registration for the ask cwd
+      - path: "config/tg-ctl.{bot_id}.registration.json"
+        content: '[{"cwd": "{cwd}", "registeredAt": 0}]'
+    env:
+      SUT_MAX_RUNTIME_S: "60"
