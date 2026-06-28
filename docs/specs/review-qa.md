@@ -431,16 +431,21 @@ gitleaks-scanned config (`~/.config/tg-cli-qa/.env`), never committed, never log
 from artifacts. Prefer Telegram's TEST data center where the SUT can register there.
 Cleanup created test messages/topics after a run.
 
-### 7.4 Tier-2 (the LIVE tier) — SCAFFOLDING shipped, CREDS the CTO must provision (#82/#84)
+### 7.4 Tier-2 (the LIVE tier) — bot MTProto driver BUILT; CREDS the CTO must provision (#82/#84)
 
 Tier-1 (the deterministic / hermetic harnesses) ships and gates in CI with no creds. Tier-2 is
-the LIVE tier: it swaps the in-process fake / local boot for a REAL external system. The
-**scaffolding** is built and unit-tested without creds (`reviewlib/qa/live_tier.py`): the
+the LIVE tier: it swaps the in-process fake / local boot for a REAL external system. The common
+machinery is built and unit-tested without creds (`reviewlib/qa/live_tier.py`): the
 `tier: live` config path (a per-SUT `driver:` value), a per-SUT availability GATE that names the
-EXACT missing creds, the live-driver SKELETON wired behind the SAME protocol seam the Tier-1
-driver speaks, and the dispatch that SKIPs LOUD (a controlled BLOCKED, never a fake pass) when
-creds are absent. **The actual live run is tracked in #82** — it needs the credentials/infra
-below. Until then, a `tier: live` block runs to a BLOCKED that names exactly what to provide.
+EXACT missing creds, the live drivers wired behind the SAME protocol seam the Tier-1 driver
+speaks, and the dispatch that SKIPs LOUD (a controlled BLOCKED, never a fake pass) when creds are
+absent. **The bot LIVE run is BUILT** (`reviewlib/qa/live_tier.py::LiveBotDriver` +
+`reviewlib/qa/live_bot_runner.py`): the real MTProto driver (Telethon) connects as a DEDICATED
+test USER account and drives the suite — `send` / `expect` a reply / `tap` an inline button —
+against the real bot, with the availability gate and fail-closed safety in front of it. The
+**web/ext** live runs remain SKELETONS tracked in **#82** (their `connect` BLOCKs with the
+not-yet-implemented message). With creds present a `tier: live` bot block drives the real bot;
+with creds absent — for any kind — it runs to a BLOCKED that names exactly what to provide.
 
 **How a live tier is selected.** Set the SUT block's `driver:` to the live value AND set the
 opt-in flag (the flag mirrors `REVIEW_QA_PLAYWRIGHT` / `REVIEW_QA_VSCODE`):
