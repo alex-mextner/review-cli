@@ -40,9 +40,35 @@ connection; they raise ``LiveTierUnavailable`` until the live run is implemented
 """
 from __future__ import annotations
 
+import asyncio
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+# How the live bot driver waits for the bot's reply: poll the chat for a NEW inbound message
+# every ``_LIVE_REPLY_POLL_S`` until the predicate matches or the caller's timeout elapses, and
+# fetch at most ``_LIVE_FETCH_LIMIT`` messages per poll (newest-first). A bot reply is one or a few
+# messages; the limit bounds the read. A burst LARGER than the limit between two polls would drop
+# its oldest messages (newest-first + the limit), so keep the limit comfortably above any realistic
+# single-reply burst.
+_LIVE_REPLY_POLL_S = 0.7
+_LIVE_FETCH_LIMIT = 100
+# A network-bounded ceiling on the MTProto connect itself, so a live run can't hang forever on an
+# unreachable Telegram (Telethon's own retries are otherwise unbounded at this layer).
+_LIVE_CONNECT_TIMEOUT_S = 30.0
+# The same ceiling on every other discrete op (auth check, entity resolve, send, tap, cleanup) so a
+# network stall on any single call surfaces as a controlled BLOCKED rather than a silent hang.
+# ``expect`` bounds itself via its own polling deadline, so it does NOT use this.
+_LIVE_OP_TIMEOUT_S = 30.0
+# Telethon's flood_sleep_threshold (default 60s) SILENTLY sleeps through a flood-wait up to that
+# many seconds — which to the QA run looks exactly like a hang. We set a SMALL positive threshold:
+# a trivial sub-threshold wait (the common case for a handful of quick sends across a suite) sleeps
+# silently and the run proceeds, while a genuinely long flood-wait still RAISES FloodWaitError (→ a
+# controlled per-case BLOCKED). A threshold of 0 would flap EVERY trivial wait into a BLOCKED and
+# make live runs flaky; 60s (the default) would silently stall the suite.
+_LIVE_FLOOD_SLEEP_THRESHOLD_S = 5
 
 
 # --- the live-tier driver-name constants (the qa.yaml `driver:` values that select Tier-2) ---
@@ -312,27 +338,304 @@ def _baseline_dir_problem(baseline: str) -> str | None:
 
 # --- the live-driver SKELETONS (wired behind the Tier-1 protocol seams; live run = #82) -------
 class LiveBotDriver:
-    """The bot Tier-2 live driver SKELETON — drives a real test Telegram USER account over MTProto
-    (Telethon) as the human caller, behind the same inbound/outbound seam the Tier-1 hermetic
-    driver speaks. The live run (open the MTProto session, ``send``/``tap``/``expect`` against the
-    real account) is implemented under #82; until then ``connect`` raises ``LiveTierUnavailable``
-    so a misrouted call BLOCKS rather than silently doing nothing.
+    """The bot Tier-2 LIVE driver — drives a real test Telegram USER account over MTProto
+    (Telethon) as the human caller, behind the same send/expect/tap seam the Tier-1 hermetic
+    driver speaks (spec §7.3 Tier 2). ``connect`` opens the MTProto session against a DEDICATED
+    test account, resolves the test chat, and marks the high-water message id so ``expect`` only
+    sees replies that arrive AFTER connect (chat history is ignored).
 
-    The CONTRACT is fixed here (spec §7.3 Tier 2): ``send(text, reply_to, thread_id, media)``,
+    THE CONTRACT (spec §7.3 Tier 2): ``send(text, reply_to)`` (deliver as the human caller),
     ``tap(message, button)`` (callback queries — the faithful way to exercise q-buttons /
-    plan-approval), ``expect(predicate, timeout)``. Pinning the contract now is what makes the
-    live run a drop-in."""
+    plan-approval), ``expect(predicate, timeout)`` (wait for the bot's next INBOUND reply matching
+    the predicate; our own outbound is skipped). Telethon's client is async; this driver holds its
+    own event loop and runs each coroutine synchronously, so the deterministic case-runner drives
+    it with the same straight-line code the hermetic path uses.
 
-    def __init__(self, *, exit_blocked: int):
+    TESTABILITY. The Telethon client is built lazily inside ``connect`` (the dep is a qa-harness
+    extra, NOT installed in CI), so a unit test injects a ``client_factory`` (``loop -> client``)
+    that returns an in-memory fake transport — exercising this driver's REAL translation logic
+    (min-id polling, outbound filtering, the predicate gate, button resolution) with no Telegram,
+    no network, no telethon. A missing/old telethon or a failed connect raises
+    ``LiveTierUnavailable`` (the controlled BLOCKED), never a raw traceback."""
+
+    def __init__(
+        self,
+        *,
+        api_id: str,
+        api_hash: str,
+        session: str,
+        chat: str,
+        exit_blocked: int,
+        client_factory: Callable[[asyncio.AbstractEventLoop], Any] | None = None,
+        poll_interval_s: float = _LIVE_REPLY_POLL_S,
+        connect_timeout_s: float = _LIVE_CONNECT_TIMEOUT_S,
+        op_timeout_s: float = _LIVE_OP_TIMEOUT_S,
+    ):
+        self._api_id = api_id
+        self._api_hash = api_hash
+        self._session = session
+        self._chat = chat
         self._exit_blocked = exit_blocked
+        self._client_factory = client_factory
+        self._poll_interval_s = poll_interval_s
+        self._connect_timeout_s = connect_timeout_s
+        self._op_timeout_s = op_timeout_s
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._client: Any = None
+        self._entity: Any = None
+        self._last_seen_id = 0
+        self._sent_ids: list[int] = []  # ids of messages WE sent, deleted on disconnect (cleanup)
 
+    # --- lifecycle -------------------------------------------------------------------------
     def connect(self) -> None:
-        raise LiveTierUnavailable(
-            "the bot Tier-2 live MTProto run is not yet implemented (tracked in #82). The "
-            "scaffolding (gate, config path, this driver seam) is in place; the live run lands "
-            "once the test-account creds are provisioned and #82 is built.",
-            exit_code=self._exit_blocked,
-        )
+        """Open the MTProto session, verify the account is authorized, resolve the test chat, and
+        record the high-water message id. Any failure (telethon absent, not authorized, the chat
+        can't be resolved, the network is down, a timeout) is a controlled ``LiveTierUnavailable``
+        carrying the boot-failed exit class — the dispatch turns it into a BLOCKED transcript, never
+        a fake pass. The loop/client are always torn down on a failed connect (no leaked socket).
+
+        THREADING ASSUMPTION: this drives a dedicated event loop and makes it the thread's current
+        loop, so it assumes the QA run is on the main/a dedicated thread WITHOUT a foreign running
+        asyncio loop (the synchronous CLI case). It is not safe to call from inside another running
+        loop."""
+        # A second connect() on the SAME driver (misuse — the suite runner builds a FRESH driver
+        # per run) would orphan the prior loop/client; tear any prior session down first so connect
+        # is re-entrant-safe instead of leaking the first loop.
+        if self._loop is not None:
+            self.disconnect()
+        loop = self._loop = asyncio.new_event_loop()
+        # Make this loop the thread's current loop BEFORE building the client: Telethon binds its
+        # internal asyncio objects to ``get_event_loop()`` at construct/connect time, so without
+        # this they could attach to a different loop ("got Future attached to a different loop") on
+        # the first live call. The public methods then drive coroutines on THIS loop explicitly.
+        asyncio.set_event_loop(loop)
+        try:
+            client = self._client = self._build_client(loop)
+            # Cap how long a flood-wait may SILENTLY sleep inside send/tap (see the constant): a
+            # short wait passes quietly, a long one RAISES FloodWaitError so the run reports it
+            # rather than appearing to hang. (0 would flap even trivial waits into a BLOCKED.)
+            if hasattr(client, "flood_sleep_threshold"):
+                client.flood_sleep_threshold = _LIVE_FLOOD_SLEEP_THRESHOLD_S
+            # Bound the connect itself — an unreachable Telegram must not hang the whole QA run.
+            self._await(client.connect(), self._connect_timeout_s)
+            if not self._await(client.is_user_authorized(), self._op_timeout_s):
+                raise LiveTierUnavailable(
+                    "the bot Tier-2 live run connected to Telegram but the test account is NOT "
+                    "authorized — TG_TEST_SESSION is empty, expired, or revoked. Regenerate a "
+                    "Telethon StringSession for the DEDICATED test account. See "
+                    "docs/specs/review-qa.md §7.4.",
+                    exit_code=self._exit_blocked,
+                )
+            self._entity = self._await(client.get_entity(self._target_chat()), self._op_timeout_s)
+            self._last_seen_id = self._await(self._latest_message_id(), self._op_timeout_s)
+        except LiveTierUnavailable:
+            self.disconnect()
+            raise
+        except Exception as exc:  # noqa: BLE001 — any transport/resolve failure → controlled BLOCKED
+            self.disconnect()
+            raise LiveTierUnavailable(
+                "the bot Tier-2 live run could not open the MTProto session / resolve the test "
+                f"chat ({type(exc).__name__}: {exc}). Check TG_TEST_API_ID/HASH/SESSION and that "
+                "TG_TEST_CHAT_ID is a chat the test account is a member of. See "
+                "docs/specs/review-qa.md §7.4.",
+                exit_code=self._exit_blocked,
+            ) from exc
+
+    def _build_client(self, loop: asyncio.AbstractEventLoop) -> Any:
+        """Build the Telethon client (or the injected fake). Telethon is imported HERE (lazy) — it
+        is an opt-in qa-harness dep, not installed in CI — so a missing/old install is a clean
+        ``LiveTierUnavailable`` with the install hint, never an import crash at module load."""
+        if self._client_factory is not None:
+            return self._client_factory(loop)
+        try:
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+        except ImportError as exc:  # the dep is absent OR too old to expose StringSession
+            raise LiveTierUnavailable(
+                "the bot Tier-2 live run needs the `telethon` MTProto client (a qa-harness dep, "
+                "NOT a tg-cli dep): pip install -e '.[live]' (or pip install telethon). "
+                f"(import failed: {exc})",
+                exit_code=self._exit_blocked,
+            ) from exc
+        try:
+            api_id = int(self._api_id)
+        except (TypeError, ValueError) as exc:
+            # Do NOT echo the configured api_id value: it is an account credential (the pair to the
+            # secret api_hash) and this message lands in a SAVED BLOCKED artifact. Name the var, not
+            # the value.
+            raise LiveTierUnavailable(
+                "TG_TEST_API_ID must be the NUMERIC app id from my.telegram.org (the configured "
+                "value is not an integer). See docs/specs/review-qa.md §7.4.",
+                exit_code=self._exit_blocked,
+            ) from exc
+        # Telethon 1.x binds to the thread's current loop (set in connect); it no longer accepts a
+        # ``loop=`` kwarg, so do NOT pass one.
+        return TelegramClient(StringSession(self._session), api_id, self._api_hash)
+
+    def _target_chat(self) -> Any:
+        """The chat to drive: a numeric id as ``int`` (the common ``-100…`` supergroup / a user
+        id), else the raw string (an ``@username``) for Telethon to resolve."""
+        chat = self._chat.strip()
+        try:
+            return int(chat)
+        except ValueError:
+            return chat
+
+    async def _latest_message_id(self) -> int:
+        """The newest existing message id in the chat (the high-water mark) so ``expect`` ignores
+        history and only matches replies that land AFTER connect. Empty chat → 0."""
+        messages = await self._client.get_messages(self._entity, limit=1)
+        return max((m.id for m in messages), default=0)
+
+    def disconnect(self) -> None:
+        """Tear the session down idempotently — delete the messages WE created (spec §7.3 cleanup),
+        disconnect the client, close the loop. Never raises (teardown runs in a ``finally`` and on a
+        failed connect)."""
+        client, loop = self._client, self._loop
+        if client is not None and loop is not None and not loop.is_closed():
+            self._cleanup_sent(client, loop)
+            try:
+                loop.run_until_complete(client.disconnect())
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if loop is not None:
+            # Drop the (now-closed) loop as the thread's current loop so a later driver / caller
+            # never inherits a closed loop from us.
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:  # noqa: BLE001
+                pass
+        self._client = self._loop = self._entity = None
+        self._sent_ids = []
+
+    def _cleanup_sent(self, client: Any, loop: asyncio.AbstractEventLoop) -> None:
+        """Best-effort delete of the messages WE sent (spec §7.3: 'Cleanup created test messages
+        after a run') so a dedicated test chat doesn't accumulate run-over-run. Never raises — a bot
+        whose replies we can't delete, or a client without ``delete_messages``, is silently skipped;
+        the run already produced its verdict before teardown."""
+        if not self._sent_ids or self._entity is None or not hasattr(client, "delete_messages"):
+            return
+        try:
+            loop.run_until_complete(asyncio.wait_for(
+                client.delete_messages(self._entity, self._sent_ids), timeout=self._op_timeout_s))
+        except Exception:  # noqa: BLE001 — cleanup is best-effort, never fails the run
+            pass
+
+    # --- the send / expect / tap contract --------------------------------------------------
+    def _require_connected(self) -> None:
+        """Guard the send/expect/tap ops: a call before ``connect`` (no loop/client) is a controlled
+        ``LiveTierUnavailable``, not an ``AttributeError`` on a ``None`` client."""
+        if self._loop is None or self._client is None:
+            raise LiveTierUnavailable(
+                "the bot Tier-2 live driver was driven before connect() — call connect() first.",
+                exit_code=self._exit_blocked,
+            )
+
+    def send(self, text: str, *, reply_to: int | None = None) -> Any:
+        """Deliver ``text`` to the test chat AS the human caller and return the sent message. The
+        sent id is recorded so disconnect can delete our messages (cleanup).
+
+        Re-base the high-water mark to the chat's CURRENT newest message before sending, so each
+        ``Send:`` opens a fresh reply window. Without this, a bot that answers one ``Send:`` with
+        MULTIPLE messages (e.g. a greeting AND a separate menu card) leaves the un-matched extras
+        behind — ``expect`` returns on the FIRST match and only advances the high-water to it — and
+        those leftovers would then be consumed by the NEXT case's ``expect`` (the runner always uses
+        the any-reply predicate), producing a false match / FAIL that flaps between runs."""
+        self._require_connected()
+        self._last_seen_id = self._run_op(self._latest_message_id())
+        message = self._run_op(self._client.send_message(self._entity, text, reply_to=reply_to))
+        mid = getattr(message, "id", None)
+        if isinstance(mid, int):
+            self._sent_ids.append(mid)
+        return message
+
+    def expect(self, predicate: Callable[[Any], bool], timeout: float) -> Any | None:
+        """Wait up to ``timeout`` seconds for the bot's next INBOUND reply that satisfies
+        ``predicate``, polling the chat for messages newer than the high-water mark. Our OWN
+        outbound (``message.out``) is skipped — only the bot's replies count. Returns the matching
+        message, or ``None`` on timeout (the case classifier reports the honest miss)."""
+        self._require_connected()
+        return self._run(self._await_reply(predicate, timeout))
+
+    async def _await_reply(self, predicate: Callable[[Any], bool], timeout: float) -> Any | None:
+        loop = self._loop
+        assert loop is not None
+        deadline = loop.time() + timeout
+        seen = self._last_seen_id
+        while loop.time() < deadline:
+            # Bound EACH poll's network fetch at the FIXED op ceiling (the same 30s as send/tap/
+            # connect) so a genuinely hung get_messages surfaces as a controlled TimeoutError →
+            # BLOCKED, instead of blowing past the window on Telethon's own unbounded retries. We do
+            # NOT shrink this cap to the time-left: a HEALTHY fetch that merely runs past a tiny
+            # remaining must still complete and have its messages processed — then the deadline check
+            # returns the honest None. Shrinking to `remaining` would cut a normal sub-second
+            # round-trip near the deadline into a SPURIOUS transport BLOCKED (flapping a real "no
+            # reply" FAIL / an Expect-silent PASS into BLOCKED). The deadline loop bounds the TOTAL
+            # wait; this per-fetch cap only catches a true stall.
+            messages = await asyncio.wait_for(
+                self._client.get_messages(self._entity, min_id=seen, limit=_LIVE_FETCH_LIMIT),
+                timeout=self._op_timeout_s)
+            for message in sorted(messages, key=lambda m: m.id):
+                if message.id <= seen:
+                    continue
+                seen = self._last_seen_id = message.id
+                if getattr(message, "out", False):
+                    continue  # our own send — advance past it, never match it
+                if getattr(message, "action", None) is not None:
+                    continue  # a Telegram SERVICE message (join/pin/…), not a bot reply
+                if predicate(message):
+                    return message
+            await asyncio.sleep(self._poll_interval_s)
+        # The window elapsed with no matching inbound reply — the honest miss (the classifier turns
+        # it into a FAIL / a satisfied Expect-silent), never a transport BLOCKED.
+        self._last_seen_id = seen
+        return None
+
+    def tap(self, message: Any, button: int | str) -> Any:
+        """Tap an inline button on ``message`` (a callback query — the faithful way to exercise a
+        bot's q-buttons / plan-approval). ``button`` is the button's LABEL (text) or its 0-based
+        index. Returns Telethon's callback result (its ``.message`` is the toast/alert text)."""
+        self._require_connected()
+        return self._run_op(self._tap(message, button))
+
+    async def _tap(self, message: Any, button: int | str) -> Any:
+        if isinstance(button, int):
+            return await message.click(i=button)
+        return await message.click(text=button)
+
+    def _run(self, coro: Awaitable[Any]) -> Any:
+        """Run one client coroutine to completion on the driver's own loop — used only by ``expect``,
+        whose ``_await_reply`` bounds itself two ways: it never polls past the caller's deadline AND
+        caps each individual network fetch at the op timeout (a hung fetch raises a controlled
+        TimeoutError, never a silent hang)."""
+        loop = self._loop
+        if loop is None:
+            raise LiveTierUnavailable(
+                "the bot Tier-2 live driver was driven before connect() — call connect() first.",
+                exit_code=self._exit_blocked,
+            )
+        return loop.run_until_complete(coro)
+
+    def _run_op(self, coro: Awaitable[Any]) -> Any:
+        """Run one discrete client op (send/tap) bounded by the op timeout, so a network stall on a
+        single call can't hang the QA run forever."""
+        return self._await(coro, self._op_timeout_s)
+
+    def _await(self, coro: Awaitable[Any], timeout: float) -> Any:
+        """Run ``coro`` on the driver's loop with a hard ``timeout`` (a ``TimeoutError`` propagates,
+        which connect/the suite runner turn into a controlled BLOCKED)."""
+        loop = self._loop
+        if loop is None:
+            raise LiveTierUnavailable(
+                "the bot Tier-2 live driver was driven before connect() — call connect() first.",
+                exit_code=self._exit_blocked,
+            )
+        return loop.run_until_complete(asyncio.wait_for(coro, timeout=timeout))
 
 
 class LiveWebDriver:
@@ -412,13 +715,20 @@ def live_gate_for(kind: str) -> LiveTierGate:
 
 
 def live_driver_for(kind: str, *, exit_blocked: int):
-    """The live-driver SKELETON for ``kind`` (bot/web/ext). Each driver's ``connect`` currently
-    raises ``LiveTierUnavailable`` (the live run lands under #82); the factory exists so the
-    dispatch layer can reach the seam uniformly and the live impl is a drop-in once built. The
-    web/ext drivers read their target (site URL / baseline dir) from env at construction. Raises
-    ``LiveTierUnavailable`` for a kind with no live tier (e.g. backend)."""
+    """The live driver for ``kind`` (bot/web/ext). The BOT driver is the real MTProto driver
+    (Telethon) — its ``connect`` opens a live session against the test account read from env
+    (``TG_TEST_API_ID/HASH/SESSION/CHAT_ID``); the web/ext drivers are still SKELETONS whose
+    ``connect`` raises ``LiveTierUnavailable`` (their live run lands under #82). Each reads its
+    target from env at construction. Raises ``LiveTierUnavailable`` for a kind with no live tier
+    (e.g. backend)."""
     if kind == "bot":
-        return LiveBotDriver(exit_blocked=exit_blocked)
+        return LiveBotDriver(
+            api_id=os.environ.get("TG_TEST_API_ID", ""),
+            api_hash=os.environ.get("TG_TEST_API_HASH", ""),
+            session=os.environ.get("TG_TEST_SESSION", ""),
+            chat=os.environ.get("TG_TEST_CHAT_ID", ""),
+            exit_blocked=exit_blocked,
+        )
     if kind == "web":
         return LiveWebDriver(os.environ.get("REVIEW_QA_WEB_BASE_URL", ""), exit_blocked=exit_blocked)
     if kind == "ext":

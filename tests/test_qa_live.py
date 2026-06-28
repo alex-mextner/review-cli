@@ -355,11 +355,12 @@ def test_live_gate_for_unknown_kind_is_not_ok():
     assert "no Tier-2 live driver" in gate.reason
 
 
-# --- the live-driver skeletons --------------------------------------------------------------
-def test_live_drivers_connect_block_until_82():
-    """Each live-driver skeleton's connect raises LiveTierUnavailable (the live run is #82),
-    carrying the boot-failed exit class — a misrouted call BLOCKS, never silently no-ops."""
-    for kind in ("bot", "web", "ext"):
+# --- the live-driver skeletons (web/ext still #82; bot is REAL) ------------------------------
+def test_web_ext_drivers_connect_block_until_82():
+    """The web/ext live-driver SKELETONS still BLOCK on #82 (their live run is unbuilt); each
+    connect raises LiveTierUnavailable carrying the boot-failed exit class — a misrouted call
+    BLOCKS, never silently no-ops. (The BOT driver is now real — see the live-driver tests below.)"""
+    for kind in ("web", "ext"):
         driver = lt.live_driver_for(kind, exit_blocked=8)
         try:
             driver.connect()
@@ -367,6 +368,21 @@ def test_live_drivers_connect_block_until_82():
         except lt.LiveTierUnavailable as exc:
             assert exc.exit_code == 8
             assert "#82" in str(exc)
+
+
+def test_bot_live_driver_connect_requires_telethon():
+    """The bot live driver is REAL (no #82): with telethon absent, connect raises a controlled
+    LiveTierUnavailable naming the dep + install — never a raw ImportError, never a silent no-op,
+    never the obsolete '#82' placeholder. Carries the boot-failed exit class."""
+    with _force_import_error("telethon"):
+        driver = lt.live_driver_for("bot", exit_blocked=8)
+        try:
+            driver.connect()
+            raise AssertionError("bot connect should have raised without telethon")
+        except lt.LiveTierUnavailable as exc:
+            assert exc.exit_code == 8
+            assert "telethon" in str(exc).lower()
+            assert "#82" not in str(exc)
 
 
 def test_live_driver_for_unknown_kind_raises():
@@ -444,6 +460,11 @@ def test_dispatch_live_bot_emits_blocked_not_executor():
     assert "REVIEW_QA_BOT_LIVE" in text
     # The report FOOTER carries the live backend label, not the bot Tier-1 hermetic default.
     assert "backend: bot-live" in text and "hermetic-bot" not in text
+    # The TRANSCRIPT bring-up labels the live backend even on the creds-absent BLOCKED branch — a
+    # live BLOCKED must never be mislabelled as the hermetic fake (regression: the gate-not-ok
+    # branch used to fall back to the default "hermetic (fake Telegram)" bring-up).
+    assert "BRING-UP: live (real Telegram, MTProto)" in text
+    assert "hermetic (fake Telegram)" not in text
     # BLOCKED bring-up maps to the boot-failed exit class, not 0 (a clean pass).
     assert code == 8, code
 
@@ -742,11 +763,13 @@ def test_handler_live_short_circuits_before_suite_load():
             mod.load_suites_text = real
 
 
-def test_dispatch_creds_present_blocks_on_82_not_fake_pass():
-    """When the gate is SATISFIED (flag + all creds + a safe chat, telethon stubbed present), the
-    dispatch does NOT fake a pass — it reaches ``live_driver_for(...).connect()`` which raises the
-    not-yet-implemented ``#82`` message, and that surfaces as the BLOCKED reason. Exercises the
-    ``_live_blocked_reason`` gate-ok branch (every other dispatch test runs creds-absent)."""
+def test_dispatch_creds_present_reaches_live_driver_not_fake_pass():
+    """When the gate is SATISFIED (flag + all creds + a safe chat, telethon stubbed present but
+    WITHOUT a real TelegramClient), the dispatch does NOT fake a pass and does NOT emit the obsolete
+    ``#82`` placeholder — it reaches the REAL ``LiveBotDriver.connect()``, which fails to build the
+    Telethon client off the bare stub and surfaces a controlled BLOCKED naming ``telethon``. This is
+    the creds-present gate-ok branch now that the live run is built (every other dispatch test runs
+    creds-absent)."""
     from reviewlib.modes.qa import _run_bot_live
 
     env = {**_ALL_LIVE_VARS, "REVIEW_QA_BOT_LIVE": "1", "TG_TEST_API_ID": "1",
@@ -758,7 +781,40 @@ def test_dispatch_creds_present_blocks_on_82_not_fake_pass():
         text = report.read_text(encoding="utf-8")
     assert code == 8, code
     assert "BLOCKED" in text
-    assert "#82" in text, "a creds-present live run must BLOCK on the #82 not-yet-implemented path"
+    assert "telethon" in text.lower(), "a creds-present live run reaches the real driver's connect"
+    assert "#82" not in text, "the bot live run is built — no obsolete #82 placeholder"
+    # The footer labels the live backend, never the hermetic default.
+    assert "backend: bot-live" in text and "hermetic-bot" not in text
+
+
+def test_dispatch_live_passes_suites_and_max_cases_to_loader():
+    """The gate-ok bot live path loads the suite with the handler's suites + max_cases — the cost
+    cap reaches the LIVE run, not only the hermetic path. We spy on ``load_suites_text`` (resolved
+    via the handler's in-function ``from ..qa.suites import …``) and return an empty suite so the
+    run proceeds to the driver's connect (which then BLOCKs on the bare telethon stub)."""
+    import reviewlib.qa.suites as suites_mod
+    from reviewlib.modes.qa import _run_bot_live
+
+    env = {**_ALL_LIVE_VARS, "REVIEW_QA_BOT_LIVE": "1", "TG_TEST_API_ID": "1",
+           "TG_TEST_API_HASH": "h", "TG_TEST_SESSION": "s",
+           "TG_TEST_CHAT_ID": "-100", "TG_CHAT_ID": "-200"}
+    captured: dict = {}
+    real = suites_mod.load_suites_text
+
+    def _spy(files, *, max_cases=None):
+        captured["files"] = list(files)
+        captured["max_cases"] = max_cases
+        return ""  # empty suite → connect proceeds → telethon stub fails → BLOCKED
+
+    suites_mod.load_suites_text = _spy
+    try:
+        with _scratch() as out, _env(**env), _stub_telethon():
+            _run_bot_live(out / "r.md", out, strict=False, exit_blocked=8, in_place=False,
+                          suites=[Path("suite-a.md")], max_cases=3)
+    finally:
+        suites_mod.load_suites_text = real
+    assert captured["max_cases"] == 3
+    assert captured["files"] == [Path("suite-a.md")]
 
 
 def test_dispatch_web_creds_present_blocks_on_82_not_fake_pass():

@@ -434,14 +434,16 @@ def _run_bot_hermetic(
     # TIER-2 LIVE branch — short-circuited BEFORE the Tier-1 suite-load. A `driver: mtproto` bot
     # block drives a REAL test Telegram account, gated behind test-account creds. When the creds
     # gate is not satisfied the run SKIPs LOUD (a controlled BLOCKED naming the exact missing
-    # creds); when it is, the live driver is invoked (today it raises LiveTierUnavailable →
-    # BLOCKED, the live run is tracked in #82). The live path NEVER reads the Tier-1 suite, so it
-    # is gated ahead of load_suites_text — otherwise a suite-stage failure would be mis-attributed
-    # to a live run that was going to BLOCK on creds regardless. Either way the run NEVER silently
-    # falls through to the un-caged executor or fakes a pass.
+    # creds); when it IS satisfied the real MTProto driver connects and drives the suite against
+    # the live bot. The live path is gated AHEAD of load_suites_text — the suite is loaded INSIDE
+    # _run_bot_live only on the gate-ok branch, so a creds-absent run BLOCKs cleanly without being
+    # mis-attributed to a suite-stage failure (finding #4). Either way the run NEVER silently falls
+    # through to the un-caged executor or fakes a pass. The raw suite PATHS (not loaded text) are
+    # passed so the gate-ok branch can load them itself.
     if bot_config.is_live:
+        live_max = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
         return _run_bot_live(report_path, sut_path, strict=strict, exit_blocked=exit_blocked,
-                             in_place=ctx.args.in_place)
+                             in_place=ctx.args.in_place, suites=suites, max_cases=live_max)
 
     max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
     suite_text = load_suites_text(suites, max_cases=max_cases)
@@ -683,18 +685,39 @@ def _live_blocked_reason(kind: str, exit_blocked: int) -> str:
 
 def _run_bot_live(
     report_path: Path, sut_path: Path, *, strict: bool, exit_blocked: int, in_place: bool,
+    suites: list[Path] | tuple[Path, ...] = (), max_cases: int | None = None,
 ) -> int:
-    """Run (or SKIP-LOUD) the bot Tier-2 LIVE tier: real-Telegram MTProto. Emits a controlled
-    BLOCKED — the creds gate's exact missing-creds message, or the live-driver's #82 message when
-    creds are present — in the same ``## QA RESULTS`` contract the hermetic path uses."""
+    """Run (or SKIP-LOUD) the bot Tier-2 LIVE tier: real-Telegram MTProto. When the creds gate is
+    NOT satisfied, emits a controlled BLOCKED naming the exact missing creds (the SKIP-LOUD path —
+    never a fake pass). When it IS satisfied, the real MTProto driver connects and drives the suite
+    against the live bot, producing a real PASS/FAIL/BLOCKED transcript — the SAME ``## QA RESULTS``
+    contract the hermetic path uses. The suite is loaded HERE (only on the gate-ok branch) so a
+    creds-absent run BLOCKs cleanly without touching the suite stage (finding #4)."""
     import sys
 
     from ..qa.bot_driver import BotRunResult
     from ..qa.executor import parse_qa_results, verdict_to_exit_code
+    from ..qa.live_bot_runner import LIVE_BRING_UP
+    from ..qa.live_tier import bot_live_available
 
-    reason = _live_blocked_reason("bot", exit_blocked)
-    print(f"[review-cli] qa: bot Tier-2 LIVE run BLOCKED — {reason}", file=sys.stderr, flush=True)
-    transcript = BotRunResult(blocked_reason=reason).to_qa_results(sut_path=sut_path)
+    gate = bot_live_available()
+    if not gate.ok:
+        # SKIP-LOUD: no creds → a controlled BLOCKED naming exactly what to provision. The suite is
+        # never loaded on this branch (so a suite-stage failure can't mask the missing-creds reason).
+        print(f"[review-cli] qa: bot Tier-2 LIVE run BLOCKED — {gate.reason}",
+              file=sys.stderr, flush=True)
+        transcript = BotRunResult(blocked_reason=gate.reason).to_qa_results(
+            sut_path=sut_path, bring_up=LIVE_BRING_UP)
+    else:
+        # Creds present → load the suite and drive the REAL bot over MTProto.
+        from ..qa.live_bot_runner import run_live_bot_suite
+        from ..qa.suites import load_suites_text
+
+        suite_text = load_suites_text(list(suites), max_cases=max_cases)
+        print(f"[review-cli] qa: bot Tier-2 LIVE run driving real Telegram (MTProto) for SUT "
+              f"{sut_path}. Report -> {report_path}", file=sys.stderr, flush=True)
+        transcript = run_live_bot_suite(
+            suite_text=suite_text, sut_path=sut_path, exit_blocked=exit_blocked)
     _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
                       backend="bot-live")
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)

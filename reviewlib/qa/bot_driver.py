@@ -183,14 +183,14 @@ class BotRunResult:
             return BLOCKED
         return PASS
 
-    def to_qa_results(self, *, sut_path: Path) -> str:
+    def to_qa_results(self, *, sut_path: Path, bring_up: str = "hermetic (fake Telegram)") -> str:
         run = len(self.results)
         passed = sum(1 for r in self.results if r.status == PASS)
         failed = sum(1 for r in self.results if r.status == FAIL)
         blocked = sum(1 for r in self.results if r.status == BLOCKED)
         return "\n".join([
             "## QA RESULTS",
-            f"SUT: {sut_path}   KIND: bot   BRING-UP: hermetic (fake Telegram)",
+            f"SUT: {sut_path}   KIND: bot   BRING-UP: {bring_up}",
             f"CASES: {run} run, {passed} passed, {failed} failed, {blocked} blocked",
             "",
             "### FINDINGS",
