@@ -294,6 +294,14 @@ def test_ext_config_rejects_unknown_driver():
         raise AssertionError("an unsupported driver must raise QaConfigError")
 
 
+def test_ext_config_accepts_live_vscode_visual_driver_flags_is_live():
+    """The vscode-visual Tier-2 LIVE driver (real VS Code + window-screenshot visual diffing) is
+    now ACCEPTED (the scaffolding landed — #84) and flagged is_live; the live RUN is still gated
+    behind REVIEW_QA_EXT_LIVE + the VS Code gate + a baseline dir at dispatch."""
+    cfg = ExtConfig(driver="vscode-visual")
+    assert cfg.is_live
+
+
 def test_ext_config_parsed_from_fixture_yaml():
     cfg = load_qa_config(_FIXTURES / "ext-good", None)
     assert cfg is not None and cfg.kind == "ext"
