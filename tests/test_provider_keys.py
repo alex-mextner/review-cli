@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -59,6 +60,16 @@ _KEY_ENV_NAMES = (
     "OPENROUTER_X_TITLE",
     "REVIEW_OPENROUTER_MODE",
     "GEMINI_ENV_FILE",
+    # opencode per-provider probe (review-cli#94)
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_AI_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "XAI_API_KEY",
+    "TOGETHER_API_KEY",
+    "OC_AUTH_FILE",
+    "OC_CONFIG_FILE",
 )
 
 
@@ -1324,6 +1335,136 @@ def test_mode_review_includes_an_openrouter_seat_without_keyerror():
         finally:
             urllib.request.urlopen = old_open
     assert rc == 0, rc
+
+
+# === opencode per-provider auth probe (review-cli#94) ===========================
+
+
+def _write_oc_auth(directory: str, providers: dict) -> str:
+    """Write a minimal auth.json to *directory* and return its path."""
+    path = os.path.join(directory, "auth.json")
+    with open(path, "w") as f:
+        json.dump(providers, f)
+    return path
+
+
+def _write_oc_config(directory: str, providers: dict) -> str:
+    """Write a minimal opencode.json to *directory* and return its path."""
+    path = os.path.join(directory, "opencode.json")
+    with open(path, "w") as f:
+        json.dump({"provider": providers}, f)
+    return path
+
+
+def test_oc_bare_opencode_skips_provider_check():
+    """Bare 'opencode' (no oc: prefix) must pass with just the binary present."""
+    with _EnvSandbox():
+        # Sanity: if opencode binary is installed this must return True without any
+        # credential files set.  We cannot control the binary presence in tests,
+        # so we just confirm that _oc_provider_from_model returns None for bare strings.
+        assert backends._oc_provider_from_model("opencode") is None
+        assert backends._oc_provider_from_model("some/model") is None
+
+
+def test_oc_provider_from_model_extracts_prefix():
+    """_oc_provider_from_model peels oc:/opencode: prefix and returns provider."""
+    assert backends._oc_provider_from_model("oc:anthropic/claude-3-5-sonnet") == "anthropic"
+    assert backends._oc_provider_from_model("opencode:deepseek/deepseek-v3") == "deepseek"
+    assert backends._oc_provider_from_model("oc:commandcode/moonshotai/kimi") == "commandcode"
+    assert backends._oc_provider_from_model("opencode") is None
+    assert backends._oc_provider_from_model("codex") is None
+
+
+def test_backend_available_oc_anthropic_env_var():
+    """oc:anthropic/model is False without a key, True with ANTHROPIC_API_KEY.
+
+    Mocks _which_optional so the opencode binary appears installed on hosts
+    that don't have it (e.g. CI), keeping the test focused on credential
+    logic rather than binary presence.
+    """
+    saved_which = backends._which_optional
+    backends._which_optional = lambda name: "/fake/bin/opencode" if name == "opencode" else saved_which(name)
+    try:
+        with _EnvSandbox():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Empty auth.json + no key → unavailable.
+                os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+                os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
+                assert backends.backend_available("oc:anthropic/claude-sonnet-4-5") is False
+                # Set env var → available.
+                os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test"
+                assert backends.backend_available("oc:anthropic/claude-sonnet-4-5") is True
+    finally:
+        backends._which_optional = saved_which
+
+
+def test_backend_available_oc_provider_via_auth_json():
+    """oc:fireworks/model is True when auth.json has a key for fireworks."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(
+                tmpdir, {"fireworks": {"type": "api", "key": "fpk_test123"}}
+            )
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
+            # fireworks IS in auth.json → available (even though it's in _DEAD_PROVIDERS
+            # for the default-route guard — backend_available is a live-auth probe, not that guard).
+            assert backends._oc_provider_auth_available("fireworks") is True
+
+
+def test_backend_available_oc_provider_via_opencode_json():
+    """oc:someprovider/model is True when opencode.json has inline options.apiKey."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(
+                tmpdir,
+                {"customprovider": {"options": {"baseURL": "https://api.example.com", "apiKey": "sk-custom"}}},
+            )
+            assert backends._oc_provider_auth_available("customprovider") is True
+
+
+def test_backend_available_oc_unknown_provider_conservative_true():
+    """Unknown provider with no creds → conservative True (opencode may handle it)."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
+            # 'newprovider2099' is not in _OC_PROVIDER_ENV_VARS and not in auth/config.
+            assert backends._oc_provider_auth_available("newprovider2099") is True
+
+
+def test_backend_available_oc_known_provider_no_creds_false():
+    """Known provider (anthropic) with empty auth.json, no config, no env → False."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
+            assert backends._oc_provider_auth_available("anthropic") is False
+            assert backends._oc_provider_auth_available("openai") is False
+
+
+def test_backend_available_oc_local_provider_no_key_needed():
+    """Local inference providers (ollama, lmstudio) are always available — no key."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
+            assert backends._oc_provider_auth_available("ollama") is True
+            assert backends._oc_provider_auth_available("lmstudio") is True
+
+
+def test_oc_auth_has_provider_missing_file():
+    """Missing auth.json → False, not an exception."""
+    with _EnvSandbox():
+        os.environ["OC_AUTH_FILE"] = "/nonexistent/no-such-dir/auth.json"
+        assert backends._oc_auth_has_provider("anthropic") is False
+
+
+def test_oc_config_has_provider_key_missing_file():
+    """Missing opencode.json → False, not an exception."""
+    with _EnvSandbox():
+        os.environ["OC_CONFIG_FILE"] = "/nonexistent/no-such-dir/opencode.json"
+        assert backends._oc_config_has_provider_key("anthropic") is False
 
 
 if __name__ == "__main__":

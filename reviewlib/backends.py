@@ -1609,6 +1609,114 @@ def effective_provider(model: str) -> str:
     return lowered
 
 
+# ---------------------------------------------------------------------------
+# opencode per-provider auth probe helpers (review-cli#94)
+# ---------------------------------------------------------------------------
+
+# Env var names that override the default opencode file paths in tests.
+_OC_AUTH_FILE_ENV = "OC_AUTH_FILE"
+_OC_CONFIG_FILE_ENV = "OC_CONFIG_FILE"
+
+# Providers that run locally and need no API key.
+_OC_LOCAL_PROVIDERS = frozenset({"ollama", "lmstudio"})
+
+# Env vars for KNOWN providers.  Kept deliberately minimal — only providers
+# whose env var name is well-established and unlikely to change.  Unknown
+# providers fall through to a conservative True (opencode may handle them).
+_OC_PROVIDER_ENV_VARS: dict[str, tuple[str, ...]] = {
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    "google": ("GOOGLE_AI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"),
+    "groq": ("GROQ_API_KEY",),
+    "mistral": ("MISTRAL_API_KEY",),
+    "xai": ("XAI_API_KEY",),
+    "together": ("TOGETHER_API_KEY",),
+}
+
+
+def _oc_auth_file() -> Path:
+    """Path to opencode's auth.json.  Injectable via OC_AUTH_FILE for tests."""
+    env = os.environ.get(_OC_AUTH_FILE_ENV, "").strip()
+    if env:
+        return Path(env)
+    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / "opencode" / "auth.json"
+
+
+def _oc_config_file() -> Path:
+    """Path to opencode's opencode.json.  Injectable via OC_CONFIG_FILE for tests."""
+    env = os.environ.get(_OC_CONFIG_FILE_ENV, "").strip()
+    if env:
+        return Path(env)
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "opencode" / "opencode.json"
+
+
+def _oc_auth_has_provider(provider: str) -> bool:
+    """True iff opencode's auth.json carries a non-empty key for *provider*."""
+    try:
+        data = json.loads(_oc_auth_file().read_text())
+        return bool(data.get(provider, {}).get("key", ""))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _oc_config_has_provider_key(provider: str) -> bool:
+    """True iff opencode.json carries an inline options.apiKey for *provider*."""
+    try:
+        data = json.loads(_oc_config_file().read_text())
+        opts = data.get("provider", {}).get(provider, {}).get("options", {})
+        return bool(opts.get("apiKey", ""))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _oc_env_has_provider_key(provider: str) -> bool:
+    """True iff a known env var for *provider* is set and non-empty."""
+    return any(
+        os.environ.get(var, "").strip()
+        for var in _OC_PROVIDER_ENV_VARS.get(provider, ())
+    )
+
+
+def _oc_provider_auth_available(provider: str) -> bool:
+    """True iff opencode has credentials for *provider* from any source.
+
+    Checked in order: local (no-key) → auth.json → opencode.json → env vars.
+    For unknown providers (not in _OC_PROVIDER_ENV_VARS and not local) we fall
+    back to True — opencode may carry them through its own mechanism and we have
+    no signal to reject them.
+    """
+    if provider in _OC_LOCAL_PROVIDERS:
+        return True
+    if _oc_auth_has_provider(provider):
+        return True
+    if _oc_config_has_provider_key(provider):
+        return True
+    if _oc_env_has_provider_key(provider):
+        return True
+    # For a KNOWN provider where every credential source came up empty → unavailable.
+    # For an UNKNOWN provider → conservative True (no false negatives).
+    return provider not in _OC_PROVIDER_ENV_VARS
+
+
+def _oc_provider_from_model(model: str) -> str | None:
+    """Extract the underlying provider from an oc:/opencode: model string.
+
+    Returns None for a bare 'opencode' (no provider-scoped prefix — binary check only).
+    'oc:anthropic/claude-3-5-sonnet' → 'anthropic';
+    'opencode:deepseek/deepseek-v3' → 'deepseek';
+    'opencode' → None.
+    """
+    lowered = model.lower()
+    if not lowered.startswith(("oc:", "opencode:")):
+        return None
+    return effective_provider(lowered)
+
+
 def default_routes_live(model: str) -> bool:
     """True iff `model` is safe to ship as a DEFAULT (flat panel or board seat): the FULL id
     takes a real named route AND its effective provider is not known-dead.
@@ -1717,7 +1825,11 @@ def backend_available(model: str) -> bool:
             return _have_claude_cli()
         if backend is review_opencode:
             _which("opencode")
-            return True
+            provider = _oc_provider_from_model(model)
+            if provider is None:
+                # Bare 'opencode' (no oc: prefix) — binary check is sufficient.
+                return True
+            return _oc_provider_auth_available(provider)
     except RuntimeError:
         return False
     return False
