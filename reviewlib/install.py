@@ -485,26 +485,29 @@ _PRECOMMIT_MARKER = "# review-before-commit-gate"
 # Hash must match exactly what `review diff --staged` reviews (`git diff --no-ext-diff
 # --cached`) and the stamp path must resolve via `git rev-parse --git-path` so it
 # works in worktrees and repos whose `.git` is a pointer file.
+# `command git` bypasses shell aliases/functions (e.g. an rtk-style wrapper that rewrites
+# `git diff` output) so the hash matches the one written by review-cli, which calls the
+# real git binary via subprocess directly.
 _PRECOMMIT = """\
 #!/bin/sh
 """ + _PRECOMMIT_MARKER + """ (installed by `review install-commit-hook`)
 # Blocks a commit whose staged diff has not been reviewed. Bypass with
 # REVIEW_SKIP=1 git commit ...   or   git commit --no-verify
-root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+root=$(command git rev-parse --show-toplevel 2>/dev/null) || exit 0
 
 # A global core.hooksPath shadows each repo's own pre-commit, so run it
 # explicitly first — tests/formatters/secret-scanners must still gate. Resolve
 # via git-path so worktrees/submodules (where .git is a file) work too.
-local_hook="$(git rev-parse --git-path hooks/pre-commit)"
+local_hook="$(command git rev-parse --git-path hooks/pre-commit)"
 case "$local_hook" in /*) : ;; *) local_hook="$root/$local_hook" ;; esac
 if [ -x "$local_hook" ] && [ "$local_hook" != "$0" ]; then
   "$local_hook" "$@" || exit $?
 fi
 
 [ -n "$REVIEW_SKIP" ] && exit 0
-[ -z "$(git diff --cached --name-only)" ] && exit 0
-h=$(git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
-stamp=$(git rev-parse --git-path review-stamp)
+[ -z "$(command git diff --cached --name-only)" ] && exit 0
+h=$(command git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
+stamp=$(command git rev-parse --git-path review-stamp)
 if [ -f "$stamp" ] && grep -q "$h" "$stamp"; then exit 0; fi
 echo "review-before-commit: staged changes have not been reviewed." >&2
 echo "  run:  review diff --staged      (then commit)" >&2
