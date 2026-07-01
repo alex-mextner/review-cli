@@ -495,6 +495,7 @@ flag + creds above, then run the usual `review qa --kind <bot|web|ext> --suites 
 routes the block to its live gate; with creds present it drives the real SUT (the live run, #82),
 with creds absent it BLOCKS and prints exactly which var is missing.
 
+
 ## 8. The tester-agent SYSTEM PROMPT (core deliverable)
 
 Built in `qa.py` (`_build_tester_prompt(kind, suites_text, sut_path, stage_url, bring_up,

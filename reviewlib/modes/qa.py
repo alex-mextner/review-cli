@@ -593,6 +593,15 @@ def _run_web_deterministic(
     max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
     suite_text = load_suites_text(suites, max_cases=max_cases)
 
+    # TIER-2 LIVE branch: a `driver: agent-browser` web block drives a REAL browser against a
+    # deployed test site, gated behind REVIEW_QA_WEB_LIVE + REVIEW_QA_WEB_BASE_URL. When the gate
+    # is not satisfied the run SKIPs LOUD (a controlled BLOCKED naming the exact missing creds);
+    # when it is, the live driver is invoked (today it raises LiveTierUnavailable → BLOCKED, the
+    # live run is tracked in #82). It NEVER falls through to the un-caged executor or fakes a pass.
+    if web_config.is_live:
+        return _run_web_live(report_path, sut_path, web_config, strict=strict,
+                             exit_blocked=exit_blocked, in_place=ctx.args.in_place)
+
     print(
         f"[review-cli] qa: testing WEB SUT {sut_path} (kind=web, driver=playwright, "
         f"base_url={web_config.base_url}, "
