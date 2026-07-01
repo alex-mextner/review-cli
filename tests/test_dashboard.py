@@ -451,6 +451,380 @@ def test_cluster_sessions_and_modes():
         assert len(bs.roles()) >= 2
 
 
+def test_load_sessions_cached_parses_once_then_invalidates_on_change():
+    """The dashboard handlers (`/api/runs`, `/api/stats`, the SSE loop) used to call the pure
+    ``load_sessions`` on EVERY request, re-reading + re-parsing the whole log dir each time.
+    With a 35k-file / 434MB real log dir that is ~6s of CPU per request, two of which fire on
+    every page load (runs + stats via Promise.all) — the threaded server saturated CPU, the
+    fetch exceeded the proxy timeout, and the dashboard rendered EMPTY (stuck on "Loading…").
+
+    ``load_sessions_cached`` memoises by (resolved dir, gap) keyed on a CHEAP directory
+    signature (entry count + max mtime, stat-only, no file reads), so repeated calls within a
+    page load reuse the parse — yet a new/grown/removed log changes the signature and forces a
+    fresh parse, preserving live-activity correctness.
+    """
+    from reviewlib.dashboard import parser as p
+
+    parse_calls = {"n": 0}
+    real_parse_call_log = p.parse_call_log
+
+    def _counting_parse(path):  # spy: counts the per-file parse work the loader does
+        parse_calls["n"] += 1
+        return real_parse_call_log(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.parse_call_log = _counting_parse
+        try:
+            # Reset any module-level cache state so this test is order-independent.
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+
+            first = p.load_sessions_cached(ld, gap_seconds=90)
+            after_first = parse_calls["n"]
+            assert after_first >= 2, f"expected to parse the 2 logs at least once, got {after_first}"
+            assert len(first) == 1, first  # one clustered panel session
+
+            # Second call with the dir UNCHANGED must hit the cache: no further per-file parses.
+            second = p.load_sessions_cached(ld, gap_seconds=90)
+            assert parse_calls["n"] == after_first, (
+                f"cache miss: re-parsed on an unchanged dir ({parse_calls['n']} > {after_first})"
+            )
+            # Returns the same clustering, not a stale empty.
+            assert [s.session_id for s in second] == [s.session_id for s in first]
+
+            # A NEW log (a fresh review run streaming in) must change the cheap signature and
+            # force a re-parse — live activity must not be hidden behind the cache.
+            _write_call_log(ld, "20260601T120000_000000", "claude", 0, "later run\n", exit_code=0)
+            third = p.load_sessions_cached(ld, gap_seconds=90)
+            assert parse_calls["n"] > after_first, "cache failed to invalidate after a new log was written"
+            assert len(third) == 2, third  # the >90s-later call clusters as a new session
+        finally:
+            p.parse_call_log = real_parse_call_log
+            p.invalidate_sessions_cache()
+
+
+def test_compute_stats_cached_aggregates_once_then_invalidates_on_change():
+    """`/api/stats` was STILL ~8.5s on a warm session cache: the sessions came back fast, but the
+    handler then re-ran the PURE ``compute_stats`` (re-aggregating ~590 sessions / ~30k calls,
+    which also fans out into ``compute_model_health``) on EVERY request. ``compute_stats_cached``
+    memoises the aggregate on the SAME (resolved dir, gap) + cheap dir signature as
+    ``load_sessions_cached``, so repeated stat requests on an unchanged dir reuse the aggregate,
+    yet a new/grown/removed log invalidates both caches together (live activity stays honest).
+    """
+    from reviewlib.dashboard import parser as p
+
+    compute_calls = {"n": 0}
+    real_compute_stats = p.compute_stats
+
+    def _counting_compute(sessions):  # spy on the heavy pure aggregation
+        compute_calls["n"] += 1
+        return real_compute_stats(sessions)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.compute_stats = _counting_compute
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+
+            sessions = p.load_sessions_cached(ld, gap_seconds=90)
+
+            first = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 1, f"expected one aggregation, got {compute_calls['n']}"
+            assert first["session_count"] == 1, first
+
+            # Second call on the UNCHANGED dir must hit the cache: no further aggregation.
+            second = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 1, (
+                f"cache miss: re-aggregated on an unchanged dir ({compute_calls['n']} > 1)"
+            )
+            assert second["session_count"] == first["session_count"]
+
+            # The handler layers annotation counts ON TOP of the returned stats. That mutation
+            # must NOT pollute the cached aggregate across requests (no key accumulation / no
+            # leaked counts). Simulate the handler twice on the SAME cached dict identity.
+            handler_view_1 = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            handler_view_1["conscious_count"] = 3
+            handler_view_1["feedback_count"] = 7
+            handler_view_2 = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert "conscious_count" not in handler_view_2, (
+                "cached stats polluted: handler annotation leaked into the cache"
+            )
+            assert "feedback_count" not in handler_view_2, (
+                "cached stats polluted: handler annotation leaked into the cache"
+            )
+            assert compute_calls["n"] == 1, "annotation layering forced a needless re-aggregation"
+
+            # A NEW log (a live review streaming in) must change the cheap signature and force a
+            # fresh aggregation — stats must invalidate exactly when sessions do.
+            _write_call_log(ld, "20260601T120000_000000", "claude", 0, "later run\n", exit_code=0)
+            fresh_sessions = p.load_sessions_cached(ld, gap_seconds=90)
+            third = p.compute_stats_cached(fresh_sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 2, "stats cache failed to invalidate after a new log"
+            assert third["session_count"] == 2, third
+        finally:
+            p.compute_stats = real_compute_stats
+            p.invalidate_sessions_cache()
+
+
+def test_invalidate_sessions_cache_also_clears_stats():
+    """``invalidate_sessions_cache`` must drop BOTH the sessions and the stats memo, so an
+    explicit refresh / a test reset leaves no stale aggregate behind (coherence)."""
+    from reviewlib.dashboard import parser as p
+
+    compute_calls = {"n": 0}
+    real_compute_stats = p.compute_stats
+
+    def _counting_compute(sessions):
+        compute_calls["n"] += 1
+        return real_compute_stats(sessions)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.compute_stats = _counting_compute
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            sessions = p.load_sessions_cached(ld, gap_seconds=90)
+            p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 1
+            # Explicit invalidation must force a re-aggregation on the next call.
+            p.invalidate_sessions_cache()
+            p.compute_stats_cached(sessions, ld, gap_seconds=90)
+            assert compute_calls["n"] == 2, "stats cache survived invalidate_sessions_cache()"
+        finally:
+            p.compute_stats = real_compute_stats
+            p.invalidate_sessions_cache()
+
+
+def test_load_sessions_cached_single_flight_collapses_concurrent_cold_misses():
+    """A COLD cache (server just started) or a moving dir signature (a live ``review`` run is
+    streaming its `.log`, so `_dir_signature` keeps shifting) made EVERY concurrent request MISS
+    the cache and launch its OWN full ~30s parse of the 434MB / 35k-file log dir — a cache
+    stampede / thundering herd. Observed live: the ThreadingHTTPServer pegged at 103% CPU with a
+    dozen concurrent 30s parses, every request timed out, and the dashboard stayed empty under
+    realistic conditions (active reviews + multiple tabs/requests each firing runs+stats+SSE).
+
+    ``load_sessions_cached`` must be SINGLE-FLIGHT per key: when a parse for a (dir, gap) key is
+    already in progress, every other caller asking for the SAME key must WAIT for that in-flight
+    result instead of launching a duplicate parse. This test spawns N threads that hit a cold
+    cache simultaneously (a Barrier starts them together) against a deliberately SLOW parse, and
+    asserts the underlying per-file parse ran EXACTLY ONCE — not N times.
+    """
+    import time as _time
+
+    from reviewlib.dashboard import parser as p
+
+    n_threads = 8
+    parse_calls = {"n": 0}
+    count_lock = threading.Lock()
+    real_parse_call_log = p.parse_call_log
+
+    def _slow_counting_parse(path):  # SLOW so the N cold misses genuinely overlap in time
+        with count_lock:
+            parse_calls["n"] += 1
+        _time.sleep(0.3)
+        return real_parse_call_log(path)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.parse_call_log = _slow_counting_parse
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+
+            barrier = threading.Barrier(n_threads)
+            results: list[list] = []
+            results_lock = threading.Lock()
+
+            def _hammer():
+                barrier.wait()  # release all threads at once onto the COLD cache
+                got = p.load_sessions_cached(ld, gap_seconds=90)
+                with results_lock:
+                    results.append(got)
+
+            threads = [threading.Thread(target=_hammer) for _ in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            assert not any(t.is_alive() for t in threads), "a hammer thread hung — possible deadlock"
+
+            # Per-file parse work counts the per-call-log parses. With 2 logs, ONE single-flight
+            # parse touches each file once -> 2. Without single-flight, N concurrent cold parses
+            # each touch both files -> 2 * n_threads. We assert exactly one parse cycle ran.
+            assert parse_calls["n"] == 2, (
+                f"cache stampede: {n_threads} concurrent cold misses each ran a full parse "
+                f"(parse_calls={parse_calls['n']}, expected 2 = one single-flight parse of 2 logs)"
+            )
+            # Every waiter got the same correct clustering (one panel session), not an empty stale.
+            assert len(results) == n_threads
+            for got in results:
+                assert [s.session_id for s in got] == [s.session_id for s in results[0]]
+            assert len(results[0]) == 1, results[0]
+        finally:
+            p.parse_call_log = real_parse_call_log
+            p.invalidate_sessions_cache()
+
+
+def test_compute_stats_cached_single_flight_collapses_concurrent_cold_misses():
+    """Same thundering-herd hazard as the session parse, on the stats aggregate: a cold/moving
+    signature made every concurrent `/api/stats` re-run the multi-second ``compute_stats`` (which
+    fans into ``compute_model_health``) in parallel, saturating CPU. ``compute_stats_cached`` must
+    be single-flight per key too: concurrent cold misses for the SAME (dir, gap) collapse to one
+    aggregation. Asserts the heavy pure ``compute_stats`` ran EXACTLY ONCE under N concurrent
+    callers, not N times.
+    """
+    import time as _time
+
+    from reviewlib.dashboard import parser as p
+
+    n_threads = 8
+    compute_calls = {"n": 0}
+    count_lock = threading.Lock()
+    real_compute_stats = p.compute_stats
+
+    def _slow_counting_compute(sessions):  # SLOW so the N cold misses overlap
+        with count_lock:
+            compute_calls["n"] += 1
+        _time.sleep(0.3)
+        return real_compute_stats(sessions)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.compute_stats = _slow_counting_compute
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+            sessions = p.load_sessions_cached(ld, gap_seconds=90)
+
+            barrier = threading.Barrier(n_threads)
+            results: list[dict] = []
+            results_lock = threading.Lock()
+
+            def _hammer():
+                barrier.wait()
+                got = p.compute_stats_cached(sessions, ld, gap_seconds=90)
+                with results_lock:
+                    results.append(got)
+
+            threads = [threading.Thread(target=_hammer) for _ in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+            assert not any(t.is_alive() for t in threads), "a hammer thread hung — possible deadlock"
+
+            assert compute_calls["n"] == 1, (
+                f"stats stampede: {n_threads} concurrent cold misses each re-aggregated "
+                f"(compute_calls={compute_calls['n']}, expected 1 single-flight aggregation)"
+            )
+            assert len(results) == n_threads
+            for got in results:
+                assert got["session_count"] == results[0]["session_count"] == 1
+        finally:
+            p.compute_stats = real_compute_stats
+            p.invalidate_sessions_cache()
+
+
+def test_prewarm_cache_warms_sessions_and_stats_so_first_load_is_not_cold():
+    """A launchd-started dashboard binds and serves instantly, but the FIRST `/api/runs` +
+    `/api/stats` still pay the cold ~30s parse of the 434MB / 35k-file log dir, during which the
+    panel shows "Loading…" (looks empty). ``server._prewarm_cache`` runs that parse in a daemon
+    thread at startup, so by the time the user opens the default-gap page both caches are warm
+    and the first request is a HIT — no re-parse, no re-aggregation.
+
+    Spying on the pure ``parse_call_log`` / ``compute_stats``: after a prewarm at the front-end
+    default gap (90s), a subsequent ``load_sessions_cached`` / ``compute_stats_cached`` on the
+    SAME dir must NOT do any further per-file parse or aggregation.
+    """
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server as srv
+
+    parse_calls = {"n": 0}
+    compute_calls = {"n": 0}
+    real_parse_call_log = p.parse_call_log
+    real_compute_stats = p.compute_stats
+
+    def _counting_parse(path):
+        parse_calls["n"] += 1
+        return real_parse_call_log(path)
+
+    def _counting_compute(sessions):
+        compute_calls["n"] += 1
+        return real_compute_stats(sessions)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.parse_call_log = _counting_parse
+        p.compute_stats = _counting_compute
+        # Point log_dir() at the temp dir so the prewarm helper warms THIS dir.
+        prev_log_dir = os.environ.get("REVIEW_LOG_DIR")
+        os.environ["REVIEW_LOG_DIR"] = str(ld)
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+
+            # Prewarm parses + aggregates exactly once at the default gap.
+            srv._prewarm_cache(p.DEFAULT_SESSION_GAP_SECONDS)
+            after_prewarm_parse = parse_calls["n"]
+            after_prewarm_compute = compute_calls["n"]
+            assert after_prewarm_parse >= 2, "prewarm did not parse the logs"
+            assert after_prewarm_compute == 1, "prewarm did not aggregate stats"
+
+            # The first real default-gap page load must be a WARM hit on both caches.
+            sessions = p.load_sessions_cached(ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS)
+            assert parse_calls["n"] == after_prewarm_parse, (
+                f"cold first load: re-parsed despite prewarm "
+                f"({parse_calls['n']} > {after_prewarm_parse})"
+            )
+            p.compute_stats_cached(sessions, ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS)
+            assert compute_calls["n"] == after_prewarm_compute, (
+                f"cold first load: re-aggregated despite prewarm "
+                f"({compute_calls['n']} > {after_prewarm_compute})"
+            )
+        finally:
+            p.parse_call_log = real_parse_call_log
+            p.compute_stats = real_compute_stats
+            if prev_log_dir is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = prev_log_dir
+            p.invalidate_sessions_cache()
+
+
+def test_prewarm_cache_swallows_errors_and_never_raises():
+    """A prewarm failure must NEVER crash or block the server — the next real request just parses
+    normally. ``_prewarm_cache`` wraps its body in a broad log-and-ignore guard, so even if the
+    parse blows up it returns silently instead of propagating."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server as srv
+
+    real_load = p.load_sessions_cached
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("synthetic parse failure")
+
+    prev_log_dir = os.environ.get("REVIEW_LOG_DIR")
+    try:
+        p.load_sessions_cached = _boom  # type: ignore[assignment]
+        # Must not raise even though the parse blows up.
+        srv._prewarm_cache(p.DEFAULT_SESSION_GAP_SECONDS)
+    finally:
+        p.load_sessions_cached = real_load
+        if prev_log_dir is None:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+        else:
+            os.environ["REVIEW_LOG_DIR"] = prev_log_dir
+        p.invalidate_sessions_cache()
+
+
 def test_panel_session_surfaces_recorded_invocations_as_prompt():
     """A non-brainstorm panel run has no topic; Session.invocations must surface the DISTINCT
     recorded argv0 lines and to_summary must expose them as `invocations`, so the Prompts panel

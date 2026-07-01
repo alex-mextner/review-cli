@@ -27,7 +27,9 @@ empty/`null` field with a note rather than faked.
 """
 from __future__ import annotations
 
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import cached_property, lru_cache
@@ -771,6 +773,203 @@ def load_sessions(log_dir_path: Path, gap_seconds: float = DEFAULT_SESSION_GAP_S
             if b:
                 brainstorms.append(b)
     return cluster_sessions(calls, brainstorms, gap_seconds)
+
+
+# ---- request-time session cache --------------------------------------------------------
+# WHY: every dashboard page load fires `/api/runs` AND `/api/stats` together (the front-end's
+# `loadAll()` Promise.all), and each handler called the PURE `load_sessions` above — a full
+# read + parse of EVERY artifact in `log_dir()`. On a real, long-lived install that dir grows
+# to tens of thousands of files / hundreds of MB; one parse is ~6s of CPU. Two-plus full
+# re-parses per page load saturated the single (threaded) server, the `/api/runs` fetch blew
+# past the browser/Tailscale-proxy timeout, never resolved, and the panel stayed stuck on
+# "Loading…" — i.e. an EMPTY dashboard. The fix is a short-lived memo of the parsed sessions,
+# invalidated by a CHEAP directory signature so live activity is never hidden behind a stale
+# cache. `load_sessions` itself stays PURE (no caching) so tests keep deterministic parses.
+_CacheKey = tuple[str, float]  # (resolved dir str, gap)
+_Signature = tuple[int, float]  # (entry-count, max-mtime), from `_dir_signature`
+
+
+class _SingleFlightCache:
+    """A signature-keyed memo that COLLAPSES concurrent cold misses for the same key to ONE
+    in-flight producer call (cache-stampede / thundering-herd prevention).
+
+    WHY this and not a plain `dict` + lock: the dashboard runs on a ThreadingHTTPServer with
+    unbounded threads. A cold cache (server just started) OR a moving dir signature (a live
+    `review` run streaming its `.log` keeps `_dir_signature` shifting) made EVERY concurrent
+    request MISS and launch its OWN full ~30s parse of the 434MB / 35k-file log dir. Observed
+    live: the server pegged at 103% CPU with a dozen concurrent 30s parses, every request timed
+    out, and the dashboard stayed empty under realistic conditions (active reviews + several
+    tabs each firing runs+stats+SSE). A memo alone is insufficient — the concurrent cold misses
+    must collapse to one parse, which is what this provides.
+
+    Contract: when a producer for a key is already running, other callers asking for the SAME key
+    WAIT for that in-flight result instead of starting a duplicate producer. A waiter accepts
+    whatever that one in-flight cycle produced even if the dir signature has since moved again —
+    staleness of a single parse-cycle is fine, and it guarantees forward progress (no re-parse
+    loop while a writer hammers the dir). `load_sessions` / `compute_stats` themselves stay pure.
+
+    Thread-safety / deadlock-freedom: one `threading.Condition` (and its single underlying lock)
+    guards `_cache` and `_in_flight`. The lock is held ONLY for the cheap bookkeeping + the
+    `wait`/`notify`; the multi-second `producer()` runs with the lock RELEASED. `Condition.wait`
+    atomically releases the lock while blocked and re-acquires on wake, so a waiter never holds
+    the lock across the producer. There is exactly one lock, taken in one order, so no lock-order
+    cycle exists. Used independently per cache instance (sessions, stats) with no nesting between
+    them — neither calls into the other while holding its lock.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        # key -> (signature, value); the freshest memoised result per key.
+        self._cache: dict[_CacheKey, tuple[_Signature, object]] = {}
+        # key -> the signature the currently-running producer is computing FOR. Presence marks
+        # the key as in-flight; absence means no producer is running for it.
+        self._in_flight: dict[_CacheKey, _Signature] = {}
+
+    def _fresh(self, key: _CacheKey, signature: _Signature) -> tuple[bool, object]:
+        """Return (hit, value) if `_cache[key]` matches `signature`, else (False, None)."""
+        entry = self._cache.get(key)
+        if entry is not None and entry[0] == signature:
+            return True, entry[1]
+        return False, None
+
+    def get_or_compute(self, key: _CacheKey, signature: _Signature, producer):
+        """Return the memoised value for `key` at `signature`, computing it via `producer()` (a
+        zero-arg callable) at most ONCE across all concurrent callers for that key.
+
+        Fast warm path: a fresh entry is returned without ever touching the producer. Cold path:
+        the first caller marks the key in-flight and runs `producer()` with the lock released;
+        concurrent callers for the same key wait and then return that producer's result.
+        """
+        with self._cond:
+            while True:
+                hit, value = self._fresh(key, signature)
+                if hit:
+                    return value
+                if key in self._in_flight:
+                    # Another thread is producing this key. Wait for it, then take whatever it
+                    # produced for this cycle (re-check below also catches the now-cached value).
+                    self._cond.wait()
+                    cached = self._cache.get(key)
+                    if cached is not None:
+                        return cached[1]
+                    # Producer left no entry (it raised) — loop to re-evaluate / take our turn.
+                    continue
+                # We are the producer for this key: claim it and break out to run the producer
+                # with the lock released.
+                self._in_flight[key] = signature
+                break
+        try:
+            value = producer()
+        except BaseException:
+            # On a producer exception, clear in-flight + wake waiters so a failed producer can't
+            # wedge the key forever (a waiter then re-takes the producer role), and re-raise.
+            with self._cond:
+                self._in_flight.pop(key, None)
+                self._cond.notify_all()
+            raise
+        # Publish the result, clear in-flight, and wake every waiter — they read the fresh entry.
+        with self._cond:
+            self._cache[key] = (signature, value)
+            self._in_flight.pop(key, None)
+            self._cond.notify_all()
+        return value
+
+    def clear(self) -> None:
+        """Drop all memoised entries. In-flight producers are left to finish (clearing the memo
+        mid-flight cannot deadlock: producers run lock-free and only re-take the lock to store +
+        notify). Does NOT block on in-flight work."""
+        with self._cond:
+            self._cache.clear()
+
+
+# One single-flight memo per derived view. Key = (resolved dir str, gap). Bounded implicitly:
+# one entry per (dir, gap) the server actually serves — a handful in practice (default gap +
+# any ?gap=). The stats memo holds the PURE `compute_stats` aggregate (which the `/api/stats`
+# handler re-ran per request — ~8.5s, fanning into `compute_model_health` — on a warm session
+# cache). Both invalidate on the SAME dir signature, so stats stay coherent with their sessions.
+_SESSIONS_CACHE = _SingleFlightCache()
+_STATS_CACHE = _SingleFlightCache()
+
+
+def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
+    """A cheap (entry-count, max-mtime) fingerprint of the log dir — STAT-ONLY, no file reads.
+
+    Computing this must be orders of magnitude cheaper than parsing (which opens + reads every
+    file), so a single `os.scandir` pass using the stat already cached on each `DirEntry` is the
+    whole budget. A new/grown/removed/touched artifact moves either the count or the max mtime,
+    so the signature changes exactly when a re-parse is warranted (e.g. a live review streaming
+    its `.log`). Missing dir -> (0, 0.0), a stable signature distinct from any populated dir."""
+    count = 0
+    max_mtime = 0.0
+    try:
+        with os.scandir(log_dir_path) as it:
+            for entry in it:
+                count += 1
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    # A racing unlink between scandir and stat: skip it; the next request's
+                    # changed count/mtime will re-sync. Don't let one vanished file crash parse.
+                    continue
+                if mtime > max_mtime:
+                    max_mtime = mtime
+    except (FileNotFoundError, NotADirectoryError):
+        return (0, 0.0)
+    return (count, max_mtime)
+
+
+def load_sessions_cached(
+    log_dir_path: Path, gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS
+) -> list[Session]:
+    """Cached wrapper over `load_sessions`, keyed on (resolved dir, gap) + a stat-only dir
+    signature. Returns the memoised parse when the dir is unchanged since the last call; re-parses
+    (and refreshes the cache) when the signature moves. Thread-safe AND single-flight: the
+    dashboard's ThreadingHTTPServer serves many threads, and concurrent cold misses for the same
+    key collapse to ONE parse (see `_SingleFlightCache`) instead of N parallel ~30s parses that
+    saturated CPU and timed every request out. The multi-second `load_sessions` runs OUTSIDE the
+    lock. Use this from request handlers; use the pure `load_sessions` where deterministic
+    re-parsing is required (tests)."""
+    key = (str(log_dir_path.resolve()), gap_seconds)
+    signature = _dir_signature(log_dir_path)
+    return _SESSIONS_CACHE.get_or_compute(
+        key, signature, lambda: load_sessions(log_dir_path, gap_seconds=gap_seconds)
+    )
+
+
+def compute_stats_cached(
+    sessions: list[Session],
+    log_dir_path: Path,
+    gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS,
+) -> dict:
+    """Cached wrapper over `compute_stats`, keyed identically to `load_sessions_cached`:
+    (resolved dir, gap) + the cheap stat-only dir signature. Returns the memoised aggregate when
+    the dir is unchanged, re-aggregating only when the signature moves — so stats invalidate
+    exactly when the sessions they summarise do. Thread-safe AND single-flight: concurrent cold
+    misses for the same key collapse to ONE aggregation (see `_SingleFlightCache`), not N parallel
+    multi-second computes; the aggregation runs OUTSIDE the lock. `sessions` must be the SAME
+    parse returned by `load_sessions_cached` for this (dir, gap) — they share the signature
+    contract.
+
+    The `/api/stats` handler layers per-request annotation counts (conscious_count /
+    feedback_count) on top of the result. To keep the cached aggregate pristine no matter how a
+    caller treats the return value, this hands back a SHALLOW COPY each call — top-level keys
+    only, microseconds, nowhere near the multi-second aggregation — so adding/overwriting a
+    top-level key can never accumulate into the shared cache. Nested values are shared (the
+    handler only adds new scalar keys, never mutates nested ones)."""
+    key = (str(log_dir_path.resolve()), gap_seconds)
+    signature = _dir_signature(log_dir_path)
+    stats = _STATS_CACHE.get_or_compute(key, signature, lambda: compute_stats(sessions))
+    return dict(stats)
+
+
+def invalidate_sessions_cache() -> None:
+    """Drop all memoised sessions AND their derived stats. Clearing both keeps the two caches
+    coherent (a stale stats aggregate must never outlive the sessions it summarised). For tests
+    and for a future explicit-refresh affordance. Each cache takes its OWN lock to clear (no
+    shared lock between them), so this can never deadlock against an in-flight producer — clearing
+    only drops memoised entries; in-flight producers finish and re-publish lock-free."""
+    _SESSIONS_CACHE.clear()
+    _STATS_CACHE.clear()
 
 
 def compute_stats(sessions: list[Session]) -> dict:
