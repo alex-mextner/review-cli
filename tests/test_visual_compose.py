@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Composability tests — `--visual` as an orthogonal flag (§3). NO real backends.
+"""Composability tests — visual verification composition (§3). NO real backends.
 
 Proves the architecture, not just the pixels:
-  * `--visual` is a COMPOSABLE flag, NOT a mode: it parses alongside any mode
-    SUBCOMMAND (brainstorm / quorum / just-ask / review);
+  * `review visual <image>` is the canonical standalone visual command, while
+    `--visual` still composes with text mode subcommands;
   * with a companion mode the image's visual context is THREADED INTO that mode's
     prompt (the composition seam) — asserted by capturing the mode call;
-  * standalone (`--visual img` with no mode, no diff) runs the verdict pipeline and
-    returns the mapped exit code;
+  * standalone (`review visual img` with no diff) runs the verdict pipeline and returns
+    the mapped exit code;
   * cvGate runs in the companion path too (a broken render surfaces in the context).
 
 The mode functions are monkeypatched WHERE THEY ARE DEFINED (the per-mode modules) so
@@ -61,7 +61,7 @@ def test_visual_composes_with_brainstorm_subcommand():
     old = _brainstorm_mod.mode_brainstorm
     _brainstorm_mod.mode_brainstorm = fake_brainstorm
     try:
-        rc = cli.main(["brainstorm", "should we ship X", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["brainstorm", "should we ship X", "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _brainstorm_mod.mode_brainstorm = old
     assert rc == 0
@@ -80,7 +80,7 @@ def test_visual_threads_into_quorum():
     old = _quorum_mod.mode_quorum
     _quorum_mod.mode_quorum = fake_quorum
     try:
-        rc = cli.main(["quorum", "is this styled?", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["quorum", "is this styled?", "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _quorum_mod.mode_quorum = old
     assert rc == 0
@@ -101,7 +101,7 @@ def test_companion_cvgate_surfaces_passthrough_outcome():
     old = _just_ask_mod.mode_just_ask
     _just_ask_mod.mode_just_ask = fake_just_ask
     try:
-        rc = cli.main(["just-ask", "describe", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["just-ask", "describe", "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _just_ask_mod.mode_just_ask = old
     assert rc == 0
@@ -120,17 +120,49 @@ def _clean_repo() -> str:
     return d
 
 
-def test_standalone_runs_pipeline_and_maps_exit():
-    """`review diff --visual` with no diff runs the standalone verdict pipeline (--visual
-    rides the diff mode; an absent diff routes to standalone). A blank image with --no-ai
-    --strict must exit 10 (rollback)."""
-    clean = _clean_repo()
-    rc = cli.main(["diff", "--visual", _blank(), "--no-ai", "--strict", "-C", clean])
+def test_visual_subcommand_standalone_runs_pipeline_and_maps_exit():
+    """`review visual <image>` is the canonical standalone verdict pipeline. A blank
+    image with --no-ai --strict must exit 10 (rollback)."""
+    rc = cli.main(["visual", _blank(), "--no-ai", "--strict", "-C", str(REPO_ROOT)])
     assert rc == 10, f"blank standalone --strict must exit 10, got {rc}"
 
     # A styled pass-through under --no-ai is human_review → non-strict exit 0.
-    rc2 = cli.main(["diff", "--visual", _styled(), "--no-ai", "-C", clean])
+    rc2 = cli.main(["visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     assert rc2 == 0
+
+
+def test_visual_subcommand_with_diff_threads_visual_into_review():
+    """`review visual <image> --diff` includes the working-tree diff and runs the normal
+    review companion with the screenshot folded into the prompt."""
+    captured = {}
+
+    def fake_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
+        captured["prompt"] = prompt
+        captured["diff"] = diff
+        captured["board"] = board
+        return 0
+
+    old = _review_mod.mode_review
+    old_stdin = cli._read_stdin_if_piped
+    old_git = cli._git_diff
+    old_is_repo = cli._is_git_repo
+    old_cfg = cli.load_config
+    _review_mod.mode_review = fake_review
+    cli._read_stdin_if_piped = lambda: None
+    cli._git_diff = lambda cwd, staged: "diff --git a/x b/x\n+change\n"
+    cli._is_git_repo = lambda cwd: True
+    cli.load_config = lambda: {"models": ["codex"]}
+    try:
+        rc = cli.main(["visual", _styled(), "--diff", "--no-ai", "-C", str(REPO_ROOT)])
+    finally:
+        _review_mod.mode_review = old
+        cli._read_stdin_if_piped = old_stdin
+        cli._git_diff = old_git
+        cli._is_git_repo = old_is_repo
+        cli.load_config = old_cfg
+    assert rc == 0
+    assert "ATTACHED RENDER" in captured["prompt"], "visual companion must carry visual context"
+    assert "+change" in captured["diff"]
 
 
 def test_companion_rollback_blocks_the_mode():
@@ -190,7 +222,7 @@ def test_default_review_with_diff_threads_visual():
     _review_mod.mode_review = fake_review
     cli._read_stdin_if_piped = lambda: "diff --git a/x b/x\n+change\n"
     try:
-        rc = cli.main(["diff", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["diff", "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _review_mod.mode_review = old
         cli._read_stdin_if_piped = old_stdin

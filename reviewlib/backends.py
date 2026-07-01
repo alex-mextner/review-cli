@@ -77,6 +77,22 @@ def _payload(prompt: str, diff: str = "") -> str:
     return out
 
 
+def review_with_images(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    images: tuple[Path, ...] = (),
+) -> ReviewResult:
+    """Run a backend with raw image attachments when that backend safely supports them.
+
+    Unsupported text backends still receive the grounded visual note in the prompt; the
+    raw image path is an additive transport for capable backends, not a new hard
+    dependency for every panel seat.
+    """
+    backend = resolve_backend(model)
+    if images and backend is review_claude:
+        return review_claude_cli_with_images(model, prompt, diff, cwd, timeout, round_no, images)
+    return backend(model, prompt, diff, cwd, timeout, round_no)
+
+
 def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     codex_model = model.split(":", 1)[1] if ":" in model else None
     argv = [_which("codex"), "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
@@ -756,6 +772,8 @@ def _openai_compatible_request(
     headers = {str(k): str(v) for k, v in (extra_headers or {}).items() if str(k).lower() not in _reserved}
     headers["Content-Type"] = "application/json"
     headers["Authorization"] = f"Bearer {key}"
+    headers.setdefault("Accept", "application/json")
+    headers.setdefault("User-Agent", "review-cli/0.1")
     req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -1030,6 +1048,12 @@ _CLAUDE_REVIEW_SYSTEM = (
     "You are running inside review-cli in a headless read-only diff review. "
     "Do not use tools, inspect files, ask for permissions, or plan tool work. "
     "Answer only from the prompt and diff supplied by the user."
+)
+_CLAUDE_IMAGE_REVIEW_SYSTEM = (
+    "You are running inside review-cli in a headless read-only visual diff review. "
+    "Use the Read tool only for image file paths explicitly listed in the RAW VISUAL "
+    "ATTACHMENT section. Do not inspect the source repository or any other local files. "
+    "Answer from the prompt, diff, and those attached images only."
 )
 
 
@@ -1368,27 +1392,36 @@ def _claude_cli_binary() -> tuple[str, bool]:
     return _which("claude-p"), False  # raises a clear error if neither is present
 
 
-def _claude_cli_argv(binary: str, direct: bool, model: str | None, cwd: Path, timeout: int) -> list[str]:
+def _claude_cli_argv(
+    binary: str, direct: bool, model: str | None, cwd: Path, timeout: int,
+    *, image_dir: Path | None = None,
+) -> list[str]:
     """Build the argv for the resolved claude CLI binary.
 
     Both forms run headless, read the prompt from STDIN (never `-p <payload>` argv: a
     brainstorm round embeds the whole prior transcript and a diff can be huge, which as
     a command-line argument blows past ARG_MAX → execve E2BIG). Read-only is enforced by
-    an EMPTY tool allowlist (`--tools ""` = all built-in tools off) — strictly stronger and
-    more future-proof than a denylist, and it avoids the real `claude` emitting
-    "<tool> matches no known tool" warnings for claude-p-only tool names."""
+    an EMPTY tool allowlist (`--tools ""` = all built-in tools off) unless a visual
+    panel job needs scoped image reads, in which case direct `claude` gets `--tools Read`
+    plus `--add-dir <staged-image-dir>`. That keeps normal text review locked down while
+    allowing the explicit screenshot attachment path to read only its temp image files."""
     if direct:
         # `claude --print --output-format text` is the genuine print mode. cwd is the
         # Popen cwd (claude has no --cwd); there is no --timeout-sec (review-cli's own
-        # _run_streamed timeout governs the call). `--tools ""` disables every tool, so no
+        # _run_streamed timeout governs the call). Normal text review uses `--tools ""`;
+        # visual panel jobs use `--tools Read` scoped to the temp image dir. No
         # --disallowedTools denylist is needed (and its claude-p vocabulary, e.g.
         # MultiEdit/SlashCommand, isn't a real `claude` tool name — review-cli#76).
+        tools = "Read" if image_dir is not None else ""
+        system_prompt = _CLAUDE_IMAGE_REVIEW_SYSTEM if image_dir is not None else _CLAUDE_REVIEW_SYSTEM
         argv = [
             binary, "--print", "--output-format", "text",
-            "--permission-mode", "dontAsk", "--tools", "",
+            "--permission-mode", "dontAsk", "--tools", tools,
             "--strict-mcp-config", "--disable-slash-commands", "--safe-mode",
-            "--append-system-prompt", _CLAUDE_REVIEW_SYSTEM,
+            "--append-system-prompt", system_prompt,
         ]
+        if image_dir is not None:
+            argv += ["--add-dir", str(image_dir)]
         if model:
             argv += ["--model", model]
         return argv
@@ -1404,6 +1437,35 @@ def _claude_cli_argv(binary: str, direct: bool, model: str | None, cwd: Path, ti
         argv += ["--model", model]
     argv += ["-p"]
     return argv
+
+
+def _stage_panel_images(images: tuple[Path, ...], tmp: Path) -> list[Path]:
+    paths: list[Path] = []
+    for idx, image in enumerate(images):
+        src = Path(image)
+        if not src.is_file():
+            continue
+        suffix = src.suffix if src.suffix else ".png"
+        dst = tmp / f"{idx}-panel-image{suffix}"
+        try:
+            dst.write_bytes(src.read_bytes())
+        except OSError:
+            continue
+        paths.append(dst)
+    return paths
+
+
+def _prompt_with_panel_images(prompt: str, images: list[Path]) -> str:
+    if not images:
+        return prompt
+    refs = "\n".join(f"- @{path}" for path in images)
+    return (
+        f"{prompt}\n\n"
+        "=== RAW VISUAL ATTACHMENT ===\n"
+        "Inspect these screenshot image files directly before answering; do not rely only "
+        "on any textual visual summary already in the prompt.\n"
+        f"{refs}"
+    )
 
 
 def _claude_cli_env() -> dict[str, str]:
@@ -1449,6 +1511,42 @@ def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: in
             "--disable-slash-commands --safe-mode --append-system-prompt <read-only-review> "
             "--disallowedTools " + " ".join(_CLAUDE_DISALLOWED_TOOLS) + " -p  (prompt via stdin)"
         )
+    return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=stdout, stderr=stderr)
+
+
+def review_claude_cli_with_images(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    images: tuple[Path, ...] = (),
+) -> ReviewResult:
+    claude_model = model.split(":", 1)[1] if ":" in model else None
+    if os.environ.get(_mode_env_var("claude"), "").strip().lower() == "api":
+        return review_claude(model, prompt, diff, cwd, timeout, round_no)
+    binary = _which_optional("claude")
+    if not binary:
+        return review_claude(model, prompt, diff, cwd, timeout, round_no)
+    with tempfile.TemporaryDirectory(prefix="review-cli-claude-images-") as tmp_raw:
+        tmp = Path(tmp_raw)
+        staged = _stage_panel_images(images, tmp)
+        if not staged:
+            return review_claude_cli(model, prompt, diff, cwd, timeout, round_no)
+        _ensure_workspace_trusted(tmp)
+        argv = _claude_cli_argv(binary, True, claude_model, tmp, timeout, image_dir=tmp)
+        proc = _run_streamed(
+            argv, cwd=tmp, input_text=_payload(_prompt_with_panel_images(prompt, staged), diff),
+            env=_claude_cli_env(), timeout=timeout + 30, backend="claude", round_no=round_no,
+            announce=_ANNOUNCE_LOGS,
+        )
+    # The TemporaryDirectory context deleted tmp; remove the trust entry that
+    # _ensure_workspace_trusted seeded so dead /tmp/review-cli-claude-images-* paths
+    # don't accumulate in ~/.claude.json. (P2 fix — review-cli#98 thread.)
+    _remove_workspace_trust(tmp)
+    stdout = strip_control_sequences(proc.stdout)
+    stderr = strip_control_sequences(proc.stderr)
+    command = (
+        "claude --print --output-format text --permission-mode dontAsk --tools Read "
+        "--strict-mcp-config --disable-slash-commands --safe-mode --add-dir <image-dir> "
+        "--append-system-prompt <read-only-review>  (prompt via stdin, image @refs)"
+    )
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=stdout, stderr=stderr)
 
 

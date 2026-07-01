@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -24,6 +26,48 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib.cli import _extract_output_path, main  # noqa: E402
+
+
+class _SkipTest(Exception):
+    """A host prerequisite is absent for a standalone test run."""
+
+
+_GIT_UNAVAILABLE_REASON: str | None | bool = None
+
+
+def _git_unavailable_reason() -> str | None:
+    global _GIT_UNAVAILABLE_REASON
+    if _GIT_UNAVAILABLE_REASON is not None:
+        return _GIT_UNAVAILABLE_REASON if isinstance(_GIT_UNAVAILABLE_REASON, str) else None
+    try:
+        version = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=15)
+        if version.returncode != 0:
+            reason = (version.stdout + version.stderr).strip() or f"`git --version` exited {version.returncode}"
+            _GIT_UNAVAILABLE_REASON = reason
+            return reason
+        with tempfile.TemporaryDirectory() as d:
+            init = subprocess.run(["git", "init", "-q"], cwd=d, capture_output=True, text=True, timeout=30)
+        if init.returncode != 0:
+            reason = (init.stdout + init.stderr).strip() or f"`git init` exited {init.returncode}"
+            _GIT_UNAVAILABLE_REASON = reason
+            return reason
+    except (OSError, subprocess.SubprocessError) as exc:
+        _GIT_UNAVAILABLE_REASON = str(exc)
+        return str(exc)
+    _GIT_UNAVAILABLE_REASON = False
+    return None
+
+
+def _require_git() -> None:
+    reason = _git_unavailable_reason()
+    if not reason:
+        return
+    msg = f"git-dependent output-file test skipped: {reason}"
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        import pytest  # noqa: PLC0415
+
+        pytest.skip(msg)
+    raise _SkipTest(msg)
 
 
 def _run_main(argv: list[str]) -> tuple[int, str]:
@@ -193,8 +237,7 @@ def test_file_written_even_on_nonzero_review_exit():
     # A review with no diff exits non-zero ("No diff to review."), but the file must
     # STILL be written (a caller that asked for `-o` always gets a file). We force a
     # clean tree by pointing -C at an empty git repo.
-    import subprocess
-
+    _require_git()
     with tempfile.TemporaryDirectory() as d:
         repo = Path(d) / "repo"
         repo.mkdir()
@@ -211,10 +254,9 @@ def test_real_review_result_text_lands_in_file():
     # RESULT into the file too. We mock the backend so no model is called, give the repo
     # a staged diff, and assert the reviewer's text is BOTH printed and written. This
     # guards the contract "write the review RESULT to a file", not just trivial output.
-    import subprocess
-
     from reviewlib import backends  # noqa: PLC0415
 
+    _require_git()
     with tempfile.TemporaryDirectory() as d:
         repo = Path(d) / "repo"
         repo.mkdir()
@@ -553,15 +595,21 @@ def test_help_documents_output_flag():
 
 if __name__ == "__main__":
     failures = 0
+    skipped = 0
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             try:
                 fn()
                 print(f"PASS {name}")
+            except _SkipTest as exc:
+                skipped += 1
+                print(f"SKIP {name}: {exc}")
             except AssertionError as exc:
                 failures += 1
                 print(f"FAIL {name}: {exc}")
             except Exception as exc:  # noqa: BLE001
                 failures += 1
                 print(f"ERROR {name}: {type(exc).__name__}: {exc}")
+    if skipped:
+        print(f"SKIP {skipped} checks")
     sys.exit(1 if failures else 0)

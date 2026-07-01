@@ -62,6 +62,7 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
         "just-ask": _just_ask_mod.mode_just_ask,
         "quorum": _quorum_mod.mode_quorum,
         "git": cli._git_diff,
+        "is_git_repo": cli._is_git_repo,
         "cfg": cli.load_config,
         "stdin": cli._read_stdin_if_piped,
     }
@@ -70,6 +71,7 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
     _just_ask_mod.mode_just_ask = _mk("just-ask")
     _quorum_mod.mode_quorum = _mk("quorum")
     cli._git_diff = lambda cwd, staged: diff
+    cli._is_git_repo = lambda cwd: True
     cli.load_config = lambda: {"models": ["codex"]}  # explicit models -> no real board
     cli._read_stdin_if_piped = lambda: stdin
     old_env = os.environ.get("GEMINI_ENV_FILE")
@@ -91,6 +93,7 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
         _just_ask_mod.mode_just_ask = saved["just-ask"]
         _quorum_mod.mode_quorum = saved["quorum"]
         cli._git_diff = saved["git"]
+        cli._is_git_repo = saved["is_git_repo"]
         cli.load_config = saved["cfg"]
         cli._read_stdin_if_piped = saved["stdin"]
         if old_env is None:
@@ -169,13 +172,14 @@ def test_staged_without_subcommand_points_at_diff():
     assert "unrecognized arguments" not in cap["stderr"], cap["stderr"]
 
 
-def test_visual_without_subcommand_points_at_diff():
-    """`review --visual shot.png` (no verb) likewise points at `review diff --visual`, not
-    an opaque argparse error — the visual flags are subcommand-scoped now."""
+def test_visual_without_subcommand_points_at_visual():
+    """`review --visual shot.png` (no verb) points at the canonical `review visual` form,
+    not an opaque argparse error."""
     cap = _run(["--visual", "shot.png", "-C", str(REPO_ROOT)])
     assert cap["mode"] is None, cap
     assert cap["rc"] == 2, cap
-    assert "review diff" in cap["stderr"], cap["stderr"]
+    assert "review visual" in cap["stderr"], cap["stderr"]
+    assert "review diff --visual" not in cap["stderr"], cap["stderr"]
 
 
 def test_piped_diff_without_subcommand_fails_loud_not_silent_noop():
@@ -216,6 +220,21 @@ def test_meta_flag_without_subcommand_works():
     assert "codex" in out.getvalue(), out.getvalue()
 
 
+def test_visual_list_defaults_works_without_image():
+    out = io.StringIO()
+    saved_cfg = cli.load_config
+    cli.load_config = lambda: {}
+    try:
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = cli.main(["visual", "--list-defaults"])
+    finally:
+        cli.load_config = saved_cfg
+    assert rc == 0
+    text = out.getvalue()
+    assert "claude:claude-opus-4-8" in text, text
+    assert "oc:zai/glm-4.5v" in text, text
+
+
 # --- brainstorm composes with --diff grounding. --------------------------------------
 def test_brainstorm_with_diff_flag_grounds_on_working_tree_diff():
     """`review brainstorm "…" --diff` (or --staged) picks up the working-tree diff as
@@ -229,10 +248,12 @@ def test_brainstorm_with_diff_flag_grounds_on_working_tree_diff():
 
     saved = _brainstorm_mod.mode_brainstorm
     saved_git = cli._git_diff
+    saved_is_git_repo = cli._is_git_repo
     saved_cfg = cli.load_config
     saved_stdin = cli._read_stdin_if_piped
     _brainstorm_mod.mode_brainstorm = _fake
     cli._git_diff = lambda cwd, staged: grounding
+    cli._is_git_repo = lambda cwd: True
     cli.load_config = lambda: {"models": ["codex"]}
     cli._read_stdin_if_piped = lambda: None
     try:
@@ -241,6 +262,7 @@ def test_brainstorm_with_diff_flag_grounds_on_working_tree_diff():
     finally:
         _brainstorm_mod.mode_brainstorm = saved
         cli._git_diff = saved_git
+        cli._is_git_repo = saved_is_git_repo
         cli.load_config = saved_cfg
         cli._read_stdin_if_piped = saved_stdin
     assert rc == 0
@@ -261,10 +283,12 @@ def test_just_ask_does_not_auto_grab_diff_but_diff_flag_opts_in():
 
         saved = _just_ask_mod.mode_just_ask
         saved_git = cli._git_diff
+        saved_is_git_repo = cli._is_git_repo
         saved_cfg = cli.load_config
         saved_stdin = cli._read_stdin_if_piped
         _just_ask_mod.mode_just_ask = _fake
         cli._git_diff = lambda cwd, staged: grounding
+        cli._is_git_repo = lambda cwd: True
         cli.load_config = lambda: {"models": ["codex"]}
         cli._read_stdin_if_piped = lambda: None
         try:
@@ -273,6 +297,7 @@ def test_just_ask_does_not_auto_grab_diff_but_diff_flag_opts_in():
         finally:
             _just_ask_mod.mode_just_ask = saved
             cli._git_diff = saved_git
+            cli._is_git_repo = saved_is_git_repo
             cli.load_config = saved_cfg
             cli._read_stdin_if_piped = saved_stdin
         return rc, captured.get("diff")
@@ -408,7 +433,7 @@ def test_removed_flag_after_double_dash_is_not_intercepted():
 # --- The mode registry contract. -----------------------------------------------------
 def test_registry_known_subcommands():
     subs = _registry.known_subcommands()
-    for verb in ("diff", "brainstorm", "just-ask", "quorum", "ask"):
+    for verb in ("diff", "visual", "brainstorm", "just-ask", "quorum", "ask"):
         assert verb in subs, (verb, subs)
     # The old stuttering verb is GONE from the subcommand set (it is a removed verb now).
     assert "review" not in subs, subs
@@ -418,6 +443,7 @@ def test_registry_get_mode_resolves_subcommand_and_alias():
     assert _registry.get_mode("brainstorm").name == "brainstorm"
     assert _registry.get_mode("ask").name == "just-ask"   # alias
     assert _registry.get_mode("diff").name == "review"    # diff verb -> the review mode
+    assert _registry.get_mode("visual").name == "visual"  # canonical standalone visual
     assert _registry.get_mode("review") is None           # the old verb no longer resolves
     assert _registry.get_mode("not-a-mode") is None
 
@@ -451,6 +477,7 @@ def test_review_mode_declares_require_diff_policy():
     assert _registry.get_mode("just-ask").diff_policy == "none"
     assert _registry.get_mode("quorum").diff_policy == "none"
     assert _registry.get_mode("brainstorm").diff_policy == "optional"
+    assert _registry.get_mode("visual").diff_policy == "optional"
 
 
 def test_diff_mode_empty_diff_returns_nonzero_no_diff_to_review():
@@ -459,9 +486,11 @@ def test_diff_mode_empty_diff_returns_nonzero_no_diff_to_review():
     declared."""
     saved_cfg = cli.load_config
     saved_git = cli._git_diff
+    saved_is_git_repo = cli._is_git_repo
     saved_stdin = cli._read_stdin_if_piped
     cli.load_config = lambda: {"models": ["codex"]}  # explicit models -> flat path, no board
     cli._git_diff = lambda cwd, staged: ""             # empty diff
+    cli._is_git_repo = lambda cwd: True
     cli._read_stdin_if_piped = lambda: None
     try:
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
@@ -469,6 +498,7 @@ def test_diff_mode_empty_diff_returns_nonzero_no_diff_to_review():
     finally:
         cli.load_config = saved_cfg
         cli._git_diff = saved_git
+        cli._is_git_repo = saved_is_git_repo
         cli._read_stdin_if_piped = saved_stdin
     assert rc == 1, rc
 

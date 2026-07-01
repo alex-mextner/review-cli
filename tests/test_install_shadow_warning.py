@@ -70,6 +70,37 @@ def _venv_python(venv_dir: Path) -> Path:
     return py
 
 
+class _SkipTest(Exception):
+    """Standalone-harness skip for hosts that cannot create a runnable temp venv."""
+
+
+def _skip_test(reason: str) -> None:
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        try:
+            import pytest
+
+            pytest.skip(reason)
+        except ImportError:
+            pass
+    raise _SkipTest(reason)
+
+
+def _create_probe_venv(venv_dir: Path) -> Path:
+    venv.create(str(venv_dir), with_pip=False, symlinks=(os.name != "nt"))
+    py = _venv_python(venv_dir)
+    probe = subprocess.run(
+        [str(py), "-I", "-c", "import sys"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        _skip_test(
+            "host Python could not create a runnable temp venv for shadow-warning probes; "
+            f"stdout={probe.stdout!r} stderr={probe.stderr!r}"
+        )
+    return py
+
+
 def _interp_that_imports_reviewlib(sandbox: Path):
     """An interpreter whose `import reviewlib` SUCCEEDS from its OWN site-packages.
 
@@ -85,8 +116,7 @@ def _interp_that_imports_reviewlib(sandbox: Path):
     broken setup fails loudly HERE, not as a confusing downstream mislabel.
     """
     venv_dir = sandbox / "reviewlib-venv"
-    venv.create(str(venv_dir), with_pip=False)
-    py = _venv_python(venv_dir)
+    py = _create_probe_venv(venv_dir)
     site = subprocess.run(
         [str(py), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
         capture_output=True,
@@ -121,8 +151,7 @@ def _interp_without_reviewlib(sandbox: Path):
     the guard to "a venv that could never import reviewlib anyway".
     """
     venv_dir = sandbox / "noreviewlib-venv"
-    venv.create(str(venv_dir), with_pip=False)
-    py = str(_venv_python(venv_dir))
+    py = str(_create_probe_venv(venv_dir))
     with_pp = subprocess.run(
         [py, "-c", "import reviewlib"],
         env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
@@ -356,6 +385,8 @@ if __name__ == "__main__":
             except AssertionError as exc:
                 failures += 1
                 print(f"FAIL {name}: {exc}")
+            except _SkipTest as exc:
+                print(f"SKIP {name}: {exc}")
             except Exception as exc:  # noqa: BLE001
                 failures += 1
                 print(f"ERROR {name}: {type(exc).__name__}: {exc}")

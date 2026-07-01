@@ -1,4 +1,4 @@
-# Architecture spec — `review --visual` (image-only visual verification)
+# Architecture spec — `review visual` (image-only visual verification)
 
 Status: **spec only — do NOT build from this until CTO sign-off on the open decisions (§11).**
 Audience: agents and the CTO. This document describes what the feature WILL be; nothing here
@@ -19,7 +19,7 @@ in-product / e2e consumer and stays where it is.
 
 The `review` tool described here is **image-only**:
 
-> `review diff --visual <image>` takes an **already-captured image** and judges it. There is **no
+> `review visual <image>` takes an **already-captured image** and judges it. There is **no
 > DOM, no page, no capture**. The pipeline is pure: pixels in → verdict out. Every check —
 > including "is this render unstyled/broken" — is performed from the **image** (pixel-level CV
 > heuristics) and from **AI-with-vision** looking at the image, never from reading a stylesheet.
@@ -36,7 +36,7 @@ v2 brainstorm (`bs-visual-verify-v2.md`) talks about a `capture` module, that mo
 
 **Goals**
 
-1. `review diff --visual <image>` — a **composable flag** that (a) feeds the image(s) as
+1. `review visual <image>` — a standalone visual command, plus `--visual` as a composable flag that (a) feeds the image(s) as
    multimodal CONTEXT into whatever mode runs, and (b) activates the visual-verification
    modules. On its own (no companion mode) it runs the pure verdict pipeline on a single
    image (or before/after pair) and emits a verdict, both human-readable and `--json`;
@@ -54,7 +54,7 @@ v2 brainstorm (`bs-visual-verify-v2.md`) talks about a `capture` module, that mo
 4. A **per-project module contribution** mechanism: a project (e.g. HyperIDE / hyper-ext) can
    ship a module that `review` discovers, trusts, and loads — e.g. a **selection-highlight
    checker**.
-5. A **`tg --photo` pre-send hook** that runs `review --visual` on the outgoing PNG and blocks
+5. A **`tg --photo` pre-send hook** that runs `review visual` on the outgoing PNG and blocks
    an unstyled / broken render before it reaches Telegram — replacing the documented, often-
    violated "review screenshots before sending" rule with an enforced mechanism.
 6. **Decompose** `bin/review` (Python, ~1080 lines) and `tg` (Bun/TS, ~1692 lines) into a
@@ -72,27 +72,25 @@ v2 brainstorm (`bs-visual-verify-v2.md`) talks about a `capture` module, that mo
 
 ---
 
-## 2. The `review --visual` command
+## 2. The `review visual` command
 
-`--visual` is an **orthogonal, composable flag** in the existing argparse layer in
-`bin/review:main()` — **not** a mode and **not** in the mutually-exclusive mode group with
-`--just-ask` / `--quorum` / `--brainstorm`. It takes one image argument (plus optional flags)
-and *combines* with whatever mode runs: it adds the image(s) as multimodal context to that
-mode's model call and activates the visual-verification modules. With no companion mode it
-degenerates to pure visual verification (the verdict pipeline). See §2.1 for the composition
-matrix.
+`review visual <image>` is the canonical standalone visual command. The legacy-shaped
+`--visual` flag remains composable on text modes: it adds the image(s) as multimodal context
+to that mode's model call and activates the visual-verification modules. `review visual
+<image> --diff` is the explicit spelling for adding the working-tree diff to the standalone
+visual path. See §2.1 for the composition matrix.
 
 ```
-review diff --visual <after.png>                        # visual-only: judge a single render
-review diff --visual <after.png> --before <before.png>  # before/after pair (diff-aware judgement)
-review diff --visual <after.png> --intent "style edit: bump heading size"   # edit intent → contract
-review diff --visual <after.png> --expect style          # expectation kind (zero-diff|move|resize|
+review visual <after.png>                        # visual-only: judge a single render
+review visual <after.png> --before <before.png>  # before/after pair (diff-aware judgement)
+review visual <after.png> --intent "style edit: bump heading size"   # edit intent → contract
+review visual <after.png> --expect style          # expectation kind (zero-diff|move|resize|
                                                      #   style|wrap|insert|delete|text)
-review diff --visual <after.png> --check selection        # force-activate a named module (repeatable)
-review diff --visual <after.png> --json                   # machine verdict (used by the tg hook)
-review diff --visual <after.png> --strict                 # exit 10 on a blocking verdict (gate use)
-review diff --visual <after.png> --no-ai                  # CV-only (cvGate); skip the vision model
-review diff --visual <after.png> -m fable5                # pick the vision backend(s)
+review visual <after.png> --check selection        # force-activate a named module (repeatable)
+review visual <after.png> --json                   # machine verdict (used by the tg hook)
+review visual <after.png> --strict                 # exit 10 on a blocking verdict (gate use)
+review visual <after.png> --no-ai                  # CV-only (cvGate); skip the vision model
+review visual <after.png> -m fable5                # pick the vision backend(s)
 ```
 
 **Flags (additions to the existing `argparse`)**
@@ -126,10 +124,10 @@ mode is running. So one flag drives four combinations:
 
 | Invocation | What runs |
 |------------|-----------|
-| `review diff --visual shot.png` *(no diff, no other mode)* | **Visual-only (degenerate case).** No companion mode → the pure verdict pipeline of §3 (contract → cvGate → [optional local pre-classifier, §3.1a] → callAIVision → policyEngine). This is just the flag with no mode attached. |
+| `review visual shot.png` | **Visual-only.** The pure verdict pipeline of §3 (contract → cvGate → [optional local pre-classifier, §3.1a] → callAIVision → policyEngine). |
 | `review brainstorm "…" --visual shot.png` | The **brainstorm** panel runs, but each persona's model call is made through `callAIVision` with the image attached, so the rotating experts *see* the screenshot and reason about it alongside the prompt. The visual modules' `vision_questions` are folded into the same multimodal call. |
 | `review quorum "…" --visual shot.png` | The **quorum** runs with the image as shared multimodal context for every voting model; the verdict-relevant visual questions ride along in the same call. |
-| `review diff --visual shot.png` *(with a diff present)* | The **default diff-review** runs with the image as extra multimodal context (e.g. "here is the rendered result of this diff"). |
+| `review visual shot.png --diff` | The **default diff-review** runs with the image as extra multimodal context (e.g. "here is the rendered result of this diff"). |
 
 The rule throughout: when a companion mode is present, the image **and** the visual modules'
 questions are merged into **that mode's** multimodal model call — there is **no separate,
@@ -163,7 +161,7 @@ is `cvGate → visionClient → policyEngine` exactly as before. It is never the
 AI-vision remains the **primary** judge (CTO override).
 
 **When this pipeline runs.** The pipeline below runs **whenever `--visual` is present**. In the
-**mode-less** case (`review diff --visual shot.png`, §2.1) it runs as its own standalone pass and
+standalone case (`review visual shot.png`, §2.1) it runs as its own standalone pass and
 produces the verdict. When a **companion mode** (`--brainstorm` / `--quorum` / the default
 diff-review) is *also* present, the pipeline does **not** fire as a separate isolated run;
 instead its multimodal delivery (`callAIVision`, §3.2) and the active modules' contributions
@@ -175,7 +173,7 @@ mode's models are even invoked). The standalone stages are described below; read
 mode-less pass, and the per-stage machinery reused by a companion mode."
 
 ```
-review diff --visual <image> [--before <b>] [--intent …] [--expect …]
+review visual <image> [--before <b>] [--intent …] [--expect …]
   └─ contract     derive a VisualExpectation from --expect + --intent + (CV diff if --before).
   └─ 1. cvGate    pixel-level FAST PRE-FILTER on the image(s):
                     • auto-REJECT the 100%-unambiguously-broken set (skip the vision model);
@@ -282,7 +280,7 @@ There is no hard dependency: a missing/corrupt model logs once and degrades to p
 never blocks or errors a verification. (Symmetry with the rest of the design: optional stages
 fail *open* toward the AI-vision authority, never toward a silent CV-only keep.)
 
-**Why it matters — the `tg --photo` cost-control tier.** The hook of §7 runs `review diff --visual`
+**Why it matters — the `tg --photo` cost-control tier.** The hook of §7 runs `review visual`
 on **every** outgoing photo. Without this tier, *every* `tg --photo` send that clears cvGate
 hits a **paid** AI-vision call — the dominant cost and latency of the always-on hook. The
 pre-classifier is what makes the hook economically viable on the hot path: the overwhelming
@@ -566,11 +564,11 @@ A project declares its review modules in a **manifest at a well-known path insid
 }
 ```
 
-`review diff --visual … --project <dir>` (default `--cwd`) reads `<dir>/.review/visual-modules.json`,
+`review visual … --project <dir>` (default `--cwd`) reads `<dir>/.review/visual-modules.json`,
 resolves each `entry` relative to the project, and registers the module. `activates_on` is a
 list of tags; a module auto-activates when any tag is in `ctx.requested_checks` (from `--check`)
 or matches the intent/expectation — so `--check selection` (or an intent mentioning selection)
-turns the HyperIDE module on, and a plain `review diff --visual app.png` leaves it off.
+turns the HyperIDE module on, and a plain `review visual app.png` leaves it off.
 
 ### 6.2 Registration mechanism
 
@@ -623,7 +621,7 @@ Built-in modules (§4) are trusted implicitly (they ship in review's own source)
 
 The hook turns the often-violated "Always Read+review screenshots before TG send" rule (see the
 many `feedback_*` memories) into an **enforced mechanism**: before `tg` uploads a photo, it runs
-`review diff --visual <png> --json --strict` and **blocks** an unstyled/broken render.
+`review visual <png> --json --strict` and **blocks** an unstyled/broken render.
 
 ### 7.1 The universal hook framework (from `/tmp/detector-cli/design.md`)
 
@@ -656,7 +654,7 @@ many `feedback_*` memories) into an **enforced mechanism**: before `tg` uploads 
   never blocks a send unless explicitly tightened).
 - **Block signalling = exit code 10 + JSON message** (the §11-D1 resolution: exit-10 is the
   canonical, un-corruptible block; stdout JSON carries the human message and future fields).
-  This is why `review diff --visual --strict` exits 10.
+  This is why `review visual --strict` exits 10.
 - **TOFU-trust + quarantine** for descriptors (`{cmd_sha256, point, on_error}` pinned in
   `trust.json`), and an **append-only `audit.jsonl`** — in a fail-open system the only thing
   distinguishing "honestly allowed" from "silently bypassed" is the log.
@@ -677,7 +675,7 @@ subcommand — plain `tg "msg"` never touches the hook path.
 
 `~/.agents/skills/review/hooks/pre_send_photo.py` reads the stdin JSON
 (`{tool:"tg", point:"pre-send-photo", args:{image_path, caption, chat_id}}`), runs
-`review diff --visual <image_path> --json --strict` (default modules: style-presence, blank-frame,
+`review visual <image_path> --json --strict` (default modules: style-presence, blank-frame,
 error-overlay; `--check selection` is NOT added by default — the hook judges generic
 "is this a real styled render"), and maps the verdict:
 
@@ -832,7 +830,7 @@ lands when the hook (Stage 5) is on a paid AI-vision call per send.
 **Stage 3 — per-project modules.** `registry.py` discovery (`.review/visual-modules.json`),
 TOFU trust (`trust-module`, `register-module`), audit. Ship HyperIDE's `selection-highlight`
 module *in hyper-canvas-draft* (`.review/modules/selection_highlight.py`, the `frames-check`
-logic repackaged) — proven by `review diff --visual shot.png --check selection` against a real
+logic repackaged) — proven by `review visual shot.png --check selection` against a real
 HyperCanvas screenshot.
 
 **Stage 4 — the universal hook runner.** Vendor `agents_hooks.ts` into `tg-cli` + a Python
@@ -846,14 +844,14 @@ to feature-flags, insert the one `stat`-guarded `runPreSendPhotoHooks` call afte
 Ships behind the flag with the no-hooks `stat`-only fast path.
 
 **Stage 6 — flip the docs/rule.** Replace the "Always review screenshots before TG send"
-memories/rule with "the `review --visual` pre-send-photo hook enforces this."
+memories/rule with "the `review visual` pre-send-photo hook enforces this."
 
 ---
 
 ## 11. Open decisions for the CTO (before building)
 
 - **D1 — block signalling (RESOLVED in the hook design, restated here):** exit-code-10 canonical
-  + stdout-JSON for message/future fields. `review diff --visual --strict` exits 10. Confirm.
+  + stdout-JSON for message/future fields. `review visual --strict` exits 10. Confirm.
 - **D2 — gate `on_error` default for the photo hook:** vision is slow and can fail (no API key,
   provider down). Default **`open` + warn** (a flaky verifier never bricks a send) vs `closed`
   (a missing verifier blocks all photo sends). Recommendation: **open**, with the quarantine-as-
@@ -897,11 +895,11 @@ memories/rule with "the `review --visual` pre-send-photo hook enforces this."
   default diff-review — the §2.1 composition matrix), with a **cases mockup** (the
   `frames-check`-style hero: 4 BLOCK cases — unstyled / blank / FOUC / error-overlay — and 4
   ALLOW cases — properly styled renders — each a thumbnail + verdict + reason), the flag table
-  additions (§2), and the `review --visual` / `install-hook tg` / `register-module` usage. Add
+  additions (§2), and the `review visual` / `install-hook tg` / `register-module` usage. Add
   `--visual` to the **Flags** table (as a flag, not a mode) and note its composability in the
   **When to use which** table.
 - **review SKILL.md + blurb** (`install_agent_skill`) — extend the description and the always-on
-  blurb to mention `review diff --visual <image>` (image verification + the tg-photo gate). The blurb
+  blurb to mention `review visual <image>` (image verification + the tg-photo gate). The blurb
   is the line surfaced in every harness's CLI listing (the `<!-- skill:review -->` block in
   `~/.claude/CLAUDE.md` etc.), so it must name the new capability in one clause.
 - **tg README + AGENTS.md** — document the `hooks` feature flag, the `pre-send-photo` point, the
@@ -912,9 +910,9 @@ memories/rule with "the `review --visual` pre-send-photo hook enforces this."
   the listing every harness sees.
 - **hyper-canvas-draft** — a short note where its `.review/visual-modules.json` lives and that the
   `selection-highlight` module is the `frames-check` logic, plus the
-  `review diff --visual … --check selection` proof recipe.
+  `review visual … --check selection` proof recipe.
 - **Replace the rule** — the "Always Read+review screenshots before TG send" memories/feedback
-  become "enforced by the `review --visual` pre-send-photo hook" (Stage 6).
+  become "enforced by the `review visual` pre-send-photo hook" (Stage 6).
 
 ---
 

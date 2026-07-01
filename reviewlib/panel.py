@@ -11,7 +11,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from .backends import ReviewResult, backend_available, resolve_backend
+from .backends import ReviewResult, backend_available, resolve_backend, review_with_images
 from .config import MODERATOR_CANDIDATES, BoardReviewer
 from .process import write_retry_log
 
@@ -247,6 +247,7 @@ class PanelJob:
     prompt: str
     diff: str = ""
     label: str | None = None
+    images: tuple[Path, ...] = ()
     # The brainstorm round this job belongs to (1-based). Threaded into the backend so
     # the per-call log is stamped `-r{N}` instead of always `-r0` — the dashboard parser
     # infers brainstorm mode from round>=1 (HYP-742 finding 3). 0 = single-shot
@@ -254,7 +255,9 @@ class PanelJob:
     round_no: int = 0
 
 
-def build_board_job(reviewer: BoardReviewer, base_prompt: str, diff: str) -> PanelJob:
+def build_board_job(
+    reviewer: BoardReviewer, base_prompt: str, diff: str, images: tuple[Path, ...] = (),
+) -> PanelJob:
     """One role-lensed PanelJob for a reviewer (no availability check).
 
     The prompt is `base_prompt + "\\n\\n" + role_lens` (the generic prompt alone when
@@ -265,12 +268,13 @@ def build_board_job(reviewer: BoardReviewer, base_prompt: str, diff: str) -> Pan
     role_tag = reviewer.role or "general"
     return PanelJob(
         model=reviewer.model, prompt=prompt, diff=diff,
-        label=f"{reviewer.display} [{role_tag}]",
+        label=f"{reviewer.display} [{role_tag}]", images=images,
     )
 
 
 def build_board_jobs(
     board: list[BoardReviewer], base_prompt: str, diff: str,
+    images: tuple[Path, ...] = (),
 ) -> tuple[list[PanelJob], list[BoardReviewer]]:
     """Turn a reviewer board into PanelJobs, skipping unavailable reviewers.
 
@@ -286,7 +290,7 @@ def build_board_jobs(
         if not backend_available(reviewer.model):
             skipped.append(reviewer)
             continue
-        jobs.append(build_board_job(reviewer, base_prompt, diff))
+        jobs.append(build_board_job(reviewer, base_prompt, diff, images))
     return jobs, skipped
 
 
@@ -319,6 +323,7 @@ def run_board_with_failover(
     diff: str,
     cwd: Path,
     timeout: int,
+    images: tuple[Path, ...] = (),
 ) -> FailoverOutcome:
     """Run the priority `pool` and backfill failed seats from `reserve` (mid-run failover).
 
@@ -351,7 +356,7 @@ def run_board_with_failover(
     try:
         current = list(pool)
         while current:
-            jobs = [build_board_job(r, base_prompt, diff) for r in current]
+            jobs = [build_board_job(r, base_prompt, diff, images) for r in current]
             # In-seat retry FIRST: each seat retries the SAME model on a TRANSIENT failure
             # (429/529/5xx/timeout/overloaded) with backoff+jitter, before we fall to the
             # reserve below. A SEAT-FATAL failure (auth/bad-model/501/refusal) skips the
@@ -405,12 +410,19 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
     results: list[ReviewResult | None] = [None] * len(jobs)
     if not jobs:
         return []
+
+    def _run_job(job: PanelJob) -> ReviewResult:
+        if job.images:
+            return review_with_images(
+                job.model, job.prompt, job.diff, cwd, timeout, job.round_no, job.images
+            )
+        return resolve_backend(job.model)(
+            job.model, job.prompt, job.diff, cwd, timeout, job.round_no
+        )
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         futures = {
-            pool.submit(
-                resolve_backend(job.model), job.model, job.prompt, job.diff, cwd, timeout,
-                job.round_no,
-            ): index
+            pool.submit(_run_job, job): index
             for index, job in enumerate(jobs)
         }
         for future in concurrent.futures.as_completed(futures):

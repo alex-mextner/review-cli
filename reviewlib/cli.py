@@ -29,10 +29,12 @@ from .config import (
     MODERATOR_CANDIDATES,
     PANEL_TIMEOUT_DEFAULT,
     QA_TIMEOUT_DEFAULT,
+    VISUAL_MODELS,
     BoardConfigError,
     _expand_alias,
     _effective_pool_size,
     _split_models,
+    board_from_models,
     load_board,
     load_config,
     split_pool_reserve,
@@ -245,8 +247,8 @@ _AGENTTOOLS_SERVICE_MISSING_MSG = (
     "'agenttools_service' lib, which isn't installed.\n"
     "  why:  run/start/status/stop/enable/disable come from one shared service-manager "
     "(agent-tools/lib/agenttools_service), not a per-tool copy.\n"
-    "  fix:  pip install -e <agent-tools>/lib/agenttools_service   "
-    "(or `pip install 'review-cli[dashboard]'` once published).\n"
+    "  fix:  pip install -e <agent-tools>/lib/agenttools_daemon "
+    "-e <agent-tools>/lib/agenttools_service\n"
     "  note: `review dashboard run` still works without it for an ad-hoc foreground server."
 )
 
@@ -270,7 +272,8 @@ def _dashboard_help_no_lib() -> int:
         "  enable   install OS autostart (launchd / systemd --user / fallback) AND start now\n"
         "  disable  remove OS autostart AND stop\n\n"
         "note: start/status/stop/enable/disable need the shared 'agenttools_service' lib "
-        "(`pip install 'review-cli[dashboard]'`); `run` works without it."
+        "(pip install -e <agent-tools>/lib/agenttools_daemon "
+        "-e <agent-tools>/lib/agenttools_service); `run` works without it."
     )
     return 0
 
@@ -987,8 +990,8 @@ def _model_default_help(mode: ModeSpec | None) -> str:
     runtime selection differs per mode (only the diff review runs the board):
 
       * diff review (mode.name == "review", and the top-level overview where mode is None):
-        a `models:` list in config.yaml -> those exact models, else the active reviewer
-        BOARD (run `review --show-board`).
+        a `models:` list in config.yaml -> a priority roster for the failover board,
+        else the active reviewer BOARD (run `review --show-board`).
       * brainstorm: a `brainstorm_models:` list -> those, else `models:`, else the built-in
         DEFAULT_MODELS — the board does NOT apply here.
       * just-ask / quorum: a `models:` list -> those, else DEFAULT_MODELS.
@@ -1014,6 +1017,19 @@ def _model_default_help(mode: ModeSpec | None) -> str:
     except Exception:  # noqa: BLE001
         config_models = []
     default_models = [_expand_alias(x) for x in DEFAULT_MODELS]
+    default_visual_models = [_expand_alias(x) for x in VISUAL_MODELS]
+
+    # visual: visual_models > VISUAL_MODELS. It deliberately does NOT inherit the text
+    # review board or `models:` by default; a text-only board must not accidentally serve
+    # screenshot verification.
+    if mode is not None and mode.name == "visual":
+        try:
+            visual = _split_models(config.get("visual_models") or [])
+        except Exception:  # noqa: BLE001
+            visual = []
+        if visual:
+            return f"your config.yaml visual_models: {_fmt(visual)}"
+        return f"{_fmt(default_visual_models)} (the visual defaults)"
 
     # brainstorm: brainstorm_models > models > DEFAULT_MODELS (no board).
     if mode is not None and mode.name == "brainstorm":
@@ -1039,9 +1055,10 @@ def _model_default_help(mode: ModeSpec | None) -> str:
             return f"your config.yaml models: {_fmt(config_models)}"
         return f"{_fmt(default_models)} (the built-in defaults)"
 
-    # diff review (and the top-level overview, mode is None): models > the active board.
+    # diff review (and the top-level overview, mode is None): models priority roster >
+    # the active board.
     if config_models:
-        return f"your config.yaml models: {_fmt(config_models)}"
+        return f"your config.yaml models priority roster: {_fmt(config_models)}"
     return "the active reviewer board (run `review --show-board`; see `review help config`)"
 
 
@@ -1104,15 +1121,19 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
     # (AGENTS.md: the global list is only truly-global options). codex P1 on #46.
 
 
-def _add_visual_options(parser: argparse.ArgumentParser) -> None:
+def _add_visual_options(parser: argparse.ArgumentParser, *, include_visual_flag: bool = True) -> None:
     """Add the composable `--visual` feature flags as their own argument GROUP. These are
     SUBCOMMAND-scoped, NOT global (ROADMAP): `--visual` rides any subcommand, so they live
     on every MODE parser but must NOT clutter the top-level `review --help`. Grouping them
     makes `review <mode> --help` render them under a clear "visual verification" heading."""
-    group = parser.add_argument_group(
-        "visual verification (the composable --visual flag; rides any subcommand)"
+    group_title = (
+        "visual verification"
+        if not include_visual_flag
+        else "visual verification (the composable --visual flag; rides text subcommands)"
     )
-    group.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; rides any subcommand (e.g. `review diff --visual`; standalone verdict pipeline when no diff)")
+    group = parser.add_argument_group(group_title)
+    if include_visual_flag:
+        group.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; rides text subcommands (e.g. `review brainstorm \"Q\" --visual IMAGE`; prefer `review visual IMAGE` for standalone)")
     group.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
     group.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
     group.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
@@ -1157,7 +1178,7 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
     # parser (but never the top-level overview). --rounds / --max-rounds are brainstorm-only
     # and added by the brainstorm mode's own add_arguments; they stay in _VALUE_TAKING_OPTS
     # so the mode-agnostic `-o` pre-scan treats them as value-taking.
-    _add_visual_options(parser)
+    _add_visual_options(parser, include_visual_flag=(mode.name != "visual"))
 
     if mode.add_arguments is not None:
         mode.add_arguments(parser)
@@ -1165,7 +1186,7 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
 
 # Flags that live ONLY on a subcommand parser (NOT the global top-level parser), per the
 # option-scoping. When one of these LEADS a no-subcommand invocation (e.g. the old pre-commit
-# `review --staged`, or `review --visual shot.png`), the top-level parser would reject it with
+    # `review --staged`, or `review --visual shot.png`), the top-level parser would reject it with
 # argparse's opaque "unrecognized arguments", losing the `review diff` migration pointer. The
 # pre-parse guard below catches them and emits the friendly pointer instead.
 _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
@@ -1210,12 +1231,16 @@ def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
         if tok == "--":
             break
         if tok.split("=", 1)[0] in _SUBCOMMAND_ONLY_FLAGS:
+            use_line = (
+                "  use:  review visual IMAGE [--diff] [options]\n"
+                if tok.split("=", 1)[0] == "--visual"
+                else "  use:  review diff [options]   (e.g. `review diff --staged`)\n"
+            )
             print(
                 "review: no subcommand given. The diff review is now `review diff` "
                 "(a bare `review` no longer runs one), and that flag belongs to a "
                 "subcommand.\n"
-                "  use:  review diff [options]   (e.g. `review diff --staged`, "
-                "`review diff --visual shot.png`)\n"
+                f"{use_line}"
                 "  (run `review --help` for all subcommands)",
                 file=sys.stderr, flush=True,
             )
@@ -1236,18 +1261,26 @@ CONFIG FILE
   {CONFIG_PATH}
   Optional YAML. Absent / unparseable -> the built-in defaults apply (never an error).
   Keys:
-    models:            list[str]  default backends for the diff review + just-ask/quorum.
-                       Set this and those EXACT models run (the flat panel) — it BYPASSES
-                       the reviewer board (cost-safety: you asked for specific models).
+    models:            list[str]  priority roster for `review diff`: the live pool is
+                       selected from this full ordered set and the rest are reserve.
+                       For just-ask/quorum it remains the flat default panel.
     brainstorm_models: list[str]  default panel for `review brainstorm` (falls back to
                        `models:`, then the built-in defaults). Unreachable backends are
                        dropped gracefully.
+    visual_models:     list[str]  ordered vision backends for `review visual` and companion
+                       visual fan-out. Separate from the text reviewer board; runtime
+                       failures skip to the next vision backend.
     board:             list[seat]  override the built-in reviewer board (see BOARD below).
+    timeout:           int         per-call timeout seconds for `review diff` (overrides the
+                       1200s default; still overrideable per-invocation by --timeout).
+                       Useful for iterate-review workflows where 20 min is too long.
   Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
   `glm` -> zai:glm-5.2, `cc` -> commandcode).
 
 SELECTION CASCADE (what runs when you do NOT pass -m), by mode:
-  review diff           : explicit -m  >  config `models:`  >  the active reviewer BOARD.
+  review diff           : explicit -m exact panel  >  config `models:` priority roster  >
+                          config/default reviewer BOARD.
+  review visual         : explicit -m  >  `visual_models:`  >  visual defaults.
   review brainstorm     : explicit -m  >  `brainstorm_models:`  >  `models:`  >  defaults.
   review just-ask/quorum: explicit -m  >  `models:`  >  the built-in defaults.
   review qa             : IGNORES config `models:` / `brainstorm_models:` / the defaults.
@@ -1255,16 +1288,18 @@ SELECTION CASCADE (what runs when you do NOT pass -m), by mode:
                           a bare `-m claude|codex`  >  the `claude` default. (opencode is not
                           in v1.) The panel/board cascade does not apply to qa.
   Built-in defaults: {", ".join(_expand_alias(x) for x in DEFAULT_MODELS)}.
+  Visual defaults:  {", ".join(_expand_alias(x) for x in VISUAL_MODELS)}.
   See the live default for each subcommand in `review <mode> --help` (the --model line).
 
 REVIEWER BOARD (the diff-review default; `review --show-board` prints it live)
-  A priority-ordered panel of {DEFAULT_POOL_SIZE * 2} seats, each model carrying its own
+  A priority-ordered panel of seats, each model carrying its own
   role/lens. A plain `review diff` runs a POOL of {DEFAULT_POOL_SIZE} (top-N AVAILABLE by
   priority) with startup + mid-run failover from the reserve. `--pool N` sizes it
-  (`--pool 0` = all available). The board is never off — an explicit -m / config `models:`
-  bypasses it. To add/override a seat, set `board:` in config.yaml (a list of
-  {{model, role, name}} entries, strongest first; `name` is the display label, `role` is a
-  key into the built-in role lenses) or edit DEFAULT_BOARD in reviewlib/config.py.
+  (`--pool 0` = all available). The board is bypassed only by explicit -m. To set the
+  priority roster, configure `models:`. To add role/name metadata (or a full board when
+  `models:` is absent), set `board:` in config.yaml (a list of {{model, role, name}}
+  entries; `name` is the display label, `role` is a key into the built-in role lenses) or
+  edit DEFAULT_BOARD in reviewlib/config.py.
 
 KEYS / AUTH (resolved from the process env first, then the shared .env)
   Shared .env:  ~/.config/review-cli/.env   (override with $GEMINI_ENV_FILE)
@@ -1274,6 +1309,8 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     COMMANDCODE_API_KEY                 — commandcode seats (a `user_...` token ONLY).
     ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN (+ optional ANTHROPIC_BASE_URL) — claude API.
     REVIEW_CLAUDE_MODE=api|cli, REVIEW_<BACKEND>_MODE=api|cli — transport selection.
+    --timeout applies uniformly to every backend seat; quiet model thinking is allowed
+      until that per-call timeout expires.
   codex / opencode carry their own CLI auth (no key here).
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
@@ -1565,16 +1602,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
     config = load_config()
 
-    # `models:` from config, stripped + alias-expanded + blanks dropped (same rule as
-    # _split_models for -m). An "effectively empty" list — absent, or only
-    # blank/whitespace entries — is NOT a real preference: it must NOT count as a
-    # configured models list (else it would disable the board AND feed blank model
-    # names to the panel). Computed up-front so --list-defaults reports the SAME
-    # effective, normalized list the review path actually uses.
+    # `models:` / `visual_models:` from config, stripped + alias-expanded + blanks dropped
+    # (same rule as _split_models for -m). An "effectively empty" list — absent, or only
+    # blank/whitespace entries — is NOT a real preference.
     config_models = _split_models(config.get("models") or [])
+    config_visual_models = _split_models(config.get("visual_models") or [])
 
     if args.list_defaults:
-        effective = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        effective = (
+            config_visual_models or [_expand_alias(x) for x in VISUAL_MODELS]
+            if mode.name == "visual"
+            else config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        )
         print("\n".join(effective))
         return 0
 
@@ -1619,6 +1658,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             raise SystemExit(2)
         raise SystemExit(0)
 
+    if mode.name == "visual" and not args.visual:
+        parser.error("the following arguments are required: IMAGE")
+
     # Suppress the "reviewing it as-is" non-repo warning on the REVIEW-mode required-diff
     # path: there a non-repo hard-fails via `_fail_not_a_repo` (the authoritative message),
     # so the "as-is" promise would contradict it. The no-git modes (panel) and the
@@ -1627,10 +1669,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
     cwd = _effective_cwd(args.cwd, warn=not _review_required)
     explicit_models = _split_models(args.model)
     is_brainstorm = mode.name == "brainstorm"
+    is_visual_subcommand = mode.name == "visual"
     # A "panel mode" is any non-review mode (brainstorm / just-ask / quorum): the diff is
     # OPTIONAL context for it, its calls are long-running (announce live-log paths), and
     # its per-call timeout default is the shorter PANEL_TIMEOUT_DEFAULT.
-    panel_mode = mode.name != "review"
+    panel_mode = mode.name not in ("review", "visual")
     # Precedence: explicit -m > config > code default. Brainstorm prefers
     # config.brainstorm_models and drops unreachable backends gracefully (so a
     # missing GEMINI_API_KEY never aborts the run). Explicit -m is honored as-is.
@@ -1645,36 +1688,45 @@ def _dispatch(argv: list[str] | None = None) -> int:
         models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
 
     visual_mode = args.visual is not None
+    if explicit_models:
+        visual_models = explicit_models
+    else:
+        visual_models = config_visual_models or [_expand_alias(x) for x in VISUAL_MODELS]
     # Timeout default by mode. qa is the carve-out: it is technically a "panel mode" (non-
     # review), but a tester run boots a SUT and drives a whole suite with an un-caged agent —
     # tens of minutes, not the short PANEL_TIMEOUT_DEFAULT (240s) the chat panels use. Give it
     # its OWN long default (it leans on the <=4h backstop, not a 4-minute cap). Review keeps
     # 1200s; the other panel modes (brainstorm/just-ask/quorum) keep the short panel default.
+    # Timeout precedence: --timeout flag > config.yaml `timeout:` > mode default.
+    # `config_timeout` lets you set a persistent short default for iterate-review
+    # workflows without passing --timeout every time.
+    config_timeout = config.get("timeout")
     if args.timeout is not None:
         timeout = args.timeout
     elif mode.name == "qa":
         timeout = QA_TIMEOUT_DEFAULT
     elif panel_mode:
         timeout = PANEL_TIMEOUT_DEFAULT
+    elif config_timeout is not None:
+        timeout = int(config_timeout)
     else:
         timeout = 1200
 
-    # Reviewer board (HYP-741): the default plain-review panel assigns each model its
-    # own role/lens. Precedence is COST-SAFETY first — the board runs only when the user
-    # expressed NO model preference at all:
-    #   explicit -m  >  explicit `models:` in config.yaml  >  default board.
-    # So a configured `models:` gets exactly those (the flat panel), NOT the board. The
-    # board applies on the DEFAULT diff review (no panel mode) with neither -m nor config
-    # models. The board is NEVER disabled — `--pool N` only sizes how many of its seats
-    # run (default 4 of the 9-seat board; the rest are a reserve). `use_board` is a cheap
-    # boolean gate computed now; the actual load_board + cost-safety validation (and the
-    # --pool slice) runs LATER (validate_board, below) — after the standalone-visual path
-    # has had its chance to short-circuit, so a malformed `board:` never blocks the
-    # board-unrelated standalone `review --visual` pipeline (codex P2). It still fires
+    # Reviewer board (HYP-741): the diff-review panel assigns each model its own
+    # role/lens and keeps a reserve. Precedence:
+    #   explicit -m  >  config `models:` priority roster  >  config/default board.
+    # Only explicit -m is an exact flat override. A configured `models:` list is the full
+    # priority-ordered roster from which the active pool + reserve are selected; optional
+    # `board:` entries can still provide role/name metadata for those models. The board is
+    # NEVER disabled — `--pool N` only sizes how many of its seats run (default 4; the rest
+    # are reserve). `use_board` is a cheap boolean gate computed now; the actual board
+    # resolution + cost-safety validation (and the --pool slice) runs LATER
+    # (validate_board, below) — after the standalone-visual path has had its chance to
+    # short-circuit, so a malformed `board:` never blocks the board-unrelated standalone
+    # `review visual` pipeline (codex P2). It still fires
     # BEFORE the COMPANION visual fan-out, so a doomed config never spends a paid vision
     # call.
-    has_config_models = bool(config_models)  # filtered above: blanks-only counts as none
-    use_board = not panel_mode and not explicit_models and not has_config_models
+    use_board = not panel_mode and not explicit_models
     board: list | None = None
     board_validated = False
 
@@ -1684,14 +1736,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         failover pool path (mode_review) does the startup failover — selecting the top
         `args.pool` AVAILABLE seats by priority — and keeps the rest as the reserve that
         backfills a seat which fails mid-run. Returns an exit code (2) on an all-malformed
-        `board:` config, else None. No-op when the board does not apply (panel mode / -m /
-        config models)."""
+        `board:` config, else None. No-op when the board does not apply (panel mode or
+        explicit -m)."""
         nonlocal board, board_validated
         if board_validated or not use_board:
             return None
         board_validated = True
         try:
-            board = load_board(config)
+            board = board_from_models(config_models, config) if config_models else load_board(config)
         except BoardConfigError as exc:
             print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
             return 2
@@ -1720,7 +1772,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # review mode (no --visual) genuinely REQUIRES a diff; --staged on a review still
     # hard-requires it (the pre-commit gate). So brainstorm is excluded from needs_diff
     # and routed through the caught/optional probe below.
-    needs_diff = (args.staged or (not panel_mode and not visual_mode)) and not is_brainstorm
+    needs_diff = (
+        args.staged or (mode.name == "review" and not visual_mode)
+    ) and not is_brainstorm and not is_visual_subcommand
     if diff is None and needs_diff:
         # This path attaches the working-tree / staged diff. Outside a git repo it must NOT
         # raise a raw `git diff` traceback. Two cases:
@@ -1754,9 +1808,17 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 diff = _git_diff(cwd, args.staged)
             except RuntimeError as exc:
                 return _fail_git_diff(cwd, exc)
-    elif diff is None and visual_mode and not panel_mode:
+    elif diff is None and visual_mode and mode.name == "review":
         # --visual riding the review mode: probe the working-tree diff to decide
         # companion-vs-standalone, but tolerate "no diff / not a git repo".
+        try:
+            diff = _git_diff(cwd, args.staged)
+        except RuntimeError:
+            diff = ""
+    elif diff is None and is_visual_subcommand and (args.diff or args.staged):
+        # `review visual IMAGE` is standalone by default. `--diff` / `--staged` explicitly
+        # opt into the companion diff-review path, but still degrade to standalone when no
+        # diff can be obtained.
         try:
             diff = _git_diff(cwd, args.staged)
         except RuntimeError:
@@ -1821,7 +1883,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 expect=args.expect,
                 intent=args.intent,
                 requested_checks=list(args.check),
-                models=models,
+                models=visual_models,
                 no_ai=args.no_ai,
                 # Stage-2a cost-saver default ON; --no-local-model OR `local_model: false`
                 # in config.yaml disables it (CLI flag wins over config).
@@ -1830,7 +1892,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 as_json=args.json,
                 strict=args.strict,
                 # Per-project module discovery defaults to the CLI cwd (-C), NOT the
-                # process cwd, so `review --visual shot.png -C <repo>` finds
+                # process cwd, so `review visual shot.png -C <repo>` finds
                 # <repo>/.review/visual-modules.json (codex P2).
                 project=args.project or str(cwd),
             )
@@ -1850,9 +1912,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
             before=Path(args.before).expanduser() if args.before else None,
             expect=args.expect,
             intent=args.intent,
-            models=[] if args.no_ai else models,
+            models=[] if args.no_ai else visual_models,
             requested_checks=list(args.check),
             vision_timeout=args.vision_timeout,
+            require_vision=not args.no_ai,
         )
         # The cvGate pre-filter BLOCKS the companion run on an unambiguously-broken
         # render (codex P2): a blank/unreadable/error-overlay image must short-circuit
@@ -1860,12 +1923,17 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # --visual blank.png` would run the review and stamp success). Exit 10 under
         # --strict (the gate/hook block code), else a non-zero advisory exit.
         if visual_ctx.prefilter_verdict == "rollback":
-            print(f"[review --visual] ROLLBACK (pre-filter, mode blocked): {visual_ctx.prefilter_reason}")
+            print(f"[review visual] ROLLBACK (pre-filter, mode blocked): {visual_ctx.prefilter_reason}")
             # An unreadable/missing image is a USAGE error (exit 1), matching the
             # standalone exit-code map — scripts/hooks rely on the distinction between
             # "unreadable input" (1) and "blocking content verdict under --strict" (10).
             if "unreadable" in visual_ctx.prefilter_reason:
                 return 1
+            return 10 if args.strict else 1
+        if visual_ctx.vision_error:
+            print(f"[review visual] UNVERIFIED (mode blocked): {visual_ctx.vision_error}")
+            if visual_ctx.vision_timed_out:
+                return 124
             return 10 if args.strict else 1
 
     # Build the resolved ModeContext handed to the mode's handler (thin over the lib).
@@ -1916,7 +1984,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             mode.stats_mode, qa_seat, lambda: mode.handler(ctx),
         )
 
-    if mode.name != "review":
+    if mode.name not in ("review", "visual"):
         # just-ask / quorum: a flat multi-model panel; pool_size == len(models).
         return _run_mode_with_stats(
             mode.stats_mode, models, lambda: mode.handler(ctx),
@@ -2006,12 +2074,17 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | No
       * `unavail` — backend not reachable right now; it can't sit in the pool, but a
                     run-time "unavailable" reply still triggers a reserve backfill.
     Read-only — no model is called, no key is printed."""
+    config_models = _split_models(config.get("models") or [])
     try:
-        board = load_board(config)
+        if config_models:
+            board = board_from_models(config_models, config)
+            source = "config.yaml (models:)"
+        else:
+            board = load_board(config)
+            source = "config.yaml (board:)" if isinstance(config.get("board"), list) and config.get("board") else "default"
     except BoardConfigError as exc:
         print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
         return 2
-    source = "config.yaml (board:)" if isinstance(config.get("board"), list) and config.get("board") else "default"
     # The LIVE pool/reserve split is by PRIORITY + AVAILABILITY (the same split the
     # failover review path makes), not by raw seat index — an unavailable top seat is
     # skipped so the pool fills from the next available priority. Probe each seat ONCE by

@@ -14,8 +14,8 @@ isolated verdict pass — instead:
 Stage 1 wired only step 1 (the cvGate-described note). Stage 2 adds step 2: the per-mode
 multimodal fan-out. A single multimodal call (not one per persona — the panel backends
 are text CLIs) sees the pixels and its structured note is woven into the prompt every
-panel member receives. If no vision backend is configured the seam degrades to the
-cvGate-described note (never crashes, never hard-blocks a pass-through).
+panel member receives. If the vision fan-out is required but unavailable/unusable, the
+companion mode is blocked instead of laundering a text-only answer as visual review.
 """
 from __future__ import annotations
 
@@ -29,11 +29,13 @@ from .modules.builtins import builtin_modules
 from .vision_client import (
     VisionBlock,
     VisionVerdict,
+    VISION_VERDICTS,
     build_output_schema,
     call_ai_vision,
     capability_for,
     encode_image,
     select_vision_backend,
+    select_vision_backends,
 )
 
 
@@ -48,8 +50,11 @@ class VisualComposition:
     # a vision backend served the fan-out call, else the cvGate-described note.
     context_note: str
     image_path: Path
-    # The grounded vision observation (None when no vision backend served the fan-out).
+    # The grounded vision observation (None when no usable vision verdict served the fan-out).
     observation: VisionVerdict | None = None
+    # Non-empty when companion --visual could not produce a usable grounded observation.
+    vision_error: str = ""
+    vision_timed_out: bool = False
 
 
 def _active_builtin_modules(ctx: VisualContext):
@@ -101,6 +106,29 @@ def _grounded_note(observation: VisionVerdict, image: Path) -> str:
     return "\n".join(parts)
 
 
+def _usable_observation(observation: VisionVerdict | None) -> bool:
+    return bool(observation and observation.available and observation.verdict in VISION_VERDICTS)
+
+
+def _vision_error(observation: VisionVerdict | None) -> str:
+    if observation is None:
+        return "no vision-capable backend available for companion --visual"
+    if not observation.available:
+        return observation.error or "no vision-capable backend available for companion --visual"
+    if observation.verdict not in VISION_VERDICTS:
+        return observation.error or "vision backend returned no usable verdict"
+    return ""
+
+
+def _unverified_note(reason: str, image: Path) -> str:
+    return "\n".join([
+        "\n\n=== ATTACHED RENDER UNVERIFIED ===",
+        f"Screenshot: {image}",
+        f"Visual verification failed: {reason}",
+        "The companion text mode must not treat this as a reviewed screenshot.",
+    ])
+
+
 def build_mode_visual_context(
     image: Path,
     *,
@@ -110,6 +138,7 @@ def build_mode_visual_context(
     models: list[str] | None = None,
     requested_checks: list[str] | None = None,
     vision_timeout: int = 60,
+    require_vision: bool = True,
 ) -> VisualComposition:
     """Build the composition for a companion mode: run cvGate cheaply, then (Stage 2)
     deliver the image to a vision model and fold the grounded observation into the note.
@@ -129,10 +158,15 @@ def build_mode_visual_context(
             f"blank={sig.blank_suspected}, overlay={sig.overlay_suspected}, "
             f"unstyled={sig.unstyled_suspected})"
         )
+    # When vision is not required (--no-ai), omit the concrete image path from the note:
+    # an agentic panel that can read repo files could open the screenshot despite the flag
+    # if the path were included in text. The CV signals and expectation metadata still
+    # ground the companion, but the file reference is redacted. (P1 fix.)
+    image_ref = str(image) if require_vision else "<redacted — --no-ai>"
     cv_note = (
         "\n\n=== ATTACHED RENDER (visual context) ===\n"
         f"A screenshot was captured for this review and analysed by the cvGate pixel "
-        f"pre-filter: {image}\n"
+        f"pre-filter: {image_ref}\n"
         f"Expectation: kind={expectation.kind}, diff_policy={expectation.diff_policy}, "
         f"risk={expectation.risk}.{sig_line}\n"
         f"cvGate pre-filter outcome: {gate.outcome} — {gate.reason}\n"
@@ -142,28 +176,39 @@ def build_mode_visual_context(
 
     # On a broken render (rollback) we never run the fan-out call — the caller blocks.
     observation: VisionVerdict | None = None
+    vision_error = ""
+    vision_timed_out = False
     if prefilter != "rollback":
         observation = _run_fanout(
             image, expectation, sig, intent,
             models=models or [], requested_checks=requested_checks or [], vision_timeout=vision_timeout,
         )
+        if require_vision:
+            vision_error = _vision_error(observation)
+            vision_timed_out = bool(getattr(observation, "timed_out", False)) if observation is not None else False
 
-    note = cv_note + ("\n" + _grounded_note(observation, image) if observation is not None and observation.available else "")
+    note = cv_note
+    if _usable_observation(observation):
+        note += "\n" + _grounded_note(observation, image)
+    elif vision_error:
+        note += _unverified_note(vision_error, image)
     return VisualComposition(
         prefilter_verdict=prefilter,
         prefilter_reason=gate.reason,
         context_note=note,
         image_path=image,
-        observation=observation if (observation and observation.available) else None,
+        observation=observation if _usable_observation(observation) else None,
+        vision_error=vision_error,
+        vision_timed_out=vision_timed_out,
     )
 
 
 def _run_fanout(image, expectation, signals, intent, *, models, requested_checks, vision_timeout) -> VisionVerdict | None:
     """The single real multimodal call that delivers the image to a vision model with
     the active modules' questions folded in. Returns None when no vision backend is
-    configured (the seam then degrades to the cvGate-described note)."""
-    backend = select_vision_backend(models)
-    if backend is None:
+    configured; callers decide whether that is allowed (explicit --no-ai) or blocking."""
+    backends = _ordered_vision_backends(models)
+    if not backends:
         return None
     ctx = VisualContext(
         after_image=image.read_bytes(),
@@ -177,6 +222,29 @@ def _run_fanout(image, expectation, signals, intent, *, models, requested_checks
     questions = [q for m in modules for q in m.vision_questions(ctx)]
     module_fields = [getattr(m, "_vision_field", "") for m in modules if getattr(m, "_vision_field", "")]
     schema = build_output_schema(module_fields)
-    cap = capability_for(backend)
+    cap = capability_for(backends[0])
     blocks = _fanout_blocks(Path(image), expectation, signals, questions, cap)
-    return call_ai_vision(backend, blocks=blocks, expectation=expectation, cv_signals=signals, output_schema=schema, timeout_s=vision_timeout)
+    return _call_ai_vision_with_fallback(
+        backends, blocks=blocks, expectation=expectation, cv_signals=signals,
+        output_schema=schema, timeout_s=vision_timeout,
+    )
+
+
+def _ordered_vision_backends(models: list[str]) -> list[str]:
+    first = select_vision_backend(models)
+    if first is None:
+        return []
+    ordered = select_vision_backends(models)
+    return [first] + [model for model in ordered if model != first]
+
+
+def _call_ai_vision_with_fallback(models: list[str], **kwargs) -> VisionVerdict:
+    last: VisionVerdict | None = None
+    for model in models:
+        verdict = call_ai_vision(model, **kwargs)
+        if verdict.available and verdict.verdict in VISION_VERDICTS:
+            return verdict
+        last = verdict
+    if last is not None:
+        return last
+    return call_ai_vision(None, **kwargs)

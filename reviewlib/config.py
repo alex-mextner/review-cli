@@ -76,6 +76,15 @@ def _agentic(seat: str) -> str:
 # preferences live in ~/.config/review-cli/config.yaml (keys: models,
 # brainstorm_models) and override this — see load_config().
 DEFAULT_MODELS = ("codex", "gemini", KIMI_SEAT)
+# Visual review uses a separate priority list from the text reviewer board. The visual
+# pipeline selects the first reachable vision-capable backend, so a dead/paywalled Opus is
+# skipped automatically and the next vision seat is promoted.
+VISUAL_MODELS = (
+    "claude:claude-opus-4-8",
+    "oc:zai/glm-4.5v",
+    "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+    "gemini",
+)
 # Friendly aliases for claude models, expanded in _split_models() and the
 # default/config paths, so `-m fable5` == `-m claude:claude-fable-5`.
 MODEL_ALIASES = {
@@ -524,6 +533,31 @@ def load_board(config: dict | None = None) -> list[BoardReviewer]:
             "'capability'). Fix the board entries, or remove the `board:` key to "
             "use the default reviewer board."
         )
+    return board
+
+
+def board_from_models(models: list[str], config: dict | None = None) -> list[BoardReviewer]:
+    """Build a priority reviewer board from a config `models:` roster.
+
+    `models:` owns the seat order. A matching config `board:` entry, or a matching
+    built-in DEFAULT_BOARD seat, supplies role/name metadata; unknown models stay usable
+    with the generic review lens and a display name derived from the model id.
+    """
+    metadata: dict[str, BoardReviewer] = {reviewer.model: reviewer for reviewer in DEFAULT_BOARD}
+    raw_board = (config or {}).get("board") if isinstance(config, dict) else None
+    if isinstance(raw_board, list):
+        for entry in raw_board:
+            reviewer = _parse_board_entry(entry)
+            if reviewer is not None:
+                metadata[reviewer.model] = reviewer
+
+    board: list[BoardReviewer] = []
+    for model in models:
+        reviewer = metadata.get(model)
+        if reviewer is None:
+            board.append(BoardReviewer(model=model, role="", display=_display_name(model)))
+        else:
+            board.append(BoardReviewer(model=model, role=reviewer.role, display=reviewer.display))
     return board
 
 

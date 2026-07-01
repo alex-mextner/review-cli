@@ -37,11 +37,13 @@ class _Captured:
     def __init__(self) -> None:
         self.argv: list[str] | None = None
         self.cwd: Path | None = None
+        self.timeout: int | None = None
         self.header_argv0: str | None = None
 
     def __call__(self, argv, cwd, timeout, backend, round_no=0, announce=False, header_argv0=None):
         self.argv = list(argv)
         self.cwd = Path(cwd)
+        self.timeout = timeout
         self.header_argv0 = header_argv0
 
         class _Proc:
@@ -115,6 +117,26 @@ def test_real_repo_message_invites_reading_files():
         # The model is told it can read project files, AND the diff is the focus.
         assert "read" in message.lower(), message
         assert "DIFFBODY" in message, message
+
+
+def test_glm52_opencode_keeps_requested_timeout_like_other_models():
+    with _capture_opencode() as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            review_backends.review_opencode("oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200)
+        assert cap.timeout == 1200, cap.timeout
+
+
+def test_other_opencode_models_keep_requested_timeout():
+    with _capture_opencode() as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            review_backends.review_opencode("oc:commandcode/deepseek/deepseek-v4-pro", "Review.", "DIFF", repo, 1200)
+        assert cap.timeout == 1200, cap.timeout
 
 
 def test_non_repo_cwd_falls_back_to_temp_dir():

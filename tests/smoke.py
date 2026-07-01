@@ -13,6 +13,8 @@ Two ways to run it, both green-or-red with a real exit code:
 
 REVIEW_STATS_FILE is redirected to a throwaway temp file for the whole process so no check that
 invokes the real CLI appends to the user's real ~/.config/review-cli/run-stats.jsonl.
+Child review processes also run with a throwaway HOME/XDG_CONFIG_HOME so smoke assertions
+exercise the repo defaults instead of the developer's local review-cli config.yaml.
 """
 from __future__ import annotations
 
@@ -24,6 +26,22 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 REVIEW = str(REPO / "bin" / "review")
+_SMOKE_HOME: str | None = None
+_GIT_UNAVAILABLE_REASON: str | None | bool = None
+_GIT_REQUIRED_UNIT_FILES = frozenset({
+    "test_cwd.py",
+    "test_dashboard.py",
+    "test_inseat_retry.py",
+    "test_install_state.py",
+    "test_no_git_repo.py",
+    "test_opencode_realrepo.py",
+    "test_output_flag.py",
+    "test_qa_executor.py",
+    "test_qa_mode.py",
+    "test_review_marker.py",
+    "test_run_stats.py",
+    "test_staged_diff_honors_c_repo.py",
+})
 
 
 def _redirect_run_stats() -> None:
@@ -35,6 +53,24 @@ def _redirect_run_stats() -> None:
     creates the temp dir when the env var is unset (no leaked dirs on repeated calls)."""
     if not os.environ.get("REVIEW_STATS_FILE"):
         os.environ["REVIEW_STATS_FILE"] = str(Path(tempfile.mkdtemp()) / "run-stats.jsonl")
+
+
+def _smoke_home() -> str:
+    global _SMOKE_HOME
+    if _SMOKE_HOME is None:
+        _SMOKE_HOME = tempfile.mkdtemp(prefix="review-smoke-home-")
+    return _SMOKE_HOME
+
+
+def _smoke_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    home = _smoke_home()
+    full_env = {
+        **os.environ,
+        "HOME": home,
+        "XDG_CONFIG_HOME": str(Path(home) / ".config"),
+    }
+    full_env.update(env or {})
+    return full_env
 
 
 # When collected by pytest, redirect run-stats via an autouse session fixture (still NOT at
@@ -75,13 +111,12 @@ def run(
     # `run()` with no args runs `bin/review` with no subcommand.
     if not argv or not os.path.isabs(argv[0]):
         argv = [REVIEW, *argv]
-    full_env = {**os.environ, **(env or {})}
     return subprocess.run(
         argv,
         input=stdin,
         capture_output=True,
         text=True,
-        env=full_env,
+        env=_smoke_env(env),
         cwd=cwd,
         timeout=timeout,
     )
@@ -124,7 +159,7 @@ def run_unit(test_file: str, *, env: dict[str, str] | None = None, timeout: int 
         [sys.executable, str(REPO / "tests" / test_file)],
         capture_output=True,
         text=True,
-        env={**os.environ, **(env or {})},
+        env=_smoke_env(env),
         timeout=timeout,
     )
     if p.returncode != 0:
@@ -137,6 +172,43 @@ def _tmp() -> str:
 
 def _has(mod: str) -> bool:
     return subprocess.run([sys.executable, "-c", f"import {mod}"], capture_output=True).returncode == 0
+
+
+def _git_unavailable_reason() -> str | None:
+    global _GIT_UNAVAILABLE_REASON
+    if _GIT_UNAVAILABLE_REASON is not None:
+        return _GIT_UNAVAILABLE_REASON if isinstance(_GIT_UNAVAILABLE_REASON, str) else None
+    try:
+        version = subprocess.run(
+            ["git", "--version"], capture_output=True, text=True, env=_smoke_env(), timeout=15,
+        )
+        if version.returncode != 0:
+            reason = (version.stdout + version.stderr).strip() or f"`git --version` exited {version.returncode}"
+            _GIT_UNAVAILABLE_REASON = reason
+            return reason
+        with tempfile.TemporaryDirectory() as d:
+            init = subprocess.run(
+                ["git", "init", "-q"], cwd=d, capture_output=True, text=True, env=_smoke_env(), timeout=30,
+            )
+        if init.returncode != 0:
+            reason = (init.stdout + init.stderr).strip() or f"`git init` exited {init.returncode}"
+            _GIT_UNAVAILABLE_REASON = reason
+            return reason
+    except (OSError, subprocess.SubprocessError) as exc:
+        _GIT_UNAVAILABLE_REASON = str(exc)
+        return str(exc)
+    _GIT_UNAVAILABLE_REASON = False
+    return None
+
+
+def _require_git(context: str) -> None:
+    reason = _git_unavailable_reason()
+    if not reason:
+        return
+    msg = f"{context}: need a working git binary ({reason})"
+    if pytest is not None and os.environ.get("PYTEST_CURRENT_TEST"):
+        pytest.skip(msg)
+    raise _SkipCheck(msg)
 
 
 # --- CLI surface: subcommands, removed flags, meta ------------------------------------------
@@ -152,7 +224,7 @@ def test_shim_bootstrap_from_outside_repo_with_pythonpath_cleared():
     shim = Path(REVIEW)
     if not os.access(shim, os.X_OK):
         raise SmokeError(f"shim missing its exec bit: {shim}")
-    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env = {k: v for k, v in _smoke_env().items() if k != "PYTHONPATH"}
     p = subprocess.run([str(shim), "--list-defaults"], capture_output=True, text=True, env=env, cwd=_tmp())
     if p.returncode != 0:
         raise SmokeError(f"shim from outside repo exited {p.returncode}\n{p.stdout}\n{p.stderr}")
@@ -204,6 +276,7 @@ def test_diff_subcommand_and_review_review_pointer():
 
 
 def test_non_git_dir_fails_gracefully_with_stable_code():
+    _require_git("non-git repo error smoke")
     nongit = _tmp()
     p = run("diff", "-C", nongit, stdin="")
     if p.returncode != 3:
@@ -279,6 +352,7 @@ def test_retry_flag_surface_and_export():
     # at parse time, before any backend call. With no staged diff the run exits 1 ("No diff to
     # review") — a CLEAN, non-argparse exit (argparse usage errors are exit 2). So the flag
     # parsed and clamped fine; assert it is NOT a usage error.
+    _require_git("--retry diff smoke")
     empty = _tmp()
     subprocess.run(["git", "init", "-q"], cwd=empty, check=True)
     for val in ("9999", "-4", "0", "3"):
@@ -585,6 +659,10 @@ def test_every_unit_file_is_run():
 
 def test_reviewlib_unit_files():
     for fname, env_spec in _UNIT_FILES:
+        reason = _git_unavailable_reason() if fname in _GIT_REQUIRED_UNIT_FILES else None
+        if reason:
+            print(f"SKIP unit {fname}: need a working git binary ({reason})")
+            continue
         run_unit(fname, env=_unit_env(env_spec))
 
 

@@ -6,7 +6,7 @@ configurable option in `review --help` shows its EFFECTIVE default value, not a 
 description. Pinned here:
 
   * `--model` shows what runs when you DON'T pass -m — the active reviewer board by
-    default, OR the configured `models:` list (the config cascade is reflected);
+    default, OR the configured `models:` priority roster (the config cascade is reflected);
   * `--moderator` shows the auto-pick priority chain (opus -> codex -> gemini), not a bare
     "moderator backend";
   * `--pool` / `--timeout` / `--vision-timeout` print their concrete numeric defaults.
@@ -74,8 +74,9 @@ def test_model_help_shows_the_board_default_when_no_config_models():
 
 
 def test_model_help_reflects_configured_models():
-    # A `models:` list in config.yaml IS the effective default (the flat panel) — the help
-    # must reflect that exact list, not the generic board phrasing.
+    # For `review diff`, a `models:` list is the priority roster that feeds the
+    # failover board. The help must reflect that exact list, not the generic board
+    # phrasing.
     saved = cli.load_config
     cli.load_config = lambda: {"models": ["codex", "gemini"]}
     try:
@@ -83,6 +84,7 @@ def test_model_help_reflects_configured_models():
     finally:
         cli.load_config = saved
     assert "config.yaml models" in text, text
+    assert "priority roster" in text, text
     assert "codex" in text and "gemini" in text, text
 
 
@@ -187,17 +189,24 @@ def _option_strings(parser_help: str) -> str:
 # --- Subcommand-only options belong in the SUBCOMMAND help, not the global list (ROADMAP). -
 VISUAL_FLAGS = ("--visual", "--before", "--intent", "--expect", "--check", "--json",
                 "--strict", "--no-ai", "--no-local-model", "--vision-timeout", "--project")
+VISUAL_SUBCOMMAND_FLAGS = tuple(flag for flag in VISUAL_FLAGS if flag != "--visual")
 
 
 def test_visual_flags_absent_from_global_help_present_on_subcommands():
     opts = _option_strings(_top_level_help())
     for flag in VISUAL_FLAGS:
         assert flag not in opts, (flag, "leaked into the GLOBAL option list")
-    # …and present on every mode parser (the --visual feature rides any subcommand).
+    # …and present on text mode parsers (the --visual feature rides those subcommands).
     for sub in ("diff", "brainstorm", "just-ask", "quorum"):
         mode_opts = _option_strings(_mode_help(sub))
         for flag in VISUAL_FLAGS:
             assert flag in mode_opts, (sub, flag, "missing from the subcommand help")
+    # The canonical visual subcommand takes IMAGE positionally, so it exposes the rest of
+    # the visual group but not the legacy --visual option.
+    visual_opts = _option_strings(_mode_help("visual"))
+    assert "--visual" not in visual_opts, visual_opts
+    for flag in VISUAL_SUBCOMMAND_FLAGS:
+        assert flag in visual_opts, (flag, "missing from review visual help")
 
 
 def test_prompt_is_scoped_to_the_diff_review():

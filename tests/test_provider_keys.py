@@ -300,6 +300,8 @@ def test_commandcode_request_is_openai_shape():
     assert body["model"] == "deepseek/deepseek-v4-flash", body
     assert body["messages"][0]["content"] == "hello"
     assert captured["headers"].get("authorization") == "Bearer cc-secret"
+    assert captured["headers"].get("accept") == "application/json"
+    assert captured["headers"].get("user-agent") == "review-cli/0.1"
     # The default gateway path must NOT carry the raw-DeepSeek `thinking` field.
     assert "thinking" not in body, body
     assert res.returncode == 0 and "cc says hi" in res.stdout

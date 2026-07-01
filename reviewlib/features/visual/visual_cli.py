@@ -1,4 +1,4 @@
-"""`review --visual` standalone dispatch (the §2.1 mode-less case).
+"""`review visual` standalone dispatch.
 
 Owns: running `run_pipeline`, rendering the verdict (human-readable or `--json`), and
 mapping the verdict to the process exit code (§2). Kept out of `reviewlib.cli` so the
@@ -61,7 +61,7 @@ def run_visual_standalone(
         print(json.dumps(out, indent=2))
     else:
         glyph = _GLYPH.get(verdict.final, verdict.final.upper())
-        print(f"[review --visual] {glyph}: {verdict.reason}")
+        print(f"[review visual] {glyph}: {verdict.reason}")
         if verdict.vision_verdict and verdict.vision_verdict != verdict.final:
             print(f"  vision said: {verdict.vision_verdict} (confidence {verdict.confidence:.2f})")
         if verdict.note and verdict.note != verdict.reason:

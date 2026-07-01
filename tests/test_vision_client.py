@@ -57,6 +57,8 @@ def _before_after_blocks():
 def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write_output_file: str | None = None):
     """Monkeypatch reviewlib.process._run_streamed (the seam `_run_cli` uses). Returns the
     old function so the caller can restore it."""
+    import shutil
+
     import reviewlib.process as process
 
     def fake(argv, *, cwd, input_text=None, env=None, timeout=1200, backend="backend", round_no=0, announce=False):
@@ -93,14 +95,19 @@ def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write
         return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr="")
 
     old = process._run_streamed
+    old_which = shutil.which
     process._run_streamed = fake
-    return old
+    shutil.which = lambda name: f"/fake/bin/{name}" if name in ("codex", "claude", "opencode") else old_which(name)
+    return old, old_which
 
 
 def _restore_runner(old):
+    import shutil
+
     import reviewlib.process as process
 
-    process._run_streamed = old
+    process._run_streamed = old[0]
+    shutil.which = old[1]
 
 
 def _staged_image_bytes(cap: dict, flag: str) -> bytes | None:
@@ -162,8 +169,16 @@ def test_claude_cli_references_image_and_enables_read():
     assert argv[0] == "claude" and "-p" in argv
     prompt = argv[argv.index("-p") + 1]
     assert "@" in prompt, "claude prompt must reference the image with @<path>"
-    # Read enabled, write/exec tools denied, output-format json, add-dir for the image dir.
-    assert "--allowedTools" in argv and "Read" in argv
+    # Read is the only enabled tool; the visual wrapper must not pass stale deny-list
+    # names that newer Claude CLIs reject before reading the screenshot.
+    assert "--tools" in argv and argv[argv.index("--tools") + 1] == "Read"
+    assert "--json-schema" in argv
+    assert "--no-session-persistence" in argv
+    assert "--permission-mode" in argv and argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert "--strict-mcp-config" in argv
+    assert "--disable-slash-commands" in argv
+    assert "--safe-mode" in argv
+    assert "--disallowedTools" not in argv
     assert "--output-format" in argv and "json" in argv
     assert "--add-dir" in argv
     # The @<path> in the prompt pointed at a real staged image carrying the PNG bytes.
@@ -487,6 +502,53 @@ def test_selection_prefers_first_reachable_cli():
     finally:
         vc.vision_backend_available = old
     assert vc.select_vision_backend([]) is None
+
+
+def test_select_vision_backends_keeps_ordered_fallbacks_and_rejects_text_glm():
+    old = vc.vision_backend_available
+    vc.vision_backend_available = lambda m: True
+    try:
+        models = [
+            "claude:claude-opus-4-8",
+            "commandcode:zai-org/GLM-5.2",
+            "oc:zai/glm-4.5v",
+            "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        ]
+        assert vc.select_vision_backends(models) == [
+            "claude:claude-opus-4-8",
+            "oc:zai/glm-4.5v",
+            "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        ]
+    finally:
+        vc.vision_backend_available = old
+
+
+def test_call_ai_vision_with_fallback_skips_unusable_primary():
+    calls: list[str | None] = []
+    old = vc.call_ai_vision
+
+    def fake(model, **kwargs):
+        calls.append(model)
+        if model == "claude:claude-opus-4-8":
+            return vc.VisionVerdict(
+                available=True,
+                verdict=None,
+                error="model is currently unavailable",
+                backend=model,
+            )
+        return vc.VisionVerdict(available=True, verdict="keep", confidence=0.91, backend=model)
+
+    vc.call_ai_vision = fake
+    try:
+        verdict = vc.call_ai_vision_with_fallback(
+            ["claude:claude-opus-4-8", "oc:zai/glm-4.5v"],
+            blocks=_blocks(),
+        )
+    finally:
+        vc.call_ai_vision = old
+    assert calls == ["claude:claude-opus-4-8", "oc:zai/glm-4.5v"], calls
+    assert verdict.verdict == "keep"
+    assert verdict.backend == "oc:zai/glm-4.5v"
 
 
 # === Gemini: the ONE REST-key exception (CLI broken) =============================

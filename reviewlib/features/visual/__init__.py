@@ -2,7 +2,7 @@
 
 Stage 1 (core): the deterministic cvGate, the multimodal callAIVision path, the
 policy engine, the contract, and the orchestrating pipeline — plus the three built-in
-modules. `review --visual <image>` runs this standalone (the §2.1 mode-less case) and
+modules. `review visual <image>` runs this standalone and
 the same machinery is threaded into a companion mode's call when `--visual` rides
 `--brainstorm`/`--quorum`/the default diff-review.
 
