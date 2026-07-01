@@ -1376,16 +1376,26 @@ def test_oc_provider_from_model_extracts_prefix():
 
 
 def test_backend_available_oc_anthropic_env_var():
-    """oc:anthropic/model is False without a key, True with ANTHROPIC_API_KEY."""
-    with _EnvSandbox():
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Empty auth.json + no key → unavailable.
-            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
-            os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
-            assert backends.backend_available("oc:anthropic/claude-sonnet-4-5") is False
-            # Set env var → available.
-            os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test"
-            assert backends.backend_available("oc:anthropic/claude-sonnet-4-5") is True
+    """oc:anthropic/model is False without a key, True with ANTHROPIC_API_KEY.
+
+    Mocks _which_optional so the opencode binary appears installed on hosts
+    that don't have it (e.g. CI), keeping the test focused on credential
+    logic rather than binary presence.
+    """
+    saved_which = backends._which_optional
+    backends._which_optional = lambda name: "/fake/bin/opencode" if name == "opencode" else saved_which(name)
+    try:
+        with _EnvSandbox():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Empty auth.json + no key → unavailable.
+                os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+                os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
+                assert backends.backend_available("oc:anthropic/claude-sonnet-4-5") is False
+                # Set env var → available.
+                os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test"
+                assert backends.backend_available("oc:anthropic/claude-sonnet-4-5") is True
+    finally:
+        backends._which_optional = saved_which
 
 
 def test_backend_available_oc_provider_via_auth_json():
