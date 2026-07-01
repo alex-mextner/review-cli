@@ -22,7 +22,7 @@ import concurrent.futures
 import sys
 from pathlib import Path
 
-from ..backends import ReviewResult, backend_available, resolve_backend
+from ..backends import ReviewResult, backend_available, resolve_backend, review_with_images
 from ..config import DEFAULT_POOL_SIZE, BoardReviewer, split_pool_reserve
 from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
@@ -32,6 +32,7 @@ from ..panel import (
     run_board_with_failover,
 )
 from ..retry import retry_default, run_seat_with_retry
+from . import _visual_images
 from .contract import ModeContext, ModeSpec
 
 
@@ -40,6 +41,7 @@ def mode_review(
     board: list[BoardReviewer] | None = None, pool_size: int = DEFAULT_POOL_SIZE,
     outcome_sink: list[FailoverOutcome] | None = None,
     diff_from_stdin: bool = False,
+    visual_images: tuple[Path, ...] = (),
 ) -> int:
     if not diff.strip():
         print("No diff to review.", file=sys.stderr)
@@ -48,7 +50,7 @@ def mode_review(
     if board:
         return _mode_review_board(
             board, prompt, diff, cwd, timeout, staged, pool_size, outcome_sink,
-            diff_from_stdin,
+            diff_from_stdin, visual_images,
         )
 
     # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets in-seat
@@ -60,8 +62,14 @@ def mode_review(
     results: list[ReviewResult] = []
 
     def _run_seat_with_retry(model: str) -> ReviewResult:
+        if not visual_images:
+            return run_seat_with_retry(
+                model, lambda: resolve_backend(model)(model, prompt, diff, cwd, timeout)
+            )
         return run_seat_with_retry(
-            model, lambda: resolve_backend(model)(model, prompt, diff, cwd, timeout)
+            model, lambda: review_with_images(
+                model, prompt, diff, cwd, timeout, 0, visual_images
+            )
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
@@ -107,7 +115,7 @@ def _stamp_if_staged_commit_review(
 def _mode_review_board(
     board: list[BoardReviewer], prompt: str, diff: str, cwd: Path, timeout: int,
     staged: bool, pool_size: int, outcome_sink: list[FailoverOutcome] | None,
-    diff_from_stdin: bool = False,
+    diff_from_stdin: bool = False, visual_images: tuple[Path, ...] = (),
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -135,7 +143,7 @@ def _mode_review_board(
               "PATH).", file=sys.stderr, flush=True)
         return 1
 
-    outcome = run_board_with_failover(pool, reserve, prompt, diff, cwd, timeout)
+    outcome = run_board_with_failover(pool, reserve, prompt, diff, cwd, timeout, visual_images)
     if outcome_sink is not None:
         outcome_sink.append(outcome)
 
@@ -189,12 +197,16 @@ def _handler(ctx: ModeContext) -> int:
         ctx.args.staged,
     )
     if board is None:
-        return mode_review(*base, board=None, diff_from_stdin=diff_from_stdin)
+        return mode_review(
+            *base, board=None, diff_from_stdin=diff_from_stdin,
+            visual_images=_visual_images(ctx),
+        )
     return mode_review(
         *base, board=board,
         pool_size=ctx.extra.get("pool_size", DEFAULT_POOL_SIZE),
         outcome_sink=ctx.extra.get("outcome_sink"),
         diff_from_stdin=diff_from_stdin,
+        visual_images=_visual_images(ctx),
     )
 
 

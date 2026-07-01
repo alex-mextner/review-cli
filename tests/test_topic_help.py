@@ -59,6 +59,8 @@ def test_help_config_prints_the_config_reference():
     # Names the real config file path + the keys + the cascade + the keys/auth section.
     assert str(CONFIG_PATH) in out, out
     assert "models:" in out and "brainstorm_models:" in out and "board:" in out, out
+    assert "priority roster" in out, out
+    assert "bypassed only by explicit -m" in out, out
     assert "SELECTION CASCADE" in out, out
     # qa is in the cascade and is documented as IGNORING models:/defaults, using
     # REVIEW_QA_TESTER / a bare -m codex|claude (review-cli#61).

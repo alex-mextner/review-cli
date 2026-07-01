@@ -36,6 +36,7 @@ from reviewlib.config import (  # noqa: E402
     GLM_COMMANDCODE_SEAT,
     KIMI_SEAT,
     REVIEW_ROLES,
+    VISUAL_MODELS,
     BoardConfigError,
     BoardReviewer,
     _agentic,
@@ -186,6 +187,22 @@ def test_default_pool_roles_are_distinct_no_lens_lost():
 
 def test_default_board_has_nine_seats():
     assert len(DEFAULT_BOARD) == 9, len(DEFAULT_BOARD)
+
+
+def test_visual_models_have_separate_priority_from_review_board():
+    """Visual review has its own priority list: Opus first, then vision-capable
+    fallbacks, including a GLM vision model rather than the text-only GLM-5.2 seat."""
+    assert VISUAL_MODELS[0] == "claude:claude-opus-4-8", VISUAL_MODELS
+    assert "commandcode:zai-org/GLM-5.2" not in VISUAL_MODELS, VISUAL_MODELS
+    assert any("glm-4.5v" in model.lower() or "glm-4.6v" in model.lower() for model in VISUAL_MODELS), VISUAL_MODELS
+    assert all(
+        "vision" in model.lower()
+        or "kimi" in model.lower()
+        or "glm-4." in model.lower()
+        or "opus" in model.lower()
+        or model == "gemini"
+        for model in VISUAL_MODELS
+    ), VISUAL_MODELS
 
 
 # === No dead Fireworks/glide provider in the defaults (review-cli#25) ============
@@ -938,45 +955,50 @@ def test_cli_no_board_flag_is_gone():
         sys.stdin = old_stdin
 
 
-def test_cli_config_models_beat_board():
-    """An explicit `models:` in config.yaml OVERRIDES the default board: the user
-    configured exact models, so the paid board must NOT run (cost-safety). The
-    precedence is explicit -m > config `models:` > default board."""
+def test_cli_config_models_form_priority_board():
+    """A config `models:` list is the priority roster for the diff-review board.
+
+    It must NOT take the legacy flat path: `review diff` still gets a board, `--pool`
+    still sizes the active pool, and the remaining configured models are reserve seats.
+    Only explicit CLI `-m` is the exact flat override."""
     from reviewlib import cli
 
     captured: dict = {}
 
-    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None,
+                          pool_size=DEFAULT_POOL_SIZE, **kw):
         captured["models"] = models
         captured["board"] = board
+        captured["pool_size"] = pool_size
         return 0
 
     old = _review_mod.mode_review
     _review_mod.mode_review = _fake_mode_review
-    # Inject a config with an explicit `models:` list (and a `board:` too, to prove
-    # the board is ignored when models: is configured). load_board must NOT be hit.
     old_load_config = cli.load_config
-    cli.load_config = lambda: {"models": ["codex", "gemini"], "board": list(DEFAULT_BOARD)}
-    old_load_board = cli.load_board
-
-    def _boom(_cfg):
-        raise AssertionError("load_board must not be called when config models: is set")
-
-    cli.load_board = _boom
+    cli.load_config = lambda: {"models": ["codex", "gemini", "commandcode:deepseek/deepseek-v4-pro"]}
     old_stdin = sys.stdin
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        cli.main(["diff", "-C", str(REPO_ROOT)])
-        assert captured["board"] is None, captured["board"]
-        # The configured models flow through (alias-expanded, here identity).
-        assert captured["models"] == ["codex", "gemini"], captured["models"]
+        cli.main(["diff", "--pool", "2", "-C", str(REPO_ROOT)])
+        assert captured["board"] is not None, captured
+        assert [r.model for r in captured["board"]] == [
+            "codex",
+            "gemini",
+            "commandcode:deepseek/deepseek-v4-pro",
+        ], captured["board"]
+        assert captured["pool_size"] == 2, captured["pool_size"]
+        # The flat model list is still passed for compatibility, but the board path wins.
+        assert captured["models"] == [
+            "codex",
+            "gemini",
+            "commandcode:deepseek/deepseek-v4-pro",
+        ], captured["models"]
     finally:
         _review_mod.mode_review = old
         cli.load_config = old_load_config
-        cli.load_board = old_load_board
         sys.stdin = old_stdin
 
 
@@ -1048,7 +1070,7 @@ def test_cli_all_malformed_board_errors_nonzero():
 
 
 def test_cli_standalone_visual_ignores_malformed_board():
-    """(codex P2) Standalone `review --visual image` (no diff) does NOT use the reviewer
+    """(codex P2) Standalone `review visual image` (no diff) does NOT use the reviewer
     board, so a present-but-malformed `board:` must NOT block it — board validation runs
     only on the board path, after the standalone pipeline has had its chance."""
     from reviewlib import cli
@@ -1133,9 +1155,8 @@ def _capture_default_review_board(argv: list[str]) -> dict:
     old = _review_mod.mode_review
     _review_mod.mode_review = _fake_mode_review
     # Pin the board to DEFAULT_BOARD AND stub load_config to an empty dict so the
-    # test is independent of the dev machine's ~/.config/review-cli/config.yaml —
-    # which DOES set `models:`, and a configured `models:` now (correctly) disables
-    # the board. The true default path has neither -m nor config models.
+    # test is independent of the dev machine's ~/.config/review-cli/config.yaml.
+    # The true default path has neither -m nor config models.
     old_load_board = cli.load_board
     cli.load_board = lambda _cfg: list(DEFAULT_BOARD)
     old_load_config = cli.load_config
@@ -1258,6 +1279,33 @@ def test_show_board_tags_by_seat_not_model_for_duplicate_models():
     assert "[pool" in seat_lines[0]
     assert "[reserve]" in seat_lines[1], seat_lines[1]  # the duplicate codex, by seat
     assert "[reserve]" in seat_lines[2]
+
+
+def test_show_board_uses_config_models_as_priority_roster():
+    """`review --show-board` must reflect config `models:` as the active priority roster,
+    not silently show the unrelated built-in board."""
+    import contextlib
+    import io
+
+    from reviewlib import cli
+
+    cfg = {"models": ["codex", "gemini", "commandcode:deepseek/deepseek-v4-pro"]}
+    old_avail = backends.backend_available
+    backends.backend_available = lambda _m: True
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = cli._show_board(cfg, 2)
+    finally:
+        backends.backend_available = old_avail
+    assert rc == 0, rc
+    out = buf.getvalue()
+    assert "source: config.yaml (models:)" in out, out
+    seat_lines = [ln for ln in out.splitlines() if "[pool" in ln or "[reserve]" in ln]
+    assert ["codex" in seat_lines[0], "gemini" in seat_lines[1],
+            "commandcode:deepseek/deepseek-v4-pro" in seat_lines[2]] == [True, True, True], seat_lines
+    assert "[pool" in seat_lines[0] and "[pool" in seat_lines[1], seat_lines
+    assert "[reserve]" in seat_lines[2], seat_lines
 
 
 def test_cli_list_defaults_reports_normalized_config_models(capfd=None):

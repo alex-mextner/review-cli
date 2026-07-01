@@ -13,8 +13,8 @@ Proves (mocking call_ai_vision):
     the active modules' vision_questions folded into the request;
   * the grounded observation (the model's note + verdict + module answers) is woven into
     each persona's / voter's prompt — asserted by capturing the mode call;
-  * fan-out is robust: if no vision backend is configured (available=False) the mode
-    still runs with the cvGate-described note (degrade, never crash);
+  * fan-out is fail-closed: if a required vision call is unavailable/unusable the
+    companion text mode is blocked instead of pretending the screenshot was reviewed;
   * standalone pipeline path is unchanged (still one vision call).
 """
 from __future__ import annotations
@@ -28,9 +28,11 @@ sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 import visual_fixtures as vf  # noqa: E402
 from reviewlib import cli  # noqa: E402
+from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.features.visual import compose as cmp  # noqa: E402
 from reviewlib.features.visual.vision_client import VisionVerdict  # noqa: E402
 from reviewlib.modes import brainstorm as _brainstorm_mod  # noqa: E402
+from reviewlib.modes import just_ask as _just_ask_mod  # noqa: E402
 from reviewlib.modes import quorum as _quorum_mod  # noqa: E402
 
 
@@ -147,9 +149,9 @@ def test_quorum_voters_see_grounded_observation():
     assert "GROUNDED-SIGHT: button is centered" in captured["question"]
 
 
-def test_fanout_degrades_when_no_vision_backend():
-    """No vision backend configured (available=False) → the mode still runs, with the
-    cvGate-described note (never a crash, never a hard block on a pass-through)."""
+def test_fanout_can_be_explicitly_cv_only_when_no_vision_backend():
+    """No vision backend is allowed only when the caller explicitly disables required
+    vision, matching --no-ai's cvGate-only/offline path."""
     old_call = cmp.call_ai_vision
     old_select = cmp.select_vision_backend
     cmp.select_vision_backend = lambda models: None  # no vision backend
@@ -159,13 +161,138 @@ def test_fanout_degrades_when_no_vision_backend():
 
     cmp.call_ai_vision = fake_call
     try:
-        comp = cmp.build_mode_visual_context(Path(_styled()), models=[])
+        comp = cmp.build_mode_visual_context(Path(_styled()), models=[], require_vision=False)
     finally:
         cmp.call_ai_vision = old_call
         cmp.select_vision_backend = old_select
     assert comp.observation is None
+    assert comp.vision_error == ""
     assert "ATTACHED RENDER" in comp.context_note  # cvGate-described note still present
     assert comp.prefilter_verdict is None  # styled pass-through, not blocked
+
+
+def test_invalid_fanout_does_not_claim_grounded_observation():
+    """A configured vision backend that returns no usable verdict is not a grounded
+    observation. It must be surfaced as an unverified visual run, never as "vision saw it"."""
+    cap: dict = {}
+    old = _patch_vision(
+        VisionVerdict(
+            available=True,
+            verdict=None,
+            confidence=0.0,
+            error="CLI returned no parseable JSON verdict",
+            backend="gemini",
+        ),
+        cap,
+    )
+    try:
+        comp = cmp.build_mode_visual_context(Path(_styled()), models=["gemini"])
+    finally:
+        _restore(*old)
+    assert comp.observation is None
+    assert "no parseable JSON" in comp.vision_error
+    assert "vision model SAW this screenshot" not in comp.context_note
+    assert "ATTACHED RENDER UNVERIFIED" in comp.context_note
+
+
+def test_fanout_skips_unusable_opus_to_glm_vision_fallback():
+    calls: list[str] = []
+    old_call = cmp.call_ai_vision
+    old_select = cmp.select_vision_backend
+    old_select_all = cmp.select_vision_backends
+
+    def fake_call(model, **kwargs):
+        calls.append(model)
+        if model == "claude:claude-opus-4-8":
+            return VisionVerdict(
+                available=True,
+                verdict=None,
+                error="model is currently unavailable",
+                backend=model,
+            )
+        return VisionVerdict(
+            available=True,
+            verdict="keep",
+            confidence=0.92,
+            note="GLM saw the rendered dashboard",
+            backend=model,
+        )
+
+    cmp.call_ai_vision = fake_call
+    cmp.select_vision_backend = lambda models: "claude:claude-opus-4-8"
+    cmp.select_vision_backends = lambda models: ["claude:claude-opus-4-8", "oc:zai/glm-4.5v"]
+    try:
+        comp = cmp.build_mode_visual_context(
+            Path(_styled()),
+            models=["claude:claude-opus-4-8", "oc:zai/glm-4.5v"],
+        )
+    finally:
+        cmp.call_ai_vision = old_call
+        cmp.select_vision_backend = old_select
+        cmp.select_vision_backends = old_select_all
+    assert calls == ["claude:claude-opus-4-8", "oc:zai/glm-4.5v"], calls
+    assert comp.observation is not None
+    assert comp.observation.backend == "oc:zai/glm-4.5v"
+    assert "GLM saw the rendered dashboard" in comp.context_note
+
+
+def test_companion_invalid_vision_blocks_the_mode():
+    """End-to-end through the CLI: if the companion fan-out vision call is unusable,
+    the text mode must not run and launder the failure into a normal answer."""
+    cap: dict = {}
+    old = _patch_vision(
+        VisionVerdict(
+            available=True,
+            verdict=None,
+            confidence=0.0,
+            error="CLI returned no parseable JSON verdict",
+            backend="gemini",
+        ),
+        cap,
+    )
+    called = {"n": 0}
+
+    def fake_just_ask(question, *a, **k):
+        called["n"] += 1
+        return 0
+
+    old_ja = _just_ask_mod.mode_just_ask
+    _just_ask_mod.mode_just_ask = fake_just_ask
+    try:
+        rc_strict = cli.main(["just-ask", "describe", "--visual", _styled(), "--strict", "-C", str(REPO_ROOT)])
+        rc_advisory = cli.main(["just-ask", "describe", "--visual", _styled(), "-C", str(REPO_ROOT)])
+    finally:
+        _just_ask_mod.mode_just_ask = old_ja
+        _restore(*old)
+    assert called["n"] == 0, "the mode must not run when the visual fan-out is unusable"
+    assert rc_strict == 10
+    assert rc_advisory == 1
+
+
+def test_companion_panel_job_receives_raw_visual_image():
+    """The companion text seat receives the actual image path in PanelJob.images so
+    image-capable backends can inspect pixels directly, not only the vision summary."""
+    cap: dict = {}
+    old = _patch_vision(
+        VisionVerdict(available=True, verdict="keep", confidence=0.9, note="looks styled", backend="gemini"),
+        cap,
+    )
+    captured = {}
+
+    def fake_run_panel(jobs, cwd, timeout):
+        captured["images"] = jobs[0].images
+        return [ReviewResult(model=jobs[0].model, command="fake", returncode=0, stdout="ok", stderr="")]
+
+    old_panel = _just_ask_mod.run_panel
+    _just_ask_mod.run_panel = fake_run_panel
+    image = Path(_styled())
+    try:
+        rc = cli.main(["just-ask", "describe", "--visual", str(image), "-C", str(REPO_ROOT)])
+    finally:
+        _just_ask_mod.run_panel = old_panel
+        _restore(*old)
+    assert rc == 0
+    assert captured["images"] == (image,)
 
 
 if __name__ == "__main__":

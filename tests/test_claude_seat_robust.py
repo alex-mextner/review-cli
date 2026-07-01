@@ -216,6 +216,98 @@ def test_review_claude_cli_strips_captured_verdict_and_wires_env():
     assert "claude --print" in res.command
 
 
+def test_review_claude_cli_with_images_enables_scoped_read_and_refs_file():
+    import tempfile
+
+    captured = {}
+    trusted: list[Path] = []
+
+    def _fake_run_streamed(argv, *, cwd, input_text, env, timeout, backend, round_no, announce):
+        captured["argv"] = argv
+        captured["cwd"] = Path(cwd)
+        captured["input_text"] = input_text
+        add_dir = Path(argv[argv.index("--add-dir") + 1])
+        refs = [part[1:] for part in input_text.split() if part.startswith("@")]
+        assert add_dir.is_dir()
+        assert refs and Path(refs[0]).is_file()
+        assert Path(refs[0]).parent == add_dir
+        assert Path(cwd) == add_dir
+        return ReviewResult(model="x", command="x", returncode=0, stdout="I saw the pixels", stderr="")
+
+    saved_run = _backends._run_streamed
+    saved_which = _backends._which_optional
+    saved_trust = _backends._ensure_workspace_trusted
+    _backends._run_streamed = _fake_run_streamed
+    _backends._which_optional = lambda name: "/bin/claude" if name == "claude" else None
+    _backends._ensure_workspace_trusted = lambda cwd: trusted.append(Path(cwd))
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            image = root / "shot.png"
+            image.write_bytes(b"\x89PNG\r\n\x1a\n")
+            res = _backends.review_claude_cli_with_images(
+                "claude:claude-opus-4-8", "review this screenshot", "", root, 30,
+                images=(image,),
+            )
+    finally:
+        _backends._run_streamed = saved_run
+        _backends._which_optional = saved_which
+        _backends._ensure_workspace_trusted = saved_trust
+
+    argv = captured["argv"]
+    assert argv[argv.index("--tools") + 1] == "Read"
+    assert "--add-dir" in argv
+    add_dir = Path(argv[argv.index("--add-dir") + 1])
+    assert captured["cwd"] == add_dir
+    assert root not in trusted
+    assert add_dir in trusted
+    assert "=== RAW VISUAL ATTACHMENT ===" in captured["input_text"]
+    assert "image @refs" in res.command
+    assert res.stdout == "I saw the pixels"
+
+
+def test_review_claude_cli_with_images_falls_back_when_no_image_can_be_staged():
+    import tempfile
+
+    captured = {}
+
+    def _fake_review_claude_cli(model, prompt, diff, cwd, timeout, round_no=0):
+        captured["model"] = model
+        captured["prompt"] = prompt
+        captured["diff"] = diff
+        captured["cwd"] = Path(cwd)
+        captured["timeout"] = timeout
+        captured["round_no"] = round_no
+        return ReviewResult(model=model, command="text-only", returncode=0, stdout="fallback", stderr="")
+
+    saved_review = _backends.review_claude_cli
+    saved_run = _backends._run_streamed
+    saved_which = _backends._which_optional
+    saved_trust = _backends._ensure_workspace_trusted
+    _backends.review_claude_cli = _fake_review_claude_cli
+    _backends._run_streamed = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("image path should not run"))
+    _backends._which_optional = lambda name: "/bin/claude" if name == "claude" else None
+    _backends._ensure_workspace_trusted = lambda cwd: None
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            missing = root / "missing.png"
+            res = _backends.review_claude_cli_with_images(
+                "claude:claude-opus-4-8", "review", "diff", root, 30, round_no=4,
+                images=(missing,),
+            )
+    finally:
+        _backends.review_claude_cli = saved_review
+        _backends._run_streamed = saved_run
+        _backends._which_optional = saved_which
+        _backends._ensure_workspace_trusted = saved_trust
+
+    assert res.command == "text-only"
+    assert res.stdout == "fallback"
+    assert captured["cwd"] == root
+    assert captured["round_no"] == 4
+
+
 def test_have_claude_cli_true_with_either_binary():
     saved = _backends._which_optional
     try:

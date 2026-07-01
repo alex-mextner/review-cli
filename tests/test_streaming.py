@@ -113,6 +113,27 @@ def test_timeout_preserves_partial_output():
     assert "TIMEOUT" in result.stdout, "TIMEOUT marker missing from the preserved buffer"
 
 
+def test_silent_child_can_think_until_requested_timeout():
+    """No output is not itself a hang signal; only the requested timeout can stop it."""
+    code = "import time\n" "time.sleep(1.2)\n" "print('done', flush=True)\n"
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=5,
+        backend="fakethink",
+        round_no=8,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert elapsed >= 1.0, f"silent thinking was cut short after {elapsed:.2f}s"
+    assert "done" in result.stdout
+    assert "TIMEOUT" not in result.stdout
+
+
 def test_flushed_partial_line_survives_timeout():
     """Output that is FLUSHED without a trailing newline must still be captured.
 

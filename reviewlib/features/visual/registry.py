@@ -5,12 +5,12 @@ A project ships a manifest at a well-known path inside its tree:
     <project>/.review/visual-modules.json
 
 declaring contributed `VisualModule`s (name + entry file + `activates_on` tags). At
-run time `review --visual … --project <dir>` (default `--cwd`) discovers the manifest,
+run time `review visual … --project <dir>` (default `--cwd`) discovers the manifest,
 resolves each `entry` relative to the project, loads it, and folds its `cv_check` /
 `vision_questions` / `judge` into the same pipeline the built-in modules use.
 
 SECURITY NOTE — a project visual-module is EXECUTABLE CODE that review will run. Only
-run `review --visual` on repos you trust (your own repos, or code you have read). The
+run `review visual` on repos you trust (your own repos, or code you have read). The
 common case — reviewing your OWN repositories — is trusted by construction, so by
 DEFAULT a discovered module loads and runs with **zero ceremony**: no `trust-module`
 step, no quarantine.

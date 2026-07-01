@@ -311,10 +311,12 @@ def test_cli_default_review_staged_nonrepo_fails_gracefully():
     from reviewlib.modes import review as review_mod
 
     old_git = cli._git_diff
+    old_is_git_repo = cli._is_git_repo
     old_load_config = cli.load_config
     old_mr = review_mod.mode_review
     old_env = os.environ.get("GEMINI_ENV_FILE")
     cli._git_diff = _git_raises
+    cli._is_git_repo = lambda _cwd: True
     cli.load_config = lambda: {}
     ran = {"review": False}
 
@@ -343,6 +345,7 @@ def test_cli_default_review_staged_nonrepo_fails_gracefully():
         assert not ran["review"], "the review handler must NOT run on a failed/empty diff"
     finally:
         cli._git_diff = old_git
+        cli._is_git_repo = old_is_git_repo
         cli.load_config = old_load_config
         review_mod.mode_review = old_mr
         sys.stdin = old_stdin

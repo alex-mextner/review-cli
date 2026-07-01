@@ -2,7 +2,7 @@
 
     contract → cvGate → [optional local pre-classifier] → visionClient → policyEngine → verdict
 
-This is the mode-less pass of §2.1: `review --visual shot.png` with no companion mode.
+This is the standalone pass of §2.1: `review visual shot.png`.
 When a companion mode is present, the CLI does NOT run this pipeline as an isolated
 pass — it threads the image + the active modules' questions into that mode's model call
 (see `reviewlib.cli`). The per-stage machinery here is the same machinery a companion
@@ -28,11 +28,13 @@ from .policy_engine import Verdict, decide_from_cv, decide_from_vision
 from .preclassifier import KnownGoodCache, modules_signature
 from .vision_client import (
     VisionBlock,
+    VISION_VERDICTS,
     build_output_schema,
     call_ai_vision,
     capability_for,
     encode_image,
     select_vision_backend,
+    select_vision_backends,
 )
 
 
@@ -165,7 +167,8 @@ def run_pipeline(
     # resolve to a different backend, and a keep cached under backend A must NOT
     # short-circuit a run that now selects backend B (codex P2). `no_ai` skips vision, so
     # only resolve when we may actually call it.
-    backend = None if no_ai else select_vision_backend(models or [])
+    vision_backends = [] if no_ai else _ordered_vision_backends(models or [])
+    backend = vision_backends[0] if vision_backends else None
     # The context key MUST fold in EVERY verdict input a cached keep is conditioned on
     # (codex P1/P2): project + intent + expect + the active --check set + the --before
     # baseline + a signature of the ACTIVE modules (names + source hashes) + the SELECTED
@@ -209,8 +212,8 @@ def run_pipeline(
     schema = build_output_schema(_vision_field_names(modules))
     cap = capability_for(backend) if backend else None
     blocks = _build_blocks(after, before, expectation, signals, questions, cap)
-    vision = call_ai_vision(
-        backend, blocks=blocks, expectation=expectation, cv_signals=signals,
+    vision = _call_ai_vision_with_fallback(
+        vision_backends, blocks=blocks, expectation=expectation, cv_signals=signals,
         output_schema=schema, timeout_s=vision_timeout,
     )
 
@@ -259,3 +262,23 @@ def _image_block(image, label: str, cap) -> VisionBlock:
     else:
         data, media_type = image.read_bytes(), detect_media_type(image)
     return VisionBlock(kind="image", label=label, media_type=media_type, data_base64=encode_image(data))
+
+
+def _ordered_vision_backends(models: list[str]) -> list[str]:
+    first = select_vision_backend(models)
+    if first is None:
+        return []
+    ordered = select_vision_backends(models)
+    return [first] + [model for model in ordered if model != first]
+
+
+def _call_ai_vision_with_fallback(models: list[str], **kwargs) -> object:
+    last = None
+    for model in models:
+        verdict = call_ai_vision(model, **kwargs)
+        if verdict.available and verdict.verdict in VISION_VERDICTS:
+            return verdict
+        last = verdict
+    if last is not None:
+        return last
+    return call_ai_vision(None, **kwargs)

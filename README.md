@@ -88,8 +88,9 @@ review diff -o review.md
 
 > **Modes moved from flags to subcommands.** The old `--brainstorm` / `--quorum` /
 > `--just-ask` flags are gone — use the `brainstorm` / `quorum` / `just-ask`
-> subcommands. The flags now print a one-line pointer and exit non-zero. `--visual` stays
-> a **composable flag** (not a mode): it rides any subcommand (e.g. `review diff --visual`).
+> subcommands. The flags now print a one-line pointer and exit non-zero. Visual review is
+> **`review visual IMAGE`**; `--visual` remains a composable attachment for text modes
+> such as `review brainstorm "is this good?" --visual IMAGE`.
 
 > **Write to a file with `-o file.md`, not `review … > file.md`.** Under zsh
 > `noclobber` (a common default), `> file.md` refuses to overwrite an existing file
@@ -461,7 +462,7 @@ small local-only JSON endpoints (`GET /api/runs|stats|runs/<id>`, `POST .../feed
 
 ---
 
-## `review diff --visual` — visual verification
+## `review visual` — visual verification
 
 **Give it a screenshot; it judges keep / rollback / repair.** `--visual` is image-only
 visual verification: pixels in → verdict out. There is **no DOM, no page, no capture** —
@@ -485,21 +486,24 @@ self-decides and the local model never overrides it.
 
 ![review --visual cases — REPORTS-unstyled (top) vs no-report-styled (bottom)](docs/assets/visual-cases.png)
 
-*What `review diff --visual <image>` reports across real renders. Top row: unstyled / blank / FOUC /
+*What `review visual <image>` reports across real renders. Top row: unstyled / blank / FOUC /
 error-overlay renders the detector flags (each one would block a `tg --photo` send). Bottom row:
 properly-styled renders it stays quiet on. (The grid's title art is the tool's old standalone
 name "styleprobe" in older copies — it is the `--visual` detector.)*
 
-### Composable flag, not a mode
+### Standalone and Composable
 
-`--visual` is **orthogonal** to the four review modes — it is a **composable flag** on
-any subcommand (`brainstorm` / `quorum` / `just-ask` / `diff`), so the personas /
-voters / reviewer literally **see** the image as multimodal context, or it runs
-standalone:
+`review visual <image>` is the canonical standalone verdict pipeline. Add `--diff` or
+`--staged` when you want the screenshot judged together with the current diff. `--visual`
+remains a composable flag on text modes (`brainstorm` / `quorum` / `just-ask` / `diff`),
+so personas / voters / reviewers literally **see** the image as multimodal context:
 
 ```bash
 # Standalone — pure verdict pipeline on one render (no diff present)
-review diff --visual after.png
+review visual after.png
+
+# Standalone visual plus the working-tree diff as context
+review visual after.png --diff
 
 # The brainstorm personas see the screenshot and reason about it
 review brainstorm "is this layout good?" --visual after.png
@@ -507,13 +511,17 @@ review brainstorm "is this layout good?" --visual after.png
 # Every quorum voter gets the image as shared context
 review quorum "ship this UI?" --visual after.png
 
-# Diff review with the rendered result attached as evidence (a diff present)
-review diff --visual after.png
+# Diff review with the rendered result attached as evidence
+review visual after.png --diff
 ```
 
-When a companion mode is present the image and the active modules' visual questions are folded
-into **that mode's** model call — there is no separate isolated visual run. The standalone
-verdict pipeline (and its exit codes below) fires only in the mode-less case.
+When a companion mode is present, Claude CLI seats can receive the raw screenshot
+attachment, and every seat receives the grounded visual observation from a companion vision
+fan-out. The standalone verdict pipeline (and its exit codes below) fires only in the
+mode-less case. If that companion visual fan-out cannot produce a usable grounded
+observation, review blocks the companion text mode instead of returning a normal answer that
+merely describes cvGate signals. Use `--no-ai` only when you explicitly want the offline
+CV-only path.
 
 ### Vision backends
 
@@ -524,7 +532,11 @@ exception**: its CLI is broken, so the Gemini vision call stays on the REST API 
 (`GEMINI_API_KEY`), same as review's text Gemini backend. Vision requires a vision-capable
 model on whatever backend you pick — review never silently uses a text-only model to "verify"
 an image. (For router backends like opencode, that means selecting a vision model explicitly,
-e.g. `oc:<provider>/<vision-model>`.) `--no-local-model` disables the local cache pre-classifier (the
+e.g. `oc:<provider>/<vision-model>`.) Visual defaults are separate from the text reviewer
+board: Opus is tried first, then vision-capable fallbacks including GLM vision
+(`oc:zai/glm-4.5v`). If Opus is unavailable at runtime, review skips to the next visual
+backend instead of failing while a fallback exists. Override with `visual_models:` in
+config or `-m` on the command. `--no-local-model` disables the local cache pre-classifier (the
 cost-saver) and forces every cvGate pass-through to the paid AI-vision call.
 
 ### Modules
@@ -552,11 +564,12 @@ short-circuiting before any vision call.
 
 ### `tg --photo` hook
 
-`tg` can run `review diff --visual` as a **pre-send hook** to block an unstyled / broken screenshot
+`tg` can run `review visual` as a **pre-send hook** to block an unstyled / broken screenshot
 before it reaches Telegram — turning the often-violated "review screenshots before sending" rule
-into an enforced mechanism. The hook runs `review diff --visual <png> --json --strict`; a `rollback`
-verdict (exit 10) drops the photo, a `keep` lets it through, and a no-vision `human_review` /
-`unverified` fails *open* (warn + allow) so a missing key never bricks sends. See the
+into an enforced mechanism. The hook runs `review visual <png> --json --strict`; a `rollback`
+verdict (exit 10) drops the photo, a `keep` lets it through, and no-vision
+`human_review` / `unverified` also fail closed under `--strict` so an unverified screenshot
+does not silently pass the send gate. See the
 `feat-tg-photo-visual-hook` branch and `docs/architecture-visual-verification.md` §7.
 
 ### Exit codes
@@ -787,6 +800,7 @@ the diff review is `review diff`.
 ```
 SUBCOMMANDS
 diff                Diff review across the reviewer board (requires a diff).
+visual IMAGE        Visual verification for a screenshot; add --diff to include git diff.
 brainstorm TOPIC    Multi-round persona ideation; composable with --diff/--staged grounding.
 just-ask QUESTION   Single-shot multi-model answer to a question (diff optional).
 quorum QUESTION     Experts cite evidence + a moderator finds quorum/disagreement.
@@ -818,10 +832,11 @@ SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
 --moderator M       (quorum / brainstorm) Override the auto-picked moderator.
 --rounds N          (brainstorm) Minimum rounds before STOP is allowed (default 5).
 --max-rounds N      (brainstorm) Hard cap on rounds (default 8).
---visual IMAGE …    Composable visual-verification group (NOT a mode): attach/verify a
-                    render; rides any subcommand (e.g. `review diff --visual shot.png`).
+--visual IMAGE …    Composable visual-verification group for text modes: attach/verify a
+                    render; rides subcommands such as `review brainstorm "Q" --visual shot.png`.
                     Companions: --before/--intent/--expect/--check/--json/--strict/--no-ai/
-                    --no-local-model/--vision-timeout/--project. See `review <mode> --help`.
+                    --no-local-model/--vision-timeout/--project. For standalone use
+                    `review visual IMAGE [--diff]`. See `review <mode> --help`.
 ```
 
 > **Modes are subcommands, not flags.** `--brainstorm` / `--quorum` / `--just-ask` were
@@ -836,8 +851,8 @@ SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
 Personal defaults live in `~/.config/review-cli/config.yaml`:
 
 ```yaml
-# Backends used by plain `review` and panel modes. Setting `models:` OVERRIDES the
-# default reviewer board (see "Board vs. models precedence") — you get exactly these.
+# Priority roster for `review diff`: the first available seats fill the live pool and the
+# rest are reserve. just-ask/quorum use this same list as their flat default panel.
 models:
   - codex
   - fable5
@@ -847,6 +862,14 @@ brainstorm_models:
   - codex
   - gemini
   - fable5
+
+# Visual review uses a separate priority list from the text reviewer board.
+# Opus is tried first; unavailable/unusable vision calls fall through to the next seat.
+visual_models:
+  - claude:claude-opus-4-8
+  - oc:zai/glm-4.5v
+  - oc:commandcode/moonshotai/Kimi-K2.7-Code
+  - gemini
 ```
 
 Run `review --list-defaults` to see the effective (normalized) models after config is
@@ -967,24 +990,26 @@ review diff -m codex -m gemini   # an explicit -m bypasses the board entirely (e
 
 ### Board vs. models precedence
 
-The board is the default **only when you have not expressed a model preference**.
-Precedence (cost-safety first — the board never runs against your wishes):
+The diff-review board is always the failover mechanism unless you pass exact CLI models.
+Precedence:
 
 ```
-explicit -m on the CLI   >   `models:` in config.yaml   >   default board (failover pool)
+explicit -m exact panel   >   `models:` priority roster   >   configured/default board
 ```
 
-- A `models:` list in `config.yaml` **overrides the board**: you configured exact
-  models, so `review` runs exactly those (the flat panel, no failover), not the board.
-- The board runs whenever there is **no** `-m` and **no** `models:`. It can **never**
-  be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover pool
-  (default 4; `--pool 0`/`--pool 8` runs all available seats).
+- A `models:` list in `config.yaml` is the **full priority roster** for `review diff`:
+  the first available models fill the live pool, and lower-priority models are reserve
+  backfill. It does not disable board/failover.
+- Only explicit `-m` on the CLI is the exact flat override. The board can otherwise
+  never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
+  pool (default 4; `--pool 0`/`--pool 8` runs all available seats).
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
-  preference — the board still applies.
+  roster — the configured/default board applies.
 
 Override the board itself in `config.yaml` with a `board:` list — each entry is a
-`{model, role}` mapping (optional `name:` for the label). **List the models in priority
-order** (the first entry is the highest priority); the failover pool fills from the top.
+`{model, role}` mapping (optional `name:` for the label). When `models:` is present,
+`board:` supplies role/name metadata for matching models; priority still comes from
+`models:`. When `models:` is absent, `board:` is the full priority-ordered board.
 An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
 warning); a single malformed entry is skipped (the valid ones are kept). With **no**
 `board:` configured, the built-in 9-seat priority board above applies. A `board:` that is
@@ -1042,9 +1067,10 @@ probe unavailable at startup (the board fills the pool from the next reserve); a
 **provider auth** (opencode present but the `commandcode`/`zai` provider not logged in) is
 NOT caught by the startup probe — it surfaces at run time and triggers a **mid-run reserve
 backfill**. Either way the board degrades gracefully rather than blocking. The default GLM
-seat pins `oc:zai/glm-5.2` (the
-flagship); to run an older GLM, override the seat in a `config.yaml` `board:` list (e.g.
-`{ model: "oc:zai/glm-5.1", role: quality }`).
+seat pins `oc:zai/glm-5.2` (the flagship). It uses the same per-seat `--timeout` as
+every other backend; no-output thinking time is allowed until that timeout expires, then
+reserve backfill can take over. To run an older GLM, override the seat in a `config.yaml`
+`board:` list (e.g. `{ model: "oc:zai/glm-5.1", role: quality }`).
 
 **`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
 set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or

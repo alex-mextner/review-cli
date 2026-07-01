@@ -5,8 +5,15 @@ decomposition — zero behaviour change).
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def _diff_context_block(diff: str) -> str:
     if not diff.strip():
         return ""
     return f"\n\nAdditional context — a git diff:\n\n```diff\n{diff}\n```"
+
+
+def _visual_images(ctx) -> tuple[Path, ...]:
+    image_path = getattr(getattr(ctx, "visual_ctx", None), "image_path", None)
+    return (Path(image_path),) if image_path else ()

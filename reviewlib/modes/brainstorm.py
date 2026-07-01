@@ -25,6 +25,7 @@ from ..panel import (
     run_panel,
 )
 from ..process import log_dir
+from . import _visual_images
 from .contract import ModeContext, ModeSpec
 
 # Stable, distinct exit code for "the panel backends produced nothing" (dead / credential-less
@@ -153,6 +154,7 @@ def mode_brainstorm(
     start_round: int = 1,
     resume_log: Path | None = None,
     synthesize_only: bool = False,
+    visual_images: tuple[Path, ...] = (),
 ) -> int:
     """Run (or RESUME) a multi-round brainstorm.
 
@@ -297,7 +299,11 @@ def mode_brainstorm(
                 # The constant grounding diff (if any) rides PanelJob.diff so the backend's
                 # _payload appends it as a fenced ```diff``` block over STDIN — ARG_MAX-safe,
                 # the same transport the shared transcript uses.
-                jobs.append(PanelJob(model=model, prompt=prompt, diff=diff, label=f"{persona_name} ({model})", round_no=round_no))
+                jobs.append(PanelJob(
+                    model=model, prompt=prompt, diff=diff,
+                    label=f"{persona_name} ({model})", round_no=round_no,
+                    images=visual_images,
+                ))
 
             round_results = run_panel(jobs, cwd, timeout)
             round_text = "\n\n".join(
@@ -469,13 +475,17 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _handler(ctx: ModeContext) -> int:
+    images = _visual_images(ctx)
+    kwargs = {"diff": ctx.diff}
+    if images:
+        kwargs["visual_images"] = images
     return mode_brainstorm(
         ctx.with_visual(ctx.args.topic), ctx.models, ctx.cwd, ctx.timeout,
         ctx.moderators, ctx.args.rounds, ctx.args.max_rounds,
         # When there IS a diff (working-tree, --staged/--diff, or piped) the personas
         # see it as grounding context so they brainstorm ABOUT a specific change. No
         # diff -> pure ideation, exactly as before.
-        diff=ctx.diff,
+        **kwargs,
     )
 
 
@@ -491,4 +501,3 @@ MODE = ModeSpec(
     add_arguments=_add_arguments,
     announce_logs=True,
 )
-

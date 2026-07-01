@@ -28,12 +28,14 @@ from .just_ask import MODE as _JUST_ASK_MODE
 from .qa import MODE as _QA_MODE
 from .quorum import MODE as _QUORUM_MODE
 from .review import MODE as _REVIEW_MODE
+from .visual import MODE as _VISUAL_MODE
 
 # The built-in review modes, in the order they appear in `--help`. `review` is first
 # (it is the default). Each entry is a self-describing `ModeSpec` exposed by its module
 # as a top-level `MODE` — exactly how a visual module exposes a top-level `MODULE`.
 MODES: tuple[ModeSpec, ...] = (
     _REVIEW_MODE,
+    _VISUAL_MODE,
     _BRAINSTORM_MODE,
     _JUST_ASK_MODE,
     _QUORUM_MODE,

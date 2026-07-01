@@ -87,7 +87,8 @@ A bare `review` (no subcommand) prints HELP — it does NOT run a diff review (u
 `review diff`). The removed `review review` verb and `review -C <repo>` (flags with no
 verb) print a one-line `review diff` pointer and exit non-zero. The OLD mode flags
 (`--brainstorm` / `--quorum` / `--just-ask`) were likewise REMOVED. `--visual <img>` stays
-a COMPOSABLE flag that rides any subcommand (it is not a mode), e.g. `review diff --visual`.
+the canonical standalone command is `review visual IMAGE`; `--visual` remains a composable
+flag for text modes, e.g. `review brainstorm "Q" --visual IMAGE`.
 For configuration (config file, model/board selection, keys/auth) run `review help config`
 (alias `review --help config`); per-subcommand flags are on `review <mode> --help`.
 
@@ -117,7 +118,9 @@ failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "over
 `$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
 `--pool N` sizes the pool (top-N available, same failover); `--pool 0`/`--pool 8` runs all
 available. The board is **never disabled** — there is **no `--no-board` flag**. An explicit
-`-m` (or a `models:` list in config.yaml) bypasses the board and runs exactly those models.
+`-m` bypasses the board and runs exactly those models. A `models:` list in config.yaml is
+the priority roster for the failover board: the pool is selected from that ordered set and
+the rest are reserve.
 `review --show-board` lists the seats in priority order with their pool/reserve/unavail
 tier and availability.
 

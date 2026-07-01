@@ -13,10 +13,10 @@ CLIs):
              attaches the image, forces the JSON shape, and writes ONLY the final
              structured message to <out.json>. (Mirrors review_codex's `codex exec`.)
   * claude — the image is referenced as `@<path>` inside the `-p` prompt; the `Read`
-             tool (scoped to the image dir via --add-dir) loads it. `--output-format
-             json` wraps the result; the verdict JSON is the `result` field. (Mirrors
-             review_claude's `claude -p`, but with Read ENABLED — vision needs to load
-             the file, the read-only text reviewer forbids it.)
+             tool (scoped to the image dir via --add-dir) loads it. `--json-schema`
+             enforces the structured verdict and `--output-format json` wraps it in the
+             result field. (Mirrors review_claude's headless direct CLI path, but with
+             Read ENABLED — vision needs to load the file, the text reviewer forbids it.)
   * opencode — `opencode run "<prompt>" -m <vision-model> -f <image>` attaches the file
              and routes to whatever (vision-capable) model is named. opencode is a
              provider ROUTER; the user picks a vision model via `oc:<provider>/<model>`.
@@ -144,6 +144,8 @@ def _route_name(model: str) -> str:
         backends.review_gemini: "gemini",
         backends.review_codex: "codex",
         backends.review_opencode: "opencode",
+        backends.review_commandcode: "commandcode",
+        backends.review_zai: "zai",
     }.get(fn, "opencode")
 
 
@@ -167,7 +169,10 @@ _CLI_BINARY = {
 # opencode vision is reachable ONLY for a model whose id signals vision capability (or is
 # explicitly allowlisted via $REVIEW_OPENCODE_VISION_MODELS, comma-separated substrings),
 # so `select_vision_backend` never picks the text default for `--visual` (codex P).
-_VISION_MODEL_HINTS = ("vl", "vision", "-v-", "vlm", "pixtral", "llava", "gpt-4o", "gpt-5", "omni", "multimodal")
+_VISION_MODEL_HINTS = (
+    "vl", "vision", "-v-", "vlm", "pixtral", "llava", "gpt-4o", "gpt-5",
+    "omni", "multimodal", "kimi-k2.7-code", "glm-4.5v", "glm-4.6v",
+)
 
 
 def _opencode_model_is_vision(model: str) -> bool:
@@ -210,13 +215,25 @@ def select_vision_backend(models: list[str]) -> str | None:
     """Resolution order (§3.2): the first requested model that is vision-capable,
     reachable (CLI binary present, or Gemini key present), AND whose live dispatch is
     wired. Returns None → fail-closed `unverified`."""
+    backends = select_vision_backends(models)
+    return backends[0] if backends else None
+
+
+def select_vision_backends(models: list[str]) -> list[str]:
+    """Every requested backend that can plausibly serve vision, in priority order.
+
+    Runtime model entitlement failures (e.g. Opus visible to the CLI but unavailable for
+    the account) can only be detected after a call. Returning all candidates lets the
+    caller fail over instead of treating the first selected backend as final.
+    """
+    selected: list[str] = []
     for model in models:
         cap = capability_for(model)
         if cap is None or not cap.live_dispatch:
             continue
         if vision_backend_available(model):
-            return model
-    return None
+            selected.append(model)
+    return selected
 
 
 # --- The forced output schema (§3.2 / §5). ----------------------------------------
@@ -559,6 +576,50 @@ def call_ai_vision(
     )
 
 
+def call_ai_vision_with_fallback(
+    models: list[str],
+    *,
+    system: str | None = None,
+    blocks: list[VisionBlock],
+    expectation=None,
+    cv_signals=None,
+    output_schema: dict | None = None,
+    timeout_s: int = 60,
+) -> VisionVerdict:
+    """Try vision backends in priority order until one returns a usable verdict.
+
+    This is the runtime companion to `select_vision_backends`: cheap availability probes
+    cannot see provider/model entitlement failures, short "currently unavailable" bodies,
+    malformed output, or transient non-zero CLI exits. Those should skip to the next
+    visual backend rather than block while a configured fallback exists.
+    """
+    last: VisionVerdict | None = None
+    for model in models:
+        verdict = call_ai_vision(
+            model,
+            system=system,
+            blocks=blocks,
+            expectation=expectation,
+            cv_signals=cv_signals,
+            output_schema=output_schema,
+            timeout_s=timeout_s,
+        )
+        if verdict.available and verdict.verdict in VISION_VERDICTS:
+            return verdict
+        last = verdict
+    if last is not None:
+        return last
+    return call_ai_vision(
+        None,
+        system=system,
+        blocks=blocks,
+        expectation=expectation,
+        cv_signals=cv_signals,
+        output_schema=output_schema,
+        timeout_s=timeout_s,
+    )
+
+
 # --- Image staging: the CLIs take FILES, the blocks carry base64. Decode each image
 # block to a temp file (right suffix per media type) and hand the paths to the CLI. ----
 def _stage_images(blocks: list[VisionBlock], tmp: Path) -> list[Path]:
@@ -686,9 +747,9 @@ def _call_codex_cli(model: str, system: str, blocks: list[VisionBlock], schema: 
 
 def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int) -> VisionVerdict:
     """claude vision: reference the image as `@<path>` in the `-p` prompt; the Read tool
-    (scoped to the image dir via --add-dir) loads it. Mirrors review_claude's `claude -p`,
-    but ENABLES Read (vision needs to load the file). `--output-format json` wraps the
-    result; the verdict JSON is the `result` field."""
+    (scoped to the image dir via --add-dir) loads it. Mirrors review_claude's direct
+    headless CLI path, but ENABLES Read (vision needs to load the file). `--json-schema`
+    forces the verdict shape; `--output-format json` wraps the result field."""
     if not shutil.which("claude"):
         return VisionVerdict(available=False, verdict=None, error="claude CLI not found on PATH", backend=model)
     claude_model = model.split(":", 1)[1] if ":" in model else None
@@ -703,9 +764,13 @@ def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema:
             "claude", "-p", prompt,
             "--output-format", "json",
             "--add-dir", str(tmp),
-            "--allowedTools", "Read",
-            "--disallowedTools", "Edit", "MultiEdit", "Write", "Bash", "Grep", "Glob",
-            "NotebookEdit", "SlashCommand", "Task", "TodoWrite", "ExitPlanMode", "WebFetch", "WebSearch",
+            "--permission-mode", "dontAsk",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--safe-mode",
+            "--no-session-persistence",
+            "--tools", "Read",
+            "--json-schema", json.dumps(_strict_output_schema(schema)),
             "--append-system-prompt", system,
         ]
         if claude_model:

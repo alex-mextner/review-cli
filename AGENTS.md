@@ -21,7 +21,8 @@ review brainstorm "TOPIC"    # multi-round persona ideation
 review brainstorm "TOPIC" --diff    # …grounded in the working-tree (or --staged) diff
 review just-ask "QUESTION"   # single-shot multi-model answer (alias: review ask "Q")
 review quorum "QUESTION"     # experts cite evidence + a moderator finds quorum
-review diff --visual shot.png …   # COMPOSABLE flag (NOT a mode): rides any subcommand
+review visual shot.png [--diff]   # standalone screenshot verdict; --diff adds git context
+review brainstorm "TOPIC" --visual shot.png   # composable screenshot context for text modes
 ```
 
 A bare `review` (no subcommand) prints the HELP/usage — it does **NOT** run a diff review
@@ -45,7 +46,8 @@ collides with the mode registry.
 Flags are SCOPED so `review --help` (the top-level overview) lists only TRULY-GLOBAL
 options (`-m/--model`, `-C`, `-o`, `--timeout`, `--list-defaults`, `--show-board`, `--pool`)
 + the subcommand list. Subcommand- and feature-specific flags live on `review <mode> --help`:
-the composable `--visual` group (rides any subcommand), `--prompt` (the diff review),
+the `review visual IMAGE` options, the composable `--visual` group for text modes,
+`--prompt` (the diff review),
 `--moderator` (quorum/brainstorm), `--rounds`/`--max-rounds` (brainstorm). In `cli.py`:
 `_add_global_options` (top-level + every mode) vs `_add_mode_options` (= global + diff-source
 + the mode-relevant flags + the `_add_visual_options` group + the mode's own positional).
@@ -81,6 +83,7 @@ reviewlib/modes/
   contract.py     # ModeSpec descriptor + ModeContext
   registry.py     # MODES list + get_mode / known_subcommands / diff_mode / iter_modes
   review.py       # MODE = ModeSpec(subcommand="diff",       diff_policy="require",  handler=…)
+  visual.py       # MODE = ModeSpec(subcommand="visual",     diff_policy="optional", handler=…)
   brainstorm.py   # MODE = ModeSpec(subcommand="brainstorm", diff_policy="optional", handler=…)
   just_ask.py     # MODE = ModeSpec(subcommand="just-ask",   diff_policy="none",     handler=…)
   quorum.py       # MODE = ModeSpec(subcommand="quorum",     diff_policy="none",     handler=…)
@@ -112,6 +115,32 @@ settings.json) is reported as `! conflict`, left as-is, and the command exits no
 (`_write_if_changed`, `_append_marked` returning a changed bool, `_sessionstart_hook_present`)
 keep that honest — when you add an install target, return whether it changed so the summary
 stays accurate.
+
+## Visual review proof
+
+`review visual` / `review <text-mode> --visual` is not proven by a normal text-mode answer. Before reporting that a
+screenshot was reviewed, verify that the companion vision fan-out produced a usable
+structured verdict from the actual image (`*-vision` log, `available=true`, verdict in the
+visual schema). An empty, unparseable, unavailable, or timed-out vision result must fail
+closed and block the companion mode; do not substitute cvGate notes, DOM facts, browser
+inspection, or a non-vision panel response for screenshot delivery to the vision backend.
+When debugging visual failures, inspect the `*-vision` log first, not only the final text
+seat log.
+
+## CLI shape before hook workarounds
+
+If a hook or downstream consumer needs cleaner semantics, add the right `review` command
+surface first. Do not hide repo context, change cwd, or otherwise coerce behavior in the
+caller to paper over a wrong CLI shape; that leaves help/docs lying and makes behavior
+depend on the launch environment.
+
+## Unresolved problems need owners
+
+Do not report a failed gate or "unrelated/local environment" problem as a loose caveat.
+If a problem is real enough to mention in a final report, it needs a durable follow-up in
+the same turn: create or link the task, state the owner/next command, and start any
+independent investigation that can run in parallel. A caveat without a ticket or first
+action is not a status report; it is dropped work.
 
 ## Tests
 
