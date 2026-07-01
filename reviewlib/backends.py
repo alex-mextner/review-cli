@@ -1536,6 +1536,10 @@ def review_claude_cli_with_images(
             env=_claude_cli_env(), timeout=timeout + 30, backend="claude", round_no=round_no,
             announce=_ANNOUNCE_LOGS,
         )
+    # The TemporaryDirectory context deleted tmp; remove the trust entry that
+    # _ensure_workspace_trusted seeded so dead /tmp/review-cli-claude-images-* paths
+    # don't accumulate in ~/.claude.json. (P2 fix — review-cli#98 thread.)
+    _remove_workspace_trust(tmp)
     stdout = strip_control_sequences(proc.stdout)
     stderr = strip_control_sequences(proc.stderr)
     command = (
