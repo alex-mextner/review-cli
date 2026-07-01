@@ -28,12 +28,12 @@ live = ["telethon>=1.34,<2"]
 # systemd autostart) is powered by the shared `agenttools_service` lib — ONE service-manager
 # every long-running agent-tools server reuses, instead of each tool hand-rolling pidfiles /
 # autostart units. It is an IN-ECOSYSTEM dependency (agent-tools/lib/agenttools_service, itself
-# stdlib-only + agenttools-daemon), not yet on PyPI, so it is an OPTIONAL extra rather than a
-# hard runtime dep: `review` and the rest of the dashboard work without it; only the lifecycle
-# subcommands need it. Until it is published, install editable from the agent-tools checkout:
+# stdlib-only + agenttools-daemon), not yet on PyPI, so it CANNOT be listed as a PyPI dep.
+# Install editable from the agent-tools checkout before using `review dashboard run/start/…`:
 #   pip install -e <agent-tools>/lib/agenttools_daemon -e <agent-tools>/lib/agenttools_service
 # The lazy import in reviewlib.cli emits an actionable error (exit 4) if it is missing.
-dashboard = ["agenttools-service>=0.1.0,<1"]
+# NOTE: this extra intentionally has no PyPI packages — the dep is an in-ecosystem local install.
+dashboard = []
 
 # Stage 0 (decomposition) packaging — see docs/architecture-visual-verification.md §8.1, D8.
 # The CLI is now a real package (`reviewlib`), so it is exposed via a proper console

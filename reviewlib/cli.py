@@ -247,8 +247,8 @@ _AGENTTOOLS_SERVICE_MISSING_MSG = (
     "'agenttools_service' lib, which isn't installed.\n"
     "  why:  run/start/status/stop/enable/disable come from one shared service-manager "
     "(agent-tools/lib/agenttools_service), not a per-tool copy.\n"
-    "  fix:  pip install -e <agent-tools>/lib/agenttools_service   "
-    "(or `pip install 'review-cli[dashboard]'` once published).\n"
+    "  fix:  pip install -e <agent-tools>/lib/agenttools_daemon "
+    "-e <agent-tools>/lib/agenttools_service\n"
     "  note: `review dashboard run` still works without it for an ad-hoc foreground server."
 )
 
@@ -272,7 +272,8 @@ def _dashboard_help_no_lib() -> int:
         "  enable   install OS autostart (launchd / systemd --user / fallback) AND start now\n"
         "  disable  remove OS autostart AND stop\n\n"
         "note: start/status/stop/enable/disable need the shared 'agenttools_service' lib "
-        "(`pip install 'review-cli[dashboard]'`); `run` works without it."
+        "(pip install -e <agent-tools>/lib/agenttools_daemon "
+        "-e <agent-tools>/lib/agenttools_service); `run` works without it."
     )
     return 0
 
