@@ -158,10 +158,15 @@ def build_mode_visual_context(
             f"blank={sig.blank_suspected}, overlay={sig.overlay_suspected}, "
             f"unstyled={sig.unstyled_suspected})"
         )
+    # When vision is not required (--no-ai), omit the concrete image path from the note:
+    # an agentic panel that can read repo files could open the screenshot despite the flag
+    # if the path were included in text. The CV signals and expectation metadata still
+    # ground the companion, but the file reference is redacted. (P1 fix.)
+    image_ref = str(image) if require_vision else "<redacted — --no-ai>"
     cv_note = (
         "\n\n=== ATTACHED RENDER (visual context) ===\n"
         f"A screenshot was captured for this review and analysed by the cvGate pixel "
-        f"pre-filter: {image}\n"
+        f"pre-filter: {image_ref}\n"
         f"Expectation: kind={expectation.kind}, diff_policy={expectation.diff_policy}, "
         f"risk={expectation.risk}.{sig_line}\n"
         f"cvGate pre-filter outcome: {gate.outcome} — {gate.reason}\n"

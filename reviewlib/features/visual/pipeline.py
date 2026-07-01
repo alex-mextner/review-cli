@@ -225,9 +225,24 @@ def run_pipeline(
     # keep) seeds the known-good cache so the NEXT identical render short-circuits for
     # free. Only a final keep — a policy-downgraded/low-confidence keep must NOT be
     # learned as known-good. Best-effort; never breaks the verification. ------------
+    # Key the populate by the ACTUAL backend that produced the keep (vision.backend),
+    # not the first candidate.  If a fallback ran, the keep was earned by the fallback
+    # backend; storing it under the primary candidate would let a future primary-backend
+    # run reuse a keep that was never reviewed by that backend. (P1 fix.)
+    # Intentional trade-off: a fallback-keyed keep is NOT reused by a later run that
+    # re-selects the primary — the lookup namespace (primary) differs from the populate
+    # namespace (fallback), so the next run calls fallback again.  This is conservative:
+    # it never trusts a keep across backends in either direction.
     if local_model and verdict.final == "keep":
         try:
-            cache.remember(after, context=cache_context)
+            actual_backend = vision.backend if vision.backend else backend
+            populate_context = cache.context_key(
+                project=project, intent=intent, expect=expect,
+                requested_checks=requested_checks, before=before,
+                modules_signature=modules_signature(modules),
+                selected_backend=actual_backend,
+            )
+            cache.remember(after, context=populate_context)
         except Exception:  # noqa: BLE001
             pass
     return verdict
