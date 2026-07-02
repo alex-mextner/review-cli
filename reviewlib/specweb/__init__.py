@@ -18,7 +18,19 @@ Modules:
                  reads open, writes origin-guarded (loopback + the configured Tailscale host).
 
 Wired into the CLI as ``review spec-web <path>`` (see ``reviewlib.cli``).
+
+Multi-spec DAEMON (``review spec-web start``): ONE persistent server serves EVERY registered
+spec by name at ``/spec/<name>`` (navigator at ``/``), so a single port/Tailscale mapping
+covers all specs instead of one server per spec. Extra modules:
+  * ``registry`` — durable name -> spec-path map (``registry.json``), survives restarts.
+  * ``service``  — the daemon as a MANAGED SERVICE via the shared ``agenttools_service`` lib
+                   (start/stop/status/run/enable/disable), exactly as the dashboard does.
+The daemon adds an SSE endpoint (``/spec/<name>/api/events``) that live-reloads the rendered
+spec on file change without a full page reload (no-scroll-jump + transient highlight in app.js).
+  * ``deliver``  — on Submit, the batch is INJECTED into the owning agent's live tmux session
+                   (the required ``--agent <name>``), tg-ctl-style, so reviews reach the agent
+                   even when nothing is watching stdout.
 """
 from __future__ import annotations
 
-__all__ = ["render", "store", "server"]
+__all__ = ["render", "store", "server", "registry", "service", "deliver"]

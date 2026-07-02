@@ -546,6 +546,7 @@ _UNIT_FILES = [
     ("test_opencode_realrepo.py", {}),
     ("test_readonly_agent.py", {}),
     ("test_specweb.py", {}),
+    ("test_specweb_daemon.py", {}),
     ("test_claude_api.py", {}),
     ("test_provider_keys.py", {}),
     ("test_reviewer_board.py", {}),

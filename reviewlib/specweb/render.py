@@ -129,8 +129,13 @@ class _Renderer:
     asset discovery happen in one pass.
     """
 
-    def __init__(self, assets_dir: Path) -> None:
+    def __init__(self, assets_dir: Path, asset_base: str = "/asset/") -> None:
         self.assets_dir = assets_dir
+        # The URL prefix figures are rewritten under. Defaults to ``/asset/`` (the single-spec
+        # server route). The multi-spec DAEMON passes ``/spec/<name>/asset/`` so each spec's
+        # figures resolve to that spec's own asset route on the ONE shared origin. Always ends
+        # with a slash so ``asset_base + <name>`` is a clean path.
+        self.asset_base = asset_base if asset_base.endswith("/") else asset_base + "/"
         self.assets: dict[str, Path] = {}
         self._used_ids: dict[str, int] = {}
         self._emitted_ids: set[str] = set()
@@ -253,7 +258,7 @@ class _Renderer:
         # Percent-encode the basename for the URL (a figure named "my diagram.svg" must
         # emit /asset/my%20diagram.svg so the browser's encoded request matches; the server
         # unquotes before the disk lookup). `safe=""` so dots/spaces/etc. all encode.
-        url = "/asset/" + html.escape(urlquote(fname, safe=""), quote=True)
+        url = self.asset_base + html.escape(urlquote(fname, safe=""), quote=True)
         return (
             f'<figure class="fig"><img loading="lazy" alt="{alt_attr}" src="{url}">'
             f"<figcaption>{_emphasis(alt)}</figcaption></figure>"
@@ -488,15 +493,19 @@ class _Renderer:
         return RenderResult(html="\n".join(out), headings=headings, assets=dict(self.assets))
 
 
-def render_spec(spec_path: Path, *, assets_dir: Path | None = None) -> RenderResult:
+def render_spec(
+    spec_path: Path, *, assets_dir: Path | None = None, asset_base: str = "/asset/"
+) -> RenderResult:
     """Render a spec markdown file to HTML.
 
     ``assets_dir`` defaults to ``<spec_dir>/assets`` (the common spec convention); pass it
-    explicitly to point figures elsewhere. Figures are referenced as ``/asset/<name>`` and
-    the returned ``assets`` map tells the server which files to serve.
+    explicitly to point figures elsewhere. Figures are referenced as ``<asset_base><name>``
+    and the returned ``assets`` map tells the server which files to serve. ``asset_base``
+    defaults to ``/asset/`` (single-spec server); the multi-spec daemon passes
+    ``/spec/<name>/asset/`` so each spec's figures resolve on the one shared origin.
     """
     spec_path = Path(spec_path).expanduser().resolve()
     if assets_dir is None:
         assets_dir = spec_path.parent / "assets"
     md = spec_path.read_text(encoding="utf-8", errors="replace")
-    return _Renderer(Path(assets_dir)).render(md)
+    return _Renderer(Path(assets_dir), asset_base).render(md)

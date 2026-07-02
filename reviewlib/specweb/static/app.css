@@ -252,3 +252,18 @@ mark.sw-quote.active{background:var(--mark-active);color:#fff1c2;box-shadow:0 0 
   .layout.comments-collapsed .comments-pane{max-height:none}
   .layout.comments-collapsed .spec-pane{display:block}
 }
+
+/* Live-reload (SSE) transient highlight. When the spec file changes on disk the daemon pushes
+   a `spec-changed` event; app.js swaps the content in place and flashes the blocks that changed
+   (above OR below the fold). The flash is BACKGROUND + BOX-SHADOW only — no size/layout change —
+   so it can never shift the page or trigger a scroll (the no-jump requirement). The class is
+   removed after the animation. */
+.spec-body .sw-flash{animation:sw-flash-fade 2.5s ease-out;border-radius:4px}
+@keyframes sw-flash-fade{
+  0%{background:rgba(91,157,255,.30);box-shadow:0 0 0 4px rgba(91,157,255,.22)}
+  100%{background:transparent;box-shadow:0 0 0 4px rgba(91,157,255,0)}
+}
+/* Native browser scroll-anchoring as a backstop; the primary no-jump mechanism is the
+   measure/restore in app.js (captureScrollAnchor/restoreScrollAnchor). */
+.spec-pane{overflow-anchor:auto}
+@media (prefers-reduced-motion:reduce){.spec-body .sw-flash{animation-duration:.01s}}

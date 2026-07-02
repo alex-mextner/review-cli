@@ -520,47 +520,427 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
         return 2
 
 
+_SPECWEB_HELP = """review spec-web — multi-spec markdown reviewer (a persistent daemon)
+
+DAEMON LIFECYCLE (shared agenttools_service lib, like `review dashboard`):
+  review spec-web start --agent A [--host H] [--port N]   start the daemon in the background
+  review spec-web status                        is it running? + registered specs + URLs
+  review spec-web stop                          stop the daemon
+  review spec-web run --agent A                 run the daemon in the foreground (this shell)
+  review spec-web enable --agent A | disable    install / remove OS autostart
+
+SPECS (spec-web-specific):
+  review spec-web add <spec.md> [--agent A]     register a spec, print its name-based URL
+  review spec-web serve <spec.md> --agent A     add + wait for the review (submit -> stdout)
+  review spec-web <spec.md> --agent A            same as `serve` (backward-compatible)
+  review spec-web list                          list registered specs
+  review spec-web remove <name>                 unregister a spec
+  review spec-web watch <name|path>             wait for a submit on an already-registered spec
+  review spec-web reply <id> <answer> --spec P  the agent answers a reviewer's note
+
+add/serve options: --seed FILE (import a review thread before serving), --open (open the
+browser), --exit-on-submit (serve/watch return after the first submit), --no-watch (add:
+register into the daemon and return without waiting).
+
+--agent <name> is the tmux window/session that OWNS the served specs (e.g. --agent ext):
+every submitted review batch is INJECTED into that live session (tg-ctl-style tmux
+injection), so reviews reach the agent even when nothing is watching stdout. The
+daemon-launching actions require it; a spec's own --agent (add/serve) overrides the
+daemon default for that spec.
+
+The daemon serves EVERY registered spec by name at /spec/<name> on ONE port (navigator at /),
+so one port / Tailscale mapping covers all specs instead of a server per spec."""
+
+# The lifecycle actions handled by the shared agenttools_service ServiceManager.
+_SPECWEB_LIFECYCLE = frozenset({"start", "status", "stop", "run", "enable", "disable", "__serve"})
+
+
 def _spec_web(argv: list[str]) -> int:
-    """`review spec-web <spec.md> [--host H] [--port N] [--seed f.json] [--open]`.
+    """Dispatch ``review spec-web`` — daemon lifecycle + spec registration + the reply/watch glue.
 
-    Interactive web server to review a markdown spec: select text -> ask a question /
-    comment, accumulate a pending batch, submit the review (delivered to the launching
-    agent), answer inline. Reusable for ANY spec. See reviewlib.specweb for the full design.
-
-    Also dispatches the `reply` subcommand: `review spec-web reply <comment-id> <answer>`
-    lets the AGENT answer a reviewer's question — it threads the reply into the store
-    (shown in the UI) and delivers it to the user via tg.
+    A bare ``review spec-web`` prints HELP and launches nothing. The daemon lifecycle
+    (start/status/stop/run/enable/disable) is delegated to the shared ``agenttools_service`` lib
+    (see ``reviewlib.specweb.service`` — same pattern as ``review dashboard``); only the
+    spec-web-unique surface (add/serve/list/remove/watch/reply and the legacy positional) lives
+    here. See ``reviewlib.specweb`` for the full design.
     """
-    if argv and argv[0] == "reply":
+    if not argv or argv[0] in ("-h", "--help"):
+        print(_SPECWEB_HELP)
+        return 0
+    sub = argv[0]
+    if sub == "reply":
         return _spec_web_reply(argv[1:])
+    if sub == "__serve":
+        return _spec_web_serve_daemon(argv[1:])
+    if sub in _SPECWEB_LIFECYCLE:
+        return _spec_web_lifecycle(sub, argv[1:])
+    if sub == "list":
+        return _spec_web_list(argv[1:])
+    if sub == "remove":
+        return _spec_web_remove(argv[1:])
+    if sub == "watch":
+        return _spec_web_watch(argv[1:])
+    if sub == "add":
+        return _spec_web_add(argv[1:], watch=False)
+    if sub == "serve":
+        return _spec_web_add(argv[1:], watch=True)
+    # A legacy positional `review spec-web <spec.md>`: register + serve-in-daemon + watch for the
+    # submit (backward-compatible with the old blocking single-spec command).
+    return _spec_web_add(argv, watch=True)
 
-    parser = argparse.ArgumentParser(prog="review spec-web", description="Interactive web reviewer for a markdown spec.")
-    parser.add_argument("spec", help="path to the spec markdown file")
-    parser.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1; use 0.0.0.0 to expose over Tailscale)")
-    parser.add_argument("--port", type=int, default=None, help="bind port (default: a free ephemeral port)")
-    parser.add_argument("--seed", metavar="FILE", default=None, help="import an initial review thread from a JSON file before serving")
-    parser.add_argument("--exit-on-submit", dest="exit_on_submit", action="store_true",
-                        help="stop the server after the first Submit (the blocking call returns once the review is delivered)")
-    parser.add_argument("--open", dest="open_browser", action="store_true", help="open the URL in a browser on startup")
-    parser.add_argument("--verbose", action="store_true", help="verbose request logging")
-    ns = parser.parse_args(argv)
 
-    from .specweb.server import run_specweb
+# ---- spec-web: shared agenttools_service message + host/port parsing ---------- #
+_SPECWEB_MISSING_LIB = (
+    "[review spec-web] the daemon lifecycle needs the shared 'agenttools_service' lib, which "
+    "isn't installed.\n"
+    "  why:  start/status/stop/run/enable/disable come from one shared service-manager "
+    "(agent-tools/lib/agenttools_service), not a per-tool copy — same as `review dashboard`.\n"
+    "  fix:  pip install -e <agent-tools>/lib/agenttools_daemon -e <agent-tools>/lib/agenttools_service\n"
+)
+
+
+def _spec_web_host_port(rest: list[str], *, defaults: bool = True):
+    """Parse the optional ``--host``/``--port`` (+ ``--agent``) shared by the spec-web daemon
+    commands.
+
+    Returns ``(ns, remaining_positionals)``. With ``defaults=True`` the daemon defaults
+    (0.0.0.0 / the stable port) are applied; the raw values (possibly None) are used otherwise."""
+    from .specweb.service import DEFAULT_SPECWEB_HOST, DEFAULT_SPECWEB_PORT
+
+    parser = argparse.ArgumentParser(prog="review spec-web", add_help=False)
+    parser.add_argument("--host", default=DEFAULT_SPECWEB_HOST if defaults else None)
+    parser.add_argument("--port", type=int, default=DEFAULT_SPECWEB_PORT if defaults else None)
+    parser.add_argument("--agent", default=None)
+    return parser.parse_known_args(rest)
+
+
+# The daemon-launching actions REQUIRE an owning agent (submitted reviews are DELIVERED into
+# that agent's live session — a daemon nobody owns re-creates the "comments reach nobody" bug).
+_SPECWEB_AGENT_REQUIRED = frozenset({"start", "run", "enable", "__serve"})
+
+
+def _spec_web_require_agent(action: str, agent: str | None) -> int | None:
+    """Exit-2 usage error when a daemon-LAUNCHING action lacks ``--agent``, else None.
+
+    The agent names the tmux window/session (e.g. ``--agent ext``) that owns the served
+    specs: every submitted review batch is injected into that session (see specweb.deliver),
+    so an agentless daemon would silently strand reviews in the store again."""
+    if agent:
+        return None
+    print(
+        f"[review spec-web] `{action}` requires --agent <name> — the tmux window/session "
+        f"that owns the served specs (submitted reviews are delivered INTO that session).\n"
+        f"  use:  review spec-web {action} --agent <name>   (e.g. --agent ext)",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _spec_web_manager(host: str, port: int | None, agent: str | None = None):
+    """Build the agenttools_service ServiceManager for the spec-web daemon, or None if the lib
+    is absent (the caller prints the shared missing-lib guidance and returns exit 4)."""
+    try:
+        from agenttools_service import ServiceManager
+    except ImportError:
+        return None
+    from .specweb.service import spec_web_service
+
+    return ServiceManager(spec_web_service(host=host, port=port, agent=agent))
+
+
+def _spec_web_serve_daemon(rest: list[str]) -> int:
+    """Hidden entry: ``review spec-web __serve`` — the blocking multi-spec daemon (this shell).
+
+    This is the FOREGROUND server the managed service runs (``run``) and detaches (``start``);
+    it calls ``run_daemon`` directly so it never re-enters the service dispatcher. Not advertised
+    — operators use ``run`` (ad-hoc) or ``start`` (managed)."""
+    ns, _ = _spec_web_host_port(rest)
+    rc = _spec_web_require_agent("__serve", ns.agent)
+    if rc is not None:
+        return rc
+    verbose = "--verbose" in rest
+    from .specweb.server import run_daemon
+
+    return run_daemon(host=ns.host, port=ns.port, verbose=verbose, agent=ns.agent)
+
+
+def _spec_web_lifecycle(action: str, rest: list[str]) -> int:
+    """Run a daemon lifecycle action (start/status/stop/run/enable/disable) via the shared lib.
+
+    ``status``/``start`` additionally print the registered specs + their name-based URLs (the
+    spec-web-specific bit), so the operator immediately sees what the daemon is serving.
+
+    ``start`` is IDEMPOTENT: an already-running daemon is reported (pid + what it serves) and
+    exits 0 — a repeated ``start`` in a setup script must not read as a failure. (The shared
+    ``run_action`` alone would exit 3 there; that convention is for ``status``/``stop``'s
+    "was anything up?" branch, not for a start that got what it asked for.)
+
+    The daemon-LAUNCHING actions (start/run/enable) REQUIRE ``--agent`` — see
+    ``_spec_web_require_agent``; status/stop/disable manage the existing instance and don't."""
+    ns, _ = _spec_web_host_port(rest)
+    if action in _SPECWEB_AGENT_REQUIRED:
+        rc = _spec_web_require_agent(action, ns.agent)
+        if rc is not None:
+            return rc
+    mgr = _spec_web_manager(ns.host, ns.port, ns.agent)
+    if mgr is None:
+        print(_SPECWEB_MISSING_LIB, file=sys.stderr)
+        return 4
+    if action == "start":
+        st = mgr.status()
+        if st.running:
+            suffix = f" (pid {st.pid})" if st.pid is not None else ""
+            print(f"[review spec-web] already running{suffix} — nothing to start.")
+            _spec_web_print_registry(ns.host, ns.port)
+            return 0
+    from agenttools_service import run_action
+
+    rc = run_action(mgr, action)
+    if action in ("start", "status"):
+        _spec_web_print_registry(ns.host, ns.port)
+    return rc
+
+
+def _spec_web_print_registry(host: str, port: int) -> None:
+    """Print the navigator URL(s) + every registered spec's name-based URL (loopback + Tailscale)."""
+    from .specweb import registry
+    from .specweb.server import _reachable_urls, daemon_spec_urls
+
+    for url in _reachable_urls(host, port):
+        print(f"[review spec-web] navigator {url}")
+    specs = registry.list_specs()
+    if not specs:
+        print("[review spec-web] no specs registered yet — add one with `review spec-web add <spec.md>`")
+        return
+    for rec in specs:
+        urls = " ".join(daemon_spec_urls(rec["name"], host, port))
+        missing = "" if rec["exists"] else "  (file missing)"
+        agent = f"  (agent: {rec['agent']})" if rec.get("agent") else ""
+        print(f"[review spec-web]   {rec['name']}: {urls}{agent}{missing}")
+
+
+def _spec_web_add(rest: list[str], *, watch: bool) -> int:
+    """``review spec-web add|serve <spec.md>`` (and the legacy positional): ensure the daemon is
+    running, register the spec, print its name-based URL. ``serve`` (and the legacy form) then
+    BLOCK watching for the submit -> stdout handoff; ``add`` returns immediately.
+
+    Backward-compat: on a host WITHOUT the shared service lib, the legacy positional falls back
+    to the classic single-spec foreground server so `review spec-web <spec>` still works."""
+    parser = argparse.ArgumentParser(prog="review spec-web", add_help=False)
+    parser.add_argument("spec")
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--agent", default=None)
+    parser.add_argument("--seed", metavar="FILE", default=None)
+    parser.add_argument("--open", dest="open_browser", action="store_true")
+    parser.add_argument("--exit-on-submit", dest="exit_on_submit", action="store_true")
+    parser.add_argument("--no-watch", dest="no_watch", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    ns, _ = parser.parse_known_args(rest)
+
+    # `serve` / the legacy positional own a review round-trip — they REQUIRE the owning agent
+    # (submitted batches are DELIVERED into that session; see _spec_web_require_agent). A bare
+    # `add` may omit it (the spec then inherits the daemon's own --agent at delivery time).
+    if watch:
+        rc = _spec_web_require_agent("serve", ns.agent)
+        if rc is not None:
+            return rc
 
     spec = Path(ns.spec).expanduser()
     if not spec.is_file():
         print(f"[review spec-web] spec not found: {spec}", file=sys.stderr)
         return 1
+    # Canonicalize once, up front: registry + SpecStore key by the RESOLVED path internally,
+    # so this keeps every printed path/URL consistent with what the daemon actually serves.
+    spec = spec.resolve()
+
+    from .specweb.service import DEFAULT_SPECWEB_HOST, DEFAULT_SPECWEB_PORT
+
+    host = ns.host if ns.host is not None else DEFAULT_SPECWEB_HOST
+    # NOT `ns.port or DEFAULT`: `--port 0` is falsy and would silently become the default.
+    port = ns.port if ns.port is not None else DEFAULT_SPECWEB_PORT
+
+    mgr = _spec_web_manager(host, port, ns.agent)
+    if mgr is None:
+        if ns.no_watch or not watch:
+            # `add` / `--no-watch` mean "register into the daemon + return fast"; without the
+            # service lib there is no daemon to register into — the only lib-less mode is the
+            # BLOCKING single-spec server, the opposite of what was asked (and what the
+            # backstop classifier assumes). Refuse loudly rather than silently blocking.
+            print(_SPECWEB_MISSING_LIB, file=sys.stderr)
+            print("[review spec-web] add/--no-watch need the daemon; without the lib the only "
+                  "mode is the blocking single-spec server (`review spec-web <spec.md>`).",
+                  file=sys.stderr)
+            return 4
+        # Lib-less host: preserve the classic single-spec foreground server (full backward-compat).
+        print("[review spec-web] shared service lib absent — falling back to a single-spec server.",
+              file=sys.stderr)
+        return _spec_web_legacy_foreground(spec, ns)
+
+    if ns.seed is not None and _spec_web_seed(spec, ns.seed) != 0:
+        return 1
+
+    from .specweb import registry
+    from .specweb.server import daemon_spec_urls, watch_submits
+    from .specweb.store import SpecStore
+
+    # Baseline the store's last_submit BEFORE the daemon is (maybe) started / the spec is
+    # registered: a submit that lands in the ensure-running/register window must count as
+    # FRESH for the watch below, not be folded into the baseline and lost (the caller would
+    # then wait forever on a review that already happened).
+    baseline = SpecStore(spec).last_submit()
+
+    rc = _spec_web_ensure_running(mgr, agent=ns.agent)
+    if rc is not None:
+        return rc
+
+    name = registry.register(spec, agent=ns.agent)
+    urls = daemon_spec_urls(name, host, port)
+    print(f"[review spec-web] registered '{name}' -> {spec}")
+    for url in urls:
+        print(f"[review spec-web] {url}")
+    if ns.open_browser and urls:
+        _spec_web_open_browser(urls[0])
+    if watch and not ns.no_watch:
+        print("[review spec-web] waiting for a submit (Ctrl-C to stop; the daemon keeps running).")
+        return watch_submits(spec, exit_on_submit=ns.exit_on_submit, baseline=baseline)
+    return 0
+
+
+def _spec_web_ensure_running(mgr, *, agent: str | None = None) -> int | None:
+    """Start the daemon if it isn't already up (idempotent); None on success, an exit code on
+    refusal. A concurrent start losing the race (AlreadyRunningError) is fine — the daemon is
+    up either way. LAUNCHING an agentless daemon is refused (nothing may start without an
+    owner — see _spec_web_require_agent); an already-running daemon needs no agent here."""
+    st = mgr.status()
+    if st.running:
+        return None
+    rc = _spec_web_require_agent("start", agent)
+    if rc is not None:
+        print("[review spec-web] the daemon is not running and cannot be auto-started "
+              "without --agent.", file=sys.stderr)
+        return rc
+    # AlreadyRunningError lives in agenttools_daemon (the pidfile layer agenttools_service
+    # builds on) — it is NOT re-exported by agenttools_service. Imported only on the
+    # actually-starting path so a fake manager in tests never needs the lib installed.
+    from agenttools_daemon import AlreadyRunningError
+
+    try:
+        st = mgr.start()
+    except AlreadyRunningError:
+        return None
+    suffix = f" (pid {st.pid})" if st.pid is not None else ""
+    print(f"[review spec-web] daemon started{suffix}.")
+    return None
+
+
+def _spec_web_seed(spec: Path, seed: str) -> int:
+    """Import an initial review thread into ``spec``'s store before serving (``--seed``)."""
+    import json as _json
+
+    from .specweb.store import SpecStore
+
+    seed_path = Path(seed).expanduser()
+    try:
+        payload = _json.loads(seed_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[review spec-web] cannot read seed {seed_path}: {exc}", file=sys.stderr)
+        return 1
+    replace = bool(payload.get("replace")) if isinstance(payload, dict) else False
+    try:
+        result = SpecStore(spec).import_thread(payload, replace=replace)
+    except ValueError as exc:
+        print(f"[review spec-web] bad seed: {exc}", file=sys.stderr)
+        return 1
+    print(f"[review spec-web] seeded {result['imported']} comment(s) from {seed_path}")
+    return 0
+
+
+def _spec_web_open_browser(url: str) -> None:
+    import threading
+    import webbrowser
+
+    def _open() -> None:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Timer(0.4, _open).start()
+
+
+def _spec_web_legacy_foreground(spec: Path, ns) -> int:
+    """The classic single-spec blocking server (fallback when the shared service lib is absent).
+
+    The caller has already enforced ``--agent`` (the watch/serve path requires it up front),
+    so submitted batches are tmux-delivered to the owning session here too — the lib-less
+    fallback must not regress into store-only submits."""
+    from .specweb.server import run_specweb
 
     return run_specweb(
         spec,
-        host=ns.host,
+        host=ns.host or "127.0.0.1",
         port=ns.port,
         open_browser=ns.open_browser,
         seed=ns.seed,
         verbose=ns.verbose,
         exit_on_submit=ns.exit_on_submit,
+        agent=ns.agent,
     )
+
+
+def _spec_web_list(rest: list[str]) -> int:
+    """``review spec-web list`` — every registered spec with its open-note count."""
+    from .specweb import registry
+    from .specweb.store import SpecStore
+
+    specs = registry.list_specs()
+    if not specs:
+        print("[review spec-web] no specs registered. Add one with `review spec-web add <spec.md>`.")
+        return 0
+    for rec in specs:
+        try:
+            comments = SpecStore(rec["path"]).all_comments()
+        except Exception:  # noqa: BLE001
+            comments = []
+        openc = sum(1 for c in comments if c.get("status") in ("pending", "submitted"))
+        flag = "" if rec["exists"] else "  (file missing)"
+        print(f"  {rec['name']:<28} {openc} open / {len(comments)} total  {rec['path']}{flag}")
+    return 0
+
+
+def _spec_web_remove(rest: list[str]) -> int:
+    """``review spec-web remove <name>`` — unregister a spec (its comments are kept on disk)."""
+    if not rest:
+        print("[review spec-web] usage: review spec-web remove <name>", file=sys.stderr)
+        return 2
+    from .specweb import registry
+
+    name = rest[0]
+    if registry.unregister(name):
+        print(f"[review spec-web] removed '{name}' (its comment store is left on disk).")
+        return 0
+    print(f"[review spec-web] no registered spec named '{name}'.", file=sys.stderr)
+    return 1
+
+
+def _spec_web_watch(rest: list[str]) -> int:
+    """``review spec-web watch <name|path> [--exit-on-submit]`` — block until a fresh submit."""
+    parser = argparse.ArgumentParser(prog="review spec-web watch", add_help=False)
+    parser.add_argument("target", help="a registered spec NAME or a spec PATH")
+    parser.add_argument("--exit-on-submit", dest="exit_on_submit", action="store_true")
+    ns, _ = parser.parse_known_args(rest)
+    from .specweb import registry
+    from .specweb.server import watch_submits
+
+    spec = registry.resolve(ns.target)
+    if spec is None:
+        spec = Path(ns.target).expanduser()
+    if not spec.is_file():
+        print(f"[review spec-web watch] no such spec (name or path): {ns.target}", file=sys.stderr)
+        return 1
+    print(f"[review spec-web] watching {spec} for a submit (Ctrl-C to stop).")
+    return watch_submits(spec, exit_on_submit=ns.exit_on_submit)
 
 
 def _spec_web_reply(argv: list[str]) -> int:
@@ -726,8 +1106,8 @@ def _is_persistent_server_invocation(argv: list[str]) -> bool:
     """
     if not argv or argv[0] not in _SERVER_SUBCOMMANDS:
         return False
-    if argv[0] == "spec-web" and len(argv) > 1 and argv[1] == "reply":
-        return False
+    if argv[0] == "spec-web":
+        return _spec_web_is_persistent(argv[1:])
     if argv[0] == "dashboard":
         # Only the blocking foreground server is persistent; everything else returns fast.
         # The managed-service parser accepts the global `--host`/`--port` options BEFORE the
@@ -737,6 +1117,35 @@ def _is_persistent_server_invocation(argv: list[str]) -> bool:
         # are the only options that take a value here; skip the flag and its argument.
         return _dashboard_action(argv[1:]) in ("run", "__serve")
     return True
+
+
+# spec-web actions that BLOCK (a persistent server / a submit-watch loop) and so must bypass the
+# `-o` tee + run backstop; everything else (lifecycle management, register, list) returns fast.
+_SPECWEB_FAST_ACTIONS = frozenset(
+    {"reply", "start", "status", "stop", "enable", "disable", "add", "list", "remove", "-h", "--help"}
+)
+
+
+def _spec_web_is_persistent(rest: list[str]) -> bool:
+    """True when ``review spec-web <rest>`` blocks (foreground daemon / submit-watch), so it must
+    NOT be wrapped in the run backstop. A bare ``spec-web`` (help) and the fast management actions
+    return immediately; ``run``/``__serve`` are the blocking daemon; ``watch`` always blocks;
+    ``serve`` and the LEGACY positional ``spec-web <path>`` block on the submit-watch unless
+    ``--no-watch``."""
+    if not rest:
+        return False  # bare `review spec-web` prints help + launches nothing
+    sub = rest[0]
+    if sub in _SPECWEB_FAST_ACTIONS:
+        return False
+    if sub in ("run", "__serve", "watch"):
+        return True  # `watch` has no --no-watch: it exists only to block on the submit
+    if sub == "serve":
+        return "--no-watch" not in rest
+    # A legacy positional `review spec-web <path>` (register + serve-in-daemon + watch, or the
+    # lib-less foreground fallback) blocks unless `--no-watch`. `--no-watch` returns fast in
+    # BOTH worlds: daemon mode registers + returns; the lib-less fallback REFUSES it (exit 4)
+    # rather than silently blocking (see _spec_web_add).
+    return "--no-watch" not in rest
 
 
 def _dashboard_action(rest: list[str]) -> str | None:
@@ -1333,7 +1742,7 @@ def _subcommand_epilog() -> str:
     ) + (
         "\n  dashboard   managed web dashboard over review-cli runs (run/start/status/stop/enable/disable)"
         "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
-        "\n  spec-web    interactive web reviewer for a markdown spec"
+        "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
         "\n  install-skill / install-commit-hook / register-module"
         "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
         + topics

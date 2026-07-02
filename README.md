@@ -586,7 +586,7 @@ Add `--no-ai` to run cvGate only (fast CI smoke / offline), `--json` for the mac
 
 ---
 
-## `review spec-web <spec.md>` — interactive spec reviewer
+## `review spec-web` — multi-spec web reviewer (a persistent daemon)
 
 **Render any markdown spec server-side and review it like a GitHub PR — as a bidirectional
 channel between a human reviewer and the agent that launched it.** Select any text in the
@@ -599,18 +599,38 @@ styling) and is pushed to **Telegram**. In-progress note text **autosaves to dis
 reload never loses a half-typed comment. Single implicit reviewer (no author field). Reusable
 for *any* spec markdown file. Serve it over Tailscale to review from your phone.
 
-```sh
-# local, ephemeral port, opens a browser
-review spec-web docs/specs/my-spec.md --open
+**One daemon, every spec.** `review spec-web start` runs ONE persistent daemon (managed by the
+shared `agenttools_service` lib, exactly like `review dashboard`) that serves EVERY registered
+spec by NAME at `/spec/<name>` — a navigator at `/` lists them all — so a single port /
+Tailscale mapping covers all your specs instead of one ad-hoc server per spec. `add` registers
+a spec (idempotent by path; the name is a slug of the filename) and the daemon serves it
+immediately, no restart. The daemon **live-reloads** an open spec page when the `.md` changes
+on disk (SSE): the content swaps in place with **no scroll jump** — even when text above your
+viewport changed height — and the changed blocks flash briefly (above or below the fold, never
+scrolling to them). `start` is idempotent (an already-running daemon reports itself + what it
+serves, exit 0); only an explicit `stop` stops it.
 
-# expose over Tailscale (reachable from a phone on the tailnet)
-review spec-web docs/specs/my-spec.md --host 0.0.0.0 --port 8787
+```sh
+# daemon lifecycle (shared agenttools_service lib, like `review dashboard`)
+review spec-web start --agent ext   # start the daemon in the background (idempotent)
+review spec-web status              # running? + registered specs + their /spec/<name> URLs
+review spec-web stop                # stop it (the ONLY thing that stops it)
+review spec-web run --agent ext     # foreground (this shell), for ad-hoc use
+review spec-web enable --agent ext  # OS autostart at login (disable removes it)
+
+# specs
+review spec-web add docs/specs/my-spec.md      # register + print its /spec/<name> URL
+review spec-web serve docs/specs/my-spec.md --agent ext   # add + BLOCK until the review is submitted
+review spec-web docs/specs/my-spec.md --agent ext         # same as `serve` (backward-compatible form)
+review spec-web list                           # every registered spec + open-note counts
+review spec-web remove <name>                  # unregister (comments stay on disk)
+review spec-web watch <name|path>              # wait for a submit on a registered spec
 
 # pre-load an existing Q&A thread
-review spec-web docs/specs/my-spec.md --seed thread.json
+review spec-web serve docs/specs/my-spec.md --agent ext --seed thread.json
 
 # return to the agent as soon as the reviewer submits (one-shot review handoff)
-review spec-web docs/specs/my-spec.md --exit-on-submit
+review spec-web serve docs/specs/my-spec.md --agent ext --exit-on-submit
 
 # the agent answers a reviewer's question (shown in the UI + sent to Telegram)
 review spec-web reply <comment-id> "the answer" --spec docs/specs/my-spec.md
@@ -618,11 +638,16 @@ review spec-web reply <comment-id> "the answer" --spec docs/specs/my-spec.md
 
 | Flag | Meaning |
 |------|---------|
-| `--host` | bind host (default `127.0.0.1`; `0.0.0.0` exposes over Tailscale) |
-| `--port` | bind port (default: a free ephemeral port) |
+| `--agent <name>` | the tmux window/session that OWNS the served specs — submitted review batches are injected INTO it (see below). **Required** by the daemon-launching actions (`start`/`run`/`enable`, `serve` and the positional form); also required by `add` when the daemon is DOWN, since `add` auto-starts it. A per-spec `--agent` (on `add`/`serve`) overrides the daemon-wide default for that spec. |
+| `--host` | daemon bind host (default `0.0.0.0` — reachable over Tailscale; `127.0.0.1` for loopback-only) |
+| `--port` | daemon port (default `7920`, stable across restarts so URLs/Tailscale mappings survive) |
 | `--seed FILE` | import an initial review thread from a JSON file before serving |
-| `--exit-on-submit` | stop the server after the first Submit (the blocking call returns once the review is delivered) |
+| `--exit-on-submit` | return after the first Submit (the daemon keeps running; only the watch returns) |
+| `--no-watch` | `serve` / the positional form: register + print the URL but don't block |
 | `--open` | open the URL in a browser on startup |
+
+On a host **without** the shared `agenttools_service` lib, the positional form falls back to
+the classic single-spec foreground server (ephemeral port, Ctrl-C to stop), so nothing breaks.
 
 **The submit → agent handoff.** `review spec-web` is started by an agent and blocks. When the
 reviewer clicks **Submit review**, the server marks the batch submitted in the store and the
@@ -638,6 +663,20 @@ reviewer can keep going and the agent can `reply`), re-emitting a fresh framed p
 submit; `--exit-on-submit` returns after the first submit instead. (Like the other persistent
 server paths, `--exit-on-submit` ignores `-o FILE` — read the framed payload from stdout.) The
 store on disk stays the single source of truth.
+
+**Submit → agent delivery (`--agent`).** The stdout handoff above only reaches an agent that is
+actively watching the process's stdout — but the daemon is long-lived and the agents that
+launch specs come and go, so a submitted batch used to sit in the store with nobody reading it.
+The required `--agent <name>` fixes that: on every Submit, the batch is **injected into that
+agent's live tmux session** as a prompt — the same mechanism `tg-ctl` uses to inject inbound
+Telegram messages (`[TG from …]`) into a running session. `<name>` matches a tmux **window**
+name first, then a **session** name (e.g. `--agent ext` reaches the pane of the `ext` session).
+Each comment arrives on one line (`[SPEC-WEB comment on <spec> §<section>] "<quote>" — <body>
+(question, id <id>)`) with a trailing pointer to `review spec-web reply <id> "<answer>" --spec
+<path>`. Delivery is **best-effort**: the batch is already durably in the store, so a missing
+tmux session never fails the Submit — the failure is logged and reported to the reviewer in the
+UI, and the agent can still pull it with `review spec-web watch`. A daemon-wide `--agent` (on
+`start`/`run`) is the default; a per-spec `--agent` (on `add`/`serve`) overrides it for that spec.
 
 **The agent reply → UI + Telegram.** `review spec-web reply <comment-id> <answer> --spec <spec>`
 threads the agent's answer under that comment in the store (stamped with the `agent` author so
@@ -674,8 +713,11 @@ quote that can't be re-found shows in the sidebar as **unanchored** (never a cra
 
 **Persistence.** One JSON file per spec at `~/.config/review-cli/spec-web/<sha1-of-abspath>.json`
 (mode `0600`), surviving restarts. It holds the comments, the in-progress composer **drafts**
-(per slot), and the `last_submit` batch the launching agent reads back. Override the directory
-with `$REVIEW_SPECWEB_DIR`.
+(per slot), and the `last_submit` batch the launching agent reads back. The daemon's spec
+**registry** (`registry.json`, name → path) lives in the same directory — and the comment
+stores are keyed by spec PATH, not by name, so specs reviewed under the old one-server-per-spec
+mode keep their full history when the daemon takes over. Override the directory with
+`$REVIEW_SPECWEB_DIR`.
 
 **Security.** Reads (spec, assets, comments, **drafts**) are open — same model as comments
 (the in-progress composer text is readable by anyone who can reach the port; there are no
@@ -806,7 +848,7 @@ just-ask QUESTION   Single-shot multi-model answer to a question (diff optional)
 quorum QUESTION     Experts cite evidence + a moderator finds quorum/disagreement.
 dashboard           Local web dashboard over review-cli runs.
 sessions            List / resume brainstorm sessions (-a all, -s <id> resume).
-spec-web SPEC.md    Interactive web reviewer for a markdown spec.
+spec-web            Multi-spec web reviewer daemon (start/status/stop/add SPEC; also `spec-web SPEC.md`).
 install-skill | install-commit-hook | register-module
 
 GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)

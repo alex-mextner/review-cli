@@ -41,12 +41,17 @@ import json
 import os
 import queue
 import threading
+import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from . import registry
 from . import render as srender
 from .store import DEFAULT_KIND, NEW_DRAFT_SLOT, SpecStore, _as_int, _as_token, edit_draft_slot, store_dir
+
+from .service import DEFAULT_SPECWEB_HOST, DEFAULT_SPECWEB_PORT
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _ALLOWED_STATIC = {"app.js", "app.css"}
@@ -105,17 +110,104 @@ def allowed_hosts() -> set[str]:
     return _LOOPBACK_HOSTS | _discover_tailscale_hosts() | _extra_allowed_hosts()
 
 
+@dataclass
+class _SpecContext:
+    """Everything a request needs to serve ONE spec, resolved per request.
+
+    Single-spec mode (``make_server`` / ``run_specweb``): ``name`` is ``""`` and ``base`` is
+    ``""`` — the spec lives at the server root (``/``, ``/api/...``, ``/asset/...``). Daemon
+    mode (``make_daemon_server``): ``name`` is the registered name and ``base`` is
+    ``/spec/<name>`` — every URL the SPA builds (API fetches, figure ``src``) is prefixed with
+    it so the ONE shared origin routes to the right spec.
+    """
+
+    name: str
+    spec_path: Path
+    store: SpecStore
+    base: str  # "" (single-spec) or "/spec/<name>" (daemon)
+
+    @property
+    def asset_base(self) -> str:
+        return self.base + "/asset/"
+
+
+def _split_spec_path(path: str) -> tuple[str, str] | None:
+    """Split a daemon URL ``/spec/<name>[/<sub>]`` into ``(name, sub)``.
+
+    ``sub`` always starts with ``/`` and is ``/`` for the bare spec page (so it maps to the
+    SPA index). Returns None for anything not under ``/spec/`` (a daemon-level route). The
+    name is percent-decoded (registered names are plain slugs, but decode defensively).
+    """
+    prefix = "/spec/"
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix):]
+    if not rest:
+        return None
+    if "/" in rest:
+        name, sub = rest.split("/", 1)
+        return unquote(name), "/" + sub
+    return unquote(rest), "/"
+
+
+def _spec_mtime(spec_path: Path) -> float | None:
+    """The spec file's mtime, or None if it's missing (used by the SSE change-watcher)."""
+    try:
+        return spec_path.stat().st_mtime
+    except OSError:
+        return None
+
+
 class SpecWebHandler(BaseHTTPRequestHandler):
     server_version = "review-specweb/1.0"
 
-    # ---- access to per-server config ------------------------------------- #
+    # Set at the START of each request (do_GET/do_POST) to the resolved per-spec context, so the
+    # per-spec handlers below are mode-agnostic — they read ``self._ctx`` instead of the server's
+    # single bound spec.
+    _ctx: "_SpecContext | None" = None
+
+    # ---- per-request spec context ---------------------------------------- #
     @property
     def _spec_path(self) -> Path:
-        return self.server.spec_path  # type: ignore[attr-defined]
+        return self._ctx.spec_path  # type: ignore[union-attr]
 
     @property
     def _store(self) -> SpecStore:
-        return self.server.store  # type: ignore[attr-defined]
+        return self._ctx.store  # type: ignore[union-attr]
+
+    def _single_context(self) -> "_SpecContext":
+        """The context for single-spec mode: the one spec bound on the server at ``base=""``."""
+        return _SpecContext(
+            name="",
+            spec_path=self.server.spec_path,  # type: ignore[attr-defined]
+            store=self.server.store,  # type: ignore[attr-defined]
+            base="",
+        )
+
+    def _context_for_name(self, name: str) -> "_SpecContext | None":
+        """Resolve a registered spec name to a context, or None if it isn't registered.
+
+        The registry is the durable name->path map; the store is keyed per absolute path (the
+        same store the single-spec server and the ``reply`` CLI use), so comments/drafts/replies
+        are shared regardless of how the spec is reached."""
+        spec_path = registry.resolve(name)
+        if spec_path is None:
+            return None
+        resolved = spec_path.expanduser().resolve()
+        return _SpecContext(
+            name=name,
+            spec_path=resolved,
+            store=SpecStore(resolved),
+            base=f"/spec/{name}",
+        )
+
+    def _asset_cache(self) -> dict:
+        """The server's spec-name -> {figure: disk-path} cache (populated on /api/spec)."""
+        cache = getattr(self.server, "_asset_cache", None)
+        if cache is None:
+            cache = {}
+            self.server._asset_cache = cache  # type: ignore[attr-defined]
+        return cache
 
     def _notify_submit(self, review: dict) -> None:
         """Wake the launching process: a non-empty Submit happened. Enqueues THE REVIEW
@@ -251,41 +343,73 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
-            if path in ("/", "/index.html"):
-                return self._serve_index()
+            # Static assets (app.js / app.css) are SHARED across specs, served at /static in
+            # BOTH modes (single-spec and daemon), so the SPA can load them with an absolute
+            # path regardless of which /spec/<name> page it was served from.
             if path.startswith("/static/"):
                 return self._serve_static(path[len("/static/"):])
-            if path.startswith("/asset/"):
-                return self._serve_asset(path[len("/asset/"):])
-            if path == "/api/health":
-                return self._send_json(
-                    {
-                        "ok": True,
-                        "spec_path": str(self._spec_path),
-                        "store_path": str(self._store.path),
-                        "store_dir": str(store_dir()),
-                        "allowed_origins": sorted(allowed_hosts()),
-                        "version": self.server_version,
-                    }
-                )
-            if path == "/api/spec":
-                return self._serve_spec_json()
-            if path == "/api/comments":
-                return self._send_json(self._store.all_comments())
-            if path == "/api/drafts":
-                # The seed header lets the client start its per-session write counter above
-                # the durable high-water-mark, so a reloaded session's autosaves aren't
-                # rejected as stale against old tombstones (review-cli#30). The body shape
-                # (slot -> draft map) is unchanged.
-                return self._send_json(
-                    self._store.all_drafts(),
-                    extra_headers={"X-Draft-Token-Seed": str(self._store.max_draft_token())},
-                )
-            return self._error(404, f"not found: {path}")
+            if getattr(self.server, "multi_spec", False):
+                return self._route_daemon_get(path)
+            self._ctx = self._single_context()
+            return self._route_spec_get(path)
         except BrokenPipeError:
             pass
         except Exception as exc:  # noqa: BLE001 — never crash the server thread
             self._error(500, f"{type(exc).__name__}: {exc}")
+
+    def _route_daemon_get(self, path: str) -> None:
+        """Daemon-level GET routing: navigator at /, health, else resolve /spec/<name>."""
+        if path in ("/", "/index.html"):
+            return self._serve_navigator()
+        if path == "/api/health":
+            return self._send_json(self._daemon_health())
+        if path == "/favicon.ico":
+            return self._error(404, "no favicon")
+        spec = _split_spec_path(path)
+        if spec is None:
+            return self._error(404, f"not found: {path}")
+        name, sub = spec
+        ctx = self._context_for_name(name)
+        if ctx is None:
+            return self._error(
+                404, f"unknown spec: {name!r} — register it with `review spec-web add <path>`"
+            )
+        self._ctx = ctx
+        return self._route_spec_get(sub)
+
+    def _route_spec_get(self, path: str) -> None:
+        """Per-spec GET routing (mode-agnostic; ``self._ctx`` is already resolved)."""
+        if path in ("/", "/index.html"):
+            return self._serve_index()
+        if path.startswith("/asset/"):
+            return self._serve_asset(path[len("/asset/"):])
+        if path == "/api/events":
+            return self._serve_events()
+        if path == "/api/health":
+            return self._send_json(
+                {
+                    "ok": True,
+                    "spec_path": str(self._spec_path),
+                    "store_path": str(self._store.path),
+                    "store_dir": str(store_dir()),
+                    "allowed_origins": sorted(allowed_hosts()),
+                    "version": self.server_version,
+                }
+            )
+        if path == "/api/spec":
+            return self._serve_spec_json()
+        if path == "/api/comments":
+            return self._send_json(self._store.all_comments())
+        if path == "/api/drafts":
+            # The seed header lets the client start its per-session write counter above
+            # the durable high-water-mark, so a reloaded session's autosaves aren't
+            # rejected as stale against old tombstones (review-cli#30). The body shape
+            # (slot -> draft map) is unchanged.
+            return self._send_json(
+                self._store.all_drafts(),
+                extra_headers={"X-Draft-Token-Seed": str(self._store.max_draft_token())},
+            )
+        return self._error(404, f"not found: {path}")
 
     # ---- routing: POST ---------------------------------------------------- #
     def do_POST(self) -> None:  # noqa: N802
@@ -299,10 +423,34 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if getattr(self.server, "multi_spec", False):
+                spec = _split_spec_path(path)
+                if spec is None:
+                    return self._error(404, f"not found: {path}")
+                name, sub = spec
+                ctx = self._context_for_name(name)
+                if ctx is None:
+                    return self._error(
+                        404,
+                        f"unknown spec: {name!r} — register it with `review spec-web add <path>`",
+                    )
+                self._ctx = ctx
+                target = sub
+            else:
+                self._ctx = self._single_context()
+                target = path
             body = self._read_write_body()
             if body is None:
                 return  # error already sent
+            return self._route_spec_post(target, body)
+        except BrokenPipeError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            self._error(500, f"{type(exc).__name__}: {exc}")
 
+    def _route_spec_post(self, path: str, body: dict) -> None:
+        """Per-spec POST routing (mode-agnostic; ``self._ctx`` is already resolved)."""
+        try:
             if path == "/api/comments":
                 return self._create_comment(body)
             if path == "/api/submit":
@@ -311,9 +459,11 @@ class SpecWebHandler(BaseHTTPRequestHandler):
                 # agent. Only a non-empty submit (count>0) is a real handoff; an empty
                 # submit (no pending notes) must not wake the agent with nothing. Enqueue the
                 # review SNAPSHOT from this submit so the watcher emits exactly this batch.
+                delivery = None
                 if result.get("count"):
                     self._notify_submit(result.get("review") or {})
-                return self._send_json({"ok": True, **result})
+                    delivery = self._deliver_submit(result)
+                return self._send_json({"ok": True, "delivery": delivery, **result})
             if path == "/api/import":
                 try:
                     result = self._store.import_thread(body, replace=bool(body.get("replace")))
@@ -334,6 +484,44 @@ class SpecWebHandler(BaseHTTPRequestHandler):
             pass
         except Exception as exc:  # noqa: BLE001
             self._error(500, f"{type(exc).__name__}: {exc}")
+
+    def _owning_agent(self) -> str | None:
+        """The agent session that owns THIS spec's reviews: the spec's registry ``agent``
+        (daemon mode, set by ``add/serve --agent``) falling back to the server-wide default
+        (the required ``--agent`` on ``start``/``run``/the legacy single-spec server)."""
+        agent = None
+        ctx = self._ctx
+        if ctx is not None and ctx.name:
+            rec = registry.load_registry()["specs"].get(ctx.name) or {}
+            agent = rec.get("agent")
+        return agent or getattr(self.server, "default_agent", None)
+
+    def _deliver_submit(self, result: dict) -> dict:
+        """Push a non-empty submitted batch into the owning agent's tmux pane (see deliver.py).
+
+        Best-effort: the review is already durably in the store, so a failed delivery is
+        LOGGED (daemon log) + reported in the response, never a 500. The tg-ctl-style
+        injection is what makes a submit actually REACH someone — before this, batches sat
+        in the store until a watcher happened to poll (i.e. usually never)."""
+        from . import deliver
+
+        ctx = self._ctx
+        agent = self._owning_agent()
+        if not agent:
+            return {"agent": None, "delivered": False, "detail": "no owning agent configured"}
+        ok, detail = deliver.deliver_review(
+            agent=agent,
+            spec_name=ctx.name or ctx.spec_path.name,  # type: ignore[union-attr]
+            spec_path=ctx.spec_path,  # type: ignore[union-attr]
+            review=result.get("review") or {},
+            batch=result.get("batch"),
+        )
+        print(
+            f"[review spec-web] submit delivery -> agent '{agent}': "
+            f"{'ok' if ok else 'FAILED'} ({detail})",
+            flush=True,
+        )
+        return {"agent": agent, "delivered": ok, "detail": detail}
 
     # ---- POST handlers ---------------------------------------------------- #
     def _create_comment(self, body: dict) -> None:
@@ -451,7 +639,12 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         except OSError:
             return self._error(500, "index.html missing")
         title = self._spec_path.name
-        html = html.replace("{{SPEC_TITLE}}", _esc_attr(title))
+        # {{BASE}} is the URL prefix the SPA prepends to every API fetch: "" for single-spec,
+        # "/spec/<name>" under the daemon (so the ONE origin routes to the right spec). Escaped
+        # as a JS string below in index.html.
+        html = html.replace("{{SPEC_TITLE}}", _esc_attr(title)).replace(
+            "{{BASE}}", _esc_attr(self._ctx.base)  # type: ignore[union-attr]
+        )
         self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
 
     def _serve_static(self, name: str) -> None:
@@ -466,13 +659,16 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         self._send_bytes(body, ctype)
 
     def _serve_spec_json(self) -> None:
-        result = srender.render_spec(self._spec_path)
-        # Cache the asset map on the server so /asset/<name> can validate against it.
-        self.server.assets = result.assets  # type: ignore[attr-defined]
+        ctx = self._ctx
+        result = srender.render_spec(ctx.spec_path, asset_base=ctx.asset_base)  # type: ignore[union-attr]
+        # Cache the asset map per spec-name so /asset/<name> can validate against it (one
+        # cache serves both modes; the single-spec name is "").
+        self._asset_cache()[ctx.name] = result.assets  # type: ignore[union-attr]
         self._send_json(
             {
-                "title": self._spec_path.name,
+                "title": ctx.spec_path.name,  # type: ignore[union-attr]
                 "html": result.html,
+                "mtime": _spec_mtime(ctx.spec_path),  # type: ignore[union-attr]
                 "headings": [{"level": lv, "text": t, "id": hid} for (lv, t, hid) in result.headings],
             }
         )
@@ -491,10 +687,12 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         # Reject anything that isn't a bare basename after decode (no slashes / traversal).
         if fname != decoded or not fname or fname in (".", ".."):
             return self._error(404, f"asset not allowed: {name}")
-        assets = getattr(self.server, "assets", None)
+        ctx = self._ctx
+        cache = self._asset_cache()
+        assets = cache.get(ctx.name)  # type: ignore[union-attr]
         if not assets:
-            assets = srender.render_spec(self._spec_path).assets
-            self.server.assets = assets  # type: ignore[attr-defined]
+            assets = srender.render_spec(ctx.spec_path, asset_base=ctx.asset_base).assets  # type: ignore[union-attr]
+            cache[ctx.name] = assets  # type: ignore[union-attr]
         # Serve ONLY figures the markdown actually references (in the renderer's asset map),
         # never an arbitrary basename from the assets dir — otherwise a reachable reviewer
         # (especially over Tailscale) could download any unrelated file sitting in that dir.
@@ -541,6 +739,148 @@ class SpecWebHandler(BaseHTTPRequestHandler):
             }
         self._send_bytes(data, ctype, extra_headers=extra)
 
+    # ---- daemon: navigator / health / SSE -------------------------------- #
+    def _spec_counts(self, spec_path: Path) -> dict:
+        """Comment tally for a spec (for the navigator + daemon health). Never raises: a spec
+        whose store file is unreadable reads as all-zero."""
+        counts = {"total": 0, "pending": 0, "submitted": 0, "answered": 0, "resolved": 0,
+                  "questions": 0, "remarks": 0, "open": 0}
+        try:
+            comments = SpecStore(spec_path).all_comments()
+        except Exception:  # noqa: BLE001 — a bad store must not break the navigator
+            return counts
+        for c in comments:
+            counts["total"] += 1
+            status = c.get("status") if c.get("status") in counts else None
+            if status:
+                counts[status] += 1
+            if c.get("kind") == "question":
+                counts["questions"] += 1
+            else:
+                counts["remarks"] += 1
+            # "open" = a note still needing attention (pending or submitted, not answered/resolved).
+            if c.get("status") in ("pending", "submitted"):
+                counts["open"] += 1
+        return counts
+
+    def _spec_summaries(self) -> list[dict]:
+        """Every registered spec with its URL + comment counts (navigator + health payload)."""
+        out: list[dict] = []
+        for rec in registry.list_specs():
+            out.append(
+                {
+                    "name": rec["name"],
+                    "path": rec["path"],
+                    "exists": rec["exists"],
+                    "url": f"/spec/{rec['name']}",
+                    "counts": self._spec_counts(Path(rec["path"])),
+                }
+            )
+        return out
+
+    def _daemon_health(self) -> dict:
+        return {
+            "ok": True,
+            "mode": "daemon",
+            "version": self.server_version,
+            "store_dir": str(store_dir()),
+            "allowed_origins": sorted(allowed_hosts()),
+            "specs": self._spec_summaries(),
+        }
+
+    def _serve_navigator(self) -> None:
+        """The daemon root: a self-contained HTML index of every registered spec.
+
+        Server-rendered plain HTML (no SPA) so the navigator loads instantly and needs no
+        packaged asset. Each spec is a card linking to ``/spec/<name>`` with its open-comment
+        count; a spec whose file has gone missing is flagged rather than hidden."""
+        specs = self._spec_summaries()
+        cards: list[str] = []
+        for s in specs:
+            counts = s["counts"]
+            badge = ""
+            if counts["open"]:
+                badge = f'<span class="nav-badge nav-open">{counts["open"]} open</span>'
+            elif counts["total"]:
+                badge = f'<span class="nav-badge">{counts["total"]} note(s)</span>'
+            missing = "" if s["exists"] else '<span class="nav-badge nav-missing">file missing</span>'
+            cards.append(
+                '<a class="nav-card" href="{url}">'
+                '<div class="nav-name">{name}</div>'
+                '<div class="nav-path">{path}</div>'
+                '<div class="nav-meta">{badge}{missing}</div>'
+                "</a>".format(
+                    url=_esc_attr(s["url"]),
+                    name=_esc_html(s["name"]),
+                    path=_esc_html(s["path"]),
+                    badge=badge,
+                    missing=missing,
+                )
+            )
+        body = (
+            "".join(cards)
+            if cards
+            else '<div class="nav-empty">No specs registered yet. Add one with '
+            "<code>review spec-web add &lt;path/to/spec.md&gt;</code>.</div>"
+        )
+        html = _NAVIGATOR_HTML.replace("{{CARDS}}", body).replace("{{COUNT}}", str(len(specs)))
+        self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
+
+    def _serve_events(self) -> None:
+        """Server-Sent Events stream of spec-file changes for live reload (one per connection).
+
+        Polls the spec's mtime once a second; on a change it emits ``event: spec-changed`` so
+        the SPA re-fetches ``/api/spec`` and swaps the content in place (no full reload, no
+        scroll jump — the no-jump + highlight logic lives client-side in app.js). Heartbeat
+        comments in between let the client/proxies detect a dropped connection. Runs on its own
+        request thread (ThreadingHTTPServer); ``daemon_threads`` lets the process exit even with
+        a stream open, and ``server._sse_stop`` ends the loop on a clean shutdown."""
+        ctx = self._ctx
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        last = _spec_mtime(ctx.spec_path)  # type: ignore[union-attr]
+        if not self._sse_send("hello", {"mtime": last}):
+            return
+        # Poll interval is a server attribute so tests can shrink it (default 1s is plenty
+        # responsive for a human editing a file, and keeps the per-connection wakeups cheap).
+        poll = getattr(self.server, "sse_poll_seconds", 1.0)
+        while not getattr(self.server, "_sse_stop", False):
+            time.sleep(poll)
+            cur = _spec_mtime(ctx.spec_path)  # type: ignore[union-attr]
+            if cur != last:
+                last = cur
+                if not self._sse_send("spec-changed", {"mtime": cur}):
+                    return
+            else:
+                try:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, OSError):
+                    return
+
+    def _sse_send(self, event: str, data: dict) -> bool:
+        """Write one SSE frame; return False if the client has gone (so the loop can stop)."""
+        frame = f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+        try:
+            self.wfile.write(frame)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            return False
+
+
+def _esc_html(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
 
 def _esc_attr(value: str) -> str:
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
@@ -553,23 +893,99 @@ def _asset_content_type(fname: str) -> str:
     return srender.IMAGE_MIME_TYPES.get(ext, "application/octet-stream")
 
 
-def make_server(spec_path: Path | str, *, host: str = "127.0.0.1", port: int = 0, verbose: bool = False) -> ThreadingHTTPServer:
+# The daemon navigator (root ``/``): a self-contained HTML index of registered specs. Inline
+# CSS so it needs no packaged asset and renders instantly on a phone. ``{{CARDS}}`` and
+# ``{{COUNT}}`` are filled server-side (both already HTML-escaped).
+_NAVIGATOR_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Spec review — Navigator</title>
+<style>
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+       background: #0f1115; color: #e6e8eb; }
+.wrap { max-width: 820px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 20px; margin: 8px 0 4px; }
+.sub { color: #8a92a6; margin: 0 0 20px; font-size: 13px; }
+.nav-card { display: block; text-decoration: none; color: inherit; background: #1a1d24;
+            border: 1px solid #262b36; border-radius: 12px; padding: 14px 16px; margin: 0 0 12px;
+            transition: border-color .12s, transform .12s; }
+.nav-card:hover { border-color: #3d76f5; transform: translateY(-1px); }
+.nav-name { font-weight: 600; font-size: 16px; color: #dfe6ff; }
+.nav-path { color: #6f7789; font-size: 12px; margin-top: 2px; word-break: break-all; }
+.nav-meta { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.nav-badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #262b36; color: #aab3c5; }
+.nav-open { background: #24344f; color: #79a6ff; }
+.nav-missing { background: #4a2530; color: #ff8a9c; }
+.nav-empty { color: #8a92a6; background: #1a1d24; border: 1px dashed #363c4a; border-radius: 12px;
+             padding: 24px; text-align: center; }
+code { background: #262b36; padding: 1px 6px; border-radius: 6px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Spec review</h1>
+  <p class="sub">{{COUNT}} spec(s) registered · one daemon, name-based URLs</p>
+  {{CARDS}}
+</div>
+</body>
+</html>
+"""
+
+
+def make_server(
+    spec_path: Path | str, *, host: str = "127.0.0.1", port: int = 0, verbose: bool = False,
+    agent: str | None = None,
+) -> ThreadingHTTPServer:
     """Create (but do not serve) the spec-web server bound to ``host:port``.
 
     port=0 picks a free ephemeral port (used by tests). The bound port is on
-    ``server.server_address[1]``.
+    ``server.server_address[1]``. ``agent`` is the owning agent session submitted batches
+    are DELIVERED to (tmux injection, see deliver.py); None keeps the stdout-watcher-only
+    legacy handoff (tests / direct make_server callers).
     """
     spec_path = Path(spec_path).expanduser().resolve()
     httpd = ThreadingHTTPServer((host, port), SpecWebHandler)
+    httpd.multi_spec = False  # type: ignore[attr-defined]
+    httpd.default_agent = agent  # type: ignore[attr-defined]
     httpd.spec_path = spec_path  # type: ignore[attr-defined]
     httpd.store = SpecStore(spec_path)  # type: ignore[attr-defined]
-    httpd.assets = {}  # type: ignore[attr-defined]
+    httpd._asset_cache = {}  # type: ignore[attr-defined]  # spec-name -> figure map (name "")
+    httpd._sse_stop = False  # type: ignore[attr-defined]  # ends /api/events loops on shutdown
     httpd.verbose = verbose  # type: ignore[attr-defined]
     # Each non-empty POST /api/submit puts its batch timestamp here so the launching process
     # (draining the queue in run_specweb) hands the finalized review back to the agent. A
     # QUEUE, not an Event, so two rapid submits each get delivered (no coalescing). A test
     # that drives make_server with no watcher just leaves items unread — harmless.
     httpd.submit_queue = queue.Queue()  # type: ignore[attr-defined]
+    httpd.daemon_threads = True
+    return httpd
+
+
+def make_daemon_server(
+    *, host: str = DEFAULT_SPECWEB_HOST, port: int = DEFAULT_SPECWEB_PORT, verbose: bool = False,
+    agent: str | None = None,
+) -> ThreadingHTTPServer:
+    """Create (but do not serve) the MULTI-SPEC daemon bound to ``host:port``.
+
+    One server serves EVERY registered spec by name at ``/spec/<name>`` (navigator at ``/``).
+    Unlike ``make_server`` it binds no single spec — each request resolves its spec from the
+    URL against the registry. ``port=0`` picks a free ephemeral port (used by tests).
+    ``agent`` is the daemon-wide DEFAULT owner submitted batches are delivered to when a
+    spec's own registry record has no ``agent`` (see deliver.py).
+    """
+    httpd = ThreadingHTTPServer((host, port), SpecWebHandler)
+    httpd.multi_spec = True  # type: ignore[attr-defined]
+    httpd.default_agent = agent  # type: ignore[attr-defined]
+    httpd._asset_cache = {}  # type: ignore[attr-defined]  # spec-name -> figure map
+    httpd._sse_stop = False  # type: ignore[attr-defined]  # ends /api/events loops on shutdown
+    httpd.verbose = verbose  # type: ignore[attr-defined]
+    # No submit_queue: the daemon is a separate process from any stdout watcher, so the
+    # submit->agent handoff is cross-process via the store's last_submit (watch_submits polls
+    # it), not an in-process queue. _notify_submit is a no-op when no queue is present.
     httpd.daemon_threads = True
     return httpd
 
@@ -622,6 +1038,7 @@ def run_specweb(
     seed: Path | str | None = None,
     verbose: bool = False,
     exit_on_submit: bool = False,
+    agent: str | None = None,
 ) -> int:
     """Blocking entry for ``review spec-web``. Returns a process exit code.
 
@@ -658,7 +1075,7 @@ def run_specweb(
     # race where another process grabs the probed port in between).
     chosen = port or 0
     try:
-        httpd = make_server(spec_path, host=host, port=chosen, verbose=verbose)
+        httpd = make_server(spec_path, host=host, port=chosen, verbose=verbose, agent=agent)
     except OSError as exc:
         print(f"[review spec-web] cannot bind {host}:{chosen}: {exc}", flush=True)
         return 1
@@ -713,6 +1130,106 @@ def run_specweb(
         print("\n[review spec-web] stopped.", flush=True)
     finally:
         submit_queue.put(_STOP)  # break the watcher's blocking get so it exits
+        httpd._sse_stop = True  # type: ignore[attr-defined]  # end any live SSE loops (as run_daemon does)
         httpd.shutdown()
         httpd.server_close()
+    return 0
+
+
+def daemon_spec_urls(name: str, host: str, port: int) -> list[str]:
+    """The reachable ``/spec/<name>`` URLs for a registered spec (banner + `add` output)."""
+    return [u.rstrip("/") + f"/spec/{name}" for u in _reachable_urls(host, port)]
+
+
+def run_daemon(
+    *,
+    host: str = DEFAULT_SPECWEB_HOST,
+    port: int | None = None,
+    verbose: bool = False,
+    agent: str | None = None,
+) -> int:
+    """Blocking entry for the MULTI-SPEC daemon (``review spec-web __serve`` / ``run``).
+
+    Serves EVERY registered spec by name from ONE port (navigator at ``/``). The registry is
+    read per request, so a spec ``add``ed while the daemon runs is served immediately — no
+    restart. This is the foreground process the managed service (agenttools_service) detaches
+    on ``start``; the pidfile/liveness is the service manager's job, not ours. ``agent`` is
+    the daemon-wide default delivery target for submitted batches (the CLI REQUIRES it on
+    ``start``/``run``).
+    """
+    chosen = DEFAULT_SPECWEB_PORT if port is None else port
+    try:
+        httpd = make_daemon_server(host=host, port=chosen, verbose=verbose, agent=agent)
+    except OSError as exc:
+        print(f"[review spec-web] cannot bind {host}:{chosen}: {exc}", flush=True)
+        return 1
+    bound = httpd.server_address[1]
+    print(f"[review spec-web] daemon store dir: {store_dir()}", flush=True)
+    if agent:
+        print(f"[review spec-web] default submit-delivery agent: {agent}", flush=True)
+    for url in _reachable_urls(host, bound):
+        print(f"[review spec-web] navigator {url}", flush=True)
+    specs = registry.list_specs()
+    print(f"[review spec-web] serving {len(specs)} registered spec(s) at /spec/<name>.", flush=True)
+    for rec in specs:
+        print(f"[review spec-web]   - {rec['name']}: {rec['path']}", flush=True)
+    if host in ("0.0.0.0", "::"):
+        print("[review spec-web] bound to all interfaces — reachable over Tailscale. Writes allowed from loopback + the Tailscale host.", flush=True)
+    else:
+        print("[review spec-web] loopback-only. Pass --host 0.0.0.0 to expose over Tailscale.", flush=True)
+    print("[review spec-web] Ctrl-C to stop.", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[review spec-web] daemon stopped.", flush=True)
+    finally:
+        httpd._sse_stop = True  # type: ignore[attr-defined]  # end any live SSE loops
+        httpd.shutdown()
+        httpd.server_close()
+    return 0
+
+
+# Sentinel distinguishing "no baseline passed" from a legitimate baseline of None (a spec
+# that has never been submitted).
+_BASELINE_UNSET = object()
+
+
+def watch_submits(
+    spec_path: Path | str,
+    *,
+    exit_on_submit: bool = False,
+    poll_seconds: float = 0.5,
+    baseline: object = _BASELINE_UNSET,
+) -> int:
+    """Block, watching ONE spec's store for a fresh Submit, emitting the marker-framed review.
+
+    This is the daemon-era submit->agent handoff: the daemon (a separate process) records each
+    non-empty Submit via ``SpecStore.submit_pending`` (``last_submit`` timestamp); this poller
+    detects a CHANGE in ``last_submit`` and prints the structured review to stdout between the
+    stable SUBMIT_MARKER_* markers — the same contract ``run_specweb``'s in-process watcher
+    emits, so an agent that ran ``review spec-web serve <spec>`` reads its review identically.
+    Ctrl-C returns cleanly (the daemon keeps running). ``exit_on_submit`` returns after the
+    first fresh submit.
+
+    ``baseline`` lets the caller pin the "stale as of" point EARLIER than the watch start
+    (e.g. ``review spec-web serve`` captures it before starting/registering into the daemon,
+    so a reviewer submitting in that window is still delivered). Unset ⇒ baseline now.
+    """
+    spec_path = Path(spec_path).expanduser().resolve()
+    store = SpecStore(spec_path)
+    # Baseline the CURRENT last_submit so we only report submits that happen AFTER the watch
+    # starts (a stale prior submit from an earlier session must not fire immediately) — unless
+    # the caller pinned an earlier baseline (see docstring).
+    last_seen = store.last_submit() if baseline is _BASELINE_UNSET else baseline
+    try:
+        while True:
+            time.sleep(poll_seconds)
+            cur = store.last_submit()
+            if cur != last_seen and cur is not None:
+                last_seen = cur
+                _emit_submitted_review(store.review_payload())
+                if exit_on_submit:
+                    return 0
+    except KeyboardInterrupt:
+        print("\n[review spec-web] stopped watching (daemon still running).", flush=True)
     return 0
