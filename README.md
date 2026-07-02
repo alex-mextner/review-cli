@@ -643,6 +643,7 @@ review spec-web reply <comment-id> "the answer" --spec docs/specs/my-spec.md
 | `--port` | daemon port (default `7920`, stable across restarts so URLs/Tailscale mappings survive) |
 | `--seed FILE` | import an initial review thread from a JSON file before serving |
 | `--exit-on-submit` | return after the first Submit (the daemon keeps running; only the watch returns) |
+| `--emit-current` | `watch`: re-emit the batch ALREADY in the store before watching — the recovery path when a submit's live delivery failed (a bare `watch` only fires on a *later* submit) |
 | `--no-watch` | `serve` / the positional form: register + print the URL but don't block |
 | `--open` | open the URL in a browser on startup |
 

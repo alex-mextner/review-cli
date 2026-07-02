@@ -1418,10 +1418,15 @@
             // switch to Submitted is the success signal.
             var d = r.delivery;
             if (r.count && d && d.agent && !d.delivered) {
+              // Recovery command must EMIT the already-submitted batch, not wait for a future
+              // one: a bare `watch` baselines at the current submit and only fires on a LATER
+              // change, so `--emit-current` is what actually re-surfaces this batch. Name the
+              // spec when we know it (daemon mode: API_BASE is "/spec/<name>").
+              var name = API_BASE.indexOf('/spec/') === 0 ? API_BASE.slice('/spec/'.length) : '';
+              var pull = 'review spec-web watch ' + (name || '<spec>') + ' --emit-current';
               alert('Review submitted and saved, but delivery to agent "' + d.agent +
                     '" failed: ' + (d.detail || 'unknown reason') +
-                    '.\nIt is safe in the store — the agent can still read it with ' +
-                    '`review spec-web watch`.');
+                    '.\nIt is safe in the store — the agent can pull it now with:\n  ' + pull);
             }
           });
         })

@@ -409,6 +409,60 @@ def test_watch_submits_ignores_a_stale_pre_watch_submit():
             assert out.count(sserver.SUBMIT_MARKER_BEGIN) == 1, out
 
 
+def test_watch_submits_emit_current_re_emits_an_already_submitted_batch():
+    """The failed-live-delivery recovery path: a batch is ALREADY submitted (its live tmux
+    delivery failed), so a bare watch — which baselines at the current last_submit and only
+    fires on a LATER change — would wait forever. `emit_current` re-surfaces the stored batch
+    immediately and (with exit_on_submit) returns, so the UI's recovery hint actually works."""
+    with _TempStoreEnv():
+        with tempfile.TemporaryDirectory() as tdir:
+            spec = Path(tdir) / "undelivered.md"
+            spec.write_text("# Undelivered\n", encoding="utf-8")
+            store = SpecStore(spec)
+            store.add_comment(quote="", body="reached nobody live", kind="question")
+            store.submit_pending()  # already submitted; nothing new will happen
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = sserver.watch_submits(
+                    spec, exit_on_submit=True, poll_seconds=0.05, emit_current=True
+                )
+            assert rc == 0, rc
+            out = buf.getvalue()
+            # exactly ONE emission — the already-submitted batch, with no fresh submit at all
+            assert out.count(sserver.SUBMIT_MARKER_BEGIN) == 1, out
+            payload = out.split(sserver.SUBMIT_MARKER_BEGIN)[1].split(sserver.SUBMIT_MARKER_END)[0].strip()
+            review = json.loads(payload)
+            assert review["comments"][0]["body"] == "reached nobody live", review
+
+
+def test_watch_submits_emit_current_is_a_noop_when_nothing_submitted():
+    """`emit_current` on a never-submitted spec emits nothing up front, then behaves like a
+    normal watch — a fresh submit still fires (and only that one)."""
+    with _TempStoreEnv():
+        with tempfile.TemporaryDirectory() as tdir:
+            spec = Path(tdir) / "empty.md"
+            spec.write_text("# Empty\n", encoding="utf-8")
+            store = SpecStore(spec)
+
+            def _submit_later():
+                time.sleep(0.3)
+                store.add_comment(quote="", body="the only note", kind="question")
+                store.submit_pending()
+
+            t = threading.Thread(target=_submit_later, daemon=True)
+            t.start()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = sserver.watch_submits(
+                    spec, exit_on_submit=True, poll_seconds=0.05, emit_current=True
+                )
+            t.join()
+            assert rc == 0, rc
+            # exactly ONE emission — the fresh submit, not a spurious empty emit_current one
+            assert buf.getvalue().count(sserver.SUBMIT_MARKER_BEGIN) == 1, buf.getvalue()
+
+
 # --------------------------------------------------------------------------- #
 # submit delivery (--agent ownership + tg-ctl-style tmux injection)
 # --------------------------------------------------------------------------- #

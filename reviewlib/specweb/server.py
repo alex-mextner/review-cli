@@ -1200,6 +1200,7 @@ def watch_submits(
     exit_on_submit: bool = False,
     poll_seconds: float = 0.5,
     baseline: object = _BASELINE_UNSET,
+    emit_current: bool = False,
 ) -> int:
     """Block, watching ONE spec's store for a fresh Submit, emitting the marker-framed review.
 
@@ -1214,6 +1215,15 @@ def watch_submits(
     ``baseline`` lets the caller pin the "stale as of" point EARLIER than the watch start
     (e.g. ``review spec-web serve`` captures it before starting/registering into the daemon,
     so a reviewer submitting in that window is still delivered). Unset ⇒ baseline now.
+
+    ``emit_current`` re-emits the batch ALREADY in the store immediately, BEFORE the watch
+    loop. This is the recovery path for a submit whose LIVE tmux delivery failed (no agent
+    session was found): a bare ``watch`` baselines at the current ``last_submit`` and only
+    fires on a LATER change, so it would never re-surface an already-submitted batch — the
+    exact gap the UI's failed-delivery hint must not send the agent chasing. With
+    ``exit_on_submit`` this makes ``watch <spec> --emit-current`` a one-shot pull of the
+    saved review; without it, the current batch is emitted once and the loop then watches for
+    the next submit (the baseline advances past it so it is never double-emitted).
     """
     spec_path = Path(spec_path).expanduser().resolve()
     store = SpecStore(spec_path)
@@ -1221,6 +1231,13 @@ def watch_submits(
     # starts (a stale prior submit from an earlier session must not fire immediately) — unless
     # the caller pinned an earlier baseline (see docstring).
     last_seen = store.last_submit() if baseline is _BASELINE_UNSET else baseline
+    if emit_current:
+        current = store.last_submit()
+        if current is not None:
+            _emit_submitted_review(store.review_payload())
+            last_seen = current  # don't re-emit this batch in the loop below
+            if exit_on_submit:
+                return 0
     try:
         while True:
             time.sleep(poll_seconds)

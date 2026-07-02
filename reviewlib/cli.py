@@ -925,10 +925,19 @@ def _spec_web_remove(rest: list[str]) -> int:
 
 
 def _spec_web_watch(rest: list[str]) -> int:
-    """``review spec-web watch <name|path> [--exit-on-submit]`` — block until a fresh submit."""
+    """``review spec-web watch <name|path> [--emit-current] [--exit-on-submit]`` — block until a
+    fresh submit.
+
+    ``--emit-current`` first re-emits the batch ALREADY in the store — the recovery path when a
+    submit's live tmux delivery failed (a bare ``watch`` only fires on a LATER submit, so it
+    would never re-surface the already-submitted batch)."""
     parser = argparse.ArgumentParser(prog="review spec-web watch", add_help=False)
     parser.add_argument("target", help="a registered spec NAME or a spec PATH")
     parser.add_argument("--exit-on-submit", dest="exit_on_submit", action="store_true")
+    parser.add_argument(
+        "--emit-current", dest="emit_current", action="store_true",
+        help="re-emit the batch already in the store before watching (recover a failed live delivery)",
+    )
     ns, _ = parser.parse_known_args(rest)
     from .specweb import registry
     from .specweb.server import watch_submits
@@ -940,7 +949,7 @@ def _spec_web_watch(rest: list[str]) -> int:
         print(f"[review spec-web watch] no such spec (name or path): {ns.target}", file=sys.stderr)
         return 1
     print(f"[review spec-web] watching {spec} for a submit (Ctrl-C to stop).")
-    return watch_submits(spec, exit_on_submit=ns.exit_on_submit)
+    return watch_submits(spec, exit_on_submit=ns.exit_on_submit, emit_current=ns.emit_current)
 
 
 def _spec_web_reply(argv: list[str]) -> int:
