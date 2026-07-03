@@ -5,6 +5,22 @@ semantic versioning.
 
 ## Unreleased
 
+- **`scripts/deploy.sh` — the rig-apply deploy hook (review-cli#105).** rig-cli 0.8.0+ runs a
+  tool's `scripts/deploy.sh` on every `rig apply` to keep the installed tool fresh; this repo
+  had none, so the live symlinked checkout silently drifted stale. The script is a guarded
+  fast-forward `git pull` of, by default, the checkout the script itself lives in — exactly the
+  repo rig's no-arg freshness run targets; a copy outside any checkout falls back to resolving
+  the `review` symlink on PATH (the install is a symlink to `bin/review`, pure Python, no build
+  step — a pull IS the deploy). It scrubs foreign `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`
+  from the environment (a git-hook caller would otherwise pin every command to the wrong repo,
+  the review-cli#72 bug class), refuses on a
+  dirty (tracked-changes) worktree, detached HEAD, or a checkout that diverged from its
+  upstream (exit 2 — never merges/rebases on the user's behalf), exits 0 both when already up
+  to date and after a successful deploy, re-registers the agent skill post-pull (bounded,
+  non-fatal), and prints a restart note when the deploy touched `reviewlib/` while a resident
+  `review dashboard`/spec-web daemon may hold the old code. `--checkout DIR` targets a specific
+  clone; `--dry-run` reports what would land without pulling. Tests drive the real script
+  against throwaway origin+clone pairs.
 - **qa ext harness hardening: a queue-backed stdout reader + an absolute-path isolation
   warning (review-cli#75).** The ext runner's stdout is now drained by a dedicated reader
   THREAD into a thread-safe queue (`_StdoutLineReader`), replacing the `select` + text-mode
