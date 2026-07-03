@@ -14,6 +14,15 @@
 (function () {
   'use strict';
 
+  // The URL prefix for THIS spec's API/asset/SSE calls, injected by the server into
+  // index.html. "" in single-spec mode (the spec is at the server root); "/spec/<name>" under
+  // the multi-spec daemon so the ONE shared origin routes to the right spec. Every fetch below
+  // goes through api()/apiUrl(), which prepend it — so the SPA is identical in both modes.
+  var API_BASE = window.__SPECWEB_BASE__ || '';
+  function apiUrl(path) {
+    return API_BASE + path;
+  }
+
   var els = {
     specBody: document.getElementById('specBody'),
     specTitle: document.getElementById('specTitle'),
@@ -112,7 +121,7 @@
       opts.body = JSON.stringify(body);
     }
     if (signal) opts.signal = signal;
-    return fetch(url, opts).then(function (r) {
+    return fetch(apiUrl(url), opts).then(function (r) {
       if (!r.ok)
         return r.json().then(function (j) {
           throw new Error(j.error || r.statusText);
@@ -147,6 +156,127 @@
         els.specBody.innerHTML = '<div class="loading">Failed to load spec: ' + esc(e.message) + '</div>';
       });
   }
+
+  // ---- live reload (SSE) --------------------------------------------------
+  // The daemon streams a `spec-changed` event when the .md file changes on disk. We re-fetch
+  // the rendered HTML and swap it in WITHOUT a full page reload, and — the hard requirement —
+  // WITHOUT the reading position jumping when content ABOVE the viewport changes height. We
+  // also briefly HIGHLIGHT the blocks that actually changed (above OR below the fold) without
+  // scrolling to them.
+
+  // A stable signature for a top-level block: tag + its collapsed visible text. Two renders of
+  // the same paragraph produce the same signature; an edit changes it. Used both to re-find the
+  // scroll anchor across the swap and to diff which blocks changed (to flash them).
+  function blockSig(el) {
+    return el.tagName + '' + (el.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+  function topBlocks(root) {
+    return Array.prototype.slice.call(root.children);
+  }
+  // Pick the block the reader is currently looking at: the first top-level block whose BOTTOM
+  // is still below the pane's top edge (i.e. it straddles or sits just below the fold). Record
+  // its signature + index + exact offset from the viewport top, so we can put the SAME block
+  // back at the SAME offset after the swap — compensating for any height change above it.
+  function captureScrollAnchor() {
+    var paneTop = els.specPane.getBoundingClientRect().top;
+    var blocks = topBlocks(els.specBody);
+    for (var i = 0; i < blocks.length; i++) {
+      var r = blocks[i].getBoundingClientRect();
+      if (r.bottom > paneTop + 1) {
+        return { index: i, sig: blockSig(blocks[i]), offset: r.top - paneTop };
+      }
+    }
+    return null;
+  }
+  // Put the anchor block back where it was. Prefer matching by signature (survives added/
+  // removed blocks above it); fall back to the same index. Adjust scrollTop by the delta so the
+  // viewport does not move even though total height above may have changed.
+  function restoreScrollAnchor(anchor) {
+    if (!anchor) return;
+    var blocks = topBlocks(els.specBody);
+    var target = null;
+    for (var i = 0; i < blocks.length; i++) {
+      if (blockSig(blocks[i]) === anchor.sig) { target = blocks[i]; break; }
+    }
+    if (!target && anchor.index < blocks.length) target = blocks[anchor.index];
+    if (!target) return;
+    var paneTop = els.specPane.getBoundingClientRect().top;
+    var curOffset = target.getBoundingClientRect().top - paneTop;
+    // The pane has scroll-behavior:smooth for in-doc link nav; force an INSTANT correction here
+    // so the position restore is a silent snap, never a visible animated scroll during the swap.
+    var prev = els.specPane.style.scrollBehavior;
+    els.specPane.style.scrollBehavior = 'auto';
+    els.specPane.scrollTop += curOffset - anchor.offset;
+    els.specPane.style.scrollBehavior = prev;
+  }
+  // Which NEW top-level blocks are added-or-changed vs the OLD render (by signature multiset).
+  // These get the transient highlight. A moved-but-identical block does not flash (its text is
+  // unchanged); an edited block flashes (its signature is new).
+  function changedBlocks(oldSigs, newBlocks) {
+    var counts = {};
+    oldSigs.forEach(function (s) { counts[s] = (counts[s] || 0) + 1; });
+    var changed = [];
+    newBlocks.forEach(function (el) {
+      var s = blockSig(el);
+      if (counts[s] > 0) counts[s] -= 1;
+      else changed.push(el);
+    });
+    return changed;
+  }
+  // Briefly highlight changed blocks. Pure background/box-shadow animation (no size change) so
+  // it can't shift layout, and we NEVER scrollIntoView — a change above/below the fold lights
+  // up in place. The class is removed after the animation so a later diff starts clean.
+  function flashChanged(blocks) {
+    blocks.forEach(function (el) {
+      el.classList.remove('sw-flash');
+      // reflow so re-adding the class restarts the animation even on a rapid second change
+      void el.offsetWidth;
+      el.classList.add('sw-flash');
+      setTimeout(function () { el.classList.remove('sw-flash'); }, 2600);
+    });
+  }
+
+  // Re-fetch + swap the rendered spec in place: capture position -> swap -> restore position ->
+  // flash what changed -> re-wire links -> re-anchor comments. Comments/drafts state is
+  // untouched; reanchorAll() re-locates each comment's quote in the new content (a comment whose
+  // quoted text was edited away simply shows as unanchored — never a crash).
+  function liveReloadSpec() {
+    return api('GET', '/api/spec').then(function (data) {
+      var anchor = captureScrollAnchor();
+      var oldSigs = topBlocks(els.specBody).map(blockSig);
+      state.headings = data.headings || [];
+      els.specBody.innerHTML = data.html || '<p>(empty spec)</p>';
+      if (data.title) els.specTitle.textContent = data.title;
+      var newBlocks = topBlocks(els.specBody);
+      // Restore the reading position BEFORE flashing/re-anchoring (those add only inline marks,
+      // which don't change block heights) so the measurement is on clean block geometry.
+      restoreScrollAnchor(anchor);
+      var changed = changedBlocks(oldSigs, newBlocks);
+      wireInDocLinks();
+      reanchorAll();
+      flashChanged(changed);
+    }).catch(function () { /* a failed refresh just waits for the next event */ });
+  }
+
+  // Debounce a burst of file writes (editors often save in several syscalls) into ONE swap.
+  var liveReloadTimer = null;
+  function scheduleLiveReload() {
+    if (liveReloadTimer) clearTimeout(liveReloadTimer);
+    liveReloadTimer = setTimeout(function () {
+      liveReloadTimer = null;
+      liveReloadSpec();
+    }, 150);
+  }
+  // Open the SSE stream. EventSource auto-reconnects on transient drops, so error handling is
+  // minimal. Absent (old browser) -> no live reload, everything else still works.
+  function startLiveReload() {
+    if (typeof EventSource === 'undefined') return;
+    try {
+      var es = new EventSource(apiUrl('/api/events'));
+      es.addEventListener('spec-changed', scheduleLiveReload);
+    } catch (e) { /* no live reload; the page still works */ }
+  }
+
   function loadComments() {
     return api('GET', '/api/comments').then(function (list) {
       state.comments = Array.isArray(list) ? list : [];
@@ -163,7 +293,7 @@
     // mark (review-cli#30). The tombstones outlive a page reload, but draftWriteSeq restarts
     // at 0 each load — without this seed, the first autosaves of a reloaded session would be
     // <= the old tombstone and get silently rejected as stale, so autosave would look broken.
-    return fetch('/api/drafts')
+    return fetch(apiUrl('/api/drafts'))
       .then(function (r) {
         seedDraftToken(r.headers.get('X-Draft-Token-Seed'));
         if (!r.ok) throw new Error(r.statusText); // mirror api(): don't parse an error body as drafts
@@ -603,7 +733,7 @@
   function postDraft(slot, payload, signal) {
     var opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
     if (signal) opts.signal = signal;
-    return fetch('/api/drafts/' + encodeURIComponent(slot), opts).then(function (r) {
+    return fetch(apiUrl('/api/drafts/' + encodeURIComponent(slot)), opts).then(function (r) {
       seedDraftToken(r.headers.get('X-Draft-Token-Seed'));
       if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || r.statusText); });
       return r.json();
@@ -1281,6 +1411,23 @@
         .then(function (r) {
           return loadComments().then(function () {
             if (r.count) setFilter('submitted');
+            // Surface a FAILED hand-off to the owning agent: the batch is safely in the
+            // store, but if delivery into the agent's session failed the reviewer must know
+            // their notes haven't reached anyone yet (the exact "comments reach nobody" gap
+            // the --agent delivery closes). A successful delivery stays quiet — the filter
+            // switch to Submitted is the success signal.
+            var d = r.delivery;
+            if (r.count && d && d.agent && !d.delivered) {
+              // Recovery command must EMIT the already-submitted batch, not wait for a future
+              // one: a bare `watch` baselines at the current submit and only fires on a LATER
+              // change, so `--emit-current` is what actually re-surfaces this batch. Name the
+              // spec when we know it (daemon mode: API_BASE is "/spec/<name>").
+              var name = API_BASE.indexOf('/spec/') === 0 ? API_BASE.slice('/spec/'.length) : '';
+              var pull = 'review spec-web watch ' + (name || '<spec>') + ' --emit-current';
+              alert('Review submitted and saved, but delivery to agent "' + d.agent +
+                    '" failed: ' + (d.detail || 'unknown reason') +
+                    '.\nIt is safe in the store — the agent can pull it now with:\n  ' + pull);
+            }
           });
         })
         .catch(function (e) {
@@ -1325,5 +1472,6 @@
     .then(function () {
       restoreDraftOnLoad();
       startCommentsPolling();
+      startLiveReload();
     });
 })();

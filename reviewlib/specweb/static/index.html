@@ -77,6 +77,10 @@
   </div>
 </div>
 
+<!-- The URL prefix for this spec's API/asset calls. "" in single-spec mode; "/spec/<name>"
+     under the multi-spec daemon (so the ONE shared origin routes to the right spec). The
+     server fills {{BASE}} (already escaped); app.js prepends it to every fetch. -->
+<script>window.__SPECWEB_BASE__ = "{{BASE}}";</script>
 <script src="/static/app.js"></script>
 </body>
 </html>
