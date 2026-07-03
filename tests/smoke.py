@@ -31,6 +31,7 @@ _GIT_UNAVAILABLE_REASON: str | None | bool = None
 _GIT_REQUIRED_UNIT_FILES = frozenset({
     "test_cwd.py",
     "test_dashboard.py",
+    "test_deploy_sh.py",
     "test_inseat_retry.py",
     "test_install_state.py",
     "test_no_git_repo.py",
@@ -540,6 +541,9 @@ _UNIT_FILES = [
     ("test_cwd.py", {}),
     ("test_shim_bootstrap.py", {}),
     ("test_install_shadow_warning.py", {}),
+    # The rig-apply deploy hook (scripts/deploy.sh): safe-FF-pull refusal semantics
+    # driven against throwaway origin+clone pairs in temp dirs (review-cli#105).
+    ("test_deploy_sh.py", {}),
     ("test_no_git_repo.py", {}),
     ("test_staged_diff_honors_c_repo.py", {}),
     ("test_output_flag.py", {}),
