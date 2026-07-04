@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """`--staged -C <repo>` must diff the `-C` repo, NEVER an unrelated repo leaked via env.
 
-Bug (review-cli#71, reported by the web-harness agent): `review diff --staged -C <repoB>`
-(and `review just-ask --staged -C <repoB>`) mis-resolved the diff to an UNRELATED
+Bug (review-cli#71, reported by the web-harness agent): `review diff --task TEST-1 --staged -C <repoB>`
+(and `review just-ask "Q" --task TEST-1 --staged -C <repoB>`) mis-resolved the diff to an UNRELATED
 worktree's `git diff` instead of repoB's staged diff. This is the EXACT command every
-review-gate uses (`review diff --staged -m claude:... --pool 1 -C <worktree>`), so a
+review-gate uses (`review diff --task TEST-1 --staged -m claude:... --pool 1 -C <worktree>`), so a
 mis-resolved diff means the gate reviewed the WRONG (or empty) diff all session.
 
 Root cause: every git invocation (`_git_diff`, `_effective_cwd`'s `git rev-parse
@@ -15,9 +15,9 @@ vars OVERRIDE both `-C` and the subprocess `cwd`. `git -C /repoB diff --cached` 
 `GIT_DIR`'s repo (the unrelated worktree), not repoB.
 
 Contract pinned here:
-  * `review diff --staged -C repoB`, run from inside repoA with `GIT_DIR`/`GIT_WORK_TREE`
+  * `review diff --task TEST-1 --staged -C repoB`, run from inside repoA with `GIT_DIR`/`GIT_WORK_TREE`
     pointing at repoA, reviews repoB's staged diff — NOT repoA's.
-  * Same for `review just-ask --staged -C repoB` (the diff is optional grounding, but it
+  * Same for `review just-ask "Q" --task TEST-1 --staged -C repoB` (the diff is optional grounding, but it
     must still come from repoB when present).
 
 Driven in-process: two real temp repos with DISTINCT staged content, the mode handler
@@ -111,7 +111,7 @@ def _run_capturing(handler_owner, handler_name, dispatch_argv, *, cwd_repo, leak
 
 
 def test_diff_staged_honors_c_repo_despite_git_env_leak():
-    """`review diff --staged -C repoB` from cwd repoA with GIT_DIR/GIT_WORK_TREE leaked to
+    """`review diff --task TEST-1 --staged -C repoB` from cwd repoA with GIT_DIR/GIT_WORK_TREE leaked to
     repoA must review repoB's staged diff, not repoA's."""
     with tempfile.TemporaryDirectory() as d:
         repo_a = Path(d) / "A"
@@ -120,7 +120,7 @@ def test_diff_staged_honors_c_repo_despite_git_env_leak():
         _init_repo(repo_b, "fileB.txt", "BBBBB repoB unique content\n")
         diff = _run_capturing(
             _review_mod, "mode_review",
-            ["diff", "--staged", "-C", str(repo_b)],
+            ["diff", "--task", "TEST-1", "--staged", "-C", str(repo_b)],
             cwd_repo=repo_a, leak_repo=repo_a,
         )
         assert "BBBBB repoB" in diff, f"expected repoB's staged diff, got: {diff!r}"
@@ -128,7 +128,7 @@ def test_diff_staged_honors_c_repo_despite_git_env_leak():
 
 
 def test_just_ask_staged_honors_c_repo_despite_git_env_leak():
-    """`review just-ask --staged -C repoB` from cwd repoA with the git env leaked to repoA
+    """`review just-ask "Q" --task TEST-1 --staged -C repoB` from cwd repoA with the git env leaked to repoA
     must attach repoB's staged diff as grounding, not repoA's."""
     with tempfile.TemporaryDirectory() as d:
         repo_a = Path(d) / "A"
@@ -137,7 +137,7 @@ def test_just_ask_staged_honors_c_repo_despite_git_env_leak():
         _init_repo(repo_b, "fileB.txt", "BBBBB repoB unique content\n")
         diff = _run_capturing(
             _ja_mod, "mode_just_ask",
-            ["just-ask", "--staged", "-C", str(repo_b), "review this"],
+            ["just-ask", "review this", "--task", "TEST-1", "--staged", "-C", str(repo_b)],
             cwd_repo=repo_a, leak_repo=repo_a,
         )
         assert "BBBBB repoB" in diff, f"expected repoB's staged diff, got: {diff!r}"

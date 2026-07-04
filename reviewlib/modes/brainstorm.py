@@ -24,7 +24,7 @@ from ..panel import (
     run_moderator,
     run_panel,
 )
-from ..process import log_dir
+from ..process import current_task_code, log_dir
 from . import _visual_images
 from .contract import ModeContext, ModeSpec
 
@@ -201,8 +201,9 @@ def mode_brainstorm(
     # the completed-round counter continue where the saved session stopped.
     transcript_blocks: list[str] = list(seed_transcript) if seed_transcript else []
     moderator_label = ">".join(moderators)
+    task_part = f" task={task_code}" if (task_code := current_task_code()) else ""
     out: list[str] = [f"# Brainstorm: {topic}", f"panel={','.join(panel)} moderator={moderator_label} "
-                      f"rounds>={min_rounds} max={max_rounds}{' grounded=diff' if grounded else ''}"]
+                      f"rounds>={min_rounds} max={max_rounds}{task_part}{' grounded=diff' if grounded else ''}"]
 
     # DISCUSSION LOG: write the conversation to one file as each round/decision
     # lands (line-buffered, 0600, O_EXCL). The whole brainstorm used to be
@@ -265,7 +266,8 @@ def mode_brainstorm(
         topic_heading = " ".join(topic.splitlines()).strip()
         _disc(f"# Brainstorm: {topic_heading}\n{_SESSION_SENTINEL.format(nonce=nonce)}\n\n"
               f"panel={','.join(panel)} moderator={moderator_label} "
-              f"rounds>={min_rounds} max={max_rounds}\n")
+              f"rounds>={min_rounds} max={max_rounds}{task_part}"
+              f"{' grounded=diff' if grounded else ''}\n")
 
     persona_index = seed_persona_index
     completed = start_round - 1

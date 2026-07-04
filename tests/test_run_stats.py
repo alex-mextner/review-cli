@@ -15,7 +15,8 @@ import json
 import os
 import sys
 import tempfile
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +27,9 @@ from reviewlib import panel as _panel  # noqa: E402
 from reviewlib import stats as _stats  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.install import SKILL_BLURB, SKILL_MD  # noqa: E402
+
+TASK = "HYP-742"
+TASK_ARGS = ["--task", TASK]
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +116,7 @@ def test_fmt_duration_shapes():
 def test_record_run_writes_correct_shape():
     with _TmpStore() as store:
         ok = _stats.record_run(
+            task_code=TASK,
             mode="brainstorm",
             models=["codex", "gemini", "claude"],
             duration_seconds=372.5,
@@ -123,6 +128,7 @@ def test_record_run_writes_correct_shape():
         assert len(recs) == 1, recs
         r = recs[0]
         assert r["v"] == _stats.STATS_VERSION
+        assert r["task_code"] == TASK
         assert r["mode"] == "brainstorm"
         assert r["pool_size"] == 3
         assert r["models"] == ["codex", "gemini", "claude"]
@@ -134,9 +140,53 @@ def test_record_run_writes_correct_shape():
         assert "prompt" not in blob and "api" not in blob.lower()
 
 
+def test_task_summaries_group_iterations_and_models():
+    with _TmpStore():
+        _stats.record_run(task_code="HYP-742", mode="review", models=["codex"],
+                          duration_seconds=10, ok_count=1, fail_count=0)
+        _stats.record_run(task_code="HYP-742", mode="quorum", models=["codex", "gemini"],
+                          duration_seconds=20, ok_count=2, fail_count=0)
+        _stats.record_run(task_code="HYP-999", mode="review", models=["claude"],
+                          duration_seconds=30, ok_count=1, fail_count=0)
+        summaries = _stats.task_summaries()
+        by_code = {s["task_code"]: s for s in summaries}
+        assert by_code["HYP-742"]["iterations"] == 2
+        assert by_code["HYP-742"]["models"] == ["codex", "gemini"]
+        assert by_code["HYP-742"]["modes"] == ["quorum", "review"]
+        iterations = _stats.iterations_for_task("HYP-742")
+        assert [it["iteration"] for it in iterations] == [1, 2]
+        assert iterations[1]["models"] == ["codex", "gemini"]
+
+
+def test_cli_task_list_json_includes_multiple_tasks():
+    with _TmpStore():
+        _stats.record_run(task_code="HYP-742", mode="review", models=["codex"],
+                          duration_seconds=10, ok_count=1, fail_count=0)
+        _stats.record_run(task_code="HYP-999", mode="quorum", models=["gemini"],
+                          duration_seconds=20, ok_count=1, fail_count=0)
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", "--json"])
+        assert rc == 0, rc
+        payload = json.loads(out.getvalue())
+        by_code = {item["task_code"]: item for item in payload["tasks"]}
+        assert set(by_code) == {"HYP-742", "HYP-999"}
+        assert by_code["HYP-742"]["models"] == ["codex"]
+        assert by_code["HYP-999"]["modes"] == ["quorum"]
+
+
+def test_cli_task_subcommand_rejects_global_task_flag():
+    err = io.StringIO()
+    with redirect_stderr(err), _capture_stdout():
+        rc = _cli.main(["task", "--task", "HYP-742"])
+    assert rc == 2, rc
+    assert "review task CODE" in err.getvalue()
+    assert "--task is for recorded review modes" in err.getvalue()
+
+
 def test_record_run_file_is_0600():
     with _TmpStore() as store:
-        _stats.record_run(mode="review", models=["codex"], duration_seconds=1.0,
+        _stats.record_run(task_code=TASK, mode="review", models=["codex"], duration_seconds=1.0,
                           ok_count=1, fail_count=0)
         mode = store.path.stat().st_mode & 0o777
         assert mode == 0o600, oct(mode)
@@ -150,7 +200,7 @@ def test_record_run_tightens_preexisting_permissive_file():
         store.path.write_text("")  # pre-create
         os.chmod(store.path, 0o644)
         assert store.path.stat().st_mode & 0o777 == 0o644
-        _stats.record_run(mode="review", models=["codex"], duration_seconds=1.0,
+        _stats.record_run(task_code=TASK, mode="review", models=["codex"], duration_seconds=1.0,
                           ok_count=1, fail_count=0)
         assert store.path.stat().st_mode & 0o777 == 0o600, oct(store.path.stat().st_mode & 0o777)
         assert len(store.records()) == 1
@@ -158,8 +208,8 @@ def test_record_run_tightens_preexisting_permissive_file():
 
 def test_record_run_appends_not_truncates():
     with _TmpStore() as store:
-        _stats.record_run(mode="review", models=["a"], duration_seconds=1.0, ok_count=1, fail_count=0)
-        _stats.record_run(mode="review", models=["a", "b"], duration_seconds=2.0, ok_count=2, fail_count=0)
+        _stats.record_run(task_code=TASK, mode="review", models=["a"], duration_seconds=1.0, ok_count=1, fail_count=0)
+        _stats.record_run(task_code=TASK, mode="review", models=["a", "b"], duration_seconds=2.0, ok_count=2, fail_count=0)
         assert len(store.records()) == 2
 
 
@@ -261,6 +311,82 @@ def test_load_records_skips_junk_lines():
 # ---------------------------------------------------------------------------
 # CLI wiring: a real run records a stat record + prints an ETA line (mocked backends)
 # ---------------------------------------------------------------------------
+def test_cli_diff_requires_task_code_before_dispatch():
+    with _TmpStore() as store:
+        d = _git_init_with_diff()
+        restore = _with_backend_stub(_stub_resolve_backend(0))
+        log = tempfile.mkdtemp()
+        old_task = os.environ.pop("REVIEW_TASK_CODE", None)
+        os.environ["REVIEW_LOG_DIR"] = log
+        try:
+            err = io.StringIO()
+            with redirect_stderr(err), _capture_stdout():
+                rc = _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
+            assert rc == 2, rc
+            assert "--task CODE" in err.getvalue()
+            assert store.records() == []
+        finally:
+            restore()
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            if old_task is not None:
+                os.environ["REVIEW_TASK_CODE"] = old_task
+            d.cleanup()
+
+
+def test_cli_visual_diff_requires_task_code_before_dispatch():
+    with _TmpStore() as store:
+        old_task = os.environ.pop("REVIEW_TASK_CODE", None)
+        try:
+            err = io.StringIO()
+            with redirect_stderr(err), _capture_stdout():
+                rc = _cli.main(["visual", "shot.png", "--diff", "-C", str(REPO_ROOT)])
+            assert rc == 2, rc
+            assert "--task CODE" in err.getvalue()
+            assert store.records() == []
+        finally:
+            if old_task is not None:
+                os.environ["REVIEW_TASK_CODE"] = old_task
+
+
+def test_cli_visual_piped_diff_requires_task_code_before_dispatch():
+    with _TmpStore() as store:
+        old_task = os.environ.pop("REVIEW_TASK_CODE", None)
+        old_stdin = _cli._read_stdin_if_piped
+        _cli._read_stdin_if_piped = lambda: "diff --git a/x b/x\n+change\n"
+        try:
+            err = io.StringIO()
+            with redirect_stderr(err), _capture_stdout():
+                rc = _cli.main(["visual", "shot.png", "--no-ai", "-C", str(REPO_ROOT)])
+            assert rc == 2, rc
+            assert "--task CODE" in err.getvalue()
+            assert store.records() == []
+        finally:
+            _cli._read_stdin_if_piped = old_stdin
+            if old_task is not None:
+                os.environ["REVIEW_TASK_CODE"] = old_task
+            else:
+                os.environ.pop("REVIEW_TASK_CODE", None)
+
+
+def test_cli_invalid_task_code_fails_before_dispatch():
+    old_task = os.environ.pop("REVIEW_TASK_CODE", None)
+    old_stdin = _cli._read_stdin_if_piped
+    _cli._read_stdin_if_piped = lambda: None
+    try:
+        for bad in ("multi word", "x" * 121, "bad\ncode"):
+            err = io.StringIO()
+            with redirect_stderr(err), _capture_stdout():
+                rc = _cli.main(["diff", "--task", bad, "-C", str(REPO_ROOT), "-m", "codex"])
+            assert rc == 2, (bad, rc)
+            assert "invalid --task CODE" in err.getvalue(), (bad, err.getvalue())
+    finally:
+        _cli._read_stdin_if_piped = old_stdin
+        if old_task is not None:
+            os.environ["REVIEW_TASK_CODE"] = old_task
+        else:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+
+
 def _git_init_with_diff() -> tempfile.TemporaryDirectory:
     import subprocess
     d = tempfile.TemporaryDirectory()
@@ -290,7 +416,7 @@ def test_cli_review_run_records_stat_and_announces_eta():
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
+                rc = _cli.main(["diff", *TASK_ARGS, "-C", d.name, "-m", "codex,gemini"])
             assert rc == 0, rc
             # ETA line went to stderr.
             assert "[review] pool=2 (review)" in err.getvalue()
@@ -299,6 +425,7 @@ def test_cli_review_run_records_stat_and_announces_eta():
             recs = store.records()
             assert len(recs) == 1, recs
             r = recs[0]
+            assert r["task_code"] == TASK
             assert r["mode"] == "review"
             assert r["pool_size"] == 2
             assert sorted(r["models"]) == ["codex", "gemini"]
@@ -311,6 +438,56 @@ def test_cli_review_run_records_stat_and_announces_eta():
             restore()
             os.environ.pop("REVIEW_LOG_DIR", None)
             d.cleanup()
+
+
+def test_cli_task_flag_overrides_review_task_code_env():
+    with _TmpStore() as store:
+        d = _git_init_with_diff()
+        restore = _with_backend_stub(_stub_resolve_backend(0))
+        log = tempfile.mkdtemp()
+        old_task = os.environ.get("REVIEW_TASK_CODE")
+        os.environ["REVIEW_LOG_DIR"] = log
+        os.environ["REVIEW_TASK_CODE"] = "ENV-999"
+        try:
+            with redirect_stderr(io.StringIO()), _capture_stdout():
+                rc = _cli.main(["diff", "--task", TASK, "-C", d.name, "-m", "codex"])
+            assert rc == 0, rc
+            recs = store.records()
+            assert len(recs) == 1, recs
+            assert recs[0]["task_code"] == TASK
+        finally:
+            restore()
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            if old_task is None:
+                os.environ.pop("REVIEW_TASK_CODE", None)
+            else:
+                os.environ["REVIEW_TASK_CODE"] = old_task
+            d.cleanup()
+
+
+def test_cli_standalone_visual_does_not_record_review_task_code_env():
+    with _TmpStore() as store:
+        tests_dir = str(REPO_ROOT / "tests")
+        if tests_dir not in sys.path:
+            sys.path.insert(0, tests_dir)
+        import visual_fixtures as vf  # noqa: PLC0415
+
+        image = vf.styled_render(Path(tempfile.mkdtemp()) / "styled.png")
+        old_task = os.environ.get("REVIEW_TASK_CODE")
+        old_stdin = _cli._read_stdin_if_piped
+        _cli._read_stdin_if_piped = lambda: None
+        os.environ["REVIEW_TASK_CODE"] = "ENV-999"
+        try:
+            with redirect_stderr(io.StringIO()), _capture_stdout():
+                rc = _cli.main(["visual", str(image), "--no-ai", "-C", str(REPO_ROOT)])
+            assert rc == 0, rc
+            assert store.records() == []
+        finally:
+            _cli._read_stdin_if_piped = old_stdin
+            if old_task is None:
+                os.environ.pop("REVIEW_TASK_CODE", None)
+            else:
+                os.environ["REVIEW_TASK_CODE"] = old_task
 
 
 def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
@@ -345,7 +522,7 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["diff", "-C", d.name, *extra_argv])
+                rc = _cli.main(["diff", *TASK_ARGS, "-C", d.name, *extra_argv])
             assert rc == 0, rc
             recs = store.records()
             assert len(recs) == 1, recs
@@ -411,7 +588,7 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["diff", "-C", d.name, *extra_argv])
+                rc = _cli.main(["diff", *TASK_ARGS, "-C", d.name, *extra_argv])
             recs = store.records()
             assert len(recs) == 1, recs
             r = dict(recs[0])
@@ -478,7 +655,7 @@ def test_cli_records_failure_counts_per_call():
         os.environ["REVIEW_LOG_DIR"] = log
         try:
             with redirect_stderr(io.StringIO()), _capture_stdout():
-                rc = _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
+                rc = _cli.main(["diff", *TASK_ARGS, "-C", d.name, "-m", "codex,gemini"])
             assert rc == 1, rc
             r = store.records()[0]
             assert r["ok_count"] == 1 and r["fail_count"] == 1, r
@@ -512,7 +689,7 @@ def test_cli_no_dispatch_run_is_not_recorded_but_eta_still_printed():
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
+                rc = _cli.main(["diff", *TASK_ARGS, "-C", d.name, "-m", "codex,gemini"])
             assert rc == 1, rc  # "No diff to review."
             assert "[review] pool=2 (review)" in err.getvalue()  # ETA still printed
             assert store.records() == []  # but NOT recorded
@@ -535,13 +712,147 @@ def test_cli_second_run_eta_uses_first_runs_history():
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                _cli.main(["diff", "-C", d.name, "-m", "codex,gemini"])
+                _cli.main(["diff", *TASK_ARGS, "-C", d.name, "-m", "codex,gemini"])
             assert "past run" in err.getvalue() and "this size" in err.getvalue()
             assert len(store.records()) == 2  # seed + this run
         finally:
             restore()
             os.environ.pop("REVIEW_LOG_DIR", None)
             d.cleanup()
+
+
+def test_cli_task_command_lists_iterations_and_detail_transcript():
+    from reviewlib.process import write_sidecar_log
+
+    with _TmpStore():
+        log = tempfile.mkdtemp()
+        old_log = os.environ.get("REVIEW_LOG_DIR")
+        old_task = os.environ.get("REVIEW_TASK_CODE")
+        os.environ["REVIEW_LOG_DIR"] = log
+        os.environ["REVIEW_TASK_CODE"] = TASK
+        try:
+            started = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+            _stats.record_run(task_code=TASK, mode="review", models=["codex"],
+                              duration_seconds=1.2, ok_count=1, fail_count=0,
+                              started=started)
+            write_sidecar_log(
+                "codex", round_no=0, argv0="codex", returncode=0,
+                stdout="TRANSCRIPT-LINE from codex\n", stderr="", started=started,
+            )
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                rc = _cli.main(["task", TASK])
+            assert rc == 0, rc
+            text = out.getvalue()
+            assert "HYP-742" in text
+            assert "iteration 1" in text
+            assert "codex" in text
+
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                rc = _cli.main(["task", TASK, "--detail", "1"])
+            assert rc == 0, rc
+            assert "TRANSCRIPT-LINE from codex" in out.getvalue()
+
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                rc = _cli.main(["task", "--json"])
+            assert rc == 0, rc
+            tasks_payload = json.loads(out.getvalue())
+            assert set(tasks_payload) == {"tasks"}
+            assert tasks_payload["tasks"][0]["task_code"] == TASK
+            assert tasks_payload["tasks"][0]["iterations"] == 1
+            assert tasks_payload["tasks"][0]["models"] == ["codex"]
+            assert tasks_payload["tasks"][0]["modes"] == ["review"]
+
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                rc = _cli.main(["task", TASK, "--json"])
+            assert rc == 0, rc
+            task_payload = json.loads(out.getvalue())
+            assert set(task_payload) == {"task_code", "iterations", "sessions"}
+            assert task_payload["task_code"] == TASK
+            assert task_payload["iterations"][0]["task_code"] == TASK
+            assert task_payload["iterations"][0]["iteration"] == 1
+            assert task_payload["iterations"][0]["models"] == ["codex"]
+            assert task_payload["sessions"][0]["task_code"] == TASK
+            assert task_payload["sessions"][0]["models"] == ["codex"]
+
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                rc = _cli.main(["task", TASK, "--detail", "1", "--json"])
+            assert rc == 0, rc
+            detail_payload = json.loads(out.getvalue())
+            assert detail_payload["task_code"] == TASK
+            assert detail_payload["session_id"].startswith("sess-")
+            assert detail_payload["calls"][0]["task_code"] == TASK
+            assert "TRANSCRIPT-LINE from codex" in detail_payload["calls"][0]["body"]
+            assert "errors" in detail_payload
+            assert "brainstorm" in detail_payload
+            assert "roles" in detail_payload
+        finally:
+            if old_log is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = old_log
+            if old_task is None:
+                os.environ.pop("REVIEW_TASK_CODE", None)
+            else:
+                os.environ["REVIEW_TASK_CODE"] = old_task
+
+
+def test_cli_task_detail_matches_logs_by_timestamp_not_iteration_index():
+    from reviewlib.process import write_sidecar_log
+
+    with _TmpStore():
+        log_dir = tempfile.TemporaryDirectory()
+        old_log = os.environ.get("REVIEW_LOG_DIR")
+        old_task = os.environ.get("REVIEW_TASK_CODE")
+        os.environ["REVIEW_LOG_DIR"] = log_dir.name
+        os.environ["REVIEW_TASK_CODE"] = TASK
+        try:
+            first = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+            second = datetime(2026, 6, 1, 10, 3, tzinfo=timezone.utc)
+            _stats.record_run(task_code=TASK, mode="review", models=["codex"],
+                              duration_seconds=1.0, ok_count=1, fail_count=0,
+                              started=first)
+            _stats.record_run(task_code=TASK, mode="review", models=["gemini"],
+                              duration_seconds=1.0, ok_count=1, fail_count=0,
+                              started=second)
+            write_sidecar_log(
+                "gemini", round_no=0, argv0="gemini", returncode=0,
+                stdout="SECOND-ITERATION-TRANSCRIPT\n", stderr="", started=second,
+            )
+
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                rc = _cli.main(["task", TASK])
+            assert rc == 0, rc
+            listed = out.getvalue()
+            assert "iteration 1" in listed and "logs not found" in listed, listed
+            assert "iteration 2" in listed and "session" in listed, listed
+
+            err = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                rc = _cli.main(["task", TASK, "--detail", "1"])
+            assert rc == 1, rc
+            assert "No conversation logs found" in err.getvalue()
+
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                rc = _cli.main(["task", TASK, "--detail", "2"])
+            assert rc == 0, rc
+            assert "SECOND-ITERATION-TRANSCRIPT" in out.getvalue()
+        finally:
+            if old_log is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = old_log
+            if old_task is None:
+                os.environ.pop("REVIEW_TASK_CODE", None)
+            else:
+                os.environ["REVIEW_TASK_CODE"] = old_task
+            log_dir.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +870,7 @@ def test_cli_brainstorm_records_persona_slot_pool_not_raw_models():
         # also stubbed (returns ok), so each round is instant. Cap rounds via --rounds.
         try:
             with redirect_stderr(io.StringIO()), _capture_stdout():
-                _cli.main(["brainstorm", "topic", "-C", d.name, "-m", "codex,gemini",
+                _cli.main(["brainstorm", "topic", *TASK_ARGS, "-C", d.name, "-m", "codex,gemini",
                            "--rounds", "1", "--max-rounds", "1"])
             recs = store.records()
             assert len(recs) == 1, recs
@@ -646,6 +957,14 @@ def test_skill_blurb_warns_never_short_timeout():
     low = SKILL_BLURB.lower()
     assert "never" in low and "timeout" in low and "minutes" in low
     assert "pool size" in low or "expected duration" in low
+
+
+def test_skill_docs_show_required_task_code_for_recorded_modes():
+    for text in (SKILL_MD, SKILL_BLURB):
+        assert "review diff --task CODE" in text
+        assert "review brainstorm" in text and "--task CODE" in text
+        assert 'review just-ask "Q" --task CODE' in text
+        assert 'review quorum "Q" --task CODE' in text
 
 
 # ---------------------------------------------------------------------------

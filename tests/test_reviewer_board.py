@@ -927,7 +927,7 @@ def test_cli_explicit_models_disable_board():
 
         sys.stdin = io.StringIO("+added line\n")
         # explicit -m codex -> board must be None
-        cli.main(["diff", "-m", "codex", "-C", str(REPO_ROOT)])
+        cli.main(["diff", "--task", "TEST-1", "-m", "codex", "-C", str(REPO_ROOT)])
         assert captured["board"] is None, captured["board"]
         assert captured["models"] == ["codex"], captured["models"]
     finally:
@@ -982,7 +982,7 @@ def test_cli_config_models_form_priority_board():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        cli.main(["diff", "--pool", "2", "-C", str(REPO_ROOT)])
+        cli.main(["diff", "--task", "TEST-1", "--pool", "2", "-C", str(REPO_ROOT)])
         assert captured["board"] is not None, captured
         assert [r.model for r in captured["board"]] == [
             "codex",
@@ -1028,7 +1028,7 @@ def test_cli_empty_config_models_does_not_disable_board():
             import io
 
             sys.stdin = io.StringIO("+added line\n")
-            cli.main(["diff", "-C", str(REPO_ROOT)])
+            cli.main(["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)])
             assert captured["board"] is not None, f"{empty_models!r} must not disable the board"
             # And no blank model name leaked into the (unused) flat models list.
             assert all(m.strip() for m in captured["models"]), captured["models"]
@@ -1060,7 +1060,7 @@ def test_cli_all_malformed_board_errors_nonzero():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        rc = cli.main(["diff", "-C", str(REPO_ROOT)])
+        rc = cli.main(["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)])
         assert rc != 0, rc
         assert called["mode_review"] is False, "must not run the panel on a bad board"
     finally:
@@ -1094,7 +1094,7 @@ def test_cli_standalone_visual_ignores_malformed_board():
         # No piped diff and the cwd is not inside a diff-producing repo path we control;
         # _git_diff degrades to "" for --visual, so this routes to the standalone pipeline.
         sys.stdin = io.StringIO("")
-        rc = cli.main(["diff", "--visual", "/tmp/does-not-exist-zzz.png", "-C", "/tmp"])
+        rc = cli.main(["diff", "--task", "TEST-1", "--visual", "/tmp/does-not-exist-zzz.png", "-C", "/tmp"])
         assert rc == 0, rc
         assert reached["standalone"] is True, "standalone visual must run despite the malformed board"
     finally:
@@ -1127,7 +1127,7 @@ def test_cli_all_malformed_board_fails_before_visual_fanout():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        rc = cli.main(["diff", "--visual", "/tmp/does-not-exist-zzz.png", "-C", str(REPO_ROOT)])
+        rc = cli.main(["diff", "--task", "TEST-1", "--visual", "/tmp/does-not-exist-zzz.png", "-C", str(REPO_ROOT)])
         assert rc == 2, rc
         assert fanout_calls["n"] == 0, "fan-out ran before the board was validated"
     finally:
@@ -1185,7 +1185,7 @@ def test_cli_default_path_passes_full_board_and_default_pool():
     """No -m -> the FULL priority board is passed into mode_review (so it has the reserve
     for failover) with pool_size = the DEFAULT (4). The startup-failover slice to the top
     pool_size AVAILABLE seats happens INSIDE mode_review, not in the CLI."""
-    captured = _capture_default_review_board(["diff", "-C", str(REPO_ROOT)])
+    captured = _capture_default_review_board(["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)])
     assert captured["board"] is not None, "board should be active by default"
     assert len(captured["board"]) == len(DEFAULT_BOARD), "full board passed (reserve incl.)"
     assert [r.model for r in captured["board"]] == [r.model for r in DEFAULT_BOARD]
@@ -1195,10 +1195,10 @@ def test_cli_default_path_passes_full_board_and_default_pool():
 def test_cli_pool_flag_threads_pool_size():
     """--pool N threads N as pool_size into mode_review (the full board still flows so
     the reserve is available); --pool 0 = all seats."""
-    cap2 = _capture_default_review_board(["diff", "--pool", "2", "-C", str(REPO_ROOT)])
+    cap2 = _capture_default_review_board(["diff", "--task", "TEST-1", "--pool", "2", "-C", str(REPO_ROOT)])
     assert cap2["pool_size"] == 2, cap2["pool_size"]
     assert len(cap2["board"]) == len(DEFAULT_BOARD), "full board still passed"
-    cap_all = _capture_default_review_board(["diff", "--pool", "0", "-C", str(REPO_ROOT)])
+    cap_all = _capture_default_review_board(["diff", "--task", "TEST-1", "--pool", "0", "-C", str(REPO_ROOT)])
     assert cap_all["pool_size"] == 0, cap_all["pool_size"]
 
 

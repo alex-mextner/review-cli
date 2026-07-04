@@ -23,11 +23,11 @@ SKILL_MD = """\
 name: review
 description: >-
   Read-only multi-model code review and AI panel. Modes are SUBCOMMANDS. Use BEFORE
-  committing to check a diff across several models at once (`review diff`), to get a
-  multi-model second opinion on a question (`review just-ask "Q"`), to settle a
-  contested technical decision with cited evidence (`review quorum "Q"`), or to
+  committing to check a diff across several models at once (`review diff --task CODE`), to get a
+  multi-model second opinion on a question (`review just-ask "Q" --task CODE`), to settle a
+  contested technical decision with cited evidence (`review quorum "Q" --task CODE`), or to
   brainstorm an open design space across rotating expert personas in a loop
-  (`review brainstorm "TOPIC"`). e.g. `review diff` on the current diff.
+  (`review brainstorm "TOPIC" --task CODE`). e.g. `review diff --task CODE` on the current diff.
 metadata:
   author: alex-mextner
   repo: https://github.com/alex-mextner/review-cli
@@ -73,27 +73,36 @@ the internal ceiling, never raise it past 4h.
 Everything is a subcommand: the diff review is `review diff` (NOT a bare `review`). A bare
 `review` prints the help. The other modes: `brainstorm` / `just-ask` / `quorum`.
 ```
-review diff -C <repo>                  # review current unstaged diff across the failover pool (top 4 available)
-review diff -C <repo> --staged         # review the staged diff (pre-commit)
-review diff -C <repo> --pool 8         # run all 8 available board seats (--pool 0 also = all); default pool is 4
-review diff -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); bypasses the board
-review just-ask "Q" -C <repo>          # multi-model answer to a question (no diff needed)
-review quorum "Q" -C <repo>            # experts answer + a moderator finds consensus/disagreement
-review brainstorm "TOPIC" -C <repo>    # iterative persona ideation in a loop, with a moderator
-review brainstorm "TOPIC" --diff -C <repo>   # …+ the working-tree (or --staged) diff -> brainstorm ABOUT that change
-review diff -C <repo> -o out.md        # write the result to a file (still prints to stdout)
+review diff --task CODE -C <repo>                  # review current unstaged diff across the failover pool (top 4 available)
+review diff --task CODE -C <repo> --staged         # review the staged diff (pre-commit)
+review diff --task CODE -C <repo> --pool 8         # run all 8 available board seats (--pool 0 also = all); default pool is 4
+review diff --task CODE -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); bypasses the board
+review just-ask "Q" --task CODE -C <repo>          # multi-model answer to a question (no diff needed)
+review quorum "Q" --task CODE -C <repo>            # experts answer + a moderator finds consensus/disagreement
+review brainstorm "TOPIC" --task CODE -C <repo>    # iterative persona ideation in a loop, with a moderator
+review brainstorm "TOPIC" --task CODE --diff -C <repo>   # …+ the working-tree (or --staged) diff -> brainstorm ABOUT that change
+review diff --task CODE -C <repo> -o out.md        # write the result to a file (still prints to stdout)
+review task CODE                                   # show iterations, models, and transcripts for this task
 ```
 A bare `review` (no subcommand) prints HELP — it does NOT run a diff review (use
 `review diff`). The removed `review review` verb and `review -C <repo>` (flags with no
 verb) print a one-line `review diff` pointer and exit non-zero. The OLD mode flags
 (`--brainstorm` / `--quorum` / `--just-ask`) were likewise REMOVED. `--visual <img>` stays
 the canonical standalone command is `review visual IMAGE`; `--visual` remains a composable
-flag for text modes, e.g. `review brainstorm "Q" --visual IMAGE`.
+flag for text modes, e.g. `review brainstorm "Q" --task CODE --visual IMAGE`.
 For configuration (config file, model/board selection, keys/auth) run `review help config`
 (alias `review --help config`); per-subcommand flags are on `review <mode> --help`.
 
+## Task code is REQUIRED for review iterations
+Pass `--task CODE` on every recorded review mode, or set `REVIEW_TASK_CODE=CODE` in the
+environment for a whole automation/session. Standalone `review visual IMAGE` is the only
+normal exception; `review visual IMAGE --diff` is a diff-review iteration and still needs
+the task code. The code is written to run-stats and per-call logs so `review task CODE` and
+the dashboard can show how many iterations ran, which models were used, and the detailed
+conversations.
+
 ## Save the result to a file: `-o FILE`, NOT `> FILE`
-Use `review diff -C <repo> -o out.md`, NOT `review diff -C <repo> … > out.md`. Under zsh
+Use `review diff --task CODE -C <repo> -o out.md`, NOT `review diff -C <repo> … > out.md`. Under zsh
 `noclobber` (a common shell default), `> out.md` REFUSES to overwrite an existing
 file and the command dies silently — you get no review and no error. `-o` writes
 the result with Python (`open(...,"w")`), which bypasses the shell redirect (and
@@ -138,7 +147,7 @@ directory). Agents often invoke `review` from a scratch or temp dir, so WITHOUT
 irrelevant result. Always pass `-C <absolute repo path>`. If `-C` is not inside a
 git repo, review resolves to the repo root when it can and otherwise prints a
 loud warning — heed it. When piping into review non-interactively, also redirect
-stdin (`review just-ask "Q" -C <repo> < /dev/null`); review reads stdin for an
+stdin (`review just-ask "Q" --task CODE -C <repo> < /dev/null`); review reads stdin for an
 optional piped diff and will hang waiting for EOF if stdin is an open pipe.
 
 ## claude / opus backend: API or CLI
@@ -192,22 +201,26 @@ All three resolve their key from the env first, then the shared
 `~/.config/review-cli/.env` (the same file the gemini key uses).
 
 ## When to use
-- Before committing — sanity-check a diff across multiple models in parallel (`review diff`).
-- For a hard decision — `review quorum "Q"` (settle with cited evidence) or
-  `review brainstorm "TOPIC"` (explore an open design space across rotating expert roles,
+- Before committing — sanity-check a diff across multiple models in parallel (`review diff --task CODE`).
+- For a hard decision — `review quorum "Q" --task CODE` (settle with cited evidence) or
+  `review brainstorm "TOPIC" --task CODE` (explore an open design space across rotating expert roles,
   in a loop). The moderator defaults to opus and falls back to codex/gemini automatically.
-- For a quick multi-model second opinion — `review just-ask "Q"`.
+- For a quick multi-model second opinion — `review just-ask "Q" --task CODE`.
 
 Pair with `tg` to post the chosen options / pros-cons to Telegram.
 """
 SKILL_BLURB = (
     "`review` — multi-model read-only code review + AI panels "
     "(codex/claude/gemini/opencode). Modes are SUBCOMMANDS (the verb leads; -C follows): "
-    "`review diff -C <repo>` (diff review), `review quorum \"Q\" -C <repo>`, "
-    "`review brainstorm \"topic\" -C <repo>`, `review just-ask \"Q\" -C <repo>`. "
+    "`review diff --task CODE -C <repo>` (diff review), "
+    "`review quorum \"Q\" --task CODE -C <repo>`, "
+    "`review brainstorm \"topic\" --task CODE -C <repo>`, "
+    "`review just-ask \"Q\" --task CODE -C <repo>`. "
     "A bare `review` prints HELP — the diff review is `review diff` (NOT a bare "
     "`review`); the old --quorum/--brainstorm/--just-ask flags were removed. "
-    "Always pass -C <project-root>. Use before commits and for hard decisions. "
+    "Always pass -C <project-root>. Always pass --task CODE (or set REVIEW_TASK_CODE) for "
+    "review iterations; `review task CODE` shows iterations, models, and transcripts. "
+    "Use before commits and for hard decisions. "
     "NEVER wrap it in a short timeout — it is multi-model / multi-round and takes "
     "MINUTES (brainstorm 10–20m); it prints the expected duration for your pool "
     "size at startup, so wait for that, don't short-timeout it. Use NO external "
@@ -485,7 +498,7 @@ def install_skill() -> int:
 
 
 _PRECOMMIT_MARKER = "# review-before-commit-gate"
-# Hash must match exactly what `review diff --staged` reviews (`git diff --no-ext-diff
+# Hash must match exactly what `review diff --staged --task CODE` reviews (`git diff --no-ext-diff
 # --cached`) and the stamp path must resolve via `git rev-parse --git-path` so it
 # works in worktrees and repos whose `.git` is a pointer file.
 # `command git` bypasses shell aliases/functions (e.g. an rtk-style wrapper that rewrites
@@ -513,7 +526,7 @@ h=$(command git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
 stamp=$(command git rev-parse --git-path review-stamp)
 if [ -f "$stamp" ] && grep -q "$h" "$stamp"; then exit 0; fi
 echo "review-before-commit: staged changes have not been reviewed." >&2
-echo "  run:  review diff --staged      (then commit)" >&2
+echo "  run:  review diff --staged --task TASK-CODE      (then commit)" >&2
 echo "  skip: REVIEW_SKIP=1 git commit ...   |   git commit --no-verify" >&2
 exit 1
 """
@@ -624,8 +637,9 @@ def install_commit_hook() -> int:
         # INSTALLED state") instead of silently rewriting identical content.
         print(f"  ✓ already configured  {pre_commit}")
         print(f"  ✓ already configured  core.hooksPath -> {hooks_dir}")
-        print("review: commit gate already active — nothing to do. `review diff --staged` "
-              "before committing; bypass with REVIEW_SKIP=1 or --no-verify.")
+        print("review: commit gate already active — nothing to do. "
+              "`review diff --staged --task TASK-CODE` before committing; "
+              "bypass with REVIEW_SKIP=1 or --no-verify.")
         return 0
 
     if not already:
@@ -659,6 +673,6 @@ def install_commit_hook() -> int:
         print(f"  + set global core.hooksPath -> {hooks_dir}")
     elif hookspath_ok:
         print(f"  ✓ already configured  core.hooksPath -> {hooks_dir}")
-    print("review: commit gate active. `review diff --staged` before committing; "
-          "bypass with REVIEW_SKIP=1 or --no-verify.")
+    print("review: commit gate active. `review diff --staged --task TASK-CODE` before "
+          "committing; bypass with REVIEW_SKIP=1 or --no-verify.")
     return 0

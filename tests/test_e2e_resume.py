@@ -54,6 +54,7 @@ def _env(log_dir: Path, *, fake_delay: float | None = None) -> dict[str, str]:
     env["REVIEW_FAKE_BACKEND"] = "1"
     env["REVIEW_LOG_DIR"] = str(log_dir)
     env["REVIEW_STATS_FILE"] = str(log_dir / "stats.jsonl")
+    env["REVIEW_TASK_CODE"] = "TEST-1"
     # Keep the run deterministic: pin the panel so resolution doesn't depend on host CLIs.
     if fake_delay is not None:
         env["REVIEW_FAKE_DELAY"] = str(fake_delay)

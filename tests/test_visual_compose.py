@@ -32,6 +32,8 @@ from reviewlib.modes import just_ask as _just_ask_mod  # noqa: E402
 from reviewlib.modes import quorum as _quorum_mod  # noqa: E402
 from reviewlib.modes import review as _review_mod  # noqa: E402
 
+TASK_ARGS = ["--task", "TEST-1"]
+
 # These composability tests assert the Stage-1 cvGate-described context threading. The
 # Stage-2 per-mode fan-out would otherwise fire a REAL vision call here (a Gemini/
 # Anthropic key is configured on a dev box). Force the fan-out to find NO vision backend
@@ -50,8 +52,8 @@ def _blank(tmp: str = "/tmp/visual-compose-blank.png") -> str:
 
 
 def test_visual_composes_with_brainstorm_subcommand():
-    """--visual is composable with any mode subcommand: `review brainstorm "…" --visual
-    img` threads the image context into the brainstorm topic (the composition seam)."""
+    """--visual is composable with any mode subcommand: `review brainstorm "…" --task X
+    --visual img` threads the image context into the brainstorm topic (the composition seam)."""
     captured = {}
 
     def fake_brainstorm(topic, *a, **k):
@@ -61,7 +63,7 @@ def test_visual_composes_with_brainstorm_subcommand():
     old = _brainstorm_mod.mode_brainstorm
     _brainstorm_mod.mode_brainstorm = fake_brainstorm
     try:
-        rc = cli.main(["brainstorm", "should we ship X", "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
+        rc = cli.main(["brainstorm", "should we ship X", *TASK_ARGS, "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _brainstorm_mod.mode_brainstorm = old
     assert rc == 0
@@ -80,7 +82,7 @@ def test_visual_threads_into_quorum():
     old = _quorum_mod.mode_quorum
     _quorum_mod.mode_quorum = fake_quorum
     try:
-        rc = cli.main(["quorum", "is this styled?", "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
+        rc = cli.main(["quorum", "is this styled?", *TASK_ARGS, "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _quorum_mod.mode_quorum = old
     assert rc == 0
@@ -101,7 +103,7 @@ def test_companion_cvgate_surfaces_passthrough_outcome():
     old = _just_ask_mod.mode_just_ask
     _just_ask_mod.mode_just_ask = fake_just_ask
     try:
-        rc = cli.main(["just-ask", "describe", "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
+        rc = cli.main(["just-ask", "describe", *TASK_ARGS, "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _just_ask_mod.mode_just_ask = old
     assert rc == 0
@@ -132,8 +134,8 @@ def test_visual_subcommand_standalone_runs_pipeline_and_maps_exit():
 
 
 def test_visual_subcommand_with_diff_threads_visual_into_review():
-    """`review visual <image> --diff` includes the working-tree diff and runs the normal
-    review companion with the screenshot folded into the prompt."""
+    """`review visual <image> --task X --diff` includes the working-tree diff and runs the
+    normal review companion with the screenshot folded into the prompt."""
     captured = {}
 
     def fake_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
@@ -153,7 +155,7 @@ def test_visual_subcommand_with_diff_threads_visual_into_review():
     cli._is_git_repo = lambda cwd: True
     cli.load_config = lambda: {"models": ["codex"]}
     try:
-        rc = cli.main(["visual", _styled(), "--diff", "--no-ai", "-C", str(REPO_ROOT)])
+        rc = cli.main(["visual", _styled(), *TASK_ARGS, "--diff", "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _review_mod.mode_review = old
         cli._read_stdin_if_piped = old_stdin
@@ -178,8 +180,8 @@ def test_companion_rollback_blocks_the_mode():
     old = _just_ask_mod.mode_just_ask
     _just_ask_mod.mode_just_ask = fake_just_ask
     try:
-        rc = cli.main(["just-ask", "describe", "--visual", _blank(), "--strict", "-C", str(REPO_ROOT)])
-        rc_advisory = cli.main(["just-ask", "describe", "--visual", _blank(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["just-ask", "describe", *TASK_ARGS, "--visual", _blank(), "--strict", "-C", str(REPO_ROOT)])
+        rc_advisory = cli.main(["just-ask", "describe", *TASK_ARGS, "--visual", _blank(), "-C", str(REPO_ROOT)])
     finally:
         _just_ask_mod.mode_just_ask = old
     assert called["n"] == 0, "the mode must NOT run when the visual pre-filter rolls back"
@@ -199,7 +201,7 @@ def test_companion_unreadable_image_is_usage_exit_1():
     old = _just_ask_mod.mode_just_ask
     _just_ask_mod.mode_just_ask = fake_just_ask
     try:
-        rc = cli.main(["just-ask", "x", "--visual", "/tmp/does-not-exist-zzz.png", "--strict", "-C", str(REPO_ROOT)])
+        rc = cli.main(["just-ask", "x", *TASK_ARGS, "--visual", "/tmp/does-not-exist-zzz.png", "--strict", "-C", str(REPO_ROOT)])
     finally:
         _just_ask_mod.mode_just_ask = old
     assert called["n"] == 0, "the mode must not run on an unreadable image"
@@ -207,8 +209,8 @@ def test_companion_unreadable_image_is_usage_exit_1():
 
 
 def test_default_review_with_diff_threads_visual():
-    """`review diff --visual` with a piped diff routes to the diff-review companion with
-    the image as context — not the standalone pipeline (--visual rides the diff mode)."""
+    """`review diff --task X --visual` with a piped diff routes to the diff-review companion
+    with the image as context — not the standalone pipeline (--visual rides the diff mode)."""
     captured = {}
 
     def fake_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
@@ -222,7 +224,7 @@ def test_default_review_with_diff_threads_visual():
     _review_mod.mode_review = fake_review
     cli._read_stdin_if_piped = lambda: "diff --git a/x b/x\n+change\n"
     try:
-        rc = cli.main(["diff", "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
+        rc = cli.main(["diff", *TASK_ARGS, "--visual", _styled(), "--no-ai", "-C", str(REPO_ROOT)])
     finally:
         _review_mod.mode_review = old
         cli._read_stdin_if_piped = old_stdin

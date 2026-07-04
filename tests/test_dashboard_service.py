@@ -24,6 +24,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
 from reviewlib import cli
 from reviewlib.dashboard import service as svc
 

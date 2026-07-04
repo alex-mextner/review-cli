@@ -15,14 +15,16 @@ The mode is selected by a **subcommand**, not a flag:
 
 ```
 review                       # bare -> prints HELP (does NOT run a diff review)
-review diff                  # the diff review (was the stuttering `review review`)
-review diff --staged         # review the staged diff (pre-commit)
-review brainstorm "TOPIC"    # multi-round persona ideation
-review brainstorm "TOPIC" --diff    # …grounded in the working-tree (or --staged) diff
-review just-ask "QUESTION"   # single-shot multi-model answer (alias: review ask "Q")
-review quorum "QUESTION"     # experts cite evidence + a moderator finds quorum
-review visual shot.png [--diff]   # standalone screenshot verdict; --diff adds git context
-review brainstorm "TOPIC" --visual shot.png   # composable screenshot context for text modes
+review diff --task CODE                  # the diff review (was the stuttering `review review`)
+review diff --task CODE --staged         # review the staged diff (pre-commit)
+review brainstorm "TOPIC" --task CODE    # multi-round persona ideation
+review brainstorm "TOPIC" --task CODE --diff    # …grounded in the working-tree (or --staged) diff
+review just-ask "QUESTION" --task CODE   # single-shot multi-model answer (alias: review ask "Q")
+review quorum "QUESTION" --task CODE     # experts cite evidence + a moderator finds quorum
+review visual shot.png            # standalone screenshot verdict
+review visual shot.png --task CODE --diff   # screenshot plus diff-review context
+review brainstorm "TOPIC" --task CODE --visual shot.png   # composable screenshot context for text modes
+review task CODE              # task-scoped iterations, models, and transcripts
 ```
 
 A bare `review` (no subcommand) prints the HELP/usage — it does **NOT** run a diff review
@@ -32,19 +34,24 @@ diff review is the `diff` subcommand: `review diff` (renamed from the stuttering
 verb) print a one-line "use `review diff`" pointer and exit non-zero. The meta flags
 (`--list-defaults` / `--show-board` / `--help`) still work with no subcommand. The OLD
 mode flags (`--brainstorm` / `--quorum` / `--just-ask`) were likewise REMOVED — they print
-a "use the subcommand" pointer and exit non-zero.
+a "use the subcommand" pointer and exit non-zero. Every recorded review mode requires
+`--task CODE` or `$REVIEW_TASK_CODE`; standalone `review visual IMAGE` is the exception,
+while `review visual IMAGE --diff` is a diff-review iteration and must carry a task code.
+Task codes are one non-whitespace token, max 120 characters, with no control characters.
 
-Bare subcommands also handled by the CLI (unchanged): `dashboard`, `sessions`, `spec-web`,
-`install-skill`, `install-commit-hook`, `register-module`, `trust-module`. `sessions` is a
+Bare subcommands also handled directly by the CLI: `dashboard`, `sessions`, `spec-web`,
+`task`, `install-skill`, `install-commit-hook`, `register-module`, `trust-module`.
+`sessions` is a
 MANAGEMENT command (list / resume brainstorm sessions parsed from the discussion logs), NOT
 a fan-out mode — it is wired in `cli._dispatch` like `dashboard` and its logic lives in the
 lib (`reviewlib/sessions.py`); it deliberately does NOT register a `ModeSpec`, so it never
-collides with the mode registry.
+collides with the mode registry. `task` is also a MANAGEMENT command: it reads run-stats and
+dashboard logs to list task iterations, models used, and detailed transcripts.
 
 ### Option scoping — global vs subcommand
 
 Flags are SCOPED so `review --help` (the top-level overview) lists only TRULY-GLOBAL
-options (`-m/--model`, `-C`, `-o`, `--timeout`, `--list-defaults`, `--show-board`, `--pool`)
+options (`-m/--model`, `-C`, `--task`, `-o`, `--timeout`, `--list-defaults`, `--show-board`, `--pool`)
 + the subcommand list. Subcommand- and feature-specific flags live on `review <mode> --help`:
 the `review visual IMAGE` options, the composable `--visual` group for text modes,
 `--prompt` (the diff review),
