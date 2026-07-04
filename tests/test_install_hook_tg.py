@@ -737,3 +737,21 @@ def test_cli_dispatch_install_hook_tg_with_trailing_args_is_a_usage_error():
         rc = cli._dispatch(["install-hook", "tg", "extra"])
     assert rc == 2
     stub.assert_not_called()
+
+
+
+if __name__ == "__main__":
+    failures = 0
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {name}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                print(f"ERROR {name}: {type(exc).__name__}: {exc}")
+    print(f"\n{'FAILED' if failures else 'OK'}: {failures} failure(s)")
+    sys.exit(1 if failures else 0)
