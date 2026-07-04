@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -466,6 +467,10 @@ def test_cli_task_flag_overrides_review_task_code_env():
 
 
 def test_cli_standalone_visual_does_not_record_review_task_code_env():
+    if not shutil.which("magick"):
+        _skip("standalone `review visual` drives the real cvGate, which hard-requires "
+              "ImageMagick v7's `magick` binary (absent on this host) — same gate as "
+              "test_visual_verification_suite in smoke.py.")
     with _TmpStore() as store:
         tests_dir = str(REPO_ROOT / "tests")
         if tests_dir not in sys.path:
@@ -980,17 +985,38 @@ def _capture_stdout():
         yield buf
 
 
+# A missing ImageMagick `magick` v7 binary is a fatal CV error by design (cv_gate.py hard-
+# requires it), so the one test below that drives the real `review visual` CLI path must SKIP
+# rather than fail on a host without it — same convention as test_qa_env.py's _Skip/_skip and
+# the sibling test_visual_verification_suite gate in smoke.py.
+class _Skip(Exception):
+    pass
+
+
+def _skip(reason: str):
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        import pytest  # noqa: PLC0415
+
+        pytest.skip(reason)
+    raise _Skip(reason)
+
+
 if __name__ == "__main__":
     failures = 0
+    skipped = 0
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             try:
                 fn()
                 print(f"PASS {name}")
+            except _Skip as exc:
+                skipped += 1
+                print(f"SKIP {name}: {exc}")
             except AssertionError as exc:
                 failures += 1
                 print(f"FAIL {name}: {exc}")
             except Exception as exc:  # noqa: BLE001
                 failures += 1
                 print(f"ERROR {name}: {type(exc).__name__}: {exc}")
+    print(f"\n{'FAILED' if failures else 'OK'}: {failures} failure(s), {skipped} skipped")
     sys.exit(1 if failures else 0)
