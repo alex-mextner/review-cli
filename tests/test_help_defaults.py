@@ -209,6 +209,12 @@ def test_visual_flags_absent_from_global_help_present_on_subcommands():
         assert flag in visual_opts, (flag, "missing from review visual help")
 
 
+def test_visual_help_example_includes_required_task_code():
+    text = " ".join(_mode_help("brainstorm").split())
+    assert 'review brainstorm "Q" --task CODE --visual IMAGE' in text, text
+    assert 'review brainstorm "Q" --visual IMAGE' not in text, text
+
+
 def test_prompt_is_scoped_to_the_diff_review():
     assert "--prompt" not in _option_strings(_top_level_help()), "prompt leaked to global"
     assert "--prompt" in _option_strings(_mode_help("diff")), "diff review needs --prompt"
@@ -254,7 +260,7 @@ def test_subcommand_only_flags_set_covers_every_mode_only_flag():
 
 def test_global_help_lists_only_truly_global_options():
     opts = _option_strings(_top_level_help())
-    for flag in ("-m, --model", "-C, --cwd", "-o, --output", "--timeout",
+    for flag in ("-m, --model", "-C, --cwd", "--task", "-o, --output", "--timeout",
                  "--list-defaults", "--show-board", "--pool"):
         assert flag in opts, (flag, "missing from the global option list")
     # The mode/diff-source-only flags must NOT be global.

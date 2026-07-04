@@ -17,6 +17,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .stats import normalize_task_code
+
 # Single source of truth for stripping terminal control noise out of captured
 # backend output. A backend can leak ANSI/VT100 escapes into its stdout — colour
 # codes, cursor moves, OSC hyperlinks — and an interactive-TUI-scraper backend (the
@@ -329,6 +331,19 @@ def _safe_backend(backend: str) -> str:
     return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in backend) or "backend"
 
 
+def current_task_code() -> str | None:
+    """Task code currently attached to backend logs, if one is active."""
+    try:
+        return normalize_task_code(os.environ.get("REVIEW_TASK_CODE"))
+    except ValueError:
+        return None
+
+
+def _task_header_suffix() -> str:
+    code = current_task_code()
+    return f" task={code}" if code else ""
+
+
 def _open_log(backend: str, round_no: int) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     return log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
@@ -394,7 +409,7 @@ def write_sidecar_log(
     path = log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(f"[review-cli] {backend}: {argv0 or '?'} (args redacted)\n")
+        fh.write(f"[review-cli] {backend}: {argv0 or '?'} (args redacted){_task_header_suffix()}\n")
         if stdout:
             fh.write(stdout if stdout.endswith("\n") else stdout + "\n")
         for line in stderr.splitlines():
@@ -597,7 +612,7 @@ def _run_streamed(
                 concurrency_sem.acquire()
                 sem_acquired = True
 
-        log_fh.write(f"[review-cli] {backend}: {header} (args redacted)\n")
+        log_fh.write(f"[review-cli] {backend}: {header} (args redacted){_task_header_suffix()}\n")
         log_fh.flush()
 
         proc = subprocess.Popen(

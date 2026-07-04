@@ -366,7 +366,7 @@ def test_cli_retry_flag_overrides_existing_env(tmp_log):
     try:
         for env_val, flag_val, want in [("1", "7", 7), ("9", "-4", 0), ("2", "9999", retry.max_retry_count())]:
             os.environ["REVIEW_RETRY_COUNT"] = env_val
-            cli._dispatch(["diff", "--staged", "--retry", flag_val, "-C", repo])
+            cli._dispatch(["diff", "--task", "TEST-1", "--staged", "--retry", flag_val, "-C", repo])
             assert retry_count() == want, f"env={env_val} --retry={flag_val} -> {retry_count()}, want {want}"
     finally:
         if saved is None:

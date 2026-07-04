@@ -5,6 +5,13 @@ semantic versioning.
 
 ## Unreleased
 
+- **Review iterations are now task-coded (review-cli#108).** All recorded review modes now
+  require `--task CODE` (or `$REVIEW_TASK_CODE`) before dispatch, and the code is persisted
+  into run-stats plus per-call/brainstorm logs. `review task [CODE]` lists task iterations,
+  models, ok/fail counts, linked dashboard sessions, and can print full transcript detail
+  by iteration or session id; the dashboard now parses task metadata, filters by task badge,
+  and shows task-grouped history. Standalone `review visual IMAGE` remains a verifier-only
+  exception, while visual+diff review iterations require the task code.
 - **`scripts/deploy.sh` — the rig-apply deploy hook (review-cli#105).** rig-cli 0.8.0+ runs a
   tool's `scripts/deploy.sh` on every `rig apply` to keep the installed tool fresh; this repo
   had none, so the live symlinked checkout silently drifted stale. The script is a guarded

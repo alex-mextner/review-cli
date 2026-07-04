@@ -38,13 +38,31 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 # Schema version for the JSONL records. Bump if the record shape changes
 # incompatibly; readers tolerate unknown/missing fields and skip junk lines.
-STATS_VERSION = 1
+STATS_VERSION = 2
+_TASK_CODE_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,120}$")
+
+
+def normalize_task_code(value: str | None) -> str | None:
+    """Return a safe task code for stats/log metadata, or None when absent.
+
+    Task codes are identifiers, not prose: one non-whitespace token, no control
+    characters. Preserve case because external trackers may be case-sensitive.
+    """
+    if value is None:
+        return None
+    code = str(value).strip()
+    if not code:
+        return None
+    if not _TASK_CODE_RE.match(code):
+        raise ValueError("task code must be one non-whitespace token, max 120 characters")
+    return code
 
 
 def stats_path() -> Path:
@@ -77,6 +95,7 @@ def fmt_duration(seconds: float) -> str:
 
 def record_run(
     *,
+    task_code: str | None = None,
     mode: str,
     models: list[str],
     duration_seconds: float,
@@ -92,6 +111,10 @@ def record_run(
     successful append, False if anything went wrong (unwritable dir, etc.) — the
     run must never fail because stats couldn't be persisted.
     """
+    try:
+        clean_task = normalize_task_code(task_code)
+    except ValueError:
+        clean_task = None
     record = {
         "v": STATS_VERSION,
         "ts": (started or datetime.now(timezone.utc)).isoformat(),
@@ -102,6 +125,8 @@ def record_run(
         "ok_count": int(ok_count),
         "fail_count": int(fail_count),
     }
+    if clean_task is not None:
+        record["task_code"] = clean_task
     try:
         p = stats_path()  # may raise RuntimeError on an unexpandable ~user / no HOME
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +168,80 @@ def _load_records() -> list[dict]:
         if isinstance(rec, dict) and "duration_seconds" in rec:
             out.append(rec)
     return out
+
+
+def _parse_ts(record: dict) -> str:
+    ts = record.get("ts")
+    return ts if isinstance(ts, str) else ""
+
+
+def iterations_for_task(task_code: str) -> list[dict]:
+    """Return run records for one task, oldest first, annotated with iteration numbers."""
+    try:
+        clean = normalize_task_code(task_code)
+    except ValueError:
+        return []
+    if clean is None:
+        return []
+    records = [r for r in _load_records() if r.get("task_code") == clean]
+    records.sort(key=_parse_ts)
+    out: list[dict] = []
+    for index, record in enumerate(records, start=1):
+        item = dict(record)
+        item["iteration"] = index
+        out.append(item)
+    return out
+
+
+def task_summaries() -> list[dict]:
+    """Aggregate run-stats by task code, newest task first."""
+    groups: dict[str, dict] = {}
+    for record in _load_records():
+        code = record.get("task_code")
+        if not isinstance(code, str) or not code:
+            continue
+        group = groups.setdefault(
+            code,
+            {
+                "task_code": code,
+                "iterations": 0,
+                "models": [],
+                "modes": set(),
+                "first_ts": None,
+                "last_ts": None,
+                "duration_seconds": 0.0,
+                "ok_count": 0,
+                "fail_count": 0,
+            },
+        )
+        group["iterations"] += 1
+        ts = record.get("ts")
+        if isinstance(ts, str):
+            if group["first_ts"] is None or ts < group["first_ts"]:
+                group["first_ts"] = ts
+            if group["last_ts"] is None or ts > group["last_ts"]:
+                group["last_ts"] = ts
+        mode = record.get("mode")
+        if isinstance(mode, str) and mode:
+            group["modes"].add(mode)
+        for model in record.get("models") or []:
+            if isinstance(model, str) and model not in group["models"]:
+                group["models"].append(model)
+        dur = record.get("duration_seconds")
+        if isinstance(dur, (int, float)):
+            group["duration_seconds"] += float(dur)
+        for key in ("ok_count", "fail_count"):
+            value = record.get(key)
+            if isinstance(value, int):
+                group[key] += value
+    summaries = []
+    for group in groups.values():
+        item = dict(group)
+        item["modes"] = sorted(item["modes"])
+        item["duration_seconds"] = round(item["duration_seconds"], 3)
+        summaries.append(item)
+    summaries.sort(key=lambda item: item.get("last_ts") or "", reverse=True)
+    return summaries
 
 
 def estimate_eta(mode: str, pool_size: int) -> dict | None:

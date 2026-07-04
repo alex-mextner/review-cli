@@ -69,6 +69,7 @@ def _smoke_env(env: dict[str, str] | None = None) -> dict[str, str]:
         **os.environ,
         "HOME": home,
         "XDG_CONFIG_HOME": str(Path(home) / ".config"),
+        "REVIEW_TASK_CODE": "SMOKE-1",
     }
     full_env.update(env or {})
     return full_env

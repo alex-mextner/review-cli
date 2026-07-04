@@ -38,7 +38,7 @@ global.window = global.window || noopProxy();
 global.document = global.document || noopProxy();
 
 const APP = path.join(__dirname, '..', 'reviewlib', 'dashboard', 'assets', 'app.js');
-const { resolveModel, filteredRuns, monogram, cap, state } = require(APP);
+const { resolveModel, filteredRuns, monogram, cap, state, PANELS } = require(APP);
 
 test('resolveModel: exact family hit resolves logo + label', () => {
   const m = resolveModel('opus');
@@ -120,24 +120,27 @@ test('resolveModel: unknown model → no logo, capitalized label (monogram fallb
 // --- filteredRuns -----------------------------------------------------------
 // filteredRuns reads state.filterModel / state.filterRole (the module `state` object),
 // so each test sets them on the exported `state` and resets after.
-function withFilters(model, role, fn) {
+function withFilters(model, role, fn, task = null) {
   const prevModel = state.filterModel;
   const prevRole = state.filterRole;
+  const prevTask = state.filterTask;
   state.filterModel = model;
   state.filterRole = role;
+  state.filterTask = task;
   try {
     fn();
   } finally {
     state.filterModel = prevModel;
     state.filterRole = prevRole;
+    state.filterTask = prevTask;
   }
 }
 
 const RUNS = [
-  { models: ['opus-4-8', 'gpt-5.5'], mode: 'diff' },
-  { models: ['zai:glm-5.2'], mode: 'quorum' },
-  { models: ['oc:opencode/deepseek-v4'], mode: 'brainstorm', topic: 'caching' },
-  { models: [], mode: 'just-ask' },
+  { models: ['opus-4-8', 'gpt-5.5'], mode: 'diff', task_code: 'HYP-742' },
+  { models: ['zai:glm-5.2'], mode: 'quorum', task_code: 'HYP-742' },
+  { models: ['oc:opencode/deepseek-v4'], mode: 'brainstorm', topic: 'caching', task_code: 'HYP-999' },
+  { models: [], mode: 'just-ask', task_code: null },
 ];
 
 test('filteredRuns: no filter returns all runs unchanged', () => {
@@ -187,6 +190,39 @@ test('filteredRuns: model AND role filters compose', () => {
     assert.equal(out.length, 1);
     assert.equal(out[0].mode, 'brainstorm');
   });
+});
+
+test('filteredRuns: task filter keeps only matching task iterations', () => {
+  withFilters(null, null, () => {
+    const out = filteredRuns(RUNS);
+    assert.equal(out.length, 2);
+    assert.deepEqual(out.map((r) => r.task_code), ['HYP-742', 'HYP-742']);
+  }, 'HYP-742');
+});
+
+test('PANELS.tasks: active task filter scopes task groups and related runs', () => {
+  const prevStats = state.stats;
+  const prevRuns = state.runs;
+  try {
+    withFilters(null, null, () => {
+      state.runs = [
+        { session_id: 's1', started: '2026-06-01T10:00:00Z', models: ['codex'], mode: 'review', task_code: 'HYP-742' },
+        { session_id: 's2', started: '2026-06-01T11:00:00Z', models: ['gemini'], mode: 'review', task_code: 'HYP-999' },
+      ];
+      state.stats = {
+        tasks: [
+          { task_code: 'HYP-742', iterations: 1, models: ['codex'], modes: ['review'], last_started: '2026-06-01T10:00:00Z' },
+          { task_code: 'HYP-999', iterations: 1, models: ['gemini'], modes: ['review'], last_started: '2026-06-01T11:00:00Z' },
+        ],
+      };
+      const html = PANELS.tasks();
+      assert.match(html, /HYP-742/);
+      assert.doesNotMatch(html, /HYP-999/);
+    }, 'HYP-742');
+  } finally {
+    state.stats = prevStats;
+    state.runs = prevRuns;
+  }
 });
 
 test('filteredRuns: null/undefined runs list is tolerated', () => {

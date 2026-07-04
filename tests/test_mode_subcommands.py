@@ -75,7 +75,9 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
     cli.load_config = lambda: {"models": ["codex"]}  # explicit models -> no real board
     cli._read_stdin_if_piped = lambda: stdin
     old_env = os.environ.get("GEMINI_ENV_FILE")
+    old_task = os.environ.get("REVIEW_TASK_CODE")
     os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+    os.environ["REVIEW_TASK_CODE"] = "TEST-1"
     err = io.StringIO()
     out = io.StringIO()
     try:
@@ -100,6 +102,10 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
             os.environ.pop("GEMINI_ENV_FILE", None)
         else:
             os.environ["GEMINI_ENV_FILE"] = old_env
+        if old_task is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task
     captured["stderr"] = err.getvalue()
     captured["stdout"] = out.getvalue()
     return captured
@@ -158,6 +164,7 @@ def test_flags_without_subcommand_print_help_and_point_at_diff():
     assert cap["mode"] is None, ("no mode handler must run", cap)
     assert cap["rc"] == 2, cap
     assert "review diff" in cap["stderr"], cap["stderr"]
+    assert "--task CODE" in cap["stderr"], cap["stderr"]
 
 
 def test_staged_without_subcommand_points_at_diff():
@@ -169,6 +176,7 @@ def test_staged_without_subcommand_points_at_diff():
     assert cap["mode"] is None, cap
     assert cap["rc"] == 2, cap
     assert "review diff" in cap["stderr"], cap["stderr"]
+    assert "--task CODE" in cap["stderr"], cap["stderr"]
     assert "unrecognized arguments" not in cap["stderr"], cap["stderr"]
 
 
@@ -191,6 +199,7 @@ def test_piped_diff_without_subcommand_fails_loud_not_silent_noop():
     assert cap["mode"] is None, ("no mode handler must run", cap)
     assert cap["rc"] == 2, cap
     assert "review diff" in cap["stderr"], cap["stderr"]
+    assert "--task CODE" in cap["stderr"], cap["stderr"]
     assert "piped in" in cap["stderr"], cap["stderr"]
 
 
@@ -201,6 +210,7 @@ def test_removed_review_verb_points_at_diff():
     assert cap["mode"] is None, ("review review must not dispatch the diff handler", cap)
     assert cap["rc"] == 2, cap
     assert "review diff" in cap["stderr"], cap["stderr"]
+    assert "--task CODE" in cap["stderr"], cap["stderr"]
     assert "no longer a subcommand" in cap["stderr"], cap["stderr"]
 
 
@@ -258,7 +268,7 @@ def test_brainstorm_with_diff_flag_grounds_on_working_tree_diff():
     cli._read_stdin_if_piped = lambda: None
     try:
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
-            rc = cli.main(["brainstorm", "topic", "--diff", "-C", str(REPO_ROOT)])
+            rc = cli.main(["brainstorm", "topic", "--task", "TEST-1", "--diff", "-C", str(REPO_ROOT)])
     finally:
         _brainstorm_mod.mode_brainstorm = saved
         cli._git_diff = saved_git
@@ -302,9 +312,9 @@ def test_just_ask_does_not_auto_grab_diff_but_diff_flag_opts_in():
             cli._read_stdin_if_piped = saved_stdin
         return rc, captured.get("diff")
 
-    rc, diff = run(["just-ask", "Q", "-C", str(REPO_ROOT)])
+    rc, diff = run(["just-ask", "Q", "--task", "TEST-1", "-C", str(REPO_ROOT)])
     assert rc == 0 and diff == "", ("no --diff -> no context", diff)
-    rc, diff = run(["just-ask", "Q", "--diff", "-C", str(REPO_ROOT)])
+    rc, diff = run(["just-ask", "Q", "--task", "TEST-1", "--diff", "-C", str(REPO_ROOT)])
     assert rc == 0 and diff == grounding, ("--diff -> working-tree context", diff)
 
 
@@ -320,6 +330,7 @@ def test_removed_brainstorm_flag_errors_with_pointer():
     rc, err = _capture_main(["--brainstorm", "x", "-C", str(REPO_ROOT)])
     assert rc == 2, rc
     assert "review brainstorm" in err, err
+    assert "--task CODE" in err, err
     assert "no longer a flag" in err, err
 
 
@@ -327,18 +338,21 @@ def test_removed_quorum_flag_errors_with_pointer():
     rc, err = _capture_main(["--quorum", "x", "-C", str(REPO_ROOT)])
     assert rc == 2, rc
     assert "review quorum" in err, err
+    assert "--task CODE" in err, err
 
 
 def test_removed_just_ask_flag_errors_with_pointer():
     rc, err = _capture_main(["--just-ask", "x", "-C", str(REPO_ROOT)])
     assert rc == 2, rc
     assert "review just-ask" in err, err
+    assert "--task CODE" in err, err
 
 
 def test_removed_flag_equals_form_errors():
     rc, err = _capture_main(["--brainstorm=topic", "-C", str(REPO_ROOT)])
     assert rc == 2, rc
     assert "review brainstorm" in err, err
+    assert "--task CODE" in err, err
 
 
 # --- Flags removed WITH NO replacement (--mcp / --ln) fail LOUD, not opaque. ----------
@@ -407,7 +421,7 @@ def test_removed_no_replacement_flag_after_double_dash_is_not_intercepted():
     raised = False
     with redirect_stderr(err), redirect_stdout(io.StringIO()):
         try:
-            cli.main(["diff", "--", "--mcp"])
+            cli.main(["diff", "--task", "TEST-1", "--", "--mcp"])
         except SystemExit:
             raised = True  # argparse usage error on the stray positional — acceptable
     assert "`--mcp` was removed" not in err.getvalue(), err.getvalue()
@@ -423,7 +437,7 @@ def test_removed_flag_after_double_dash_is_not_intercepted():
     raised = False
     with redirect_stderr(err), redirect_stdout(io.StringIO()):
         try:
-            cli.main(["diff", "--", "--quorum"])
+            cli.main(["diff", "--task", "TEST-1", "--", "--quorum"])
         except SystemExit:
             raised = True  # argparse usage error on the stray positional — acceptable
     assert "no longer a flag" not in err.getvalue(), err.getvalue()
@@ -494,7 +508,7 @@ def test_diff_mode_empty_diff_returns_nonzero_no_diff_to_review():
     cli._read_stdin_if_piped = lambda: None
     try:
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
-            rc = cli.main(["diff", "-C", str(REPO_ROOT)])
+            rc = cli.main(["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)])
     finally:
         cli.load_config = saved_cfg
         cli._git_diff = saved_git

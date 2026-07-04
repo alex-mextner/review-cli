@@ -59,6 +59,7 @@ def _run(argv, *, cwd, stdin: str | None = None) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env["HOME"] = fake_home
         env["XDG_CONFIG_HOME"] = str(Path(fake_home) / ".config")
+        env["REVIEW_TASK_CODE"] = "TEST-1"
         return subprocess.run(
             [sys.executable, REVIEW, *argv],
             cwd=str(cwd),
@@ -197,7 +198,7 @@ def test_piped_diff_outside_repo_does_not_require_git():
     err = io.StringIO()
     try:
         with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
-            rc = cli._dispatch(["diff", "-C", d])
+            rc = cli._dispatch(["diff", "--task", "TEST-1", "-C", d])
     finally:
         _review_mod.mode_review = saved_handler
         cli._read_stdin_if_piped = saved_stdin
@@ -233,7 +234,7 @@ def test_panel_staged_outside_repo_degrades_gracefully():
     err = io.StringIO()
     try:
         with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
-            rc = cli._dispatch(["just-ask", "--staged", "-C", d, "what is this"])
+            rc = cli._dispatch(["just-ask", "what is this", "--task", "TEST-1", "--staged", "-C", d])
     finally:
         _ja_mod.mode_just_ask = saved_handler
         cli._read_stdin_if_piped = saved_stdin
@@ -325,7 +326,7 @@ def test_brainstorm_missing_cwd_degrades_without_traceback():
     try:
         with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
             missing = str(Path(d) / "gone")
-            rc = cli._dispatch(["brainstorm", "topic", "--diff", "-C", missing])
+            rc = cli._dispatch(["brainstorm", "topic", "--task", "TEST-1", "--diff", "-C", missing])
     finally:
         _bs_mod.mode_brainstorm = saved_handler
         cli._read_stdin_if_piped = saved_stdin
@@ -389,7 +390,7 @@ def test_no_git_mode_runs_when_git_binary_is_missing_or_wedged():
             with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
                 # Must not raise: the toplevel probe in `_effective_cwd` swallows the spawn
                 # failure and degrades to "review the dir as-is", then just-ask runs.
-                rc = cli._dispatch(["just-ask", "-C", d, "what is this"])
+                rc = cli._dispatch(["just-ask", "what is this", "--task", "TEST-1", "-C", d])
             assert rc == 0, (boom.__name__, rc)
             assert "Traceback" not in err.getvalue(), (boom.__name__, err.getvalue())
             assert "FileNotFoundError" not in err.getvalue(), (boom.__name__, err.getvalue())
@@ -442,7 +443,7 @@ def test_panel_staged_in_repo_degrades_when_git_diff_raises():
             repo = Path(d) / "repo"
             repo.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
-            rc = cli._dispatch(["just-ask", "--staged", "-C", str(repo), "what is this"])
+            rc = cli._dispatch(["just-ask", "what is this", "--task", "TEST-1", "--staged", "-C", str(repo)])
     finally:
         _ja_mod.mode_just_ask = saved_handler
         cli._read_stdin_if_piped = saved_stdin
@@ -479,7 +480,7 @@ def test_required_review_in_repo_fails_gracefully_when_git_diff_raises():
             repo.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
             # `review diff` (the REQUIRED diff path) in a real repo where git diff blows up.
-            rc = cli._dispatch(["diff", "-C", str(repo)])
+            rc = cli._dispatch(["diff", "--task", "TEST-1", "-C", str(repo)])
     finally:
         cli._read_stdin_if_piped = saved_stdin
         cli.load_config = saved_cfg
@@ -491,9 +492,9 @@ def test_required_review_in_repo_fails_gracefully_when_git_diff_raises():
     assert "index file corrupt" in msg, msg          # the underlying cause is surfaced
     assert "Traceback" not in msg, msg               # no raw traceback
     assert "not in a git repository" not in msg.lower(), msg  # not the wrong message
-    # The stdin fix hint must point at the CURRENT verb (`git diff | review diff`), not the
+    # The stdin fix hint must point at the CURRENT verb + required task code, not the
     # bare `review` (which now exits 2 on a piped diff) — codex review finding.
-    assert "git diff | review diff" in msg, msg
+    assert "git diff | review diff --task CODE" in msg, msg
 
 
 def test_opencode_runs_in_repo_tolerates_spawn_failures():
