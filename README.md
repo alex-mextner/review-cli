@@ -51,32 +51,40 @@ resolve the conflict and re-run.
 
 Modes are **subcommands**: `review <mode> …`. The first verb selects the mode. A bare
 `review` (no subcommand) prints the **help** — the diff review is `review diff`.
+Every review iteration that is recorded in stats requires a task/issue code: pass
+`--task CODE`, or set `REVIEW_TASK_CODE=CODE` once in the environment for automation.
+Standalone `review visual IMAGE` is the exception because it is a single-image verifier,
+not a multi-model review iteration.
 
 ```bash
 # Review unstaged diff with your default backends
-review diff
+review diff --task HYP-742
 
 # Review staged changes (pre-commit)
-review diff --staged
+review diff --staged --task HYP-742
 
 # Add backends to the defaults
-review diff -m codex -m fable5 -m gemini
+review diff --task HYP-742 -m codex -m fable5 -m gemini
 
 # Ask all backends a quick question (no diff needed)
-review just-ask "Is a single-file Python CLI the right idiom for this tool?"
+review just-ask "Is a single-file Python CLI the right idiom for this tool?" --task HYP-742
 
 # Settle a contested decision with cited evidence
-review quorum "Should we cap brainstorm at 8 rounds?"
+review quorum "Should we cap brainstorm at 8 rounds?" --task HYP-742
 
 # Open-ended design exploration
-review brainstorm "How should we design the plugin system?"
+review brainstorm "How should we design the plugin system?" --task HYP-742
 
 # Brainstorm ABOUT the current change (grounded in the working-tree / staged diff)
-review brainstorm "Alternatives before I commit?" --diff
-review brainstorm "Risks in this design?" --staged
+review brainstorm "Alternatives before I commit?" --task HYP-742 --diff
+review brainstorm "Risks in this design?" --task HYP-742 --staged
 
 # Save the result to a file — use -o, NOT `> file` (zsh noclobber-safe)
-review diff -o review.md
+review diff --task HYP-742 -o review.md
+
+# Later, inspect task-scoped iterations and transcripts
+review task HYP-742
+review task HYP-742 --detail 2
 ```
 
 > **The diff review is `review diff` now.** A bare `review` (no subcommand) prints the
@@ -90,7 +98,7 @@ review diff -o review.md
 > `--just-ask` flags are gone — use the `brainstorm` / `quorum` / `just-ask`
 > subcommands. The flags now print a one-line pointer and exit non-zero. Visual review is
 > **`review visual IMAGE`**; `--visual` remains a composable attachment for text modes
-> such as `review brainstorm "is this good?" --visual IMAGE`.
+> such as `review brainstorm "is this good?" --task CODE --visual IMAGE`.
 
 > **Write to a file with `-o file.md`, not `review … > file.md`.** Under zsh
 > `noclobber` (a common default), `> file.md` refuses to overwrite an existing file
@@ -102,6 +110,13 @@ review diff -o review.md
 > `review help config` (alias `review --help config`) prints the configuration reference —
 > the config file + cascade, the model/board selection, and keys/auth. The main `--help`
 > lists the available topics.
+
+> **Task history: `--task CODE` is required for review modes.** `review` stores the code
+> in run stats and per-call logs, so `review task CODE` and the dashboard can show how many
+> iterations were run for that task, which models participated, and the detailed
+> conversations when logs are still present. Use `$REVIEW_TASK_CODE` in hooks/agents when
+> repeating `--task` on every command would be noisy. `CODE` is one non-whitespace token,
+> max 120 characters, with no control characters; examples: `HYP-742`, `review-cli-108`.
 
 ---
 
@@ -116,9 +131,9 @@ checks where you want fast, independent perspectives without ceremony. The diff 
 the **`diff`** subcommand (`review diff`); **a diff is required**.
 
 ```bash
-review diff
-review diff --staged
-git show --format= --no-ext-diff HEAD | review diff -m gemini,codex
+review diff --task HYP-742
+review diff --staged --task HYP-742
+git show --format= --no-ext-diff HEAD | review diff --task HYP-742 -m gemini,codex
 ```
 
 ---
@@ -132,8 +147,8 @@ one in or add `--staged` to attach it as context. One pass, no moderator, result
 printed side by side.
 
 ```bash
-review just-ask "Does this change need a migration?"
-git diff | review just-ask "Is this safe to merge?"
+review just-ask "Does this change need a migration?" --task HYP-742
+git diff | review just-ask "Is this safe to merge?" --task HYP-742
 ```
 
 ---
@@ -164,7 +179,7 @@ multi-model and (for the panel modes) multi-round, so it takes **minutes**, and 
 short shell `timeout` around it kills the run before its synthesis — a `brainstorm`
 only emits its final answer at the very end, so a short cap yields *nothing* usable.
 To make the expected duration visible up front, every run that actually dispatches a
-backend appends a structured stat record — mode, pool size (backends actually
+backend appends a structured stat record — task code, mode, pool size (backends actually
 dispatched; for a small-panel brainstorm that is the per-round persona slot count),
 model **names** (never keys or prompts), the real monotonic wall-clock, and ok/fail
 counts — to an append-only
@@ -180,7 +195,9 @@ With no exact history it falls back to pool-size-only across modes, then to a
 `no history yet … expect MINUTES` line. Read that line and wait at least that long.
 (This store is separate from the dashboard's per-call log reader, whose mode is
 *inferred* and whose duration is an mtime proxy — this one records the run's ground
-truth.)
+truth.) Task-coded records power `review task CODE` and the dashboard's task history.
+The run-stats JSONL schema is versioned; task-coded records are `v: 2` and add the optional
+`task_code` field for consumers that read the local store directly.
 
 **No external timeout — `review` carries its own internal ≤4h backstop.** Do not
 put *any* external `timeout` on `review`: it is designed to run unbounded from the
@@ -191,9 +208,9 @@ finishes in minutes, far under the ceiling) and a stuck run can't run forever ei
 `$REVIEW_BACKSTOP_SECONDS` can only **lower** that ceiling, never raise it past 4h.
 
 ```bash
-review quorum "Should we cap brainstorm at 8 rounds?"
-git diff | review quorum "Is this diff safe to merge?" -m codex,gemini,fable5
-review quorum "Should we switch to a plugin architecture?" --moderator gemini
+review quorum "Should we cap brainstorm at 8 rounds?" --task HYP-742
+git diff | review quorum "Is this diff safe to merge?" --task HYP-742 -m codex,gemini,fable5
+review quorum "Should we switch to a plugin architecture?" --task HYP-742 --moderator gemini
 ```
 
 ---
@@ -224,9 +241,9 @@ ideation.
 ```bash
 # brainstorm grounded in the current uncommitted working-tree diff
 # (the subcommand leads; -C and the other shared options follow it)
-review brainstorm "Is this caching approach sound? What are the risks?" --diff -C <repo>
-review brainstorm "Alternatives to this design before I commit?" --staged -C <repo>
-git diff main... | review brainstorm "How else could we structure this?" -C <repo>
+review brainstorm "Is this caching approach sound? What are the risks?" --task HYP-742 --diff -C <repo>
+review brainstorm "Alternatives to this design before I commit?" --task HYP-742 --staged -C <repo>
+git diff main... | review brainstorm "How else could we structure this?" --task HYP-742 -C <repo>
 ```
 
 The whole conversation is also written **incrementally** to a single discussion log
@@ -244,8 +261,9 @@ transcript (~1 MB+) can still hit `ARG_MAX` on those paths. `_payload` prints a 
 WARNING as it approaches the limit; keep `--max-rounds` and diffs reasonable.
 
 ```bash
-review brainstorm "How should we design the plugin system?"
+review brainstorm "How should we design the plugin system?" --task HYP-742
 review brainstorm "API shape for the cache layer" \
+  --task HYP-742 \
   --rounds 5 --max-rounds 10 \
   -m codex,gemini --moderator gemini
 ```
@@ -266,10 +284,10 @@ BLOCKED. With **no** authored suite, qa fails the no-suites gate (exit 6) and te
 how to author one — a green qa run with zero cases is a lie.
 
 ```bash
-review qa <sut> --suites docs/tests/suites/*.md       # default: claude tester, isolated worktree, 1 case
-review qa <sut> --kind backend --max-cases 5          # cap the run (cost control); 0 = full suite
-review qa <sut> --in-place                            # run in the SUT tree (riskier; opt-in)
-REVIEW_QA_TESTER=codex review qa <sut>                # use the codex write/exec seat instead of claude
+review qa <sut> --task HYP-742 --suites docs/tests/suites/*.md       # default: claude tester, isolated worktree, 1 case
+review qa <sut> --task HYP-742 --kind backend --max-cases 5          # cap the run (cost control); 0 = full suite
+review qa <sut> --task HYP-742 --in-place                            # run in the SUT tree (riskier; opt-in)
+REVIEW_QA_TESTER=codex review qa <sut> --task HYP-742                # use the codex write/exec seat instead of claude
 ```
 
 **Safety — read this.** qa is the first review-cli mode that runs an **un-caged** agent
@@ -316,7 +334,7 @@ sut:
 ```
 
 ```bash
-REVIEW_QA_PLAYWRIGHT=1 review qa <web-sut> --kind web   # deterministic headless-browser run
+REVIEW_QA_PLAYWRIGHT=1 review qa <web-sut> --task HYP-742 --kind web   # deterministic headless-browser run
 ```
 
 Both emit the SAME `## QA RESULTS` contract the un-caged tester does, so the verdict→exit mapping
@@ -330,7 +348,7 @@ to stand a mock / drive the site by hand.
 
 | Subcommand | Reach for it when... |
 |------------|----------------------|
-| `review` (default) | Pre-commit diff check — fast, parallel, no overhead |
+| `diff` | Pre-commit diff check — fast, parallel, no overhead |
 | `just-ask` | Quick multi-model second opinion on any question |
 | `quorum` | A contested decision that needs cited evidence to settle |
 | `brainstorm` | An open design space you want to explore across multiple rounds (optionally grounded in a diff — pass `--diff` / `--staged` or have an uncommitted diff to brainstorm about a specific change) |
@@ -397,6 +415,39 @@ handled explicitly:
 
 ---
 
+## `review task` — task-scoped review history
+
+Every recorded review mode requires `--task CODE` (or `$REVIEW_TASK_CODE`) so iterations can
+be grouped by the external task/issue that caused them. The CLI history view reads the
+append-only run-stats store for the authoritative iteration count and model list, then joins
+against dashboard logs for the detailed conversations when those logs are still present.
+
+```bash
+review task                 # list all task codes seen in run-stats
+review task HYP-742         # iterations, models, ok/fail counts, log session ids
+review task HYP-742 --json  # machine-readable history
+review task HYP-742 --detail 2
+review task HYP-742 --detail sess-20260703T101500_123456
+```
+
+`--detail` accepts either an iteration number or a dashboard session id. It prints the
+brainstorm discussion body when present, then each backend call transcript and stderr block.
+If the stat record exists but the old per-call logs have been deleted, the iteration still
+appears in the summary and the detail command reports that transcript logs are unavailable.
+The `--json` shapes are public CLI output contracts: task listings contain `task_code`,
+iteration counts, model/mode lists, timestamps, duration, and ok/fail counts; detail output
+uses the dashboard session-detail schema (`session_id`, calls, errors, brainstorm, roles).
+
+JSON top-level shapes:
+
+| Command | Shape |
+|---------|-------|
+| `review task --json` | `{"tasks": [{"task_code": str, "iterations": int, "models": [str], "modes": [str], "first_ts": str, "last_ts": str, "duration_seconds": number, "ok_count": int, "fail_count": int}]}` |
+| `review task CODE --json` | `{"task_code": str, "iterations": [run_stats_record], "sessions": [dashboard_session_summary]}` |
+| `review task CODE --detail N --json` | `dashboard_session_detail` with `session_id`, `task_code`, `calls`, `errors`, `brainstorm`, and `roles` |
+
+---
+
 ## `review dashboard` — local web dashboard (managed service)
 
 The dashboard is a **managed service**: it gets the same lifecycle subcommands every
@@ -445,11 +496,15 @@ Subprocess backends (codex/claude/opencode) write these live; REST backends (gem
 commandcode) emit an equivalent sidecar log on every call — each under its OWN backend name,
 so every backend is counted and attributed correctly. Calls are time-clustered into
 **sessions** (review-cli emits no run id; a session = a burst of calls separated by a gap),
-and the mode (review / panel / brainstorm) is inferred from the call/round shape.
+and the mode (review / panel / brainstorm) is inferred from the call/round shape. Task
+metadata from `--task CODE` is parsed from those logs, so a dashboard session carries the
+same task code as the CLI stat record.
 
-**Panels:** Chat logs (per-run transcripts), Stats (runs over time, by mode/model/role),
+**Panels:** Chat logs (per-run transcripts), Stats (runs over time, by task/mode/model/role),
 Models & roles, Metrics (durations, success/fail rates), Overseer feedback, Modes, Errors,
-Tasks (mark a session **conscious**), Prompts, and PR + ticket links.
+Tasks (task-coded review history plus the **conscious** session marker), Prompts, and PR +
+ticket links. A task badge filters runs by code and the task view shows iterations, models,
+modes, related sessions, and drill-down links to the full conversations.
 
 **The overseer's annotations** — free-text feedback, the per-session **conscious** flag,
 and PR/ticket associations — are the only NEW persistence: a small atomic JSON store at
@@ -494,7 +549,8 @@ name "styleprobe" in older copies — it is the `--visual` detector.)*
 ### Standalone and Composable
 
 `review visual <image>` is the canonical standalone verdict pipeline. Add `--diff` or
-`--staged` when you want the screenshot judged together with the current diff. `--visual`
+`--staged` plus `--task CODE` when you want the screenshot judged together with the current
+diff. `--visual`
 remains a composable flag on text modes (`brainstorm` / `quorum` / `just-ask` / `diff`),
 so personas / voters / reviewers literally **see** the image as multimodal context:
 
@@ -503,16 +559,16 @@ so personas / voters / reviewers literally **see** the image as multimodal conte
 review visual after.png
 
 # Standalone visual plus the working-tree diff as context
-review visual after.png --diff
+review visual after.png --task HYP-742 --diff
 
 # The brainstorm personas see the screenshot and reason about it
-review brainstorm "is this layout good?" --visual after.png
+review brainstorm "is this layout good?" --task HYP-742 --visual after.png
 
 # Every quorum voter gets the image as shared context
-review quorum "ship this UI?" --visual after.png
+review quorum "ship this UI?" --task HYP-742 --visual after.png
 
 # Diff review with the rendered result attached as evidence
-review visual after.png --diff
+review diff --task HYP-742 --visual after.png
 ```
 
 When a companion mode is present, Claude CLI seats can receive the raw screenshot
@@ -770,7 +826,7 @@ delivers the structured review to the launching agent.)
 
 `review` earns its keep when an agent hits a hard call:
 
-1. The agent runs `review brainstorm "<the decision>"` — many models in rotating
+1. The agent runs `review brainstorm "<the decision>" --task HYP-742` — many models in rotating
    expert roles, looping across several rounds — to surface candidate approaches a
    single model wouldn't reach.
 2. It picks the top one or two and posts them to Telegram via
@@ -779,9 +835,10 @@ delivers the structured review to the launching agent.)
 3. For the closest calls, it builds the rival approaches in parallel **git worktrees**
    and compares them for real before committing.
 
-And before every commit, `review diff --staged` is a multi-model gate — optionally *enforced*
-with `review install-commit-hook` (a global pre-commit hook that blocks unreviewed
-staged changes; bypass with `REVIEW_SKIP=1 git commit` or `git commit --no-verify`).
+And before every commit, `review diff --staged --task HYP-742` is a multi-model gate —
+optionally *enforced* with `review install-commit-hook` (a global pre-commit hook that
+blocks unreviewed staged changes; bypass with `REVIEW_SKIP=1 git commit` or
+`git commit --no-verify`).
 
 ---
 
@@ -847,8 +904,10 @@ visual IMAGE        Visual verification for a screenshot; add --diff to include 
 brainstorm TOPIC    Multi-round persona ideation; composable with --diff/--staged grounding.
 just-ask QUESTION   Single-shot multi-model answer to a question (diff optional).
 quorum QUESTION     Experts cite evidence + a moderator finds quorum/disagreement.
+qa SUT              Agent-as-tester mode for authored QA suites.
 dashboard           Local web dashboard over review-cli runs.
 sessions            List / resume brainstorm sessions (-a all, -s <id> resume).
+task [CODE]         List task-coded review iterations, models, and transcript details.
 spec-web            Multi-spec web reviewer daemon (start/status/stop/add SPEC; also `spec-web SPEC.md`).
 install-skill | install-commit-hook | register-module
 
@@ -858,6 +917,9 @@ GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)
                     brainstorm uses `brainstorm_models:`, just-ask/quorum the defaults.
                     Each subcommand's `--help` shows its own effective default.
 -C / --cwd DIR      Run against a different repository directory.
+--task CODE         Task/issue code for this review iteration. Required for recorded
+                    review modes; standalone `review visual IMAGE` is the exception.
+                    Can also be supplied by $REVIEW_TASK_CODE for automation.
 -o / --output FILE  Write the result to FILE via Python (creates parent dirs, always
                     overwrites) while still printing to stdout. Use this instead of
                     `review … > FILE`, which fails silently under zsh noclobber.
@@ -876,10 +938,12 @@ SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
 --rounds N          (brainstorm) Minimum rounds before STOP is allowed (default 5).
 --max-rounds N      (brainstorm) Hard cap on rounds (default 8).
 --visual IMAGE …    Composable visual-verification group for text modes: attach/verify a
-                    render; rides subcommands such as `review brainstorm "Q" --visual shot.png`.
+                    render; rides subcommands such as
+                    `review brainstorm "Q" --task CODE --visual shot.png`.
                     Companions: --before/--intent/--expect/--check/--json/--strict/--no-ai/
                     --no-local-model/--vision-timeout/--project. For standalone use
-                    `review visual IMAGE [--diff]`. See `review <mode> --help`.
+                    `review visual IMAGE` or `review visual IMAGE --task CODE --diff`.
+                    See `review <mode> --help`.
 ```
 
 > **Modes are subcommands, not flags.** `--brainstorm` / `--quorum` / `--just-ask` were
@@ -1023,6 +1087,7 @@ it they fall back to the reserve.
 
 ```bash
 review --show-board        # priority order + which 4 are the live pool + reserve + availability
+export REVIEW_TASK_CODE=HYP-742
 review diff                # default failover pool: the top 4 AVAILABLE seats by priority
 review diff --pool 8       # run all 8 available seats (--pool 0 also means "all available")
 review diff --pool 2       # run the top 2 available seats (with failover)

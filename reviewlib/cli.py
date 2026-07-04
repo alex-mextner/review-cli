@@ -58,7 +58,14 @@ from .modes.review import mode_review
 from .panel import begin_call_tally, end_call_tally, pick_moderators
 from .process import _run, git_repo_env, strip_control_sequences
 from .retry import max_retry_count
-from .stats import announce_eta, record_run
+from .stats import (
+    announce_eta,
+    fmt_duration,
+    iterations_for_task,
+    normalize_task_code,
+    record_run,
+    task_summaries,
+)
 
 if TYPE_CHECKING:
     from agenttools_service import ServiceManager
@@ -137,8 +144,9 @@ def _fail_not_a_repo(cwd: Path) -> int:
     print(
         f"[review-cli] not in a git repository ({cwd}).\n"
         "  the diff review needs a repo to diff (it reviews your working-tree / staged changes).\n"
-        "  fix: run a mode that needs no git — `review just-ask \"...\"` / "
-        "`review quorum \"...\"` / `review brainstorm \"...\"` — or cd into a repo and re-run.",
+        "  fix: run a mode that needs no git — `review just-ask \"...\" --task CODE` / "
+        "`review quorum \"...\" --task CODE` / `review brainstorm \"...\" --task CODE` — "
+        "or cd into a repo and re-run.",
         file=sys.stderr, flush=True,
     )
     return EXIT_NOT_A_REPO
@@ -153,7 +161,7 @@ def _fail_git_diff(cwd: Path, exc: Exception) -> int:
         f"[review-cli] could not read the git diff in {cwd}.\n"
         f"  git diff failed: {exc}\n"
         "  fix: check the repo is healthy (`git status`), or pipe a diff on stdin "
-        "(`git diff | review diff`).",
+        "(`git diff | review diff --task CODE`).",
         file=sys.stderr, flush=True,
     )
     return EXIT_GIT_DIFF_FAILED
@@ -518,6 +526,243 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
         # (codex P2: CTO sided with the bot over the prior "intentional" exit-0 choice).
         print(f"[review sessions] {exc}", file=sys.stderr, flush=True)
         return 2
+
+
+def _task_sessions(task_code: str):
+    """Dashboard sessions for a task, oldest first. Best-effort over existing logs."""
+    from .dashboard import parser as dparser
+    from .process import log_dir
+
+    sessions = [s for s in dparser.load_sessions(log_dir()) if s.task_code == task_code]
+    return sorted(sessions, key=lambda s: s.started)
+
+
+_TASK_SESSION_MATCH_WINDOW_SECONDS = 10 * 60
+
+
+def _parse_task_record_started(record: dict) -> datetime | None:
+    ts = record.get("ts")
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _session_started_utc(session) -> datetime:
+    dt = session.started
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _task_record_iteration(record: dict) -> int | None:
+    try:
+        return int(record["iteration"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _closest_iteration_for_session(session, iterations: list[dict]) -> int | None:
+    session_started = _session_started_utc(session)
+    best_iteration: int | None = None
+    best_delta: float | None = None
+    for record in iterations:
+        started = _parse_task_record_started(record)
+        iteration = _task_record_iteration(record)
+        if started is None or iteration is None:
+            continue
+        delta = abs((session_started - started).total_seconds())
+        if delta > _TASK_SESSION_MATCH_WINDOW_SECONDS:
+            continue
+        if best_delta is None or delta < best_delta:
+            best_iteration = iteration
+            best_delta = delta
+    return best_iteration
+
+
+def _session_for_task_iteration(
+    record: dict,
+    sessions: list,
+    all_iterations: list[dict] | None = None,
+    used_session_ids: set[str] | None = None,
+):
+    """Match a stats iteration to the session whose start time is closest to it."""
+    started = _parse_task_record_started(record)
+    iteration = _task_record_iteration(record)
+    if started is None or iteration is None:
+        return None
+    best = None
+    best_delta: float | None = None
+    used = used_session_ids or set()
+    for session in sessions:
+        if session.session_id in used:
+            continue
+        delta = abs((_session_started_utc(session) - started).total_seconds())
+        if delta > _TASK_SESSION_MATCH_WINDOW_SECONDS:
+            continue
+        if all_iterations and _closest_iteration_for_session(session, all_iterations) != iteration:
+            continue
+        if best_delta is None or delta < best_delta:
+            best = session
+            best_delta = delta
+    return best
+
+
+def _iteration_for_session(session, iterations: list[dict]) -> int | None:
+    return _closest_iteration_for_session(session, iterations)
+
+
+def _task_subcommand(rest: list[str]) -> int:
+    """`review task CODE [--detail N|SESSION] [--json]` — task-scoped review history.
+
+    The run-stats JSONL is the authoritative iteration list; dashboard logs provide
+    transcript detail when they are still present. Both stores are private local files.
+    """
+    if "--task" in rest or any(arg.startswith("--task=") for arg in rest):
+        print(
+            "[review task] use positional CODE for history lookup: review task CODE. "
+            "--task is for recorded review modes.",
+            file=sys.stderr,
+        )
+        return 2
+    parser = argparse.ArgumentParser(
+        prog="review task",
+        description="Show review iterations, models, and transcripts for one task code.",
+    )
+    parser.add_argument("code", nargs="?", help="task/issue code, e.g. HYP-742")
+    parser.add_argument("--detail", metavar="N|SESSION",
+                        help="print the full transcript for an iteration number or session id")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    ns = parser.parse_args(rest)
+
+    if not ns.code:
+        summaries = task_summaries()
+        if ns.json:
+            import json as _json
+
+            print(_json.dumps({"tasks": summaries}, indent=2))
+            return 0
+        if not summaries:
+            print("No task-coded review iterations found.")
+            return 0
+        print("Review tasks:")
+        for item in summaries:
+            models = ", ".join(item["models"]) or "-"
+            print(
+                f"  {item['task_code']}: {item['iterations']} iteration"
+                f"{'' if item['iterations'] == 1 else 's'} · models: {models}"
+            )
+        return 0
+
+    try:
+        code = normalize_task_code(ns.code)
+    except ValueError as exc:
+        print(f"[review task] invalid task code: {exc}", file=sys.stderr)
+        return 2
+    assert code is not None
+
+    iterations = iterations_for_task(code)
+    sessions = _task_sessions(code)
+
+    if ns.detail:
+        return _task_detail(code, ns.detail, iterations, sessions, as_json=ns.json)
+
+    if ns.json:
+        import json as _json
+
+        payload = {
+            "task_code": code,
+            "iterations": iterations,
+            "sessions": [s.to_summary() for s in sessions],
+        }
+        print(_json.dumps(payload, indent=2))
+        return 0
+
+    if not iterations and not sessions:
+        print(f"No review iterations found for task {code}.")
+        return 1
+
+    count = len(iterations) if iterations else len(sessions)
+    print(f"Task {code}: {count} iteration{'' if count == 1 else 's'}")
+    if iterations:
+        used_session_ids: set[str] = set()
+        for item in iterations:
+            idx = int(item["iteration"])
+            session = _session_for_task_iteration(item, sessions, iterations, used_session_ids)
+            if session is not None:
+                used_session_ids.add(session.session_id)
+            models = ", ".join(item.get("models") or []) or "-"
+            duration = fmt_duration(float(item.get("duration_seconds") or 0))
+            suffix = f" · session {session.session_id}" if session else " · logs not found"
+            print(
+                f"  iteration {idx}: {item.get('ts', '?')} · {item.get('mode', '?')} "
+                f"· pool={item.get('pool_size', 0)} · models: {models} "
+                f"· ok={item.get('ok_count', 0)} fail={item.get('fail_count', 0)} "
+                f"· {duration}{suffix}"
+            )
+    else:
+        for idx, session in enumerate(sessions, start=1):
+            print(
+                f"  iteration {idx}: {session.started.isoformat()} · {session.mode} "
+                f"· models: {', '.join(session.models) or '-'} · session {session.session_id}"
+            )
+    print(f"\nDetail: review task {code} --detail <iteration|session_id>")
+    return 0
+
+
+def _task_detail(code: str, selector: str, iterations: list[dict], sessions: list, *, as_json: bool) -> int:
+    session = None
+    iteration_no: int | None = None
+    if selector.isdigit():
+        iteration_no = int(selector)
+        if iteration_no <= 0:
+            print("[review task] --detail iteration must be >= 1", file=sys.stderr)
+            return 2
+        if iterations:
+            record = next((item for item in iterations if item.get("iteration") == iteration_no), None)
+            if record is None:
+                print(f"No review iteration {iteration_no} found for task {code}.", file=sys.stderr)
+                return 1
+            session = _session_for_task_iteration(record, sessions, iterations)
+        elif iteration_no - 1 < len(sessions):
+            session = sessions[iteration_no - 1]
+    else:
+        session = next((s for s in sessions if s.session_id == selector), None)
+        if session is not None:
+            iteration_no = _iteration_for_session(session, iterations) or sessions.index(session) + 1
+    if session is None:
+        print(f"No conversation logs found for task {code} detail {selector}.", file=sys.stderr)
+        return 1
+    detail = session.to_detail()
+    if as_json:
+        import json as _json
+
+        print(_json.dumps(detail, indent=2))
+        return 0
+
+    label = f"iteration {iteration_no}" if iteration_no is not None else selector
+    print(f"# Task {code} {label}")
+    print(f"Session: {session.session_id}")
+    print(f"Mode: {session.mode}")
+    print(f"Started: {session.started.isoformat()}")
+    print(f"Models: {', '.join(session.models) or '-'}")
+    if session.brainstorm is not None:
+        print("\n## Brainstorm transcript")
+        print(session.brainstorm.body.rstrip())
+    for idx, call in enumerate(session.calls, start=1):
+        status = "error" if call.has_error else ("running" if not call.completed else "ok")
+        print(f"\n## Call {idx}: {call.backend} r{call.round} [{status}] {call.filename}")
+        if call.body:
+            print(call.body)
+        if call.stderr_lines:
+            print("\nstderr:")
+            print("\n".join(call.stderr_lines))
+    return 0
 
 
 _SPECWEB_HELP = """review spec-web — multi-spec markdown reviewer (a persistent daemon)
@@ -1035,7 +1280,14 @@ def _spec_web_reply_to_tg(spec: Path, comment: dict, answer: str) -> None:
         print(f"[review spec-web reply] tg delivery error: {exc}", flush=True)
 
 
-def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch, models_after=None) -> int:
+def _run_mode_with_stats(
+    mode: str,
+    pool_models: list[str],
+    dispatch,
+    models_after=None,
+    *,
+    task_code: str | None = None,
+) -> int:
     """Announce the ETA, time the run on a monotonic clock, and append a stat record.
 
     `mode` is the EXACT mode (review/just-ask/quorum/brainstorm) and `pool_models` is
@@ -1066,9 +1318,17 @@ def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch, models_aft
     begin_call_tally()
     started = datetime.now(timezone.utc)
     start = time.monotonic()
+    old_task_env = os.environ.get("REVIEW_TASK_CODE")
+    if task_code:
+        os.environ["REVIEW_TASK_CODE"] = task_code
     try:
         return dispatch()
     finally:
+        if task_code:
+            if old_task_env is None:
+                os.environ.pop("REVIEW_TASK_CODE", None)
+            else:
+                os.environ["REVIEW_TASK_CODE"] = old_task_env
         elapsed = time.monotonic() - start
         tally = end_call_tally()
         ok_count, fail_count = tally["ok"], tally["fail"]
@@ -1085,6 +1345,7 @@ def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch, models_aft
         # the ETA average.
         if ok_count or fail_count:
             record_run(
+                task_code=task_code,
                 mode=mode,
                 models=recorded_models,
                 duration_seconds=elapsed,
@@ -1092,6 +1353,22 @@ def _run_mode_with_stats(mode: str, pool_models: list[str], dispatch, models_aft
                 fail_count=fail_count,
                 started=started,
             )
+
+
+def _call_with_task_env(task_code: str | None, fn):
+    """Run a pre-stats helper while exposing the validated task code to log writers."""
+    clean_task = normalize_task_code(task_code)
+    if not clean_task:
+        return fn()
+    old_task_env = os.environ.get("REVIEW_TASK_CODE")
+    os.environ["REVIEW_TASK_CODE"] = clean_task
+    try:
+        return fn()
+    finally:
+        if old_task_env is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task_env
 
 
 # Subcommands that run a PERSISTENT server until Ctrl-C (`review dashboard`,
@@ -1217,7 +1494,7 @@ class _Tee(io.TextIOBase):
 # (e.g. `review --just-ask --output` where `--output` is the question text, or a
 # `--prompt -o…`). This keeps the light pre-scan from stealing another flag's value.
 _VALUE_TAKING_OPTS = frozenset({
-    "-m", "--model", "-C", "--cwd", "-o", "--output", "--prompt", "--timeout",
+    "-m", "--model", "-C", "--cwd", "--task", "-o", "--output", "--prompt", "--timeout",
     "--pool", "--moderator", "--rounds", "--max-rounds",
     "--visual", "--before", "--intent", "--expect", "--check",
     "--vision-timeout", "--project",
@@ -1259,16 +1536,20 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
     out: Path | None = None
     rest: list[str] = []
     i = 0
+    value_for_previous = False
     while i < len(argv):
         tok = argv[i]
         if tok == "--":
             # End of options: keep `--` and everything after it untouched.
             rest.extend(argv[i:])
             break
-        # If the PREVIOUS token is a value-taking option (space form), THIS token is its
-        # value — pass it through, never read it as the output flag.
-        if i > 0 and argv[i - 1] in _VALUE_TAKING_OPTS:
+        # If the prior token we recognized as a value-taking option (space form), THIS
+        # token is its value — pass it through, never read it as the output flag. Track
+        # this as state, not by peeking at argv[i-1], because a *value* can itself equal
+        # another value-taking flag string (e.g. `--task --output -o out.md`).
+        if value_for_previous:
             rest.append(tok)
+            value_for_previous = False
             i += 1
             continue
         if tok in ("-o", "--output"):
@@ -1295,6 +1576,8 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
             i += 1
             continue
         rest.append(tok)
+        if tok in _VALUE_TAKING_OPTS:
+            value_for_previous = True
         i += 1
     return out, rest
 
@@ -1507,6 +1790,14 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
     )
     parser.add_argument("-C", "--cwd", default=".", help="repository directory")
     parser.add_argument(
+        "--task", metavar="CODE", default=None,
+        help=(
+            "task/issue code for this review iteration (required for recorded review "
+            "modes; standalone visual without diff is exempt; may also be supplied by "
+            "$REVIEW_TASK_CODE)"
+        ),
+    )
+    parser.add_argument(
         "-o", "--output", metavar="FILE", default=None,
         help=(
             "write the result to FILE via Python (creates parent dirs, overwrites) "
@@ -1551,7 +1842,7 @@ def _add_visual_options(parser: argparse.ArgumentParser, *, include_visual_flag:
     )
     group = parser.add_argument_group(group_title)
     if include_visual_flag:
-        group.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; rides text subcommands (e.g. `review brainstorm \"Q\" --visual IMAGE`; prefer `review visual IMAGE` for standalone)")
+        group.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; rides text subcommands (e.g. `review brainstorm \"Q\" --task CODE --visual IMAGE`; prefer `review visual IMAGE` for standalone)")
     group.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
     group.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
     group.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
@@ -1625,7 +1916,7 @@ _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
 # missing `review diff`.
 _BARE_SUBCOMMANDS: frozenset[str] = frozenset({
     "install-skill", "install-commit-hook", "dashboard", "sessions",
-    "trust-module", "register-module", "spec-web",
+    "task", "trust-module", "register-module", "spec-web",
 })
 
 
@@ -1652,7 +1943,8 @@ def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
             use_line = (
                 "  use:  review visual IMAGE [--diff] [options]\n"
                 if tok.split("=", 1)[0] == "--visual"
-                else "  use:  review diff [options]   (e.g. `review diff --staged`)\n"
+                else "  use:  review diff --task CODE [options]   "
+                     "(e.g. `review diff --staged --task CODE`)\n"
             )
             print(
                 "review: no subcommand given. The diff review is now `review diff` "
@@ -1751,6 +2043,7 @@ def _subcommand_epilog() -> str:
     ) + (
         "\n  dashboard   managed web dashboard over review-cli runs (run/start/status/stop/enable/disable)"
         "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
+        "\n  task        show review iterations and transcripts for one task code"
         "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
         "\n  install-skill / install-commit-hook / register-module"
         "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
@@ -1818,9 +2111,10 @@ def _reject_removed_flags(argv: list[str]) -> int | None:
         bare = tok.split("=", 1)[0]
         sub = REMOVED_MODE_FLAGS.get(bare)
         if sub is not None:
+            task_hint = " --task CODE" if sub in {"brainstorm", "just-ask", "quorum"} else ""
             print(
                 f"review: `{bare}` is no longer a flag — it is now the `{sub}` subcommand.\n"
-                f"  use:  review {sub} \"<your text>\" [options]\n"
+                f"  use:  review {sub} \"<your text>\"{task_hint} [options]\n"
                 f"  (modes are subcommands now: brainstorm / just-ask / quorum; "
                 f"run `review --help`)",
                 file=sys.stderr, flush=True,
@@ -1849,7 +2143,7 @@ def _reject_removed_subcommand(argv: list[str]) -> int | None:
         print(
             f"review: `review {argv[0]}` is no longer a subcommand — the diff review is "
             f"now `review {replacement}`.\n"
-            f"  use:  review {replacement} [options]\n"
+            f"  use:  review {replacement} --task CODE [options]\n"
             f"  (run `review --help` for all subcommands)",
             file=sys.stderr, flush=True,
         )
@@ -1936,6 +2230,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # mode, so it is wired here and stays off the main review argparse surface.
     if argv and argv[0] == "sessions":
         return _sessions_subcommand(argv[1:])
+    # `review task CODE` — task-scoped run-stat iterations + log transcripts.
+    if argv and argv[0] == "task":
+        return _task_subcommand(argv[1:])
     # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
     # install-skill) so they don't clutter the main review argparse surface. Project
     # modules load by default (trust-by-default); trust-module only pins under the
@@ -2040,6 +2337,32 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # would actually run in a real repo for THIS -C (it's diff-only outside a repo).
         return _show_board(config, args.pool, _effective_cwd(args.cwd))
 
+    piped_input = _read_stdin_if_piped()
+    task_code: str | None = None
+    requires_task_code = is_subcommand and (
+        mode.name != "visual"
+        or getattr(args, "diff", False)
+        or getattr(args, "staged", False)
+        or piped_input is not None
+    )
+    if requires_task_code:
+        raw_task = getattr(args, "task", None) or os.environ.get("REVIEW_TASK_CODE")
+        try:
+            task_code = normalize_task_code(raw_task)
+        except ValueError as exc:
+            print(f"[review-cli] invalid --task CODE: {exc}", file=sys.stderr, flush=True)
+            return 2
+        if task_code is None:
+            print(
+                "[review-cli] missing required --task CODE for review iteration history.\n"
+                "  use: review <mode> --task CODE ...\n"
+                "  or set REVIEW_TASK_CODE=CODE for automation.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        args.task = task_code
+
     # A bare `review` (or `review --flag …` with no verb / an unknown verb) reaches here
     # without a meta flag to serve: print the HELP/usage instead of silently running a diff
     # review. There are three shapes:
@@ -2056,21 +2379,21 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # pre-existing `-o` target with the help text / an empty buffer. SystemExit propagates
     # through the tee's `finally` with `completed=False`, so no write happens.
     if not is_subcommand:
-        piped_diff = (not rest) and (_read_stdin_if_piped() is not None)
+        piped_diff = (not rest) and (piped_input is not None)
         usage_error = bool(rest) or piped_diff
         parser.print_help(sys.stderr if usage_error else sys.stdout)
         if piped_diff:
             print(
                 "\nreview: a diff was piped in but no subcommand given. The diff review is "
                 "now `review diff` (a bare `review` no longer runs one). "
-                "Run `git diff | review diff`.",
+                "Run `git diff | review diff --task CODE`.",
                 file=sys.stderr, flush=True,
             )
             raise SystemExit(2)
         if rest:
             print(
                 "\nreview: no subcommand given. The diff review is now `review diff` "
-                "(a bare `review` no longer runs one). Run `review diff [options]`.",
+                "(a bare `review` no longer runs one). Run `review diff --task CODE [options]`.",
                 file=sys.stderr, flush=True,
             )
             raise SystemExit(2)
@@ -2178,7 +2501,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # (§3): a present diff → the diff-review companion, an absent diff → the standalone
     # pipeline — so we MUST still try to discover it, but a missing diff / non-repo must
     # degrade to standalone rather than abort.
-    diff = _read_stdin_if_piped()
+    diff = piped_input
     # A piped diff is NOT the git index, so it must not satisfy the staged commit gate
     # even under `--staged` (the stamp/marker mean "the staged index was reviewed", and
     # `printf ... | review --staged` reviews arbitrary stdin, not `git diff --cached`).
@@ -2325,15 +2648,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
             return rc
         # Stage 2: the image is delivered to a vision model (the per-mode fan-out) unless
         # --no-ai, and the grounded observation is folded into the mode prompt.
-        visual_ctx = build_mode_visual_context(
-            Path(args.visual).expanduser(),
-            before=Path(args.before).expanduser() if args.before else None,
-            expect=args.expect,
-            intent=args.intent,
-            models=[] if args.no_ai else visual_models,
-            requested_checks=list(args.check),
-            vision_timeout=args.vision_timeout,
-            require_vision=not args.no_ai,
+        visual_ctx = _call_with_task_env(
+            task_code,
+            lambda: build_mode_visual_context(
+                Path(args.visual).expanduser(),
+                before=Path(args.before).expanduser() if args.before else None,
+                expect=args.expect,
+                intent=args.intent,
+                models=[] if args.no_ai else visual_models,
+                requested_checks=list(args.check),
+                vision_timeout=args.vision_timeout,
+                require_vision=not args.no_ai,
+            ),
         )
         # The cvGate pre-filter BLOCKS the companion run on an unambiguously-broken
         # render (codex P2): a blank/unreadable/error-overlay image must short-circuit
@@ -2387,6 +2713,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return _run_mode_with_stats(
             mode.stats_mode, brainstorm_pool(models),
             lambda: mode.handler(ctx),
+            task_code=task_code,
         )
 
     if mode.name == "qa":
@@ -2400,12 +2727,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         qa_seat = [resolved_tester_backend(_split_models(args.model or []))]
         return _run_mode_with_stats(
             mode.stats_mode, qa_seat, lambda: mode.handler(ctx),
+            task_code=task_code,
         )
 
     if mode.name not in ("review", "visual"):
         # just-ask / quorum: a flat multi-model panel; pool_size == len(models).
         return _run_mode_with_stats(
             mode.stats_mode, models, lambda: mode.handler(ctx),
+            task_code=task_code,
         )
 
     # The review mode. Validate the board now if it wasn't already (the no-visual path);
@@ -2434,11 +2763,13 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return _run_mode_with_stats(
             mode.stats_mode, eta_models, lambda: mode.handler(ctx),
             models_after=_ran_models,
+            task_code=task_code,
         )
     # Flat review path (no board): ctx.extra has no "board" key, so the handler reads
     # board=None and takes the legacy flat call shape.
     return _run_mode_with_stats(
         mode.stats_mode, models, lambda: mode.handler(ctx),
+        task_code=task_code,
     )
 
 

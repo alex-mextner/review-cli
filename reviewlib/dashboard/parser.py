@@ -6,6 +6,7 @@ run is the per-CALL streamed log files (and the brainstorm discussion `.md`) tha
 
   per-call log : ``{UTCstamp}-{backend}-r{round}.log``
                  line 0 = ``[review-cli] {backend}: {argv0} (args redacted)``
+                          with optional `` task=CODE`` suffix
                  body   = streamed stdout, stderr lines prefixed ``[stderr] ``,
                  a timeout adds ``[review-cli] TIMEOUT after {N}s — partial output above]``
   brainstorm   : ``{UTCstamp}-brainstorm.md`` (topic + per-round persona transcript)
@@ -39,7 +40,9 @@ from pathlib import Path
 _CALL_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-(.+)-r(\d+)\.log$")
 # Brainstorm discussion md: 20260613T114552_999796Z-brainstorm.md
 _BRAINSTORM_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-brainstorm\.md$")
-_HEADER_RE = re.compile(r"^\[review-cli\] (?P<backend>.+?): (?P<argv0>.*?) \(args redacted\)\s*$")
+_HEADER_RE = re.compile(r"^\[review-cli\] (?P<backend>.+?): (?P<argv0>.*?) \(args redacted\)(?: task=(?P<task>\S+))?\s*$")
+_NO_TASK_RE = re.compile(r"^\[review-cli\] TASK\s*$")
+_WAITING_RE = re.compile(r"^\[review-cli\] .+?: waiting for a concurrency slot \(cap \d+\)\s*$")
 _TIMEOUT_RE = re.compile(r"^\[review-cli\] TIMEOUT after (?P<secs>\d+)s")
 # Explicit status footer written by every log writer (process._run_streamed and
 # backends' REST sidecar). This is the authoritative success/failure signal (finding 4).
@@ -162,6 +165,7 @@ class CallLog:
     # output legitimately contains those strings while describing the code it reviewed
     # (HYP-742 finding 4: that grep inflated the Errors panel and tanked the success rate).
     exit_code: int | None = None
+    task_code: str | None = None
 
     @property
     def duration_seconds(self) -> float | None:
@@ -271,6 +275,7 @@ class CallLog:
             "timed_out": self.timed_out,
             "timeout_secs": self.timeout_secs,
             "exit_code": self.exit_code,
+            "task_code": self.task_code,
             "completed": self.completed,
             "has_error": self.has_error,
             "error_summary": self.error_summary,
@@ -290,6 +295,7 @@ class BrainstormLog:
     moderator: str | None
     rounds: list[dict]  # [{round, personas: [{name, model, text}]}]
     body: str
+    task_code: str | None = None
     mtime: datetime | None = None
 
     def to_dict(self) -> dict:
@@ -299,6 +305,7 @@ class BrainstormLog:
             "topic": self.topic,
             "panel": self.panel,
             "moderator": self.moderator,
+            "task_code": self.task_code,
             "rounds": self.rounds,
             "body": self.body,
         }
@@ -344,6 +351,10 @@ def parse_call_log(path: Path) -> CallLog | None:
     timed_out = False
     timeout_secs: int | None = None
     exit_code: int | None = None
+    task_code: str | None = None
+    header_seen = False
+    pre_header = True
+    expect_legacy_empty_task_marker = False
     # The status footer is ALWAYS the final non-empty line the logger writes. Consume it
     # ONLY in that position — a model's review output can legitimately QUOTE an exact
     # `[review-cli] EXIT 1` line mid-body (e.g. while reviewing review-cli's own logs);
@@ -379,11 +390,22 @@ def parse_call_log(path: Path) -> CallLog | None:
     for i, line in enumerate(lines):
         if i == exit_line_idx:
             continue  # the authoritative trailing status footer — kept out of the body
-        if i == 0:
+        if pre_header and not header_seen:
             hm = _HEADER_RE.match(line)
             if hm:
                 # filename backend wins (header backend can be the same), but keep argv0.
                 argv0 = hm.group("argv0")
+                task_code = hm.group("task")
+                header_seen = True
+                pre_header = False
+                expect_legacy_empty_task_marker = True
+                continue
+            if _WAITING_RE.match(line):
+                continue
+            pre_header = False
+        if expect_legacy_empty_task_marker:
+            expect_legacy_empty_task_marker = False
+            if _NO_TASK_RE.match(line):
                 continue
         if i == timeout_line_idx:
             tm = _TIMEOUT_RE.match(line)
@@ -412,12 +434,14 @@ def parse_call_log(path: Path) -> CallLog | None:
         timed_out=timed_out,
         timeout_secs=timeout_secs,
         exit_code=exit_code,
+        task_code=task_code,
         size_bytes=size,
         mtime=mtime,
     )
 
 
 _BS_HEADER_RE = re.compile(r"panel=(?P<panel>[^ ]*) moderator=(?P<mod>[^ ]*)")
+_BS_TASK_RE = re.compile(r"\btask=(?P<task>\S+)")
 _BS_PERSONA_RE = re.compile(r"^#### (?P<name>.+?) \((?P<model>[^)]+)\)\s*$")
 # The EXACT dashboard section markers the brainstorm WRITER emits after a round's persona
 # blocks (modes/brainstorm.py): `## Moderator (round N)` and `# Final synthesis` (each on
@@ -441,6 +465,7 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
     topic = ""
     panel: list[str] = []
     moderator: str | None = None
+    task_code: str | None = None
     rounds: list[dict] = []
     cur_round: dict | None = None
     cur_persona: dict | None = None
@@ -457,6 +482,9 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
         if hm and not panel:
             panel = [p for p in hm.group("panel").split(",") if p]
             moderator = hm.group("mod") or None
+            tm = _BS_TASK_RE.search(line)
+            if tm:
+                task_code = tm.group("task")
             continue
         rm = re.match(r"^# Round (\d+)\s*$", line)
         if rm:
@@ -502,6 +530,7 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
         topic=topic,
         panel=panel,
         moderator=moderator,
+        task_code=task_code,
         rounds=rounds,
         body=raw,
         mtime=mtime,
@@ -518,6 +547,19 @@ class Session:
     ended: datetime
     calls: list[CallLog] = field(default_factory=list)
     brainstorm: BrainstormLog | None = None
+
+    @property
+    def task_code(self) -> str | None:
+        # Best-effort session clustering can only derive task identity from child artifacts:
+        # the brainstorm discussion header is authoritative when present; otherwise use the
+        # first call log carrying task metadata. A real invocation writes one task code to all
+        # calls, so mixed codes indicate manual/corrupt logs rather than a supported shape.
+        if self.brainstorm is not None and self.brainstorm.task_code:
+            return self.brainstorm.task_code
+        for call in self.calls:
+            if call.task_code:
+                return call.task_code
+        return None
 
     @property
     def models(self) -> list[str]:
@@ -653,6 +695,7 @@ class Session:
             "ended": self.ended.isoformat(),
             "duration_seconds": self.duration_seconds,
             "mode": self.mode,
+            "task_code": self.task_code,
             "models": self.models,
             "call_count": len(self.calls),
             "error_count": len(self.errors),
@@ -709,7 +752,8 @@ def cluster_sessions(
         # Gap is measured from the prior call's END (last write), not its start, so a
         # single invocation whose individual call runs longer than `gap` is not split
         # into multiple sessions. `cur.ended` therefore tracks the max call end-time.
-        if cur is None or (call.started - cur.ended).total_seconds() > gap_seconds:
+        same_task = cur is not None and (cur.task_code or "") == (call.task_code or "")
+        if cur is None or not same_task or (call.started - cur.ended).total_seconds() > gap_seconds:
             cur = Session(
                 session_id=_session_id_for(call.started),
                 started=call.started,
@@ -977,6 +1021,8 @@ def compute_stats(sessions: list[Session]) -> dict:
     by_mode: dict[str, int] = {}
     by_model: dict[str, int] = {}
     by_role: dict[str, int] = {}
+    by_task: dict[str, int] = {}
+    task_groups: dict[str, dict] = {}
     by_day: dict[str, int] = {}
     durations: list[float] = []
     call_total = 0
@@ -987,8 +1033,28 @@ def compute_stats(sessions: list[Session]) -> dict:
     for s in sessions:
         by_mode[s.mode] = by_mode.get(s.mode, 0) + 1
         by_day[s.started.date().isoformat()] = by_day.get(s.started.date().isoformat(), 0) + 1
+        if s.task_code:
+            by_task[s.task_code] = by_task.get(s.task_code, 0) + 1
+            group = task_groups.setdefault(
+                s.task_code,
+                {
+                    "task_code": s.task_code,
+                    "iterations": 0,
+                    "models": [],
+                    "modes": set(),
+                    "session_ids": [],
+                    "last_started": None,
+                },
+            )
+            group["iterations"] += 1
+            group["session_ids"].append(s.session_id)
+            if group["last_started"] is None or s.started.isoformat() > group["last_started"]:
+                group["last_started"] = s.started.isoformat()
+            group["modes"].add(s.mode)
         for m in s.models:
             by_model[m] = by_model.get(m, 0) + 1
+            if s.task_code and m not in task_groups[s.task_code]["models"]:
+                task_groups[s.task_code]["models"].append(m)
         for role in s.roles():
             by_role[role["role"]] = by_role.get(role["role"], 0) + role["count"]
         for c in s.calls:
@@ -1014,6 +1080,13 @@ def compute_stats(sessions: list[Session]) -> dict:
         idx = min(len(durations) - 1, int(p * len(durations)))
         return round(durations[idx], 3)
 
+    tasks = []
+    for group in task_groups.values():
+        item = dict(group)
+        item["modes"] = sorted(item["modes"])
+        tasks.append(item)
+    tasks.sort(key=lambda item: item.get("last_started") or "", reverse=True)
+
     return {
         "session_count": len(sessions),
         "call_count": call_total,
@@ -1027,6 +1100,8 @@ def compute_stats(sessions: list[Session]) -> dict:
         "by_mode": by_mode,
         "by_model": by_model,
         "by_role": by_role,
+        "by_task": by_task,
+        "tasks": tasks,
         "by_day": dict(sorted(by_day.items())),
         "duration_seconds": {
             "count": len(durations),

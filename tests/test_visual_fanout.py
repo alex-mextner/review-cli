@@ -19,6 +19,7 @@ Proves (mocking call_ai_vision):
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -117,7 +118,7 @@ def test_brainstorm_personas_see_grounded_observation():
     old_bs = _brainstorm_mod.mode_brainstorm
     _brainstorm_mod.mode_brainstorm = fake_brainstorm
     try:
-        rc = cli.main(["brainstorm", "is the layout good", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["brainstorm", "is the layout good", "--task", "TEST-1", "--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
         _brainstorm_mod.mode_brainstorm = old_bs
         _restore(*old)
@@ -141,12 +142,46 @@ def test_quorum_voters_see_grounded_observation():
     old_q = _quorum_mod.mode_quorum
     _quorum_mod.mode_quorum = fake_quorum
     try:
-        rc = cli.main(["quorum", "is it centered?", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc = cli.main(["quorum", "is it centered?", "--task", "TEST-1", "--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
         _quorum_mod.mode_quorum = old_q
         _restore(*old)
     assert rc == 0
     assert "GROUNDED-SIGHT: button is centered" in captured["question"]
+
+
+def test_companion_vision_call_sees_cli_task_env():
+    """Vision fan-out runs before stats wrapping, but its logs still need --task metadata."""
+    cap: dict = {}
+
+    def fake_call(model, **kwargs):
+        cap["task_env"] = os.environ.get("REVIEW_TASK_CODE")
+        return VisionVerdict(available=True, verdict="keep", confidence=0.9, note="ok")
+
+    def fake_just_ask(question, *a, **k):
+        cap["question"] = question
+        return 0
+
+    old_call = cmp.call_ai_vision
+    old_select = cmp.select_vision_backend
+    old_ask = _just_ask_mod.mode_just_ask
+    old_task = os.environ.pop("REVIEW_TASK_CODE", None)
+    cmp.call_ai_vision = fake_call
+    cmp.select_vision_backend = lambda models: "gemini"
+    _just_ask_mod.mode_just_ask = fake_just_ask
+    try:
+        rc = cli.main(["just-ask", "describe", "--task", "TEST-1", "--visual", _styled(), "-C", str(REPO_ROOT)])
+    finally:
+        cmp.call_ai_vision = old_call
+        cmp.select_vision_backend = old_select
+        _just_ask_mod.mode_just_ask = old_ask
+        if old_task is not None:
+            os.environ["REVIEW_TASK_CODE"] = old_task
+        else:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+    assert rc == 0
+    assert cap["task_env"] == "TEST-1"
+    assert "ATTACHED RENDER" in cap["question"]
 
 
 def test_fanout_can_be_explicitly_cv_only_when_no_vision_backend():
@@ -259,8 +294,8 @@ def test_companion_invalid_vision_blocks_the_mode():
     old_ja = _just_ask_mod.mode_just_ask
     _just_ask_mod.mode_just_ask = fake_just_ask
     try:
-        rc_strict = cli.main(["just-ask", "describe", "--visual", _styled(), "--strict", "-C", str(REPO_ROOT)])
-        rc_advisory = cli.main(["just-ask", "describe", "--visual", _styled(), "-C", str(REPO_ROOT)])
+        rc_strict = cli.main(["just-ask", "describe", "--task", "TEST-1", "--visual", _styled(), "--strict", "-C", str(REPO_ROOT)])
+        rc_advisory = cli.main(["just-ask", "describe", "--task", "TEST-1", "--visual", _styled(), "-C", str(REPO_ROOT)])
     finally:
         _just_ask_mod.mode_just_ask = old_ja
         _restore(*old)
@@ -287,7 +322,7 @@ def test_companion_panel_job_receives_raw_visual_image():
     _just_ask_mod.run_panel = fake_run_panel
     image = Path(_styled())
     try:
-        rc = cli.main(["just-ask", "describe", "--visual", str(image), "-C", str(REPO_ROOT)])
+        rc = cli.main(["just-ask", "describe", "--task", "TEST-1", "--visual", str(image), "-C", str(REPO_ROOT)])
     finally:
         _just_ask_mod.run_panel = old_panel
         _restore(*old)

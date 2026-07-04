@@ -44,7 +44,9 @@ def _run(argv: list[str]) -> tuple[int, str, str]:
     """Run `cli.main(argv)` offline and capture (rc, stdout, stderr). A non-repo env file
     keeps any stray config/key read inert; the qa gate never reaches a backend anyway."""
     old_env = os.environ.get("GEMINI_ENV_FILE")
+    old_task = os.environ.get("REVIEW_TASK_CODE")
     os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+    os.environ["REVIEW_TASK_CODE"] = "TEST-1"
     out, err = io.StringIO(), io.StringIO()
     try:
         with redirect_stdout(out), redirect_stderr(err):
@@ -57,6 +59,10 @@ def _run(argv: list[str]) -> tuple[int, str, str]:
             os.environ.pop("GEMINI_ENV_FILE", None)
         else:
             os.environ["GEMINI_ENV_FILE"] = old_env
+        if old_task is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task
     return rc, out.getvalue(), err.getvalue()
 
 

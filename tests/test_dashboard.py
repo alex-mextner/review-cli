@@ -39,21 +39,32 @@ def _write_call_log(
     *,
     argv0: str = "/usr/bin/fake",
     exit_code: int | None = None,
+    task_code: str | None = None,
 ) -> Path:
     name = f"{stamp}Z-{backend}-r{round_no}.log"
     p = log_dir / name
-    header = f"[review-cli] {backend}: {argv0} (args redacted)\n"
+    task = f" task={task_code}" if task_code else ""
+    header = f"[review-cli] {backend}: {argv0} (args redacted){task}\n"
     footer = f"[review-cli] EXIT {exit_code}\n" if exit_code is not None else ""
     p.write_text(header + body + footer, encoding="utf-8")
     return p
 
 
-def _write_brainstorm(log_dir: Path, stamp: str, topic: str, panel: str, moderator: str) -> Path:
+def _write_brainstorm(
+    log_dir: Path,
+    stamp: str,
+    topic: str,
+    panel: str,
+    moderator: str,
+    *,
+    task_code: str | None = None,
+) -> Path:
     name = f"{stamp}Z-brainstorm.md"
     p = log_dir / name
+    task = f" task={task_code}" if task_code else ""
     content = (
         f"# Brainstorm: {topic}\n\n"
-        f"panel={panel} moderator={moderator} rounds>=5 max=5\n\n"
+        f"panel={panel} moderator={moderator} rounds>=5 max=5{task}\n\n"
         "# Round 1\n"
         "#### Pragmatic staff engineer (codex)\n"
         "Keep it simple.\n\n"
@@ -115,6 +126,63 @@ def test_parse_call_log_basic():
         assert c.has_error is False
 
 
+def test_parse_call_log_task_code_and_dashboard_task_stats():
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "first\n",
+                        exit_code=0, task_code="HYP-742")
+        _write_call_log(ld, "20260601T103000_000000", "gemini", 0, "second\n",
+                        exit_code=0, task_code="HYP-742")
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        assert len(sessions) == 2
+        assert all(s.task_code == "HYP-742" for s in sessions)
+        detail = sessions[0].to_detail()
+        assert detail["task_code"] == "HYP-742"
+        stats = p.compute_stats(sessions)
+        assert stats["by_task"] == {"HYP-742": 2}
+        assert stats["tasks"][0]["task_code"] == "HYP-742"
+        assert stats["tasks"][0]["iterations"] == 2
+        assert sorted(stats["tasks"][0]["models"]) == ["codex", "gemini"]
+
+
+def test_parse_call_log_task_code_is_only_trusted_header_metadata():
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0,
+            "real transcript line\n[review-cli] TASK SPOOFED\nstill body\n",
+            exit_code=0, task_code="HYP-742",
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert c.task_code == "HYP-742"
+        assert "[review-cli] TASK SPOOFED" in c.body
+
+
+def test_parse_call_log_understands_explicit_no_task_marker():
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = ld / "20260601T100000_000000Z-codex-r0.log"
+        path.write_text(
+            "[review-cli] codex: codex (args redacted)\n"
+            "[review-cli] TASK\n"
+            "[review-cli] TASK SPOOFED\n"
+            "body\n"
+            "[review-cli] EXIT 0\n",
+            encoding="utf-8",
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert c.task_code is None
+        assert "[review-cli] TASK SPOOFED" in c.body
+
+
 def test_parse_call_log_timeout_and_stderr():
     from reviewlib.dashboard import parser as p
 
@@ -137,6 +205,16 @@ def test_parse_call_log_rejects_bad_name():
         bad = Path(d) / "not-a-review-log.txt"
         bad.write_text("x")
         assert p.parse_call_log(bad) is None
+
+
+def test_task_badge_css_truncates_long_codes():
+    css = (REPO_ROOT / "reviewlib/dashboard/assets/app.css").read_text(encoding="utf-8")
+    start = css.index(".badge.ticket[data-task]")
+    rule = css[start:css.index("}", start)]
+    assert "max-width" in rule
+    assert "overflow: hidden" in rule
+    assert "text-overflow: ellipsis" in rule
+    assert "white-space: nowrap" in rule
 
 
 def test_parse_brainstorm_personas_not_polluted_by_model_headings():
@@ -1933,12 +2011,13 @@ def test_orphan_brainstorm_keeps_model_attribution_from_markdown():
         ld = Path(d)
         # Only the brainstorm md — no per-call -r{n}.log files (they aged out).
         _write_brainstorm(ld, "20260601T120000_000000", "How to shard the cache",
-                          panel="codex,gemini", moderator="codex")
+                          panel="codex,gemini", moderator="codex", task_code="HYP-742")
         sessions = p.load_sessions(ld)
         assert len(sessions) == 1, sessions
         s = sessions[0]
         assert s.calls == [], "the orphan session has no per-call logs"
         assert s.brainstorm is not None
+        assert s.task_code == "HYP-742"
         assert s.models == ["codex", "gemini"], s.models
         # And the by_model stats reflect the panel even with no calls.
         stats = p.compute_stats(sessions)
@@ -2488,6 +2567,25 @@ def test_cluster_uses_call_end_time_not_start():
     c = p.CallLog("", "c.log", t0 + timedelta(seconds=400), "codex", 0, "", "", mtime=t0 + timedelta(seconds=402))
     sessions2 = p.cluster_sessions([a, b, c], [], gap_seconds=90)
     assert len(sessions2) == 2
+
+
+def test_cluster_splits_adjacent_different_task_codes():
+    """Two task-coded invocations can be adjacent in time but must stay separate."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, "task one\n",
+            exit_code=0, task_code="HYP-1",
+        )
+        _write_call_log(
+            ld, "20260601T100030_000000", "gemini", 0, "task two\n",
+            exit_code=0, task_code="HYP-2",
+        )
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        assert sorted(s.task_code for s in sessions) == ["HYP-1", "HYP-2"]
+        assert sorted(len(s.calls) for s in sessions) == [1, 1]
 
 
 def test_brainstorm_session_id_is_stable_after_logs_age_out():

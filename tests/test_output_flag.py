@@ -162,6 +162,14 @@ def test_extract_does_not_steal_retry_value():
     assert rest == ["--retry", "3"], rest
 
 
+def test_extract_does_not_steal_task_value():
+    # `--task CODE` is global and CODE is intentionally one opaque token. The pre-scan
+    # must not steal a valid task code just because it happens to look like --output/-o.
+    out, rest = _extract_output_path(["diff", "--task", "--output", "-o", "out.md"])
+    assert out == Path("out.md"), out
+    assert rest == ["diff", "--task", "--output"], rest
+
+
 def test_extract_absent_returns_none_and_unchanged():
     out, rest = _extract_output_path(["--show-board", "-m", "codex"])
     assert out is None, out
@@ -243,7 +251,7 @@ def test_file_written_even_on_nonzero_review_exit():
         repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
         target = Path(d) / "out.md"
-        rc, _ = _run_main(["diff", "-C", str(repo), "-o", str(target)])
+        rc, _ = _run_main(["diff", "--task", "TEST-1", "-C", str(repo), "-o", str(target)])
         # No diff -> non-zero exit, but the file exists (empty result is fine).
         assert rc != 0, rc
         assert target.is_file(), target
@@ -285,7 +293,7 @@ def test_real_review_result_text_lands_in_file():
         try:
             target = Path(d) / "out.md"
             rc, printed = _run_main(
-                ["diff", "-C", str(repo), "--staged", "-m", "codex", "-o", str(target)],
+                ["diff", "--task", "TEST-1", "-C", str(repo), "--staged", "-m", "codex", "-o", str(target)],
             )
             body = target.read_text(encoding="utf-8")
             assert sentinel in body, body          # the verdict reached the file

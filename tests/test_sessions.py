@@ -149,6 +149,19 @@ def test_parse_completed_log():
     assert sess.rounds[2].moderator_stop is True
 
 
+def test_parse_log_reads_task_code_from_metadata():
+    import reviewlib.sessions as S
+
+    d = _fresh_log_dir()
+    body = _COMPLETED_LOG.replace(
+        "panel=codex,gemini moderator=opus rounds>=5 max=8",
+        "panel=codex,gemini moderator=opus rounds>=5 max=8 task=HYP-742",
+    )
+    p = _write_log(d, "20260616T013310_280992Z", body)
+    sess = S.parse_log(p)
+    assert sess.task_code == "HYP-742"
+
+
 def test_parse_interrupted_and_empty_round_log():
     import reviewlib.sessions as S
 
@@ -820,6 +833,53 @@ def test_resume_at_cap_only_synthesizes_no_extra_round():
     # No new persona round ran (the loop was empty); resume went straight to synthesis.
     assert seen_rounds == [], f"expected no extra round, got {seen_rounds}"
     assert S.parse_log(p).completed is True
+
+
+def test_resume_restores_saved_task_code_for_backend_dispatch():
+    """A resumed brainstorm must keep the original task in per-call backend logs."""
+    import reviewlib.modes.brainstorm as bs
+    import reviewlib.sessions as S
+    from reviewlib.backends import ReviewResult
+
+    d = _fresh_log_dir()
+    rounds = "".join(
+        f"# Round {n}\n#### codex\nidea {n}\n\n## Moderator (round {n})\nok\nDECISION: CONTINUE\n"
+        for n in range(1, 5)
+    )
+    body = f"# Brainstorm: taskful resume\n\npanel=codex moderator=opus rounds>=5 max=5 task=HYP-742\n{rounds}"
+    p = _write_log(d, "20260616T071000_000006Z", body)
+    sess = S.parse_log(p)
+    assert sess.task_code == "HYP-742"
+
+    seen_task_env: list[str | None] = []
+    old_panel, old_mod = bs.run_panel, bs.run_moderator
+    old_task = os.environ.get("REVIEW_TASK_CODE")
+    os.environ["REVIEW_TASK_CODE"] = "OTHER-999"
+    try:
+        def _fake_panel(jobs, cwd, timeout):
+            seen_task_env.append(os.environ.get("REVIEW_TASK_CODE"))
+            return [ReviewResult(model=j.model, command="f", returncode=0,
+                                 stdout="idea", stderr="") for j in jobs]
+
+        def _fake_mod(candidates, prompt, cwd, timeout, diff="", round_no=0):
+            seen_task_env.append(os.environ.get("REVIEW_TASK_CODE"))
+            return ReviewResult(model="opus", command="f", returncode=0,
+                                stdout="s\nDECISION: STOP", stderr="")
+
+        bs.run_panel = _fake_panel
+        bs.run_moderator = _fake_mod
+        rc = S.resume_session(sess, models=["codex"], cwd=Path("."), timeout=1,
+                              moderators=["opus"])
+        assert rc == 0, rc
+    finally:
+        bs.run_panel, bs.run_moderator = old_panel, old_mod
+        if old_task is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task
+
+    assert seen_task_env and set(seen_task_env) == {"HYP-742"}, seen_task_env
+    assert os.environ.get("REVIEW_TASK_CODE") == old_task
 
 
 def test_cli_sessions_list_and_resume_wiring():

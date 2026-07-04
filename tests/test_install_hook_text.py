@@ -2,11 +2,12 @@
 """The installed pre-commit hook must tell blocked users the CURRENT review command.
 
 When the diff review moved from a bare `review` / `review --staged` to the `review diff`
-subcommand, the pre-commit gate's "how to fix" text had to move with it: a user blocked by
-the gate is told `run: review diff --staged`. The OLD `review --staged` text would itself
-hit the "no subcommand given" migration error and never satisfy the gate (codex P2), so
-this pins the hook body to the new command. Pure string assertions on the `_PRECOMMIT`
-template — no global hook is installed.
+subcommand, and later gained a required task code, the pre-commit gate's "how to fix" text
+had to move with it: a user blocked by the gate is told
+`run: review diff --staged --task TASK-CODE`. The OLD `review --staged` text would itself
+hit the "no subcommand given" migration error, and `review diff --staged` would now fail the
+missing-task gate, so this pins the hook body to the current command. Pure string assertions
+on the `_PRECOMMIT` template — no global hook is installed.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from reviewlib.install import _PRECOMMIT  # noqa: E402
 
 
 def test_precommit_hook_tells_user_to_run_review_diff_staged():
-    assert "review diff --staged" in _PRECOMMIT, _PRECOMMIT
+    assert "review diff --staged --task TASK-CODE" in _PRECOMMIT, _PRECOMMIT
     # The bare `review --staged` (no subcommand) is GONE from the hint — it would now hit
     # the "no subcommand" migration error instead of satisfying the gate.
     assert "review --staged" not in _PRECOMMIT, _PRECOMMIT

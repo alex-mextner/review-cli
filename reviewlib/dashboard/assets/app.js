@@ -18,6 +18,7 @@ const state = {
   gap: 90,
   filterModel: null, // when set, session lists show only runs that used this model
   filterRole: null, // when set, session lists show only brainstorm runs with this persona
+  filterTask: null, // when set, session lists show only runs for this task code
 };
 
 // ---- model identity --------------------------------------------------------
@@ -284,6 +285,11 @@ function roleChip(name) {
   const active = state.filterRole && state.filterRole === String(name);
   return `<button type="button" class="role-chip${active ? ' is-active' : ''}" data-role="${esc(name)}" title="filter brainstorm sessions with the ${esc(name)} lens">${esc(name)}</button>`;
 }
+function taskChip(code) {
+  if (!code) return '';
+  const active = state.filterTask && state.filterTask === String(code);
+  return `<button type="button" class="badge ticket${active ? ' is-active' : ''}" data-task="${esc(code)}" title="filter review iterations for task ${esc(code)}">${esc(code)}</button>`;
+}
 
 // ---- data loading ----------------------------------------------------------
 async function loadAll() {
@@ -343,6 +349,7 @@ function filteredRuns(runs) {
     out = out.filter((r) => (r.models || []).some((m) => String(m) === want || resolveModel(m).key === resolveModel(want).key));
   }
   if (state.filterRole) out = out.filter((r) => r.mode === 'brainstorm' || r.topic);
+  if (state.filterTask) out = out.filter((r) => String(r.task_code || '') === state.filterTask);
   return out;
 }
 // The active-filter banner shown atop a filtered list. Clear buttons reset the filter.
@@ -359,6 +366,9 @@ function filterBar() {
     // runs (where the lens applies) and the chosen persona is highlighted once a session opens —
     // it does NOT claim a precise per-lens row match the data can't back.
     bits.push(`<span class="filter-pill" title="${esc(state.filterRole)} appears in brainstorm sessions — open one to see its turns">brainstorm runs <span class="muted">(${esc(state.filterRole)})</span> <button class="filter-x" data-clear="role" aria-label="clear lens filter">×</button></span>`);
+  }
+  if (state.filterTask) {
+    bits.push(`<span class="filter-pill">${esc(state.filterTask)} <button class="filter-x" data-clear="task" aria-label="clear task filter">×</button></span>`);
   }
   if (!bits.length) return '';
   return `<div class="filterbar"><span class="muted">filtered by</span> ${bits.join(' ')} <button class="btn small" data-clear="all">clear all</button></div>`;
@@ -400,7 +410,7 @@ PANELS.overview = () => {
     ? `<div class="list">${runs.slice(0, 12).map(runRow).join('')}</div>`
     : emptyState(
         'sessions',
-        'Run <code>review diff</code> / <code>review quorum</code> / <code>review brainstorm</code> and the per-call logs will appear here.',
+        'Run <code>review diff --task CODE</code> / <code>review quorum "Q" --task CODE</code> / <code>review brainstorm "TOPIC" --task CODE</code> and the per-call logs will appear here.',
       );
   html += `</div>`;
   return html;
@@ -418,6 +428,7 @@ function runRow(r) {
   const linkBadges = [
     ((r.links && r.links.prs) || []).map((p) => `<span class="badge pr">PR ${esc(p)}</span>`).join(''),
     ((r.links && r.links.tickets) || []).map((t) => `<span class="badge ticket">${esc(t)}</span>`).join(''),
+    r.task_code ? taskChip(r.task_code) : '',
   ].join('');
   const consc = r.conscious ? `<span class="badge conscious">★ conscious</span>` : '';
   const body = sessionRequest(r);
@@ -469,6 +480,8 @@ PANELS.stats = () => {
   let html = `<div class="panel-head"><h2>Stats</h2><p class="sub">Runs over time and counts by mode/model/role. Click a model bar to filter the board.</p></div>`;
   html += `<div class="section"><h3>Sessions per day</h3>${barChart(s.by_day)}</div>`;
   html += `<div class="section"><h3>By mode</h3>${barChart(s.by_mode)}</div>`;
+  if (s.by_task && Object.keys(s.by_task).length)
+    html += `<div class="section"><h3>By task</h3>${barChart(s.by_task, { task: true })}</div>`;
   html += `<div class="section"><h3>By model</h3>${barChart(s.by_model, { model: true })}</div>`;
   if (s.by_role && Object.keys(s.by_role).length)
     html += `<div class="section"><h3>By role / persona</h3>${barChart(s.by_role, { role: true })}</div>`;
@@ -691,16 +704,36 @@ PANELS.errors = () => {
 
 PANELS.tasks = () => {
   const runs = filteredRuns(state.runs || []);
+  const s = state.stats || {};
+  const taskGroups = state.filterTask
+    ? (s.tasks || []).filter((t) => String(t.task_code || '') === state.filterTask)
+    : (s.tasks || []);
   const conscious = runs.filter((r) => r.conscious);
-  let html = `<div class="panel-head"><h2>Tasks</h2><p class="sub">Mark a session as <strong>conscious</strong> (deliberately reviewed / acted on). Conscious-marked sessions are surfaced first.</p></div>`;
+  let html = `<div class="panel-head"><h2>Tasks</h2><p class="sub">Task-coded review history: iterations, model pools, and transcript links.</p></div>`;
   html += filterBar();
-  html += `<div class="section"><h3>Conscious sessions (${conscious.length})</h3>`;
+  html += `<div class="section"><h3>Review tasks (${taskGroups.length})</h3>`;
+  html += taskGroups.length
+    ? `<div class="list">${taskGroups.map((t) => taskGroupRow(t, runs)).join('')}</div>`
+    : emptyState('task-coded reviews', 'Run a review mode with <code>--task CODE</code>.');
+  html += `</div><div class="section"><h3>Conscious sessions (${conscious.length})</h3>`;
   html += conscious.length
     ? `<div class="list">${conscious.map(taskRow).join('')}</div>`
     : emptyState('conscious sessions', 'Toggle “mark conscious” on any session below.');
   html += `</div><div class="section"><h3>All sessions</h3><div class="list">${runs.map(taskRow).join('')}</div></div>`;
   return html;
 };
+
+function taskGroupRow(t, runs = state.runs || []) {
+  const related = runs.filter((r) => r.task_code === t.task_code).sort((a, b) => String(b.started).localeCompare(String(a.started)));
+  return `<div class="run mode-review">
+    <div class="run-top">
+      <div class="run-badges">${taskChip(t.task_code)}<span class="badge">${esc(t.iterations)} iteration${t.iterations === 1 ? '' : 's'}</span></div>
+      <span class="run-time">${fmtTime(t.last_started)}</span>
+    </div>
+    <div class="run-mid">${seatChips(t.models)}<span class="run-meta">${esc((t.modes || []).join(', ') || 'review')}</span></div>
+    ${related.length ? `<div class="list task-iterations">${related.slice(0, 4).map(runRow).join('')}</div>` : ''}
+  </div>`;
+}
 
 function taskRow(r) {
   return `<div class="run mode-${esc(r.mode)}">
@@ -778,6 +811,7 @@ function barChart(obj, opts) {
       let key;
       if (opts && opts.model) key = seatChip(k, { small: true });
       else if (opts && opts.role) key = roleChip(k);
+      else if (opts && opts.task) key = taskChip(k);
       else key = `<span class="bar-key-txt" title="${esc(k)}">${esc(k)}</span>`;
       return `<div class="bar-row"><div class="k">${key}</div>
       <div class="bar-track"><div class="bar-fill" style="width:${((v / max) * 100).toFixed(1)}%"></div></div>
@@ -839,7 +873,7 @@ function focusCall(d, filename) {
 function renderDetail(d) {
   let html = `<div class="detail-back"><button class="btn" id="back">← back to sessions</button></div>`;
   html += `<div class="panel-head detail-hero mode-${esc(d.mode)}">
-    <div class="detail-title">${modeBadge(d.mode)}<h2>session</h2>${d.conscious ? `<span class="badge conscious">★ conscious</span>` : ''}</div>
+    <div class="detail-title">${modeBadge(d.mode)}<h2>session</h2>${d.task_code ? taskChip(d.task_code) : ''}${d.conscious ? `<span class="badge conscious">★ conscious</span>` : ''}</div>
     <p class="sub">${fmtTime(d.started)} → ${fmtTime(d.ended)} · ${fmtDur(d.duration_seconds)}</p>
     <div class="run-mid">${seatChips(d.models)}</div>
   </div>`;
@@ -1144,7 +1178,21 @@ function wireChips() {
       const what = el.dataset.clear;
       if (what === 'model' || what === 'all') state.filterModel = null;
       if (what === 'role' || what === 'all') state.filterRole = null;
+      if (what === 'task' || what === 'all') state.filterTask = null;
       render();
+    };
+  });
+  document.querySelectorAll('[data-task]').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const t = el.dataset.task;
+      state.filterTask = state.filterTask === t ? null : t;
+      state.detail = null;
+      if (state.panel !== 'tasks' && state.panel !== 'overview' && state.panel !== 'chat') {
+        navigate('tasks');
+      } else {
+        render();
+      }
     };
   });
 }
@@ -1168,6 +1216,7 @@ function render() {
         e.target.closest('[data-conscious]') ||
         e.target.closest('[data-model]') ||
         e.target.closest('[data-role]') ||
+        e.target.closest('[data-task]') ||
         e.target.closest('[data-manual]')
       )
         return;
@@ -1251,5 +1300,5 @@ document.addEventListener('DOMContentLoaded', boot);
 // are harmless no-ops. Keeping the export here (not a separate module) means the tests
 // exercise the EXACT code the browser runs — no copy that can drift.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { resolveModel, filteredRuns, monogram, cap, state };
+  module.exports = { resolveModel, filteredRuns, monogram, cap, state, PANELS };
 }

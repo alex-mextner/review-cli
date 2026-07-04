@@ -18,7 +18,9 @@ by the __main__ block; backends/panel funcs are stubbed by reassigning module gl
 """
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -132,6 +134,36 @@ def test_brainstorm_diff_default_is_empty_backward_compatible():
         assert "ABOUT this change" not in job.prompt
 
 
+def test_brainstorm_discussion_log_records_task_code():
+    """The persisted brainstorm md must carry task=... so task history survives after
+    per-call logs age out."""
+    old_log = os.environ.get("REVIEW_LOG_DIR")
+    old_task = os.environ.get("REVIEW_TASK_CODE")
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["REVIEW_LOG_DIR"] = d
+        os.environ["REVIEW_TASK_CODE"] = "HYP-742"
+        cap = _Capture()
+        try:
+            with cap:
+                rc = bs.mode_brainstorm(
+                    "topic", ["codex"], REPO_ROOT, 5, ["mod"], rounds=1, max_rounds=1,
+                )
+            assert rc == 0, rc
+            logs = list(Path(d).glob("*-brainstorm.md"))
+            assert len(logs) == 1, logs
+            text = logs[0].read_text(encoding="utf-8")
+            assert "task=HYP-742" in text
+        finally:
+            if old_log is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = old_log
+            if old_task is None:
+                os.environ.pop("REVIEW_TASK_CODE", None)
+            else:
+                os.environ["REVIEW_TASK_CODE"] = old_task
+
+
 # === run_moderator signature pin: the real callee MUST accept diff= ===============
 def test_run_moderator_accepts_diff_kwarg():
     """The grounded brainstorm calls run_moderator(..., diff=diff, ...). The persona/
@@ -200,12 +232,14 @@ def _capture_cli_brainstorm_diff(argv: list[str], *, stdin_text: str | None,
     old_git = cli._git_diff
     old_load_config = cli.load_config
     old_env = os.environ.get("GEMINI_ENV_FILE")
+    old_task = os.environ.get("REVIEW_TASK_CODE")
     brainstorm_mod.mode_brainstorm = _fake_brainstorm
     cli._git_diff = _wrapped_git_diff
     cli.load_config = lambda: {}  # no config models, deterministic
     old_stdin = sys.stdin
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        os.environ["REVIEW_TASK_CODE"] = "TEST-1"
         if stdin_text is None:
             class _Tty(io.StringIO):
                 def isatty(self):
@@ -225,6 +259,10 @@ def _capture_cli_brainstorm_diff(argv: list[str], *, stdin_text: str | None,
             os.environ.pop("GEMINI_ENV_FILE", None)
         else:
             os.environ["GEMINI_ENV_FILE"] = old_env
+        if old_task is None:
+            os.environ.pop("REVIEW_TASK_CODE", None)
+        else:
+            os.environ["REVIEW_TASK_CODE"] = old_task
     return captured
 
 
@@ -337,7 +375,7 @@ def test_cli_default_review_staged_nonrepo_fails_gracefully():
         raised = False
         rc = None
         try:
-            rc = cli.main(["diff", "--staged", "-C", str(REPO_ROOT)])
+            rc = cli.main(["diff", "--task", "TEST-1", "--staged", "-C", str(REPO_ROOT)])
         except RuntimeError:
             raised = True  # the OLD bug: a raw traceback. The graceful path must NOT do this.
         assert not raised, "default --staged review must FAIL GRACEFULLY, not raise a traceback"

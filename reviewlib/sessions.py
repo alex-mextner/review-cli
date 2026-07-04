@@ -75,6 +75,7 @@ INVARIANTS
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -113,6 +114,7 @@ class Session:
     rounds: list[RoundBlock] = field(default_factory=list)
     completed: bool = False  # True iff a Final synthesis block exists
     timestamp: datetime | None = None
+    task_code: str | None = None
 
     @property
     def completed_rounds(self) -> int:
@@ -173,6 +175,7 @@ def _parse_timestamp(path: Path) -> datetime | None:
 
 _META_RE = re.compile(
     r"panel=(?P<panel>\S*)\s+moderator=(?P<mod>\S*)\s+rounds>=(?P<min>\d+)\s+max=(?P<max>\d+)"
+    r"(?:\s+task=(?P<task>\S+))?"
 )
 
 # UNFORGEABLE structural sentinels the WRITER (modes/brainstorm.py) emits on their own line
@@ -204,6 +207,7 @@ def parse_log(path: Path) -> Session:
     min_rounds = 0
     max_rounds = 0
     completed = False
+    task_code: str | None = None
 
     # Header: `# Brainstorm: <topic>` then a `panel=… moderator=… rounds>=N max=M` line.
     for line in lines[:8]:
@@ -216,6 +220,7 @@ def parse_log(path: Path) -> Session:
                 moderator = mm.group("mod")
                 min_rounds = int(mm.group("min"))
                 max_rounds = int(mm.group("max"))
+                task_code = mm.group("task")
 
     # The set of session nonces this file declared at its TRUSTED header position. A sentinel-
     # era log declares exactly one (line index 1); a pre-sentinel LEGACY log declares none (so
@@ -370,6 +375,7 @@ def parse_log(path: Path) -> Session:
         rounds=rounds,
         completed=completed,
         timestamp=_parse_timestamp(path),
+        task_code=task_code,
     )
 
 
@@ -487,21 +493,31 @@ def resume_session(
     saved_max = max(sess.max_rounds, 1)
     saved_min = max(sess.min_rounds, 1)
 
-    return mode_brainstorm(
-        sess.topic,
-        models,
-        cwd,
-        timeout,
-        moderators,
-        saved_min,
-        saved_max,
-        diff=diff,
-        synthesize_only=synthesize_only,
-        seed_transcript=sess.transcript_blocks(),
-        seed_persona_index=seed_persona_index,
-        start_round=start_round,
-        resume_log=sess.path,
-    )
+    old_task_env = os.environ.get("REVIEW_TASK_CODE")
+    if sess.task_code:
+        os.environ["REVIEW_TASK_CODE"] = sess.task_code
+    try:
+        return mode_brainstorm(
+            sess.topic,
+            models,
+            cwd,
+            timeout,
+            moderators,
+            saved_min,
+            saved_max,
+            diff=diff,
+            synthesize_only=synthesize_only,
+            seed_transcript=sess.transcript_blocks(),
+            seed_persona_index=seed_persona_index,
+            start_round=start_round,
+            resume_log=sess.path,
+        )
+    finally:
+        if sess.task_code:
+            if old_task_env is None:
+                os.environ.pop("REVIEW_TASK_CODE", None)
+            else:
+                os.environ["REVIEW_TASK_CODE"] = old_task_env
 
 
 class AmbiguousSessionError(Exception):
