@@ -37,7 +37,7 @@ pipx install git+https://github.com/alex-mextner/review-cli
 After install, run `review install-skill` to register the tool into agent harnesses
 (`~/.agents/skills/review/`) so that Claude Code, Codex, opencode, and Gemini agents
 know `review` exists and can call it. The one-liner above runs this automatically.
-The `install-*` commands (`install-skill` / `install-commit-hook` / `register-module`)
+The `install-*` commands (`install-skill` / `install-commit-hook` / `install-hook tg` / `register-module`)
 are idempotent and report their INSTALLED state: each target shows a green ✓ "already
 configured" when nothing changed, or "+ wrote/updated" when it (re)wrote — so a re-run on
 a fully-set-up machine prints "already configured — nothing to do". A target that can't be
@@ -909,7 +909,7 @@ dashboard           Local web dashboard over review-cli runs.
 sessions            List / resume brainstorm sessions (-a all, -s <id> resume).
 task [CODE]         List task-coded review iterations, models, and transcript details.
 spec-web            Multi-spec web reviewer daemon (start/status/stop/add SPEC; also `spec-web SPEC.md`).
-install-skill | install-commit-hook | register-module
+install-skill | install-commit-hook | install-hook tg | register-module
 
 GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)
 -m / --model        Backend to run; repeat or comma-separate. Default (no -m) is mode-aware:

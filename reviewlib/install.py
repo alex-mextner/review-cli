@@ -590,6 +590,214 @@ def _touch_review_marker() -> None:
         pass
 
 
+# --- install-hook tg (review-visual pre-send-photo gate) -------------------
+#
+# The canonical source of `pre_send_photo.py` + its descriptor template is the
+# `tg-cli` repo (features/hooks/review-descriptor/), NOT review-cli — review-cli only
+# provides the `review visual` verdict the hook shells out to. Before this installer
+# existed, the descriptor's own template comment ("`review install-hook tg` substitutes
+# the absolute cmd path") described a command that was never actually built: the hook
+# was placed by hand-copying both files into ~/.agents/hooks/tg/, and that copy silently
+# desynced from tg-cli twice in one day (an unmerged fix landed on the live copy by hand
+# and was never carried forward when tg-cli moved on).
+#
+# Fix, mirrored from rig's own `install_agent_hook` action (riglib/actions/runner.py
+# `_do_install_agent_hook`): install ONLY the descriptor, with `cmd` rewritten to the
+# absolute path of the script INSIDE the source checkout. There is no local copy of the
+# script to go stale — `git pull` (or `git submodule update`) in the tg-cli checkout IS
+# the entire resync step, same as it already is for every agent-tools-sourced hook.
+_TG_HOOK_REL_DIR = "features/hooks/review-descriptor"
+_TG_HOOK_SCRIPT_NAME = "pre_send_photo.py"
+_TG_HOOK_DESCRIPTOR_NAME = "review-visual.pre-send-photo.json"
+# The exact identity tg's hook dispatcher (features/hooks/run-photo-hooks.ts
+# loadDescriptors) matches on: it loads every *.json under ~/.agents/hooks/tg/ and keeps
+# only the ones whose `point` equals "pre-send-photo" — a descriptor with a right-shaped
+# but WRONG id/point would install "successfully" here and then simply never fire.
+_TG_HOOK_EXPECTED_ID = "review-visual"
+_TG_HOOK_EXPECTED_POINT = "pre-send-photo"
+
+# Preference order: the `.files` submodule is the checkout the `tg` binary on PATH
+# actually runs (a deliberately version-pinned "deployed" copy); the `xp/tg-cli` dev
+# workspace is a fallback for a machine that only has the dev checkout.
+_TG_CLI_SOURCE_CANDIDATES = ("~/.files/repos/tg-cli", "~/xp/tg-cli")
+
+
+def _looks_like_tg_cli_checkout(p: Path) -> bool:
+    return (p / _TG_HOOK_REL_DIR / _TG_HOOK_SCRIPT_NAME).is_file()
+
+
+def resolve_tg_cli_source(configured: str | None = None) -> Path:
+    """Resolve the tg-cli checkout that owns the pre-send-photo hook's canonical source.
+
+    Same resolution order/shape as rig's `agent_tools_source` (riglib/catalog.py
+    `resolve_source`): an explicit arg, then the `REVIEW_TG_CLI_SOURCE` env var, then a
+    fixed candidate list — each validated by checking the hook script actually exists
+    there, so a stale/wrong path fails loudly instead of installing a broken `cmd`."""
+    # (source label, raw value) — pairs so the error message attributes a bad path to
+    # where it ACTUALLY came from (an explicit `configured` arg vs. the env var), not
+    # always the env var name regardless of origin (review found).
+    for label, raw in (("configured", configured), ("REVIEW_TG_CLI_SOURCE", os.environ.get("REVIEW_TG_CLI_SOURCE"))):
+        if raw:
+            p = Path(os.path.expanduser(raw)).resolve()
+            if not _looks_like_tg_cli_checkout(p):
+                raise ValueError(
+                    f"{label} '{raw}' is not a tg-cli checkout (expected "
+                    f"{_TG_HOOK_REL_DIR}/{_TG_HOOK_SCRIPT_NAME} under {p})"
+                )
+            return p
+    for cand in _TG_CLI_SOURCE_CANDIDATES:
+        p = Path(os.path.expanduser(cand)).resolve()
+        if _looks_like_tg_cli_checkout(p):
+            return p
+    raise ValueError(
+        "no tg-cli checkout found for the pre-send-photo hook. Set REVIEW_TG_CLI_SOURCE "
+        "to one, or clone tg-cli to one of: " + ", ".join(_TG_CLI_SOURCE_CANDIDATES)
+    )
+
+
+def _load_source_descriptor(src_descriptor: Path) -> tuple[dict | None, str | None]:
+    """Load + validate the source descriptor JSON. Returns (spec, None) on success, or
+    (None, message) describing the conflict otherwise — never raises.
+
+    Requires the EXACT expected `id`/`point` (`_TG_HOOK_EXPECTED_ID` / `_TG_HOOK_EXPECTED_POINT`
+    — "review-visual"/"pre-send-photo"), not merely non-empty strings: tg's own dispatcher
+    (features/hooks/run-photo-hooks.ts `loadDescriptors`) only fires a descriptor whose `point`
+    matches "pre-send-photo" exactly, so a right-shaped-but-wrong value would install
+    "successfully" here and then silently never run — the same "looks fine, does nothing"
+    failure mode a missing field would cause (review found both). `on_error`, if present, must
+    be `open`/`closed` (it's optional — omitted or absent is fine). `cmd` is NOT checked here;
+    the caller always overwrites it."""
+    if not src_descriptor.is_file():
+        return None, f"descriptor not found: {src_descriptor}"
+    try:
+        spec = json.loads(src_descriptor.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"bad descriptor json at {src_descriptor}: {exc}"
+    if not isinstance(spec, dict):
+        # A syntactically valid but non-object descriptor (`[]`, `"..."`, `null`, a bare
+        # number) must be a reported conflict, not a `TypeError` crash on the caller's
+        # `spec["cmd"] = ...` assignment (review found).
+        return None, f"descriptor at {src_descriptor} is not a JSON object: {spec!r}"
+    if spec.get("id") != _TG_HOOK_EXPECTED_ID:
+        return None, (
+            f"descriptor at {src_descriptor} has id={spec.get('id')!r}, expected "
+            f"{_TG_HOOK_EXPECTED_ID!r} — a right-shaped but wrong id installs a descriptor "
+            "the tg dispatcher will never match"
+        )
+    if spec.get("point") != _TG_HOOK_EXPECTED_POINT:
+        return None, (
+            f"descriptor at {src_descriptor} has point={spec.get('point')!r}, expected "
+            f"{_TG_HOOK_EXPECTED_POINT!r} — the tg dispatcher only fires a descriptor whose "
+            "point matches exactly, so a wrong-but-non-empty value would silently never run"
+        )
+    on_error = spec.get("on_error")
+    if on_error is not None and on_error not in ("open", "closed"):
+        return None, f"descriptor at {src_descriptor} has on_error={on_error!r} (must be 'open' or 'closed')"
+    return spec, None
+
+
+def _check_source_script(src_script: Path) -> bool:
+    """Best-effort executable check, run BEFORE any write. `resolve_tg_cli_source` already
+    guarantees `src_script` EXISTS (that is exactly what `_looks_like_tg_cli_checkout`
+    checks), so there is nothing left to gate existence on here — only whether it's
+    runnable. Returns True iff a non-executable warning was printed (never a conflict:
+    on_error stays open, matching the hook's own fail-open philosophy)."""
+    if not os.access(src_script, os.X_OK):
+        print(f"      (warning: source script not executable: {src_script})")
+        return True
+    return False
+
+
+def _clear_stale_local_copy(target_dir: Path, script_name: str) -> tuple[bool, bool]:
+    """Remove a leftover local .py copy that predates this no-copy installer (dead weight:
+    the descriptor no longer reads it, and a second copy that LOOKS authoritative is
+    exactly the trap that let this hook silently desync from tg-cli in the first place).
+
+    A REGULAR FILE or a BROKEN/dangling symlink is removed (neither can be a legitimate
+    reference to anything real). A WORKING symlink is left alone — assumed to be an
+    intentional convenience link someone already pointed at the canonical file.
+
+    A failed removal is a WARNING, never a conflict: by this point the descriptor is
+    already written and `cmd` already points at the source, so the hook IS installed and
+    working — the leftover file is inert clutter, not a correctness problem, and must not
+    sink an otherwise-successful install (review found: it previously returned exit 1 here,
+    reporting a working install as a failure).
+
+    Returns (removed, warned): `warned` is True iff a removal was ATTEMPTED and failed — the
+    caller must fold this into whether "nothing to do" is still an honest final summary
+    (review found: an unremovable copy previously printed its warning directly above a
+    contradicting "nothing to do" line, same class of bug already fixed for the OTHER two
+    non-idempotent paths, wrote_descriptor and warned_non_executable)."""
+    local_copy = target_dir / script_name
+    if local_copy.is_symlink():
+        if local_copy.exists():  # `exists()` follows the link — True here means it resolves
+            return False, False  # a working symlink; leave it alone
+        label, note = "broken symlink", "dangling; cmd points at the source checkout"
+    elif local_copy.exists():
+        label, note = "stale local copy", "cmd now points at the source checkout"
+    else:
+        return False, False
+    try:
+        local_copy.unlink()
+        print(f"  - removed {label}  {local_copy} ({note})")
+        return True, False
+    except OSError as exc:
+        print(f"      (warning: could not remove {label} {local_copy}: {exc} — harmless, the hook doesn't read it)")
+        return False, True
+
+
+def install_hook_tg() -> int:
+    """`review install-hook tg` — install/refresh the tg `pre-send-photo` review-visual
+    gate descriptor. Idempotent; safe to re-run after every tg-cli update (that's the
+    whole point: re-running never needs to copy anything new, `cmd` already points at
+    the live checkout)."""
+    home = Path.home()
+    try:
+        source = resolve_tg_cli_source()
+    except ValueError as exc:
+        print(f"  ! conflict  {exc}")
+        return 1
+
+    src_dir = source / _TG_HOOK_REL_DIR
+    src_descriptor = src_dir / _TG_HOOK_DESCRIPTOR_NAME
+    src_script = src_dir / _TG_HOOK_SCRIPT_NAME
+    spec, error = _load_source_descriptor(src_descriptor)
+    if error is not None:
+        print(f"  ! conflict  {error}")
+        return 1
+
+    warned_non_executable = _check_source_script(src_script)
+
+    spec["cmd"] = str(src_script.resolve())
+    content = json.dumps(spec, indent=2) + "\n"
+
+    target_dir = home / ".agents" / "hooks" / "tg"
+    target_descriptor = target_dir / _TG_HOOK_DESCRIPTOR_NAME
+    try:
+        wrote_descriptor = _write_if_changed(target_descriptor, content)
+    except OSError as exc:
+        print(f"  ! conflict  {target_descriptor} could not be written ({exc})")
+        return 1
+    print(f"  {'+ wrote/updated' if wrote_descriptor else '✓ already configured'}  {target_descriptor}")
+    print(f"      cmd -> {spec['cmd']}")
+    print(f"      (sourced live from {source}; `git pull` there resyncs the hook — no re-install needed)")
+
+    removed_stale_copy, warned_stale_removal = _clear_stale_local_copy(target_dir, _TG_HOOK_SCRIPT_NAME)
+
+    # "nothing to do" is only true when NOTHING changed and nothing needs attention — a
+    # rewritten descriptor, a removed stale copy, a failed-but-harmless removal attempt, or a
+    # live non-executable-script warning must all keep the summary from claiming "nothing to
+    # do" (review found: each of these could previously print a real action/warning right
+    # above a contradicting "nothing to do" line).
+    if wrote_descriptor or removed_stale_copy:
+        print(f"review: install-hook tg — done. Descriptor points at {source}. Idempotent; re-run anytime.")
+    elif warned_non_executable or warned_stale_removal:
+        print("review: install-hook tg — descriptor already configured, but see the warning above.")
+    else:
+        print("review: install-hook tg — already configured, nothing to do. Idempotent; re-run anytime.")
+    return 0
+
+
 def install_commit_hook() -> int:
     """Install a GLOBAL git pre-commit hook enforcing review-before-commit.
     Opt-in (not run by install-skill) because it affects every repo."""
