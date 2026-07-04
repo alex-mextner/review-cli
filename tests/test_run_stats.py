@@ -478,9 +478,10 @@ def test_cli_standalone_visual_does_not_record_review_task_code_env():
         _cli._read_stdin_if_piped = lambda: None
         os.environ["REVIEW_TASK_CODE"] = "ENV-999"
         try:
-            with redirect_stderr(io.StringIO()), _capture_stdout():
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf), _capture_stdout() as out_buf:
                 rc = _cli.main(["visual", str(image), "--no-ai", "-C", str(REPO_ROOT)])
-            assert rc == 0, rc
+            assert rc == 0, f"rc={rc} stdout={out_buf.getvalue()!r} stderr={err_buf.getvalue()!r}"
             assert store.records() == []
         finally:
             _cli._read_stdin_if_piped = old_stdin
