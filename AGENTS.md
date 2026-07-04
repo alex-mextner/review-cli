@@ -40,7 +40,8 @@ while `review visual IMAGE --diff` is a diff-review iteration and must carry a t
 Task codes are one non-whitespace token, max 120 characters, with no control characters.
 
 Bare subcommands also handled directly by the CLI: `dashboard`, `sessions`, `spec-web`,
-`task`, `install-skill`, `install-commit-hook`, `register-module`, `trust-module`.
+`task`, `install-skill`, `install-commit-hook`, `install-hook tg`, `register-module`,
+`trust-module`.
 `sessions` is a
 MANAGEMENT command (list / resume brainstorm sessions parsed from the discussion logs), NOT
 a fan-out mode — it is wired in `cli._dispatch` like `dashboard` and its logic lives in the

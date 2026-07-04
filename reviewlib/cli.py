@@ -39,7 +39,7 @@ from .config import (
     load_config,
     split_pool_reserve,
 )
-from .install import install_commit_hook, install_skill
+from .install import install_commit_hook, install_hook_tg, install_skill
 from .modes.brainstorm import mode_brainstorm
 from .modes.contract import ModeContext, ModeSpec
 from .modes.just_ask import mode_just_ask
@@ -1915,7 +1915,7 @@ _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
 # them alone — a `--diff`/`--moderator` after `sessions` belongs to that subparser, not a
 # missing `review diff`.
 _BARE_SUBCOMMANDS: frozenset[str] = frozenset({
-    "install-skill", "install-commit-hook", "dashboard", "sessions",
+    "install-skill", "install-commit-hook", "install-hook", "dashboard", "sessions",
     "task", "trust-module", "register-module", "spec-web",
 })
 
@@ -2045,7 +2045,7 @@ def _subcommand_epilog() -> str:
         "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
         "\n  task        show review iterations and transcripts for one task code"
         "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
-        "\n  install-skill / install-commit-hook / register-module"
+        "\n  install-skill / install-commit-hook / install-hook tg / register-module"
         "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
         + topics
         + "\n  see `review help config` for configuration."
@@ -2211,6 +2211,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return install_skill()
     if argv == ["install-commit-hook"]:
         return install_commit_hook()
+    if argv and argv[0] == "install-hook":
+        if argv[1:] == ["tg"]:
+            return install_hook_tg()
+        print("usage: review install-hook tg", file=sys.stderr)
+        return 2
     # `review --reviewlib-dir` — print the directory of the `reviewlib` package this `review`
     # actually runs, then exit. Used by the managed-dashboard service to detect the live-symlink
     # trap (the `review` on PATH resolving to a DIFFERENT checkout than the one wiring the

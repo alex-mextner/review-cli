@@ -687,9 +687,24 @@ error-overlay; `--check selection` is NOT added by default — the hook judges g
   fail-open, so a missing API key never bricks sends), with a loud stderr line and an audit entry.
 
 `review install-hook tg` (opt-in subcommand, mirrors `install-commit-hook`) drops the
-quarantined descriptor into `~/.agents/hooks/tg/` and registers `pre_send_photo.py`. Inert until
-`tg` is hook-aware **and** the user trusts it (TOFU), so it is safe to ship ahead of the tg
-change.
+descriptor into `~/.agents/hooks/tg/`. Inert until `tg` is hook-aware, so it is safe to ship
+ahead of the tg change.
+
+**As actually implemented (reviewlib/install.py `install_hook_tg`), two things differ from
+this section's original plan, both discovered while building the real installer:**
+- `pre_send_photo.py` ended up living in the **tg-cli repo**
+  (`features/hooks/review-descriptor/pre_send_photo.py`), not under review-cli's own
+  `~/.agents/skills/review/hooks/` as sketched above — it is tg-side glue that shells out to
+  `review visual`, and evolved alongside the other tg-cli hook plumbing (runner.ts,
+  run-photo-hooks.ts) rather than review-cli's code. `install-hook tg` does **not** copy or
+  register the script at all: it writes only the descriptor, with `cmd` rewritten to the
+  absolute path of `pre_send_photo.py` **inside** a resolved tg-cli checkout
+  (`REVIEW_TG_CLI_SOURCE` env var, else `~/.files/repos/tg-cli`, else `~/xp/tg-cli`) — no local
+  copy ever goes stale; `git pull` in that checkout is the entire resync step. (This mirrors
+  how rig's own `install_agent_hook` action installs every other agent-tools-sourced hook.)
+- Trust is **trust-by-default** in the shipped runner (`features/hooks/run-photo-hooks.ts`
+  `untrustedGuardActive`), not TOFU-quarantine-by-default as planned above — the TOFU pin/
+  quarantine only re-engages under the opt-in `AGENTS_HOOKS_TRUST=1` (or `=auto`) guard.
 
 ---
 

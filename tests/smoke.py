@@ -644,6 +644,9 @@ _UNIT_FILES = [
     # ImageMagick/Pillow dependency, so it runs as a plain unit file rather than
     # via the gated visual-verification suite.
     ("test_intent_keywords.py", {}),
+    # `review install-hook tg` (the tg pre-send-photo review-visual gate installer): isolated
+    # HOME + a fake tg-cli checkout, no git needed.
+    ("test_install_hook_tg.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in
