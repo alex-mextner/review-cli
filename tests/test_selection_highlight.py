@@ -14,6 +14,7 @@ Proves:
     BLOCKS (a hard veto), so a model `keep` cannot pass a missing-selection proof.
   * pass: when the outline IS present, the module does not block.
 """
+
 from __future__ import annotations
 
 import sys
@@ -35,7 +36,14 @@ from reviewlib.features.visual.vision_client import VisionVerdict  # noqa: E402
 # Load the contributed reference module directly (the file the registry would import).
 import importlib.util  # noqa: E402
 
-_ENTRY = REPO_ROOT / "reviewlib" / "features" / "visual" / "contrib" / "selection_highlight.py"
+_ENTRY = (
+    REPO_ROOT
+    / "reviewlib"
+    / "features"
+    / "visual"
+    / "contrib"
+    / "selection_highlight.py"
+)
 _spec = importlib.util.spec_from_file_location("selection_highlight_ref", _ENTRY)
 selection_highlight = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(selection_highlight)
@@ -92,7 +100,50 @@ def test_activates_only_on_selection_tag():
     _with_outline(img)
     assert MODULE.activates(_ctx(img, requested_checks=[])) is False
     assert MODULE.activates(_ctx(img, requested_checks=["selection"])) is True
-    assert MODULE.activates(_ctx(img, intent="confirm the selection outline is drawn")) is True
+    assert (
+        MODULE.activates(_ctx(img, intent="confirm the selection outline is drawn"))
+        is True
+    )
+
+
+def test_activates_on_russian_intent():
+    """tg#6188: a Russian caption claiming the element is selected must ALSO activate
+    the module — not just an English "selection" mention."""
+    img = Path(tempfile.mkstemp(suffix="-sel.png")[1])
+    _with_outline(img)
+    assert MODULE.activates(_ctx(img, intent="проверь что элемент выбран")) is True
+    assert MODULE.activates(_ctx(img, intent="элемент выделен рамкой")) is True
+    assert MODULE.activates(_ctx(img, intent="элемент подсвечен")) is True
+    assert MODULE.activates(_ctx(img, intent="видна рамка выделения")) is True
+    # An unrelated Russian caption still leaves it off.
+    assert MODULE.activates(_ctx(img, intent="кнопка стилизована правильно")) is False
+
+
+def test_cv_check_blocks_and_passes_regardless_of_intent_language():
+    """`cv_check` itself doesn't look at `ctx.intent` at all — it's a pure pixel
+    decision — so a Russian intent must not change its block/pass outcome versus the
+    English-intent tests above. This does NOT prove the tg#6188 fix end-to-end (it
+    doesn't exercise `activates()`/`intent_mentions_tag` — a Russian intent that never
+    even activated the module would still make these same two assertions pass); the
+    real end-to-end regression test (Russian intent -> activation -> run_pipeline
+    rollback, with NO --check forcing it) is
+    test_visual_registry.py::test_pipeline_folds_contributed_selection_module_via_russian_intent."""
+    intent = "элемент выбран"
+    missing = Path(tempfile.mkstemp(suffix="-nosel.png")[1])
+    _without_outline(missing)
+    mv = MODULE.cv_check(_ctx(missing, intent=intent))
+    assert mv is not None
+    assert mv.decision == "block", (
+        f"Russian 'selected' claim with no outline must veto, got {mv.decision}"
+    )
+
+    present = Path(tempfile.mkstemp(suffix="-sel.png")[1])
+    _with_outline(present)
+    mv = MODULE.cv_check(_ctx(present, intent=intent))
+    assert mv is not None
+    assert mv.decision == "pass", (
+        f"Russian 'selected' claim WITH outline must pass, got {mv.decision}"
+    )
 
 
 def test_cv_check_blocks_when_outline_missing():
@@ -118,7 +169,12 @@ def test_judge_blocks_when_model_says_missing():
     selection check must block (the judge folds the model answer)."""
     img = Path(tempfile.mkstemp(suffix="-sel.png")[1])
     _with_outline(img)
-    vision = VisionVerdict(available=True, verdict="keep", confidence=0.9, module_answers={"selection_present": False})
+    vision = VisionVerdict(
+        available=True,
+        verdict="keep",
+        confidence=0.9,
+        module_answers={"selection_present": False},
+    )
     mv = MODULE.judge(_ctx(img, requested_checks=["selection"]), vision)
     assert mv.decision == "block", "model-confirmed missing selection must veto"
 

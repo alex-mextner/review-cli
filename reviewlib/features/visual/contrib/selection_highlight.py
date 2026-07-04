@@ -22,11 +22,13 @@ bin script is unavailable in a given install layout.
 Entry-point contract (what the registry loads): this file exposes a top-level `MODULE`
 object satisfying the `VisualModule` Protocol.
 """
+
 from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
 
+from reviewlib.features.visual.intent_keywords import intent_mentions_tag
 from reviewlib.features.visual.module_api import ModuleVerdict, VisualContext
 
 # HyperCanvas selection outline (overlay-renderer.ts SELECTION_BORDER).
@@ -51,7 +53,9 @@ def _frames_check_detect():
     self-contained fallback is used). The script lives at <repo>/bin/frames-check;
     from this file that is parents[4]/bin/frames-check."""
     candidates = [
-        Path(__file__).resolve().parents[4] / "bin" / "frames-check",  # repo/bin/frames-check
+        Path(__file__).resolve().parents[4]
+        / "bin"
+        / "frames-check",  # repo/bin/frames-check
     ]
     import shutil
 
@@ -62,7 +66,9 @@ def _frames_check_detect():
         if not path.is_file():
             continue
         try:
-            spec = importlib.util.spec_from_file_location("_frames_check_canonical", path)
+            spec = importlib.util.spec_from_file_location(
+                "_frames_check_canonical", path
+            )
             if spec is None or spec.loader is None:
                 continue
             mod = importlib.util.module_from_spec(spec)
@@ -80,7 +86,9 @@ def detect_selection_frames(image: Path) -> list[dict]:
     fill_ratio}. Reuses bin/frames-check's `detect_frames` (canonical) when available."""
     detect = _frames_check_detect()
     if detect is not None:
-        frames, mask = detect(Path(image), SELECTION_COLOR, _FUZZ, _MIN_DIM, _MAX_FILL, _MIN_AREA)
+        frames, mask = detect(
+            Path(image), SELECTION_COLOR, _FUZZ, _MIN_DIM, _MAX_FILL, _MIN_AREA
+        )
         try:
             Path(mask).unlink(missing_ok=True)
         except OSError:
@@ -101,17 +109,35 @@ def _fallback_detect(image: Path) -> list[dict]:
     mask = Path(tempfile.mkstemp(suffix="-sel-mask.png")[1])
     proc = subprocess.run(
         [
-            "magick", str(image),
-            "-fuzz", f"{_FUZZ}%", "-fill", "white", "-opaque", f"rgb({r},{g},{b})",
-            "-fuzz", "0", "-fill", "black", "+opaque", "white",
-            "-define", "connected-components:verbose=true",
-            "-define", f"connected-components:area-threshold={_MIN_AREA}",
-            "-connected-components", "8", str(mask),
+            "magick",
+            str(image),
+            "-fuzz",
+            f"{_FUZZ}%",
+            "-fill",
+            "white",
+            "-opaque",
+            f"rgb({r},{g},{b})",
+            "-fuzz",
+            "0",
+            "-fill",
+            "black",
+            "+opaque",
+            "white",
+            "-define",
+            "connected-components:verbose=true",
+            "-define",
+            f"connected-components:area-threshold={_MIN_AREA}",
+            "-connected-components",
+            "8",
+            str(mask),
         ],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     mask.unlink(missing_ok=True)
-    line_re = re.compile(r"^\s*\d+:\s+(\d+)x(\d+)\+(-?\d+)\+(-?\d+)\s+[\d.,]+\s+(\d+)\s+s?rgba?\(([^)]+)\)")
+    line_re = re.compile(
+        r"^\s*\d+:\s+(\d+)x(\d+)\+(-?\d+)\+(-?\d+)\s+[\d.,]+\s+(\d+)\s+s?rgba?\(([^)]+)\)"
+    )
     frames: list[dict] = []
     for line in (proc.stdout + proc.stderr).splitlines():
         m = line_re.match(line)
@@ -125,7 +151,16 @@ def _fallback_detect(image: Path) -> list[dict]:
             continue
         fill_ratio = area / bbox_area
         if min(w, h) >= _MIN_DIM and area >= _MIN_AREA and fill_ratio <= _MAX_FILL:
-            frames.append({"x": x, "y": y, "w": w, "h": h, "area": area, "fill_ratio": round(fill_ratio, 4)})
+            frames.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "area": area,
+                    "fill_ratio": round(fill_ratio, 4),
+                }
+            )
     frames.sort(key=lambda f: (f["y"], f["x"]))
     return frames
 
@@ -145,8 +180,11 @@ class _SelectionHighlightModule:
         tags = {t.lower() for t in self.activates_on}
         if requested & tags:
             return True
-        intent = (ctx.intent or "").lower()
-        return bool(intent and any(t in intent for t in tags))
+        # Free-text intent match: any tag mentioned verbatim OR via a registered
+        # non-English synonym (e.g. a Russian caption saying "selected" — tg#6188).
+        return bool(
+            ctx.intent and any(intent_mentions_tag(ctx.intent, tag) for tag in tags)
+        )
 
     def cv_check(self, ctx: VisualContext) -> ModuleVerdict | None:
         """Deterministic colour+shape detection. When a selection is expected and NO
@@ -160,16 +198,25 @@ class _SelectionHighlightModule:
             tmp.write_bytes(ctx.after_image)
             frames = detect_selection_frames(tmp)
         except Exception as exc:  # noqa: BLE001 — a detector failure must not crash the run
-            return ModuleVerdict(module=self.name, decision="abstain", confidence=0.0, reason=f"detector error: {exc}")
+            return ModuleVerdict(
+                module=self.name,
+                decision="abstain",
+                confidence=0.0,
+                reason=f"detector error: {exc}",
+            )
         finally:
             tmp.unlink(missing_ok=True)
         if frames:
             return ModuleVerdict(
-                module=self.name, decision="pass", confidence=0.9,
+                module=self.name,
+                decision="pass",
+                confidence=0.9,
                 reason=f"selection outline present ({len(frames)} frame(s))",
             )
         return ModuleVerdict(
-            module=self.name, decision="block", confidence=0.9,
+            module=self.name,
+            decision="block",
+            confidence=0.9,
             reason="selection expected but NO 2px rgb(59,130,246) outline detected",
         )
 
@@ -185,12 +232,16 @@ class _SelectionHighlightModule:
         answer = getattr(vision, "module_answers", {}).get(self._vision_field)
         if answer is False:
             return ModuleVerdict(
-                module=self.name, decision="block", confidence=getattr(vision, "confidence", 0.0),
+                module=self.name,
+                decision="block",
+                confidence=getattr(vision, "confidence", 0.0),
                 reason="vision confirmed no selection outline present",
             )
         # Otherwise defer to the deterministic CV opinion (self-contained).
         cv = self.cv_check(ctx)
-        return cv or ModuleVerdict(module=self.name, decision="abstain", confidence=0.0, reason="no opinion")
+        return cv or ModuleVerdict(
+            module=self.name, decision="abstain", confidence=0.0, reason="no opinion"
+        )
 
 
 MODULE = _SelectionHighlightModule()
