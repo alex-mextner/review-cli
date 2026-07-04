@@ -638,6 +638,11 @@ _UNIT_FILES = [
     ("test_install_hook_text.py", {}),
     ("test_install_state.py", {}),
     ("test_topic_help.py", {}),
+    # intent_mentions_tag: multilingual (English + Russian) synonym matching for
+    # intent-based module activation (tg#6188). Pure string/regex logic, no
+    # ImageMagick/Pillow dependency, so it runs as a plain unit file rather than
+    # via the gated visual-verification suite.
+    ("test_intent_keywords.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in
