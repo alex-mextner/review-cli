@@ -125,6 +125,11 @@ EXIT_QA_ENV_UNHEALTHY = 9   # bring-up succeeded but the health gate timed out (
 # not break; nothing in the live code returns it anymore.
 EXIT_QA_NOT_IMPLEMENTED = 70
 
+# Codes 11/12 are CLAIMED by `modes/review.py` (EXIT_COMMIT_REQUIRES_STAGED / EXIT_COMMIT_
+# FAILED, the `--commit` checkpoint feature) — defined there, not here, because that mode
+# module can't import from cli.py without a circular import. Recorded here too so the next
+# person picking a new top-level exit code doesn't re-use them.
+
 
 def _is_git_repo(cwd: Path) -> bool:
     """Cheap, correct "is `cwd` inside a git work tree?" probe.
@@ -2146,7 +2151,7 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
 _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
     "--diff", "--staged", "--prompt", "--moderator", "--rounds", "--max-rounds",
     "--visual", "--before", "--intent", "--expect", "--check", "--json", "--strict",
-    "--no-ai", "--no-local-model", "--vision-timeout", "--project", "--retry",
+    "--no-ai", "--no-local-model", "--vision-timeout", "--project", "--retry", "--commit",
     # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
     # etc. must get the friendly "use the subcommand" pointer, not argparse's opaque error.
     # Phase 3 adds the SUT-env flags `--stage-url` / `--config` / `--keep-env`.
@@ -2328,8 +2333,9 @@ def _build_top_level_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="review",
         description=(
-            "Run read-only code reviews / AI panels across multiple model backends. "
-            "Everything is a SUBCOMMAND: `review diff` (review the git diff), "
+            "Run read-only code reviews / AI panels across multiple model backends "
+            "(one narrow opt-in exception: `review diff --staged --commit` checkpoints "
+            "a commit). Everything is a SUBCOMMAND: `review diff` (review the git diff), "
             "`review brainstorm`, `review just-ask`, `review quorum`. A bare `review` "
             "(no subcommand) prints this help — it does NOT run a diff review; use "
             "`review diff` for that."

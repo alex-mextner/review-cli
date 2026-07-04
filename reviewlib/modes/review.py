@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -39,9 +40,29 @@ from ..panel import (
     format_result,
     run_board_with_failover,
 )
+from ..process import _run, git_repo_env
 from ..retry import retry_default, run_seat_with_retry
 from . import _visual_images
 from .contract import ModeContext, ModeSpec
+
+# Stable, per-class exit codes for the `--commit` checkpoint feature (structured-exit-codes),
+# continuing the numbering discipline started in cli.py (EXIT_NOT_A_REPO=3 … EXIT_QA_ENV_
+# UNHEALTHY=9) and features/visual/policy_engine.py (EXIT_BLOCK_STRICT=10). 11/12 are the next
+# free integers — distinct from every class above so a script/hook can tell "you misused
+# --commit" apart from "the checkpoint commit itself failed" apart from any other exit class.
+#
+# --commit REQUIRES --staged: a checkpoint commits the reviewed STAGED diff, and there is no
+# such thing as checkpointing an unstaged/piped diff. This is a hard usage ERROR, not a silent
+# no-op and not an implicit `--staged` (a smaller surprise is still a surprise) and NEVER a
+# fallback to `git commit -a` (which would sweep in unrelated unstaged changes — exactly the
+# "sweep everything" accident class this whole feature exists to prevent).
+EXIT_COMMIT_REQUIRES_STAGED = 11
+# The review itself succeeded (`ok`) and the checkpoint gate was satisfied (staged, not
+# piped), but the actual `git commit` subprocess FAILED (a commit-msg/pre-commit hook
+# rejected it, "nothing to commit", or any other nonzero). The user explicitly asked for a
+# checkpoint guarantee and did not get one — that must be a visible, distinct failure, never
+# silently swallowed as if the review itself failed (which already has its own 0/1 result).
+EXIT_COMMIT_FAILED = 12
 
 if TYPE_CHECKING:
     from ..config import EffortOverride
@@ -55,7 +76,20 @@ def mode_review(
     visual_images: tuple[Path, ...] = (),
     exact_board: bool = False,
     effort_override: "EffortOverride | None" = None,
+    commit: bool = False,
 ) -> int:
+    # --commit REQUIRES --staged (see the exit-code block above). Checked BEFORE the (paid)
+    # panel dispatch, not after — a usage mistake should fail fast, not after burning a full
+    # multi-model review the checkpoint could never have used anyway.
+    if commit and not staged:
+        print(
+            "[review-cli] --commit requires --staged: a checkpoint commits the reviewed "
+            "STAGED diff, and there is no such thing as checkpointing an unstaged/piped "
+            "diff.\n  fix: add --staged (`review diff --staged --commit`), or drop --commit.",
+            file=sys.stderr, flush=True,
+        )
+        return EXIT_COMMIT_REQUIRES_STAGED
+
     if not diff.strip():
         print("No diff to review.", file=sys.stderr)
         return 1
@@ -68,7 +102,7 @@ def mode_review(
         board = apply_effort_override(board, effort_override)
         return _mode_review_board(
             board, prompt, diff, cwd, timeout, staged, pool_size, outcome_sink,
-            diff_from_stdin, visual_images, exact_board,
+            diff_from_stdin, visual_images, exact_board, commit,
         )
 
     # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets in-seat
@@ -114,6 +148,9 @@ def mode_review(
     print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))
     ok = all(result.returncode == 0 for result in results)
     _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
+    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd)
+    if override is not None:
+        return override
     return 0 if ok else 1
 
 
@@ -138,11 +175,94 @@ def _stamp_if_staged_commit_review(
         _touch_review_marker()
 
 
+_CHECKPOINT_COMMIT_MESSAGE = "chore: checkpoint via review diff --staged --commit"
+
+
+def _checkpoint_commit(cwd: Path) -> tuple[bool, str]:
+    """Create the real checkpoint commit of the currently-staged index.
+
+    Anchored `-C <cwd>` AND a pinned `git_repo_env(cwd)` (review-cli#71/#72, the same
+    reasoning as `cli._git_diff`): a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE pointing
+    at a FOREIGN repo must not divert this commit to the wrong tree.
+
+    This is a REAL `git commit` — it runs the repo's own commit-msg/pre-commit hooks
+    (lint/typecheck/tests, conventional-commit format) and can genuinely fail on a red
+    tree or a malformed message. It never passes `--no-verify`: bypassing that gate is
+    exactly the kind of accident this feature exists to prevent, not reproduce under a
+    new flag. Returns `(succeeded, detail)` — `detail` is empty on success, else a short
+    explanation (spawn error, or git's own stderr/stdout) for the caller to report.
+    """
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "commit", "-m", _CHECKPOINT_COMMIT_MESSAGE],
+            cwd=cwd, env=git_repo_env(cwd),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"git commit could not run: {exc}"
+    if proc.returncode != 0:
+        return False, proc.stderr.strip() or proc.stdout.strip() or "git commit failed"
+    return True, ""
+
+
+def _checkpoint_if_requested(
+    commit: bool, ok: bool, diff_from_stdin: bool, cwd: Path,
+) -> int | None:
+    """Create the `--commit` checkpoint commit after a review, if requested.
+
+    Called only after `mode_review` has already validated commit-implies-staged up
+    front, so `staged` is always True here by construction — the remaining gate mirrors
+    `_stamp_if_staged_commit_review`'s other two conditions (`ok`, not `diff_from_stdin`).
+
+    Precisely: this CHECKPOINTS the reviewed staged diff after the review completes —
+    it does NOT mean "commits when the review passes". `ok` means the pool produced
+    usable verdicts, not that the diff is clean; a review that reports open findings
+    still has `ok=True` and still gets checkpointed (findings are informational, the
+    same as the existing `--staged` stamp gate). That is intended, not a bug.
+
+    Returns `None` to leave the review's own 0/1 result standing (covers: `--commit`
+    not requested; the gate not satisfied — the review failed, or the diff was piped —
+    in which case a note is printed but the review's own result is untouched; or the
+    checkpoint commit itself succeeded). Returns `EXIT_COMMIT_FAILED` to OVERRIDE an
+    otherwise-successful review's exit code when the review passed, the gate was
+    satisfied, but the `git commit` subprocess itself failed — the user asked for a
+    checkpoint guarantee and did not get one, so that must be visible, never silently
+    swallowed.
+    """
+    if not commit:
+        return None
+    if not ok:
+        print(
+            "[review-cli] --commit: the review did not succeed — no checkpoint created.",
+            file=sys.stderr, flush=True,
+        )
+        return None
+    if diff_from_stdin:
+        print(
+            "[review-cli] --commit: the diff was piped on stdin, not the git index — no "
+            "checkpoint created (a pipe reviews arbitrary input; --commit checkpoints the "
+            "staged index).",
+            file=sys.stderr, flush=True,
+        )
+        return None
+    succeeded, detail = _checkpoint_commit(cwd)
+    if succeeded:
+        print("[review-cli] --commit: checkpoint commit created.", file=sys.stderr, flush=True)
+        return None
+    print(
+        "[review-cli] --commit: the review succeeded but the checkpoint commit itself "
+        f"FAILED — no checkpoint was created.\n  git commit failed: {detail}\n"
+        "  fix: check the repo's commit-msg/pre-commit hooks (lint/typecheck/tests may be "
+        "blocking it), then re-run `review diff --staged --commit`.",
+        file=sys.stderr, flush=True,
+    )
+    return EXIT_COMMIT_FAILED
+
+
 def _mode_review_board(
     board: list[BoardReviewer], prompt: str, diff: str, cwd: Path, timeout: int,
     staged: bool, pool_size: int, outcome_sink: list[FailoverOutcome] | None,
     diff_from_stdin: bool = False, visual_images: tuple[Path, ...] = (),
-    exact_board: bool = False,
+    exact_board: bool = False, commit: bool = False,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -189,6 +309,9 @@ def _mode_review_board(
     # shortfall (reserve exhausted) does.
     ok = not outcome.degraded
     _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
+    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd)
+    if override is not None:
+        return override
     return 0 if ok else 1
 
 
@@ -208,6 +331,22 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             "SEAT-FATAL failure (auth/bad-model/501/refusal) is never retried. 0 disables it."
         ),
     )
+    parser.add_argument(
+        "--commit", action="store_true",
+        help=(
+            "checkpoint the reviewed diff with a real `git commit` after the review "
+            "completes — REQUIRES --staged (errors otherwise, exit "
+            f"{EXIT_COMMIT_REQUIRES_STAGED}). This checkpoints the reviewed staged diff, "
+            "it does NOT mean 'commits only when the review passes': a review with open "
+            "findings still gets checkpointed (same as the existing --staged stamp gate) "
+            "— findings are informational. Runs the repo's own commit-msg/pre-commit "
+            "hooks; a hook rejection fails the checkpoint distinctly (exit "
+            f"{EXIT_COMMIT_FAILED}), never bypassed with --no-verify. Undo a bad "
+            "checkpoint with `git reset --soft HEAD~1` (safe — leaves untracked/foreign "
+            "files alone); never `git reset --hard` mid-review-cycle (wipes uncommitted "
+            "work, including anyone else's, in a shared checkout)."
+        ),
+    )
 
 
 def _handler(ctx: ModeContext) -> int:
@@ -223,6 +362,7 @@ def _handler(ctx: ModeContext) -> int:
     # A diff piped on stdin (vs read from `git diff --cached`) must not satisfy the staged
     # commit gate even under --staged — see _stamp_if_staged_commit_review.
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
+    commit = bool(getattr(ctx.args, "commit", False))
     base = (
         ctx.models, ctx.with_visual(ctx.args.prompt), ctx.diff, ctx.cwd, ctx.timeout,
         ctx.args.staged,
@@ -232,6 +372,7 @@ def _handler(ctx: ModeContext) -> int:
             *base, board=None, diff_from_stdin=diff_from_stdin,
             visual_images=_visual_images(ctx),
             effort_override=ctx.effort_override,
+        commit=commit,
         )
     return mode_review(
         *base, board=board,
@@ -240,6 +381,7 @@ def _handler(ctx: ModeContext) -> int:
         diff_from_stdin=diff_from_stdin,
         visual_images=_visual_images(ctx),
         exact_board=bool(ctx.extra.get("exact_board", False)),
+        commit=commit,
     )
 
 
@@ -251,7 +393,7 @@ MODE = ModeSpec(
     subcommand="diff",
     diff_policy="require",
     stats_mode="review",
-    summary="diff review across the reviewer board (requires a diff)",
+    summary="diff review across the reviewer board (requires a diff; --staged --commit checkpoints progress)",
     handler=_handler,
     add_arguments=_add_arguments,
     announce_logs=False,
