@@ -37,6 +37,7 @@ own source). ONLY contributed modules are subject to the optional guard.
 This module imports NOTHING heavy at import time; the entry file is loaded with
 `importlib` only for a module about to run.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -49,6 +50,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .intent_keywords import intent_mentions_tag
 from .module_api import ModuleVerdict, VisualContext, VisualModule
 
 MANIFEST_RELPATH = Path(".review") / "visual-modules.json"
@@ -62,7 +64,12 @@ UNTRUSTED_GUARD_ENV = "REVIEW_UNTRUSTED_MODULES"
 
 def _untrusted_guard_active() -> bool:
     """True when the opt-in untrusted-repo guard is enabled (quarantine re-engaged)."""
-    return os.environ.get(UNTRUSTED_GUARD_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get(UNTRUSTED_GUARD_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 # --- Configurable environment (so tests isolate from the real ~/.config). ----------
@@ -84,7 +91,9 @@ class RegistryEnv:
     # functions and have `RegistryEnv()` (constructed inside run_pipeline → load_modules
     # with no explicit env) pick up the isolated test paths.
     trust_path: Path = field(default_factory=lambda: _default_trust_path())
-    global_registry_path: Path = field(default_factory=lambda: _default_global_registry_path())
+    global_registry_path: Path = field(
+        default_factory=lambda: _default_global_registry_path()
+    )
     audit_path: Path = field(default_factory=lambda: _default_audit_path())
 
 
@@ -120,7 +129,9 @@ def _parse_manifest(manifest_path: Path) -> list[ModuleSpec]:
     if data.get("review_api") not in (REVIEW_API, "review-visual/v1"):
         # Unknown manifest schema → ignore rather than guess (forward-compatible).
         return []
-    base = manifest_path.parent.parent  # <project>/  (manifest lives in <project>/.review/)
+    base = (
+        manifest_path.parent.parent
+    )  # <project>/  (manifest lives in <project>/.review/)
     specs: list[ModuleSpec] = []
     for entry in data.get("modules", []) or []:
         if not isinstance(entry, dict):
@@ -130,7 +141,9 @@ def _parse_manifest(manifest_path: Path) -> list[ModuleSpec]:
         if not name or not rel:
             continue
         entry_path = (base / rel).resolve()
-        activates_on = [str(t) for t in (entry.get("activates_on") or []) if str(t).strip()]
+        activates_on = [
+            str(t) for t in (entry.get("activates_on") or []) if str(t).strip()
+        ]
         specs.append(
             ModuleSpec(
                 name=name,
@@ -144,7 +157,9 @@ def _parse_manifest(manifest_path: Path) -> list[ModuleSpec]:
     return specs
 
 
-def discover_specs(*, project: Path | None = None, env: RegistryEnv | None = None) -> list[ModuleSpec]:
+def discover_specs(
+    *, project: Path | None = None, env: RegistryEnv | None = None
+) -> list[ModuleSpec]:
     """Discover every contributed module spec for this run.
 
     Sources (deduplicated by name, project-local wins over a global registration):
@@ -156,7 +171,7 @@ def discover_specs(*, project: Path | None = None, env: RegistryEnv | None = Non
     specs: list[ModuleSpec] = []
     seen: set[str] = set()
 
-    local_manifest = (project / MANIFEST_RELPATH)
+    local_manifest = project / MANIFEST_RELPATH
     if local_manifest.is_file():
         for s in _parse_manifest(local_manifest):
             if s.name not in seen:
@@ -180,7 +195,11 @@ def _global_manifest_paths(env: RegistryEnv) -> list[Path]:
         return []
     if not isinstance(data, dict):
         return []
-    return [Path(p).expanduser() for p in (data.get("manifests") or []) if isinstance(p, str)]
+    return [
+        Path(p).expanduser()
+        for p in (data.get("manifests") or [])
+        if isinstance(p, str)
+    ]
 
 
 # --- Trust store (§6.3). -----------------------------------------------------------
@@ -202,7 +221,15 @@ def _write_trust(env: RegistryEnv, store: dict) -> None:
         pass
 
 
-def _audit(env: RegistryEnv, *, module: str, entry_sha256: str, trust_state: str, decision: str, duration_ms: float) -> None:
+def _audit(
+    env: RegistryEnv,
+    *,
+    module: str,
+    entry_sha256: str,
+    trust_state: str,
+    decision: str,
+    duration_ms: float,
+) -> None:
     """Append-only audit row. Best-effort — auditing must never break a verification."""
     row = {
         "ts": time.time(),
@@ -259,7 +286,9 @@ def _load_entry_object(spec: ModuleSpec) -> object | None:
     A contributed entry exposes its module as a top-level `MODULE` object, or a
     `module()`/`get_module()` factory, or a class named `Module`. Returns None if none
     is found / the file fails to import."""
-    mod_name = f"_review_visual_contrib_{spec.name.replace('-', '_')}_{uuid.uuid4().hex[:8]}"
+    mod_name = (
+        f"_review_visual_contrib_{spec.name.replace('-', '_')}_{uuid.uuid4().hex[:8]}"
+    )
     try:
         impl_spec = importlib.util.spec_from_file_location(mod_name, spec.entry_path)
         if impl_spec is None or impl_spec.loader is None:
@@ -312,8 +341,9 @@ class ContributedModule:
         tags = [t.lower() for t in self.activates_on]
         if any(t in requested for t in tags):
             return True
-        intent = (ctx.intent or "").lower()
-        if intent and any(t in intent for t in tags):
+        # Free-text intent match: any tag mentioned verbatim OR via a registered
+        # non-English synonym (e.g. a Russian caption saying "selected" — tg#6188).
+        if ctx.intent and any(intent_mentions_tag(ctx.intent, tag) for tag in tags):
             return True
         return False
 
@@ -329,7 +359,9 @@ class ContributedModule:
         fn = getattr(self._impl, "judge", None)
         if callable(fn):
             return fn(ctx, vision)
-        return ModuleVerdict(module=self.name, decision="abstain", confidence=0.0, reason="no judge")
+        return ModuleVerdict(
+            module=self.name, decision="abstain", confidence=0.0, reason="no judge"
+        )
 
     @property
     def _vision_field(self) -> str:
@@ -381,27 +413,74 @@ def load_modules(
         state, reason = _trust_state_for(spec, store)
         if state in ("untrusted", "changed"):
             _banner(spec, state)
-            _audit(env, module=spec.name, entry_sha256=sha, trust_state="quarantined", decision="absent", duration_ms=(time.time() - t0) * 1000)
+            _audit(
+                env,
+                module=spec.name,
+                entry_sha256=sha,
+                trust_state="quarantined",
+                decision="absent",
+                duration_ms=(time.time() - t0) * 1000,
+            )
             quarantined.append(Quarantined(spec.name, reason))
             continue
         # Trusted (or auto): load the entry.
         obj = _load_entry_object(spec)
         if obj is None:
-            _audit(env, module=spec.name, entry_sha256=sha, trust_state=state, decision="load-failed", duration_ms=(time.time() - t0) * 1000)
-            quarantined.append(Quarantined(spec.name, "entry did not expose a VisualModule (MODULE/module()/Module)"))
+            _audit(
+                env,
+                module=spec.name,
+                entry_sha256=sha,
+                trust_state=state,
+                decision="load-failed",
+                duration_ms=(time.time() - t0) * 1000,
+            )
+            quarantined.append(
+                Quarantined(
+                    spec.name,
+                    "entry did not expose a VisualModule (MODULE/module()/Module)",
+                )
+            )
             continue
         if not isinstance(obj, VisualModule):
-            _audit(env, module=spec.name, entry_sha256=sha, trust_state=state, decision="not-a-module", duration_ms=(time.time() - t0) * 1000)
-            quarantined.append(Quarantined(spec.name, "loaded object does not satisfy the VisualModule protocol"))
+            _audit(
+                env,
+                module=spec.name,
+                entry_sha256=sha,
+                trust_state=state,
+                decision="not-a-module",
+                duration_ms=(time.time() - t0) * 1000,
+            )
+            quarantined.append(
+                Quarantined(
+                    spec.name,
+                    "loaded object does not satisfy the VisualModule protocol",
+                )
+            )
             continue
-        loaded.append(ContributedModule(name=spec.name, activates_on=spec.activates_on, _impl=obj, entry_path=spec.entry_path))
+        loaded.append(
+            ContributedModule(
+                name=spec.name,
+                activates_on=spec.activates_on,
+                _impl=obj,
+                entry_path=spec.entry_path,
+            )
+        )
         trust_state = "trusted" if state == "trusted" else "auto"
-        _audit(env, module=spec.name, entry_sha256=sha, trust_state=trust_state, decision="loaded", duration_ms=(time.time() - t0) * 1000)
+        _audit(
+            env,
+            module=spec.name,
+            entry_sha256=sha,
+            trust_state=trust_state,
+            decision="loaded",
+            duration_ms=(time.time() - t0) * 1000,
+        )
     return loaded, quarantined
 
 
 # --- Subcommands (`review trust-module` / `review register-module`). ---------------
-def trust_module(name: str, *, project: Path | None = None, env: RegistryEnv | None = None) -> int:
+def trust_module(
+    name: str, *, project: Path | None = None, env: RegistryEnv | None = None
+) -> int:
     """Pin `{entry_sha256, activates_on}` for a discovered module (the untrusted-repo
     guard case). Re-hash the entry at pin time so a later load can detect tampering.
     Append-only audit.
@@ -420,12 +499,17 @@ def trust_module(name: str, *, project: Path | None = None, env: RegistryEnv | N
     specs = {s.name: s for s in discover_specs(project=project, env=env)}
     spec = specs.get(name)
     if spec is None:
-        print(f"review trust-module: no module named {name!r} discovered (looked in {project or Path.cwd()})", file=sys.stderr)
+        print(
+            f"review trust-module: no module named {name!r} discovered (looked in {project or Path.cwd()})",
+            file=sys.stderr,
+        )
         return 1
     try:
         sha = _entry_sha256(spec.entry_path)
     except OSError as exc:
-        print(f"review trust-module: cannot read entry for {name}: {exc}", file=sys.stderr)
+        print(
+            f"review trust-module: cannot read entry for {name}: {exc}", file=sys.stderr
+        )
         return 1
     store = _load_trust(env)
     store[name] = {
@@ -435,8 +519,17 @@ def trust_module(name: str, *, project: Path | None = None, env: RegistryEnv | N
         "trusted_at": time.time(),
     }
     _write_trust(env, store)
-    _audit(env, module=name, entry_sha256=sha, trust_state="trusted", decision="trust-pinned", duration_ms=0.0)
-    print(f"review: trusted module {name} (sha256 {sha[:12]}…, activates_on={spec.activates_on})")
+    _audit(
+        env,
+        module=name,
+        entry_sha256=sha,
+        trust_state="trusted",
+        decision="trust-pinned",
+        duration_ms=0.0,
+    )
+    print(
+        f"review: trusted module {name} (sha256 {sha[:12]}…, activates_on={spec.activates_on})"
+    )
     return 0
 
 
@@ -470,15 +563,19 @@ def register_module(manifest_path: str, *, env: RegistryEnv | None = None) -> in
     manifests.append(str(path))
     try:
         env.global_registry_path.parent.mkdir(parents=True, exist_ok=True)
-        env.global_registry_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        env.global_registry_path.write_text(
+            json.dumps(data, indent=2) + "\n", encoding="utf-8"
+        )
     except OSError as exc:
         # An unwritable registry (read-only FS, EPERM, ENOSPC) is a structured conflict +
         # non-zero exit, not a traceback — same install-* contract as the other writes (glm
         # review).
         # Conflicts go to STDOUT (consistent with install.py's `! conflict` lines) so a CI
         # scraper watching one stream catches every install-* failure (glm review).
-        print(f"review: ! conflict — registry {env.global_registry_path} could not be written "
-              f"({exc}). Fix permissions and re-run.")
+        print(
+            f"review: ! conflict — registry {env.global_registry_path} could not be written "
+            f"({exc}). Fix permissions and re-run."
+        )
         return 1
     print(f"review: + registered module manifest {path}")
     return 0

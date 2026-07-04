@@ -23,6 +23,7 @@ Proves:
 
 Everything is isolated to a tmp HOME so the real ~/.config is never touched.
 """
+
 from __future__ import annotations
 
 import json
@@ -44,7 +45,7 @@ from reviewlib.features.visual.module_api import VisualContext  # noqa: E402
 
 # A minimal contributed module source: a class exposing the VisualModule protocol with
 # an `activates_on`-driven activate + a CV block when a flag is set.
-_MODULE_SRC = '''\
+_MODULE_SRC = """\
 from reviewlib.features.visual.module_api import ModuleVerdict, VisualContext
 
 class _Mod:
@@ -65,10 +66,12 @@ class _Mod:
         return ModuleVerdict(module=self.name, decision="abstain", confidence=0.0, reason="stub")
 
 MODULE = _Mod()
-'''
+"""
 
 
-def _project_with_module(tmp: Path, *, src: str = _MODULE_SRC, activates_on=None) -> Path:
+def _project_with_module(
+    tmp: Path, *, src: str = _MODULE_SRC, activates_on=None
+) -> Path:
     review_dir = tmp / ".review"
     (review_dir / "modules").mkdir(parents=True, exist_ok=True)
     entry = review_dir / "modules" / "selection_highlight.py"
@@ -80,12 +83,16 @@ def _project_with_module(tmp: Path, *, src: str = _MODULE_SRC, activates_on=None
                 "name": "selection-highlight",
                 "runtime": "python",
                 "entry": ".review/modules/selection_highlight.py",
-                "activates_on": activates_on if activates_on is not None else ["selection"],
+                "activates_on": activates_on
+                if activates_on is not None
+                else ["selection"],
                 "description": "test module",
             }
         ],
     }
-    (review_dir / "visual-modules.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (review_dir / "visual-modules.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
     return tmp
 
 
@@ -154,7 +161,9 @@ def test_module_loads_and_runs_by_default_no_trust_step():
         home = Path(d) / "home"
         with _env_var("REVIEW_UNTRUSTED_MODULES", None):
             loaded, quarantined = reg.load_modules(project=proj, env=_env(home))
-        assert [m.name for m in loaded] == ["selection-highlight"], "default must load+run with no trust step"
+        assert [m.name for m in loaded] == ["selection-highlight"], (
+            "default must load+run with no trust step"
+        )
         assert quarantined == [], "no quarantine in the common (trusted-repo) path"
 
 
@@ -166,7 +175,9 @@ def test_untrusted_guard_quarantines_inert():
         home = Path(d) / "home"
         with _untrusted_guard():
             loaded, quarantined = reg.load_modules(project=proj, env=_env(home))
-        assert loaded == [], "under the guard an untrusted module must be inert (absent), not active"
+        assert loaded == [], (
+            "under the guard an untrusted module must be inert (absent), not active"
+        )
         assert any(q.name == "selection-highlight" for q in quarantined)
 
 
@@ -180,7 +191,9 @@ def test_trust_module_is_noop_without_guard():
         with _env_var("REVIEW_UNTRUSTED_MODULES", None):
             rc = reg.trust_module("selection-highlight", project=proj, env=env)
         assert rc == 0, "trust-module must succeed (no-op) in the default world"
-        assert not env.trust_path.exists(), "no trust pin is written when the guard is off"
+        assert not env.trust_path.exists(), (
+            "no trust pin is written when the guard is off"
+        )
 
 
 def test_trust_module_pins_sha_and_activates_under_guard():
@@ -246,7 +259,9 @@ def test_trust_auto_env_bypasses_quarantine_under_guard():
         env = _env(home)
         with _untrusted_guard(), _env_var("REVIEW_MODULES_TRUST", "auto"):
             loaded, quarantined = reg.load_modules(project=proj, env=env)
-        assert [m.name for m in loaded] == ["selection-highlight"], "auto-trust must load untrusted modules"
+        assert [m.name for m in loaded] == ["selection-highlight"], (
+            "auto-trust must load untrusted modules"
+        )
 
 
 def test_activation_gating_on_tag():
@@ -267,7 +282,12 @@ def test_activation_gating_on_tag():
         # --check by module NAME also force-activates.
         assert mod.activates(_ctx(requested_checks=["selection-highlight"])) is True
         # Intent mentioning the tag → active.
-        assert mod.activates(_ctx(intent="verify the selection outline renders")) is True
+        assert (
+            mod.activates(_ctx(intent="verify the selection outline renders")) is True
+        )
+        # tg#6188: a Russian intent mentioning the same concept must ALSO activate —
+        # not just the English tag substring.
+        assert mod.activates(_ctx(intent="проверь что элемент выбран")) is True
 
 
 def test_audit_log_appended_on_default_load():
@@ -280,9 +300,14 @@ def test_audit_log_appended_on_default_load():
         with _env_var("REVIEW_UNTRUSTED_MODULES", None):
             reg.load_modules(project=proj, env=env)
         assert env.audit_path.exists()
-        rows = [json.loads(line) for line in env.audit_path.read_text().splitlines() if line.strip()]
+        rows = [
+            json.loads(line)
+            for line in env.audit_path.read_text().splitlines()
+            if line.strip()
+        ]
         assert any(
-            r["module"] == "selection-highlight" and r["decision"] == "loaded" for r in rows
+            r["module"] == "selection-highlight" and r["decision"] == "loaded"
+            for r in rows
         ), "a default load must be audited"
 
 
@@ -295,14 +320,115 @@ def test_audit_log_appended_under_guard():
             # An untrusted load writes a quarantine audit row.
             reg.load_modules(project=proj, env=env)
             assert env.audit_path.exists()
-            rows = [json.loads(line) for line in env.audit_path.read_text().splitlines() if line.strip()]
-            assert any(r["module"] == "selection-highlight" and r["trust_state"] == "quarantined" for r in rows)
+            rows = [
+                json.loads(line)
+                for line in env.audit_path.read_text().splitlines()
+                if line.strip()
+            ]
+            assert any(
+                r["module"] == "selection-highlight"
+                and r["trust_state"] == "quarantined"
+                for r in rows
+            )
             # Trust + a successful load appends a trusted row (append-only — old rows kept).
             reg.trust_module("selection-highlight", project=proj, env=env)
             reg.load_modules(project=proj, env=env)
-            rows2 = [json.loads(line) for line in env.audit_path.read_text().splitlines() if line.strip()]
+            rows2 = [
+                json.loads(line)
+                for line in env.audit_path.read_text().splitlines()
+                if line.strip()
+            ]
         assert len(rows2) > len(rows), "audit is append-only"
         assert any(r["trust_state"] == "trusted" for r in rows2)
+
+
+def _run_selection_pipeline(tmp_dir: Path, *, requested_checks=None, intent=None):
+    """Shared end-to-end harness: a project that contributes the real
+    selection-highlight module (the reference contrib impl), a styled render with NO
+    selection outline, and a mock vision that would otherwise `keep`. Returns
+    (verdict, call_log) so a caller can assert the module veto fired via WHATEVER
+    activation path it passes (--check via `requested_checks`, or free-text `intent`)
+    without duplicating the registry/pipeline isolation plumbing."""
+    from reviewlib.features.visual import pipeline as pl
+    from reviewlib.features.visual.vision_client import VisionVerdict
+
+    home = tmp_dir / "home"
+    env = _env(home)
+    # The project manifest points at the SHIPPED contrib reference module.
+    contrib = (
+        REPO_ROOT
+        / "reviewlib"
+        / "features"
+        / "visual"
+        / "contrib"
+        / "selection_highlight.py"
+    )
+    proj = tmp_dir / "proj"
+    review_dir = proj / ".review"
+    review_dir.mkdir(parents=True)
+    manifest = {
+        "review_api": "review-visual/v1",
+        "modules": [
+            {
+                "name": "selection-highlight",
+                "runtime": "python",
+                "entry": str(contrib),  # absolute entry → resolved as-is
+                "activates_on": ["selection"],
+                "description": "reference selection-highlight",
+            }
+        ],
+    }
+    (review_dir / "visual-modules.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    # Point the registry's default env at our isolated HOME so load_modules (called
+    # inside run_pipeline with no env) uses it.
+    import reviewlib.features.visual.registry as regmod
+
+    old_trust = regmod._default_trust_path
+    old_glob = regmod._default_global_registry_path
+    old_audit = regmod._default_audit_path
+    regmod._default_trust_path = lambda: env.trust_path
+    regmod._default_global_registry_path = lambda: env.global_registry_path
+    regmod._default_audit_path = lambda: env.audit_path
+    # Also reset the once-per-process banner set so the load path is clean.
+    regmod._BANNERED.clear()
+    guard = _env_var("REVIEW_UNTRUSTED_MODULES", None)  # default world: no trust step
+    guard.__enter__()
+    try:
+        img = Path(tempfile.mkstemp(suffix="-nosel.png")[1])
+        vf.styled_render(img)  # styled, but NO selection outline
+
+        # A mock vision keep would otherwise pass — the module veto must win, and it
+        # must short-circuit BEFORE any vision call.
+        call_log: list = []
+
+        def fake_call(model, **kwargs):
+            call_log.append(model)
+            return VisionVerdict(available=True, verdict="keep", confidence=1.0)
+
+        old_call = pl.call_ai_vision
+        old_select = pl.select_vision_backend
+        pl.call_ai_vision = fake_call
+        pl.select_vision_backend = lambda models: "gemini"
+        try:
+            v = pl.run_pipeline(
+                img,
+                models=["gemini"],
+                requested_checks=requested_checks or [],
+                intent=intent,
+                project=proj,
+            )
+        finally:
+            pl.call_ai_vision = old_call
+            pl.select_vision_backend = old_select
+    finally:
+        guard.__exit__(None, None, None)
+        regmod._default_trust_path = old_trust
+        regmod._default_global_registry_path = old_glob
+        regmod._default_audit_path = old_audit
+    return v, call_log
 
 
 def test_pipeline_folds_contributed_selection_module():
@@ -311,75 +437,49 @@ def test_pipeline_folds_contributed_selection_module():
     step). On a styled render with NO selection outline + --check selection, the
     module's cv_check BLOCKS → the pipeline rolls back with NO vision call (the
     registry → pipeline path)."""
-    from reviewlib.features.visual import pipeline as pl
-    from reviewlib.features.visual.vision_client import VisionVerdict
-
     with tempfile.TemporaryDirectory() as d:
-        home = Path(d) / "home"
-        env = _env(home)
-        # The project manifest points at the SHIPPED contrib reference module.
-        contrib = REPO_ROOT / "reviewlib" / "features" / "visual" / "contrib" / "selection_highlight.py"
-        proj = Path(d) / "proj"
-        review_dir = proj / ".review"
-        review_dir.mkdir(parents=True)
-        manifest = {
-            "review_api": "review-visual/v1",
-            "modules": [
-                {
-                    "name": "selection-highlight",
-                    "runtime": "python",
-                    "entry": str(contrib),  # absolute entry → resolved as-is
-                    "activates_on": ["selection"],
-                    "description": "reference selection-highlight",
-                }
-            ],
-        }
-        (review_dir / "visual-modules.json").write_text(json.dumps(manifest), encoding="utf-8")
+        v, call_log = _run_selection_pipeline(Path(d), requested_checks=["selection"])
 
-        # Point the registry's default env at our isolated HOME so load_modules (called
-        # inside run_pipeline with no env) uses it.
-        import reviewlib.features.visual.registry as regmod
-
-        old_trust = regmod._default_trust_path
-        old_glob = regmod._default_global_registry_path
-        old_audit = regmod._default_audit_path
-        regmod._default_trust_path = lambda: env.trust_path
-        regmod._default_global_registry_path = lambda: env.global_registry_path
-        regmod._default_audit_path = lambda: env.audit_path
-        # Also reset the once-per-process banner set so the load path is clean.
-        regmod._BANNERED.clear()
-        guard = _env_var("REVIEW_UNTRUSTED_MODULES", None)  # default world: no trust step
-        guard.__enter__()
-        try:
-            img = Path(tempfile.mkstemp(suffix="-nosel.png")[1])
-            vf.styled_render(img)  # styled, but NO selection outline
-
-            # A mock vision keep would otherwise pass — the module veto must win, and it
-            # must short-circuit BEFORE any vision call.
-            call_log: list = []
-
-            def fake_call(model, **kwargs):
-                call_log.append(model)
-                return VisionVerdict(available=True, verdict="keep", confidence=1.0)
-
-            old_call = pl.call_ai_vision
-            old_select = pl.select_vision_backend
-            pl.call_ai_vision = fake_call
-            pl.select_vision_backend = lambda models: "gemini"
-            try:
-                v = pl.run_pipeline(img, models=["gemini"], requested_checks=["selection"], project=proj)
-            finally:
-                pl.call_ai_vision = old_call
-                pl.select_vision_backend = old_select
-        finally:
-            guard.__exit__(None, None, None)
-            regmod._default_trust_path = old_trust
-            regmod._default_global_registry_path = old_glob
-            regmod._default_audit_path = old_audit
-
-        assert v.final == "rollback", f"missing selection must veto via the contributed module, got {v.final}"
+        assert v.final == "rollback", (
+            f"missing selection must veto via the contributed module, got {v.final}"
+        )
         assert "selection-highlight" in v.reason
         assert call_log == [], "module veto must short-circuit before the vision call"
+
+
+def test_pipeline_folds_contributed_selection_module_via_russian_intent():
+    """The tg#6188 regression, fully end-to-end (not just unit-level `activates()`):
+    NO `--check`/`requested_checks` at all — activation must come ENTIRELY from a
+    Russian free-text `--intent` flowing through `intent_mentions_tag` ->
+    `ContributedModule.activates` -> the registry -> `run_pipeline`. If that wiring
+    ever breaks, this is the test that catches it (a unit test on `activates()` alone,
+    or a `cv_check()` call that bypasses activation, would not)."""
+    with tempfile.TemporaryDirectory() as d:
+        v, call_log = _run_selection_pipeline(
+            Path(d), intent="на экране элемент выбран"
+        )
+
+        assert v.final == "rollback", (
+            f"Russian intent must activate the module and veto the missing outline, got {v.final}"
+        )
+        assert "selection-highlight" in v.reason
+        assert call_log == [], "module veto must short-circuit before the vision call"
+
+
+def test_pipeline_negated_russian_intent_does_not_falsely_veto():
+    """The negation half of the SAME end-to-end path: an intent that explicitly DENIES a
+    selection ("элемент не выбран") must NOT activate the module — so `run_pipeline`
+    falls through to vision (mocked `keep`) instead of a spurious rollback on a render
+    that never claimed a selection in the first place."""
+    with tempfile.TemporaryDirectory() as d:
+        v, call_log = _run_selection_pipeline(Path(d), intent="элемент не выбран")
+
+        assert v.final == "keep", (
+            f"a negated intent must not spuriously veto a render with no selection claim, got {v.final}"
+        )
+        assert call_log == ["gemini"], (
+            "with the module inactive, vision must be called as usual"
+        )
 
 
 def test_global_registered_manifest_discovered():
@@ -391,12 +491,16 @@ def test_global_registered_manifest_discovered():
         env = _env(home)
         env.global_registry_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path = proj / ".review" / "visual-modules.json"
-        env.global_registry_path.write_text(json.dumps({"manifests": [str(manifest_path)]}), encoding="utf-8")
+        env.global_registry_path.write_text(
+            json.dumps({"manifests": [str(manifest_path)]}), encoding="utf-8"
+        )
         # Discover with a DIFFERENT (empty) project dir — the global registry still finds it.
         empty = Path(d) / "empty-cwd"
         empty.mkdir()
         specs = reg.discover_specs(project=empty, env=env)
-        assert any(s.name == "selection-highlight" for s in specs), "global registry manifest not discovered"
+        assert any(s.name == "selection-highlight" for s in specs), (
+            "global registry manifest not discovered"
+        )
 
 
 if __name__ == "__main__":
