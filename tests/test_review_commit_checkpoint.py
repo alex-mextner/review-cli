@@ -49,7 +49,12 @@ from reviewlib.modes.review import (  # noqa: E402
     mode_review,
 )
 
-_ENV_VARS = ("REVIEW_FAKE_BACKEND",)
+# Mirrors tests/test_review_marker.py's _MARKER_ENV: REVIEW_MARKER/HOME are sandboxed too,
+# because a genuine ok+staged run through mode_review touches the review marker as a side
+# effect (_stamp_if_staged_commit_review) -- without this, running this file standalone would
+# mutate the developer's real ~/.cache/agent-tools/last-review (codex review finding on this
+# feature's own PR).
+_ENV_VARS = ("REVIEW_FAKE_BACKEND", "REVIEW_MARKER", "HOME")
 
 
 class _EnvSandbox:
@@ -76,7 +81,10 @@ def _init_git_repo(path: Path) -> None:
 
 
 def _make_staged_repo(tmp: Path, *, filename: str = "a.txt") -> tuple[Path, str]:
-    """A real repo with one staged change. Returns (repo, staged_diff)."""
+    """A real repo with one staged change. Returns (repo, staged_diff). Also redirects
+    REVIEW_MARKER under `tmp` so a genuine ok+staged review in the caller never touches the
+    developer's real ~/.cache/agent-tools/last-review."""
+    os.environ["REVIEW_MARKER"] = str(tmp / "last-review")
     repo = tmp / "repo"
     repo.mkdir()
     _init_git_repo(repo)
@@ -278,6 +286,43 @@ def test_commit_hook_failure_is_a_distinct_exit_code():
         stderr_text = stderr_capture.getvalue()
         assert "checkpoint" in stderr_text.lower()
         assert "blocked by hook" in stderr_text
+
+
+def test_index_drift_since_review_refuses_to_checkpoint():
+    """TOCTOU guard (codex review finding on this feature's own PR): a review is
+    multi-minute / multi-model, leaving a window in which another process/session sharing
+    the same checkout could stage additional changes. If the staged index no longer
+    matches the diff that was actually reviewed by the time --commit runs, the checkpoint
+    must REFUSE (EXIT_COMMIT_FAILED) rather than silently commit unreviewed/unrelated
+    staged work -- exactly the "sweep in someone else's changes" accident this feature
+    exists to prevent."""
+    with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        repo, diff = _make_staged_repo(tmp)
+        os.environ["REVIEW_FAKE_BACKEND"] = "1"
+        # Simulate drift: something stages an EXTRA file AFTER `diff` was captured (the
+        # snapshot the review actually ran against) but BEFORE the checkpoint commit fires.
+        (repo / "b.txt").write_text("sneaky\n", encoding="utf-8")
+        subprocess.run(["git", "add", "b.txt"], cwd=repo, check=True)
+        before = _head_count(repo)
+
+        import contextlib
+        import io
+
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            rc = mode_review(
+                ["codex"],
+                prompt="p",
+                diff=diff,
+                cwd=repo,
+                timeout=30,
+                staged=True,
+                commit=True,
+            )
+        assert rc == EXIT_COMMIT_FAILED, rc
+        assert _head_count(repo) == before, "drifted index must NOT be checkpointed"
+        assert "changed since the review ran" in stderr_capture.getvalue()
 
 
 def test_board_path_commit_checkpoint():

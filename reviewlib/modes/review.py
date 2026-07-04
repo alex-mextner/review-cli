@@ -148,7 +148,7 @@ def mode_review(
     print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))
     ok = all(result.returncode == 0 for result in results)
     _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
-    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd)
+    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd, diff)
     if override is not None:
         return override
     return 0 if ok else 1
@@ -178,20 +178,56 @@ def _stamp_if_staged_commit_review(
 _CHECKPOINT_COMMIT_MESSAGE = "chore: checkpoint via review diff --staged --commit"
 
 
-def _checkpoint_commit(cwd: Path) -> tuple[bool, str]:
+def _current_staged_diff(cwd: Path) -> str | None:
+    """Re-derive the CURRENT staged diff, anchored `-C <cwd>` AND pinned via
+    `git_repo_env(cwd)` — the exact same invocation shape as `cli._git_diff` (review-
+    cli#71/#72), so a foreign GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE can't divert the
+    comparison to the wrong repo. Returns None on ANY failure (spawn error, timeout,
+    non-zero git diff) — the caller treats "can't verify" the same as "verification
+    failed": don't commit."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--cached"],
+            cwd=cwd, env=git_repo_env(cwd),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _checkpoint_commit(cwd: Path, reviewed_diff: str) -> tuple[bool, str]:
     """Create the real checkpoint commit of the currently-staged index.
 
     Anchored `-C <cwd>` AND a pinned `git_repo_env(cwd)` (review-cli#71/#72, the same
     reasoning as `cli._git_diff`): a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE pointing
     at a FOREIGN repo must not divert this commit to the wrong tree.
 
+    TOCTOU guard (codex review finding on this feature's own PR): a review is
+    multi-minute / multi-model, leaving a window in which another process or session
+    sharing the same checkout could stage additional changes. Before committing, this
+    re-reads the CURRENT staged diff (`_current_staged_diff`) and refuses to checkpoint
+    if it no longer matches `reviewed_diff` — otherwise `--commit` could silently commit
+    unreviewed/unrelated staged work, which is exactly the "sweep in someone else's
+    changes" accident class this whole feature exists to prevent.
+
     This is a REAL `git commit` — it runs the repo's own commit-msg/pre-commit hooks
     (lint/typecheck/tests, conventional-commit format) and can genuinely fail on a red
     tree or a malformed message. It never passes `--no-verify`: bypassing that gate is
     exactly the kind of accident this feature exists to prevent, not reproduce under a
     new flag. Returns `(succeeded, detail)` — `detail` is empty on success, else a short
-    explanation (spawn error, or git's own stderr/stdout) for the caller to report.
+    explanation (drift detected, spawn error, or git's own stderr/stdout) for the caller
+    to report.
     """
+    current_diff = _current_staged_diff(cwd)
+    if current_diff is None:
+        return False, "could not re-read the staged diff to verify it is still the reviewed one"
+    if current_diff != reviewed_diff:
+        return False, (
+            "the staged diff changed since the review ran (another process/session may "
+            "have touched the index) — refusing to checkpoint a diff that was never reviewed"
+        )
     try:
         proc = _run(
             ["git", "-C", str(cwd), "commit", "-m", _CHECKPOINT_COMMIT_MESSAGE],
@@ -205,7 +241,7 @@ def _checkpoint_commit(cwd: Path) -> tuple[bool, str]:
 
 
 def _checkpoint_if_requested(
-    commit: bool, ok: bool, diff_from_stdin: bool, cwd: Path,
+    commit: bool, ok: bool, diff_from_stdin: bool, cwd: Path, diff: str,
 ) -> int | None:
     """Create the `--commit` checkpoint commit after a review, if requested.
 
@@ -244,7 +280,7 @@ def _checkpoint_if_requested(
             file=sys.stderr, flush=True,
         )
         return None
-    succeeded, detail = _checkpoint_commit(cwd)
+    succeeded, detail = _checkpoint_commit(cwd, diff)
     if succeeded:
         print("[review-cli] --commit: checkpoint commit created.", file=sys.stderr, flush=True)
         return None
@@ -309,7 +345,7 @@ def _mode_review_board(
     # shortfall (reserve exhausted) does.
     ok = not outcome.degraded
     _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
-    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd)
+    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd, diff)
     if override is not None:
         return override
     return 0 if ok else 1

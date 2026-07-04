@@ -158,7 +158,10 @@ existing `--staged` commit-hook stamp already follows. The checkpoint is a real 
 it runs the repo's own commit-msg/pre-commit hooks; if a hook rejects it, `--commit` fails
 loudly with a distinct exit code rather than silently skipping the checkpoint. `--commit`
 without `--staged` is a usage error (there is no unstaged/piped diff to checkpoint against).
-This is the recommended default for any review loop that might need multiple rounds.
+A review is multi-minute, so `--commit` also re-checks the staged index right before
+committing and refuses (same distinct exit code) if it drifted from what was actually
+reviewed — it never commits changes another process/session staged in the meantime. This
+is the recommended default for any review loop that might need multiple rounds.
 
 ---
 

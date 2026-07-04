@@ -52,8 +52,12 @@ semantic versioning.
   committed, since `ok` means the pool produced usable verdicts, not "zero findings". The
   commit runs the repo's own commit-msg/pre-commit hooks (never bypassed with
   `--no-verify`); if a hook rejects it, `--commit` fails loudly with its own distinct exit
-  code rather than silently skipping the checkpoint. README/AGENTS.md now explicitly warn
-  against `git reset --hard` mid-review-cycle and name the safe alternatives.
+  code rather than silently skipping the checkpoint. Because a review is multi-minute,
+  `--commit` also re-reads the staged index right before committing and refuses (same
+  distinct exit code) if it drifted from the diff that was actually reviewed — a TOCTOU
+  guard against silently committing unreviewed/unrelated work another process/session
+  staged in the meantime. README/AGENTS.md now explicitly warn against `git reset --hard`
+  mid-review-cycle and name the safe alternatives.
 - **Review iterations are now task-coded (review-cli#108).** All recorded review modes now
   require `--task CODE` (or `$REVIEW_TASK_CODE`) before dispatch, and the code is persisted
   into run-stats plus per-call/brainstorm logs. `review task [CODE]` lists task iterations,
