@@ -27,8 +27,8 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from reviewlib import cli
-from reviewlib.dashboard import service as svc
+from reviewlib import cli  # noqa: E402
+from reviewlib.dashboard import service as svc  # noqa: E402
 
 # The `Service` DESCRIPTOR tests below build a real `agenttools_service.Service`, so they only
 # run when the shared service lib is installed (the `[dashboard]` extra). CI installs the core
