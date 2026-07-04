@@ -44,6 +44,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.modes import review as review_mode  # noqa: E402
 from reviewlib.modes.review import (  # noqa: E402
+    _CHECKPOINT_COMMIT_MESSAGE,
     EXIT_COMMIT_FAILED,
     EXIT_COMMIT_REQUIRES_STAGED,
     mode_review,
@@ -323,6 +324,274 @@ def test_index_drift_since_review_refuses_to_checkpoint():
         assert rc == EXIT_COMMIT_FAILED, rc
         assert _head_count(repo) == before, "drifted index must NOT be checkpointed"
         assert "changed since the review ran" in stderr_capture.getvalue()
+
+
+def test_hook_mutating_index_during_commit_is_undone_not_checkpointed():
+    """P1 codex finding on this feature's own PR (review-cli#120): a pre-commit hook that
+    auto-formats/lint-`--fix`es and RE-STAGES a file, then exits 0, lets `git commit`
+    succeed -- but the tree it commits is read from the index AS IT STANDS once the hook
+    finishes, which can now hold more than the reviewed diff. The TOCTOU guard exercised in
+    test_index_drift_since_review_refuses_to_checkpoint only catches drift BEFORE `git
+    commit` runs; it cannot catch a hook that mutates the index as a side effect of that
+    SAME call, since the tree snapshot happens after the hook exits, not before. This must
+    be caught AFTER the fact by re-diffing the produced commit against the reviewed diff,
+    and the bad commit undone (index/working tree left alone) rather than kept."""
+    with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        repo, diff = _make_staged_repo(tmp)
+        os.environ["REVIEW_FAKE_BACKEND"] = "1"
+        hook = repo / ".git" / "hooks" / "pre-commit"
+        # Mirrors an auto-format/lint-staged hook: stages an EXTRA file, then exits 0 --
+        # git commits using the index AS IT NOW STANDS, not the one that was reviewed.
+        hook.write_text(
+            "#!/bin/sh\necho sneaky > b.txt\ngit add b.txt\nexit 0\n", encoding="utf-8"
+        )
+        hook.chmod(0o755)
+        before = _head_count(repo)
+
+        import contextlib
+        import io
+
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            rc = mode_review(
+                ["codex"],
+                prompt="p",
+                diff=diff,
+                cwd=repo,
+                timeout=30,
+                staged=True,
+                commit=True,
+            )
+        assert rc == EXIT_COMMIT_FAILED, rc
+        assert _head_count(repo) == before, (
+            "a hook that smuggled in an extra file must be undone, not checkpointed"
+        )
+        # b.txt must never have landed in history — the checkpoint's whole point is to
+        # commit ONLY the reviewed diff, and the hook's file was never reviewed.
+        history = subprocess.run(
+            ["git", "-C", str(repo), "log", "--all", "--name-only", "--format="],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "b.txt" not in history, (
+            "the hook's extra file must never land in history"
+        )
+        # The hook's own staged change is left in the index for the user to inspect --
+        # neither lost nor silently swept into the checkpoint.
+        status = subprocess.run(
+            ["git", "-C", str(repo), "status", "--short"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "b.txt" in status, (
+            "the hook's staged file must survive the undo, untouched"
+        )
+        stderr_text = stderr_capture.getvalue()
+        assert "hook" in stderr_text.lower()
+
+
+def test_verify_checkpoint_uses_the_passed_sha_not_a_stale_head():
+    """P1 codex finding on this feature's own PR (review-cli#120): verification/undo MUST
+    identify the checkpoint commit by the exact SHA passed in (in the real flow, parsed
+    from `git commit`'s own stdout summary line via `_parse_new_commit_sha`), never by
+    re-reading `HEAD` afterward -- HEAD can have moved past our commit by the time
+    verification runs (a post-commit hook, or a concurrent session sharing the checkout,
+    making its own commit). A naive `rev-parse HEAD` would then verify/undo THAT later
+    commit instead of ours -- in the worst case resetting away a commit we have no
+    business touching.
+
+    Exercises `_verify_checkpoint_matches_review` directly against a checkpoint sha while
+    HEAD has since moved on to an unrelated commit -- this can't accidentally pass by
+    coincidentally reading HEAD, since HEAD deliberately points somewhere else.
+
+    Both raw commits below pass REVIEW_SKIP=1: this test is exercising pure git-plumbing
+    behaviour of the new verification function, not the review-marker gate (covered by
+    the other tests in this file), and the ambient machine's own ~/.config/git/hooks
+    pre-commit gate (this repo's sibling `review-gate` hook, installed globally) would
+    otherwise refuse a commit with no recorded review, unrelated to what this test checks.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        _init_git_repo(repo)
+        env = {**os.environ, "REVIEW_SKIP": "1"}
+        (repo / "a.txt").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)
+        reviewed_diff = subprocess.run(
+            ["git", "diff", "--cached"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        subprocess.run(
+            ["git", "commit", "-m", _CHECKPOINT_COMMIT_MESSAGE],
+            cwd=repo,
+            env=env,
+            check=True,
+        )
+        checkpoint_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        # Simulate something advancing HEAD after our checkpoint (a post-commit hook, or a
+        # concurrent session sharing the checkout) -- an unrelated commit lands on top.
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "unrelated later commit"],
+            cwd=repo,
+            env=env,
+            check=True,
+        )
+        later_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert later_sha != checkpoint_sha
+
+        detail = review_mode._verify_checkpoint_matches_review(
+            repo, checkpoint_sha, reviewed_diff
+        )
+        assert detail == "", (
+            f"verification against the correct sha must succeed: {detail!r}"
+        )
+        # Nothing must have been touched: HEAD is still the later commit, and the
+        # checkpoint commit is untouched underneath it.
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert head_after == later_sha, "the later, unrelated commit must be left alone"
+
+
+def test_undo_refuses_when_head_moved_past_the_mismatched_commit():
+    """P1 codex finding on this feature's own PR (review-cli#120): the undo must use a
+    compare-and-swap (`git update-ref <ref> <new> <old>`), not a blind `git reset --soft`
+    -- a blind reset acts on whatever HEAD CURRENTLY is, so if HEAD has already moved past
+    the mismatched commit (a post-commit hook, or a concurrent session, made its own
+    commit on top) before the undo runs, a blind reset would silently drag that later,
+    unrelated commit backwards too -- discarding it as collateral damage.
+
+    Here `sha`'s diff will NOT match `reviewed_diff` (a genuine mismatch, same shape as
+    the hook-mutation case), but by the time verification runs, HEAD has already advanced
+    past `sha`. The undo must REFUSE (return a non-empty detail, nothing touched) rather
+    than reset the later commit away."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        _init_git_repo(repo)
+        env = {**os.environ, "REVIEW_SKIP": "1"}
+        (repo / "a.txt").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)
+        reviewed_diff = "this reviewed diff will never match the real commit below\n"
+        subprocess.run(
+            ["git", "commit", "-m", _CHECKPOINT_COMMIT_MESSAGE],
+            cwd=repo,
+            env=env,
+            check=True,
+        )
+        checkpoint_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "unrelated later commit"],
+            cwd=repo,
+            env=env,
+            check=True,
+        )
+        later_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        detail = review_mode._verify_checkpoint_matches_review(
+            repo, checkpoint_sha, reviewed_diff
+        )
+        assert detail != "", (
+            "a genuine content mismatch must be reported, not swallowed"
+        )
+        assert (
+            "could not" in detail.lower() or "not be safely undone" in detail.lower()
+        ), f"must explain the undo was refused, not silently attempted: {detail!r}"
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert head_after == later_sha, (
+            "the later, unrelated commit must survive -- the CAS must refuse, not reset it away"
+        )
+
+
+def test_parse_new_commit_sha_handles_detached_head():
+    """P2 codex finding on this feature's own PR (review-cli#120): `git commit`'s summary
+    line reads `[detached HEAD abc1234] message` in detached HEAD state -- "detached HEAD"
+    is TWO words where every other ref-description is a single branch-name token. Without
+    a dedicated alternative in the regex, parsing silently fails and the checkpoint is
+    reported as failed even though the commit itself succeeded and is perfectly fine."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        _init_git_repo(repo)
+        env = {**os.environ, "REVIEW_SKIP": "1"}
+        (repo / "a.txt").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "a.txt"], cwd=repo, env=env, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"], cwd=repo, env=env, check=True
+        )
+        first_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "--detach", first_sha], cwd=repo, env=env, check=True
+        )
+        (repo / "b.txt").write_text("world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "b.txt"], cwd=repo, env=env, check=True)
+        commit_proc = subprocess.run(
+            ["git", "commit", "-m", _CHECKPOINT_COMMIT_MESSAGE],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "detached HEAD" in commit_proc.stdout, (
+            f"test setup assumption broken -- expected detached-HEAD summary line, got: "
+            f"{commit_proc.stdout!r}"
+        )
+        parsed = review_mode._parse_new_commit_sha(repo, commit_proc.stdout)
+        expected_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert parsed == expected_sha, (
+            f"must parse the detached-HEAD commit summary correctly: got {parsed!r}, "
+            f"expected {expected_sha!r}"
+        )
 
 
 def test_board_path_commit_checkpoint():
