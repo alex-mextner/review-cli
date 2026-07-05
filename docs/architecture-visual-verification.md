@@ -483,6 +483,8 @@ class VisualModule(Protocol):
   "is this a bare unstyled render?" vision question). Activates by default on any `--visual`.
 - `blank-frame` — blank/FOUC/solid-canvas detector. Activates by default.
 - `error-overlay` — dev-server / runtime error-overlay detector. Activates by default.
+- `error-text` — vision-only runtime error/exception/failure text detector, with no CV pre-filter.
+  Activates by default.
 
 The per-project `selection-highlight` module (§6) is the worked example of a *contributed*
 module — it is NOT built into review.
@@ -676,8 +678,8 @@ subcommand — plain `tg "msg"` never touches the hook path.
 `~/.agents/skills/review/hooks/pre_send_photo.py` reads the stdin JSON
 (`{tool:"tg", point:"pre-send-photo", args:{image_path, caption, chat_id}}`), runs
 `review visual <image_path> --json --strict` (default modules: style-presence, blank-frame,
-error-overlay; `--check selection` is NOT added by default — the hook judges generic
-"is this a real styled render"), and maps the verdict:
+error-overlay, error-text; `--check selection` is NOT added by default — the hook judges
+generic "is this a real styled render"), and maps the verdict:
 
 - `keep` → `decision: "allow"`, exit 0.
 - `rollback` (unstyled/broken/blank) → `decision: "block"`, JSON `message` from the verdict

@@ -1,8 +1,8 @@
 """reviewlib.features.visual — image-only visual-verification pipeline.
 
 Stage 1 (core): the deterministic cvGate, the multimodal callAIVision path, the
-policy engine, the contract, and the orchestrating pipeline — plus the three built-in
-modules. `review visual <image>` runs this standalone and
+policy engine, the contract, and the orchestrating pipeline — plus the built-in
+modules (`modules/builtins.py`). `review visual <image>` runs this standalone and
 the same machinery is threaded into a companion mode's call when `--visual` rides
 `--brainstorm`/`--quorum`/the default diff-review.
 
@@ -25,6 +25,7 @@ Stages NOT yet built (clear extension points left in place):
     to the known-good cache shipped here; slots in behind the same --no-local-model flag.
   * Stage 3 — the `tg --photo` pre-send hook integration (§7).
 """
+
 from __future__ import annotations
 
 from .compose import VisualComposition, build_mode_visual_context
