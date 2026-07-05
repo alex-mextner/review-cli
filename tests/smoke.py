@@ -654,7 +654,7 @@ _UNIT_FILES = [
 _VISUAL_UNIT_FILES = frozenset({
     "test_cv_gate.py", "test_vision_client.py", "test_policy_engine.py", "test_pipeline.py",
     "test_preclassifier.py", "test_visual_compose.py", "test_visual_registry.py",
-    "test_selection_highlight.py", "test_visual_fanout.py",
+    "test_selection_highlight.py", "test_error_text_module.py", "test_visual_fanout.py",
 })
 
 
@@ -700,7 +700,7 @@ def test_visual_verification_suite():
     for fname in (
         "test_cv_gate.py", "test_vision_client.py", "test_policy_engine.py", "test_pipeline.py",
         "test_preclassifier.py", "test_visual_compose.py", "test_visual_registry.py",
-        "test_selection_highlight.py", "test_visual_fanout.py",
+        "test_selection_highlight.py", "test_error_text_module.py", "test_visual_fanout.py",
     ):
         run_unit(fname)
 

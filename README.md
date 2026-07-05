@@ -598,7 +598,7 @@ cost-saver) and forces every cvGate pass-through to the paid AI-vision call.
 ### Modules
 
 Each visual check is an independent, self-selecting **module** that declares *when it
-activates*. Built-ins: `style-presence`, `blank-frame`, `error-overlay`. A module contributes a
+activates*. Built-ins: `style-presence`, `blank-frame`, `error-overlay`, `error-text`. A module contributes a
 cheap `cv_check` pre-filter and/or `vision_questions` folded into the multimodal call, plus a
 `judge` that can veto a keep. Force-activate one with `--check <name>`; otherwise modules
 self-select from `--intent` / `--expect`.

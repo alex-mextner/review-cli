@@ -5,6 +5,11 @@ semantic versioning.
 
 ## Unreleased
 
+- **Visible error text is now a built-in visual veto (review-cli#121).** The visual verifier
+  asks the existing vision-LLM pass whether any on-screen text reads as a real runtime
+  error, exception, or failure diagnostic. Because arbitrary error text has no reliable
+  cvGate pixel signature, the new `error-text` module has no CV pre-filter and only blocks
+  when the vision answer explicitly sets `error_text_visible=true`.
 - **Review iterations are now task-coded (review-cli#108).** All recorded review modes now
   require `--task CODE` (or `$REVIEW_TASK_CODE`) before dispatch, and the code is persisted
   into run-stats plus per-call/brainstorm logs. `review task [CODE]` lists task iterations,
