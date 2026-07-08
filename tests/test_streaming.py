@@ -3,8 +3,8 @@
 
 Proves the two properties the streaming runner must guarantee:
   (a) child stdout reaches the live LOG FILE incrementally, BEFORE the child exits;
-  (b) a timeout PRESERVES the partial accumulated output (non-empty stdout + a clear
-      TIMEOUT marker) and a non-zero returncode, instead of raising the buffer away.
+  (b) an idle timeout PRESERVES the partial accumulated output (non-empty stdout + a
+      clear TIMEOUT marker) and a non-zero returncode, instead of raising the buffer away.
 
 Uses a fake slow command we control (a tiny python one-liner) so the test never
 depends on codex/gemini/claude/opencode being installed.
@@ -16,6 +16,7 @@ package directly — the RUNTIME behaviour is unchanged.
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -28,6 +29,29 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import reviewlib as review  # noqa: E402  (package façade re-exports the public surface)
 from reviewlib import backends as review_backends  # noqa: E402  (backends patch target)
+import reviewlib.process as process  # noqa: E402
+
+
+def _with_env(**env):
+    class _Ctx:
+        def __enter__(self):
+            self._saved = {k: os.environ.get(k) for k in env}
+            for k, v in env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            return self
+
+        def __exit__(self, *exc):
+            for k, old in self._saved.items():
+                if old is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = old
+            return False
+
+    return _Ctx()
 
 
 # A fake backend that prints one line every 0.4s for N lines, flushing each line,
@@ -94,8 +118,13 @@ def test_log_file_grows_incrementally_before_exit():
 
 
 def test_timeout_preserves_partial_output():
-    """(b) On timeout, return partial stdout + a TIMEOUT marker and rc 124."""
-    argv = _slow_argv(lines=40, interval=0.4)  # ~16s; we cut it off at 2s
+    """(b) On idle timeout, return partial stdout + a TIMEOUT marker and rc 124."""
+    code = (
+        "import time\n"
+        "print('line-0', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    argv = [sys.executable, "-c", code]
 
     result = review._run_streamed(
         argv,
@@ -111,6 +140,64 @@ def test_timeout_preserves_partial_output():
     assert result.stdout.strip(), "partial output was lost on timeout (stdout empty)"
     assert "line-0" in result.stdout, "early lines missing from the preserved buffer"
     assert "TIMEOUT" in result.stdout, "TIMEOUT marker missing from the preserved buffer"
+
+
+def test_periodic_output_resets_idle_timeout():
+    """A backend that keeps writing progress must run longer than one idle window."""
+    argv = _slow_argv(lines=5, interval=0.4)  # total runtime ~2s; idle window is 1s
+
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="1"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=1,
+            backend="fake-progress",
+            round_no=9,
+        )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "line-4" in result.stdout
+    assert "TIMEOUT" not in result.stdout
+
+
+def test_wall_timeout_ignores_periodic_output():
+    """Bounded surfaces can request an exact wall-clock timeout despite chatty output."""
+    argv = _slow_argv(lines=20, interval=0.2)  # total runtime ~4s; wall cap is 1s
+
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=1,
+        backend="fake-wall",
+        round_no=10,
+        timeout_mode="wall",
+    )
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert "line-0" in result.stdout
+    assert "line-19" not in result.stdout
+    assert "total runtime" in result.stdout
+
+
+def test_idle_timeout_seconds_contract():
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS=None):
+        assert process.idle_timeout_seconds(30) == 30
+        assert process.idle_timeout_seconds(59) == 59
+        assert process.idle_timeout_seconds(60) == process._DEFAULT_IDLE_TIMEOUT
+        assert process.idle_timeout_seconds(240) == process._DEFAULT_IDLE_TIMEOUT
+        assert process.idle_timeout_seconds(60, idle_floor=0) == 60
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="7"):
+        assert process.idle_timeout_seconds(240) == 7
+        assert process.idle_timeout_seconds(240, idle_floor=0) == 240
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
+        assert process.idle_timeout_seconds(240) is None
+        assert process.idle_timeout_seconds(240, idle_floor=0) == 240
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="-5"):
+        assert process.idle_timeout_seconds(240) == process._DEFAULT_IDLE_TIMEOUT
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="not-a-number"):
+        assert process.idle_timeout_seconds(3) == 3
+        assert process.idle_timeout_seconds(90) == process._DEFAULT_IDLE_TIMEOUT
+        assert process.idle_timeout_seconds(240) == process._DEFAULT_IDLE_TIMEOUT
 
 
 def test_silent_child_can_think_until_requested_timeout():
@@ -132,6 +219,26 @@ def test_silent_child_can_think_until_requested_timeout():
     assert elapsed >= 1.0, f"silent thinking was cut short after {elapsed:.2f}s"
     assert "done" in result.stdout
     assert "TIMEOUT" not in result.stdout
+
+
+def test_disabled_idle_reap_falls_back_to_wall_timeout():
+    """REVIEW_IDLE_TIMEOUT_SECONDS=0 must not turn _run_streamed into an unbounded wait."""
+    code = "import time\nprint('started', flush=True)\ntime.sleep(60)\n"
+    argv = [sys.executable, "-c", code]
+
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=1,
+            backend="fake-disabled-idle",
+            round_no=11,
+        )
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert "started" in result.stdout
+    assert "total runtime" in result.stdout
+    assert "without output" not in result.stdout
 
 
 def test_flushed_partial_line_survives_timeout():
@@ -293,7 +400,8 @@ def test_no_daemon_traceback_when_escaped_writer_outlives_close():
         "code = (\n"
         "  \"import sys, subprocess, time\\n\"\n"
         "  \"print('p', flush=True)\\n\"\n"
-        "  \"subprocess.Popen([sys.executable,'-c','import sys,time\\\\nwhile True:\\\\n \"\n"
+        "  \"subprocess.Popen([sys.executable,'-c','import sys,time\\\\n\"\n"
+        "  \"time.sleep(3)\\\\nwhile True:\\\\n \"\n"
         "  \"sys.stdout.write(chr(120))\\\\n sys.stdout.flush()\\\\n time.sleep(0.2)'], \"\n"
         "  \"start_new_session=True)\\n\"\n"
         "  \"time.sleep(60)\\n\"\n"

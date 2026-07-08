@@ -197,6 +197,8 @@ def vision_backend_available(model: str) -> bool:
     cap = capability_for(model)
     if cap is None:
         return False
+    if backends.provider_marked_unpaid(model):
+        return False
     if cap.wire == "gemini":
         try:
             backends._gemini_key()
@@ -206,8 +208,12 @@ def vision_backend_available(model: str) -> bool:
     binary = _CLI_BINARY.get(cap.wire)
     if not (binary and shutil.which(binary)):
         return False
-    if cap.wire == "opencode-cli" and not _opencode_model_is_vision(model):
-        return False
+    if cap.wire == "opencode-cli":
+        if not _opencode_model_is_vision(model):
+            return False
+        provider = backends._oc_provider_from_model(model)
+        if provider is not None and not backends._oc_provider_auth_available(provider):
+            return False
     return True
 
 
@@ -555,6 +561,10 @@ def call_ai_vision(
     cap = capability_for(model)
     if cap is None:
         return VisionVerdict(available=False, verdict=None, error=f"backend {model} is not vision-capable")
+    from ... import backends
+
+    if backends.provider_marked_unpaid(model):
+        return VisionVerdict(available=False, verdict=None, error=backends.unpaid_provider_error(model), backend=model)
 
     schema = output_schema or build_output_schema()
     sys_prompt = system or _SYSTEM_PROMPT
@@ -642,7 +652,10 @@ def _run_cli(argv: list[str], *, cwd: Path, input_text: str | None, timeout_s: i
     tree/partial-output guarantees. Returns (returncode, stdout, stderr, timed_out)."""
     from ...process import _run_streamed
 
-    proc = _run_streamed(argv, cwd=cwd, input_text=input_text, timeout=timeout_s, backend=backend)
+    proc = _run_streamed(
+        argv, cwd=cwd, input_text=input_text, timeout=timeout_s,
+        backend=backend, timeout_mode="wall",
+    )
     return proc.returncode, proc.stdout, proc.stderr, proc.returncode == 124
 
 
@@ -792,9 +805,20 @@ def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schem
     review_opencode's `opencode run`; attaches the image with `-f` and routes to the named
     (vision-capable) model. opencode is a provider ROUTER, so the user selects a vision
     model via `oc:<provider>/<vision-model>`. The verdict JSON is parsed from the output."""
+    from ... import backends
+
+    if backends.provider_marked_unpaid(model):
+        return VisionVerdict(available=False, verdict=None, error=backends.unpaid_provider_error(model), backend=model)
+    provider = backends._oc_provider_from_model(model)
+    if provider is not None and not backends._oc_provider_auth_available(provider):
+        return VisionVerdict(
+            available=False,
+            verdict=None,
+            error=f"opencode provider {provider!r} has no configured auth",
+            backend=model,
+        )
     if not shutil.which("opencode"):
         return VisionVerdict(available=False, verdict=None, error="opencode CLI not found on PATH", backend=model)
-    from ... import backends
 
     oc_model = model.split(":", 1)[1] if ":" in model else model
     with tempfile.TemporaryDirectory(prefix="review-cli-vision-opencode-") as tmp_raw:

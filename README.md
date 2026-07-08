@@ -170,9 +170,18 @@ to a per-call log in the OS-standard per-user log dir — **macOS** `~/Library/L
 **Linux** `$XDG_STATE_HOME/review-cli/logs/` (default `~/.local/state/review-cli/logs/`);
 override with `$REVIEW_LOG_DIR`; files are private, mode 0600. Panel modes print the
 log path to stderr at the start of each call, so you can `tail -f` it to watch a long
-run progress instead of staring at a frozen terminal. If a call hits its `--timeout`,
-the partial output captured so far is still returned (with a `[review-cli] TIMEOUT
-after Ns]` marker and exit 124) rather than being thrown away.
+run progress instead of staring at a frozen terminal. Review/panel agent CLI calls use
+`--timeout` as a **silence** timeout: if the backend writes stdout/stderr, the timer
+resets; if it stays quiet for the idle window, the partial output captured so far is
+still returned (with a `[review-cli] TIMEOUT after Ns without output]` marker and exit
+124) rather than being thrown away. Normal review runs allow at least 20 minutes of quiet
+thinking time for subprocess backends. REST calls still use their HTTP request timeout;
+QA and vision calls keep wall-clock timeout caps. Advanced override:
+`REVIEW_IDLE_TIMEOUT_SECONDS=N` sets the review/panel subprocess idle window; `0` disables
+idle reap and uses wall-clock `--timeout`. Values under 60s stay exact for tests/probes;
+otherwise the normal 20m floor applies when the env var is unset. Idle mode treats any
+stdout/stderr as progress, including output inherited from child processes; the internal
+review backstop is the hard guard for a chatty but otherwise wedged process tree.
 
 **Run stats & a startup ETA — never short-timeout `review`.** `review` is
 multi-model and (for the panel modes) multi-round, so it takes **minutes**, and a
@@ -923,7 +932,11 @@ GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)
 -o / --output FILE  Write the result to FILE via Python (creates parent dirs, always
                     overwrites) while still printing to stdout. Use this instead of
                     `review … > FILE`, which fails silently under zsh noclobber.
---timeout N         Per-call timeout in seconds (default 1200 for review, 240 for panel modes).
+--timeout N         Per-call timeout in seconds. Review/panel agent CLIs use an idle/silence
+                    timeout with a 20m default floor on normal review runs; REST calls use it
+                    as the HTTP request timeout, and QA/vision keep wall-clock caps. Values
+                    under 60s stay exact for tests/probes; REVIEW_IDLE_TIMEOUT_SECONDS
+                    overrides the review/panel idle window when set.
 --list-defaults     Print effective default backends and exit.
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
 --pool N            How many of the board's seats to run (default 4); the first N seats run,
@@ -977,13 +990,19 @@ visual_models:
   - oc:zai/glm-4.5v
   - oc:commandcode/moonshotai/Kimi-K2.7-Code
   - gemini
+
+# Optional: skip every seat under providers whose subscription/billing is currently
+# unavailable. Same as REVIEW_UNPAID_PROVIDERS=commandcode,fireworks.
+# unpaid_providers:
+#   - commandcode
+#   - fireworks
 ```
 
 Run `review --list-defaults` to see the effective (normalized) models after config is
 applied.
 
 Code defaults (when no config file exists): `codex`, `gemini`,
-`oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo`.
+`commandcode:moonshotai/Kimi-K2.7-Code`.
 
 ---
 
@@ -996,7 +1015,7 @@ out of the box — no config file required.
 
 ### Priority-ordered failover pool
 
-The board is a **priority-ordered** list of 8 models — strongest first — and a plain
+The board is a **priority-ordered** list of 9 models — strongest first — and a plain
 `review diff` runs a **pool of 4**. The pool is chosen by **priority + availability**, with
 two layers of failover so the run keeps **4 working reviewers** even when models drop:
 
@@ -1046,10 +1065,12 @@ reaches it). Both are read-only by construction (they POST only the diff).
 `agentic`/`diff-only` scope for the current host. The board has
 a reserve, so an `oc:` seat that opencode can't reach is backfilled rather than blocking:
 a missing opencode **binary** is detected at startup (the seat probes unavailable and the
-pool fills from the next reserve); a missing **provider auth** (opencode present but the
-`commandcode`/`zai` provider not logged in) only surfaces at run time and triggers a mid-run
-reserve backfill. (The diff-only `commandcode:`/`zai:` keyed-HTTP backends are still there
-for explicit `-m cc`/`-m glm` and config boards on hosts without opencode.)
+pool fills from the next reserve); missing opencode **provider auth** for known providers is
+also a startup skip. If a provider key exists but the account is not entitled/billed, list the
+provider in `unpaid_providers:` (or set `REVIEW_UNPAID_PROVIDERS`) and every direct or `oc:`
+seat under it is skipped before any model process/API call. (The diff-only
+`commandcode:`/`zai:` keyed-HTTP backends are still there for explicit `-m cc`/`-m glm` and
+config boards on hosts without opencode.)
 
 **In-seat retry before reserve-replace.** A seat that fails is first re-tried *on the same
 model* when the failure looks **transient** — a `429` rate-limit, a `529`/5xx overload, a
@@ -1089,7 +1110,7 @@ it they fall back to the reserve.
 review --show-board        # priority order + which 4 are the live pool + reserve + availability
 export REVIEW_TASK_CODE=HYP-742
 review diff                # default failover pool: the top 4 AVAILABLE seats by priority
-review diff --pool 8       # run all 8 available seats (--pool 0 also means "all available")
+review diff --pool 0       # run all available seats (future-proof as the board grows)
 review diff --pool 2       # run the top 2 available seats (with failover)
 review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
 review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
@@ -1110,7 +1131,8 @@ explicit -m exact panel   >   `models:` priority roster   >   configured/default
   backfill. It does not disable board/failover.
 - Only explicit `-m` on the CLI is the exact flat override. The board can otherwise
   never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
-  pool (default 4; `--pool 0`/`--pool 8` runs all available seats).
+  pool (default 4; `--pool 0` runs all available seats; `--pool 9` currently covers the
+  built-in board but is not future-proof).
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
   roster — the configured/default board applies.
 
@@ -1146,7 +1168,7 @@ pass; both run agentically through opencode's commandcode provider (needs openco
 
 ```yaml
 board:
-  # ... the 8 default seats ...
+  # ... the 9 default seats ...
   - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
   - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
 ```
@@ -1171,14 +1193,21 @@ they run **agentically through opencode**, so they authenticate via **opencode's
 provider config** (`opencode auth login`, the `commandcode`/`zai` providers in
 `~/.config/opencode/opencode.json`), NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
 opencode must be installed for these seats. A missing opencode **binary** makes the seat
-probe unavailable at startup (the board fills the pool from the next reserve); a missing
-**provider auth** (opencode present but the `commandcode`/`zai` provider not logged in) is
-NOT caught by the startup probe — it surfaces at run time and triggers a **mid-run reserve
-backfill**. Either way the board degrades gracefully rather than blocking. The default GLM
-seat pins `oc:zai/glm-5.2` (the flagship). It uses the same per-seat `--timeout` as
-every other backend; no-output thinking time is allowed until that timeout expires, then
-reserve backfill can take over. To run an older GLM, override the seat in a `config.yaml`
-`board:` list (e.g. `{ model: "oc:zai/glm-5.1", role: quality }`).
+probe unavailable at startup (the board fills the pool from the next reserve); missing
+**provider auth** for known opencode providers is also caught by the startup probe. If auth
+exists but the provider is not currently paid/entitled, configure `unpaid_providers:` or
+`REVIEW_UNPAID_PROVIDERS` so the seat is skipped before launch. Either way the board
+degrades gracefully rather than blocking. The default GLM
+seat pins `oc:zai/glm-5.2` (the flagship). Agentic opencode seats use the same per-seat
+idle timeout as every other subprocess backend: progress output keeps the call alive, while
+a fully silent call is reaped after the idle window and reserve backfill can take over. To
+run an older GLM, override the seat in a `config.yaml` `board:` list (e.g.
+`{ model: "oc:zai/glm-5.1", role: quality }`).
+
+**Advanced timeout env:** `REVIEW_IDLE_TIMEOUT_SECONDS=N` overrides the review/panel
+subprocess idle window for CLI seats; `0` disables idle reap and leaves the review
+backstop as the hard guard. It does not change REST HTTP timeouts, QA wall-clock caps, or
+vision wall-clock caps.
 
 **`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
 set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or

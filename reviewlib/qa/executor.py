@@ -766,7 +766,7 @@ def _spawn_claude_writeexec(
     try:
         proc = _run_streamed(
             argv, cwd=cwd, input_text=prompt, timeout=timeout + 30,
-            backend="qa-claude", round_no=0, announce=True,
+            backend="qa-claude", round_no=0, announce=True, timeout_mode="wall",
         )
     finally:
         # Reap the trust entry we seeded — but ONLY for an EPHEMERAL `review-qa-wt-*` worktree, so
@@ -848,7 +848,7 @@ def _spawn_codex_writeexec(
     ]
     return _run_streamed(
         argv, cwd=cwd, input_text=prompt, timeout=timeout + 30,
-        backend="qa-codex", round_no=0, announce=True,
+        backend="qa-codex", round_no=0, announce=True, timeout_mode="wall",
     )
 
 

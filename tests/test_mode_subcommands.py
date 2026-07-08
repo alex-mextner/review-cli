@@ -214,6 +214,15 @@ def test_removed_review_verb_points_at_diff():
     assert "no longer a subcommand" in cap["stderr"], cap["stderr"]
 
 
+def test_removed_review_verb_points_at_diff_after_leading_model_option():
+    """Leading global options must not hide the removed `review` verb diagnostic."""
+    cap = _run(["-m", "fable5", "review", "-C", str(REPO_ROOT)], diff="diff --git a/x b/x\n+y\n")
+    assert cap["mode"] is None, ("review -m fable review must not dispatch", cap)
+    assert cap["rc"] == 2, cap
+    assert "review diff" in cap["stderr"], cap["stderr"]
+    assert "no longer a subcommand" in cap["stderr"], cap["stderr"]
+
+
 def test_meta_flag_without_subcommand_works():
     """A meta query (--list-defaults) without a subcommand still works (exit 0) and prints
     the defaults, not the help."""

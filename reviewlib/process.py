@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -75,6 +76,9 @@ def strip_control_sequences(text: str) -> str:
 # reserve backfills) that one process can create.
 _DEFAULT_MAX_CONCURRENCY = 4
 _MAX_CONCURRENCY_CEILING = 64  # a typo'd env can't pin an absurd number of children
+_DEFAULT_IDLE_TIMEOUT = 20 * 60
+_SHORT_TIMEOUT_EXACT_THRESHOLD = 60
+_IDLE_TIMEOUT_ENV = "REVIEW_IDLE_TIMEOUT_SECONDS"
 
 # Built lazily + cached: read $REVIEW_MAX_CONCURRENCY once on first spawn so a test can set
 # the env before importing/using the module, and so every seat in a run shares ONE semaphore
@@ -101,6 +105,43 @@ def max_concurrency() -> int:
     if value <= 0:
         return 0  # disabled
     return min(value, _MAX_CONCURRENCY_CEILING)
+
+
+def idle_timeout_seconds(timeout: int, *, idle_floor: int | None = _DEFAULT_IDLE_TIMEOUT) -> int | None:
+    """Seconds of backend silence allowed before reaping a subprocess.
+
+    The historical `timeout` was a hard wall clock cap. Agent CLIs can legitimately run
+    for a long time (Fable can take ~15 minutes) while still being alive, so subprocess
+    calls are now bounded by *silence*: if a backend writes stdout/stderr before the idle
+    window expires, the clock resets. Normal review-seat subprocesses get at least 20
+    minutes of quiet thinking time; callers with a tighter idle contract can pass
+    ``idle_floor=0`` to keep the requested value exact, and bounded surfaces such as
+    QA/vision use `_run_streamed(..., timeout_mode="wall")` instead.
+    Set REVIEW_IDLE_TIMEOUT_SECONDS=0 to rely only on the process backstop for idle-based
+    callers. Callers that pass ``idle_floor=0`` have a tight user-facing contract, so their
+    requested value stays exact even when the ambient env var is present.
+    """
+    requested = max(int(timeout), 1)
+    if idle_floor is not None and idle_floor <= 0:
+        return requested
+    raw = os.environ.get(_IDLE_TIMEOUT_ENV)
+    if raw is not None and raw.strip():
+        try:
+            value = int(raw)
+        except ValueError:
+            value = None
+        if value is not None:
+            if value == 0:
+                return None
+            if value > 0:
+                return value
+    if idle_floor is None:
+        return requested
+    # Tiny timeouts are test/debug contracts. Preserve them exactly so unit tests and
+    # one-off probes can still finish quickly; normal human review timeouts get the floor.
+    if requested < _SHORT_TIMEOUT_EXACT_THRESHOLD:
+        return requested
+    return max(requested, idle_floor)
 
 
 def _get_concurrency_sem() -> threading.BoundedSemaphore | None:
@@ -538,6 +579,8 @@ def _run_streamed(
     round_no: int = 0,
     announce: bool = False,
     header_argv0: str | None = None,
+    idle_floor: int | None = _DEFAULT_IDLE_TIMEOUT,
+    timeout_mode: str = "idle",
 ) -> subprocess.CompletedProcess[str]:
     """Run a long backend call, streaming its output in real time.
 
@@ -546,12 +589,13 @@ def _run_streamed(
       * drains stdout AND stderr on daemon threads, TEEing each line to an in-memory
         accumulator AND a per-call log file under log_dir(), flushed per line so
         `tail -f <path>` shows live progress as output arrives (no wait-for-exit);
-      * enforces `timeout` on the PROCESS via proc.wait(timeout) — NOT on pipe EOF —
-        so a leaked stdout fd held by an escaped/daemonized descendant cannot make
-        the call hang past its deadline; on timeout it SIGTERM→SIGKILLs the child's
-        whole process group, gives the readers a brief grace flush, then RETURNS the
-        partial buffer plus a clear TIMEOUT marker and returncode 124 — it never
-        raises the buffer away.
+      * enforces either an IDLE timeout on the PROCESS (normal review seats) or an exact
+        WALL timeout for bounded surfaces such as QA/vision. On timeout it SIGTERM→SIGKILLs
+        the child's whole process group, gives the readers a brief grace flush, then RETURNS
+        the partial buffer plus a clear TIMEOUT marker and returncode 124 — it never raises
+        the buffer away. Idle mode treats stdout/stderr as progress, including output from
+        descendants that inherited the pipe; if idle reap is disabled, the runner falls back
+        to the requested wall-clock timeout rather than waiting forever.
 
     Returns a CompletedProcess-compatible object (.returncode/.stdout/.stderr) so
     callers like review_codex need no structural change.
@@ -565,6 +609,13 @@ def _run_streamed(
     log_lock = threading.Lock()
     stopping = threading.Event()
     timed_out = False
+    if timeout_mode not in {"idle", "wall"}:
+        raise ValueError(f"unknown timeout_mode: {timeout_mode}")
+    idle_timeout = idle_timeout_seconds(timeout, idle_floor=idle_floor) if timeout_mode == "idle" else None
+    timeout_secs = max(int(timeout), 1)
+    timeout_marker_secs = timeout_secs
+    timeout_marker_kind = "without output" if timeout_mode == "idle" else "total runtime"
+    activity = {"last": time.monotonic()}
     proc: subprocess.Popen | None = None
     pgid: int | None = None
     child_handle: tuple[subprocess.Popen, int | None] | None = None
@@ -647,6 +698,10 @@ def _run_streamed(
         if pgid is not None:
             child_handle = _reregister_child(child_handle, proc, pgid)
 
+        # Queueing on the concurrency cap is not backend runtime. Start the idle clock only
+        # once the child exists, so a queued seat is never falsely timed out before spawn.
+        activity["last"] = time.monotonic()
+
         def _feed_stdin() -> None:
             if input_text is None or running.stdin is None:
                 return
@@ -699,6 +754,7 @@ def _run_streamed(
                         with log_lock:
                             if stopping.is_set():
                                 break
+                            activity["last"] = time.monotonic()
                             buf.append(text)
                             if tag:
                                 line_rem += text
@@ -725,17 +781,39 @@ def _run_streamed(
         stdout_thread.start()
         stderr_thread.start()
 
-        # Enforce the timeout on the PROCESS, not on pipe EOF. proc.wait(timeout) is
-        # immune to a leaked fd held by an escaped descendant.
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_tree(proc, pgid)
+        # Enforce the configured timeout. Review seats use silence-from-backend so long
+        # agent calls such as Fable can think for ~15 minutes; QA/vision use wall time
+        # because their public `--timeout` flags are cost/latency caps.
+        if timeout_mode == "wall" or idle_timeout is None:
+            timeout_marker_kind = "total runtime"
             try:
-                proc.wait(timeout=3)
+                proc.wait(timeout=timeout_secs)
             except subprocess.TimeoutExpired:
-                pass
+                timed_out = True
+                timeout_marker_secs = timeout_secs
+                _kill_tree(proc, pgid)
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+        else:
+            while True:
+                try:
+                    proc.wait(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    # CPython's GIL makes this single-float read safe enough; stale reads are
+                    # harmless because the next 0.5s poll sees any newer activity.
+                    if time.monotonic() - activity["last"] < idle_timeout:
+                        continue
+                    timed_out = True
+                    timeout_marker_secs = idle_timeout
+                    _kill_tree(proc, pgid)
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    break
 
         # The process has exited (or been killed). Give the readers a short grace window
         # to flush. If EITHER is STILL blocked, a child is holding a pipe open — reap
@@ -761,7 +839,10 @@ def _run_streamed(
             stdout = "".join(out_buf)
             stderr = "".join(err_buf)
             if timed_out:
-                marker = f"\n[review-cli] TIMEOUT after {timeout}s — partial output above]\n"
+                marker = (
+                    f"\n[review-cli] TIMEOUT after {timeout_marker_secs}s {timeout_marker_kind} "
+                    "— partial output above]\n"
+                )
                 stdout += marker
                 try:
                     log_fh.write(marker)

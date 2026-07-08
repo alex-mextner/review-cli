@@ -584,13 +584,10 @@ def test_install_skill_text_documents_agentic_default_board(  ):
     assert "diff-only" in low and "default board" in low
     """review-cli#24 contract (codex review): the agentic `oc:` board seats authenticate via
     opencode's OWN provider config — NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
-    So their availability gates on the `opencode` BINARY being present, regardless of whether
-    review-cli's commandcode/z.ai keys are set. A host whose keys live only in review-cli's
-    `.env` (and never ran `opencode auth login`) must NOT have an `oc:` seat falsely
-    reported available on key-presence alone — and conversely, a host WITH opencode but
-    WITHOUT those review-cli keys still reports the seat available (opencode carries auth).
-    This pins that the two auth surfaces are decoupled; the board's reserve backfills an
-    `oc:` seat opencode can't actually reach at run time (mid-run failover)."""
+    So their availability gates on the `opencode` BINARY plus opencode's OWN provider
+    config — NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`. A host whose keys live only
+    in review-cli's `.env` (and never configured opencode's `commandcode` provider) must NOT
+    have an `oc:commandcode/...` seat falsely reported available on key-presence alone."""
     oc_seats = [r.model for r in DEFAULT_BOARD if r.model.startswith("oc:")]
     assert oc_seats, "expected agentic oc: seats on the default board"
 
@@ -600,30 +597,55 @@ def test_install_skill_text_documents_agentic_default_board(  ):
     # later tests become order-dependent on this one's teardown (codex review).
     saved_env = {
         k: os.environ.get(k)
-        for k in ("COMMANDCODE_API_KEY", "ZAI_API_KEY", "ZHIPU_API_KEY", "GEMINI_ENV_FILE")
+        for k in (
+            "COMMANDCODE_API_KEY", "ZAI_API_KEY", "ZHIPU_API_KEY", "GEMINI_ENV_FILE",
+            "OC_AUTH_FILE", "OC_CONFIG_FILE",
+        )
     }
     try:
         # Scrub review-cli's commandcode/z.ai keys AND point the env-file at nothing, so the
-        # only thing that could make the seat available is the opencode binary.
+        # only things that could make a seat available are opencode itself and opencode auth.
         for k in saved_env:
             os.environ.pop(k, None)
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        import tempfile
 
-        # opencode present -> available even with NO review-cli commandcode/z.ai key.
-        backends._which = lambda name: f"/fake/bin/{name}"
-        for seat in oc_seats:
-            assert backends.backend_available(seat) is True, seat
+        with tempfile.TemporaryDirectory() as tmp_raw:
+            tmp = Path(tmp_raw)
+            auth_file = tmp / "auth.json"
+            config_file = tmp / "opencode.json"
+            auth_file.write_text("{}", encoding="utf-8")
+            config_file.write_text('{"provider": {}}', encoding="utf-8")
+            os.environ["OC_AUTH_FILE"] = str(auth_file)
+            os.environ["OC_CONFIG_FILE"] = str(config_file)
 
-        # opencode absent -> unavailable (so the board backfills), even if review-cli keys
-        # existed they would not rescue an `oc:` seat — it needs the opencode binary.
-        def _no_opencode(name: str) -> str:
-            if name == "opencode":
-                raise RuntimeError("opencode not found")
-            return f"/fake/bin/{name}"
+            # opencode present but commandcode provider auth missing -> commandcode seats
+            # are skipped at startup. Other oc providers keep their existing semantics.
+            backends._which = lambda name: f"/fake/bin/{name}"
+            commandcode_seats = [seat for seat in oc_seats if seat.startswith("oc:commandcode/")]
+            assert commandcode_seats, oc_seats
+            for seat in commandcode_seats:
+                assert backends.backend_available(seat) is False, seat
 
-        backends._which = _no_opencode
-        for seat in oc_seats:
-            assert backends.backend_available(seat) is False, seat
+            # opencode provider auth present -> commandcode oc seats are available, still
+            # without consulting review-cli's COMMANDCODE_API_KEY.
+            config_file.write_text(
+                '{"provider": {"commandcode": {"options": {"apiKey": "user_opencode"}}}}',
+                encoding="utf-8",
+            )
+            for seat in commandcode_seats:
+                assert backends.backend_available(seat) is True, seat
+
+            # opencode absent -> unavailable (so the board backfills), even if review-cli
+            # keys existed they would not rescue an `oc:` seat — it needs the opencode binary.
+            def _no_opencode(name: str) -> str:
+                if name == "opencode":
+                    raise RuntimeError("opencode not found")
+                return f"/fake/bin/{name}"
+
+            backends._which = _no_opencode
+            for seat in oc_seats:
+                assert backends.backend_available(seat) is False, seat
     finally:
         backends._which = saved_which
         # Restore each mutated var to its exact prior state (set it back, or remove it if it
@@ -935,6 +957,88 @@ def test_cli_explicit_models_disable_board():
         sys.stdin = old_stdin
 
 
+def test_cli_explicit_models_override_config_models_and_board():
+    """-m is an exact panel override even when config.yaml has both models: and board:."""
+    from reviewlib import cli
+
+    captured: dict = {}
+
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
+        captured["models"] = models
+        captured["board"] = board
+        return 0
+
+    old_mode = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {
+        "models": ["commandcode:deepseek/deepseek-v4-pro", "codex"],
+        "board": [
+            {"model": "commandcode:deepseek/deepseek-v4-pro", "role": "tests", "name": "DeepSeek-cc"},
+            {"model": "codex", "role": "consistency", "name": "Codex"},
+        ],
+    }
+    old_stdin = sys.stdin
+    try:
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        cli.main(["diff", "--task", "TEST-1", "-m", "fable5", "-C", str(REPO_ROOT)])
+        assert captured["board"] is None, captured
+        assert captured["models"] == ["claude:claude-fable-5"], captured
+    finally:
+        _review_mod.mode_review = old_mode
+        cli.load_config = old_load_config
+        sys.stdin = old_stdin
+
+
+def test_cli_leading_model_option_before_subcommand_is_honored():
+    """`review -m fable diff ...` must mean the same thing as `review diff -m fable ...`."""
+    from reviewlib import cli
+
+    captured: dict = {}
+
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
+        captured["models"] = models
+        captured["board"] = board
+        captured["cwd"] = cwd
+        return 0
+
+    old_mode = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {"models": ["commandcode:deepseek/deepseek-v4-pro", "codex"]}
+    old_stdin = sys.stdin
+    try:
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        cli.main(["-m", "fable5", "-C", str(REPO_ROOT), "diff", "--task", "TEST-1"])
+        assert captured["board"] is None, captured
+        assert captured["models"] == ["claude:claude-fable-5"], captured
+        assert captured["cwd"] == REPO_ROOT, captured
+    finally:
+        _review_mod.mode_review = old_mode
+        cli.load_config = old_load_config
+        sys.stdin = old_stdin
+
+
+def test_cli_leading_model_option_does_not_reorder_management_subcommands():
+    """Management subcommands are not review modes, so leading -m remains an argparse error."""
+    from reviewlib import cli
+
+    argv = ["-m", "fable5", "dashboard"]
+    assert cli._normalize_leading_mode_options(argv) == argv
+
+
+def test_cli_leading_mode_options_do_not_treat_long_flags_as_short_m():
+    """Unknown long options such as --markdown must not be mistaken for glued -m values."""
+    from reviewlib import cli
+
+    argv = ["--markdown", "diff"]
+    assert cli._normalize_leading_mode_options(argv) == argv
+
+
 def test_cli_no_board_flag_is_gone():
     """The board can NEVER be disabled: --no-board was removed, so argparse must
     reject it (SystemExit) rather than silently accepting + disabling the board."""
@@ -1150,6 +1254,7 @@ def _capture_default_review_board(argv: list[str]) -> dict:
                           pool_size=DEFAULT_POOL_SIZE, outcome_sink=None, **kw):
         captured["board"] = board
         captured["pool_size"] = pool_size
+        captured["timeout"] = timeout
         return 0
 
     old = _review_mod.mode_review
@@ -1200,6 +1305,15 @@ def test_cli_pool_flag_threads_pool_size():
     assert len(cap2["board"]) == len(DEFAULT_BOARD), "full board still passed"
     cap_all = _capture_default_review_board(["diff", "--task", "TEST-1", "--pool", "0", "-C", str(REPO_ROOT)])
     assert cap_all["pool_size"] == 0, cap_all["pool_size"]
+
+
+def test_cli_leading_pool_and_timeout_options_before_subcommand_are_honored():
+    """Value-taking global flags before the mode verb must land on the mode parser."""
+    captured = _capture_default_review_board([
+        "--pool", "2", "--timeout", "77", "diff", "--task", "TEST-1", "-C", str(REPO_ROOT),
+    ])
+    assert captured["pool_size"] == 2, captured
+    assert captured["timeout"] == 77, captured
 
 
 def _show_board_lines(
