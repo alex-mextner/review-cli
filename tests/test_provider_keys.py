@@ -860,6 +860,12 @@ def test_configured_unpaid_provider_skips_without_env():
             backends._CONFIG_UNPAID_PROVIDERS = saved
 
 
+def test_configure_unpaid_providers_accepts_saved_frozenset():
+    with _EnvSandbox():
+        backends.configure_unpaid_providers(frozenset({"commandcode"}))
+        assert backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro") is True
+
+
 def test_commandcode_unpaid_provider_does_not_post():
     """Explicit `-m commandcode:*` fails fast when billing is disabled."""
     def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
@@ -910,6 +916,20 @@ def test_opencode_unpaid_provider_does_not_spawn_cli():
     assert "unpaid/disabled" in res.stderr, res.stderr
 
 
+def test_claude_unpaid_alias_provider_does_not_spawn_cli():
+    """Unexpanded Claude aliases must be skipped before CLI probing or launch."""
+    old_which = backends._which_optional
+    backends._which_optional = lambda _name: (_ for _ in ()).throw(AssertionError("claude CLI was probed"))
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
+        try:
+            res = backends.review_claude("fable5", "q", "", REPO_ROOT, 10)
+        finally:
+            backends._which_optional = old_which
+    assert res.returncode == 1, res
+    assert "unpaid/disabled" in res.stderr, res.stderr
+
+
 def test_unpaid_provider_uses_canonical_commandcode_aliases():
     """Legacy command/common-code spellings must hit the same payment gate."""
     with _EnvSandbox():
@@ -920,10 +940,44 @@ def test_unpaid_provider_uses_canonical_commandcode_aliases():
         assert backends.provider_marked_unpaid("common-code:deepseek/deepseek-v4-pro") is True
 
 
+def test_unpaid_provider_uses_canonical_zai_aliases():
+    """Every accepted z.ai/Zhipu/GLM spelling must hit the same payment gate."""
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
+        assert backends.effective_provider("z.ai:glm-5.2") == "zai"
+        assert backends.effective_provider("zhipu:glm-5.2") == "zai"
+        assert backends.effective_provider("glm:glm-5.2") == "zai"
+        assert backends.effective_provider("oc:z.ai/glm-5.2") == "zai"
+        assert backends.provider_marked_unpaid("z.ai:glm-5.2") is True
+        assert backends.provider_marked_unpaid("zhipu:glm-5.2") is True
+        assert backends.provider_marked_unpaid("glm:glm-5.2") is True
+        assert backends.backend_available("oc:z.ai/glm-5.2") is False
+
+
+def test_unpaid_provider_uses_canonical_gemini_and_claude_aliases():
+    """Every named Gemini/Claude alias must hit the same payment gate."""
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "gemini"
+        assert backends.effective_provider("gemini-api") == "gemini"
+        assert backends.provider_marked_unpaid("gemini-api") is True
+        assert backends.backend_available("gemini-api") is False
+
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
+        assert backends.effective_provider("claude-p") == "claude"
+        assert backends.effective_provider("claude-fable-5") == "claude"
+        assert backends.effective_provider("fable5") == "claude"
+        assert backends.provider_marked_unpaid("claude-p") is True
+        assert backends.provider_marked_unpaid("claude-fable-5") is True
+        assert backends.provider_marked_unpaid("fable5") is True
+
+
 def test_unpaid_provider_env_uses_canonical_commandcode_aliases():
     """Aliases are normalized in the env/config value, not only in model ids."""
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "common-code"
+        assert backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro") is True
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "cc"
         assert backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro") is True
 
 
@@ -943,6 +997,68 @@ def test_zai_unpaid_provider_does_not_post():
             urllib.request.urlopen = old_open
     assert res.returncode == 1, res
     assert "unpaid/disabled" in res.stderr, res.stderr
+
+
+def test_zai_unpaid_alias_provider_does_not_post():
+    """Accepted z.ai aliases are gated before the REST request, not only the zai prefix."""
+    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+        raise AssertionError("z.ai alias POSTed despite REVIEW_UNPAID_PROVIDERS")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _should_not_post
+    with _EnvSandbox():
+        os.environ["ZAI_API_KEY"] = "zai_present"
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
+        try:
+            res = backends.review_zai("z.ai:glm-5.2", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 1, res
+    assert "unpaid/disabled" in res.stderr, res.stderr
+
+
+def test_unpaid_provider_logs_use_model_specific_headers():
+    """Unpaid sidecar logs still need exact model argv0s for dashboard attribution."""
+    emitted = []
+    old_emit = backends._emit_rest_log
+    backends._emit_rest_log = (
+        lambda backend, command, **kwargs: emitted.append((backend, command))
+    )
+    with _EnvSandbox():
+        try:
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai,commandcode,openrouter,claude,gemini"
+            backends.review_zai("z.ai:glm-5.2", "q", "", REPO_ROOT, 10)
+            backends.review_commandcode("commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10)
+            backends.review_openrouter("openrouter:anthropic/claude-3.5-sonnet", "q", "", REPO_ROOT, 10)
+            backends.review_claude("claude:claude-fable-5", "q", "", REPO_ROOT, 10)
+            backends.review_gemini("gemini:gemini-2.5-flash", "q", "", REPO_ROOT, 10)
+        finally:
+            backends._emit_rest_log = old_emit
+    assert emitted == [
+        ("z.ai", "z.ai API glm-5.2"),
+        ("commandcode", "commandcode API deepseek/deepseek-v4-pro"),
+        ("openrouter", "openrouter API anthropic/claude-3.5-sonnet"),
+        ("claude", "Anthropic API claude-fable-5"),
+        ("gemini", "Gemini API gemini-2.5-flash"),
+    ]
+
+
+def test_unpaid_provider_log_failure_still_returns_skip_result():
+    """A sidecar write failure must not turn a deliberate unpaid skip into an internal crash."""
+    old_emit = backends._emit_rest_log
+
+    def _raise_oserror(*args, **kwargs):
+        raise OSError("disk full")
+
+    backends._emit_rest_log = _raise_oserror
+    with _EnvSandbox():
+        try:
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
+            res = backends.review_zai("zai:glm-5.2", "q", "", REPO_ROOT, 10)
+        finally:
+            backends._emit_rest_log = old_emit
+    assert res.returncode == 1, res
+    assert "provider 'zai'" in res.stderr, res.stderr
 
 
 def test_claude_with_images_unpaid_provider_does_not_spawn_cli():

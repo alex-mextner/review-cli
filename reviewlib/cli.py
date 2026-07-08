@@ -1587,6 +1587,7 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
 _LEADING_MODE_VALUE_OPTS = frozenset({
     "-m", "--model", "-C", "--cwd", "--task", "--timeout", "--pool",
 })
+_LEADING_MODE_FLAG_OPTS = frozenset({"--list-defaults", "--show-board"})
 _LEADING_MODE_INLINE_SHORT_OPTS = ("-m", "-C")
 
 
@@ -1625,6 +1626,10 @@ def _normalize_leading_mode_options(argv: list[str]) -> list[str]:
                 return argv
             moved.extend([tok, argv[i + 1]])
             i += 2
+            continue
+        if tok in _LEADING_MODE_FLAG_OPTS:
+            moved.append(tok)
+            i += 1
             continue
         if any(tok.startswith(f"{opt}=") for opt in _LEADING_MODE_VALUE_OPTS if opt.startswith("--")):
             moved.append(tok)
@@ -2237,6 +2242,9 @@ def _leading_removed_subcommand(argv: list[str]) -> str | None:
             i += 2
             continue
         if any(tok.startswith(f"{opt}=") for opt in _LEADING_MODE_VALUE_OPTS if opt.startswith("--")):
+            i += 1
+            continue
+        if tok in _LEADING_MODE_FLAG_OPTS:
             i += 1
             continue
         if _is_leading_inline_short_option(tok):
@@ -2903,11 +2911,7 @@ def _seat_reads_repo(model: str, cwd_is_repo: bool) -> bool:
         if mode == "cli":
             return True
         # Auto-pick mirrors the dispatcher: CLI when the binary is present.
-        try:
-            backends._which("claude-p")
-            return True
-        except RuntimeError:
-            return False
+        return backends._have_claude_cli()
     return False
 
 
@@ -2960,7 +2964,7 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | No
         available = avail[index]
         if available:
             status = "available"
-        elif backends.provider_marked_unpaid(reviewer.model):
+        elif backends.runtime_provider_marked_unpaid(reviewer.model):
             status = "SKIPPED (provider unpaid/disabled)"
         else:
             status = "SKIPPED (no key/CLI)"

@@ -117,9 +117,9 @@ def idle_timeout_seconds(timeout: int, *, idle_floor: int | None = _DEFAULT_IDLE
     minutes of quiet thinking time; callers with a tighter idle contract can pass
     ``idle_floor=0`` to keep the requested value exact, and bounded surfaces such as
     QA/vision use `_run_streamed(..., timeout_mode="wall")` instead.
-    Set REVIEW_IDLE_TIMEOUT_SECONDS=0 to rely only on the process backstop for idle-based
-    callers. Callers that pass ``idle_floor=0`` have a tight user-facing contract, so their
-    requested value stays exact even when the ambient env var is present.
+    Set REVIEW_IDLE_TIMEOUT_SECONDS=0 to disable idle reap and use the requested wall-clock
+    timeout instead. Callers that pass ``idle_floor=0`` have a tight user-facing contract,
+    so their requested value stays exact even when the ambient env var is present.
     """
     requested = max(int(timeout), 1)
     if idle_floor is not None and idle_floor <= 0:

@@ -1,10 +1,11 @@
-"""review (default): run the diff across every selected backend in parallel.
+"""diff review: run the diff across every selected backend in parallel.
 
-`review review …` (or a bare `review …`, which defaults to this mode) — the diff
-review. **--diff/diff is the default** (the mode REQUIRES a diff, as the pre-commit
-path always has). Originally the flag-less default of `bin/review:main()` (Stage 0
-decomposition); now a first-class SUBCOMMAND backed by the `MODE` descriptor at the
-bottom of this file (see `modes/contract.py`).
+`review diff …` is the diff review. A bare `review` prints top-level help, and the
+old `review review …` spelling is a usage error that points here. **--diff/diff is
+the default** (the mode REQUIRES a diff, as the pre-commit path always has).
+Originally the flag-less default of `bin/review:main()` (Stage 0 decomposition);
+now a first-class SUBCOMMAND backed by the `MODE` descriptor at the bottom of this
+file (see `modes/contract.py`).
 
 The reviewer-board path (HYP-741) is layered on top: when a board is passed, each
 reviewer gets its own role-lens prompt + label, but the parallel run, result

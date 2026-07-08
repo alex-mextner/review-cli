@@ -562,6 +562,42 @@ def test_unpaid_visual_cli_call_does_not_spawn_runner():
     assert "unpaid/disabled" in (v.error or "")
 
 
+def test_unpaid_claude_gateway_visual_call_does_not_spawn_runner():
+    """Visual Claude inherits ANTHROPIC_* gateway vars and must honor unpaid gateways."""
+    import shutil
+
+    import reviewlib.process as process
+
+    saved_env = {
+        key: os.environ.get(key)
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "REVIEW_UNPAID_PROVIDERS")
+    }
+    old_runner = process._run_streamed
+    old_which = shutil.which
+
+    def _boom(*args, **kwargs):  # pragma: no cover - asserted by not raising
+        raise AssertionError("visual Claude runner spawned despite unpaid CommandCode gateway")
+
+    process._run_streamed = _boom
+    shutil.which = lambda name: "/usr/bin/claude" if name == "claude" else old_which(name)
+    os.environ["ANTHROPIC_API_KEY"] = "user_x"
+    os.environ["ANTHROPIC_BASE_URL"] = "https://api.commandcode.ai/provider"
+    os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
+    try:
+        assert vc.vision_backend_available("claude:opus") is False
+        v = vc.call_ai_vision("claude:opus", blocks=_blocks())
+    finally:
+        process._run_streamed = old_runner
+        shutil.which = old_which
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert v.available is False and v.verdict is None
+    assert "provider 'commandcode'" in (v.error or "")
+
+
 def test_unpaid_visual_rest_call_does_not_post():
     """Direct call_ai_vision callers must not bypass unpaid-provider skips for REST routes."""
     import urllib.request

@@ -1185,7 +1185,7 @@ Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`
 `GEMINI_ENV_FILE=/path/to/.env` overrides the search path.
 
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
-Codex is the #3 board seat (GPT-5.5 IS codex — the agentic CLI route, free).
+Codex is the #4 board seat (GPT-5.5 IS codex — the agentic CLI route, free).
 
 **Kimi / Qwen / DeepSeek / GLM board reviewers (agentic, via opencode):** since
 review-cli#24 these default board seats are `oc:commandcode/…` / `oc:zai/glm-5.2` —
@@ -1205,9 +1205,9 @@ run an older GLM, override the seat in a `config.yaml` `board:` list (e.g.
 `{ model: "oc:zai/glm-5.1", role: quality }`).
 
 **Advanced timeout env:** `REVIEW_IDLE_TIMEOUT_SECONDS=N` overrides the review/panel
-subprocess idle window for CLI seats; `0` disables idle reap and leaves the review
-backstop as the hard guard. It does not change REST HTTP timeouts, QA wall-clock caps, or
-vision wall-clock caps.
+subprocess idle window for CLI seats; `0` disables idle reap and uses wall-clock
+`--timeout` instead. It does not change REST HTTP timeouts, QA wall-clock caps, or vision
+wall-clock caps.
 
 **`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
 set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or
@@ -1265,7 +1265,7 @@ review-cli is layered so the same panel engine is reusable beyond the CLI:
 reviewlib/modes/
   contract.py     # ModeSpec descriptor + ModeContext (mirrors features/visual/contract.py + module_api.py)
   registry.py     # MODES list, get_mode / known_subcommands / default_mode (mirrors features/visual/registry.py)
-  review.py       # MODE = ModeSpec(subcommand="review", diff_policy="require", handler=…)
+  review.py       # MODE = ModeSpec(subcommand="diff", diff_policy="require", handler=…)
   brainstorm.py   # MODE = ModeSpec(subcommand="brainstorm", diff_policy="optional", …)
   just_ask.py     # MODE = ModeSpec(subcommand="just-ask", diff_policy="none", …)
   quorum.py       # MODE = ModeSpec(subcommand="quorum", diff_policy="none", …)

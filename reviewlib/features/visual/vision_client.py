@@ -197,7 +197,7 @@ def vision_backend_available(model: str) -> bool:
     cap = capability_for(model)
     if cap is None:
         return False
-    if backends.provider_marked_unpaid(model):
+    if backends.runtime_provider_marked_unpaid(model):
         return False
     if cap.wire == "gemini":
         try:
@@ -563,8 +563,8 @@ def call_ai_vision(
         return VisionVerdict(available=False, verdict=None, error=f"backend {model} is not vision-capable")
     from ... import backends
 
-    if backends.provider_marked_unpaid(model):
-        return VisionVerdict(available=False, verdict=None, error=backends.unpaid_provider_error(model), backend=model)
+    if backends.runtime_provider_marked_unpaid(model):
+        return VisionVerdict(available=False, verdict=None, error=backends.runtime_unpaid_provider_error(model), backend=model)
 
     schema = output_schema or build_output_schema()
     sys_prompt = system or _SYSTEM_PROMPT
@@ -807,8 +807,8 @@ def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schem
     model via `oc:<provider>/<vision-model>`. The verdict JSON is parsed from the output."""
     from ... import backends
 
-    if backends.provider_marked_unpaid(model):
-        return VisionVerdict(available=False, verdict=None, error=backends.unpaid_provider_error(model), backend=model)
+    if backends.runtime_provider_marked_unpaid(model):
+        return VisionVerdict(available=False, verdict=None, error=backends.runtime_unpaid_provider_error(model), backend=model)
     provider = backends._oc_provider_from_model(model)
     if provider is not None and not backends._oc_provider_auth_available(provider):
         return VisionVerdict(

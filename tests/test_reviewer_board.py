@@ -1316,6 +1316,28 @@ def test_cli_leading_pool_and_timeout_options_before_subcommand_are_honored():
     assert captured["timeout"] == 77, captured
 
 
+def test_cli_leading_meta_flags_before_subcommand_are_honored():
+    """Zero-arg global flags before the mode verb must land on the mode parser too."""
+    from reviewlib import cli
+
+    assert cli._normalize_leading_mode_options(["--list-defaults", "diff"]) == ["diff", "--list-defaults"]
+    captured: dict = {}
+    old_show_board = cli._show_board
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {}
+    cli._show_board = lambda config, pool_size, cwd=None: captured.update(
+        {"pool_size": pool_size, "cwd": cwd}
+    ) or 0
+    try:
+        rc = cli.main(["--show-board", "--pool", "2", "diff", "-C", str(REPO_ROOT)])
+    finally:
+        cli._show_board = old_show_board
+        cli.load_config = old_load_config
+    assert rc == 0
+    assert captured["pool_size"] == 2, captured
+    assert captured["cwd"] == REPO_ROOT, captured
+
+
 def _show_board_lines(
     pool_size: int, board_models: list[str] | None = None,
     available: set[str] | None = None,
@@ -1375,6 +1397,43 @@ def test_show_board_startup_failover_skips_unavailable_top_seat():
     assert "Fable" in by_tier["unavail"][0], by_tier["unavail"]
     assert "Opus" in by_tier["pool"][0]
     assert "GLM-cc" in by_tier["pool"][1]
+
+
+def test_show_board_marks_claude_commandcode_api_gateway_unpaid():
+    import contextlib
+    import io
+
+    from reviewlib import cli
+
+    saved = {
+        k: os.environ.get(k)
+        for k in (
+            "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "REVIEW_CLAUDE_MODE",
+            "REVIEW_UNPAID_PROVIDERS",
+        )
+    }
+    old_which = backends._which_optional
+    buf = io.StringIO()
+    try:
+        backends._which_optional = lambda _name: None
+        os.environ["ANTHROPIC_API_KEY"] = "user_x"
+        os.environ["ANTHROPIC_BASE_URL"] = "https://api.commandcode.ai/provider"
+        os.environ.pop("REVIEW_CLAUDE_MODE", None)
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
+        cfg = {"board": [{"model": "claude:claude-fable-5", "role": "tests"}]}
+        with contextlib.redirect_stdout(buf):
+            rc = cli._show_board(cfg, 1, REPO_ROOT)
+    finally:
+        backends._which_optional = old_which
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert rc == 0, buf.getvalue()
+    lines = buf.getvalue().splitlines()
+    row = next(line for line in lines if "claude:claude-fable-5" in line)
+    assert "SKIPPED (provider unpaid/disabled)" in row, row
 
 
 def test_show_board_pool_zero_marks_all_seats_pool():
