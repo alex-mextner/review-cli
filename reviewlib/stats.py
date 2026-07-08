@@ -193,6 +193,76 @@ def iterations_for_task(task_code: str) -> list[dict]:
     return out
 
 
+def _store_unreadable_error() -> str | None:
+    """Return an error string if the stats store cannot be read, else None.
+
+    Distinguishes "store missing/unreadable" from "store readable but the task has
+    zero records" so quorum_check can report a more useful message than a bare
+    empty result in both cases. Never raises.
+    """
+    try:
+        stats_path().read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — reporting only, never abort a check
+        return f"stats store unreadable: {exc}"
+    return None
+
+
+def quorum_check(task_code: str, *, min_iter: int, min_models: int) -> dict:
+    """Compute the quorum verdict for one task: N iterations across M distinct models.
+
+    This is a STRUCTURAL check on runs that were DISPATCHED, not on review VERDICTS —
+    the store (record_run) has no "findings addressed" / "approved" field today, only
+    which models ran and their raw ok/fail call counts. A future "passed-verdict"
+    quorum (e.g. requiring every reviewer to have come back clean) would need a new
+    verdict field threaded through record_run; this check only answers "did enough
+    independent reviewers actually run", which is what PR1 of the self-merge-authority
+    program needs as its foundation.
+
+    Fail-closed: an invalid task code, an unreadable/missing store, or zero recorded
+    iterations for the code all yield ``passed: False`` plus an ``"error"`` key
+    explaining why — the caller must never treat "no data" as "quorum met".
+    """
+    try:
+        clean = normalize_task_code(task_code)
+    except ValueError as exc:
+        return {
+            "task_code": task_code,
+            "iterations": 0,
+            "distinct_models": 0,
+            "models": [],
+            "min_iter": min_iter,
+            "min_models": min_models,
+            "passed": False,
+            "error": f"invalid task code: {exc}",
+        }
+
+    store_error = _store_unreadable_error()
+    iterations = iterations_for_task(clean) if clean else []
+    models: list[str] = []
+    for item in iterations:
+        for model in item.get("models") or []:
+            if isinstance(model, str) and model not in models:
+                models.append(model)
+    models.sort()
+
+    result = {
+        "task_code": clean,
+        "iterations": len(iterations),
+        "distinct_models": len(models),
+        "models": models,
+        "min_iter": min_iter,
+        "min_models": min_models,
+        "passed": len(iterations) >= min_iter and len(models) >= min_models,
+    }
+    if store_error is not None:
+        result["passed"] = False
+        result["error"] = store_error
+    elif not iterations:
+        result["passed"] = False
+        result["error"] = f"no recorded review iterations for {clean}"
+    return result
+
+
 def task_summaries() -> list[dict]:
     """Aggregate run-stats by task code, newest task first."""
     groups: dict[str, dict] = {}

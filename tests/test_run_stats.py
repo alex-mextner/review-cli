@@ -973,6 +973,218 @@ def test_skill_docs_show_required_task_code_for_recorded_modes():
 
 
 # ---------------------------------------------------------------------------
+# quorum_check + `review task CODE --quorum-check` (self-merge-authority PR1 gate)
+# ---------------------------------------------------------------------------
+def test_quorum_check_met():
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(task_code=TASK, mode="review", models=[model],
+                              duration_seconds=1.0, ok_count=1, fail_count=0)
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is True
+        assert result["iterations"] == 3
+        assert result["distinct_models"] == 3
+        assert result["models"] == ["codex", "fable5", "gemini"]
+        assert "error" not in result
+        # Contract: the returned dict has a stable shape + value types (Gemini review).
+        assert set(result) == {"task_code", "iterations", "distinct_models", "models",
+                               "min_iter", "min_models", "passed"}
+        assert isinstance(result["task_code"], str)
+        assert isinstance(result["iterations"], int)
+        assert isinstance(result["distinct_models"], int)
+        assert isinstance(result["models"], list)
+        assert all(isinstance(m, str) for m in result["models"])
+        assert isinstance(result["min_iter"], int)
+        assert isinstance(result["min_models"], int)
+        assert isinstance(result["passed"], bool)
+
+
+def test_quorum_check_short_on_iterations():
+    with _TmpStore():
+        # 2 runs, but 3 distinct models across them (>= min_models) -- only iterations short.
+        _stats.record_run(task_code=TASK, mode="review", models=["codex", "gemini"],
+                          duration_seconds=1.0, ok_count=2, fail_count=0)
+        _stats.record_run(task_code=TASK, mode="review", models=["fable5"],
+                          duration_seconds=1.0, ok_count=1, fail_count=0)
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is False
+        assert result["iterations"] == 2
+        assert result["distinct_models"] == 3
+        assert "error" not in result
+
+
+def test_quorum_check_short_on_models():
+    with _TmpStore():
+        # 3 runs, but the SAME model each time -- only distinct_models short.
+        for _ in range(3):
+            _stats.record_run(task_code=TASK, mode="review", models=["codex"],
+                              duration_seconds=1.0, ok_count=1, fail_count=0)
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is False
+        assert result["iterations"] == 3
+        assert result["distinct_models"] == 1
+        assert "error" not in result
+
+
+def test_quorum_check_zero_records_fails_closed():
+    with _TmpStore():
+        # Write a record for a DIFFERENT task first so the store exists and is
+        # readable -- isolates "store readable, zero records for THIS code" from
+        # "store missing/unreadable" (covered separately below).
+        _stats.record_run(task_code="HYP-000", mode="review", models=["codex"],
+                          duration_seconds=1.0, ok_count=1, fail_count=0)
+        result = _stats.quorum_check("HYP-999", min_iter=1, min_models=1)
+        assert result["passed"] is False
+        assert result["iterations"] == 0
+        assert "error" in result
+        assert "HYP-999" in result["error"]
+
+
+def test_quorum_check_missing_store_fails_closed():
+    saved = os.environ.get("REVIEW_STATS_FILE")
+    os.environ["REVIEW_STATS_FILE"] = "/nonexistent-xyz/deeper/run-stats.jsonl"
+    try:
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=1)
+        assert result["passed"] is False
+        assert "error" in result
+    finally:
+        if saved is None:
+            os.environ.pop("REVIEW_STATS_FILE", None)
+        else:
+            os.environ["REVIEW_STATS_FILE"] = saved
+
+
+def test_quorum_check_unexpandable_store_fails_closed():
+    """An unexpandable $REVIEW_STATS_FILE makes stats_path() raise RuntimeError --
+    quorum_check must catch it and fail closed, never raise (mirrors
+    test_stats_never_raise_on_unexpandable_path for record_run/eta_line)."""
+    saved = os.environ.get("REVIEW_STATS_FILE")
+    os.environ["REVIEW_STATS_FILE"] = "~nosuchuser-zzz/run-stats.jsonl"
+    try:
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=1)
+        assert result["passed"] is False
+        assert "error" in result
+    finally:
+        if saved is None:
+            os.environ.pop("REVIEW_STATS_FILE", None)
+        else:
+            os.environ["REVIEW_STATS_FILE"] = saved
+
+
+def test_quorum_check_invalid_task_code_fails_closed():
+    result = _stats.quorum_check("bad code", min_iter=1, min_models=1)
+    assert result["passed"] is False
+    assert "error" in result
+    assert result["iterations"] == 0 and result["distinct_models"] == 0
+
+
+def test_cli_quorum_check_met_prints_verdict_and_exits_0():
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(task_code=TASK, mode="review", models=[model],
+                              duration_seconds=1.0, ok_count=1, fail_count=0)
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--quorum-check"])
+        assert rc == 0, rc
+        text = out.getvalue()
+        assert "quorum met" in text
+        assert TASK in text
+        assert "3 iteration" in text and "3 distinct model" in text
+
+
+def test_cli_quorum_check_short_prints_ratio_and_exits_nonzero():
+    with _TmpStore():
+        _stats.record_run(task_code=TASK, mode="review", models=["codex", "gemini"],
+                          duration_seconds=1.0, ok_count=2, fail_count=0)
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--quorum-check"])
+        assert rc != 0, rc
+        text = out.getvalue()
+        assert "quorum NOT met" in text
+        assert "1/3 iterations" in text
+        assert "2/3 distinct models" in text
+
+
+def test_cli_quorum_check_custom_thresholds():
+    with _TmpStore():
+        _stats.record_run(task_code=TASK, mode="review", models=["codex", "gemini"],
+                          duration_seconds=1.0, ok_count=2, fail_count=0)
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--quorum-check", "--min-iter", "1", "--min-models", "2"])
+        assert rc == 0, rc
+        assert "quorum met" in out.getvalue()
+
+
+def test_cli_quorum_check_missing_store_fails_closed_nonzero():
+    saved = os.environ.get("REVIEW_STATS_FILE")
+    os.environ["REVIEW_STATS_FILE"] = "/nonexistent-xyz/deeper/run-stats.jsonl"
+    try:
+        err = io.StringIO()
+        with redirect_stderr(err), _capture_stdout():
+            rc = _cli.main(["task", TASK, "--quorum-check"])
+        assert rc != 0, rc
+        assert "quorum NOT met" in err.getvalue()
+    finally:
+        if saved is None:
+            os.environ.pop("REVIEW_STATS_FILE", None)
+        else:
+            os.environ["REVIEW_STATS_FILE"] = saved
+
+
+def test_cli_quorum_check_zero_records_fails_closed_nonzero():
+    with _TmpStore():
+        err = io.StringIO()
+        with redirect_stderr(err), _capture_stdout():
+            rc = _cli.main(["task", "HYP-999", "--quorum-check"])
+        assert rc != 0, rc
+        assert "quorum NOT met" in err.getvalue()
+
+
+def test_cli_quorum_check_json_shape():
+    with _TmpStore():
+        _stats.record_run(task_code=TASK, mode="review", models=["codex"],
+                          duration_seconds=1.0, ok_count=1, fail_count=0)
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--quorum-check", "--json"])
+        assert rc != 0, rc  # short of default 3/3
+        payload = json.loads(out.getvalue())
+        required = {"task_code", "iterations", "distinct_models", "models", "min_iter",
+                    "min_models", "passed"}
+        assert required.issubset(payload.keys()), payload
+        assert payload["task_code"] == TASK
+        assert payload["iterations"] == 1
+        assert payload["distinct_models"] == 1
+        assert payload["models"] == ["codex"]
+        assert payload["min_iter"] == 3
+        assert payload["min_models"] == 3
+        assert payload["passed"] is False
+
+
+def test_cli_quorum_check_json_exits_0_when_passed():
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(task_code=TASK, mode="review", models=[model],
+                              duration_seconds=1.0, ok_count=1, fail_count=0)
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--quorum-check", "--json"])
+        assert rc == 0, rc
+        assert json.loads(out.getvalue())["passed"] is True
+
+
+def test_cli_quorum_check_requires_code():
+    err = io.StringIO()
+    with redirect_stderr(err), _capture_stdout():
+        rc = _cli.main(["task", "--quorum-check"])
+    assert rc == 2, rc
+    assert "requires a task CODE" in err.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # stdout capture helper (keep the mode's printed review output off the test log)
 # ---------------------------------------------------------------------------
 import contextlib  # noqa: E402

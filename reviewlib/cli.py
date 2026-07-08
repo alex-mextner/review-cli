@@ -63,6 +63,7 @@ from .stats import (
     fmt_duration,
     iterations_for_task,
     normalize_task_code,
+    quorum_check,
     record_run,
     task_summaries,
 )
@@ -638,7 +639,27 @@ def _task_subcommand(rest: list[str]) -> int:
     parser.add_argument("--detail", metavar="N|SESSION",
                         help="print the full transcript for an iteration number or session id")
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--quorum-check",
+        action="store_true",
+        help="exit 0 iff the task has enough recorded iterations across enough "
+        "distinct models (self-merge-authority gate); see --min-iter/--min-models. "
+        "STRUCTURAL check on runs that were dispatched, NOT on review verdicts — "
+        "it answers 'did enough independent reviewers run', not 'did they approve'",
+    )
+    parser.add_argument(
+        "--min-iter", type=int, default=3, help="quorum floor: recorded iterations (default 3)"
+    )
+    parser.add_argument(
+        "--min-models", type=int, default=3, help="quorum floor: distinct models (default 3)"
+    )
     ns = parser.parse_args(rest)
+
+    if ns.quorum_check:
+        if not ns.code:
+            print("[review task] --quorum-check requires a task CODE", file=sys.stderr)
+            return 2
+        return _quorum_check_subcommand(ns.code, ns.min_iter, ns.min_models, as_json=ns.json)
 
     if not ns.code:
         summaries = task_summaries()
@@ -713,6 +734,44 @@ def _task_subcommand(rest: list[str]) -> int:
             )
     print(f"\nDetail: review task {code} --detail <iteration|session_id>")
     return 0
+
+
+def _quorum_check_subcommand(code: str, min_iter: int, min_models: int, *, as_json: bool) -> int:
+    """`review task CODE --quorum-check [--min-iter N] [--min-models M]`.
+
+    Exit 0 iff CODE has >= min_iter recorded iterations across >= min_models
+    distinct models; exit 1 otherwise, including the fail-closed cases (invalid
+    code, unreadable/missing stats store, zero records) where reviewlib.stats.
+    quorum_check sets an "error" key. See quorum_check's docstring for the
+    "dispatched runs, not verdicts" caveat this check is scoped to.
+    """
+    result = quorum_check(code, min_iter=min_iter, min_models=min_models)
+    if as_json:
+        import json as _json
+
+        print(_json.dumps(result, indent=2))
+        return 0 if result["passed"] else 1
+
+    if "error" in result:
+        print(f"quorum NOT met for {result['task_code']}: {result['error']}", file=sys.stderr)
+        return 1
+
+    iterations, distinct = result["iterations"], result["distinct_models"]
+    if result["passed"]:
+        models = ", ".join(result["models"]) or "-"
+        plural_i = "" if iterations == 1 else "s"
+        plural_m = "" if distinct == 1 else "s"
+        print(
+            f"quorum met for {result['task_code']}: {iterations} iteration{plural_i} "
+            f"across {distinct} distinct model{plural_m} ({models})"
+        )
+        return 0
+
+    print(
+        f"quorum NOT met for {result['task_code']}: "
+        f"{iterations}/{min_iter} iterations, {distinct}/{min_models} distinct models"
+    )
+    return 1
 
 
 def _task_detail(code: str, selector: str, iterations: list[dict], sessions: list, *, as_json: bool) -> int:
