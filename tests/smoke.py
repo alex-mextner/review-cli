@@ -553,6 +553,8 @@ _UNIT_FILES = [
     ("test_specweb.py", {}),
     ("test_specweb_daemon.py", {}),
     ("test_claude_api.py", {}),
+    # --effort flag parsing + per-backend reasoning-effort propagation (review-cli#126).
+    ("test_effort_flag.py", {}),
     ("test_provider_keys.py", {}),
     ("test_reviewer_board.py", {}),
     # Capability-aware seat resolution from the shared models.yaml manifest (rig-cli#8 consumer

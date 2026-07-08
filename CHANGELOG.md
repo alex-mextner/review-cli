@@ -5,6 +5,15 @@ semantic versioning.
 
 ## Unreleased
 
+- **`--effort LEVEL` — per-run reasoning effort across backends (review-cli#126).** All
+  modes accept a repeatable `--effort` (low|medium|high|xhigh|max), globally or scoped as
+  `PROVIDER=LEVEL` (e.g. `--effort xhigh --effort codex=high`), also honoured from
+  `$REVIEW_EFFORT` / `$REVIEW_EFFORT_<PROVIDER>`. The level is threaded into every backend
+  that supports it — claude CLI `--effort`, Anthropic API `output_config.effort`, codex
+  `-c model_reasoning_effort` (max mapped to xhigh), opencode `--variant` — while backends
+  with no effort control (gemini, zai, commandcode, openrouter, the legacy claude-p
+  fallback) warn once on stderr instead of silently ignoring the flag. Enables e.g.
+  `review brainstorm "…" --task CODE -m fable --effort xhigh`.
 - **Visible error text is now a built-in visual veto (review-cli#121).** The visual verifier
   asks the existing vision-LLM pass whether any on-screen text reads as a real runtime
   error, exception, or failure diagnostic. Because arbitrary error text has no reliable

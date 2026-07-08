@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 from . import backends
+from .backends import EFFORT_LEVELS
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
 from .config import (
@@ -1775,6 +1776,44 @@ def _moderator_default_help() -> str:
     return " -> ".join(MODERATOR_CANDIDATES).replace("%", "%%")
 
 
+def _apply_effort_args(values: list[str]) -> str | None:
+    """Export the `--effort` selections as env vars, returning an error string or None.
+
+    Each value is either a bare LEVEL (global -> $REVIEW_EFFORT) or PROVIDER=LEVEL
+    (one backend -> $REVIEW_EFFORT_<PROVIDER>). Same transport as `--retry` /
+    $REVIEW_RETRY_COUNT: exporting for the rest of the process means the panel's
+    threads and backend subprocess spawns all see one consistent value, and the flag
+    wins over a pre-existing env while an unset flag leaves the env in force.
+
+    "The flag wins" matches its scope: a bare (global) LEVEL clears EVERY pre-existing
+    $REVIEW_EFFORT* var first, so a stale provider-scoped export (e.g.
+    REVIEW_EFFORT_CODEX=low) can never silently beat an explicit `--effort xhigh`;
+    a PROVIDER=LEVEL value overrides only its own provider's var, leaving an
+    env-provided global in force for the other seats."""
+    if any(raw.strip() and "=" not in raw for raw in values):
+        for var in [v for v in os.environ if v.startswith("REVIEW_EFFORT")]:
+            del os.environ[var]
+    for raw in values:
+        item = raw.strip().lower()
+        if not item:
+            continue
+        provider, sep, level = item.partition("=")
+        if not sep:
+            provider, level = "", provider
+        provider = provider.strip()
+        level = level.strip()
+        if level not in EFFORT_LEVELS:
+            return (
+                f"invalid --effort level {level!r}: choose from "
+                f"{'|'.join(EFFORT_LEVELS)} (optionally scoped as PROVIDER=LEVEL)"
+            )
+        if provider and not provider.replace("-", "").replace("_", "").isalnum():
+            return f"invalid --effort provider {provider!r} (e.g. codex, claude, opencode)"
+        suffix = f"_{provider.upper().replace('-', '_')}" if provider else ""
+        os.environ[f"REVIEW_EFFORT{suffix}"] = level
+    return None
+
+
 def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
     """Add the TRULY-GLOBAL options — the only ones the top-level `review --help` should
     list (ROADMAP "Subcommand-only options belong in the subcommand help, not the global
@@ -1811,6 +1850,19 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             "per-call timeout seconds (default 1200 for review, 240 for the chat panel "
             f"modes, {QA_TIMEOUT_DEFAULT} for qa — a tester run boots a SUT and drives a "
             "whole suite)"
+        ),
+    )
+    parser.add_argument(
+        "--effort", action="append", default=[], metavar="LEVEL",
+        help=(
+            "reasoning effort for backends that support it: low|medium|high|xhigh|max. "
+            "Repeatable; a bare LEVEL applies to every seat, PROVIDER=LEVEL scopes one "
+            "backend (e.g. --effort xhigh --effort codex=high). Mapping: claude CLI "
+            "--effort / Anthropic API output_config.effort / codex "
+            "model_reasoning_effort (max -> xhigh) / opencode --variant; backends "
+            "without an effort control (gemini, zai, commandcode, openrouter) warn and "
+            "run at their default. Also honoured from $REVIEW_EFFORT / "
+            "$REVIEW_EFFORT_<PROVIDER> (the flag wins)."
         ),
     )
     parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
@@ -2319,6 +2371,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # ceiling so a stray `--retry 9999` can't pin a dead seat for minutes.
     if getattr(args, "retry", None) is not None:
         os.environ["REVIEW_RETRY_COUNT"] = str(max(0, min(args.retry, max_retry_count())))
+
+    # `--effort` rides the same env-export transport ($REVIEW_EFFORT[_<PROVIDER>]) so
+    # the value reaches every backend call in every panel thread/subprocess without
+    # threading a parameter through each backend signature (see backends.effort_for).
+    effort_error = _apply_effort_args(getattr(args, "effort", []) or [])
+    if effort_error is not None:
+        print(f"[review-cli] {effort_error}", file=sys.stderr, flush=True)
+        return 2
 
     config = load_config()
 

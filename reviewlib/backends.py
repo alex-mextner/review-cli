@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -32,6 +33,99 @@ GEMINI_ENV_FALLBACKS = (
 # the user knows what to `tail -f`. Enabled by the panel modes (--just-ask/--quorum/
 # --brainstorm); the plain single-diff review path keeps stderr quiet.
 _ANNOUNCE_LOGS = False
+
+# ---------------------------------------------------------------------------
+# Run-scoped reasoning effort (`--effort`, review-cli#126)
+# ---------------------------------------------------------------------------
+# The CLI exports the selection as env vars (same pattern as `--retry` /
+# $REVIEW_RETRY_COUNT): $REVIEW_EFFORT is the global level, and an optional
+# $REVIEW_EFFORT_<PROVIDER> (e.g. REVIEW_EFFORT_CODEX) overrides it for one
+# backend. Env transport means the value survives every thread/subprocess hop
+# the panel makes without threading a parameter through each backend signature.
+#
+# The canonical vocabulary is the claude one (low..max). Per-backend mapping:
+#   claude CLI  -> `--effort <level>`            (native; all five levels)
+#   claude API  -> `output_config: {effort: X}`  (native; all five levels)
+#   codex       -> `-c model_reasoning_effort=X` (no `max`; mapped to `xhigh`)
+#   opencode    -> `--variant <level>`           (provider-specific passthrough)
+# Backends with no effort control (gemini REST, zai, commandcode, openrouter)
+# WARN once on stderr instead of silently ignoring the flag.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_EFFORT_ENV = "REVIEW_EFFORT"
+
+
+def effort_for(provider: str) -> str | None:
+    """The effort level in force for ``provider`` (codex/claude/gemini/...), or None.
+
+    Provider-scoped $REVIEW_EFFORT_<PROVIDER> beats the global $REVIEW_EFFORT.
+    Values are normalized to lowercase; an unknown level is rejected here (with a
+    one-line stderr note) rather than passed through, so a typo'd env var can never
+    silently send a bogus level to a backend CLI/API."""
+    key = provider.upper().replace("-", "_")
+    for var in (f"{_EFFORT_ENV}_{key}", _EFFORT_ENV):
+        value = os.environ.get(var, "").strip().lower()
+        if not value:
+            continue
+        if value not in EFFORT_LEVELS:
+            # Warn and FALL THROUGH: a typo'd scoped var must not also suppress a
+            # valid global level for this provider's seat.
+            _warn_effort_once(
+                f"{var}={value!r}", f"is not a known effort level ({'|'.join(EFFORT_LEVELS)})"
+            )
+            continue
+        return value
+    return None
+
+
+# One warning per subject per process — a panel run calls each backend many times
+# (rounds, retries, parallel seats) and must not spam identical effort warnings on
+# every call. The lock makes check-then-add atomic across the panel's worker threads.
+_EFFORT_WARNED: set[str] = set()
+_EFFORT_WARNED_LOCK = threading.Lock()
+
+
+def _warn_effort_once(subject: str, detail: str) -> None:
+    with _EFFORT_WARNED_LOCK:
+        if subject in _EFFORT_WARNED:
+            return
+        _EFFORT_WARNED.add(subject)
+    print(f"[review-cli] effort: {subject} {detail}", file=sys.stderr, flush=True)
+
+
+def _warn_effort_unsupported(backend: str) -> None:
+    """Explicit non-silence for backends that cannot honour --effort at all."""
+    if effort_for(backend) is not None:
+        _warn_effort_once(backend, "does not support --effort; running at its default effort")
+
+
+# Shared per-backend effort argv builders — ONE source of truth for how each CLI
+# spells its effort knob, used by BOTH the text backends below and the visual
+# vision-client calls (reviewlib/features/visual/vision_client.py).
+def codex_effort_argv() -> list[str]:
+    """`-c model_reasoning_effort=<level>` for codex, or []. codex has no `max`
+    tier — its ceiling is `xhigh`; map rather than fail so a global `--effort max`
+    run still lifts every seat."""
+    effort = effort_for("codex")
+    if not effort:
+        return []
+    if effort == "max":
+        _warn_effort_once("codex", "has no 'max' reasoning effort; using 'xhigh'")
+        effort = "xhigh"
+    return ["-c", f"model_reasoning_effort={effort}"]
+
+
+def claude_effort_argv() -> list[str]:
+    """`--effort <level>` for the direct `claude --print` CLI, or []."""
+    effort = effort_for("claude")
+    return ["--effort", effort] if effort else []
+
+
+def opencode_variant_argv() -> list[str]:
+    """`--variant <level>` for opencode, or []. --variant values are provider-specific
+    (e.g. high/max/minimal) — the requested level is passed through verbatim; a provider
+    that doesn't know the value reports its own error in the seat output."""
+    effort = effort_for("opencode")
+    return ["--variant", effort] if effort else []
 
 
 @dataclass(frozen=True)
@@ -98,6 +192,7 @@ def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int, ro
     argv = [_which("codex"), "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
     if codex_model:
         argv += ["-m", codex_model]
+    argv += codex_effort_argv()
     argv.append("-")
     command = " ".join(argv[:-1]) + " -"
     proc = _run_streamed(
@@ -378,8 +473,11 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
     oc_model = model.split(":", 1)[1] if ":" in model else model
     _ensure_opencode_readonly_agent(cwd, oc_model)
 
+    variant_argv = opencode_variant_argv()
+    variant_cmd = " " + " ".join(variant_argv) if variant_argv else ""
+
     if _opencode_runs_in_repo(cwd):
-        command = f"opencode run --agent read-only-reviewer --dir {cwd} -m {oc_model} <prompt-with-diff>"
+        command = f"opencode run --agent read-only-reviewer --dir {cwd} -m {oc_model}{variant_cmd} <prompt-with-diff>"
         # AGENTIC, read-only: run opencode in the REAL repo (like review_codex's
         # `codex exec -s read-only -C <cwd>`), so it can READ any project file — not
         # just the diff embedded in the prompt. SAFETY is enforced by the
@@ -406,6 +504,7 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
             str(cwd),
             "-m",
             oc_model,
+            *variant_argv,
             message,
         ]
         proc = _run_streamed(argv, cwd=cwd, timeout=timeout, backend="opencode", round_no=round_no,
@@ -415,7 +514,7 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
     # FALLBACK: cwd is not a git repo (e.g. a panel `--just-ask` run from a scratch
     # dir) — there is nothing to read, so keep the old isolated empty-temp-dir posture
     # and review the diff/prompt alone.
-    command = f"opencode run --agent read-only-reviewer -m {oc_model} <prompt-with-diff>"
+    command = f"opencode run --agent read-only-reviewer -m {oc_model}{variant_cmd} <prompt-with-diff>"
     with tempfile.TemporaryDirectory(prefix="review-cli-opencode-") as tmp_raw:
         tmp = Path(tmp_raw)
         # Strip the repo-pinning git env: a leaked GIT_DIR/GIT_WORK_TREE would make `git init`
@@ -440,6 +539,7 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
             "read-only-reviewer",
             "-m",
             oc_model,
+            *variant_argv,
             message,
         ]
         proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", round_no=round_no,
@@ -510,6 +610,9 @@ def _gemini_key() -> str:
 def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     gemini_model = model.split(":", 1)[1] if ":" in model else os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     command = f"Gemini API {gemini_model}"
+    # No generic effort control: generateContent's thinking knobs are model-generation
+    # specific (thinkingBudget on 2.5, thinkingLevel on 3.x) — warn instead of guessing.
+    _warn_effort_unsupported("gemini")
     # Gemini is a REST backend — it never goes through `_run_streamed`, so it must emit
     # its own per-call sidecar log or the dashboard parser (which reads ONLY `.log`
     # files) would not see it at all: models undercounted, Gemini-only runs invisible
@@ -855,6 +958,7 @@ def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int, roun
     # A forced-mode config error or a missing key both produce a NON-zero result AND a
     # sidecar log — like review_gemini, these are real (failed) run attempts and must be
     # visible in the dashboard, never raise out of run_panel as an invisible internal 127.
+    _warn_effort_unsupported("zai")
     try:
         resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
         key = _zai_key()
@@ -922,6 +1026,7 @@ def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: i
     # A forced-mode config error or a missing key both produce a NON-zero result AND a
     # sidecar log (see review_zai) — a failed run must be visible in the dashboard, never
     # an invisible internal 127 raised out of run_panel.
+    _warn_effort_unsupported("commandcode")
     try:
         resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
         key = _commandcode_key()
@@ -1014,6 +1119,7 @@ def review_openrouter(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     # the panel's uniform 6-arg dispatch does not raise (see review_zai for the rationale).
     # A forced-mode config error or a missing key both produce a NON-zero result AND a
     # sidecar log so a failed run is visible in the dashboard, not an invisible internal 127.
+    _warn_effort_unsupported("openrouter")
     try:
         resolve_backend_mode("openrouter", OPENROUTER_SUPPORTED_MODES, "api")
         key = _openrouter_key()
@@ -1109,6 +1215,12 @@ def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: in
         "system": _CLAUDE_REVIEW_SYSTEM,
         "messages": [{"role": "user", "content": _payload(prompt, diff)}],
     }
+    # `output_config.effort` is GA on the Messages API (low..max, xhigh on 4.7+);
+    # models that don't support a level reject it with a 400 that surfaces in the
+    # seat's stderr — an honest failure, not a silent downgrade.
+    effort = effort_for("claude")
+    if effort:
+        body["output_config"] = {"effort": effort}
     headers = {
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
@@ -1424,9 +1536,15 @@ def _claude_cli_argv(
             argv += ["--add-dir", str(image_dir)]
         if model:
             argv += ["--model", model]
+        argv += claude_effort_argv()
         return argv
     # Legacy claude-p fallback (TUI-scraper): keep its --cwd / --tools '' / --timeout-sec
-    # / -p surface and its denylist unchanged so a claude-less host still works.
+    # / -p surface and its denylist unchanged so a claude-less host still works. It has
+    # no --effort flag — warn instead of silently dropping the request (review-cli#126).
+    if effort_for("claude") is not None:
+        _warn_effort_once(
+            "claude-p", "legacy claude fallback has no --effort flag; running at its default effort"
+        )
     argv = [
         binary, "--cwd", str(cwd), "--permission-mode", "dontAsk", "--tools", "",
         "--strict-mcp-config", "--disable-slash-commands", "--safe-mode",
@@ -1499,11 +1617,12 @@ def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     stdout = strip_control_sequences(proc.stdout)
     stderr = strip_control_sequences(proc.stderr)
     # A redacted, human-readable command line for the result header (no prompt/diff).
+    effort_note = f" --effort {effort}" if (effort := effort_for("claude")) and direct else ""
     if direct:
         command = (
             "claude --print --output-format text --permission-mode dontAsk --tools '' "
             "--strict-mcp-config --disable-slash-commands --safe-mode "
-            "--append-system-prompt <read-only-review>  (prompt via stdin)"
+            f"--append-system-prompt <read-only-review>{effort_note}  (prompt via stdin)"
         )
     else:
         command = (
@@ -1545,7 +1664,9 @@ def review_claude_cli_with_images(
     command = (
         "claude --print --output-format text --permission-mode dontAsk --tools Read "
         "--strict-mcp-config --disable-slash-commands --safe-mode --add-dir <image-dir> "
-        "--append-system-prompt <read-only-review>  (prompt via stdin, image @refs)"
+        "--append-system-prompt <read-only-review>"
+        + (f" --effort {e}" if (e := effort_for("claude")) else "")
+        + "  (prompt via stdin, image @refs)"
     )
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=stdout, stderr=stderr)
 

@@ -22,6 +22,7 @@ Proves:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -652,6 +653,109 @@ def test_stage_images_writes_real_files_with_right_suffix():
         assert len(paths) == 1
         assert paths[0].suffix == ".jpg"
         assert paths[0].read_bytes() == _IMG_BYTES
+
+
+
+
+# === --effort threading into the vision CLIs (review-cli#126) =====================
+class _EffortEnv:
+    """Context manager: hermetic REVIEW_EFFORT* env + fresh warn-dedup set."""
+
+    def __init__(self, **env: str) -> None:
+        self._env = env
+
+    def __enter__(self):
+        import reviewlib.backends as backends
+
+        self._saved = {k: v for k, v in os.environ.items() if k.startswith("REVIEW_EFFORT")}
+        for key in self._saved:
+            del os.environ[key]
+        os.environ.update(self._env)
+        self._saved_warned = backends._EFFORT_WARNED
+        backends._EFFORT_WARNED = set()
+        return self
+
+    def __exit__(self, *exc):
+        import reviewlib.backends as backends
+
+        for key in [k for k in os.environ if k.startswith("REVIEW_EFFORT")]:
+            del os.environ[key]
+        os.environ.update(self._saved)
+        backends._EFFORT_WARNED = self._saved_warned
+        return False
+
+
+def test_codex_vision_gets_reasoning_effort_and_maps_max():
+    cap: dict = {}
+    with _EffortEnv(REVIEW_EFFORT="max"):
+        old = _patch_runner(cap, write_output_file='{"verdict":"keep","confidence":0.9}')
+        try:
+            vc.call_ai_vision("codex", blocks=_blocks())
+        finally:
+            _restore_runner(old)
+    argv = cap["argv"]
+    assert "-c" in argv and argv[argv.index("-c") + 1] == "model_reasoning_effort=xhigh", argv
+
+
+def test_claude_vision_gets_effort_flag():
+    cap: dict = {}
+    with _EffortEnv(REVIEW_EFFORT="xhigh"):
+        old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9}')
+        try:
+            vc.call_ai_vision("claude", blocks=_blocks())
+        finally:
+            _restore_runner(old)
+    argv = cap["argv"]
+    assert "--effort" in argv and argv[argv.index("--effort") + 1] == "xhigh", argv
+
+
+def test_opencode_vision_gets_variant_flag():
+    cap: dict = {}
+    with _EffortEnv(REVIEW_EFFORT="high"):
+        old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9}')
+        try:
+            vc.call_ai_vision("oc:zai/glm-4.6v", blocks=_blocks())
+        finally:
+            _restore_runner(old)
+    argv = cap["argv"]
+    assert "--variant" in argv and argv[argv.index("--variant") + 1] == "high", argv
+
+
+def test_vision_clis_clean_without_effort():
+    for model, out_kw in (
+        ("codex", {"write_output_file": '{"verdict":"keep","confidence":0.9}'}),
+        ("claude", {"stdout": '{"verdict":"keep","confidence":0.9}'}),
+        ("oc:zai/glm-4.6v", {"stdout": '{"verdict":"keep","confidence":0.9}'}),
+    ):
+        cap: dict = {}
+        with _EffortEnv():
+            old = _patch_runner(cap, **out_kw)
+            try:
+                vc.call_ai_vision(model, blocks=_blocks())
+            finally:
+                _restore_runner(old)
+        argv = cap["argv"]
+        for flag in ("--effort", "--variant", "-c"):
+            assert flag not in argv, (model, flag, argv)
+
+
+def test_gemini_vision_warns_when_effort_set():
+    import contextlib
+    import io
+
+    import reviewlib.backends as backends
+
+    buf = io.StringIO()
+    with _EffortEnv(REVIEW_EFFORT="xhigh"), contextlib.redirect_stderr(buf):
+        saved = backends._gemini_key
+        backends._gemini_key = lambda: (_ for _ in ()).throw(RuntimeError("no key"))
+        try:
+            v = vc._call_gemini("gemini", body={}, timeout_s=5)
+        finally:
+            backends._gemini_key = saved
+    assert not v.available
+    text = buf.getvalue()
+    assert "gemini" in text and "does not support --effort" in text
 
 
 if __name__ == "__main__":

@@ -731,6 +731,9 @@ def _call_codex_cli(model: str, system: str, blocks: list[VisionBlock], schema: 
         argv = ["codex", "exec", "-s", "read-only", "--skip-git-repo-check", "-C", str(tmp), "--ephemeral"]
         if codex_model:
             argv += ["-m", codex_model]
+        from ... import backends
+
+        argv += backends.codex_effort_argv()
         for img in images:
             argv += ["-i", str(img)]
         argv += ["--output-schema", str(schema_path), "-o", str(out_path), "-"]
@@ -775,6 +778,9 @@ def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema:
         ]
         if claude_model:
             argv += ["--model", claude_model]
+        from ... import backends
+
+        argv += backends.claude_effort_argv()
         rc, stdout, stderr, timed_out = _run_cli(argv, cwd=tmp, input_text=None, timeout_s=timeout_s, backend="claude-vision")
         # `--output-format json` wraps the answer; the verdict JSON is the `result` field.
         text = stdout
@@ -814,6 +820,7 @@ def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schem
         # Message FIRST (positional), then flags: the -f array flag is greedy and would
         # otherwise swallow a trailing positional message.
         argv = ["opencode", "run", prompt, "--agent", "read-only-reviewer", "-m", oc_model]
+        argv += backends.opencode_variant_argv()
         for img in images:
             argv += ["-f", str(img)]
         rc, stdout, stderr, timed_out = _run_cli(argv, cwd=tmp, input_text=None, timeout_s=timeout_s, backend="opencode-vision")
@@ -835,6 +842,9 @@ def _parse_gemini_response(payload: dict, backend: str) -> VisionVerdict:
 def _call_gemini(model: str, body: dict, timeout_s: int) -> VisionVerdict:
     from ... import backends
 
+    # Same contract as review_gemini: no effort control on the REST call — warn
+    # instead of silently ignoring a requested --effort (review-cli#126).
+    backends._warn_effort_unsupported("gemini")
     try:
         key = backends._gemini_key()
     except RuntimeError as exc:

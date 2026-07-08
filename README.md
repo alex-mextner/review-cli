@@ -924,6 +924,15 @@ GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)
                     overwrites) while still printing to stdout. Use this instead of
                     `review … > FILE`, which fails silently under zsh noclobber.
 --timeout N         Per-call timeout in seconds (default 1200 for review, 240 for panel modes).
+--effort LEVEL      Reasoning effort for backends that support it: low|medium|high|xhigh|max.
+                    Repeatable; a bare LEVEL applies to every seat, PROVIDER=LEVEL scopes one
+                    backend (e.g. `--effort xhigh --effort codex=high`). Mapping: claude CLI
+                    `--effort` / Anthropic API `output_config.effort` / codex
+                    `model_reasoning_effort` (max -> xhigh) / opencode `--variant`. Backends
+                    without an effort control (gemini, zai, commandcode, openrouter) warn on
+                    stderr and run at their default — never a silent ignore. Also honoured
+                    from $REVIEW_EFFORT / $REVIEW_EFFORT_<PROVIDER> (the flag wins).
+                    Example: `review brainstorm "hard design call" --task CODE -m fable --effort xhigh`.
 --list-defaults     Print effective default backends and exit.
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
 --pool N            How many of the board's seats to run (default 4); the first N seats run,
