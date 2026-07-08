@@ -22,6 +22,7 @@ Proves:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -61,12 +62,16 @@ def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write
 
     import reviewlib.process as process
 
-    def fake(argv, *, cwd, input_text=None, env=None, timeout=1200, backend="backend", round_no=0, announce=False):
+    def fake(
+        argv, *, cwd, input_text=None, env=None, timeout=1200, backend="backend",
+        round_no=0, announce=False, idle_floor=None, timeout_mode="idle",
+    ):
         argv = list(argv)
         capture["argv"] = argv
         capture["input_text"] = input_text
         capture["cwd"] = str(cwd)
         capture["backend"] = backend
+        capture["timeout_mode"] = timeout_mode
         capture.setdefault("calls", []).append(argv)
         # The staged image temp dir is deleted when call_ai_vision returns, so snapshot the
         # attached image bytes (per CLI flag) HERE, while the files still exist.
@@ -96,9 +101,11 @@ def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write
 
     old = process._run_streamed
     old_which = shutil.which
+    old_fireworks_key = os.environ.get("FIREWORKS_API_KEY")
     process._run_streamed = fake
     shutil.which = lambda name: f"/fake/bin/{name}" if name in ("codex", "claude", "opencode") else old_which(name)
-    return old, old_which
+    os.environ["FIREWORKS_API_KEY"] = "test-fireworks-key"
+    return old, old_which, old_fireworks_key
 
 
 def _restore_runner(old):
@@ -108,6 +115,10 @@ def _restore_runner(old):
 
     process._run_streamed = old[0]
     shutil.which = old[1]
+    if old[2] is None:
+        os.environ.pop("FIREWORKS_API_KEY", None)
+    else:
+        os.environ["FIREWORKS_API_KEY"] = old[2]
 
 
 def _staged_image_bytes(cap: dict, flag: str) -> bytes | None:
@@ -377,7 +388,9 @@ def test_text_opencode_model_not_selected_for_vision():
     import shutil
 
     old_which = shutil.which
+    old_key = os.environ.get("FIREWORKS_API_KEY")
     shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    os.environ["FIREWORKS_API_KEY"] = "test-fireworks-key"
     vc.vision_backend_available = old  # use the real function under test
     try:
         text_default = "oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo"
@@ -387,6 +400,10 @@ def test_text_opencode_model_not_selected_for_vision():
         assert vc.vision_backend_available("oc:fireworks/qwen2-vl") is True
     finally:
         shutil.which = old_which
+        if old_key is None:
+            os.environ.pop("FIREWORKS_API_KEY", None)
+        else:
+            os.environ["FIREWORKS_API_KEY"] = old_key
 
 
 def test_opencode_vision_allowlist_env_override():
@@ -397,7 +414,9 @@ def test_opencode_vision_allowlist_env_override():
     old_which = shutil.which
     shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
     old_env = os.environ.get("REVIEW_OPENCODE_VISION_MODELS")
+    old_key = os.environ.get("FIREWORKS_API_KEY")
     os.environ["REVIEW_OPENCODE_VISION_MODELS"] = "kimi-k2p6-turbo"
+    os.environ["FIREWORKS_API_KEY"] = "test-fireworks-key"
     try:
         assert vc.vision_backend_available("oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo") is True
     finally:
@@ -406,6 +425,201 @@ def test_opencode_vision_allowlist_env_override():
             os.environ.pop("REVIEW_OPENCODE_VISION_MODELS", None)
         else:
             os.environ["REVIEW_OPENCODE_VISION_MODELS"] = old_env
+        if old_key is None:
+            os.environ.pop("FIREWORKS_API_KEY", None)
+        else:
+            os.environ["FIREWORKS_API_KEY"] = old_key
+
+
+def test_opencode_vision_requires_provider_auth_for_known_providers():
+    """The visual opencode path must reuse the text path's provider-auth startup skip."""
+    import shutil
+    import tempfile
+
+    old_which = shutil.which
+    old_key = os.environ.pop("FIREWORKS_API_KEY", None)
+    old_auth = os.environ.get("OC_AUTH_FILE")
+    old_config = os.environ.get("OC_CONFIG_FILE")
+    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["OC_AUTH_FILE"] = str(Path(tmp) / "auth.json")
+        os.environ["OC_CONFIG_FILE"] = str(Path(tmp) / "opencode.json")
+        try:
+            assert vc.vision_backend_available("oc:fireworks/qwen2-vl") is False
+        finally:
+            shutil.which = old_which
+            if old_key is not None:
+                os.environ["FIREWORKS_API_KEY"] = old_key
+            if old_auth is None:
+                os.environ.pop("OC_AUTH_FILE", None)
+            else:
+                os.environ["OC_AUTH_FILE"] = old_auth
+            if old_config is None:
+                os.environ.pop("OC_CONFIG_FILE", None)
+            else:
+                os.environ["OC_CONFIG_FILE"] = old_config
+
+
+def test_opencode_zai_vision_requires_opencode_auth_not_zai_rest_key():
+    """`ZAI_API_KEY` is direct REST auth only; `oc:zai/...` needs opencode provider auth."""
+    import shutil
+    import tempfile
+
+    old_which = shutil.which
+    old_zai_key = os.environ.get("ZAI_API_KEY")
+    old_auth = os.environ.get("OC_AUTH_FILE")
+    old_config = os.environ.get("OC_CONFIG_FILE")
+    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["OC_AUTH_FILE"] = str(Path(tmp) / "auth.json")
+        os.environ["OC_CONFIG_FILE"] = str(Path(tmp) / "opencode.json")
+        os.environ["ZAI_API_KEY"] = "direct-rest-key-only"
+        try:
+            assert vc.vision_backend_available("oc:zai/glm-4.5v") is False
+        finally:
+            shutil.which = old_which
+            if old_zai_key is None:
+                os.environ.pop("ZAI_API_KEY", None)
+            else:
+                os.environ["ZAI_API_KEY"] = old_zai_key
+            if old_auth is None:
+                os.environ.pop("OC_AUTH_FILE", None)
+            else:
+                os.environ["OC_AUTH_FILE"] = old_auth
+            if old_config is None:
+                os.environ.pop("OC_CONFIG_FILE", None)
+            else:
+                os.environ["OC_CONFIG_FILE"] = old_config
+
+
+def test_unpaid_opencode_provider_not_selected_for_vision():
+    """Payment/entitlement skips apply to visual opencode seats before CLI launch too."""
+    import os
+    import shutil
+
+    old_env = os.environ.get("REVIEW_UNPAID_PROVIDERS")
+    old_which = shutil.which
+    shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
+    os.environ["REVIEW_UNPAID_PROVIDERS"] = "fireworks"
+    try:
+        assert vc.vision_backend_available("oc:fireworks/qwen2-vl") is False
+        assert vc.select_vision_backend(["oc:fireworks/qwen2-vl"]) is None
+    finally:
+        shutil.which = old_which
+        if old_env is None:
+            os.environ.pop("REVIEW_UNPAID_PROVIDERS", None)
+        else:
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = old_env
+
+
+def test_unpaid_opencode_vision_call_does_not_spawn_runner():
+    """A direct visual call for an unpaid provider returns unavailable without subprocesses."""
+    import os
+
+    import reviewlib.process as process
+
+    old_env = os.environ.get("REVIEW_UNPAID_PROVIDERS")
+    old_runner = process._run_streamed
+
+    def _boom(*args, **kwargs):  # pragma: no cover - asserted by not raising
+        raise AssertionError("visual opencode runner spawned despite unpaid provider")
+
+    process._run_streamed = _boom
+    os.environ["REVIEW_UNPAID_PROVIDERS"] = "fireworks"
+    try:
+        v = vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks())
+    finally:
+        process._run_streamed = old_runner
+        if old_env is None:
+            os.environ.pop("REVIEW_UNPAID_PROVIDERS", None)
+        else:
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = old_env
+    assert v.available is False and v.verdict is None
+    assert "unpaid/disabled" in (v.error or "")
+
+
+def test_unpaid_visual_cli_call_does_not_spawn_runner():
+    """Direct call_ai_vision callers must not bypass unpaid-provider skips for CLI routes."""
+    import reviewlib.process as process
+
+    old_env = os.environ.get("REVIEW_UNPAID_PROVIDERS")
+    old_runner = process._run_streamed
+
+    def _boom(*args, **kwargs):  # pragma: no cover - asserted by not raising
+        raise AssertionError("visual CLI runner spawned despite unpaid provider")
+
+    process._run_streamed = _boom
+    os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
+    try:
+        v = vc.call_ai_vision("claude:opus", blocks=_blocks())
+    finally:
+        process._run_streamed = old_runner
+        if old_env is None:
+            os.environ.pop("REVIEW_UNPAID_PROVIDERS", None)
+        else:
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = old_env
+    assert v.available is False and v.verdict is None
+    assert "unpaid/disabled" in (v.error or "")
+
+
+def test_unpaid_claude_gateway_visual_call_does_not_spawn_runner():
+    """Visual Claude inherits ANTHROPIC_* gateway vars and must honor unpaid gateways."""
+    import shutil
+
+    import reviewlib.process as process
+
+    saved_env = {
+        key: os.environ.get(key)
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "REVIEW_UNPAID_PROVIDERS")
+    }
+    old_runner = process._run_streamed
+    old_which = shutil.which
+
+    def _boom(*args, **kwargs):  # pragma: no cover - asserted by not raising
+        raise AssertionError("visual Claude runner spawned despite unpaid CommandCode gateway")
+
+    process._run_streamed = _boom
+    shutil.which = lambda name: "/usr/bin/claude" if name == "claude" else old_which(name)
+    os.environ["ANTHROPIC_API_KEY"] = "user_x"
+    os.environ["ANTHROPIC_BASE_URL"] = "https://api.commandcode.ai/provider"
+    os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
+    try:
+        assert vc.vision_backend_available("claude:opus") is False
+        v = vc.call_ai_vision("claude:opus", blocks=_blocks())
+    finally:
+        process._run_streamed = old_runner
+        shutil.which = old_which
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert v.available is False and v.verdict is None
+    assert "provider 'commandcode'" in (v.error or "")
+
+
+def test_unpaid_visual_rest_call_does_not_post():
+    """Direct call_ai_vision callers must not bypass unpaid-provider skips for REST routes."""
+    import urllib.request
+
+    old_env = os.environ.get("REVIEW_UNPAID_PROVIDERS")
+    old_open = urllib.request.urlopen
+
+    def _boom(*args, **kwargs):  # pragma: no cover - asserted by not raising
+        raise AssertionError("Gemini REST call posted despite unpaid provider")
+
+    urllib.request.urlopen = _boom
+    os.environ["REVIEW_UNPAID_PROVIDERS"] = "gemini"
+    try:
+        v = vc.call_ai_vision("gemini", blocks=_blocks())
+    finally:
+        urllib.request.urlopen = old_open
+        if old_env is None:
+            os.environ.pop("REVIEW_UNPAID_PROVIDERS", None)
+        else:
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = old_env
+    assert v.available is False and v.verdict is None
+    assert "unpaid/disabled" in (v.error or "")
 
 
 def test_codex_strict_schema_closes_additional_properties():
@@ -473,6 +687,16 @@ def test_cli_timeout_sets_timed_out_flag():
     finally:
         _restore_runner(old)
     assert v.available is True and v.verdict is None and v.timed_out is True
+
+
+def test_visual_cli_runner_uses_wall_timeout_mode():
+    cap: dict = {}
+    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9}')
+    try:
+        vc.call_ai_vision("claude:opus", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    assert cap["timeout_mode"] == "wall"
 
 
 def test_cli_backend_unreachable_when_binary_missing():

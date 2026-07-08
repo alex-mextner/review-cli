@@ -5,6 +5,22 @@ semantic versioning.
 
 ## Unreleased
 
+- **Model override and unpaid-provider handling are now explicit (review-cli#128).**
+  `-m/--model` is honored even when passed before a mode verb (`review -m fable5 diff ...`)
+  and remains an exact flat-panel override over config `models:` / `board:`. Providers whose
+  billing/subscription is unavailable can be listed in `config.yaml` `unpaid_providers:` or
+  `REVIEW_UNPAID_PROVIDERS`; direct seats such as `commandcode:...` and agentic
+  `oc:commandcode/...` / `oc:fireworks/...` seats are skipped before any backend process or
+  API call. DeepSeek stays in the default board as `oc:commandcode/deepseek/deepseek-v4-pro`;
+  the provider availability gate decides whether it can run on the current machine. Use
+  `--pool 0` to run every available reviewer seat; fixed counts such as `--pool 8` no
+  longer mean "the whole board" after the built-in board grew.
+- **Review/panel subprocess backends now time out on silence, not total runtime (review-cli#128).**
+  Agent CLI seats such as Fable/Claude/Codex/opencode get at least 20 minutes of quiet
+  thinking time on normal review runs; any stdout/stderr progress resets the idle timer, and
+  the review-level backstop remains the hard last-resort cap. Bounded QA and vision calls keep
+  wall-clock timeout caps. `REVIEW_IDLE_TIMEOUT_SECONDS=N` overrides that subprocess idle
+  window for advanced cases; `0` disables idle reap and uses wall-clock `--timeout`.
 - **Visible error text is now a built-in visual veto (review-cli#121).** The visual verifier
   asks the existing vision-LLM pass whether any on-screen text reads as a real runtime
   error, exception, or failure diagnostic. Because arbitrary error text has no reliable

@@ -936,6 +936,58 @@ def test_cli_sessions_list_and_resume_wiring():
         bs.run_panel, bs.run_moderator = old_panel, old_mod
 
 
+def test_cli_sessions_resume_applies_configured_unpaid_provider_before_filtering():
+    """`sessions -s` uses the saved panel directly, so it must load unpaid_providers itself."""
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    import reviewlib.modes.brainstorm as bs
+    from reviewlib import backends, cli
+    from reviewlib.backends import ReviewResult
+
+    d = _fresh_log_dir()
+    os.environ["REVIEW_STATS_FILE"] = str(d / "stats.jsonl")
+    interrupted = (
+        "# Brainstorm: unpaid resume\n\n"
+        "panel=commandcode:deepseek/deepseek-v4-pro,codex moderator=codex rounds>=5 max=8\n"
+        "# Round 1\n#### codex\nseed idea\n\n## Moderator (round 1)\nok\nDECISION: CONTINUE\n"
+    )
+    _write_log(d, "20260616T070000_000005Z", interrupted)
+
+    seen_models: list[str] = []
+    old_panel, old_mod = bs.run_panel, bs.run_moderator
+    old_cfg = cli.load_config
+    old_avail = backends.backend_available
+    old_unpaid = backends._CONFIG_UNPAID_PROVIDERS
+    try:
+        def _fake_panel(jobs, cwd, timeout):
+            seen_models.extend(j.model for j in jobs)
+            return [ReviewResult(model=j.model, command="f", returncode=0,
+                                 stdout="idea", stderr="") for j in jobs]
+
+        def _fake_mod(candidates, prompt, cwd, timeout, diff="", round_no=0):
+            return ReviewResult(model="codex", command="f", returncode=0,
+                                stdout="s\nDECISION: STOP", stderr="")
+
+        bs.run_panel = _fake_panel
+        bs.run_moderator = _fake_mod
+        cli.load_config = lambda: {"unpaid_providers": ["commandcode"]}
+        backends.configure_unpaid_providers(None)
+        backends.backend_available = lambda model: not backends.provider_marked_unpaid(model)
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = cli.main(["sessions", "-s", "20260616T070000"])
+        assert rc == 0, rc
+        assert seen_models
+        assert "codex" in seen_models
+        assert "commandcode:deepseek/deepseek-v4-pro" not in seen_models
+    finally:
+        bs.run_panel, bs.run_moderator = old_panel, old_mod
+        cli.load_config = old_cfg
+        backends.backend_available = old_avail
+        backends.configure_unpaid_providers(old_unpaid)
+
+
 def _run_all() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

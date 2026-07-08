@@ -23,8 +23,15 @@ sys.path.insert(0, str(REPO_ROOT))
 from reviewlib import backends as b  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 
-_ANTHROPIC_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-                  "ANTHROPIC_MODEL", "ANTHROPIC_MAX_TOKENS", "REVIEW_CLAUDE_MODE")
+_ANTHROPIC_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_MAX_TOKENS",
+    "REVIEW_CLAUDE_MODE",
+    "REVIEW_UNPAID_PROVIDERS",
+)
 
 
 class _Env:
@@ -163,6 +170,133 @@ def test_api_request_shape_and_parse_xapikey():
     assert "the diff" in body["messages"][0]["content"]  # diff folded into the prompt
     assert "verdict here" in res.stdout and res.returncode == 0
     assert "output_tokens=7" in res.stdout
+
+
+def test_api_commandcode_gateway_respects_unpaid_provider():
+    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+        raise AssertionError("Claude API posted to unpaid CommandCode gateway")
+
+    saved_open = b.urllib.request.urlopen
+    b.urllib.request.urlopen = _should_not_post
+    with _Env(
+        ANTHROPIC_API_KEY="user_x",
+        ANTHROPIC_BASE_URL="https://api.commandcode.ai/provider",
+        REVIEW_UNPAID_PROVIDERS="commandcode",
+    ):
+        try:
+            res = b.review_claude_api("claude:claude-fable-5", "Question?", "the diff", Path("."), 30)
+        finally:
+            b.urllib.request.urlopen = saved_open
+    assert res.returncode == 1, res
+    assert "provider 'commandcode'" in res.stderr, res.stderr
+    assert res.command == "Anthropic API claude-fable-5"
+
+
+def test_api_commandcode_gateway_with_default_port_respects_unpaid_provider():
+    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+        raise AssertionError("Claude API posted to unpaid CommandCode gateway")
+
+    saved_open = b.urllib.request.urlopen
+    b.urllib.request.urlopen = _should_not_post
+    with _Env(
+        ANTHROPIC_API_KEY="user_x",
+        ANTHROPIC_BASE_URL="https://api.commandcode.ai:443/provider",
+        REVIEW_UNPAID_PROVIDERS="commandcode",
+    ):
+        try:
+            res = b.review_claude_api("claude:claude-fable-5", "Question?", "the diff", Path("."), 30)
+        finally:
+            b.urllib.request.urlopen = saved_open
+    assert res.returncode == 1, res
+    assert "provider 'commandcode'" in res.stderr, res.stderr
+
+
+def test_api_commandcode_gateway_schemeless_base_url_respects_unpaid_provider():
+    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+        raise AssertionError("Claude API posted to unpaid CommandCode gateway")
+
+    saved_open = b.urllib.request.urlopen
+    b.urllib.request.urlopen = _should_not_post
+    with _Env(
+        ANTHROPIC_API_KEY="user_x",
+        ANTHROPIC_BASE_URL="api.commandcode.ai/provider",
+        REVIEW_UNPAID_PROVIDERS="commandcode",
+    ):
+        try:
+            res = b.review_claude_api("claude:claude-fable-5", "Question?", "the diff", Path("."), 30)
+        finally:
+            b.urllib.request.urlopen = saved_open
+    assert res.returncode == 1, res
+    assert "provider 'commandcode'" in res.stderr, res.stderr
+
+
+def test_backend_available_api_commandcode_gateway_respects_unpaid_provider():
+    with _Env(
+        ANTHROPIC_API_KEY="user_x",
+        ANTHROPIC_BASE_URL="https://api.commandcode.ai/provider",
+        REVIEW_CLAUDE_MODE="api",
+        REVIEW_UNPAID_PROVIDERS="commandcode",
+    ):
+        assert b.backend_available("claude:claude-fable-5") is False
+
+
+def test_auto_claude_commandcode_gateway_unpaid_skips_before_cli():
+    saved_cli = b.review_claude_cli
+    saved_which = b._which_optional
+    b.review_claude_cli = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("Claude CLI spawned despite unpaid CommandCode gateway")
+    )
+    b._which_optional = lambda name: "/bin/claude" if name == "claude" else None
+    with _Env(
+        ANTHROPIC_API_KEY="user_x",
+        ANTHROPIC_BASE_URL="https://api.commandcode.ai/provider",
+        REVIEW_UNPAID_PROVIDERS="commandcode",
+    ):
+        try:
+            res = b.review_claude("claude:claude-fable-5", "Question?", "the diff", Path("."), 30)
+            available = b.backend_available("claude:claude-fable-5")
+        finally:
+            b.review_claude_cli = saved_cli
+            b._which_optional = saved_which
+    assert res.returncode == 1, res
+    assert "provider 'commandcode'" in res.stderr, res.stderr
+    assert available is False
+
+
+def test_auto_claude_commandcode_gateway_without_auth_unpaid_skips_before_cli():
+    saved_cli = b.review_claude_cli
+    saved_which = b._which_optional
+    b.review_claude_cli = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("Claude CLI spawned despite unpaid CommandCode gateway")
+    )
+    b._which_optional = lambda name: "/bin/claude" if name == "claude" else None
+    with _Env(
+        ANTHROPIC_BASE_URL="https://api.commandcode.ai/provider",
+        REVIEW_UNPAID_PROVIDERS="commandcode",
+    ):
+        try:
+            res = b.review_claude("claude:claude-fable-5", "Question?", "the diff", Path("."), 30)
+            available = b.backend_available("claude:claude-fable-5")
+        finally:
+            b.review_claude_cli = saved_cli
+            b._which_optional = saved_which
+    assert res.returncode == 1, res
+    assert "provider 'commandcode'" in res.stderr, res.stderr
+    assert available is False
+
+
+def test_auto_claude_commandcode_gateway_unpaid_unavailable_without_cli():
+    with _Env(
+        ANTHROPIC_API_KEY="user_x",
+        ANTHROPIC_BASE_URL="https://api.commandcode.ai/provider",
+        REVIEW_UNPAID_PROVIDERS="commandcode",
+    ):
+        saved_which = b._which_optional
+        b._which_optional = _which_cli(cli_present=False)
+        try:
+            assert b.backend_available("claude:claude-fable-5") is False
+        finally:
+            b._which_optional = saved_which
 
 
 def test_api_uses_bearer_with_auth_token():

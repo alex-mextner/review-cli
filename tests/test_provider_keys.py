@@ -70,6 +70,8 @@ _KEY_ENV_NAMES = (
     "TOGETHER_API_KEY",
     "OC_AUTH_FILE",
     "OC_CONFIG_FILE",
+    "FIREWORKS_API_KEY",
+    "REVIEW_UNPAID_PROVIDERS",
 )
 
 
@@ -79,11 +81,13 @@ class _EnvSandbox:
 
     def __enter__(self):
         self._saved = {name: os.environ.get(name) for name in _KEY_ENV_NAMES}
+        self._saved_config_unpaid = backends._CONFIG_UNPAID_PROVIDERS
         for name in _KEY_ENV_NAMES:
             os.environ.pop(name, None)
         # Point the .env fallback at a path that does not exist so, by default,
         # no key resolves unless a test sets one explicitly.
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        backends.configure_unpaid_providers(None)
         return self
 
     def __exit__(self, *exc):
@@ -92,6 +96,7 @@ class _EnvSandbox:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+        backends.configure_unpaid_providers(self._saved_config_unpaid)
         return False
 
 
@@ -797,6 +802,281 @@ def test_backend_available_reflects_commandcode_key():
         assert backends.backend_available("common-code") is True
 
 
+def test_backend_available_skips_unpaid_provider_before_key_or_cli_checks():
+    """A provider marked unpaid/disabled is skipped immediately for direct and oc seats."""
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is True
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = " commandcode, fireworks "
+        assert backends.backend_available("commandcode") is False
+        assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is False
+        # These return False without needing opencode on PATH because the entitlement
+        # denylist is checked before the backend's CLI/auth probe.
+        assert backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro") is False
+        assert backends.backend_available("oc:fireworks/accounts/fireworks/models/fable-5") is False
+
+
+def test_unpaid_oc_provider_skip_wins_even_when_opencode_auth_exists():
+    """Pin the unpaid branch for `oc:` seats, not merely a missing-opencode false result."""
+    old_which = backends._which
+    backends._which = lambda name: "/fake/bin/opencode" if name == "opencode" else old_which(name)
+    try:
+        with _EnvSandbox():
+            with tempfile.TemporaryDirectory() as tmp:
+                auth = Path(tmp) / "auth.json"
+                auth.write_text(json.dumps({"commandcode": {"key": "opencode-key"}}), encoding="utf-8")
+                os.environ["OC_AUTH_FILE"] = str(auth)
+                assert backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro") is True
+                os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
+                assert backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro") is False
+    finally:
+        backends._which = old_which
+
+
+def test_oc_zai_requires_opencode_auth_not_zai_rest_key():
+    old_which = backends._which
+    backends._which = lambda name: "/fake/bin/opencode" if name == "opencode" else old_which(name)
+    try:
+        with _EnvSandbox():
+            with tempfile.TemporaryDirectory() as tmp:
+                os.environ["OC_AUTH_FILE"] = str(Path(tmp) / "auth.json")
+                os.environ["OC_CONFIG_FILE"] = str(Path(tmp) / "opencode.json")
+                os.environ["ZAI_API_KEY"] = "direct-rest-key-only"
+                assert backends.backend_available("zai:glm-5.2") is True
+                assert backends.backend_available("oc:zai/glm-5.2") is False
+    finally:
+        backends._which = old_which
+
+
+def test_configured_unpaid_provider_skips_without_env():
+    """CLI-loaded config.yaml unpaid_providers feeds the same availability gate as env."""
+    saved = backends._CONFIG_UNPAID_PROVIDERS
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            backends.configure_unpaid_providers(["commandcode"])
+            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is False
+        finally:
+            backends._CONFIG_UNPAID_PROVIDERS = saved
+
+
+def test_configure_unpaid_providers_accepts_saved_frozenset():
+    with _EnvSandbox():
+        backends.configure_unpaid_providers(frozenset({"commandcode"}))
+        assert backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro") is True
+
+
+def test_commandcode_unpaid_provider_does_not_post():
+    """Explicit `-m commandcode:*` fails fast when billing is disabled."""
+    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+        raise AssertionError("commandcode POSTed despite REVIEW_UNPAID_PROVIDERS")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _should_not_post
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
+        try:
+            res = backends.review_commandcode(
+                "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 1, res
+    assert "unpaid/disabled" in res.stderr, res.stderr
+
+
+def test_codex_unpaid_provider_does_not_spawn_cli():
+    """Agent CLI providers are also gated before PATH lookup or subprocess spawn."""
+    old_which = backends._which
+    backends._which = lambda _name: (_ for _ in ()).throw(AssertionError("codex CLI was probed"))
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "codex"
+        try:
+            res = backends.review_codex("codex", "q", "", REPO_ROOT, 10)
+        finally:
+            backends._which = old_which
+    assert res.returncode == 1, res
+    assert "unpaid/disabled" in res.stderr, res.stderr
+
+
+def test_opencode_unpaid_provider_does_not_spawn_cli():
+    """`oc:provider/model` seats are skipped before read-only agent setup or launch."""
+    old_ensure = backends._ensure_opencode_readonly_agent
+    backends._ensure_opencode_readonly_agent = (
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("opencode setup ran"))
+    )
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
+        try:
+            res = backends.review_opencode("oc:commandcode/deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10)
+        finally:
+            backends._ensure_opencode_readonly_agent = old_ensure
+    assert res.returncode == 1, res
+    assert "unpaid/disabled" in res.stderr, res.stderr
+
+
+def test_claude_unpaid_alias_provider_does_not_spawn_cli():
+    """Unexpanded Claude aliases must be skipped before CLI probing or launch."""
+    old_which = backends._which_optional
+    backends._which_optional = lambda _name: (_ for _ in ()).throw(AssertionError("claude CLI was probed"))
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
+        try:
+            res = backends.review_claude("fable5", "q", "", REPO_ROOT, 10)
+        finally:
+            backends._which_optional = old_which
+    assert res.returncode == 1, res
+    assert "unpaid/disabled" in res.stderr, res.stderr
+
+
+def test_unpaid_provider_uses_canonical_commandcode_aliases():
+    """Legacy command/common-code spellings must hit the same payment gate."""
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
+        assert backends.effective_provider("command-code:deepseek/deepseek-v4-pro") == "commandcode"
+        assert backends.effective_provider("common-code:deepseek/deepseek-v4-pro") == "commandcode"
+        assert backends.provider_marked_unpaid("command-code:deepseek/deepseek-v4-pro") is True
+        assert backends.provider_marked_unpaid("common-code:deepseek/deepseek-v4-pro") is True
+
+
+def test_unpaid_provider_uses_canonical_zai_aliases():
+    """Every accepted z.ai/Zhipu/GLM spelling must hit the same payment gate."""
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
+        assert backends.effective_provider("z.ai:glm-5.2") == "zai"
+        assert backends.effective_provider("zhipu:glm-5.2") == "zai"
+        assert backends.effective_provider("glm:glm-5.2") == "zai"
+        assert backends.effective_provider("oc:z.ai/glm-5.2") == "zai"
+        assert backends.provider_marked_unpaid("z.ai:glm-5.2") is True
+        assert backends.provider_marked_unpaid("zhipu:glm-5.2") is True
+        assert backends.provider_marked_unpaid("glm:glm-5.2") is True
+        assert backends.backend_available("oc:z.ai/glm-5.2") is False
+
+
+def test_unpaid_provider_uses_canonical_gemini_and_claude_aliases():
+    """Every named Gemini/Claude alias must hit the same payment gate."""
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "gemini"
+        assert backends.effective_provider("gemini-api") == "gemini"
+        assert backends.provider_marked_unpaid("gemini-api") is True
+        assert backends.backend_available("gemini-api") is False
+
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
+        assert backends.effective_provider("claude-p") == "claude"
+        assert backends.effective_provider("claude-fable-5") == "claude"
+        assert backends.effective_provider("fable5") == "claude"
+        assert backends.provider_marked_unpaid("claude-p") is True
+        assert backends.provider_marked_unpaid("claude-fable-5") is True
+        assert backends.provider_marked_unpaid("fable5") is True
+
+
+def test_unpaid_provider_env_uses_canonical_commandcode_aliases():
+    """Aliases are normalized in the env/config value, not only in model ids."""
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "common-code"
+        assert backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro") is True
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "cc"
+        assert backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro") is True
+
+
+def test_zai_unpaid_provider_does_not_post():
+    """Every direct REST provider must fail fast when billing is disabled, not only commandcode."""
+    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+        raise AssertionError("z.ai POSTed despite REVIEW_UNPAID_PROVIDERS")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _should_not_post
+    with _EnvSandbox():
+        os.environ["ZAI_API_KEY"] = "zai_present"
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
+        try:
+            res = backends.review_zai("zai:glm-5.2", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 1, res
+    assert "unpaid/disabled" in res.stderr, res.stderr
+
+
+def test_zai_unpaid_alias_provider_does_not_post():
+    """Accepted z.ai aliases are gated before the REST request, not only the zai prefix."""
+    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+        raise AssertionError("z.ai alias POSTed despite REVIEW_UNPAID_PROVIDERS")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _should_not_post
+    with _EnvSandbox():
+        os.environ["ZAI_API_KEY"] = "zai_present"
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
+        try:
+            res = backends.review_zai("z.ai:glm-5.2", "q", "", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 1, res
+    assert "unpaid/disabled" in res.stderr, res.stderr
+
+
+def test_unpaid_provider_logs_use_model_specific_headers():
+    """Unpaid sidecar logs still need exact model argv0s for dashboard attribution."""
+    emitted = []
+    old_emit = backends._emit_rest_log
+    backends._emit_rest_log = (
+        lambda backend, command, **kwargs: emitted.append((backend, command))
+    )
+    with _EnvSandbox():
+        try:
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai,commandcode,openrouter,claude,gemini"
+            backends.review_zai("z.ai:glm-5.2", "q", "", REPO_ROOT, 10)
+            backends.review_commandcode("commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10)
+            backends.review_openrouter("openrouter:anthropic/claude-3.5-sonnet", "q", "", REPO_ROOT, 10)
+            backends.review_claude("claude:claude-fable-5", "q", "", REPO_ROOT, 10)
+            backends.review_gemini("gemini:gemini-2.5-flash", "q", "", REPO_ROOT, 10)
+        finally:
+            backends._emit_rest_log = old_emit
+    assert emitted == [
+        ("z.ai", "z.ai API glm-5.2"),
+        ("commandcode", "commandcode API deepseek/deepseek-v4-pro"),
+        ("openrouter", "openrouter API anthropic/claude-3.5-sonnet"),
+        ("claude", "Anthropic API claude-fable-5"),
+        ("gemini", "Gemini API gemini-2.5-flash"),
+    ]
+
+
+def test_unpaid_provider_log_failure_still_returns_skip_result():
+    """A sidecar write failure must not turn a deliberate unpaid skip into an internal crash."""
+    old_emit = backends._emit_rest_log
+
+    def _raise_oserror(*args, **kwargs):
+        raise OSError("disk full")
+
+    backends._emit_rest_log = _raise_oserror
+    with _EnvSandbox():
+        try:
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai"
+            res = backends.review_zai("zai:glm-5.2", "q", "", REPO_ROOT, 10)
+        finally:
+            backends._emit_rest_log = old_emit
+    assert res.returncode == 1, res
+    assert "provider 'zai'" in res.stderr, res.stderr
+
+
+def test_claude_with_images_unpaid_provider_does_not_spawn_cli():
+    """The Claude raw-image special case must not bypass the unpaid-provider gate."""
+    old_which = backends._which_optional
+    backends._which_optional = lambda _name: (_ for _ in ()).throw(AssertionError("claude CLI was probed"))
+    with _EnvSandbox():
+        os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
+        try:
+            res = backends.review_with_images(
+                "claude:claude-opus-4-8", "q", "", REPO_ROOT, 10, images=(Path("shot.png"),)
+            )
+        finally:
+            backends._which_optional = old_which
+    assert res.returncode == 1, res
+    assert "unpaid/disabled" in res.stderr, res.stderr
+
+
 def test_backend_available_false_for_forced_api_only_cli_mode():
     """Codex P2: with REVIEW_COMMANDCODE_MODE=cli (an unrunnable forced mode), the
     availability probe must report False so the moderator/brainstorm filter never
@@ -1413,6 +1693,20 @@ def test_backend_available_oc_provider_via_auth_json():
             assert backends._oc_provider_auth_available("fireworks") is True
 
 
+def test_backend_available_oc_commandcode_requires_opencode_provider_auth():
+    """oc:commandcode uses opencode's provider auth, not review-cli's COMMANDCODE_API_KEY."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["COMMANDCODE_API_KEY"] = "review-cli-direct-key"
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
+            assert backends._oc_provider_auth_available("commandcode") is False
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(
+                tmpdir, {"commandcode": {"options": {"apiKey": "user_opencode"}}}
+            )
+            assert backends._oc_provider_auth_available("commandcode") is True
+
+
 def test_backend_available_oc_provider_via_opencode_json():
     """oc:someprovider/model is True when opencode.json has inline options.apiKey."""
     with _EnvSandbox():
@@ -1443,6 +1737,8 @@ def test_backend_available_oc_known_provider_no_creds_false():
             os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
             assert backends._oc_provider_auth_available("anthropic") is False
             assert backends._oc_provider_auth_available("openai") is False
+            assert backends._oc_provider_auth_available("commandcode") is False
+            assert backends._oc_provider_auth_available("fireworks") is False
 
 
 def test_backend_available_oc_local_provider_no_key_needed():

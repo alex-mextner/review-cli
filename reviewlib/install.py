@@ -75,7 +75,7 @@ Everything is a subcommand: the diff review is `review diff` (NOT a bare `review
 ```
 review diff --task CODE -C <repo>                  # review current unstaged diff across the failover pool (top 4 available)
 review diff --task CODE -C <repo> --staged         # review the staged diff (pre-commit)
-review diff --task CODE -C <repo> --pool 8         # run all 8 available board seats (--pool 0 also = all); default pool is 4
+review diff --task CODE -C <repo> --pool 0         # run all available board seats (currently 9); default pool is 4
 review diff --task CODE -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); bypasses the board
 review just-ask "Q" --task CODE -C <repo>          # multi-model answer to a question (no diff needed)
 review quorum "Q" --task CODE -C <repo>            # experts answer + a moderator finds consensus/disagreement
@@ -111,7 +111,7 @@ prints the result to stdout so you see it live. So whenever you want the review 
 a file, reach for `-o file.md`, never `> file.md`.
 
 ## Reviewer board + `--pool` (priority-ordered failover pool)
-A plain `review diff` runs the built-in **reviewer board** — a **priority-ordered** panel of 8
+A plain `review diff` runs the built-in **reviewer board** — a **priority-ordered** panel of 9
 models (strongest first) where each model also gets its own role/lens (architecture,
 correctness, consistency, performance, quality, security, tests, contracts). The active
 **pool is 4**, chosen by **priority + availability** with two failovers so the run keeps
@@ -125,13 +125,20 @@ failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "over
 "service unavailable") with backoff + jitter; a **seat-fatal** failure (auth / bad model /
 501 / refusal) is never retried and falls straight to the reserve. `--retry N` (or
 `$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
-`--pool N` sizes the pool (top-N available, same failover); `--pool 0`/`--pool 8` runs all
-available. The board is **never disabled** — there is **no `--no-board` flag**. An explicit
+`--pool N` sizes the pool (top-N available, same failover); `--pool 0` runs all available.
+The board is **never disabled** — there is **no `--no-board` flag**. An explicit
 `-m` bypasses the board and runs exactly those models. A `models:` list in config.yaml is
 the priority roster for the failover board: the pool is selected from that ordered set and
-the rest are reserve.
+the rest are reserve. If a provider is authenticated but not currently paid/entitled, list it
+in config.yaml `unpaid_providers:` or set `REVIEW_UNPAID_PROVIDERS=commandcode,fireworks`;
+all direct and `oc:` seats under that provider are skipped before any backend process/API call.
 `review --show-board` lists the seats in priority order with their pool/reserve/unavail
 tier and availability.
+
+The default repo-capable gateway seats are agentic `oc:` routes, not diff-only REST:
+`oc:commandcode/moonshotai/Kimi-K2.7-Code`, `oc:commandcode/Qwen/Qwen3.7-Max`,
+`oc:commandcode/deepseek/deepseek-v4-pro`, and `oc:zai/glm-5.2`. The keyed-HTTP
+`commandcode:` / `zai:` routes remain for explicit `-m cc` / `-m glm` and custom config.
 
 ## `brainstorm` can take a diff
 `review brainstorm "<topic>"` is multi-round persona ideation. When there IS a diff

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -77,6 +78,18 @@ def _payload(prompt: str, diff: str = "") -> str:
     return out
 
 
+def _claude_api_model(model: str) -> str:
+    return (
+        model.split(":", 1)[1]
+        if ":" in model
+        else os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
+    )
+
+
+def _claude_api_command(model: str) -> str:
+    return f"Anthropic API {_claude_api_model(model)}"
+
+
 def review_with_images(
     model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
     images: tuple[Path, ...] = (),
@@ -89,12 +102,21 @@ def review_with_images(
     """
     backend = resolve_backend(model)
     if images and backend is review_claude:
+        unpaid = unpaid_provider_result(
+            model, backend="claude", command=_claude_api_command(model),
+            round_no=round_no, provider=_claude_gateway_provider_from_env(),
+        )
+        if unpaid is not None:
+            return unpaid
         return review_claude_cli_with_images(model, prompt, diff, cwd, timeout, round_no, images)
     return backend(model, prompt, diff, cwd, timeout, round_no)
 
 
 def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     codex_model = model.split(":", 1)[1] if ":" in model else None
+    unpaid = unpaid_provider_result(model, backend="codex", command="codex", round_no=round_no)
+    if unpaid is not None:
+        return unpaid
     argv = [_which("codex"), "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
     if codex_model:
         argv += ["-m", codex_model]
@@ -376,6 +398,11 @@ def _opencode_runs_in_repo(cwd: Path) -> bool:
 
 def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     oc_model = model.split(":", 1)[1] if ":" in model else model
+    unpaid = unpaid_provider_result(
+        model, backend="opencode", command=f"opencode -m {oc_model}", round_no=round_no
+    )
+    if unpaid is not None:
+        return unpaid
     _ensure_opencode_readonly_agent(cwd, oc_model)
 
     if _opencode_runs_in_repo(cwd):
@@ -522,6 +549,9 @@ def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int, r
     # would leave that auth failure invisible — `run_panel` would turn it into an
     # internal 127 with no `.log` (codex P2). Now the auth failure emits a sidecar too.
     started = datetime.now(timezone.utc)
+    unpaid = unpaid_provider_result(model, backend="gemini", command=command, round_no=round_no, started=started)
+    if unpaid is not None:
+        return unpaid
     try:
         key = _gemini_key()
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
@@ -855,13 +885,17 @@ def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int, roun
     # A forced-mode config error or a missing key both produce a NON-zero result AND a
     # sidecar log — like review_gemini, these are real (failed) run attempts and must be
     # visible in the dashboard, never raise out of run_panel as an invisible internal 127.
+    zai_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ZAI_MODEL", ZAI_DEFAULT_MODEL)
+    command = f"z.ai API {zai_model}"
+    unpaid = unpaid_provider_result(model, backend="z.ai", command=command, round_no=round_no)
+    if unpaid is not None:
+        return unpaid
     try:
         resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
         key = _zai_key()
     except RuntimeError as exc:
-        _emit_rest_log("z.ai", "z.ai", round_no=round_no, returncode=1, stdout="", stderr=str(exc))
-        return ReviewResult(model=model, command="z.ai", returncode=1, stdout="", stderr=str(exc))
-    zai_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ZAI_MODEL", ZAI_DEFAULT_MODEL)
+        _emit_rest_log("z.ai", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc))
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
     base_url = os.environ.get("ZAI_BASE_URL", ZAI_DEFAULT_BASE_URL)
     return _openai_compatible_request(
         model=model, api_model=zai_model, label="z.ai", base_url=base_url, key=key,
@@ -922,15 +956,19 @@ def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: i
     # A forced-mode config error or a missing key both produce a NON-zero result AND a
     # sidecar log (see review_zai) — a failed run must be visible in the dashboard, never
     # an invisible internal 127 raised out of run_panel.
+    has_suffix = ":" in model
+    env_model = os.environ.get("COMMANDCODE_MODEL")
+    cc_model = model.split(":", 1)[1] if has_suffix else (env_model or COMMANDCODE_DEFAULT_MODEL)
+    command = f"commandcode API {cc_model}"
+    unpaid = unpaid_provider_result(model, backend="commandcode", command=command, round_no=round_no)
+    if unpaid is not None:
+        return unpaid
     try:
         resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
         key = _commandcode_key()
     except RuntimeError as exc:
-        _emit_rest_log("commandcode", "commandcode", round_no=round_no, returncode=1, stdout="", stderr=str(exc))
-        return ReviewResult(model=model, command="commandcode", returncode=1, stdout="", stderr=str(exc))
-    has_suffix = ":" in model
-    env_model = os.environ.get("COMMANDCODE_MODEL")
-    cc_model = model.split(":", 1)[1] if has_suffix else (env_model or COMMANDCODE_DEFAULT_MODEL)
+        _emit_rest_log("commandcode", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc))
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
     base_url = os.environ.get("COMMANDCODE_BASE_URL") or COMMANDCODE_DEFAULT_BASE_URL
     return _openai_compatible_request(
         model=model, api_model=cc_model, label="commandcode", base_url=base_url, key=key,
@@ -1014,12 +1052,6 @@ def review_openrouter(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     # the panel's uniform 6-arg dispatch does not raise (see review_zai for the rationale).
     # A forced-mode config error or a missing key both produce a NON-zero result AND a
     # sidecar log so a failed run is visible in the dashboard, not an invisible internal 127.
-    try:
-        resolve_backend_mode("openrouter", OPENROUTER_SUPPORTED_MODES, "api")
-        key = _openrouter_key()
-    except RuntimeError as exc:
-        _emit_rest_log("openrouter", "openrouter", round_no=round_no, returncode=1, stdout="", stderr=str(exc))
-        return ReviewResult(model=model, command="openrouter", returncode=1, stdout="", stderr=str(exc))
     # `split(":", 1)[1]` strips ONLY the `openrouter:` prefix, preserving both the slug's
     # `/` AND any trailing `:variant` colon (e.g. openrouter:anthropic/claude-3.5-sonnet:beta
     # → anthropic/claude-3.5-sonnet:beta). The suffix is `.strip()`ed and used ONLY when
@@ -1033,6 +1065,16 @@ def review_openrouter(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     suffix = model.split(":", 1)[1].strip() if ":" in model else ""
     env_model = os.environ.get("OPENROUTER_MODEL", "").strip()
     or_model = suffix or env_model or OPENROUTER_DEFAULT_MODEL
+    command = f"openrouter API {or_model}"
+    unpaid = unpaid_provider_result(model, backend="openrouter", command=command, round_no=round_no)
+    if unpaid is not None:
+        return unpaid
+    try:
+        resolve_backend_mode("openrouter", OPENROUTER_SUPPORTED_MODES, "api")
+        key = _openrouter_key()
+    except RuntimeError as exc:
+        _emit_rest_log("openrouter", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc))
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
     base_url = os.environ.get("OPENROUTER_BASE_URL", "").strip() or OPENROUTER_DEFAULT_BASE_URL
     return _openai_compatible_request(
         model=model, api_model=or_model, label="openrouter", base_url=base_url, key=key,
@@ -1075,8 +1117,28 @@ def _anthropic_api_config() -> dict | None:
         if not token:
             return None
         auth = ("Authorization", f"Bearer {token}")
-    base = (os.environ.get("ANTHROPIC_BASE_URL", "").strip() or "https://api.anthropic.com").rstrip("/")
+    base = _anthropic_base_url_from_env() or "https://api.anthropic.com"
     return {"base": base, "auth": auth}
+
+
+def _anthropic_base_url_from_env() -> str | None:
+    base = os.environ.get("ANTHROPIC_BASE_URL", "").strip().rstrip("/")
+    return base or None
+
+
+def _base_url_hostname(base_url: str) -> str:
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.hostname:
+        return parsed.hostname.lower()
+    parsed = urllib.parse.urlparse(f"//{base_url}")
+    return (parsed.hostname or "").lower()
+
+
+def _anthropic_gateway_provider(base_url: str) -> str | None:
+    host = _base_url_hostname(base_url)
+    if host == "api.commandcode.ai":
+        return "commandcode"
+    return None
 
 
 def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
@@ -1091,10 +1153,17 @@ def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     the CLI variant) on EVERY return path with ``round_no`` threaded — else a claude
     API-mode run would be invisible to the dashboard and missing from stats / brainstorm
     round attribution (codex P2)."""
-    claude_model = model.split(":", 1)[1] if ":" in model else os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
+    claude_model = _claude_api_model(model)
     cfg = _anthropic_api_config()
     command = f"Anthropic API {claude_model}"
     started = datetime.now(timezone.utc)
+    gateway_provider = _anthropic_gateway_provider(cfg["base"]) if cfg is not None else None
+    unpaid = unpaid_provider_result(
+        model, backend="claude", command=command, round_no=round_no,
+        started=started, provider=gateway_provider,
+    )
+    if unpaid is not None:
+        return unpaid
     if cfg is None:
         stderr = "claude API mode: no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN configured"
         _emit_rest_log("claude", command, round_no=round_no, returncode=1, stdout="", stderr=stderr, started=started)
@@ -1171,6 +1240,26 @@ def _have_claude_cli() -> bool:
     return bool(_which_optional("claude") or _which_optional("claude-p"))
 
 
+def _claude_api_available_for_model(model: str) -> bool:
+    cfg = _anthropic_api_config()
+    if cfg is None:
+        return False
+    provider = _anthropic_gateway_provider(cfg["base"])
+    return _matched_unpaid_provider(model, provider) is None
+
+
+def _claude_gateway_provider_from_env() -> str | None:
+    base = _anthropic_base_url_from_env()
+    return _anthropic_gateway_provider(base) if base is not None else None
+
+
+def _claude_runtime_gateway_provider() -> str | None:
+    # The Claude CLI child intentionally inherits ANTHROPIC_* vars, so an
+    # Anthropic-compatible gateway can be the runtime provider for both API and CLI paths.
+    return _claude_gateway_provider_from_env()
+
+
+
 def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
     """Dispatch the claude/opus backend between the API and CLI variants.
 
@@ -1185,6 +1274,12 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int, r
     ``round_no`` is threaded from the panel into BOTH variants so the per-call sidecar
     log lands in the right brainstorm round (the dashboard parser keys on it) — the CLI
     variant via _run_streamed, the API variant via its own _emit_rest_log sidecar."""
+    unpaid = unpaid_provider_result(
+        model, backend="claude", command=_claude_api_command(model),
+        round_no=round_no, provider=_claude_runtime_gateway_provider(),
+    )
+    if unpaid is not None:
+        return unpaid
     mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
     if mode == "api":
         return review_claude_api(model, prompt, diff, cwd, timeout, round_no)
@@ -1426,12 +1521,14 @@ def _claude_cli_argv(
             argv += ["--model", model]
         return argv
     # Legacy claude-p fallback (TUI-scraper): keep its --cwd / --tools '' / --timeout-sec
-    # / -p surface and its denylist unchanged so a claude-less host still works.
+    # / -p surface and its denylist so a claude-less host still works. Disable the wrapper's
+    # wall-clock cap; review-cli's own streamed runner owns the idle timeout and can keep a
+    # chatty/known-alive Fable run going without a hidden 20m wall kill.
     argv = [
         binary, "--cwd", str(cwd), "--permission-mode", "dontAsk", "--tools", "",
         "--strict-mcp-config", "--disable-slash-commands", "--safe-mode",
         "--append-system-prompt", _CLAUDE_REVIEW_SYSTEM,
-        "--disallowedTools", *_CLAUDE_DISALLOWED_TOOLS, "--timeout-sec", str(timeout),
+        "--disallowedTools", *_CLAUDE_DISALLOWED_TOOLS, "--timeout-sec", "0",
     ]
     if model:
         argv += ["--model", model]
@@ -1491,7 +1588,7 @@ def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     argv = _claude_cli_argv(binary, direct, claude_model, cwd, timeout)
     proc = _run_streamed(
         argv, cwd=cwd, input_text=_payload(prompt, diff), env=_claude_cli_env(),
-        timeout=timeout + 30, backend="claude", round_no=round_no, announce=_ANNOUNCE_LOGS,
+        timeout=timeout, backend="claude", round_no=round_no, announce=_ANNOUNCE_LOGS,
     )
     # Belt-and-suspenders: strip any terminal control noise the CLI still leaked into the
     # pipe (a stray spinner frame from claude-p, an escape sequence) so it can never
@@ -1533,7 +1630,7 @@ def review_claude_cli_with_images(
         argv = _claude_cli_argv(binary, True, claude_model, tmp, timeout, image_dir=tmp)
         proc = _run_streamed(
             argv, cwd=tmp, input_text=_payload(_prompt_with_panel_images(prompt, staged), diff),
-            env=_claude_cli_env(), timeout=timeout + 30, backend="claude", round_no=round_no,
+            env=_claude_cli_env(), timeout=timeout, backend="claude", round_no=round_no,
             announce=_ANNOUNCE_LOGS,
         )
     # The TemporaryDirectory context deleted tmp; remove the trust entry that
@@ -1699,12 +1796,14 @@ def effective_provider(model: str) -> str:
         if lowered.startswith(prefix):
             lowered = lowered[len(prefix):]
             break
+    if lowered.startswith("fable"):
+        return "claude"
     # The provider is the first segment before either a `:` (keyed-HTTP `provider:model`)
     # or a `/` (opencode `provider/model`), whichever comes first.
     for sep in (":", "/"):
         if sep in lowered:
             lowered = lowered.split(sep, 1)[0]
-    return lowered
+    return _canonical_provider(lowered)
 
 
 # ---------------------------------------------------------------------------
@@ -1725,12 +1824,132 @@ _OC_PROVIDER_ENV_VARS: dict[str, tuple[str, ...]] = {
     "anthropic": ("ANTHROPIC_API_KEY",),
     "openai": ("OPENAI_API_KEY",),
     "deepseek": ("DEEPSEEK_API_KEY",),
+    # commandcode is an opencode custom provider in this ecosystem. Deliberately do NOT
+    # treat review-cli's COMMANDCODE_API_KEY as opencode auth: that key powers the direct
+    # diff-only `commandcode:` REST backend, while `oc:commandcode/...` must be configured in
+    # opencode itself. Listing it here with no env aliases makes missing opencode provider
+    # auth a startup skip instead of a long opencode failure.
+    "commandcode": (),
+    "fireworks": ("FIREWORKS_API_KEY",),
+    # z.ai is likewise an opencode provider for `oc:zai/...`; REVIEW/ZAI_API_KEY powers
+    # only the direct diff-only `zai:` REST backend and must not make opencode seats live.
+    "zai": (),
     "google": ("GOOGLE_AI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"),
     "groq": ("GROQ_API_KEY",),
     "mistral": ("MISTRAL_API_KEY",),
     "xai": ("XAI_API_KEY",),
     "together": ("TOGETHER_API_KEY",),
 }
+
+_UNPAID_PROVIDERS_ENV = "REVIEW_UNPAID_PROVIDERS"
+_CONFIG_UNPAID_PROVIDERS: frozenset[str] = frozenset()
+_PROVIDER_ALIASES = {
+    "command-code": "commandcode",
+    "command_code": "commandcode",
+    "common-code": "commandcode",
+    "commoncode": "commandcode",
+    "common_code": "commandcode",
+    "cc": "commandcode",
+    "gemini-api": "gemini",
+    "claude-p": "claude",
+    "claude-fable-5": "claude",
+    "z.ai": "zai",
+    "zhipu": "zai",
+    "glm": "zai",
+}
+
+
+def _canonical_provider(provider: str) -> str:
+    return _PROVIDER_ALIASES.get(provider.strip().lower(), provider.strip().lower())
+
+
+def _parse_provider_names(raw: object) -> frozenset[str]:
+    """Normalize config/env provider lists (`["commandcode"]` or "a,b")."""
+    if raw is None:
+        return frozenset()
+    parts: list[str] = []
+    if isinstance(raw, str):
+        parts = raw.split(",")
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        for item in raw:
+            if isinstance(item, str):
+                parts.extend(item.split(","))
+    return frozenset(_canonical_provider(part) for part in parts if part.strip())
+
+
+def configure_unpaid_providers(raw: object) -> None:
+    """Set per-process providers whose billing/entitlement is currently unavailable.
+
+    `reviewlib.backends` intentionally does not import the YAML config loader. The CLI calls
+    this after `load_config()`; tests and non-CLI callers can use REVIEW_UNPAID_PROVIDERS.
+    """
+    global _CONFIG_UNPAID_PROVIDERS
+    _CONFIG_UNPAID_PROVIDERS = _parse_provider_names(raw)
+
+
+def unpaid_providers() -> frozenset[str]:
+    """Providers skipped before dispatch because their subscription/billing is unavailable."""
+    return _CONFIG_UNPAID_PROVIDERS | _parse_provider_names(os.environ.get(_UNPAID_PROVIDERS_ENV))
+
+
+def provider_marked_unpaid(model: str) -> bool:
+    """True when `model` routes through a provider disabled by the payment/entitlement list."""
+    return effective_provider(model) in unpaid_providers()
+
+
+def _runtime_unpaid_provider(model: str) -> str | None:
+    provider = _claude_runtime_gateway_provider() if resolve_backend(model) is review_claude else None
+    return _matched_unpaid_provider(model, provider)
+
+
+def runtime_provider_marked_unpaid(model: str) -> bool:
+    """True when a backend invocation for `model` would use a disabled provider."""
+    return _runtime_unpaid_provider(model) is not None
+
+
+def runtime_unpaid_provider_error(model: str) -> str:
+    return unpaid_provider_error(model, _runtime_unpaid_provider(model))
+
+
+def _matched_unpaid_provider(model: str, provider: str | None = None) -> str | None:
+    providers = []
+    if provider:
+        providers.append(_canonical_provider(provider))
+    providers.append(effective_provider(model))
+    disabled = unpaid_providers()
+    for candidate in providers:
+        if candidate in disabled:
+            return candidate
+    return None
+
+
+def unpaid_provider_error(model: str, provider: str | None = None) -> str:
+    provider = _matched_unpaid_provider(model, provider) or effective_provider(model)
+    return (
+        f"provider '{provider}' is marked unpaid/disabled "
+        f"({_UNPAID_PROVIDERS_ENV} or config.yaml unpaid_providers); skipping {model}"
+    )
+
+
+def unpaid_provider_result(
+    model: str,
+    *,
+    backend: str,
+    command: str,
+    round_no: int = 0,
+    started: datetime | None = None,
+    provider: str | None = None,
+) -> ReviewResult | None:
+    """Return a skipped result for an unpaid provider, emitting the usual live-log sidecar."""
+    provider = _matched_unpaid_provider(model, provider)
+    if provider is None:
+        return None
+    stderr = unpaid_provider_error(model, provider)
+    try:
+        _emit_rest_log(backend, command, stdout="", stderr=stderr, returncode=1, round_no=round_no, started=started)
+    except OSError as exc:
+        print(f"[review-cli] unpaid-provider sidecar log skipped: {exc}", file=sys.stderr, flush=True)
+    return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=stderr)
 
 
 def _oc_auth_file() -> Path:
@@ -1881,6 +2100,8 @@ def backend_available(model: str) -> bool:
     # models as "unavailable" on a host lacking the real CLIs (e.g. CI), defeating the e2e.
     if _fake_backend_enabled():
         return True
+    if runtime_provider_marked_unpaid(model):
+        return False
     backend = resolve_backend(model)
     try:
         if backend is review_gemini:
@@ -1915,12 +2136,12 @@ def backend_available(model: str) -> bool:
             # binary or the legacy `claude-p` wrapper — review-cli#76).
             mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
             if mode == "api":
-                return _anthropic_api_config() is not None
+                return _claude_api_available_for_model(model)
             if mode == "cli":
                 return _have_claude_cli()
-            if _anthropic_api_config() is not None:
+            if _have_claude_cli():
                 return True
-            return _have_claude_cli()
+            return _claude_api_available_for_model(model)
         if backend is review_opencode:
             _which("opencode")
             provider = _oc_provider_from_model(model)

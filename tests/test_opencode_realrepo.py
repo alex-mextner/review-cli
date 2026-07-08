@@ -19,6 +19,7 @@ Mock harness style mirrors tests/test_streaming.py.
 from __future__ import annotations
 
 import contextlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -227,6 +228,23 @@ def test_show_board_scope_label_tracks_cwd_for_opencode():
     # commandcode / z.ai are diff-only regardless of the repo bit (keyed HTTP, no workspace).
     assert _seat_reads_repo("commandcode:moonshotai/Kimi-K2.7-Code", True) is False
     assert _seat_reads_repo("zai:glm-5.2", True) is False
+
+
+def test_show_board_scope_label_tracks_direct_claude_cli():
+    from reviewlib.cli import _seat_reads_repo  # noqa: PLC0415
+
+    saved_which = review_backends._which_optional
+    saved_mode = os.environ.get("REVIEW_CLAUDE_MODE")
+    review_backends._which_optional = lambda name: "/bin/claude" if name == "claude" else None
+    os.environ.pop("REVIEW_CLAUDE_MODE", None)
+    try:
+        assert _seat_reads_repo("claude:claude-opus-4-8", True) is True
+    finally:
+        review_backends._which_optional = saved_which
+        if saved_mode is None:
+            os.environ.pop("REVIEW_CLAUDE_MODE", None)
+        else:
+            os.environ["REVIEW_CLAUDE_MODE"] = saved_mode
 
 
 class _CapturedCodex:

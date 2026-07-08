@@ -471,6 +471,8 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
     complete) with actionable messages + meaningful exit codes."""
     from . import backends, sessions as _sessions
 
+    backends.configure_unpaid_providers(load_config().get("unpaid_providers"))
+
     try:
         sess = _sessions.find_session(ns.resume)
     except _sessions.AmbiguousSessionError as exc:
@@ -1641,6 +1643,65 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
     return out, rest
 
 
+_LEADING_MODE_VALUE_OPTS = frozenset({
+    "-m", "--model", "-C", "--cwd", "--task", "--timeout", "--pool",
+})
+_LEADING_MODE_FLAG_OPTS = frozenset({"--list-defaults", "--show-board"})
+_LEADING_MODE_INLINE_SHORT_OPTS = ("-m", "-C")
+
+
+def _is_leading_inline_short_option(tok: str) -> bool:
+    """True only for glued short global forms like `-mMODEL`, never long flags."""
+    return (
+        len(tok) > 2
+        and tok.startswith("-")
+        and not tok.startswith("--")
+        and any(tok.startswith(opt) and tok != opt for opt in _LEADING_MODE_INLINE_SHORT_OPTS)
+    )
+
+
+def _normalize_leading_mode_options(argv: list[str]) -> list[str]:
+    """Allow truly-global options before a mode verb.
+
+    The mode parser already accepts `review diff -m fable ...`; users also naturally type
+    `review -m fable diff ...` because `-m` is advertised as global. Move only recognized
+    global options that appear before a known mode verb to just after that verb, leaving
+    unknown/management invocations untouched so argparse still reports the right error.
+    """
+    if not argv or (not argv[0].startswith("-") and argv[0] in known_subcommands()):
+        return argv
+    moved: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            return argv
+        if not tok.startswith("-"):
+            if tok in known_subcommands() and moved:
+                return [tok, *moved, *argv[i + 1:]]
+            return argv
+        if tok in _LEADING_MODE_VALUE_OPTS:
+            if i + 1 >= len(argv):
+                return argv
+            moved.extend([tok, argv[i + 1]])
+            i += 2
+            continue
+        if tok in _LEADING_MODE_FLAG_OPTS:
+            moved.append(tok)
+            i += 1
+            continue
+        if any(tok.startswith(f"{opt}=") for opt in _LEADING_MODE_VALUE_OPTS if opt.startswith("--")):
+            moved.append(tok)
+            i += 1
+            continue
+        if _is_leading_inline_short_option(tok):
+            moved.append(tok)
+            i += 1
+            continue
+        return argv
+    return argv
+
+
 def _write_output_file(path: Path, text: str) -> None:
     """Persist captured stdout to `path` via Python `open(...,"w")` — which bypasses
     the shell entirely, so it NEVER trips zsh `noclobber` the way `review … > FILE`
@@ -1676,6 +1737,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     raw = sys.argv[1:] if argv is None else argv
     output_path, raw = _extract_output_path(list(raw))
+    raw = _normalize_leading_mode_options(raw)
 
     # A REMOVED flag (--mcp/--ln, or a removed mode flag) OR the removed `review review`
     # SUBCOMMAND verb is a USAGE error — it must behave like argparse's own usage errors
@@ -1867,9 +1929,10 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
     parser.add_argument(
         "--timeout", type=int, default=None,
         help=(
-            "per-call timeout seconds (default 1200 for review, 240 for the chat panel "
-            f"modes, {QA_TIMEOUT_DEFAULT} for qa — a tester run boots a SUT and drives a "
-            "whole suite)"
+            "per-call timeout seconds; REST uses wall/request timeout; review/panel "
+            "agent CLIs use idle/silence timeout with a 20m floor for values >=60 "
+            "(set REVIEW_IDLE_TIMEOUT_SECONDS to shorten); qa/vision keep wall-clock "
+            f"caps (requested defaults: review 1200, panel 240, qa {QA_TIMEOUT_DEFAULT})"
         ),
     )
     parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
@@ -2040,9 +2103,17 @@ CONFIG FILE
                        visual fan-out. Separate from the text reviewer board; runtime
                        failures skip to the next vision backend.
     board:             list[seat]  override the built-in reviewer board (see BOARD below).
-    timeout:           int         per-call timeout seconds for `review diff` (overrides the
-                       1200s default; still overrideable per-invocation by --timeout).
-                       Useful for iterate-review workflows where 20 min is too long.
+    unpaid_providers:  list[str]   providers whose billing/subscription is currently
+                       unavailable; every direct or oc: seat under them is skipped before
+                       any backend process/API call. Env equivalent:
+                       REVIEW_UNPAID_PROVIDERS=commandcode,fireworks.
+    timeout:           int         per-call timeout seconds for `review diff` (replaces the
+                       configured/default request timeout; still overrideable
+                       per-invocation by --timeout). Review/panel agent CLI backends treat
+                       this as an idle/silence timeout with a 20m default floor for normal
+                       review runs; REST backends use it as their HTTP request timeout.
+                       `review qa` uses its timeout as a
+                       wall-clock QA cost cap.
   Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
   `glm` -> zai:glm-5.2, `cc` -> commandcode).
 
@@ -2078,8 +2149,14 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     COMMANDCODE_API_KEY                 — commandcode seats (a `user_...` token ONLY).
     ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN (+ optional ANTHROPIC_BASE_URL) — claude API.
     REVIEW_CLAUDE_MODE=api|cli, REVIEW_<BACKEND>_MODE=api|cli — transport selection.
-    --timeout applies uniformly to every backend seat; quiet model thinking is allowed
-      until that per-call timeout expires.
+    REVIEW_UNPAID_PROVIDERS=provider[,provider...] — skip disabled/unpaid providers early.
+    REVIEW_IDLE_TIMEOUT_SECONDS=N       — override the review/panel subprocess idle window;
+                                          0 disables idle reap and uses wall-clock --timeout.
+    --timeout applies to every backend seat. For review/panel subprocess agent CLIs, backend
+      stdout/stderr resets the idle timer; a fully silent seat is reaped after the idle
+      window. Values under 60s stay exact for tests/probes; otherwise the normal 20m floor
+      applies unless REVIEW_IDLE_TIMEOUT_SECONDS is set. QA and vision calls keep wall-clock
+      timeout caps.
   codex / opencode carry their own CLI auth (no key here).
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
@@ -2194,19 +2271,45 @@ def _reject_removed_flags(argv: list[str]) -> int | None:
 def _reject_removed_subcommand(argv: list[str]) -> int | None:
     """Reject the renamed-away SUBCOMMAND verb `review review` (the diff review is `review
     diff` now) with a one-line `review diff` pointer + the stable usage code (2), else None.
-    A pure argv check (argv[0] only) so it can run in `main()` BEFORE the `-o` tee is armed —
-    a usage error must NOT write/truncate the `-o` file (codex P1), exactly like the removed
-    FLAGS. The later call in `_dispatch` is then a harmless no-op."""
-    if argv and argv[0] in REMOVED_SUBCOMMANDS:
-        replacement = REMOVED_SUBCOMMANDS[argv[0]]
+    A pure argv check so it can run in `main()` BEFORE the `-o` tee is armed — a usage error
+    must NOT write/truncate the `-o` file (codex P1), exactly like the removed FLAGS. It scans
+    past leading global options because `review -m fable review` should get the same helpful
+    pointer as `review review`. The later call in `_dispatch` is then a harmless no-op."""
+    removed = _leading_removed_subcommand(argv)
+    if removed:
+        replacement = REMOVED_SUBCOMMANDS[removed]
         print(
-            f"review: `review {argv[0]}` is no longer a subcommand — the diff review is "
+            f"review: `review {removed}` is no longer a subcommand — the diff review is "
             f"now `review {replacement}`.\n"
             f"  use:  review {replacement} --task CODE [options]\n"
             f"  (run `review --help` for all subcommands)",
             file=sys.stderr, flush=True,
         )
         return 2
+    return None
+
+
+def _leading_removed_subcommand(argv: list[str]) -> str | None:
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            return None
+        if tok in REMOVED_SUBCOMMANDS:
+            return tok
+        if tok in _LEADING_MODE_VALUE_OPTS:
+            i += 2
+            continue
+        if any(tok.startswith(f"{opt}=") for opt in _LEADING_MODE_VALUE_OPTS if opt.startswith("--")):
+            i += 1
+            continue
+        if tok in _LEADING_MODE_FLAG_OPTS:
+            i += 1
+            continue
+        if _is_leading_inline_short_option(tok):
+            i += 1
+            continue
+        return None
     return None
 
 
@@ -2253,6 +2356,7 @@ def _help_subcommand(rest: list[str]) -> int:
 def _dispatch(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    argv = _normalize_leading_mode_options(list(argv))
     # `review help [<topic>]` — deep topic help. Wired here (a bare management subcommand
     # like `dashboard`), before mode resolution, so it stays off the main argparse surface.
     if argv and argv[0] == "help":
@@ -2380,6 +2484,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         os.environ["REVIEW_RETRY_COUNT"] = str(max(0, min(args.retry, max_retry_count())))
 
     config = load_config()
+    backends.configure_unpaid_providers(config.get("unpaid_providers"))
 
     # `models:` / `visual_models:` from config, stripped + alias-expanded + blanks dropped
     # (same rule as _split_models for -m). An "effectively empty" list — absent, or only
@@ -2865,11 +2970,7 @@ def _seat_reads_repo(model: str, cwd_is_repo: bool) -> bool:
         if mode == "cli":
             return True
         # Auto-pick mirrors the dispatcher: CLI when the binary is present.
-        try:
-            backends._which("claude-p")
-            return True
-        except RuntimeError:
-            return False
+        return backends._have_claude_cli()
     return False
 
 
@@ -2920,7 +3021,12 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | No
     seen_available = 0  # how many AVAILABLE seats walked so far (priority order)
     for index, reviewer in enumerate(board):
         available = avail[index]
-        status = "available" if available else "SKIPPED (no key/CLI)"
+        if available:
+            status = "available"
+        elif backends.runtime_provider_marked_unpaid(reviewer.model):
+            status = "SKIPPED (provider unpaid/disabled)"
+        else:
+            status = "SKIPPED (no key/CLI)"
         role = (reviewer.role or "general").ljust(role_w)
         if not available:
             tier = "unavail"

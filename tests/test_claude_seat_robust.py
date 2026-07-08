@@ -123,15 +123,24 @@ def test_claude_p_fallback_argv_keeps_wrapper_surface():
         "/usr/local/bin/claude-p", direct=False, model="claude-opus-4-8",
         cwd=Path("/tmp/repo"), timeout=90,
     )
-    # The wrapper needs its own --cwd / --tools '' / --timeout-sec / -p surface.
+    # The wrapper needs its own --cwd / --tools '' / --timeout-sec / -p surface, but
+    # review-cli disables claude-p's wall timer so _run_streamed owns the idle timeout.
     assert argv[argv.index("--cwd") + 1] == "/tmp/repo"
-    assert argv[argv.index("--timeout-sec") + 1] == "90"
+    assert argv[argv.index("--timeout-sec") + 1] == "0"
     assert "-p" in argv
     assert "--print" not in argv  # claude-p has no --print; -p is its print toggle
     # Same read-only guarantees as the direct path.
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     for tool in _backends._CLAUDE_DISALLOWED_TOOLS:
         assert tool in argv
+
+
+def test_claude_p_fallback_timeout_disables_wrapper_wall_reap():
+    argv = _backends._claude_cli_argv(
+        "/usr/local/bin/claude-p", direct=False, model="claude-fable-5",
+        cwd=Path("/tmp/repo"), timeout=90,
+    )
+    assert argv[argv.index("--timeout-sec") + 1] == "0"
 
 
 # --- binary resolution prefers the direct print binary ---------------------------------
@@ -185,6 +194,7 @@ def test_review_claude_cli_strips_captured_verdict_and_wires_env():
     def _fake_run_streamed(argv, *, cwd, input_text, env, timeout, backend, round_no, announce):
         captured["argv"] = argv
         captured["env"] = env
+        captured["timeout"] = timeout
         captured["backend"] = backend
         # Simulate a backend that leaked a coloured/cursor-noisy verdict into stdout.
         noisy = "\x1b[32m## claude:claude-opus-4-8 review\x1b[0m\nlgtm\n## verdict [ok]\n"
@@ -211,6 +221,7 @@ def test_review_claude_cli_strips_captured_verdict_and_wires_env():
     # The direct print path was used, with the decoration-hostile env.
     assert "--print" in captured["argv"]
     assert captured["env"]["TERM"] == "dumb"
+    assert captured["timeout"] == 30
     assert captured["backend"] == "claude"
     # The reported command reflects the direct binary, not claude-p.
     assert "claude --print" in res.command
@@ -226,6 +237,7 @@ def test_review_claude_cli_with_images_enables_scoped_read_and_refs_file():
         captured["argv"] = argv
         captured["cwd"] = Path(cwd)
         captured["input_text"] = input_text
+        captured["timeout"] = timeout
         add_dir = Path(argv[argv.index("--add-dir") + 1])
         refs = [part[1:] for part in input_text.split() if part.startswith("@")]
         assert add_dir.is_dir()
@@ -261,6 +273,7 @@ def test_review_claude_cli_with_images_enables_scoped_read_and_refs_file():
     assert captured["cwd"] == add_dir
     assert root not in trusted
     assert add_dir in trusted
+    assert captured["timeout"] == 30
     assert "=== RAW VISUAL ATTACHMENT ===" in captured["input_text"]
     assert "image @refs" in res.command
     assert res.stdout == "I saw the pixels"
