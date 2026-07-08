@@ -19,7 +19,6 @@ as tests/test_streaming.py — no pytest dependency.
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
