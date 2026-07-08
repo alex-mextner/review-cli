@@ -42,7 +42,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..backends import _which
+from ..backends import _warn_effort_once, _which, codex_effort_argv, effort_for
 from ..process import _run, _run_streamed
 
 # The machine-parsed contract the tester emits at the END of its run (spec §8). The
@@ -716,6 +716,15 @@ def _spawn_claude_writeexec(
     explicitly lists the tester's toolset so the grant is auditable, not a blanket wildcard.
     The system prompt goes on stdin (ARG_MAX-safe)."""
     claude_p = _which("claude-p")
+    # The claude tester rides claude-p, which has no --effort flag — warn instead of
+    # silently ignoring a requested effort level (review-cli#126). The codex tester
+    # (REVIEW_QA_TESTER=codex) DOES honour it via codex_effort_argv below.
+    if effort_for("claude") is not None:
+        _warn_effort_once(
+            "qa-claude",
+            "the claude tester (claude-p) has no --effort flag; running at its default "
+            "effort — use REVIEW_QA_TESTER=codex for an effort-controlled tester",
+        )
     # Pre-accept workspace trust for cwd, EXACTLY like the read-only claude backend
     # (backends._ensure_workspace_trusted): a FRESH worktree is untrusted, and claude's
     # headless safety gate BLOCKS on an untrusted folder — so without this, bare
@@ -844,6 +853,9 @@ def _spawn_codex_writeexec(
     argv = [
         _which("codex"), "exec", "-s", "workspace-write", "--full-auto", "--ephemeral",
         *(["-m", model] if model else []),
+        # Honour --effort for the tester spawn too (review-cli#126): same shared
+        # builder as the read-only codex seat (`-c model_reasoning_effort=...`).
+        *codex_effort_argv(),
         "-C", str(cwd), "-",
     ]
     return _run_streamed(

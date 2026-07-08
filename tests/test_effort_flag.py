@@ -86,6 +86,7 @@ class _Captured:
         self.argv = list(argv)
 
         class _Proc:
+            args = argv
             returncode = 0
             stdout = "ok"
             stderr = ""
@@ -418,6 +419,78 @@ def test_unsupported_warning_fires_once():
         review_backends._warn_effort_unsupported("gemini")
         review_backends._warn_effort_unsupported("gemini")
     assert err.getvalue().count("does not support --effort") == 1
+
+
+
+
+# ---------------------------------------------------------------------------
+# qa tester spawns: codex honours --effort; the claude-p tester warns
+# ---------------------------------------------------------------------------
+
+
+def test_qa_codex_tester_gets_reasoning_effort():
+    from reviewlib.qa import executor as qa_executor
+
+    captured = _Captured()
+    with _clean_effort_env(REVIEW_EFFORT="xhigh"), _patched(
+        qa_executor,
+        _run_streamed=captured,
+        _which=lambda name: f"/mock/bin/{name}",
+    ):
+        qa_executor._spawn_codex_writeexec("p", Path("."), 60)
+    idx = captured.argv.index("-c")
+    assert captured.argv[idx + 1] == "model_reasoning_effort=xhigh"
+
+
+def test_qa_codex_tester_clean_without_effort():
+    from reviewlib.qa import executor as qa_executor
+
+    captured = _Captured()
+    with _clean_effort_env(), _patched(
+        qa_executor,
+        _run_streamed=captured,
+        _which=lambda name: f"/mock/bin/{name}",
+    ):
+        qa_executor._spawn_codex_writeexec("p", Path("."), 60)
+    assert "-c" not in captured.argv
+
+
+def test_qa_claude_tester_warns_when_effort_set():
+    from reviewlib.qa import executor as qa_executor
+
+    captured = _Captured()
+    with (
+        _clean_effort_env(REVIEW_EFFORT="xhigh"),
+        _patched(
+            qa_executor,
+            _run_streamed=captured,
+            _which=lambda name: f"/mock/bin/{name}",
+        ),
+        _patched(review_backends, _ensure_workspace_trusted=lambda cwd: None),
+        _captured_stderr() as err,
+    ):
+        qa_executor._spawn_claude_writeexec("p", Path("."), 60)
+    assert "--effort" not in captured.argv  # claude-p has no such flag
+    text = err.getvalue()
+    assert "qa-claude" in text and "default" in text
+
+
+def test_qa_claude_tester_silent_without_effort():
+    from reviewlib.qa import executor as qa_executor
+
+    captured = _Captured()
+    with (
+        _clean_effort_env(),
+        _patched(
+            qa_executor,
+            _run_streamed=captured,
+            _which=lambda name: f"/mock/bin/{name}",
+        ),
+        _patched(review_backends, _ensure_workspace_trusted=lambda cwd: None),
+        _captured_stderr() as err,
+    ):
+        qa_executor._spawn_claude_writeexec("p", Path("."), 60)
+    assert "--effort" not in err.getvalue()
 
 
 if __name__ == "__main__":
