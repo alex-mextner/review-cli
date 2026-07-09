@@ -170,6 +170,25 @@ def test_extract_does_not_steal_task_value():
     assert rest == ["diff", "--task", "--output"], rest
 
 
+def test_extract_task_check_is_boolean_not_value_taking():
+    # `review task CODE --check` is a BOOLEAN flag — the one place `--check` does NOT
+    # mean `--check NAME` (visual module force-activation). A following `-o FILE` must
+    # still resolve to the output flag, not get swallowed as --check's (nonexistent)
+    # value. Regression for the --quorum-check -> --check rename colliding with the
+    # pre-existing visual --check NAME flag.
+    out, rest = _extract_output_path(["task", "ABC-1", "--check", "-o", "out.md"])
+    assert out == Path("out.md"), out
+    assert rest == ["task", "ABC-1", "--check"], rest
+
+
+def test_extract_diff_check_still_consumes_its_value():
+    # Every OTHER subcommand's `--check NAME` is unaffected by the task-only carve-out —
+    # it still consumes the following token as its value, not as -o's argument.
+    out, rest = _extract_output_path(["diff", "--check", "error-text", "-o", "out.md"])
+    assert out == Path("out.md"), out
+    assert rest == ["diff", "--check", "error-text"], rest
+
+
 def test_extract_absent_returns_none_and_unchanged():
     out, rest = _extract_output_path(["--show-board", "-m", "codex"])
     assert out is None, out
