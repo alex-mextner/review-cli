@@ -205,8 +205,13 @@ With no exact history it falls back to pool-size-only across modes, then to a
 (This store is separate from the dashboard's per-call log reader, whose mode is
 *inferred* and whose duration is an mtime proxy — this one records the run's ground
 truth.) Task-coded records power `review task CODE` and the dashboard's task history.
-The run-stats JSONL schema is versioned; task-coded records are `v: 2` and add the optional
-`task_code` field for consumers that read the local store directly.
+The run-stats JSONL schema is versioned (currently `v: 3`); task-coded records add the
+optional `task_code` field, and `v: 3` adds an optional `passed: bool` verdict field (the
+mode's own success/failure signal, used by `review task CODE --check` — the self-merge-
+authority gate). A record with no `passed` key has verdict UNKNOWN — either it predates
+`v: 3`, or it is a current record from a mode with no verdict to thread (`qa` is
+report-only by design; see `reviewlib/qa/executor.py`) — never crashes a reader, but the
+quorum gate treats unknown as not-passed either way.
 
 **No external timeout — `review` carries its own internal ≤4h backstop.** Do not
 put *any* external `timeout` on `review`: it is designed to run unbounded from the
@@ -454,6 +459,7 @@ JSON top-level shapes:
 | `review task --json` | `{"tasks": [{"task_code": str, "iterations": int, "models": [str], "modes": [str], "first_ts": str, "last_ts": str, "duration_seconds": number, "ok_count": int, "fail_count": int}]}` |
 | `review task CODE --json` | `{"task_code": str, "iterations": [run_stats_record], "sessions": [dashboard_session_summary]}` |
 | `review task CODE --detail N --json` | `dashboard_session_detail` with `session_id`, `task_code`, `calls`, `errors`, `brainstorm`, and `roles` |
+| `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models": int, "passed": bool, "error"?: str}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). |
 
 ---
 

@@ -644,22 +644,36 @@ def _task_subcommand(rest: list[str]) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="exit 0 iff the task has enough recorded iterations across enough "
+        help="exit 0 iff the task has enough PASSED recorded iterations across enough "
         "distinct models (self-merge-authority gate); see --min-iter/--min-models. "
-        "STRUCTURAL check on runs that were dispatched, NOT on review verdicts — "
-        "it answers 'did enough independent reviewers run', not 'did they approve'",
+        "Counts only iterations whose run came back clean — a review that ran but "
+        "failed/degraded does not count toward the bar, and pre-verdict-field "
+        "history never satisfies it either (fail-closed)",
     )
     parser.add_argument(
-        "--min-iter", type=int, default=3, help="review-bar floor: recorded iterations (default 3)"
+        "--min-iter", type=int, default=3,
+        help="review-bar floor: PASSED recorded iterations (default 3)",
     )
     parser.add_argument(
-        "--min-models", type=int, default=3, help="review-bar floor: distinct models (default 3)"
+        "--min-models", type=int, default=3,
+        help="review-bar floor: distinct models among the PASSED iterations (default 3)",
     )
     ns = parser.parse_args(rest)
 
     if ns.check:
         if not ns.code:
             print("[review task] --check requires a task CODE", file=sys.stderr)
+            return 2
+        # A floor of 0 would trivially satisfy the bar for a task with ZERO passed
+        # iterations (0 >= 0), even one whose every recorded run failed or predates
+        # the verdict field -- defeating the fail-closed contract this gate exists
+        # for. Both floors must be at least 1.
+        if ns.min_iter < 1 or ns.min_models < 1:
+            print(
+                "[review task] --min-iter and --min-models must both be >= 1 "
+                f"(got --min-iter {ns.min_iter} --min-models {ns.min_models})",
+                file=sys.stderr,
+            )
             return 2
         return _quorum_check_subcommand(ns.code, ns.min_iter, ns.min_models, as_json=ns.json)
 
@@ -741,11 +755,12 @@ def _task_subcommand(rest: list[str]) -> int:
 def _quorum_check_subcommand(code: str, min_iter: int, min_models: int, *, as_json: bool) -> int:
     """`review task CODE --check [--min-iter N] [--min-models M]`.
 
-    Exit 0 iff CODE has >= min_iter recorded iterations across >= min_models
-    distinct models; exit 1 otherwise, including the fail-closed cases (invalid
-    code, unreadable/missing stats store, zero records) where reviewlib.stats.
-    quorum_check sets an "error" key. See quorum_check's docstring for the
-    "dispatched runs, not verdicts" caveat this check is scoped to.
+    Exit 0 iff CODE has >= min_iter PASSED recorded iterations across >= min_models
+    distinct models among those passed iterations; exit 1 otherwise, including the
+    fail-closed cases (invalid code, unreadable/missing stats store, zero records,
+    or a task whose only history predates the verdict field) where reviewlib.stats.
+    quorum_check sets an "error" key or simply comes up short. See quorum_check's
+    docstring for the "passed, not just dispatched" semantics this check enforces.
     """
     result = quorum_check(code, min_iter=min_iter, min_models=min_models)
     if as_json:
@@ -758,20 +773,22 @@ def _quorum_check_subcommand(code: str, min_iter: int, min_models: int, *, as_js
         print(f"review bar NOT met for {result['task_code']}: {result['error']}", file=sys.stderr)
         return 1
 
-    iterations, distinct = result["iterations"], result["distinct_models"]
+    passed_iter = result["passed_iterations"]
+    distinct = result["distinct_models_passed"]
     if result["passed"]:
         models = ", ".join(result["models"]) or "-"
-        plural_i = "" if iterations == 1 else "s"
+        plural_i = "" if passed_iter == 1 else "s"
         plural_m = "" if distinct == 1 else "s"
         print(
-            f"review bar met for {result['task_code']}: {iterations} iteration{plural_i} "
-            f"across {distinct} distinct model{plural_m} ({models})"
+            f"review bar met for {result['task_code']}: {passed_iter} passed "
+            f"iteration{plural_i} across {distinct} distinct model{plural_m} ({models})"
         )
         return 0
 
     print(
         f"review bar NOT met for {result['task_code']}: "
-        f"{iterations}/{min_iter} iterations, {distinct}/{min_models} distinct models"
+        f"{passed_iter}/{min_iter} passed iterations, "
+        f"{distinct}/{min_models} distinct models"
     )
     return 1
 
@@ -1382,8 +1399,10 @@ def _run_mode_with_stats(
     old_task_env = os.environ.get("REVIEW_TASK_CODE")
     if task_code:
         os.environ["REVIEW_TASK_CODE"] = task_code
+    rc: int | None = None
     try:
-        return dispatch()
+        rc = dispatch()
+        return rc
     finally:
         if task_code:
             if old_task_env is None:
@@ -1405,6 +1424,58 @@ def _run_mode_with_stats(
         # dispatch -> nothing real to time -> skip, so no-op invocations never poison
         # the ETA average.
         if ok_count or fail_count:
+            # The mode handler's own exit code IS the run's verdict for every TEXT
+            # panel mode (review/quorum/just-ask/brainstorm): each already returns 0
+            # iff its own success criterion held (every seat produced a usable
+            # verdict / the board didn't degrade) and nonzero otherwise — the same
+            # signal the CLI exits the process with. Reuse it rather than inventing
+            # a parallel verdict pipeline.
+            #
+            # KNOWN LIMITATION for `review` (diff review) specifically: this rc is
+            # "every reviewer call completed technically" (reviewlib/modes/review.py's
+            # `ok = all(r.returncode == 0 for r in results)`), NOT "every reviewer
+            # approved the diff with no findings" — review-cli's text-panel reviewers
+            # print free-text findings with no structured accept/reject grammar to
+            # parse (unlike `qa`'s PASS/FAIL/BLOCKED verdict below), so there is no
+            # richer existing signal to key on. This still closes the gap the CTO
+            # decision (tg#7306 #1) targeted — a run whose backend calls genuinely
+            # failed no longer counts — but a reviewer that ran cleanly and printed
+            # "found 3 blocking issues" still counts as passed today. Building a real
+            # content verdict for review mode is a separate, larger effort (issue
+            # #137 tracks whether/how to close this).
+            #
+            # `qa` is the one mode where exit code is NOT a verdict: it is
+            # deliberately REPORT-ONLY (reviewlib/qa/executor.py:verdict_to_exit_code)
+            # — a FAIL verdict with real findings still exits 0 unless --strict, so
+            # rc==0 would wrongly read as "passed" for a run that found bugs. Rather
+            # than mis-record a qa run as passed, its verdict is UNKNOWN here (not
+            # threaded through this generic wrapper) and fails closed — it simply
+            # never counts toward the quorum gate until a dedicated fix threads qa's
+            # parsed PASS/FAIL/BLOCKED verdict through instead of its exit code.
+            #
+            # brainstorm's exit 0 on a MID-RUN COLLAPSE (some good rounds, then a
+            # dead panel, still synthesized — reviewlib/modes/brainstorm.py's
+            # "documented partial-success behavior", CTO 2026-06-16) is intentionally
+            # still treated as passed here, unlike qa: it is brainstorm's own,
+            # deliberately-chosen definition of "produced a usable result", not an
+            # accidental decoupling of exit code from verdict the way qa's is — qa
+            # has a real PASS/FAIL/BLOCKED grammar that the exit code ignores by
+            # design; brainstorm has no such grammar to ignore. Whether a degraded
+            # brainstorm (or any non-`review`-mode iteration at all) SHOULD count
+            # toward the self-merge-authority quorum is a separate, broader design
+            # question tracked in issue #137 — out of scope for this "ran vs passed"
+            # fix, which only had to stop mis-recording a KNOWN-not-passed run as
+            # passed.
+            #
+            # `rc` is None only if `dispatch()` raised before returning; treat that
+            # as not-passed (fail-closed) too — a run that never completed is not a
+            # pass by any definition.
+            if mode == "qa":
+                verdict: bool | None = None
+            elif rc is None:
+                verdict = False
+            else:
+                verdict = rc == 0
             record_run(
                 task_code=task_code,
                 mode=mode,
@@ -1413,6 +1484,7 @@ def _run_mode_with_stats(
                 ok_count=ok_count,
                 fail_count=fail_count,
                 started=started,
+                passed=verdict,
             )
 
 
