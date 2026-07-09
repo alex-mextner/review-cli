@@ -405,6 +405,17 @@ def test_removed_ln_flag_equals_form_errors():
     assert "`--ln` was removed" in err, err
 
 
+def test_removed_quorum_check_flag_points_to_check():
+    """`review task CODE --quorum-check` was renamed to `--check` (collided with the
+    unrelated `review quorum` panel). It must fail LOUD with a pointer to the new spelling,
+    not argparse's opaque `unrecognized arguments`."""
+    rc, err = _capture_main(["task", "ABC-1", "--quorum-check"])
+    assert rc == 2, rc
+    assert "`--quorum-check` was removed" in err, err
+    assert "--check" in err, err
+    assert "unrecognized arguments" not in err, err
+
+
 def test_removed_flag_caught_after_valid_global_args():
     """A stale launcher can put `--mcp` AFTER valid args (e.g. `-C <dir> --mcp`). The
     scan walks the whole pre-`--` argv, so it is still caught — not left to argparse."""

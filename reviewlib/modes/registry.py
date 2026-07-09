@@ -137,6 +137,13 @@ REMOVED_FLAGS: dict[str, RemovedFlag] = {
         reason="the `--ln` line-number flag was removed in the subcommand refactor.",
         fix="drop `--ln` from the invocation; it no longer does anything.",
     ),
+    "--quorum-check": RemovedFlag(
+        reason="`review task CODE --quorum-check` was renamed to `--check` to avoid "
+        "colliding with the unrelated `review quorum` multi-model consensus panel — same "
+        "word, two different features.",
+        fix="use `review task CODE --check` instead; `--min-iter`/`--min-models`/`--json` "
+        "are unchanged.",
+    ),
 }
 
 
