@@ -45,7 +45,16 @@ from pathlib import Path
 
 # Schema version for the JSONL records. Bump if the record shape changes
 # incompatibly; readers tolerate unknown/missing fields and skip junk lines.
-STATS_VERSION = 2
+#
+# v3 adds "passed": bool — the run's VERDICT (did it come back clean), keyed off
+# the mode handler's own exit code (0 = every seat produced a usable verdict /
+# board not degraded, nonzero = failure/degraded — see `_run_mode_with_stats` in
+# cli.py). A record with no "passed" key has verdict UNKNOWN — either it predates
+# v3, or it is a CURRENT record from a mode with no verdict to thread (e.g. `qa`,
+# report-only by design). Readers must treat "no key" as unknown either way, never
+# crash, and — for the quorum gate specifically — fail-closed (unknown counts as
+# not-passed; see quorum_check).
+STATS_VERSION = 3
 _TASK_CODE_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,120}$")
 
 
@@ -102,6 +111,7 @@ def record_run(
     ok_count: int,
     fail_count: int,
     started: datetime | None = None,
+    passed: bool | None = None,
 ) -> bool:
     """Append one run record to the JSONL store. Best-effort: never raises.
 
@@ -110,6 +120,17 @@ def record_run(
     wall-clock the caller timed with a monotonic clock. Returns True on a
     successful append, False if anything went wrong (unwritable dir, etc.) — the
     run must never fail because stats couldn't be persisted.
+
+    ``passed`` is the run's VERDICT — the caller's own success/failure criterion
+    (e.g. the mode handler's exit code), NOT ``ok_count``/``fail_count`` (those are
+    per-BACKEND-CALL technical tallies, unrelated to whether the review came back
+    clean). ``None`` means "caller has no verdict to report" and the field is
+    omitted from the record entirely, so a reader can tell "unknown" apart from an
+    explicit False. Every pre-v3 record looks like this (the field didn't exist
+    yet), but so can a CURRENT v3 record from a mode with no verdict to thread
+    (e.g. ``qa``, which is report-only — see the ``mode == "qa"`` branch in
+    ``cli.py``'s ``_run_mode_with_stats``): a missing ``passed`` key means "verdict
+    unknown", not specifically "written before v3".
     """
     try:
         clean_task = normalize_task_code(task_code)
@@ -127,6 +148,8 @@ def record_run(
     }
     if clean_task is not None:
         record["task_code"] = clean_task
+    if passed is not None:
+        record["passed"] = bool(passed)
     try:
         p = stats_path()  # may raise RuntimeError on an unexpandable ~user / no HOME
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -208,38 +231,57 @@ def _store_unreadable_error() -> str | None:
 
 
 def quorum_check(task_code: str, *, min_iter: int, min_models: int) -> dict:
-    """Compute the quorum verdict for one task: N iterations across M distinct models.
+    """Compute the quorum verdict for one task: N PASSED iterations across M distinct
+    models (self-merge-authority gate; CTO decision tg#7306 #1).
 
-    This is a STRUCTURAL check on runs that were DISPATCHED, not on review VERDICTS —
-    the store (record_run) has no "findings addressed" / "approved" field today, only
-    which models ran and their raw ok/fail call counts. A future "passed-verdict"
-    quorum (e.g. requiring every reviewer to have come back clean) would need a new
-    verdict field threaded through record_run; this check only answers "did enough
-    independent reviewers actually run", which is what PR1 of the self-merge-authority
-    program needs as its foundation.
+    Only iterations whose record has ``passed is True`` count toward ``min_iter``, and
+    ``min_models`` is the distinct-model count among those SAME passed iterations — a
+    model that only ever failed/degraded does not help satisfy model diversity either.
+    A record with no ``passed`` key is verdict UNKNOWN (either pre-STATS_VERSION-3
+    history, or a current record from a mode with no verdict to thread, e.g. `qa`) and
+    is deliberately treated as not-passed: unverdicted iterations — old OR current —
+    can never satisfy this gate, only verdict-tagged passed runs can. This is
+    fail-closed by design, not a bug — see record_run's ``passed`` param.
 
-    Fail-closed: an invalid task code, an unreadable/missing store, or zero recorded
-    iterations for the code all yield ``passed: False`` plus an ``"error"`` key
-    explaining why — the caller must never treat "no data" as "quorum met".
+    Fail-closed (independent of the above): an invalid task code, an unreadable/missing
+    store, or zero recorded iterations for the code all yield ``passed: False`` plus an
+    ``"error"`` key explaining why — the caller must never treat "no data" as "quorum
+    met". A ``min_iter``/``min_models`` floor below 1 is also rejected the same way — 0
+    would trivially satisfy the bar via ``0 >= 0`` even for a task with zero passed
+    iterations, undermining the whole point of this gate. Validated HERE (not only in
+    the CLI wrapper) so a direct library caller can't bypass the floor either.
     """
-    try:
-        clean = normalize_task_code(task_code)
-    except ValueError as exc:
+
+    def _rejected(error: str) -> dict:
         return {
             "task_code": task_code,
-            "iterations": 0,
-            "distinct_models": 0,
+            "passed_iterations": 0,
+            "total_iterations": 0,
+            "distinct_models_passed": 0,
             "models": [],
             "min_iter": min_iter,
             "min_models": min_models,
             "passed": False,
-            "error": f"invalid task code: {exc}",
+            "error": error,
         }
+
+    if min_iter < 1 or min_models < 1:
+        return _rejected(
+            f"min_iter and min_models must both be >= 1 (got min_iter={min_iter} "
+            f"min_models={min_models})"
+        )
+    try:
+        clean = normalize_task_code(task_code)
+    except ValueError as exc:
+        return _rejected(f"invalid task code: {exc}")
 
     store_error = _store_unreadable_error()
     iterations = iterations_for_task(clean) if clean else []
+    # Fail-closed: a record with no "passed" key (pre-v3, verdict unknown) is NOT
+    # passed — `is True` (not truthy) so it never accidentally matches None/missing.
+    passed_iterations = [item for item in iterations if item.get("passed") is True]
     models: list[str] = []
-    for item in iterations:
+    for item in passed_iterations:
         for model in item.get("models") or []:
             if isinstance(model, str) and model not in models:
                 models.append(model)
@@ -247,12 +289,13 @@ def quorum_check(task_code: str, *, min_iter: int, min_models: int) -> dict:
 
     result = {
         "task_code": clean,
-        "iterations": len(iterations),
-        "distinct_models": len(models),
+        "passed_iterations": len(passed_iterations),
+        "total_iterations": len(iterations),
+        "distinct_models_passed": len(models),
         "models": models,
         "min_iter": min_iter,
         "min_models": min_models,
-        "passed": len(iterations) >= min_iter and len(models) >= min_models,
+        "passed": len(passed_iterations) >= min_iter and len(models) >= min_models,
     }
     if store_error is not None:
         result["passed"] = False
