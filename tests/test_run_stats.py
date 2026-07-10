@@ -139,6 +139,34 @@ def test_record_run_writes_correct_shape():
         # NO secrets/keys/prompts — model names only.
         blob = json.dumps(r)
         assert "prompt" not in blob and "api" not in blob.lower()
+        # No `passed=` kwarg given -> verdict UNKNOWN -> the key is omitted entirely
+        # (not written as null), so a reader can tell "never told us" from "told us False".
+        assert "passed" not in r
+
+
+def test_record_run_passed_true_and_false_are_persisted():
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+        )
+        recs = store.records()
+        assert recs[0]["passed"] is True
+        assert recs[1]["passed"] is False
 
 
 def test_task_summaries_group_iterations_and_models():
@@ -431,6 +459,9 @@ def test_cli_review_run_records_stat_and_announces_eta():
             assert r["pool_size"] == 2
             assert sorted(r["models"]) == ["codex", "gemini"]
             assert r["ok_count"] == 2 and r["fail_count"] == 0
+            # A CLI run that exits 0 must record passed=True -- the mode handler's
+            # own exit code IS the verdict signal, threaded through end to end.
+            assert r["passed"] is True
             # Real wall-clock duration (monotonic-timed), not a fixture proxy: a tiny
             # mocked run is sub-second but must be a real, non-negative number.
             assert isinstance(r["duration_seconds"], (int, float))
@@ -698,6 +729,9 @@ def test_cli_records_failure_counts_per_call():
             assert rc == 1, rc
             r = store.records()[0]
             assert r["ok_count"] == 1 and r["fail_count"] == 1, r
+            # A seat failure -> mode_review's own `ok = all(rc==0 ...)` is False ->
+            # exit 1 -> the recorded verdict must be passed=False, not just "ran".
+            assert r["passed"] is False, r
         finally:
             restore()
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -736,6 +770,40 @@ def test_cli_no_dispatch_run_is_not_recorded_but_eta_still_printed():
             restore()
             os.environ.pop("REVIEW_LOG_DIR", None)
             d.cleanup()
+
+
+def test_qa_mode_exit_0_does_not_record_passed_true():
+    """qa is deliberately REPORT-ONLY (reviewlib.qa.executor.verdict_to_exit_code): a
+    FAIL verdict with real findings still exits 0 unless --strict, so the handler's rc
+    is NOT a review verdict for qa the way it is for review/quorum/just-ask/brainstorm.
+    A qa run must never be recorded as passed=True purely because dispatch() returned
+    0 -- that would let a bug-finding qa run with `VERDICT: FAIL` satisfy the
+    self-merge-authority quorum gate (codex review finding on this same change)."""
+    from reviewlib import panel as _panel
+
+    def _fake_qa_dispatch_that_found_a_bug() -> int:
+        # Mirrors a real non-strict qa run: one call succeeded technically (ok_count
+        # goes up) but the run's OWN verdict was FAIL -- exit code is still 0.
+        _panel._tally_ok(True)
+        return 0
+
+    with _TmpStore() as store:
+        rc = _cli._run_mode_with_stats(
+            "qa",
+            ["codex"],
+            _fake_qa_dispatch_that_found_a_bug,
+            task_code=TASK,
+        )
+        assert rc == 0
+        recs = store.records()
+        assert len(recs) == 1, recs
+        # Verdict UNKNOWN -> key omitted, NOT written as True.
+        assert "passed" not in recs[0], recs[0]
+        # And the quorum gate must never count it: unknown verdict fails closed too.
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=1)
+        assert result["passed"] is False
+        assert result["passed_iterations"] == 0
+        assert result["total_iterations"] == 1
 
 
 def test_cli_second_run_eta_uses_first_runs_history():
@@ -1008,24 +1076,46 @@ def test_skill_docs_show_required_task_code_for_recorded_modes():
 
 # ---------------------------------------------------------------------------
 # quorum_check + `review task CODE --check` (self-merge-authority PR1 gate)
+#
+# min_iter/min_models are evaluated over PASSED iterations ONLY (CTO decision
+# tg#7306 #1) — a record needs record_run(..., passed=True) to count. A record
+# written with no `passed` kwarg (the pre-v3 shape) has verdict UNKNOWN and must
+# fail closed: it never counts, even though it has real ok_count/fail_count.
 # ---------------------------------------------------------------------------
 def test_quorum_check_met():
     with _TmpStore():
         for model in ("codex", "gemini", "fable5"):
-            _stats.record_run(task_code=TASK, mode="review", models=[model],
-                              duration_seconds=1.0, ok_count=1, fail_count=0)
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
         result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
         assert result["passed"] is True
-        assert result["iterations"] == 3
-        assert result["distinct_models"] == 3
+        assert result["passed_iterations"] == 3
+        assert result["total_iterations"] == 3
+        assert result["distinct_models_passed"] == 3
         assert result["models"] == ["codex", "fable5", "gemini"]
         assert "error" not in result
         # Contract: the returned dict has a stable shape + value types (Gemini review).
-        assert set(result) == {"task_code", "iterations", "distinct_models", "models",
-                               "min_iter", "min_models", "passed"}
+        assert set(result) == {
+            "task_code",
+            "passed_iterations",
+            "total_iterations",
+            "distinct_models_passed",
+            "models",
+            "min_iter",
+            "min_models",
+            "passed",
+        }
         assert isinstance(result["task_code"], str)
-        assert isinstance(result["iterations"], int)
-        assert isinstance(result["distinct_models"], int)
+        assert isinstance(result["passed_iterations"], int)
+        assert isinstance(result["total_iterations"], int)
+        assert isinstance(result["distinct_models_passed"], int)
         assert isinstance(result["models"], list)
         assert all(isinstance(m, str) for m in result["models"])
         assert isinstance(result["min_iter"], int)
@@ -1035,29 +1125,176 @@ def test_quorum_check_met():
 
 def test_quorum_check_short_on_iterations():
     with _TmpStore():
-        # 2 runs, but 3 distinct models across them (>= min_models) -- only iterations short.
-        _stats.record_run(task_code=TASK, mode="review", models=["codex", "gemini"],
-                          duration_seconds=1.0, ok_count=2, fail_count=0)
-        _stats.record_run(task_code=TASK, mode="review", models=["fable5"],
-                          duration_seconds=1.0, ok_count=1, fail_count=0)
+        # 2 passed runs, but 3 distinct models across them (>= min_models) -- only
+        # iterations short.
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex", "gemini"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["fable5"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
         result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
         assert result["passed"] is False
-        assert result["iterations"] == 2
-        assert result["distinct_models"] == 3
+        assert result["passed_iterations"] == 2
+        assert result["total_iterations"] == 2
+        assert result["distinct_models_passed"] == 3
         assert "error" not in result
 
 
 def test_quorum_check_short_on_models():
     with _TmpStore():
-        # 3 runs, but the SAME model each time -- only distinct_models short.
+        # 3 passed runs, but the SAME model each time -- only distinct_models short.
         for _ in range(3):
-            _stats.record_run(task_code=TASK, mode="review", models=["codex"],
-                              duration_seconds=1.0, ok_count=1, fail_count=0)
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
         result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
         assert result["passed"] is False
-        assert result["iterations"] == 3
-        assert result["distinct_models"] == 1
+        assert result["passed_iterations"] == 3
+        assert result["distinct_models_passed"] == 1
         assert "error" not in result
+
+
+def test_quorum_check_only_counts_passed_iterations():
+    """The bug being fixed: 3 DISPATCHED iterations (enough to satisfy the old
+    count-everything gate) but only 1 of them PASSED -- must fail, not pass, and
+    the failed ones must not even count toward total for the purpose of the bar."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["fable5"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+        )
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=1)
+        assert result["passed"] is False
+        assert result["passed_iterations"] == 1
+        assert result["total_iterations"] == 3  # all 3 ran, only 1 passed
+        assert result["distinct_models_passed"] == 1
+        assert result["models"] == ["codex"]  # the failed seats' models don't count
+
+
+def test_quorum_check_min_models_only_counts_models_that_passed():
+    """3 distinct models dispatched, but only ONE of them ever came back passed --
+    --min-models 2 must fail even though 3 distinct models technically ran (a model
+    that only ever failed doesn't count toward diversity)."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=False,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["fable5"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=False,
+        )
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=2)
+        assert result["passed"] is False
+        assert result["passed_iterations"] == 1
+        assert result["distinct_models_passed"] == 1
+        assert result["models"] == ["codex"]
+
+
+def test_quorum_check_legacy_records_without_verdict_fail_closed():
+    """Records with no `passed` key at all -- the shape every run written before
+    STATS_VERSION 3 has -- must NOT satisfy the gate: unknown verdict is treated as
+    not-passed, even though the old count-everything gate would have happily
+    counted them."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            # No passed= kwarg -> pre-migration shape, verdict unknown.
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+            )
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=1)
+        assert result["passed"] is False
+        assert result["passed_iterations"] == 0
+        assert result["total_iterations"] == 3
+        assert result["distinct_models_passed"] == 0
+        assert result["models"] == []
+
+
+def test_quorum_check_current_verdictless_mode_also_fails_closed():
+    """A missing `passed` key is not EXCLUSIVELY a legacy (pre-v3) signature -- a
+    CURRENT record from a mode with no verdict to thread (qa, recorded via
+    `_run_mode_with_stats`'s `mode == "qa"` branch) has the identical shape and must
+    fail closed the same way, not be mistaken for "written before v3"."""
+    with _TmpStore() as store:
+        from reviewlib import panel as _panel
+
+        def _fake_qa_dispatch() -> int:
+            _panel._tally_ok(True)
+            return 0
+
+        _cli._run_mode_with_stats("qa", ["codex"], _fake_qa_dispatch, task_code=TASK)
+        rec = store.records()[0]
+        assert rec["v"] == _stats.STATS_VERSION  # a CURRENT record, not legacy
+        assert "passed" not in rec
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=1)
+        assert result["passed"] is False
+        assert result["passed_iterations"] == 0
 
 
 def test_quorum_check_zero_records_fails_closed():
@@ -1065,11 +1302,18 @@ def test_quorum_check_zero_records_fails_closed():
         # Write a record for a DIFFERENT task first so the store exists and is
         # readable -- isolates "store readable, zero records for THIS code" from
         # "store missing/unreadable" (covered separately below).
-        _stats.record_run(task_code="HYP-000", mode="review", models=["codex"],
-                          duration_seconds=1.0, ok_count=1, fail_count=0)
+        _stats.record_run(
+            task_code="HYP-000",
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
         result = _stats.quorum_check("HYP-999", min_iter=1, min_models=1)
         assert result["passed"] is False
-        assert result["iterations"] == 0
+        assert result["passed_iterations"] == 0
         assert "error" in result
         assert "HYP-999" in result["error"]
 
@@ -1109,14 +1353,36 @@ def test_quorum_check_invalid_task_code_fails_closed():
     result = _stats.quorum_check("bad code", min_iter=1, min_models=1)
     assert result["passed"] is False
     assert "error" in result
-    assert result["iterations"] == 0 and result["distinct_models"] == 0
+    assert result["passed_iterations"] == 0 and result["distinct_models_passed"] == 0
+
+
+def test_quorum_check_rejects_zero_or_negative_thresholds_directly():
+    """The floor validation lives in quorum_check() itself, not only the CLI
+    wrapper -- a direct library caller (bypassing the CLI's own --min-iter/
+    --min-models argparse validation) must not be able to get passed=True via
+    0 >= 0 for a task with only failed/unverdicted iterations (codex review
+    finding: the CLI-only check let a lib caller bypass the fail-closed floor)."""
+    with _TmpStore():
+        _stats.record_run(task_code=TASK, mode="review", models=["codex"],
+                          duration_seconds=1.0, ok_count=0, fail_count=1, passed=False)
+        for min_iter, min_models in ((0, 1), (1, 0), (-1, 1), (1, -1)):
+            result = _stats.quorum_check(TASK, min_iter=min_iter, min_models=min_models)
+            assert result["passed"] is False, (min_iter, min_models, result)
+            assert "error" in result, (min_iter, min_models, result)
 
 
 def test_cli_check_met_prints_verdict_and_exits_0():
     with _TmpStore():
         for model in ("codex", "gemini", "fable5"):
-            _stats.record_run(task_code=TASK, mode="review", models=[model],
-                              duration_seconds=1.0, ok_count=1, fail_count=0)
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
             rc = _cli.main(["task", TASK, "--check"])
@@ -1124,27 +1390,64 @@ def test_cli_check_met_prints_verdict_and_exits_0():
         text = out.getvalue()
         assert "review bar met" in text
         assert TASK in text
-        assert "3 iteration" in text and "3 distinct model" in text
+        assert "3 passed iteration" in text and "3 distinct model" in text
 
 
 def test_cli_check_short_prints_ratio_and_exits_nonzero():
     with _TmpStore():
-        _stats.record_run(task_code=TASK, mode="review", models=["codex", "gemini"],
-                          duration_seconds=1.0, ok_count=2, fail_count=0)
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex", "gemini"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+        )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
             rc = _cli.main(["task", TASK, "--check"])
         assert rc != 0, rc
         text = out.getvalue()
         assert "review bar NOT met" in text
-        assert "1/3 iterations" in text
+        assert "1/3 passed iterations" in text
         assert "2/3 distinct models" in text
+
+
+def test_cli_check_ran_but_not_passed_does_not_satisfy_bar():
+    """The exact scenario the fix targets: enough iterations RAN, none of them
+    PASSED -- the old gate would have said "met", the new one must say "NOT met"."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=0,
+                fail_count=1,
+                passed=False,
+            )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check"])
+        assert rc != 0, rc
+        text = out.getvalue()
+        assert "review bar NOT met" in text
+        assert "0/3 passed iterations" in text
 
 
 def test_cli_check_custom_thresholds():
     with _TmpStore():
-        _stats.record_run(task_code=TASK, mode="review", models=["codex", "gemini"],
-                          duration_seconds=1.0, ok_count=2, fail_count=0)
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex", "gemini"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+        )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
             rc = _cli.main(["task", TASK, "--check", "--min-iter", "1", "--min-models", "2"])
@@ -1179,19 +1482,35 @@ def test_cli_check_zero_records_fails_closed_nonzero():
 
 def test_cli_check_json_shape():
     with _TmpStore():
-        _stats.record_run(task_code=TASK, mode="review", models=["codex"],
-                          duration_seconds=1.0, ok_count=1, fail_count=0)
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
             rc = _cli.main(["task", TASK, "--check", "--json"])
         assert rc != 0, rc  # short of default 3/3
         payload = json.loads(out.getvalue())
-        required = {"task_code", "iterations", "distinct_models", "models", "min_iter",
-                    "min_models", "passed"}
+        required = {
+            "task_code",
+            "passed_iterations",
+            "total_iterations",
+            "distinct_models_passed",
+            "models",
+            "min_iter",
+            "min_models",
+            "passed",
+        }
         assert required.issubset(payload.keys()), payload
         assert payload["task_code"] == TASK
-        assert payload["iterations"] == 1
-        assert payload["distinct_models"] == 1
+        assert payload["passed_iterations"] == 1
+        assert payload["total_iterations"] == 1
+        assert payload["distinct_models_passed"] == 1
         assert payload["models"] == ["codex"]
         assert payload["min_iter"] == 3
         assert payload["min_models"] == 3
@@ -1201,8 +1520,15 @@ def test_cli_check_json_shape():
 def test_cli_check_json_exits_0_when_passed():
     with _TmpStore():
         for model in ("codex", "gemini", "fable5"):
-            _stats.record_run(task_code=TASK, mode="review", models=[model],
-                              duration_seconds=1.0, ok_count=1, fail_count=0)
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
             rc = _cli.main(["task", TASK, "--check", "--json"])
@@ -1216,6 +1542,46 @@ def test_cli_check_requires_code():
         rc = _cli.main(["task", "--check"])
     assert rc == 2, rc
     assert "requires a task CODE" in err.getvalue()
+
+
+def test_cli_check_rejects_zero_min_iter():
+    """--min-iter 0 would trivially satisfy the bar (0 >= 0) for a task whose every
+    recorded iteration failed or predates the verdict field -- defeating the whole
+    fail-closed point of this gate. Both floors must be >= 1 (codex review finding
+    on this same change)."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+        )
+        err = io.StringIO()
+        with redirect_stderr(err), _capture_stdout():
+            rc = _cli.main(["task", TASK, "--check", "--min-iter", "0"])
+        assert rc == 2, rc
+        assert "--min-iter" in err.getvalue() and ">= 1" in err.getvalue()
+
+
+def test_cli_check_rejects_zero_min_models():
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        err = io.StringIO()
+        with redirect_stderr(err), _capture_stdout():
+            rc = _cli.main(["task", TASK, "--check", "--min-models", "0"])
+        assert rc == 2, rc
+        assert "--min-models" in err.getvalue() and ">= 1" in err.getvalue()
 
 
 # ---------------------------------------------------------------------------
