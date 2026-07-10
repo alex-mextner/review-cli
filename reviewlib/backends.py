@@ -7,6 +7,7 @@ panel modes so streamed calls print their live-log path to stderr.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -403,6 +405,12 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
     )
     if unpaid is not None:
         return unpaid
+    _which("opencode")
+    preflight = provider_preflight_result(
+        model, backend="opencode", command=f"opencode -m {oc_model}", round_no=round_no
+    )
+    if preflight is not None:
+        return preflight
     _ensure_opencode_readonly_agent(cwd, oc_model)
 
     if _opencode_runs_in_repo(cwd):
@@ -969,6 +977,11 @@ def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: i
     except RuntimeError as exc:
         _emit_rest_log("commandcode", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc))
         return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
+    preflight = provider_preflight_result(
+        model, backend="commandcode", command=command, round_no=round_no
+    )
+    if preflight is not None:
+        return preflight
     base_url = os.environ.get("COMMANDCODE_BASE_URL") or COMMANDCODE_DEFAULT_BASE_URL
     return _openai_compatible_request(
         model=model, api_model=cc_model, label="commandcode", base_url=base_url, key=key,
@@ -1950,6 +1963,198 @@ def unpaid_provider_result(
     except OSError as exc:
         print(f"[review-cli] unpaid-provider sidecar log skipped: {exc}", file=sys.stderr, flush=True)
     return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=stderr)
+
+
+_PAYMENT_PREFLIGHT_PROVIDERS = frozenset({"commandcode", "fireworks"})
+_PAYMENT_PREFLIGHT_MARKER_CODES = frozenset({401, 403})
+_PAYMENT_PREFLIGHT_MARKERS = (
+    "account disabled",
+    "account suspended",
+    "insufficient balance",
+    "insufficient credit",
+    "insufficient credits",
+    "payment required",
+    "subscription required",
+    "unpaid",
+)
+_FIREWORKS_DEFAULT_BASE_URL = "https://api.fireworks.ai/inference/v1"
+_PROVIDER_PREFLIGHT_TIMEOUT_SECONDS = 2.0
+_PAYMENT_PREFLIGHT_CACHE: dict[tuple[str, str, str], tuple[bool, int | None]] = {}
+_PAYMENT_PREFLIGHT_CACHE_LOCK = threading.Lock()
+
+
+def _provider_preflight_url(provider: str) -> str | None:
+    if provider == "commandcode":
+        base = os.environ.get("COMMANDCODE_BASE_URL") or COMMANDCODE_DEFAULT_BASE_URL
+    elif provider == "fireworks":
+        base = os.environ.get("FIREWORKS_BASE_URL") or _FIREWORKS_DEFAULT_BASE_URL
+    else:
+        return None
+    return base.rstrip("/") + "/models"
+
+
+def _oc_auth_provider_key(provider: str) -> str | None:
+    try:
+        data = json.loads(_oc_auth_file().read_text())
+        value = data.get(provider, {}).get("key", "")
+        return value if isinstance(value, str) and value.strip() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _oc_config_provider_key(provider: str) -> str | None:
+    key, _base = _oc_config_provider_credentials(provider)
+    return key
+
+
+def _oc_config_provider_credentials(provider: str) -> tuple[str | None, str | None]:
+    try:
+        data = json.loads(_oc_config_file().read_text())
+        opts = data.get("provider", {}).get(provider, {}).get("options", {})
+        value = opts.get("apiKey", "")
+        key = value if isinstance(value, str) and value.strip() else None
+        base_value = opts.get("baseURL") or opts.get("baseUrl") or opts.get("base_url") or ""
+        base = base_value.strip() if isinstance(base_value, str) else ""
+        return key, (base or None)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _oc_env_provider_key(provider: str) -> str | None:
+    for var in _OC_PROVIDER_ENV_VARS.get(provider, ()):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _oc_provider_key(provider: str) -> str | None:
+    return (
+        _oc_auth_provider_key(provider)
+        or _oc_config_provider_key(provider)
+        or _oc_env_provider_key(provider)
+    )
+
+
+def _models_url_from_base(base_url: str | None, provider: str) -> str | None:
+    if not base_url:
+        return _provider_preflight_url(provider)
+    return base_url.rstrip("/") + "/models"
+
+
+def _payment_preflight_credentials(model: str, provider: str) -> tuple[str | None, str | None]:
+    if provider == "commandcode":
+        if model.lower().startswith(("oc:", "opencode:")):
+            config_key, config_base = _oc_config_provider_credentials(provider)
+            auth_key = _oc_auth_provider_key(provider)
+            if auth_key:
+                return auth_key, _models_url_from_base(config_base, provider)
+            if config_key:
+                return config_key, _models_url_from_base(config_base, provider)
+            env_key = _oc_env_provider_key(provider)
+            return env_key, _models_url_from_base(config_base, provider)
+        try:
+            return _commandcode_key(), _provider_preflight_url(provider)
+        except RuntimeError:
+            return None, None
+    if provider == "fireworks":
+        config_key, config_base = _oc_config_provider_credentials(provider)
+        auth_key = _oc_auth_provider_key(provider)
+        if auth_key:
+            return auth_key, _models_url_from_base(config_base, provider)
+        if config_key:
+            return config_key, _models_url_from_base(config_base, provider)
+        env_key = _oc_env_provider_key(provider)
+        return env_key, _models_url_from_base(config_base, provider)
+    return None, None
+
+
+def _payment_preflight_cache_key(provider: str, url: str, key: str) -> tuple[str, str, str]:
+    # Keep the cache key credential-sensitive without storing the credential itself.
+    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return (provider, url, key_hash)
+
+
+def _is_payment_preflight_denial(code: int | None, body: str) -> bool:
+    if code == 402:
+        return True
+    lowered = body.lower()
+    return code in _PAYMENT_PREFLIGHT_MARKER_CODES and any(
+        marker in lowered for marker in _PAYMENT_PREFLIGHT_MARKERS
+    )
+
+
+def _payment_preflight_reason(provider: str, model: str, code: int | None) -> str:
+    suffix = f"HTTP {code}" if code is not None else "payment/availability denial"
+    return f"provider '{provider}' failed payment/availability preflight ({suffix}); skipping {model}"
+
+
+def _provider_payment_preflight_unavailable_reason(model: str) -> str | None:
+    """Return a skip reason when a provider key exists but payment/entitlement is unavailable.
+
+    This is deliberately narrow: only providers with known cheap `/models` entitlement probes
+    are checked. Network/DNS/transient failures are conservative-allow so an offline probe
+    does not make a working provider disappear; explicit payment/auth/disabled responses are
+    conservative-deny so they do not launch chat/opencode calls.
+    """
+    provider = effective_provider(model)
+    if provider not in _PAYMENT_PREFLIGHT_PROVIDERS:
+        return None
+    key, url = _payment_preflight_credentials(model, provider)
+    if not key or not url:
+        return None
+    cache_key = _payment_preflight_cache_key(provider, url, key)
+    with _PAYMENT_PREFLIGHT_CACHE_LOCK:
+        cached = _PAYMENT_PREFLIGHT_CACHE.get(cache_key)
+    if cached is not None:
+        denied, code = cached
+        return _payment_preflight_reason(provider, model, code) if denied else None
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {key}",
+            "User-Agent": "review-cli/0.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_PROVIDER_PREFLIGHT_TIMEOUT_SECONDS):
+            with _PAYMENT_PREFLIGHT_CACHE_LOCK:
+                _PAYMENT_PREFLIGHT_CACHE[cache_key] = (False, None)
+            return None
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        if _is_payment_preflight_denial(exc.code, body):
+            with _PAYMENT_PREFLIGHT_CACHE_LOCK:
+                _PAYMENT_PREFLIGHT_CACHE[cache_key] = (True, exc.code)
+            return _payment_preflight_reason(provider, model, exc.code)
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    except Exception:  # noqa: BLE001
+        # Test fakes and unusual urllib failures that are not explicit entitlement
+        # denials should not make a provider disappear. Only the HTTP payment/auth
+        # shapes above are authoritative enough to skip a seat.
+        return None
+
+
+def provider_preflight_result(
+    model: str,
+    *,
+    backend: str,
+    command: str,
+    round_no: int = 0,
+    started: datetime | None = None,
+) -> ReviewResult | None:
+    reason = _provider_payment_preflight_unavailable_reason(model)
+    if reason is None:
+        return None
+    try:
+        _emit_rest_log(backend, command, stdout="", stderr=reason, returncode=1, round_no=round_no, started=started)
+    except OSError as exc:
+        print(f"[review-cli] provider-preflight sidecar log skipped: {exc}", file=sys.stderr, flush=True)
+    return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=reason)
 
 
 def _oc_auth_file() -> Path:

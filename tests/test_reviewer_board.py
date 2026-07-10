@@ -12,7 +12,8 @@ unavailable):
   (d) graceful skip — an unavailable reviewer is dropped (not crashed) and surfaced
       in the `skipped` list; an all-unavailable board returns no jobs;
   (e) mode_review board path runs in parallel and returns 0 on success / 1 on a
-      failed reviewer, and only an explicit -m disables the board in the CLI.
+      failed reviewer, and explicit -m either runs a flat panel (no config) or narrows
+      configured board metadata.
 
 Runs as a plain script (mirrors tests/test_provider_keys.py): each `test_*` is
 invoked by the __main__ block, no pytest required.
@@ -918,6 +919,43 @@ def test_mode_review_board_fails_when_a_reviewer_fails():
     assert rc == 1, rc
 
 
+def test_mode_review_board_backfills_preflight_skip_from_reserve():
+    from reviewlib.modes import review as review_mod
+
+    calls: list[str] = []
+
+    def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0):
+        calls.append(model)
+        if model == "commandcode:deepseek/deepseek-v4-pro":
+            return ReviewResult(
+                model=model,
+                command="commandcode API deepseek/deepseek-v4-pro",
+                returncode=1,
+                stdout="",
+                stderr="provider 'commandcode' failed payment/availability preflight (HTTP 402); skipping",
+            )
+        return ReviewResult(model=model, command="fake", returncode=0, stdout="ok", stderr="")
+
+    board = [
+        BoardReviewer("commandcode:deepseek/deepseek-v4-pro", "tests", "CommandCode"),
+        BoardReviewer("codex", "correctness", "Codex"),
+    ]
+    import reviewlib.panel as panel
+
+    old_panel_resolve = panel.resolve_backend
+    panel.resolve_backend = lambda _m: _fake_backend
+    try:
+        with _AvailabilityPatch({"commandcode:deepseek/deepseek-v4-pro", "codex"}):
+            rc = review_mod.mode_review(
+                [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False,
+                board=board, pool_size=1,
+            )
+    finally:
+        panel.resolve_backend = old_panel_resolve
+    assert rc == 0, rc
+    assert calls == ["commandcode:deepseek/deepseek-v4-pro", "codex"], calls
+
+
 def test_mode_review_board_with_no_available_reviewers_returns_1():
     from reviewlib.modes import review as review_mod
 
@@ -926,7 +964,38 @@ def test_mode_review_board_with_no_available_reviewers_returns_1():
     assert rc == 1, rc
 
 
-# === CLI wiring: explicit -m disables the board (no --no-board flag exists) ======
+def test_mode_review_exact_board_runs_unavailable_explicit_seat_and_fails():
+    """Explicit -m with board metadata is exact: unavailable requested seats must not vanish."""
+    from reviewlib.modes import review as review_mod
+
+    calls: list[str] = []
+
+    def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0):
+        calls.append(model)
+        rc = 0 if model == "codex" else 1
+        return ReviewResult(model=model, command="fake", returncode=rc, stdout="ok" if rc == 0 else "", stderr="missing")
+
+    board = [
+        BoardReviewer("codex", "correctness", "Codex"),
+        BoardReviewer("missing-provider:model", "tests", "Missing"),
+    ]
+    import reviewlib.panel as panel
+
+    old_panel_resolve = panel.resolve_backend
+    panel.resolve_backend = lambda _m: _fake_backend
+    try:
+        with _AvailabilityPatch({"codex"}):
+            rc = review_mod.mode_review(
+                [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False,
+                board=board, pool_size=len(board), exact_board=True,
+            )
+    finally:
+        panel.resolve_backend = old_panel_resolve
+    assert rc == 1, rc
+    assert set(calls) == {"codex", "missing-provider:model"}, calls
+
+
+# === CLI wiring: explicit -m precedence (no --no-board flag exists) ==============
 def test_cli_explicit_models_disable_board():
     """An explicit -m must run the flat legacy panel (board=None), NOT the board."""
     from reviewlib import cli
@@ -940,6 +1009,8 @@ def test_cli_explicit_models_disable_board():
 
     old = _review_mod.mode_review
     _review_mod.mode_review = _fake_mode_review
+    old_load_config = cli.load_config
+    cli.load_config = lambda: {}
     # Avoid touching a real config file / git diff: feed the diff via stdin and
     # point the env file at nothing so no provider key resolves.
     old_stdin = sys.stdin
@@ -954,11 +1025,12 @@ def test_cli_explicit_models_disable_board():
         assert captured["models"] == ["codex"], captured["models"]
     finally:
         _review_mod.mode_review = old
+        cli.load_config = old_load_config
         sys.stdin = old_stdin
 
 
 def test_cli_explicit_models_override_config_models_and_board():
-    """-m is an exact panel override even when config.yaml has both models: and board:."""
+    """-m narrows configured board/model preferences to the requested models only."""
     from reviewlib import cli
 
     captured: dict = {}
@@ -971,29 +1043,160 @@ def test_cli_explicit_models_override_config_models_and_board():
     old_mode = _review_mod.mode_review
     _review_mod.mode_review = _fake_mode_review
     old_load_config = cli.load_config
+    old_avail = backends.backend_available
     cli.load_config = lambda: {
         "models": ["commandcode:deepseek/deepseek-v4-pro", "codex"],
         "board": [
             {"model": "commandcode:deepseek/deepseek-v4-pro", "role": "tests", "name": "DeepSeek-cc"},
             {"model": "codex", "role": "consistency", "name": "Codex"},
+            {"model": "claude:claude-fable-5", "role": "architect", "name": "Fable"},
         ],
     }
+    backends.backend_available = lambda _m: True
     old_stdin = sys.stdin
     try:
         import io
 
         sys.stdin = io.StringIO("+added line\n")
         cli.main(["diff", "--task", "TEST-1", "-m", "fable5", "-C", str(REPO_ROOT)])
-        assert captured["board"] is None, captured
+        assert captured["board"] is not None, captured
+        assert [(r.model, r.role, r.display) for r in captured["board"]] == [
+            ("claude:claude-fable-5", "architect", "Fable"),
+        ], captured
         assert captured["models"] == ["claude:claude-fable-5"], captured
     finally:
         _review_mod.mode_review = old_mode
         cli.load_config = old_load_config
+        backends.backend_available = old_avail
         sys.stdin = old_stdin
 
 
+def test_cli_explicit_models_are_not_sliced_by_pool():
+    """When -m is explicit, --pool must not drop requested models from the review panel."""
+    from reviewlib import cli
+
+    captured: dict = {}
+
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None,
+                          pool_size=DEFAULT_POOL_SIZE, **kw):
+        captured["models"] = models
+        captured["board"] = board
+        captured["pool_size"] = pool_size
+        captured["exact_board"] = kw.get("exact_board")
+        return 0
+
+    old_mode = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
+    old_load_config = cli.load_config
+    old_avail = backends.backend_available
+    cli.load_config = lambda: {
+        "models": ["codex", "gemini", "claude:claude-fable-5"],
+        "board": [
+            {"model": "codex", "role": "correctness", "name": "Codex"},
+            {"model": "gemini", "role": "tests", "name": "Gemini"},
+            {"model": "claude:claude-fable-5", "role": "architect", "name": "Fable"},
+        ],
+    }
+    backends.backend_available = lambda _m: True
+    old_stdin = sys.stdin
+    try:
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        cli.main([
+            "diff", "--task", "TEST-1",
+            "-m", "codex", "-m", "fable5",
+            "--pool", "1",
+            "-C", str(REPO_ROOT),
+        ])
+        assert [r.model for r in captured["board"]] == [
+            "codex",
+            "claude:claude-fable-5",
+        ], captured
+        assert captured["pool_size"] == 2, captured
+        assert captured["exact_board"] is True, captured
+        assert captured["models"] == ["codex", "claude:claude-fable-5"], captured
+    finally:
+        _review_mod.mode_review = old_mode
+        cli.load_config = old_load_config
+        backends.backend_available = old_avail
+        sys.stdin = old_stdin
+
+
+def test_cli_explicit_model_not_in_config_board_is_still_requested():
+    """Configured board metadata must not drop an explicit model that lacks a board entry."""
+    from reviewlib import cli
+
+    captured: dict = {}
+
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
+        captured["models"] = models
+        captured["board"] = board
+        captured["exact_board"] = kw.get("exact_board")
+        return 0
+
+    old_mode = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
+    old_load_config = cli.load_config
+    old_avail = backends.backend_available
+    cli.load_config = lambda: {
+        "models": ["codex"],
+        "board": [{"model": "codex", "role": "correctness", "name": "Codex"}],
+    }
+    backends.backend_available = lambda _m: True
+    old_stdin = sys.stdin
+    try:
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        cli.main(["diff", "--task", "TEST-1", "-m", "gemini", "-C", str(REPO_ROOT)])
+        assert captured["models"] == ["gemini"], captured
+        assert [r.model for r in captured["board"]] == ["gemini"], captured
+        assert captured["exact_board"] is True, captured
+    finally:
+        _review_mod.mode_review = old_mode
+        cli.load_config = old_load_config
+        backends.backend_available = old_avail
+        sys.stdin = old_stdin
+
+
+def test_cli_explicit_models_ignore_malformed_config_board():
+    """Explicit -m is an override: a broken config board must not abort the requested run."""
+    from reviewlib import cli
+
+    captured: dict = {}
+
+    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
+        captured["models"] = models
+        captured["board"] = board
+        captured["exact_board"] = kw.get("exact_board")
+        return 0
+
+    old_mode = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
+    old_load_config = cli.load_config
+    old_avail = backends.backend_available
+    cli.load_config = lambda: {"board": [{"role": "tests"}]}
+    backends.backend_available = lambda _m: True
+    old_stdin = sys.stdin
+    try:
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        rc = cli.main(["diff", "--task", "TEST-1", "-m", "codex", "-C", str(REPO_ROOT)])
+    finally:
+        _review_mod.mode_review = old_mode
+        cli.load_config = old_load_config
+        backends.backend_available = old_avail
+        sys.stdin = old_stdin
+    assert rc == 0
+    assert captured["models"] == ["codex"], captured
+    assert [r.model for r in captured["board"]] == ["codex"], captured
+    assert captured["exact_board"] is True, captured
+
+
 def test_cli_leading_model_option_before_subcommand_is_honored():
-    """`review -m fable diff ...` must mean the same thing as `review diff -m fable ...`."""
+    """Leading -m keeps the same precedence and narrows config models after normalization."""
     from reviewlib import cli
 
     captured: dict = {}
@@ -1007,19 +1210,23 @@ def test_cli_leading_model_option_before_subcommand_is_honored():
     old_mode = _review_mod.mode_review
     _review_mod.mode_review = _fake_mode_review
     old_load_config = cli.load_config
+    old_avail = backends.backend_available
     cli.load_config = lambda: {"models": ["commandcode:deepseek/deepseek-v4-pro", "codex"]}
+    backends.backend_available = lambda _m: True
     old_stdin = sys.stdin
     try:
         import io
 
         sys.stdin = io.StringIO("+added line\n")
         cli.main(["-m", "fable5", "-C", str(REPO_ROOT), "diff", "--task", "TEST-1"])
-        assert captured["board"] is None, captured
+        assert captured["board"] is not None, captured
+        assert [r.model for r in captured["board"]] == ["claude:claude-fable-5"], captured
         assert captured["models"] == ["claude:claude-fable-5"], captured
         assert captured["cwd"] == REPO_ROOT, captured
     finally:
         _review_mod.mode_review = old_mode
         cli.load_config = old_load_config
+        backends.backend_available = old_avail
         sys.stdin = old_stdin
 
 
@@ -1064,7 +1271,7 @@ def test_cli_config_models_form_priority_board():
 
     It must NOT take the legacy flat path: `review diff` still gets a board, `--pool`
     still sizes the active pool, and the remaining configured models are reserve seats.
-    Only explicit CLI `-m` is the exact flat override."""
+    Explicit CLI `-m` narrows this configured board to the requested models."""
     from reviewlib import cli
 
     captured: dict = {}

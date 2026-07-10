@@ -194,7 +194,7 @@ def test_piped_diff_outside_repo_does_not_require_git():
 
     _review_mod.mode_review = _fake_review
     cli._read_stdin_if_piped = lambda: piped
-    cli.load_config = lambda: {"models": ["codex"]}  # explicit models -> no real board
+    cli.load_config = lambda: {"models": ["codex"]}  # deterministic one-seat config board
     err = io.StringIO()
     try:
         with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
