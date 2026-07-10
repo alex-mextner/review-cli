@@ -819,6 +819,9 @@ def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schem
         )
     if not shutil.which("opencode"):
         return VisionVerdict(available=False, verdict=None, error="opencode CLI not found on PATH", backend=model)
+    preflight = backends._provider_payment_preflight_unavailable_reason(model)
+    if preflight is not None:
+        return VisionVerdict(available=False, verdict=None, error=preflight, backend=model)
 
     oc_model = model.split(":", 1)[1] if ":" in model else model
     with tempfile.TemporaryDirectory(prefix="review-cli-vision-opencode-") as tmp_raw:

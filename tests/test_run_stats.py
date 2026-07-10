@@ -682,6 +682,40 @@ def test_cli_failover_exhausted_reserve_degrades_exit_1():
     assert r["pool_size"] == 2, r
 
 
+def test_cli_exact_board_records_all_explicit_attempted_models_on_partial_failure():
+    with _TmpStore() as store:
+        d = _git_init_with_diff()
+        restore = _with_backend_stub(_stub_resolve_backend({"codex": 0, "gemini": 1}))
+        saved_cfg = _cli.load_config
+        log = tempfile.mkdtemp()
+        os.environ["REVIEW_LOG_DIR"] = log
+        _cli.load_config = lambda: {
+            "models": ["codex", "gemini"],
+            "board": [
+                {"model": "codex", "role": "correctness", "name": "Codex"},
+                {"model": "gemini", "role": "contracts", "name": "Gemini"},
+            ],
+        }
+        try:
+            with redirect_stderr(io.StringIO()), _capture_stdout():
+                rc = _cli.main([
+                    "diff", *TASK_ARGS,
+                    "-C", d.name,
+                    "-m", "codex",
+                    "-m", "gemini",
+                ])
+            assert rc == 1, rc
+            r = store.records()[0]
+            assert r["models"] == ["codex", "gemini"], r
+            assert r["pool_size"] == 2, r
+            assert r["ok_count"] == 1 and r["fail_count"] == 1, r
+        finally:
+            restore()
+            _cli.load_config = saved_cfg
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            d.cleanup()
+
+
 def test_cli_records_failure_counts_per_call():
     with _TmpStore() as store:
         d = _git_init_with_diff()

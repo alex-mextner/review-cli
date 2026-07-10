@@ -29,7 +29,9 @@ import json
 import os
 import sys
 import tempfile
+import io
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -38,7 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import reviewlib.backends as backends  # noqa: E402
-from reviewlib.config import _expand_alias  # noqa: E402
+from reviewlib.config import BoardReviewer, split_pool_reserve, _expand_alias  # noqa: E402
 
 _KEY_ENV_NAMES = (
     "ZAI_API_KEY",
@@ -71,6 +73,7 @@ _KEY_ENV_NAMES = (
     "OC_AUTH_FILE",
     "OC_CONFIG_FILE",
     "FIREWORKS_API_KEY",
+    "FIREWORKS_BASE_URL",
     "REVIEW_UNPAID_PROVIDERS",
 )
 
@@ -88,6 +91,8 @@ class _EnvSandbox:
         # no key resolves unless a test sets one explicitly.
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
         backends.configure_unpaid_providers(None)
+        with backends._PAYMENT_PREFLIGHT_CACHE_LOCK:
+            backends._PAYMENT_PREFLIGHT_CACHE.clear()
         return self
 
     def __exit__(self, *exc):
@@ -97,6 +102,8 @@ class _EnvSandbox:
             else:
                 os.environ[name] = value
         backends.configure_unpaid_providers(self._saved_config_unpaid)
+        with backends._PAYMENT_PREFLIGHT_CACHE_LOCK:
+            backends._PAYMENT_PREFLIGHT_CACHE.clear()
         return False
 
 
@@ -124,6 +131,16 @@ def _fake_urlopen(captured: dict, payload: dict):
         return _FakeResp(payload)
 
     return _inner
+
+
+def _http_error(url: str, code: int, body: str) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(url, code, "preflight failed", {}, io.BytesIO(body.encode("utf-8")))
+
+
+def _allow_preflight(req, timeout=None):
+    if req.full_url.endswith("/models"):
+        return _FakeResp({"data": []})
+    raise AssertionError(f"unexpected provider dispatch in preflight stub: {req.full_url}")
 
 
 # === resolve_backend routing ====================================================
@@ -793,33 +810,495 @@ def test_backend_available_reflects_zai_key():
 
 
 def test_backend_available_reflects_commandcode_key():
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("backend_available made network"))
     with _EnvSandbox():
-        assert backends.backend_available("commandcode") is False
+        try:
+            assert backends.backend_available("commandcode") is False
+            os.environ["COMMANDCODE_API_KEY"] = "user_present"
+            assert backends.backend_available("commandcode") is True
+            assert backends.backend_available("commandcode:deepseek/deepseek-coder") is True
+            # The legacy model-name spelling routes to the same backend (key present).
+            assert backends.backend_available("common-code") is True
+        finally:
+            urllib.request.urlopen = old_open
+
+
+def test_commandcode_payment_preflight_skips_unpaid_provider_without_chat_post():
+    """A Command Code key can exist while the provider is unpaid/unavailable.
+
+    The cheap availability probe stays offline; the backend itself must check entitlement
+    before falling through to /chat/completions.
+    """
+    captured: list[tuple[str, str]] = []
+
+    def _preflight_only(req, timeout=None):
+        captured.append((req.get_method(), req.full_url))
+        if req.full_url.endswith("/models"):
+            raise _http_error(req.full_url, 402, "insufficient balance")
+        raise AssertionError(f"unexpected Command Code chat POST after failed preflight: {req.full_url}")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _preflight_only
+    with _EnvSandbox():
         os.environ["COMMANDCODE_API_KEY"] = "user_present"
-        assert backends.backend_available("commandcode") is True
-        assert backends.backend_available("commandcode:deepseek/deepseek-coder") is True
-        # The legacy model-name spelling routes to the same backend (key present).
-        assert backends.backend_available("common-code") is True
+        try:
+            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is True
+            res = backends.review_commandcode(
+                "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert captured == [
+        ("GET", "https://api.commandcode.ai/provider/v1/models"),
+    ], captured
+    assert res.returncode == 1, res
+    assert "preflight" in res.stderr and "skipping" in res.stderr, res.stderr
+
+
+def test_fireworks_payment_preflight_removes_seat_before_opencode_spawn():
+    """Fireworks stays selectable, but runtime preflight must skip before opencode spawn."""
+    captured: list[tuple[str, str]] = []
+
+    def _preflight_only(req, timeout=None):
+        captured.append((req.get_method(), req.full_url))
+        if req.full_url.endswith("/models"):
+            raise _http_error(req.full_url, 403, "account suspended")
+        raise AssertionError(f"unexpected Fireworks model dispatch after failed preflight: {req.full_url}")
+
+    old_open = urllib.request.urlopen
+    old_which = backends._which
+    old_ensure = backends._ensure_opencode_readonly_agent
+    urllib.request.urlopen = _preflight_only
+    backends._which = lambda name: f"/fake/bin/{name}"
+    backends._ensure_opencode_readonly_agent = (
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("opencode setup ran"))
+    )
+    with _EnvSandbox():
+        os.environ["FIREWORKS_API_KEY"] = "fw_present"
+        try:
+            assert backends.backend_available("oc:fireworks/accounts/fireworks/models/kimi") is True
+            res = backends.review_opencode(
+                "oc:fireworks/accounts/fireworks/models/kimi", "q", "", REPO_ROOT, 10
+            )
+        finally:
+            urllib.request.urlopen = old_open
+            backends._which = old_which
+            backends._ensure_opencode_readonly_agent = old_ensure
+    assert captured == [
+        ("GET", "https://api.fireworks.ai/inference/v1/models"),
+    ], captured
+    assert res.returncode == 1, res
+    assert "preflight" in res.stderr and "skipping" in res.stderr, res.stderr
+
+
+def test_opencode_missing_binary_does_not_run_payment_preflight():
+    def _network_should_not_run(_req, timeout=None):
+        raise AssertionError("payment preflight ran before opencode binary check")
+
+    def _no_opencode(name):
+        raise RuntimeError(f"{name} CLI not found")
+
+    old_open = urllib.request.urlopen
+    old_which = backends._which
+    urllib.request.urlopen = _network_should_not_run
+    backends._which = _no_opencode
+    with _EnvSandbox():
+        os.environ["FIREWORKS_API_KEY"] = "fw_present"
+        try:
+            raised = False
+            try:
+                backends.review_opencode(
+                    "oc:fireworks/accounts/fireworks/models/kimi", "q", "", REPO_ROOT, 10
+                )
+            except RuntimeError:
+                raised = True
+        finally:
+            urllib.request.urlopen = old_open
+            backends._which = old_which
+    assert raised
+
+
+def test_payment_preflight_ignores_transient_network_failures():
+    calls = {"transient": 0, "ok": 0}
+
+    def _transient(_req, timeout=None):
+        calls["transient"] += 1
+        raise urllib.error.URLError("temporary dns failure")
+
+    def _ok(_req, timeout=None):
+        calls["ok"] += 1
+        return _FakeResp({"data": []})
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _transient
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            assert backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            ) is None
+            urllib.request.urlopen = _ok
+            assert backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:moonshotai/Kimi-K2.7-Code"
+            ) is None
+        finally:
+            urllib.request.urlopen = old_open
+    assert calls == {"transient": 1, "ok": 1}, calls
+
+
+def test_payment_preflight_403_without_billing_marker_is_not_authoritative():
+    def _waf(_req, timeout=None):
+        raise _http_error("https://api.commandcode.ai/provider/v1/models", 403, "cloudflare challenge")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _waf
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            assert backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            ) is None
+        finally:
+            urllib.request.urlopen = old_open
+
+
+def test_payment_preflight_401_without_billing_marker_is_not_authoritative():
+    def _auth_scope(_req, timeout=None):
+        raise _http_error("https://api.commandcode.ai/provider/v1/models", 401, "model listing auth scope denied")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _auth_scope
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            assert backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            ) is None
+        finally:
+            urllib.request.urlopen = old_open
+
+
+def test_payment_preflight_generic_500_billing_text_is_not_authoritative():
+    def _generic_500(_req, timeout=None):
+        raise _http_error("https://api.commandcode.ai/provider/v1/models", 500, "billing service disabled")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _generic_500
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            assert backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            ) is None
+        finally:
+            urllib.request.urlopen = old_open
+
+
+def test_payment_preflight_specific_billing_marker_denies_http_402():
+    def _unpaid(_req, timeout=None):
+        raise _http_error("https://api.commandcode.ai/provider/v1/models", 402, "insufficient credits")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _unpaid
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            reason = backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert reason is not None and "preflight" in reason, reason
+
+
+def test_payment_preflight_billing_marker_on_auth_status_denies():
+    def _auth_with_marker(_req, timeout=None):
+        raise _http_error("https://api.commandcode.ai/provider/v1/models", 401, "payment required for model list scope")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _auth_with_marker
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            reason = backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert reason is not None and "HTTP 401" in reason, reason
+
+
+def test_payment_preflight_http_402_denies_even_with_empty_body():
+    def _empty_payment_required(_req, timeout=None):
+        raise _http_error("https://api.commandcode.ai/provider/v1/models", 402, "")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _empty_payment_required
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            reason = backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert reason is not None and "HTTP 402" in reason, reason
+
+
+def test_payment_preflight_success_is_cached_for_dispatch():
+    calls = {"n": 0}
+
+    def _ok(req, timeout=None):
+        calls["n"] += 1
+        return _FakeResp({"data": []})
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _ok
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is True
+            assert backends.provider_preflight_result(
+                "commandcode:deepseek/deepseek-v4-pro", backend="commandcode", command="commandcode API x"
+            ) is None
+            assert backends.provider_preflight_result(
+                "commandcode:moonshotai/Kimi-K2.7-Code", backend="commandcode", command="commandcode API y"
+            ) is None
+        finally:
+            urllib.request.urlopen = old_open
+    assert calls["n"] == 1, calls
+
+
+def test_visual_opencode_availability_does_not_use_payment_preflight():
+    from reviewlib.features.visual import vision_client
+
+    old_open = urllib.request.urlopen
+    old_which = vision_client.shutil.which
+    urllib.request.urlopen = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("vision availability made network"))
+    vision_client.shutil.which = lambda name: f"/fake/bin/{name}"
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(
+                tmpdir,
+                {"fireworks": {"options": {"apiKey": "fw_present"}}},
+            )
+            try:
+                assert vision_client.vision_backend_available(
+                    "oc:fireworks/accounts/fireworks/models/gpt-4o"
+                ) is True
+            finally:
+                urllib.request.urlopen = old_open
+                vision_client.shutil.which = old_which
+
+
+def test_visual_opencode_call_returns_preflight_unavailable_without_spawn():
+    from reviewlib.features.visual import vision_client
+
+    def _unpaid(req, timeout=None):
+        raise _http_error(req.full_url, 402, "insufficient balance")
+
+    old_open = urllib.request.urlopen
+    old_which = vision_client.shutil.which
+    urllib.request.urlopen = _unpaid
+    vision_client.shutil.which = lambda name: f"/fake/bin/{name}"
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(
+                tmpdir,
+                {"fireworks": {"options": {"apiKey": "fw_present"}}},
+            )
+            try:
+                verdict = vision_client.call_ai_vision(
+                    "oc:fireworks/accounts/fireworks/models/gpt-4o",
+                    blocks=[],
+                )
+            finally:
+                urllib.request.urlopen = old_open
+                vision_client.shutil.which = old_which
+    assert verdict.available is False, verdict
+    assert verdict.error and "preflight" in verdict.error, verdict.error
+
+
+def test_payment_preflight_uses_opencode_config_base_url_with_config_key():
+    captured: dict = {}
+
+    def _capture(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["auth"] = req.headers.get("Authorization")
+        return _FakeResp({"data": []})
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _capture
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(
+                tmpdir,
+                {
+                    "fireworks": {
+                        "options": {
+                            "baseURL": "https://proxy.example.test/fireworks/v1",
+                            "apiKey": "fw_config_key",
+                        }
+                    }
+                },
+            )
+            try:
+                assert backends._provider_payment_preflight_unavailable_reason(
+                    "oc:fireworks/accounts/fireworks/models/gpt-4o"
+                ) is None
+            finally:
+                urllib.request.urlopen = old_open
+    assert captured["url"] == "https://proxy.example.test/fireworks/v1/models", captured
+    assert captured["auth"] == "Bearer fw_config_key", captured
+
+
+def test_payment_preflight_uses_opencode_config_base_url_with_auth_key():
+    captured: dict = {}
+
+    def _capture(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["auth"] = req.headers.get("Authorization")
+        return _FakeResp({"data": []})
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _capture
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {"fireworks": {"key": "fw_auth_key"}})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(
+                tmpdir,
+                {
+                    "fireworks": {
+                        "options": {
+                            "baseURL": "https://proxy.example.test/fireworks/v1",
+                        }
+                    }
+                },
+            )
+            try:
+                assert backends._provider_payment_preflight_unavailable_reason(
+                    "oc:fireworks/accounts/fireworks/models/gpt-4o"
+                ) is None
+            finally:
+                urllib.request.urlopen = old_open
+    assert captured["url"] == "https://proxy.example.test/fireworks/v1/models", captured
+    assert captured["auth"] == "Bearer fw_auth_key", captured
+
+
+def test_payment_preflight_uses_opencode_config_base_url_with_env_key():
+    captured: dict = {}
+
+    def _capture(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["auth"] = req.headers.get("Authorization")
+        return _FakeResp({"data": []})
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _capture
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["FIREWORKS_API_KEY"] = "fw_env_key"
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(
+                tmpdir,
+                {
+                    "fireworks": {
+                        "options": {
+                            "baseURL": "https://proxy.example.test/fireworks/v1",
+                        }
+                    }
+                },
+            )
+            try:
+                assert backends._provider_payment_preflight_unavailable_reason(
+                    "oc:fireworks/accounts/fireworks/models/gpt-4o"
+                ) is None
+            finally:
+                urllib.request.urlopen = old_open
+    assert captured["url"] == "https://proxy.example.test/fireworks/v1/models", captured
+    assert captured["auth"] == "Bearer fw_env_key", captured
+
+
+def test_payment_preflight_denial_is_cached_for_provider_key_url():
+    calls = {"n": 0}
+
+    def _unpaid(req, timeout=None):
+        calls["n"] += 1
+        raise _http_error(req.full_url, 402, "insufficient credits")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _unpaid
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            first = backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            )
+            second = backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:moonshotai/Kimi-K2.7-Code"
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert first and "deepseek" in first, first
+    assert second and "Kimi" in second, second
+    assert calls["n"] == 1, calls
+
+
+def test_preflight_failed_provider_does_not_make_startup_split_do_network():
+    """Startup failover is a cheap offline check; runtime dispatch owns payment preflight."""
+    def _no_network(req, timeout=None):
+        raise AssertionError(f"startup availability made network: {req.full_url}")
+
+    old_open = urllib.request.urlopen
+    old_which = backends._which
+    urllib.request.urlopen = _no_network
+    backends._which = lambda name: f"/fake/bin/{name}"
+    with _EnvSandbox():
+        os.environ["FIREWORKS_API_KEY"] = "fw_present"
+        try:
+            board = [
+                BoardReviewer("oc:fireworks/accounts/fireworks/models/kimi", "tests", "Fireworks"),
+                BoardReviewer("codex", "correctness", "Codex"),
+            ]
+            pool, reserve = split_pool_reserve(
+                board, 1, lambda reviewer: backends.backend_available(reviewer.model)
+            )
+        finally:
+            urllib.request.urlopen = old_open
+            backends._which = old_which
+    assert [seat.model for seat in pool] == ["oc:fireworks/accounts/fireworks/models/kimi"], pool
+    assert [seat.model for seat in reserve] == ["codex"], reserve
 
 
 def test_backend_available_skips_unpaid_provider_before_key_or_cli_checks():
     """A provider marked unpaid/disabled is skipped immediately for direct and oc seats."""
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _allow_preflight
     with _EnvSandbox():
-        os.environ["COMMANDCODE_API_KEY"] = "user_present"
-        assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is True
-        os.environ["REVIEW_UNPAID_PROVIDERS"] = " commandcode, fireworks "
-        assert backends.backend_available("commandcode") is False
-        assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is False
-        # These return False without needing opencode on PATH because the entitlement
-        # denylist is checked before the backend's CLI/auth probe.
-        assert backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro") is False
-        assert backends.backend_available("oc:fireworks/accounts/fireworks/models/fable-5") is False
+        try:
+            os.environ["COMMANDCODE_API_KEY"] = "user_present"
+            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is True
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = " commandcode, fireworks "
+            assert backends.backend_available("commandcode") is False
+            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is False
+            # These return False without needing opencode on PATH because the entitlement
+            # denylist is checked before the backend's CLI/auth probe.
+            assert backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro") is False
+            assert backends.backend_available("oc:fireworks/accounts/fireworks/models/fable-5") is False
+        finally:
+            urllib.request.urlopen = old_open
 
 
 def test_unpaid_oc_provider_skip_wins_even_when_opencode_auth_exists():
     """Pin the unpaid branch for `oc:` seats, not merely a missing-opencode false result."""
     old_which = backends._which
+    old_open = urllib.request.urlopen
     backends._which = lambda name: "/fake/bin/opencode" if name == "opencode" else old_which(name)
+    urllib.request.urlopen = _allow_preflight
     try:
         with _EnvSandbox():
             with tempfile.TemporaryDirectory() as tmp:
@@ -831,6 +1310,7 @@ def test_unpaid_oc_provider_skip_wins_even_when_opencode_auth_exists():
                 assert backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro") is False
     finally:
         backends._which = old_which
+        urllib.request.urlopen = old_open
 
 
 def test_oc_zai_requires_opencode_auth_not_zai_rest_key():
@@ -1081,16 +1561,21 @@ def test_backend_available_false_for_forced_api_only_cli_mode():
     """Codex P2: with REVIEW_COMMANDCODE_MODE=cli (an unrunnable forced mode), the
     availability probe must report False so the moderator/brainstorm filter never
     selects a backend that can only return a dead-backend result — even with a key."""
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _allow_preflight
     with _EnvSandbox():
-        os.environ["COMMANDCODE_API_KEY"] = "user_present"
-        assert backends.backend_available("commandcode") is True
-        os.environ["REVIEW_COMMANDCODE_MODE"] = "cli"
-        assert backends.backend_available("commandcode") is False
-        # z.ai is api-only too: a forced cli mode makes it unavailable.
-        os.environ["ZAI_API_KEY"] = "k"
-        assert backends.backend_available("zai") is True
-        os.environ["REVIEW_ZAI_MODE"] = "cli"
-        assert backends.backend_available("zai") is False
+        try:
+            os.environ["COMMANDCODE_API_KEY"] = "user_present"
+            assert backends.backend_available("commandcode") is True
+            os.environ["REVIEW_COMMANDCODE_MODE"] = "cli"
+            assert backends.backend_available("commandcode") is False
+            # z.ai is api-only too: a forced cli mode makes it unavailable.
+            os.environ["ZAI_API_KEY"] = "k"
+            assert backends.backend_available("zai") is True
+            os.environ["REVIEW_ZAI_MODE"] = "cli"
+            assert backends.backend_available("zai") is False
+        finally:
+            urllib.request.urlopen = old_open
 
 
 def test_zai_key_missing_raises():

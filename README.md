@@ -947,7 +947,7 @@ GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
 --pool N            How many of the board's seats to run (default 4); the first N seats run,
                     the rest are kept in reserve. The board is never off — --pool only sizes
-                    it. N<=0 (e.g. --pool 0) runs all seats.
+                    it. N<=0 (e.g. --pool 0) runs all seats. Ignored for explicit -m.
 
 SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
 --diff / --staged   Diff source: working-tree (--diff) or staged (--staged). On the diff
@@ -1120,25 +1120,29 @@ review diff --pool 0       # run all available seats (future-proof as the board 
 review diff --pool 2       # run the top 2 available seats (with failover)
 review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
 review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
-review diff -m codex -m gemini   # an explicit -m bypasses the board entirely (exact models)
+review diff -m codex -m gemini   # exact requested models; narrows config board metadata if present
 ```
 
 ### Board vs. models precedence
 
-The diff-review board is always the failover mechanism unless you pass exact CLI models.
+The diff-review board is always the failover mechanism unless you pass exact CLI models
+without any configured `models:`/`board:` metadata.
 Precedence:
 
 ```
-explicit -m exact panel   >   `models:` priority roster   >   configured/default board
+explicit -m requested models   >   `models:` priority roster   >   configured/default board
 ```
 
 - A `models:` list in `config.yaml` is the **full priority roster** for `review diff`:
   the first available models fill the live pool, and lower-priority models are reserve
   backfill. It does not disable board/failover.
-- Only explicit `-m` on the CLI is the exact flat override. The board can otherwise
+- Explicit `-m` on the CLI never lets config add extra seats. With no configured
+  `models:`/`board:` it is the legacy flat exact panel; with config present it narrows
+  the configured board metadata to only the requested models. The board can otherwise
   never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
   pool (default 4; `--pool 0` runs all available seats; `--pool 9` currently covers the
-  built-in board but is not future-proof).
+  built-in board but is not future-proof). `--pool` does not reduce an explicit `-m` list:
+  every requested `-m` seat is attempted.
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
   roster — the configured/default board applies.
 
@@ -1221,7 +1225,9 @@ set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY`
 keyed-HTTP backends directly — `-m cc`, `-m glm`, or an explicit `commandcode:`/`zai:` seat
 in a `config.yaml` `board:` list. These keys are NOT consulted for the agentic `oc:` board
 seats above (opencode carries its own auth). No key is ever written to disk by review — it
-is only read. For z.ai the default base URL is the **GLM Coding-Plan endpoint**
+is only read. Command Code and Fireworks run a cheap `/models` payment/entitlement
+preflight when a key is present; explicit unpaid/auth-disabled responses are skipped before
+chat dispatch or opencode launch. For z.ai the default base URL is the **GLM Coding-Plan endpoint**
 `https://api.z.ai/api/coding/paas/v4` — only that endpoint serves the flagship `glm-5.2`;
 the standard `https://api.z.ai/api/paas/v4` endpoint tops out at `glm-5.1`. A Coding-Plan
 key gets `glm-5.2` out of the box; a standard-plan user overrides with

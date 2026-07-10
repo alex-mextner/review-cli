@@ -43,6 +43,7 @@ def mode_review(
     outcome_sink: list[FailoverOutcome] | None = None,
     diff_from_stdin: bool = False,
     visual_images: tuple[Path, ...] = (),
+    exact_board: bool = False,
 ) -> int:
     if not diff.strip():
         print("No diff to review.", file=sys.stderr)
@@ -51,7 +52,7 @@ def mode_review(
     if board:
         return _mode_review_board(
             board, prompt, diff, cwd, timeout, staged, pool_size, outcome_sink,
-            diff_from_stdin, visual_images,
+            diff_from_stdin, visual_images, exact_board,
         )
 
     # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets in-seat
@@ -117,6 +118,7 @@ def _mode_review_board(
     board: list[BoardReviewer], prompt: str, diff: str, cwd: Path, timeout: int,
     staged: bool, pool_size: int, outcome_sink: list[FailoverOutcome] | None,
     diff_from_stdin: bool = False, visual_images: tuple[Path, ...] = (),
+    exact_board: bool = False,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -137,7 +139,10 @@ def _mode_review_board(
     pool). Only a genuine shortfall (reserve exhausted before the pool refilled) is a
     failure. `outcome_sink`, when given, receives the FailoverOutcome so the CLI can
     report the models that actually ran."""
-    pool, reserve = split_pool_reserve(board, pool_size, lambda r: backend_available(r.model))
+    if exact_board:
+        pool, reserve = list(board), []
+    else:
+        pool, reserve = split_pool_reserve(board, pool_size, lambda r: backend_available(r.model))
     if not pool:
         print("[review-cli] board: no reviewers are available — configure at least one "
               "backend key/CLI (e.g. COMMANDCODE_API_KEY, GEMINI_API_KEY, codex/claude on "
@@ -186,9 +191,10 @@ def _handler(ctx: ModeContext) -> int:
     passes them through `ctx.extra` (only the failover-board path needs them).
 
     The board path passes `board` + `pool_size` + `outcome_sink`; the flat path
-    (explicit -m / configured models) passes board=None and NOTHING else — the call
-    shape there is identical to the pre-redesign default review (a board=None call with
-    no pool_size/outcome_sink), so consumers/stubs of the flat path stay compatible."""
+    (explicit -m with no configured board/models) passes board=None and NOTHING else —
+    the call shape there is identical to the pre-redesign default review (a board=None
+    call with no pool_size/outcome_sink), so consumers/stubs of the flat path stay
+    compatible."""
     board = ctx.extra.get("board")
     # A diff piped on stdin (vs read from `git diff --cached`) must not satisfy the staged
     # commit gate even under --staged — see _stamp_if_staged_commit_review.
@@ -208,6 +214,7 @@ def _handler(ctx: ModeContext) -> int:
         outcome_sink=ctx.extra.get("outcome_sink"),
         diff_from_stdin=diff_from_stdin,
         visual_images=_visual_images(ctx),
+        exact_board=bool(ctx.extra.get("exact_board", False)),
     )
 
 
