@@ -5,6 +5,8 @@ semantic versioning.
 
 ## Unreleased
 
+- **Gemini review/vision seat now defaults to the current GA model `gemini-3.5-flash` (review-cli#139).** The old `gemini-2.5-flash` default was 404ing the pool's gemini seat (it is retired-soon; Google names `gemini-3.5-flash` as its GA replacement with no shutdown date), so a dead seat could silently count toward the self-merge review-quorum's distinct-model bar. Both the text backend (`review_gemini`) and the vision fallback default to `gemini-3.5-flash`; an explicit `$GEMINI_MODEL` or a `gemini:<model>` seat suffix still overrides it. The quorum-count half (a failed/404/degraded seat must not count as a substantive reviewer) is handled by review-cli#138.
+
 - **Model override and unpaid-provider handling are now explicit (review-cli#128).**
   `-m/--model` is honored even when passed before a mode verb (`review -m fable5 diff ...`)
   and remains an exact flat-panel override over config `models:` / `board:`. Providers whose

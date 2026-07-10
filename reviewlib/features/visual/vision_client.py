@@ -870,7 +870,7 @@ def _call_gemini(model: str, body: dict, timeout_s: int) -> VisionVerdict:
     # model; bare `gemini` → $GEMINI_MODEL else the default, so the visual path doesn't
     # silently use a different model than the configured one.
     _suffix = model.split(":", 1)[1].strip() if ":" in model else ""
-    gemini_model = _suffix or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_model = _suffix or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
