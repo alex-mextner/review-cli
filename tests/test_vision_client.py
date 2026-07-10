@@ -60,6 +60,7 @@ def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write
     old function so the caller can restore it."""
     import shutil
 
+    import reviewlib.backends as backends
     import reviewlib.process as process
 
     def fake(
@@ -102,23 +103,41 @@ def _patch_runner(capture: dict, *, stdout: str = "", returncode: int = 0, write
     old = process._run_streamed
     old_which = shutil.which
     old_fireworks_key = os.environ.get("FIREWORKS_API_KEY")
+    old_preflight = backends._provider_payment_preflight_unavailable_reason
     process._run_streamed = fake
     shutil.which = lambda name: f"/fake/bin/{name}" if name in ("codex", "claude", "opencode") else old_which(name)
+    backends._provider_payment_preflight_unavailable_reason = lambda _model: None
     os.environ["FIREWORKS_API_KEY"] = "test-fireworks-key"
-    return old, old_which, old_fireworks_key
+    return old, old_which, old_fireworks_key, old_preflight
 
 
 def _restore_runner(old):
     import shutil
 
+    import reviewlib.backends as backends
     import reviewlib.process as process
 
     process._run_streamed = old[0]
     shutil.which = old[1]
+    backends._provider_payment_preflight_unavailable_reason = old[3]
     if old[2] is None:
         os.environ.pop("FIREWORKS_API_KEY", None)
     else:
         os.environ["FIREWORKS_API_KEY"] = old[2]
+
+
+def _patch_preflight_allow():
+    import reviewlib.backends as backends
+
+    old = backends._provider_payment_preflight_unavailable_reason
+    backends._provider_payment_preflight_unavailable_reason = lambda _model: None
+    return old
+
+
+def _restore_preflight(old) -> None:
+    import reviewlib.backends as backends
+
+    backends._provider_payment_preflight_unavailable_reason = old
 
 
 def _staged_image_bytes(cap: dict, flag: str) -> bytes | None:
@@ -389,6 +408,7 @@ def test_text_opencode_model_not_selected_for_vision():
 
     old_which = shutil.which
     old_key = os.environ.get("FIREWORKS_API_KEY")
+    old_preflight = _patch_preflight_allow()
     shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
     os.environ["FIREWORKS_API_KEY"] = "test-fireworks-key"
     vc.vision_backend_available = old  # use the real function under test
@@ -400,6 +420,7 @@ def test_text_opencode_model_not_selected_for_vision():
         assert vc.vision_backend_available("oc:fireworks/qwen2-vl") is True
     finally:
         shutil.which = old_which
+        _restore_preflight(old_preflight)
         if old_key is None:
             os.environ.pop("FIREWORKS_API_KEY", None)
         else:
@@ -415,12 +436,14 @@ def test_opencode_vision_allowlist_env_override():
     shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else old_which(name)
     old_env = os.environ.get("REVIEW_OPENCODE_VISION_MODELS")
     old_key = os.environ.get("FIREWORKS_API_KEY")
+    old_preflight = _patch_preflight_allow()
     os.environ["REVIEW_OPENCODE_VISION_MODELS"] = "kimi-k2p6-turbo"
     os.environ["FIREWORKS_API_KEY"] = "test-fireworks-key"
     try:
         assert vc.vision_backend_available("oc:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo") is True
     finally:
         shutil.which = old_which
+        _restore_preflight(old_preflight)
         if old_env is None:
             os.environ.pop("REVIEW_OPENCODE_VISION_MODELS", None)
         else:
@@ -536,6 +559,38 @@ def test_unpaid_opencode_vision_call_does_not_spawn_runner():
             os.environ["REVIEW_UNPAID_PROVIDERS"] = old_env
     assert v.available is False and v.verdict is None
     assert "unpaid/disabled" in (v.error or "")
+
+
+def test_opencode_vision_missing_binary_does_not_run_payment_preflight():
+    """Local opencode prerequisites must fail before any provider `/models` preflight."""
+    import shutil
+    import urllib.request
+
+    old_key = os.environ.get("FIREWORKS_API_KEY")
+    old_which = shutil.which
+    old_open = urllib.request.urlopen
+
+    def _no_opencode(name):
+        if name == "opencode":
+            return None
+        return old_which(name)
+
+    def _network_should_not_run(*_args, **_kwargs):
+        raise AssertionError("visual payment preflight ran before opencode binary check")
+
+    shutil.which = _no_opencode
+    urllib.request.urlopen = _network_should_not_run
+    os.environ["FIREWORKS_API_KEY"] = "fw_present"
+    try:
+        v = vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks())
+    finally:
+        shutil.which = old_which
+        urllib.request.urlopen = old_open
+        if old_key is None:
+            os.environ.pop("FIREWORKS_API_KEY", None)
+        else:
+            os.environ["FIREWORKS_API_KEY"] = old_key
+    assert v.available is False and "opencode CLI not found" in (v.error or "")
 
 
 def test_unpaid_visual_cli_call_does_not_spawn_runner():

@@ -87,7 +87,7 @@ def _run_capturing(handler_owner, handler_name, dispatch_argv, *, cwd_repo, leak
 
     setattr(handler_owner, handler_name, _fake)
     cli._read_stdin_if_piped = lambda: None
-    cli.load_config = lambda: {"models": ["codex"]}  # explicit models -> no real board
+    cli.load_config = lambda: {"models": ["codex"]}  # deterministic one-seat config board
     os.chdir(str(cwd_repo))
     # The leak: point git at repoA via the env, exactly as a git hook / stale export would.
     os.environ["GIT_DIR"] = str(Path(leak_repo) / ".git")

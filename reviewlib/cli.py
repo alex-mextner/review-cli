@@ -1949,7 +1949,7 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
         help=(
             f"how many of the board's seats to run (default {DEFAULT_POOL_SIZE}); the "
             "first N seats participate, the rest are kept in reserve. The board is "
-            "never off — --pool only sizes it. N<=0 means all seats."
+            "never off — --pool only sizes it. N<=0 means all seats. Ignored for explicit -m."
         ),
     )
     # NOTE: `--retry` is NOT global — it only applies to the diff REVIEW path (the failover
@@ -2124,9 +2124,12 @@ CONFIG FILE
   Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
   `glm` -> zai:glm-5.2, `cc` -> commandcode).
 
-SELECTION CASCADE (what runs when you do NOT pass -m), by mode:
-  review diff           : explicit -m exact panel  >  config `models:` priority roster  >
+SELECTION CASCADE, by mode:
+  review diff           : explicit -m requested models  >  config `models:` priority roster  >
                           config/default reviewer BOARD.
+                          With configured `models:`/`board:` metadata, -m narrows that
+                          board metadata to only the requested models; without config it is
+                          the legacy flat exact panel.
   review visual         : explicit -m  >  `visual_models:`  >  visual defaults.
   review brainstorm     : explicit -m  >  `brainstorm_models:`  >  `models:`  >  defaults.
   review just-ask/quorum: explicit -m  >  `models:`  >  the built-in defaults.
@@ -2142,9 +2145,10 @@ REVIEWER BOARD (the diff-review default; `review --show-board` prints it live)
   A priority-ordered panel of seats, each model carrying its own
   role/lens. A plain `review diff` runs a POOL of {DEFAULT_POOL_SIZE} (top-N AVAILABLE by
   priority) with startup + mid-run failover from the reserve. `--pool N` sizes it
-  (`--pool 0` = all available). The board is bypassed only by explicit -m. To set the
-  priority roster, configure `models:`. To add role/name metadata (or a full board when
-  `models:` is absent), set `board:` in config.yaml (a list of {{model, role, name}}
+  (`--pool 0` = all available). Explicit -m never lets config add extra seats; it narrows
+  configured metadata when present, else uses the flat exact panel. To set the priority
+  roster, configure `models:`. To add role/name metadata (or a full board when `models:`
+  is absent), set `board:` in config.yaml (a list of {{model, role, name}}
   entries; `name` is the display label, `role` is a key into the built-in role lenses) or
   edit DEFAULT_BOARD in reviewlib/config.py.
 
@@ -2632,18 +2636,22 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # Reviewer board (HYP-741): the diff-review panel assigns each model its own
     # role/lens and keeps a reserve. Precedence:
     #   explicit -m  >  config `models:` priority roster  >  config/default board.
-    # Only explicit -m is an exact flat override. A configured `models:` list is the full
-    # priority-ordered roster from which the active pool + reserve are selected; optional
-    # `board:` entries can still provide role/name metadata for those models. The board is
-    # NEVER disabled — `--pool N` only sizes how many of its seats run (default 4; the rest
-    # are reserve). `use_board` is a cheap boolean gate computed now; the actual board
-    # resolution + cost-safety validation (and the --pool slice) runs LATER
+    # With no configured board/models, explicit -m keeps the legacy flat panel. When a
+    # config board/models roster exists, explicit -m NARROWS that configured board to the
+    # requested models only, preserving matching role/name metadata but never adding extra
+    # configured seats. A configured `models:` list is the full priority-ordered roster from
+    # which the active pool + reserve are selected; optional `board:` entries can still
+    # provide role/name metadata for those models. The board is NEVER disabled — `--pool N`
+    # only sizes how many of its seats run (default 4; the rest are reserve). `use_board` is
+    # a cheap boolean gate computed now; the actual board resolution + cost-safety validation
+    # (and the --pool slice) runs LATER
     # (validate_board, below) — after the standalone-visual path has had its chance to
     # short-circuit, so a malformed `board:` never blocks the board-unrelated standalone
     # `review visual` pipeline (codex P2). It still fires
     # BEFORE the COMPANION visual fan-out, so a doomed config never spends a paid vision
     # call.
-    use_board = not panel_mode and not explicit_models
+    config_has_board = isinstance(config.get("board"), list) and bool(config.get("board"))
+    use_board = not panel_mode and (not explicit_models or bool(config_models) or config_has_board)
     board: list | None = None
     board_validated = False
 
@@ -2654,13 +2662,25 @@ def _dispatch(argv: list[str] | None = None) -> int:
         `args.pool` AVAILABLE seats by priority — and keeps the rest as the reserve that
         backfills a seat which fails mid-run. Returns an exit code (2) on an all-malformed
         `board:` config, else None. No-op when the board does not apply (panel mode or
-        explicit -m)."""
+        explicit -m with no configured board/models)."""
         nonlocal board, board_validated
         if board_validated or not use_board:
             return None
         board_validated = True
         try:
-            board = board_from_models(config_models, config) if config_models else load_board(config)
+            if explicit_models:
+                try:
+                    board = board_from_models(explicit_models, config)
+                except BoardConfigError as exc:
+                    print(
+                        f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
+                        file=sys.stderr, flush=True,
+                    )
+                    board = board_from_models(explicit_models, {})
+            elif config_models:
+                board = board_from_models(config_models, config)
+            else:
+                board = load_board(config)
         except BoardConfigError as exc:
             print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
             return 2
@@ -2920,18 +2940,29 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if rc is not None:
         return rc
     if board:
+        review_pool_size = len(board) if explicit_models else args.pool
         # Failover pool. The PLANNED pool keys the up-front ETA: the top `--pool`
         # AVAILABLE seats by priority (startup failover — the same selection mode_review
         # makes). The RECORDED models come from the failover outcome (the seats that
         # actually produced verdicts, after any mid-run backfill), via outcome_sink.
-        planned_pool, _ = split_pool_reserve(
-            board, args.pool, lambda r: backends.backend_available(r.model),
-        )
+        if explicit_models:
+            planned_pool = list(board)
+        else:
+            planned_pool, _ = split_pool_reserve(
+                board, review_pool_size, lambda r: backends.backend_available(r.model),
+            )
         eta_models = [r.model for r in planned_pool]
         outcome_sink: list = []
-        ctx.extra.update(board=board, pool_size=args.pool, outcome_sink=outcome_sink)
+        ctx.extra.update(
+            board=board,
+            pool_size=review_pool_size,
+            outcome_sink=outcome_sink,
+            exact_board=bool(explicit_models),
+        )
 
         def _ran_models() -> list[str]:
+            if explicit_models:
+                return [r.model for r in board]
             # The BARE model ids that produced verdicts (a backfilled reserve under its
             # real id), so the stat record keys on what actually ran — not labels.
             return outcome_sink[0].usable_models if outcome_sink else []

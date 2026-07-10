@@ -76,7 +76,7 @@ Everything is a subcommand: the diff review is `review diff` (NOT a bare `review
 review diff --task CODE -C <repo>                  # review current unstaged diff across the failover pool (top 4 available)
 review diff --task CODE -C <repo> --staged         # review the staged diff (pre-commit)
 review diff --task CODE -C <repo> --pool 0         # run all available board seats (currently 9); default pool is 4
-review diff --task CODE -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); bypasses the board
+review diff --task CODE -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); narrows config board metadata if present
 review just-ask "Q" --task CODE -C <repo>          # multi-model answer to a question (no diff needed)
 review quorum "Q" --task CODE -C <repo>            # experts answer + a moderator finds consensus/disagreement
 review brainstorm "TOPIC" --task CODE -C <repo>    # iterative persona ideation in a loop, with a moderator
@@ -126,12 +126,15 @@ failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "over
 501 / refusal) is never retried and falls straight to the reserve. `--retry N` (or
 `$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
 `--pool N` sizes the pool (top-N available, same failover); `--pool 0` runs all available.
-The board is **never disabled** — there is **no `--no-board` flag**. An explicit
-`-m` bypasses the board and runs exactly those models. A `models:` list in config.yaml is
-the priority roster for the failover board: the pool is selected from that ordered set and
-the rest are reserve. If a provider is authenticated but not currently paid/entitled, list it
-in config.yaml `unpaid_providers:` or set `REVIEW_UNPAID_PROVIDERS=commandcode,fireworks`;
-all direct and `oc:` seats under that provider are skipped before any backend process/API call.
+The board is **never disabled** — there is **no `--no-board` flag**. An explicit `-m`
+always limits the run to exactly those models; with no configured `models:`/`board:` it is
+the legacy flat panel, and with config present it narrows the configured board metadata to
+those requested models. A `models:` list in config.yaml is the priority roster for the
+failover board: the pool is selected from that ordered set and the rest are reserve. Command
+Code and Fireworks run a cheap payment/entitlement preflight when a key is present; a
+provider that is authenticated but not paid/entitled is skipped before any backend
+process/API call. You can also list disabled providers in config.yaml `unpaid_providers:`
+or set `REVIEW_UNPAID_PROVIDERS=commandcode,fireworks`.
 `review --show-board` lists the seats in priority order with their pool/reserve/unavail
 tier and availability.
 

@@ -72,7 +72,7 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
     _quorum_mod.mode_quorum = _mk("quorum")
     cli._git_diff = lambda cwd, staged: diff
     cli._is_git_repo = lambda cwd: True
-    cli.load_config = lambda: {"models": ["codex"]}  # explicit models -> no real board
+    cli.load_config = lambda: {"models": ["codex"]}  # deterministic one-seat config board
     cli._read_stdin_if_piped = lambda: stdin
     old_env = os.environ.get("GEMINI_ENV_FILE")
     old_task = os.environ.get("REVIEW_TASK_CODE")
