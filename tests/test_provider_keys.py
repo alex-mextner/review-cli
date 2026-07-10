@@ -1511,7 +1511,7 @@ def test_unpaid_provider_logs_use_model_specific_headers():
             backends.review_commandcode("commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10)
             backends.review_openrouter("openrouter:anthropic/claude-3.5-sonnet", "q", "", REPO_ROOT, 10)
             backends.review_claude("claude:claude-fable-5", "q", "", REPO_ROOT, 10)
-            backends.review_gemini("gemini:gemini-2.5-flash", "q", "", REPO_ROOT, 10)
+            backends.review_gemini("gemini:gemini-3.5-flash", "q", "", REPO_ROOT, 10)
         finally:
             backends._emit_rest_log = old_emit
     assert emitted == [
@@ -1519,8 +1519,62 @@ def test_unpaid_provider_logs_use_model_specific_headers():
         ("commandcode", "commandcode API deepseek/deepseek-v4-pro"),
         ("openrouter", "openrouter API anthropic/claude-3.5-sonnet"),
         ("claude", "Anthropic API claude-fable-5"),
-        ("gemini", "Gemini API gemini-2.5-flash"),
+        ("gemini", "Gemini API gemini-3.5-flash"),
     ]
+
+
+def test_gemini_bare_seat_resolves_to_current_default_model():
+    """The bare `gemini` seat must POST to a CURRENT, non-retired model.
+
+    `gemini-2.5-flash` (the old default) shuts down 2026-10-16 and was already
+    404ing the review pool's gemini seat (issue #139); `gemini-3.5-flash` is the
+    GA successor Google names as its replacement (no shutdown date). This guards
+    the default so a stale id can't silently 404 every gemini review again -- a
+    dead seat that would inflate the self-merge quorum's distinct-model count.
+    """
+    captured: dict = {}
+    payload = {"candidates": [{"content": {"parts": [{"text": "looks good"}]}}], "usageMetadata": {}}
+    old_open = urllib.request.urlopen
+    old_key = backends._gemini_key
+    old_model = os.environ.pop("GEMINI_MODEL", None)
+    backends._gemini_key = lambda: "fake-key"
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    try:
+        with _EnvSandbox():
+            result = backends.review_gemini("gemini", "q", "", REPO_ROOT, 10)
+    finally:
+        urllib.request.urlopen = old_open
+        backends._gemini_key = old_key
+        if old_model is not None:
+            os.environ["GEMINI_MODEL"] = old_model
+    assert "models/gemini-3.5-flash:generateContent" in captured["url"], captured.get("url")
+    assert result.command == "Gemini API gemini-3.5-flash", result.command
+    assert result.returncode == 0, result.stderr
+
+
+def test_gemini_model_env_override_still_honored():
+    """An explicit $GEMINI_MODEL must still win over the default -- the fix only
+    moves the FALLBACK, it must not hardcode the model."""
+    captured: dict = {}
+    payload = {"candidates": [{"content": {"parts": [{"text": "ok"}]}}], "usageMetadata": {}}
+    old_open = urllib.request.urlopen
+    old_key = backends._gemini_key
+    old_model = os.environ.get("GEMINI_MODEL")
+    backends._gemini_key = lambda: "fake-key"
+    urllib.request.urlopen = _fake_urlopen(captured, payload)
+    try:
+        with _EnvSandbox():
+            os.environ["GEMINI_MODEL"] = "gemini-3.1-flash-lite"
+            result = backends.review_gemini("gemini", "q", "", REPO_ROOT, 10)
+    finally:
+        urllib.request.urlopen = old_open
+        backends._gemini_key = old_key
+        if old_model is None:
+            os.environ.pop("GEMINI_MODEL", None)
+        else:
+            os.environ["GEMINI_MODEL"] = old_model
+    assert "models/gemini-3.1-flash-lite:generateContent" in captured["url"], captured.get("url")
+    assert result.command == "Gemini API gemini-3.1-flash-lite", result.command
 
 
 def test_unpaid_provider_log_failure_still_returns_skip_result():

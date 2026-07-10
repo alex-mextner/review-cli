@@ -860,7 +860,7 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | `codex` / `codex:<model>` | cli | `codex exec -s read-only --ephemeral` |
 | `claude` / `claude:<model>` | api \| cli | `claude-p` CLI, or the Anthropic-compatible Messages API |
 | `fable` / `fable5` | api \| cli | Alias for `claude:claude-fable-5` |
-| `gemini` / `gemini:<model>` | api | Gemini REST API (`gemini-2.5-flash` by default) |
+| `gemini` / `gemini:<model>` | api | Gemini REST API (`gemini-3.5-flash` by default) |
 | `zai:<model>` / `glm` / `glm52` … | api | z.ai (GLM) OpenAI-compatible REST API — needs `ZAI_API_KEY` |
 | `commandcode:<model>` / `cc` | api | Command Code OpenAI-compatible Provider API — needs `COMMANDCODE_API_KEY` |
 | `openrouter:<model>` / `openrouter` | api | OpenRouter OpenAI-compatible aggregator (400+ models) — needs `OPENROUTER_API_KEY` (bare `openrouter` → `openrouter/auto`) |

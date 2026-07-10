@@ -543,7 +543,7 @@ def _gemini_key() -> str:
 
 
 def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
-    gemini_model = model.split(":", 1)[1] if ":" in model else os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_model = model.split(":", 1)[1] if ":" in model else os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
     command = f"Gemini API {gemini_model}"
     # Gemini is a REST backend — it never goes through `_run_streamed`, so it must emit
     # its own per-call sidecar log or the dashboard parser (which reads ONLY `.log`

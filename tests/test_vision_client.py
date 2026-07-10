@@ -879,6 +879,48 @@ def test_gemini_stays_rest_key_and_honors_env_model():
             os.environ["GEMINI_MODEL"] = old_env
 
 
+def test_gemini_vision_default_model_is_current():
+    """The vision Gemini fallback must POST to a CURRENT, non-retired model when
+    $GEMINI_MODEL is unset. Guards vision_client.py's default independently of
+    review_gemini's (issue #139): the old `gemini-2.5-flash` fallback 404'd and
+    shuts down 2026-10-16; `gemini-3.5-flash` is Google's GA replacement."""
+    import os
+    import urllib.request
+
+    import reviewlib.backends as backends
+
+    captured = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"candidates":[{"content":{"parts":[{"text":"{\\"verdict\\":\\"keep\\",\\"confidence\\":0.9}"}]}}]}'
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return _FakeResp()
+
+    old_open = urllib.request.urlopen
+    old_key = backends._gemini_key
+    old_env = os.environ.pop("GEMINI_MODEL", None)
+    urllib.request.urlopen = fake_urlopen
+    backends._gemini_key = lambda: "fake-key"
+    try:
+        v = vc.call_ai_vision("gemini", blocks=_blocks())
+        assert v.verdict == "keep"
+        assert "models/gemini-3.5-flash:generateContent" in captured["url"], captured.get("url")
+    finally:
+        urllib.request.urlopen = old_open
+        backends._gemini_key = old_key
+        if old_env is not None:
+            os.environ["GEMINI_MODEL"] = old_env
+
+
 def test_gemini_unreachable_without_key():
     """No Gemini key → available=False (fail-closed → unverified), never a crash."""
     import reviewlib.backends as backends
