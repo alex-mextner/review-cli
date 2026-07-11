@@ -371,7 +371,7 @@ def test_commandcode_base_url_and_model_override():
 
 
 def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
-    """The priority-3 GLM-5.2 board seat (`commandcode:zai-org/GLM-5.2`) must POST the
+    """The priority-4 GLM-5.2 board seat (`commandcode:zai-org/GLM-5.2`) must POST the
     byte-exact gateway model id `zai-org/GLM-5.2` — INCLUDING the embedded slash. The id has
     TWO `/`-free segments around a single `/` plus the `commandcode:` provider prefix, so a
     naive split could truncate it; this pins that `review_commandcode` strips ONLY the
@@ -396,7 +396,7 @@ def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
 
 
 def test_commandcode_glm_seat_id_beats_commandcode_model_env():
-    """The priority-3 GLM-cc seat id WINS over a `COMMANDCODE_MODEL` env override — so a host
+    """The priority-4 GLM-cc seat id WINS over a `COMMANDCODE_MODEL` env override — so a host
     that exports `COMMANDCODE_MODEL` (a legitimate override for the bare `-m cc` path) can NOT
     silently hijack the default-board seat into POSTing a different model. `review_commandcode`
     only consults `COMMANDCODE_MODEL` for a BARE `commandcode` id (no suffix); a suffixed seat
@@ -1012,6 +1012,193 @@ def test_payment_preflight_specific_billing_marker_denies_http_402():
     assert reason is not None and "preflight" in reason, reason
 
 
+def test_payment_preflight_specific_billing_marker_denies_http_400():
+    def _unpaid(_req, timeout=None):
+        raise _http_error("https://api.commandcode.ai/provider/v1/models", 400, "insufficient credits")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _unpaid
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            reason = backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert reason is not None and "HTTP 400" in reason, reason
+
+
+def test_commandcode_chat_billing_marker_caches_provider_skip_for_next_seat():
+    calls: list[str] = []
+
+    def _models_ok_then_chat_unpaid(req, timeout=None):
+        calls.append(req.full_url)
+        if req.full_url.endswith("/models"):
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+                def read(self):
+                    return b'{"data":[]}'
+
+            return _Resp()
+        raise _http_error(req.full_url, 400, "insufficient credits")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _models_ok_then_chat_unpaid
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            first = backends.review_commandcode(
+                "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
+            )
+            second = backends.review_commandcode(
+                "commandcode:Qwen/Qwen3.7-Max", "q", "", REPO_ROOT, 10
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert first.returncode == 400
+    assert second.returncode == 1
+    assert "preflight" in second.stderr and "skipping" in second.stderr, second.stderr
+    assert len([url for url in calls if url.endswith("/chat/completions")]) == 1, calls
+
+
+def test_commandcode_model_subscription_denial_only_caches_that_model():
+    calls: list[str] = []
+
+    def _models_ok_then_chat_subscription_denied(req, timeout=None):
+        calls.append(req.full_url)
+        if req.full_url.endswith("/models"):
+            return _FakeResp({"data": []})
+        raise _http_error(req.full_url, 400, "subscription required for this model")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _models_ok_then_chat_subscription_denied
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            first = backends.review_commandcode(
+                "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
+            )
+            same_model = backends.review_commandcode(
+                "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
+            )
+            different_model = backends.review_commandcode(
+                "commandcode:Qwen/Qwen3.7-Max", "q", "", REPO_ROOT, 10
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert first.returncode == 400
+    assert same_model.returncode == 1
+    assert "preflight" in same_model.stderr and "skipping" in same_model.stderr, same_model.stderr
+    assert different_model.returncode == 400
+    assert len([url for url in calls if url.endswith("/chat/completions")]) == 2, calls
+
+
+def test_commandcode_chat_nonbilling_http_400_does_not_cache_provider_skip():
+    calls: list[str] = []
+
+    def _models_ok_then_chat_bad_request(req, timeout=None):
+        calls.append(req.full_url)
+        if req.full_url.endswith("/models"):
+            return _FakeResp({"data": []})
+        raise _http_error(req.full_url, 400, "context length exceeded")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _models_ok_then_chat_bad_request
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            first = backends.review_commandcode(
+                "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
+            )
+            second = backends.review_commandcode(
+                "commandcode:Qwen/Qwen3.7-Max", "q", "", REPO_ROOT, 10
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert first.returncode == 400
+    assert second.returncode == 400
+    assert "preflight" not in second.stderr and "skipping" not in second.stderr, second.stderr
+    assert len([url for url in calls if url.endswith("/chat/completions")]) == 2, calls
+
+
+def test_successful_payment_preflight_does_not_overwrite_existing_provider_denial():
+    def _models_ok(req, timeout=None):
+        if req.full_url.endswith("/models"):
+            return _FakeResp({"data": []})
+        raise AssertionError(f"unexpected chat dispatch in preflight stub: {req.full_url}")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _models_ok
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        provider = "commandcode"
+        key, url = backends._payment_preflight_credentials(
+            "commandcode:deepseek/deepseek-v4-pro", provider
+        )
+        assert key and url
+        cache_key = backends._payment_preflight_cache_key(provider, url, key)
+        with backends._PAYMENT_PREFLIGHT_CACHE_LOCK:
+            backends._PAYMENT_PREFLIGHT_CACHE[cache_key] = (True, 402)
+
+        # Simulate the write phase of a slower concurrent successful /models probe that
+        # began before the denial was cached. It must not clear the denial.
+        with urllib.request.urlopen(
+            urllib.request.Request(url, method="GET"),
+            timeout=backends._PROVIDER_PREFLIGHT_TIMEOUT_SECONDS,
+        ):
+            with backends._PAYMENT_PREFLIGHT_CACHE_LOCK:
+                cached = backends._PAYMENT_PREFLIGHT_CACHE.get(cache_key)
+                if cached is None or cached[0] is False:
+                    backends._PAYMENT_PREFLIGHT_CACHE[cache_key] = (False, None)
+
+        try:
+            reason = backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:Qwen/Qwen3.7-Max"
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert reason is not None and "HTTP 402" in reason, reason
+
+
+def test_successful_payment_preflight_returns_concurrent_provider_denial():
+    """A slower successful /models probe must notice a denial cached while it was in flight."""
+    calls = {"n": 0}
+
+    def _models_ok_after_denial(req, timeout=None):
+        calls["n"] += 1
+        if req.full_url.endswith("/models"):
+            provider = "commandcode"
+            key, url = backends._payment_preflight_credentials(
+                "commandcode:deepseek/deepseek-v4-pro", provider
+            )
+            assert key and url
+            with backends._PAYMENT_PREFLIGHT_CACHE_LOCK:
+                backends._PAYMENT_PREFLIGHT_CACHE[
+                    backends._payment_preflight_cache_key(provider, url, key)
+                ] = (True, 402)
+            return _FakeResp({"data": []})
+        raise AssertionError(f"unexpected chat dispatch in preflight stub: {req.full_url}")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _models_ok_after_denial
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        try:
+            reason = backends._provider_payment_preflight_unavailable_reason(
+                "commandcode:deepseek/deepseek-v4-pro"
+            )
+        finally:
+            urllib.request.urlopen = old_open
+    assert reason is not None and "HTTP 402" in reason, reason
+    assert calls["n"] == 1, calls
+
+
 def test_payment_preflight_billing_marker_on_auth_status_denies():
     def _auth_with_marker(_req, timeout=None):
         raise _http_error("https://api.commandcode.ai/provider/v1/models", 401, "payment required for model list scope")
@@ -1068,6 +1255,29 @@ def test_payment_preflight_success_is_cached_for_dispatch():
         finally:
             urllib.request.urlopen = old_open
     assert calls["n"] == 1, calls
+
+
+def test_backend_available_uses_cached_payment_denial_without_network():
+    def _no_network(req, timeout=None):
+        raise AssertionError(f"backend_available made network: {req.full_url}")
+
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _no_network
+    with _EnvSandbox():
+        os.environ["COMMANDCODE_API_KEY"] = "user_present"
+        provider = "commandcode"
+        key, url = backends._payment_preflight_credentials(
+            "commandcode:deepseek/deepseek-v4-pro", provider
+        )
+        assert key and url
+        with backends._PAYMENT_PREFLIGHT_CACHE_LOCK:
+            backends._PAYMENT_PREFLIGHT_CACHE[
+                backends._payment_preflight_cache_key(provider, url, key)
+            ] = (True, 402)
+        try:
+            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is False
+        finally:
+            urllib.request.urlopen = old_open
 
 
 def test_visual_opencode_availability_does_not_use_payment_preflight():

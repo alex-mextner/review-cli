@@ -75,7 +75,7 @@ Everything is a subcommand: the diff review is `review diff` (NOT a bare `review
 ```
 review diff --task CODE -C <repo>                  # review current unstaged diff across the failover pool (top 4 available)
 review diff --task CODE -C <repo> --staged         # review the staged diff (pre-commit)
-review diff --task CODE -C <repo> --pool 0         # run all available board seats (currently 9); default pool is 4
+review diff --task CODE -C <repo> --pool 0         # run all available seats in the selected preset/board
 review diff --task CODE -C <repo> -m codex -m gemini    # pick backends (repeat or comma-separate); narrows config board metadata if present
 review just-ask "Q" --task CODE -C <repo>          # multi-model answer to a question (no diff needed)
 review quorum "Q" --task CODE -C <repo>            # experts answer + a moderator finds consensus/disagreement
@@ -110,26 +110,30 @@ thus noclobber) entirely: it creates parent dirs, always overwrites, and STILL
 prints the result to stdout so you see it live. So whenever you want the review in
 a file, reach for `-o file.md`, never `> file.md`.
 
-## Reviewer board + `--pool` (priority-ordered failover pool)
-A plain `review diff` runs the built-in **reviewer board** — a **priority-ordered** panel of 9
-models (strongest first) where each model also gets its own role/lens (architecture,
-correctness, consistency, performance, quality, security, tests, contracts). The active
-**pool is 4**, chosen by **priority + availability** with two failovers so the run keeps
-4 working reviewers: **startup failover** picks the top 4 AVAILABLE seats by priority (a
+## Reviewer board, presets, and `--pool` (priority-ordered failover pool)
+A plain `review diff` runs the **default preset**: pool 4, high effort, no Fable/Sol.
+Use `--preset light` for quick/cheap preflight (pool 2, medium effort), and
+`--preset heavy` for release/risky changes (Fable, Sol, Opus, GLM-cc at highest effort,
+with the remaining board seats as highest-effort reserve). The built-in reviewer board is
+a **priority-ordered** panel where each model also gets its own role/lens. The active pool
+is chosen by **priority + availability** with two failovers so the run keeps its requested
+reviewer count: **startup failover** picks the top N AVAILABLE seats by priority (a
 higher-priority but unavailable seat is skipped, the next pulled up); **mid-run failover**
 replaces a seat that fails DURING the run (backend error, timeout, empty output, or an
-"unavailable" reply such as a paywalled model) with the next-priority **reserve**, until 4
-working verdicts are produced or the reserve is exhausted (then it degrades and says so).
+"unavailable" reply such as a paywalled model) with the next-priority **reserve**, until
+the requested number of working verdicts is produced or the reserve is exhausted (then it
+degrades and says so).
 Before promoting a reserve, a failed seat is first **retried on the same model** when the
 failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "overloaded" /
 "service unavailable") with backoff + jitter; a **seat-fatal** failure (auth / bad model /
 501 / refusal) is never retried and falls straight to the reserve. `--retry N` (or
 `$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
-`--pool N` sizes the pool (top-N available, same failover); `--pool 0` runs all available.
+`--pool N` sizes the pool (top-N available, same failover); `--pool 0` runs all available
+seats in the selected preset/board (`--preset heavy --pool 0` covers all 10 built-ins).
 The board is **never disabled** — there is **no `--no-board` flag**. An explicit `-m`
 always limits the run to exactly those models; with no configured `models:`/`board:` it is
-the legacy flat panel, and with config present it narrows the configured board metadata to
-those requested models. A `models:` list in config.yaml is the priority roster for the
+the legacy flat panel unless an explicit preset supplies metadata, and with config present it
+narrows the configured board metadata to those requested models. A `models:` list in config.yaml is the priority roster for the
 failover board: the pool is selected from that ordered set and the rest are reserve. Command
 Code and Fireworks run a cheap payment/entitlement preflight when a key is present; a
 provider that is authenticated but not paid/entitled is skipped before any backend

@@ -173,7 +173,11 @@ def _tmp() -> str:
 
 
 def _has(mod: str) -> bool:
-    return subprocess.run([sys.executable, "-c", f"import {mod}"], capture_output=True).returncode == 0
+    return subprocess.run(
+        [sys.executable, "-c", f"import {mod}"],
+        capture_output=True,
+        env=_smoke_env(),
+    ).returncode == 0
 
 
 def _git_unavailable_reason() -> str | None:
@@ -310,22 +314,25 @@ def test_board_flags_and_listing():
     assert_not_in("--no-board", top)
     board = review_out("--show-board")
     for needle in (
-        "architect", "claude:claude-fable-5", "claude:claude-opus-4-8",
-        "oc:commandcode/deepseek/deepseek-v4-pro", "oc:zai/glm-5.2", "contracts", "9 seats", "#1",
-        # The CTO-directed GLM-5.2-via-commandcode seat (priority 3, diff-only keyed HTTP).
+        "source: preset:default", "claude:claude-opus-4-8",
+        "oc:commandcode/deepseek/deepseek-v4-pro", "oc:zai/glm-5.2", "contracts", "8 seats", "#1",
+        # The CTO-directed GLM-5.2-via-commandcode seat (default preset, diff-only keyed HTTP).
         "commandcode:zai-org/GLM-5.2", "GLM-cc",
     ):
         assert_in(needle, board, "in --show-board")
+    heavy = review_out("--show-board", "--preset", "heavy")
+    for needle in ("source: preset:heavy", "architect", "claude:claude-fable-5", "codex:gpt-5.6-sol", "10 seats"):
+        assert_in(needle, heavy, "in --show-board --preset heavy")
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())
-    # The codex seat is agentic (now priority 4, after the GLM-cc seat).
+    # The codex seat is agentic.
     codex_line = next((ln for ln in board.splitlines() if "Codex" in ln), "")
     assert_in("codex", codex_line)
     assert_in("agentic", codex_line)
-    # The GLM-cc seat sits directly under Opus (#2) at #3 and is diff-only.
+    # In the default preset, GLM-cc sits directly under Opus at #2 and is diff-only.
     glmcc_line = next((ln for ln in board.splitlines() if "GLM-cc" in ln), "")
-    assert_in("#3", glmcc_line)
+    assert_in("#2", glmcc_line)
     assert_in("diff-only", glmcc_line)
 
 
@@ -372,7 +379,7 @@ def test_output_flag():
     assert_in("codex", out_path.read_text())  # parent dir made + file written
     # Overwrite must work even under the shell's noclobber (the bug -o fixes) — a fresh write.
     review_out("-o", str(out_path), "--show-board")
-    assert_in("architect", out_path.read_text())
+    assert_in("priority", out_path.read_text())
 
 
 def test_brainstorm_combines_with_diff_grounding():

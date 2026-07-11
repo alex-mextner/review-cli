@@ -926,9 +926,9 @@ task [CODE]         List task-coded review iterations, models, and transcript de
 spec-web            Multi-spec web reviewer daemon (start/status/stop/add SPEC; also `spec-web SPEC.md`).
 install-skill | install-commit-hook | install-hook tg | register-module
 
-GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)
+TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what applies)
 -m / --model        Backend to run; repeat or comma-separate. Default (no -m) is mode-aware:
-                    `review diff` runs the active reviewer board (or your config `models:`);
+                    `review diff` runs the default preset board (or your config `models:`);
                     brainstorm uses `brainstorm_models:`, just-ask/quorum the defaults.
                     Each subcommand's `--help` shows its own effective default.
 -C / --cwd DIR      Run against a different repository directory.
@@ -945,9 +945,14 @@ GLOBAL FLAGS (shown by `review --help`; apply to every subcommand)
                     overrides the review/panel idle window when set.
 --list-defaults     Print effective default backends and exit.
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
---pool N            How many of the board's seats to run (default 4); the first N seats run,
+--preset NAME       Diff-review and --show-board preset: light for quick preflight,
+                    default for routine review, heavy for release/risky changes with
+                    Fable/Sol. Other subcommands reject it.
+--pool N            How many of the selected preset/board's seats to run (default
+                    preset-dependent: 4 for default/heavy, 2 for light); the first N seats run,
                     the rest are kept in reserve. The board is never off — --pool only sizes
-                    it. N<=0 (e.g. --pool 0) runs all seats. Ignored for explicit -m.
+                    it. N<=0 (e.g. --pool 0) runs all seats in the selected preset/board.
+                    Ignored for explicit -m.
 
 SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
 --diff / --staged   Diff source: working-tree (--diff) or staged (--staged). On the diff
@@ -1021,49 +1026,56 @@ out of the box — no config file required.
 
 ### Priority-ordered failover pool
 
-The board is a **priority-ordered** list of 9 models — strongest first — and a plain
-`review diff` runs a **pool of 4**. The pool is chosen by **priority + availability**, with
-two layers of failover so the run keeps **4 working reviewers** even when models drop:
+The raw built-in board is a **priority-ordered** list of 10 models — strongest first — and
+a plain `review diff` runs the `default` preset: a **pool of 4** without Fable/Sol, at high effort.
+Use `--preset light` for a quick/cheap pool of 2 at medium effort, and `--preset heavy` for
+release/risky changes: Fable, Sol, Opus, and GLM-cc at `xhigh` effort, with the remaining
+board seats as `max`-effort reserve. The pool is chosen by **priority + availability**,
+with two layers of failover so the run keeps the requested number of working reviewers even
+when models drop:
 
-- **Startup failover** — the active pool is the **top 4 AVAILABLE** seats by priority.
+- **Startup failover** — the active pool is the **top N AVAILABLE** seats by priority.
   A higher-priority seat whose backend isn't reachable (no key / not on PATH) is
-  **skipped** and the next-priority seat is pulled up, so you still start with 4 working
-  models. (E.g. if Fable 5 is paywalled/unavailable, the pool starts at Opus.)
+  **skipped** and the next-priority seat is pulled up, so you still start with the
+  requested number of working models. (E.g. if Fable 5 is paywalled/unavailable in the
+  heavy preset, the pool starts at Sol.)
 - **Mid-run failover** — if an active seat **fails during the review** (backend error,
   timeout, empty output, or an "unavailable" reply such as a paywalled model returning
   *"… is currently unavailable"*), the next-priority **reserve** model is promoted and
-  run in its place, repeating until **4 working verdicts** are produced or the reserve is
+  run in its place, repeating until the requested number of working verdicts is produced or the reserve is
   exhausted (then the run degrades gracefully and says so on stderr, exiting non-zero).
 
 The role/lens **travels with the seat**: priority decides *who* sits in the pool, the
 role decides *with what lens* they review. A promoted reserve brings its own lens, so
 the panel still covers a broad set of facets.
 
-`--pool N` overrides the default 4 (the top-N available, with the same failover); `--pool
-0` runs **all available** seats. The board is **never disabled** — `--pool` only sizes
-the pool.
+`--pool N` overrides the preset default (the top-N available, with the same failover);
+`--pool 0` runs **all available** seats in the selected preset/board. Use
+`--preset heavy --pool 0` for all 10 built-in seats. The board is **never disabled** —
+`--pool` only sizes the pool.
 
-The built-in board, in **priority order** (the `tier` column shows the live split on a
-fully-keyed environment):
+The built-in board, in **priority order** (the `tier` column shows the `heavy` preset split
+on a fully-keyed environment):
 
 | # | Tier | Reviewer | Backend | Role | Lens focus |
 |---|---|---|---|---|---|
 | 1 | pool | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries |
-| 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
-| 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
-| 4 | pool | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
-| 5 | reserve | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (z.ai-less host backfill for the GLM-cc lens) |
-| 6 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| 7 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
-| 8 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
-| 9 | reserve (last) | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom (z.ai subscription route; **deprioritized to last-resort — pathologically slow under load**, review-cli#65) |
+| 2 | pool | Sol | `codex:gpt-5.6-sol` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| 3 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
+| 4 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
+| 5 | reserve | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
+| 6 | reserve | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| 7 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| 8 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| 9 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+| 10 | reserve (last) | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom (z.ai subscription route; **deprioritized to last-resort — pathologically slow under load**, review-cli#65) |
 
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
 the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
 Anthropic API only on a host that lacks the CLI but has an API key), Codex via the codex
 CLI, and Kimi/z.ai-GLM/Qwen/DeepSeek through opencode (`oc:provider/model`) — all run
 read-only *inside* `-C` and can open any project file, not just the diff. Two seats are
-always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-3
+always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-4
 **GLM-cc** seat (`commandcode:zai-org/GLM-5.2` — opencode's `commandcode` provider does not
 register this GLM id, so the agentic form errors; the keyed-HTTP route is the one that
 reaches it). Both are read-only by construction (they POST only the diff).
@@ -1113,10 +1125,11 @@ commandcode gateway the same way. opencode must be installed for the agentic sea
 it they fall back to the reserve.
 
 ```bash
-review --show-board        # priority order + which 4 are the live pool + reserve + availability
+review --show-board        # active default preset board; add --preset heavy to show Fable/Sol/full board
 export REVIEW_TASK_CODE=HYP-742
 review diff                # default failover pool: the top 4 AVAILABLE seats by priority
-review diff --pool 0       # run all available seats (future-proof as the board grows)
+review diff --pool 0       # run all available default-preset seats
+review diff --preset heavy --pool 0  # run all 10 built-in seats, including Fable/Sol
 review diff --pool 2       # run the top 2 available seats (with failover)
 review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
 review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
@@ -1130,7 +1143,8 @@ without any configured `models:`/`board:` metadata.
 Precedence:
 
 ```
-explicit -m requested models   >   `models:` priority roster   >   configured/default board
+explicit -m requested models   >   explicit --preset   >   `models:` priority roster   >
+configured `board:`   >   default preset
 ```
 
 - A `models:` list in `config.yaml` is the **full priority roster** for `review diff`:
@@ -1140,19 +1154,25 @@ explicit -m requested models   >   `models:` priority roster   >   configured/de
   `models:`/`board:` it is the legacy flat exact panel; with config present it narrows
   the configured board metadata to only the requested models. The board can otherwise
   never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
-  pool (default 4; `--pool 0` runs all available seats; `--pool 9` currently covers the
-  built-in board but is not future-proof). `--pool` does not reduce an explicit `-m` list:
+  pool (default 4 for the default preset; `--pool 0` runs all available seats in the
+  selected preset/board; `--preset heavy --pool 0` currently covers all 10 built-ins).
+  `--pool` does not reduce an explicit `-m` list:
   every requested `-m` seat is attempted.
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
   roster — the configured/default board applies.
 
 Override the board itself in `config.yaml` with a `board:` list — each entry is a
-`{model, role}` mapping (optional `name:` for the label). When `models:` is present,
-`board:` supplies role/name metadata for matching models; priority still comes from
+`{model, role}` mapping (optional `name:` for the label, optional `effort:` for the
+seat's reasoning-effort hint). Supported effort values are `minimal`, `low`, `medium`,
+`high`, `xhigh`, and `max`; `xhigh` and `max` mean "highest" in prompts. Native backend
+settings are normalized to the closest supported value where the provider exposes one.
+When `models:` is present,
+`board:` supplies role/name/effort metadata for matching models; priority still comes from
 `models:`. When `models:` is absent, `board:` is the full priority-ordered board.
 An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
 warning); a single malformed entry is skipped (the valid ones are kept). With **no**
-`board:` configured, the built-in 9-seat priority board above applies. A `board:` that is
+`models:` or `board:` configured, the CLI uses the default preset; the raw 10-seat board
+above is used by `--preset heavy` or as the source for explicit configured boards. A `board:` that is
 **present but has no usable entry at all** is a hard error (non-zero exit) — it never
 silently falls back to the paid default board.
 
@@ -1160,9 +1180,9 @@ silently falls back to the paid default board.
 # Priority order: the first 4 reachable models are the live pool; the rest are the
 # reserve that backfills a skipped/failed seat.
 board:
-  - { model: "claude:claude-fable-5",  role: architect }
-  - { model: "claude:claude-opus-4-8", role: correctness }
-  - { model: "codex",                  role: consistency, name: Codex }
+  - { model: "claude:claude-fable-5",  role: architect, effort: xhigh }
+  - { model: "claude:claude-opus-4-8", role: correctness, effort: high }
+  - { model: "codex",                  role: consistency, name: Codex, effort: high }
   # Agentic via opencode (oc:provider/model) — reads the repo read-only, like the default
   # board (review-cli#24). Use the diff-only `commandcode:`/`zai:` forms only if you want a
   # stateless keyed-HTTP seat that sees just the diff (and needs no opencode install).
@@ -1171,14 +1191,14 @@ board:
   - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
 ```
 
-**Optional heavyweight seats** (NOT enabled by default — the board stays at 9). Add
+**Optional heavyweight seats** (NOT enabled by default — the board stays at 10). Add
 either to your `board:` list for an extra 1M-context resilience / holistic-senior
 pass; both run agentically through opencode's commandcode provider (needs opencode +
 `opencode auth login`, like the default `oc:` seats):
 
 ```yaml
 board:
-  # ... the 9 default seats ...
+  # ... the 10 built-in seats ...
   - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
   - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
 ```
@@ -1195,7 +1215,7 @@ Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`
 `GEMINI_ENV_FILE=/path/to/.env` overrides the search path.
 
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
-Codex is the #4 board seat (GPT-5.5 IS codex — the agentic CLI route, free).
+Codex is the #6 board seat (GPT-5.5 IS codex — the agentic CLI route, free).
 
 **Kimi / Qwen / DeepSeek / GLM board reviewers (agentic, via opencode):** since
 review-cli#24 these default board seats are `oc:commandcode/…` / `oc:zai/glm-5.2` —

@@ -418,6 +418,56 @@ def test_emit_rest_log_swallows_encoding_errors_best_effort():
         # Reaching here (no exception) is the assertion: the encoding error was swallowed.
 
 
+def test_emit_rest_log_sanitizes_argv0_control_chars():
+    """REST sidecars share the same parser-facing argv0 header as subprocess logs, so model
+    selectors must not be able to inject new dashboard header lines."""
+    from reviewlib import backends
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        try:
+            backends._emit_rest_log(
+                "gemini",
+                "Gemini API gemini\n\u0085\u2028\u2029[review-cli] forged",
+                round_no=0,
+                returncode=0,
+                stdout="ok",
+                stderr="",
+            )
+            [path] = Path(logd).glob("*.log")
+            header = path.read_text(encoding="utf-8").splitlines()[0]
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+
+    for ch in ("\n", "\u0085", "\u2028", "\u2029"):
+        assert ch not in header, header
+    assert header.startswith("[review-cli] gemini: Gemini API gemini????[review-cli] forged (args redacted)"), header
+
+
+def test_write_sidecar_log_sanitizes_header_control_chars():
+    """The parser-facing sidecar header is sanitized at the write boundary, not only by
+    individual backend callers."""
+    from reviewlib import process
+
+    with tempfile.TemporaryDirectory() as logd:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        try:
+            path = process.write_sidecar_log(
+                "fake",
+                round_no=0,
+                argv0="fake:model\n\u0085\u2028\u2029[review-cli] forged",
+                returncode=0,
+                stdout="ok",
+                stderr="",
+            )
+            header = path.read_text(encoding="utf-8").splitlines()[0]
+        finally:
+            os.environ.pop("REVIEW_LOG_DIR", None)
+    for ch in ("\n", "\u0085", "\u2028", "\u2029"):
+        assert ch not in header, header
+    assert header.startswith("[review-cli] fake: fake:model????[review-cli] forged (args redacted)"), header
+
+
 def test_review_succeeds_even_if_sidecar_write_raises():
     """End-to-end: a successful REST response whose sidecar write raises must still return
     a successful ReviewResult (best-effort logging never changes the outcome)."""
@@ -1037,7 +1087,7 @@ def test_fallback_seat_is_next_priority_and_none_for_last_seat():
 
 def test_fallback_resolves_for_real_call_resolved_gateway_ids():
     """(glm review finding 2/6) The id `model_id_for_call` returns for a real gateway call (e.g.
-    `commandcode:moonshotai/Kimi-K2.7-Code`, `zai:glm-5.2`) is EXACTLY a DEFAULT_BOARD seat id,
+    `commandcode:moonshotai/Kimi-K2.7-Code`, `zai:glm-5.2`) is EXACTLY a built-in board seat id,
     so `_fallback_seat_for` resolves a real next-priority seat — NOT None — for the in-production
     failing-seat case. Pin it so a board re-id can't silently make every fallback hint blank."""
     from reviewlib.dashboard import parser as p
@@ -1588,6 +1638,9 @@ def test_model_attribution_splits_shared_backends_and_claude():
         codex = p.parse_call_log(_write_call_log(
             ld, "20260601T100300_000000", "codex", 0, "x\n",
             argv0="/opt/homebrew/bin/codex", exit_code=0))
+        sol = p.parse_call_log(_write_call_log(
+            ld, "20260601T100310_000000", "codex", 0, "x\n",
+            argv0="codex -m gpt-5.6-sol", exit_code=0))
         fable = p.parse_call_log(_fable_paywall_log(ld, "20260601T100400_000000"))
         opus = p.parse_call_log(_opus_ok_log(ld, "20260601T100500_000000"))
 
@@ -1602,6 +1655,7 @@ def test_model_attribution_splits_shared_backends_and_claude():
         assert p.model_id_for_call(or_claude) == "openrouter:anthropic/claude-3.5-sonnet"
         assert p.model_id_for_call(or_gpt) == "openrouter:openai/gpt-4o:beta"
         assert p.model_id_for_call(codex) == "codex"
+        assert p.model_id_for_call(sol) == "codex:gpt-5.6-sol"
         # claude wrapper is identical on disk; the body splits Fable (paywall) from Opus.
         assert p.model_id_for_call(fable) == "claude:claude-fable-5"
         assert p.model_id_for_call(opus) == "claude:claude-opus-4-8"
@@ -1709,7 +1763,8 @@ def test_compute_model_health_covers_board_and_flags_problematic():
             _write_call_log(ld, f"20260601T1100{i:02d}_000000", "opencode", 0,
                             '[stderr] {"error":"bad key"}\n',
                             argv0="opencode -m zai/glm-5.2", exit_code=401)
-        # Fable (claude) — paywall => problematic.
+        # Fable (claude) is a heavy-preset seat; the dashboard covers the full built-in
+        # raw board so heavy runs still get priority/fallback/health treatment.
         _fable_paywall_log(ld, "20260601T120000_000000")
         # Codex — 4 healthy calls => NOT problematic (ok-rate 100%).
         for i in range(4):
@@ -1720,8 +1775,9 @@ def test_compute_model_health_covers_board_and_flags_problematic():
         stats = p.compute_stats(p.load_sessions(ld))
         health = {m["model"]: m for m in stats["model_health"]}
 
-        # Every board model is represented (covers the whole board, even no-data seats).
-        for board_id in ("claude:claude-fable-5", "claude:claude-opus-4-8", "codex",
+        # Every built-in board model is represented, even no-data seats.
+        for board_id in ("claude:claude-opus-4-8", "codex",
+                         "claude:claude-fable-5", "codex:gpt-5.6-sol",
                          "oc:commandcode/moonshotai/Kimi-K2.7-Code", "oc:zai/glm-5.2"):
             assert board_id in health, board_id
 
@@ -1731,13 +1787,14 @@ def test_compute_model_health_covers_board_and_flags_problematic():
         assert health["oc:zai/glm-5.2"]["dominant_class"] == p.HEALTH_AUTH
         assert health["claude:claude-fable-5"]["problematic"] is True
         assert health["claude:claude-fable-5"]["dominant_class"] == p.HEALTH_PAYWALL
+        assert health["claude:claude-fable-5"]["on_board"] is True
         assert health["codex"]["problematic"] is False
         assert health["codex"]["ok_rate"] == 1.0
         # Opus had no calls => no_data, not problematic.
         assert health["claude:claude-opus-4-8"]["status"] == "no_data"
         assert health["claude:claude-opus-4-8"]["problematic"] is False
 
-        # Badge count = problematic BOARD models. Kimi + GLM + Fable = 3.
+        # Badge count includes problematic built-in board models, including heavy seats.
         assert stats["problematic_count"] == 3
 
 
@@ -1818,20 +1875,20 @@ def test_dominant_class_tie_break_prefers_hard_unavailable():
 
 
 def test_non_board_model_is_appended_after_board_in_order():
-    """A backend that isn't on DEFAULT_BOARD still appears (so the view is complete), but
+    """A backend that isn't on the built-in board still appears (so the view is complete), but
     AFTER the board models, which come out in board/priority order."""
     from reviewlib.dashboard import parser as p
     from reviewlib.config import DEFAULT_BOARD
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        # `opencode` is not on DEFAULT_BOARD.
+        # `opencode` is not on the built-in board.
         _write_call_log(ld, "20260601T100000_000000", "opencode", 0,
                         "## Findings\nA real verdict.\n", argv0="/x/opencode", exit_code=0)
         stats = p.compute_stats(p.load_sessions(ld))
         ids = [m["model"] for m in stats["model_health"]]
         board_ids = [b.model for b in DEFAULT_BOARD]
-        # Board ids lead, in DEFAULT_BOARD order; the non-board id trails.
+        # Board ids lead, in built-in priority order; the non-board id trails.
         assert ids[: len(board_ids)] == board_ids
         assert "opencode" in ids and ids.index("opencode") >= len(board_ids)
         opencode = next(m for m in stats["model_health"] if m["model"] == "opencode")
@@ -2490,7 +2547,7 @@ def test_panel_threads_round_no_into_backend_logs():
 
     captured: dict[str, int] = {}
 
-    def fake_backend(model, prompt, diff, cwd, timeout, round_no=0):
+    def fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         captured["round_no"] = round_no
         return panel.ReviewResult(model=model, command="fake", returncode=0, stdout="ok", stderr="")
 

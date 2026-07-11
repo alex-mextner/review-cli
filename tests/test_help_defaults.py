@@ -59,8 +59,8 @@ def _model_line(help_text: str) -> str:
     return norm[start:end]
 
 
-def test_model_help_shows_the_board_default_when_no_config_models():
-    # No configured models -> the default is the active board; the --model LINE must say so
+def test_model_help_shows_the_default_preset_when_no_config_models():
+    # No configured models -> the default is the active preset board; the --model LINE must say so
     # and point at --show-board. Scope to the --model line: the --show-board flag's own
     # description also names the board, so a whole-help check would false-positive (codex).
     saved = cli.load_config
@@ -69,7 +69,7 @@ def test_model_help_shows_the_board_default_when_no_config_models():
         line = _model_line(_top_level_help())
     finally:
         cli.load_config = saved
-    assert "active reviewer board" in line, line
+    assert "default" in line and "preset reviewer board" in line, line
     assert "--show-board" in line, line
 
 
@@ -102,8 +102,9 @@ def test_model_default_is_mode_aware_not_board_for_panel_modes():
             assert "active reviewer board" not in line, (sub, line)
             # The built-in defaults are named instead (codex is in DEFAULT_MODELS).
             assert "built-in defaults" in line, (sub, line)
-        # And the diff subcommand DOES claim the board on its --model line.
-        assert "active reviewer board" in _model_line(_mode_help("diff")), _model_line(_mode_help("diff"))
+        # And the diff subcommand DOES claim the default preset board on its --model line.
+        line = _model_line(_mode_help("diff"))
+        assert "default" in line and "preset reviewer board" in line, line
     finally:
         cli.load_config = saved
 
@@ -139,6 +140,15 @@ def test_numeric_defaults_are_concrete():
     assert "default 60" in _mode_help("diff"), _mode_help("diff")  # --vision-timeout (visual)
 
 
+def test_preset_help_recommends_when_to_use_each_preset():
+    text = _mode_help("diff")
+    assert "--preset" in text, text
+    low = " ".join(text.lower().split())
+    assert "light" in low and "quick" in low, text
+    assert "default" in low and "routine" in low, text
+    assert "heavy" in low and "release" in low, text
+
+
 def test_model_help_does_not_crash_on_unreadable_config():
     # --help must never raise even if load_config blows up; it falls back to the board phrasing.
     saved = cli.load_config
@@ -151,7 +161,7 @@ def test_model_help_does_not_crash_on_unreadable_config():
         line = _model_line(_top_level_help())
     finally:
         cli.load_config = saved
-    assert "active reviewer board" in line, line
+    assert "default" in line and "preset reviewer board" in line, line
 
 
 def test_model_help_does_not_crash_on_percent_in_config_model_id():
@@ -261,7 +271,7 @@ def test_subcommand_only_flags_set_covers_every_mode_only_flag():
 def test_global_help_lists_only_truly_global_options():
     opts = _option_strings(_top_level_help())
     for flag in ("-m, --model", "-C, --cwd", "--task", "-o, --output", "--timeout",
-                 "--list-defaults", "--show-board", "--pool"):
+                 "--list-defaults", "--show-board", "--preset", "--pool"):
         assert flag in opts, (flag, "missing from the global option list")
     # The mode/diff-source-only flags must NOT be global.
     for flag in ("--diff", "--staged", "--prompt", "--moderator"):
@@ -281,7 +291,7 @@ def test_help_end_to_end_via_cli_shows_model_default():
             capture_output=True, text=True, timeout=60, env=env,
         )
         assert proc.returncode == 0, (proc.returncode, proc.stderr)
-        assert "active reviewer board" in proc.stdout, proc.stdout
+        assert "preset reviewer board" in proc.stdout, proc.stdout
 
 
 if __name__ == "__main__":

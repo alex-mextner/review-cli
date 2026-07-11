@@ -50,6 +50,8 @@ const MODEL_LOGO = {
   o3: 'codex',
   o1: 'codex',
   gpt: 'codex',
+  'gpt-5.6-sol': 'codex',
+  sol: 'codex',
   // Google
   gemini: 'gemini',
   google: 'gemini',
@@ -103,6 +105,8 @@ const MODEL_LABEL = {
   haiku: 'Haiku',
   claude: 'Claude',
   codex: 'Codex',
+  'gpt-5.6-sol': 'Sol',
+  sol: 'Sol',
   openai: 'OpenAI',
   gpt: 'GPT',
   gemini: 'Gemini',
@@ -306,7 +310,7 @@ async function loadAll() {
 
 // The tab buttons live in the static shell (they are NOT re-rendered with the panel), so
 // their count badges are updated here whenever fresh stats land. Models & roles shows the
-// number of currently-problematic models; a zero count hides the badge entirely.
+// number of currently-problematic raw-board models; a zero count hides the badge entirely.
 function updateTabBadges() {
   const badge = $('models-badge');
   if (!badge) return;
@@ -314,7 +318,7 @@ function updateTabBadges() {
   if (n > 0) {
     badge.textContent = String(n);
     badge.hidden = false;
-    badge.title = `${n} model(s) currently problematic`;
+    badge.title = `${n} raw-board model(s) currently problematic`;
   } else {
     badge.textContent = '';
     badge.hidden = true;
@@ -532,7 +536,7 @@ PANELS.models = () => {
     return (a.ok_rate ?? 1) - (b.ok_rate ?? 1);
   });
   const probCount = s.problematic_count || 0;
-  html += `<div class="section"><div class="section-head"><h3>Board health</h3><span class="muted">${probCount} problematic</span></div>`;
+  html += `<div class="section"><div class="section-head"><h3>Raw board health</h3><span class="muted">${probCount} problematic</span></div>`;
   html += mh.length
     ? `<div class="mh-list">${mh.map(modelHealthRow).join('')}</div>`
     : emptyState('model health', 'No calls in the window to classify.');

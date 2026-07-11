@@ -255,11 +255,16 @@ class _CapturedCodex:
         self.argv: list[str] | None = None
         self.cwd: Path | None = None
         self.input_text: str | None = None
+        self.header_argv0: str | None = None
 
-    def __call__(self, argv, cwd, timeout, backend, round_no=0, announce=False, input_text=""):
+    def __call__(
+        self, argv, cwd, timeout, backend, round_no=0, announce=False,
+        input_text="", header_argv0=None,
+    ):
         self.argv = list(argv)
         self.cwd = Path(cwd)
         self.input_text = input_text
+        self.header_argv0 = header_argv0
 
         class _Proc:
             returncode = 0
@@ -313,6 +318,7 @@ def test_codex_bare_seat_runs_agentic_read_only_in_repo_no_model_flag():
         # drops the payload would otherwise pass an argv-only check while reviewing nothing.
         assert "Review." in (cap.input_text or ""), cap.input_text
         assert "some diff" in (cap.input_text or ""), cap.input_text
+        assert cap.header_argv0 is None
 
 
 def test_codex_pinned_model_seat_passes_model_flag():
@@ -326,6 +332,7 @@ def test_codex_pinned_model_seat_passes_model_flag():
             review_backends.review_codex("codex:gpt-5.5", "Review.", "diff", repo, 60)
         argv = cap.argv or []
         assert "-m" in argv and argv[argv.index("-m") + 1] == "gpt-5.5", argv
+        assert cap.header_argv0 == "codex -m gpt-5.5", cap.header_argv0
 
 
 if __name__ == "__main__":

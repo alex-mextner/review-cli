@@ -68,10 +68,11 @@ def test_help_config_prints_the_config_reference():
     assert "REVIEW_QA_TESTER" in out, out
     assert "COMMANDCODE_API_KEY" in out and "GEMINI_API_KEY" in out, out
     assert "review --show-board" in out, out
-    # The board-entry shape must name the keys load_board ACTUALLY reads (model/role/name),
+    # The board-entry shape must name the keys load_board ACTUALLY reads (model/role/name/effort),
     # NOT a `display` key it ignores (codex review) — else a user can't set a seat label.
     assert "name" in out, out
-    assert "{model, role, name}" in out, out
+    assert "{model, role, name," in out and "effort} entries" in out, out
+    assert "minimal/low/medium/high/xhigh/max" in out, out
     assert "{model, role, display}" not in out, out
 
 

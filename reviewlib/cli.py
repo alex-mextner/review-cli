@@ -23,6 +23,7 @@ from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
 from .config import (
     CONFIG_PATH,
+    DEFAULT_PRESET,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
     DEFAULT_PROMPT,
@@ -37,6 +38,8 @@ from .config import (
     board_from_models,
     load_board,
     load_config,
+    preset_names,
+    preset_pool_size,
     split_pool_reserve,
 )
 from .install import install_commit_hook, install_hook_tg, install_skill
@@ -200,7 +203,10 @@ def _git_diff(cwd: Path, staged: bool) -> str:
 def _read_stdin_if_piped() -> str | None:
     if sys.stdin.isatty():
         return None
-    data = sys.stdin.read()
+    try:
+        data = sys.stdin.read()
+    except OSError:
+        return None
     return data if data else None
 
 
@@ -1628,7 +1634,7 @@ class _Tee(io.TextIOBase):
 # `--prompt -o…`). This keeps the light pre-scan from stealing another flag's value.
 _VALUE_TAKING_OPTS = frozenset({
     "-m", "--model", "-C", "--cwd", "--task", "-o", "--output", "--prompt", "--timeout",
-    "--pool", "--moderator", "--rounds", "--max-rounds",
+    "--pool", "--preset", "--moderator", "--rounds", "--max-rounds",
     "--visual", "--before", "--intent", "--expect", "--check",
     "--vision-timeout", "--project",
     # `--retry N` is a diff-mode-only int option (reviewlib/modes/review.py). It consumes a
@@ -1723,7 +1729,7 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
 
 
 _LEADING_MODE_VALUE_OPTS = frozenset({
-    "-m", "--model", "-C", "--cwd", "--task", "--timeout", "--pool",
+    "-m", "--model", "-C", "--cwd", "--task", "--timeout", "--pool", "--preset",
 })
 _LEADING_MODE_FLAG_OPTS = frozenset({"--list-defaults", "--show-board"})
 _LEADING_MODE_INLINE_SHORT_OPTS = ("-m", "-C")
@@ -1957,10 +1963,20 @@ def _model_default_help(mode: ModeSpec | None) -> str:
         return f"{_fmt(default_models)} (the built-in defaults)"
 
     # diff review (and the top-level overview, mode is None): models priority roster >
-    # the active board.
+    # config board > active/default preset board.
     if config_models:
         return f"your config.yaml models priority roster: {_fmt(config_models)}"
-    return "the active reviewer board (run `review --show-board`; see `review help config`)"
+    if isinstance(config.get("board"), list) and config.get("board"):
+        try:
+            board_models = [r.model for r in load_board(config)]
+        except Exception:  # noqa: BLE001 — --help must never crash on a bad board
+            board_models = []
+        if board_models:
+            return f"your config.yaml board: {_fmt(board_models)}"
+    return (
+        f"the {DEFAULT_PRESET!r} preset reviewer board "
+        "(run `review --show-board`; see `review help config`)"
+    )
 
 
 def _moderator_default_help() -> str:
@@ -2016,10 +2032,24 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
     )
     parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
     parser.add_argument("--show-board", action="store_true", help="print the active reviewer board (model -> role, availability) and exit")
+    if mode is None or mode.name == "review":
+        parser.add_argument(
+            "--preset",
+            choices=preset_names(),
+            default=None,
+            help=(
+                "diff-review preset: light = quick/cheap preflight (pool 2, medium effort); "
+                "default = routine change review (pool 4, high effort, excludes Fable/Sol); "
+                "heavy = release/risky-change review (pool 4, highest effort, includes Fable/Sol). "
+                f"If no config board/models are set, review diff uses {DEFAULT_PRESET!r}."
+            ),
+        )
     parser.add_argument(
-        "--pool", type=int, default=DEFAULT_POOL_SIZE, metavar="N",
+        "--pool", type=int, default=None, metavar="N",
         help=(
-            f"how many of the board's seats to run (default {DEFAULT_POOL_SIZE}); the "
+            "how many of the board's seats to run (default "
+            f"{preset_pool_size('default')} for default/heavy, {preset_pool_size('light')} "
+            f"for light; {DEFAULT_POOL_SIZE} with no preset); the "
             "first N seats participate, the rest are kept in reserve. The board is "
             "never off — --pool only sizes it. N<=0 means all seats. Ignored for explicit -m."
         ),
@@ -2197,11 +2227,13 @@ CONFIG FILE
   `glm` -> zai:glm-5.2, `cc` -> commandcode).
 
 SELECTION CASCADE, by mode:
-  review diff           : explicit -m requested models  >  config `models:` priority roster  >
-                          config/default reviewer BOARD.
+  review diff           : explicit -m requested models  >  explicit --preset  >
+                          config `models:` priority roster  >  config `board:`  >
+                          default preset.
                           With configured `models:`/`board:` metadata, -m narrows that
                           board metadata to only the requested models; without config it is
-                          the legacy flat exact panel.
+                          the legacy flat exact panel unless an explicit preset supplies
+                          metadata/effort for the requested models.
   review visual         : explicit -m  >  `visual_models:`  >  visual defaults.
   review brainstorm     : explicit -m  >  `brainstorm_models:`  >  `models:`  >  defaults.
   review just-ask/quorum: explicit -m  >  `models:`  >  the built-in defaults.
@@ -2213,16 +2245,18 @@ SELECTION CASCADE, by mode:
   Visual defaults:  {", ".join(_expand_alias(x) for x in VISUAL_MODELS)}.
   See the live default for each subcommand in `review <mode> --help` (the --model line).
 
-REVIEWER BOARD (the diff-review default; `review --show-board` prints it live)
+REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints it live)
   A priority-ordered panel of seats, each model carrying its own
-  role/lens. A plain `review diff` runs a POOL of {DEFAULT_POOL_SIZE} (top-N AVAILABLE by
-  priority) with startup + mid-run failover from the reserve. `--pool N` sizes it
-  (`--pool 0` = all available). Explicit -m never lets config add extra seats; it narrows
+  role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool 4, high effort,
+  without Fable/Sol. Use `--preset light` for quick preflight (pool 2, medium effort) and
+  `--preset heavy` for release/risky changes (Fable/Sol/Opus/GLM-cc at highest effort).
+  `--pool N` sizes the selected board (`--pool 0` = all available). Explicit -m never lets config add extra seats; it narrows
   configured metadata when present, else uses the flat exact panel. To set the priority
-  roster, configure `models:`. To add role/name metadata (or a full board when `models:`
-  is absent), set `board:` in config.yaml (a list of {{model, role, name}}
-  entries; `name` is the display label, `role` is a key into the built-in role lenses) or
-  edit DEFAULT_BOARD in reviewlib/config.py.
+  roster, configure `models:`. To add role/name/effort metadata (or a full board when
+  `models:` is absent), set `board:` in config.yaml (a list of {{model, role, name,
+  effort}} entries; `name` is the display label, `role` is a key into the built-in role
+  lenses, and `effort` is one of minimal/low/medium/high/xhigh/max) or edit DEFAULT_BOARD in
+  reviewlib/config.py.
 
 KEYS / AUTH (resolved from the process env first, then the shared .env)
   Shared .env:  ~/.config/review-cli/.env   (override with $GEMINI_ENV_FILE)
@@ -2574,20 +2608,53 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # blank/whitespace entries — is NOT a real preference.
     config_models = _split_models(config.get("models") or [])
     config_visual_models = _split_models(config.get("visual_models") or [])
+    config_has_board = isinstance(config.get("board"), list) and bool(config.get("board"))
+    explicit_models = _split_models(args.model)
+    explicit_preset = getattr(args, "preset", None) is not None
+    preset_applies = mode.name == "review"
+    if explicit_preset and preset_applies:
+        active_preset = args.preset
+    elif preset_applies and not explicit_models and not config_models and not config_has_board:
+        active_preset = DEFAULT_PRESET
+    else:
+        active_preset = None
+    effective_pool_size = args.pool if args.pool is not None else preset_pool_size(active_preset)
 
     if args.list_defaults:
-        effective = (
-            config_visual_models or [_expand_alias(x) for x in VISUAL_MODELS]
-            if mode.name == "visual"
-            else config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
-        )
+        if explicit_models:
+            effective = explicit_models
+        elif mode.name == "visual":
+            effective = config_visual_models or [_expand_alias(x) for x in VISUAL_MODELS]
+        elif mode.name == "review" and active_preset is not None:
+            try:
+                effective = [r.model for r in load_board(config, preset=active_preset)]
+            except BoardConfigError as exc:
+                print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
+                return 2
+        elif mode.name == "review" and config_models:
+            effective = config_models
+        elif mode.name == "review" and config_has_board:
+            try:
+                effective = [r.model for r in load_board(config)]
+            except BoardConfigError as exc:
+                print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
+                return 2
+        elif mode.name == "brainstorm":
+            effective = _split_models(config.get("brainstorm_models") or []) or config_models or [
+                _expand_alias(x) for x in DEFAULT_MODELS
+            ]
+        else:
+            effective = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
         print("\n".join(effective))
         return 0
 
     if args.show_board:
         # Resolve cwd up front so the agentic/diff-only labels reflect whether opencode
         # would actually run in a real repo for THIS -C (it's diff-only outside a repo).
-        return _show_board(config, args.pool, _effective_cwd(args.cwd))
+        return _show_board(
+            config, effective_pool_size, _effective_cwd(args.cwd),
+            preset=active_preset, explicit_models=explicit_models,
+        )
 
     piped_input = _read_stdin_if_piped()
     task_code: str | None = None
@@ -2660,7 +2727,6 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # tolerant `--visual` review (which DOES proceed as-is) keep the warning.
     _review_required = mode.name == "review" and (args.staged or args.visual is None)
     cwd = _effective_cwd(args.cwd, warn=not _review_required)
-    explicit_models = _split_models(args.model)
     is_brainstorm = mode.name == "brainstorm"
     is_visual_subcommand = mode.name == "visual"
     # A "panel mode" is any non-review mode (brainstorm / just-ask / quorum): the diff is
@@ -2722,8 +2788,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # `review visual` pipeline (codex P2). It still fires
     # BEFORE the COMPANION visual fan-out, so a doomed config never spends a paid vision
     # call.
-    config_has_board = isinstance(config.get("board"), list) and bool(config.get("board"))
-    use_board = not panel_mode and (not explicit_models or bool(config_models) or config_has_board)
+    use_board = not panel_mode and (
+        not explicit_models or bool(config_models) or config_has_board or active_preset is not None
+    )
     board: list | None = None
     board_validated = False
 
@@ -2731,7 +2798,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         """Resolve + validate the FULL priority-ordered reviewer board for the default
         review path, once. The board is loaded whole (NOT sliced to --pool here): the
         failover pool path (mode_review) does the startup failover — selecting the top
-        `args.pool` AVAILABLE seats by priority — and keeps the rest as the reserve that
+        configured number of AVAILABLE seats by priority — and keeps the rest as the reserve that
         backfills a seat which fails mid-run. Returns an exit code (2) on an all-malformed
         `board:` config, else None. No-op when the board does not apply (panel mode or
         explicit -m with no configured board/models)."""
@@ -2742,13 +2809,15 @@ def _dispatch(argv: list[str] | None = None) -> int:
         try:
             if explicit_models:
                 try:
-                    board = board_from_models(explicit_models, config)
+                    board = board_from_models(explicit_models, config, preset=active_preset)
                 except BoardConfigError as exc:
                     print(
                         f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
                         file=sys.stderr, flush=True,
                     )
-                    board = board_from_models(explicit_models, {})
+                    board = board_from_models(explicit_models, {}, preset=active_preset)
+            elif active_preset is not None:
+                board = load_board(config, preset=active_preset)
             elif config_models:
                 board = board_from_models(config_models, config)
             else:
@@ -3012,7 +3081,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if rc is not None:
         return rc
     if board:
-        review_pool_size = len(board) if explicit_models else args.pool
+        review_pool_size = len(board) if explicit_models else effective_pool_size
         # Failover pool. The PLANNED pool keys the up-front ETA: the top `--pool`
         # AVAILABLE seats by priority (startup failover — the same selection mode_review
         # makes). The RECORDED models come from the failover outcome (the seats that
@@ -3084,12 +3153,16 @@ def _seat_reads_repo(model: str, cwd_is_repo: bool) -> bool:
     return False
 
 
-def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | None = None) -> int:
+def _show_board(
+    config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | None = None,
+    *, preset: str | None = None, explicit_models: list[str] | None = None,
+) -> int:
     """Print the active reviewer board as a PRIORITY-ordered failover pool.
 
-    The board (config.yaml `board:` if set, else the built-in DEFAULT_BOARD) is listed
-    in priority order (strongest first). Each seat shows its display name, role, model,
-    backend availability (key/CLI present), and a failover TIER:
+    The selected board (explicit preset, else config.yaml `models:`/`board:`, else the
+    raw built-in DEFAULT_BOARD) is listed in priority order (strongest first). Each seat
+    shows its display name, role, model, backend availability (key/CLI present), and a
+    failover TIER:
       * `pool`    — one of the top-`pool_size` AVAILABLE seats that a plain `review`
                     actually runs (startup failover: a higher-priority but UNAVAILABLE
                     seat is skipped and the next available one is pulled into the pool);
@@ -3099,8 +3172,22 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | No
                     run-time "unavailable" reply still triggers a reserve backfill.
     Read-only — no model is called, no key is printed."""
     config_models = _split_models(config.get("models") or [])
+    exact_models = explicit_models or []
     try:
-        if config_models:
+        if exact_models:
+            try:
+                board = board_from_models(exact_models, config, preset=preset)
+            except BoardConfigError as exc:
+                print(
+                    f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
+                    file=sys.stderr, flush=True,
+                )
+                board = board_from_models(exact_models, {}, preset=preset)
+            source = f"explicit -m{f' + preset:{preset}' if preset else ''}"
+        elif preset:
+            board = load_board(config, preset=preset)
+            source = f"preset:{preset}"
+        elif config_models:
             board = board_from_models(config_models, config)
             source = "config.yaml (models:)"
         else:
@@ -3117,14 +3204,20 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | No
     # `reserve`. `pool_filled` is how many of the AVAILABLE seats the pool size selects.
     avail = [backends.backend_available(r.model) for r in board]
     available_count = sum(avail)
-    pool_filled = _effective_pool_size(available_count, pool_size)
-    sized = " (sized by --pool)" if pool_size != DEFAULT_POOL_SIZE else ""
-    pool_target = "all available" if pool_size <= 0 else pool_size
-    print(f"Reviewer board ({len(board)} seats, priority-ordered, source: {source}; "
-          f"live pool = top {pool_target} AVAILABLE by priority{sized}, "
-          f"{pool_filled} filled, the rest reserve — size with --pool N):\n")
+    exact_board = bool(exact_models)
+    pool_filled = len(board) if exact_board else _effective_pool_size(available_count, pool_size)
+    sized = " (sized by preset/--pool)" if pool_size != DEFAULT_POOL_SIZE else ""
+    if exact_board:
+        print(f"Reviewer board ({len(board)} explicit seats, source: {source}; "
+              "exact -m run = every listed seat is attempted; --pool is ignored):\n")
+    else:
+        pool_target = "all AVAILABLE seats" if pool_size <= 0 else f"top {pool_size} AVAILABLE"
+        print(f"Reviewer board ({len(board)} seats, priority-ordered, source: {source}; "
+              f"live pool = {pool_target} by priority{sized}, "
+              f"{pool_filled} filled, the rest reserve — size with --pool N):\n")
     name_w = max((len(r.display) for r in board), default=0)
     role_w = max((len(r.role or "general") for r in board), default=0)
+    effort_w = max((len(r.effort or "-") for r in board), default=1)
     # Resolve the repo bit ONCE (a single git rev-parse) for the opencode scope label,
     # rather than per seat in the loop.
     cwd_is_repo = backends._opencode_runs_in_repo(cwd or Path.cwd())
@@ -3134,11 +3227,17 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | No
         if available:
             status = "available"
         elif backends.runtime_provider_marked_unpaid(reviewer.model):
-            status = "SKIPPED (provider unpaid/disabled)"
+            status = (
+                "will attempt (provider unpaid/disabled)"
+                if exact_board else "SKIPPED (provider unpaid/disabled)"
+            )
         else:
-            status = "SKIPPED (no key/CLI)"
+            status = "will attempt (no key/CLI)" if exact_board else "SKIPPED (no key/CLI)"
         role = (reviewer.role or "general").ljust(role_w)
-        if not available:
+        effort = (reviewer.effort or "-").ljust(effort_w)
+        if exact_board:
+            tier = "explicit"
+        elif not available:
             tier = "unavail"
         else:
             tier = "pool   " if seen_available < pool_filled else "reserve"
@@ -3146,15 +3245,24 @@ def _show_board(config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | No
         prio = f"#{index + 1}"
         scope = "agentic" if _seat_reads_repo(reviewer.model, cwd_is_repo) else "diff-only"
         print(f"  {prio:>3}  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  "
-              f"{reviewer.model}  [{status}]  ({scope})")
+              f"{reviewer.model}  [{status}]  ({scope})  effort={effort}")
     print("\nScope: `agentic` seats (codex / opencode / claude-CLI) run read-only in the "
           "real repo and can read any project file; `diff-only` seats (gemini / z.ai / "
           "commandcode / claude-API) are stateless HTTP calls that see only the diff.")
-    print(f"\nA plain `review diff` runs the top {DEFAULT_POOL_SIZE} AVAILABLE seats by "
-          f"priority (--pool {DEFAULT_POOL_SIZE}); a higher-priority seat that is "
-          f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "
-          f"pool keeps {DEFAULT_POOL_SIZE} working reviewers. `--pool N` sizes the pool; "
-          f"`--pool 0` runs all available seats.")
+    if exact_board:
+        print("\nWith explicit `-m`, review-cli attempts exactly the listed models in order. "
+              "`--pool` and reserve failover do not slice or reorder explicit seats.")
+    elif pool_size <= 0:
+        print("\nA plain `review diff` runs all AVAILABLE seats by priority (--pool 0); "
+              "a higher-priority seat that is unavailable is skipped, and a seat that "
+              "fails mid-run is recorded while the remaining available seats continue. "
+              "`--pool N` sizes the pool.")
+    else:
+        print(f"\nA plain `review diff` runs the top {pool_size} AVAILABLE seats by "
+              f"priority (--pool {pool_size}); a higher-priority seat that is "
+              f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "
+              f"pool keeps {pool_size} working reviewers. `--pool N` sizes the pool; "
+              f"`--pool 0` runs all available seats.")
     if not all(avail):
         print("Unavailable reviewers drop out and are backfilled from the reserve; the "
               "board degrades gracefully only if the reserve is exhausted. The default "

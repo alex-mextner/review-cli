@@ -20,6 +20,19 @@ from pathlib import Path
 
 from .stats import normalize_task_code
 
+_LOG_HEADER_CONTROL_TRANSLATION = {
+    **{codepoint: "?" for codepoint in range(0x20)},
+    **{codepoint: "?" for codepoint in range(0x80, 0xA0)},
+    0x7F: "?",
+    0x2028: "?",
+    0x2029: "?",
+}
+
+
+def _safe_log_header(value: object) -> str:
+    return str(value or "?").translate(_LOG_HEADER_CONTROL_TRANSLATION)
+
+
 # Single source of truth for stripping terminal control noise out of captured
 # backend output. A backend can leak ANSI/VT100 escapes into its stdout — colour
 # codes, cursor moves, OSC hyperlinks — and an interactive-TUI-scraper backend (the
@@ -72,7 +85,7 @@ def strip_control_sequences(text: str) -> str:
 # NOTE: this is a PER-PROCESS cap. A swarm of N separate `review` processes is N independent
 # caps — the cross-process lever is the per-seat timeout (a stalled seat frees its slot fast)
 # plus deprioritizing the known-slow reserve seat, both also part of #65. A per-process cap
-# still bounds the worst single-invocation fan-out (a `--pool 9` board, or a cascade of
+# still bounds the worst single-invocation fan-out (`--pool 0` on a large board, or a cascade of
 # reserve backfills) that one process can create.
 _DEFAULT_MAX_CONCURRENCY = 4
 _MAX_CONCURRENCY_CEILING = 64  # a typo'd env can't pin an absurd number of children
@@ -450,7 +463,10 @@ def write_sidecar_log(
     path = log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(f"[review-cli] {backend}: {argv0 or '?'} (args redacted){_task_header_suffix()}\n")
+        fh.write(
+            f"[review-cli] {_safe_log_header(backend)}: {_safe_log_header(argv0)} "
+            f"(args redacted){_task_header_suffix()}\n"
+        )
         if stdout:
             fh.write(stdout if stdout.endswith("\n") else stdout + "\n")
         for line in stderr.splitlines():
@@ -639,7 +655,7 @@ def _run_streamed(
         # backend may pass `header_argv0` to record a model SELECTOR instead of the bare
         # binary path (e.g. opencode's `opencode -m <provider/model>`), so the dashboard
         # can attribute the call to its board seat — it must still contain NO prompt/diff.
-        header = header_argv0 or (argv[0] if argv else "?")
+        header = _safe_log_header(header_argv0 or (argv[0] if argv else "?"))
 
         # Acquire a concurrency slot BEFORE spawning, so the number of heavy backend
         # subprocesses in flight is capped (review-cli#65). This BLOCKS until a slot frees —
@@ -663,7 +679,7 @@ def _run_streamed(
                 concurrency_sem.acquire()
                 sem_acquired = True
 
-        log_fh.write(f"[review-cli] {backend}: {header} (args redacted){_task_header_suffix()}\n")
+        log_fh.write(f"[review-cli] {_safe_log_header(backend)}: {header} (args redacted){_task_header_suffix()}\n")
         log_fh.flush()
 
         proc = subprocess.Popen(

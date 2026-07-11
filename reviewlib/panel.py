@@ -11,7 +11,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from .backends import ReviewResult, backend_available, resolve_backend, review_with_images
+from .backends import ReviewResult, backend_available, call_backend, resolve_backend, review_with_images
 from .config import MODERATOR_CANDIDATES, BoardReviewer
 from .process import write_retry_log
 
@@ -253,6 +253,7 @@ class PanelJob:
     # infers brainstorm mode from round>=1 (HYP-742 finding 3). 0 = single-shot
     # review/just-ask/quorum (no rounds).
     round_no: int = 0
+    effort: str | None = None
 
 
 def build_board_job(
@@ -260,15 +261,19 @@ def build_board_job(
 ) -> PanelJob:
     """One role-lensed PanelJob for a reviewer (no availability check).
 
-    The prompt is `base_prompt + "\\n\\n" + role_lens` (the generic prompt alone when
-    the role is unknown / blank) and the label is `"<display> [<role>]"` so the result
-    block shows who reviewed with which lens."""
+    The prompt is `base_prompt + "\\n\\n" + role_lens` (the generic prompt alone
+    when the role is unknown / blank) and the label is
+    `"<display> [<role>]"` so the result block shows who reviewed with which lens."""
     lens = reviewer.role_lens
-    prompt = f"{base_prompt}\n\n{lens}" if lens else base_prompt
+    parts = [base_prompt]
+    if lens:
+        parts.append(lens)
+    prompt = "\n\n".join(parts)
     role_tag = reviewer.role or "general"
     return PanelJob(
         model=reviewer.model, prompt=prompt, diff=diff,
         label=f"{reviewer.display} [{role_tag}]", images=images,
+        effort=reviewer.effort,
     )
 
 
@@ -414,10 +419,12 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
     def _run_job(job: PanelJob) -> ReviewResult:
         if job.images:
             return review_with_images(
-                job.model, job.prompt, job.diff, cwd, timeout, job.round_no, job.images
+                job.model, job.prompt, job.diff, cwd, timeout, job.round_no, job.images,
+                effort=job.effort,
             )
-        return resolve_backend(job.model)(
-            job.model, job.prompt, job.diff, cwd, timeout, job.round_no
+        return call_backend(
+            resolve_backend(job.model),
+            job.model, job.prompt, job.diff, cwd, timeout, job.round_no, effort=job.effort,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:

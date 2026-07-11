@@ -5,6 +5,15 @@ semantic versioning.
 
 ## Unreleased
 
+- **Diff review presets and the Sol seat are now built in.** A plain `review diff` now runs the
+  `default` preset: pool 4, high effort, and no Fable/Sol by default. Use `--preset light` for a
+  cheaper pool 2 at medium effort, or `--preset heavy` for release/risky changes with Fable, Sol
+  (`codex:gpt-5.6-sol`), Opus, and GLM-cc in the live pool at highest effort plus the full reserve.
+  `--show-board` follows the same preset selection, explicit `-m` remains exact, and unpaid
+  Command Code/Fireworks providers are skipped before dispatch. Programmatic `load_board({})`
+  now returns the default preset board; use `load_board(..., preset="heavy")` or `DEFAULT_BOARD`
+  when callers need the raw 10-seat board including Fable/Sol.
+
 - **Gemini review/vision seat now defaults to the current GA model `gemini-3.5-flash` (review-cli#139).** The old `gemini-2.5-flash` default was 404ing the pool's gemini seat (it is retired-soon; Google names `gemini-3.5-flash` as its GA replacement with no shutdown date), so a dead seat could silently count toward the self-merge review-quorum's distinct-model bar. Both the text backend (`review_gemini`) and the vision fallback default to `gemini-3.5-flash`; an explicit `$GEMINI_MODEL` or a `gemini:<model>` seat suffix still overrides it. The quorum-count half (a failed/404/degraded seat must not count as a substantive reviewer) is handled by review-cli#138.
 
 - **Model override and unpaid-provider handling are now explicit (review-cli#128).**
@@ -116,36 +125,15 @@ semantic versioning.
   belt-and-suspenders so a stray escape can never corrupt the parsed `## … [ok]/[needs-changes]`
   line. Other seats and the API path are unchanged.
 
-- **GLM 5.2 via the Command Code gateway added as the priority-3 board seat (directly under
-  Opus).** A new default-board seat `commandcode:zai-org/GLM-5.2` (display `GLM-cc`, role
-  `performance`) sits immediately after Opus, so a plain `review diff` runs Fable, Opus,
-  GLM-5.2-via-commandcode, Codex as its top-4 pool. It carries the `performance` lens (NOT a
-  second `correctness` — that would duplicate Opus's lens): inserting it at #3 pushes Kimi,
-  the old performance seat, to #5/reserve, so GLM-cc takes over `performance` and the default
-  pool keeps its four distinct lenses (architect/correctness/performance/consistency) — a
-  pure priority change, no *lens* lost. TRADE-OFF (named explicitly): the default top-4 pool
-  used to be fully agentic; now the `performance` lens in a plain `review diff` is served by
-  this **diff-only** GLM-cc seat instead of the repo-aware Kimi (pushed to reserve #5), so
-  that lens no longer reads the whole repo in a default run — a deliberate consequence of
-  ranking GLM-5.2's model strength above transport capability, per the directive, not an
-  oversight. When GLM-cc itself is unavailable, the pool backfills with Kimi (#5,
-  `performance`) and ends as `[Fable, Opus, Codex, Kimi]` — the SAME four distinct lenses the
-  pre-#57 board had, so the new seat costs no lens diversity when it is the one missing (test
-  `test_glm_cc_unavailable_keeps_four_distinct_lenses`). Whether that backfill is *agentic*
-  depends on the host: review-cli's `COMMANDCODE_API_KEY` gates only the diff-only GLM-cc
-  seat, NOT opencode's `commandcode` provider (which carries its own auth from `opencode auth
-  login`, independent of that env var — verified: opencode's provider config has no `apiKey`
-  bound to it), so a host missing only review-cli's key still has the agentic Kimi reserve.
-  The seat is **diff-only** (a stateless
-  keyed-HTTP POST through `review_commandcode`, like Gemini) and therefore **read-only by
-  construction** — no repo access, tools, or exec, so it needs no `-s read-only` cage. It is
-  diff-only on purpose: opencode's `commandcode` provider does not register this GLM id, so
-  the agentic `oc:commandcode/zai-org/GLM-5.2` route errors; the keyed-HTTP route is the only
-  one that reaches it (verified live). It is **distinct** from the existing lower-priority
-  `oc:zai/glm-5.2` seat (display `GLM`): same model family, different provider/transport
-  (Command Code gateway vs the z.ai Coding-Plan subscription). It degrades gracefully when
-  `COMMANDCODE_API_KEY` is absent (the pool backfills it from the reserve), exactly like every
-  other key-gated backend. The board is now 9 seats. (Canonical id: `GLM_COMMANDCODE_SEAT`.)
+- **GLM 5.2 via the Command Code gateway remains the priority-4 raw-board seat under
+  Sol/Opus.** The raw built-in board is now 10 seats: Fable, Sol, Opus, GLM-cc, Kimi,
+  Codex, Qwen, DeepSeek, Gemini, and GLM. `commandcode:zai-org/GLM-5.2` (display `GLM-cc`,
+  role `performance`) is still diff-only and read-only by construction, because opencode's
+  `commandcode` provider does not register that GLM id. A plain `review diff` no longer runs
+  Fable/Sol; it uses the `default` preset (`Opus`, `GLM-cc`, `Kimi`, `Codex` as the top
+  available pool at high effort, with reserve failover). Use `--preset heavy` to put Fable,
+  Sol, Opus, and GLM-cc in the live pool at `xhigh` effort, with the remaining raw-board
+  seats as `max`-effort reserve. (Canonical id: `GLM_COMMANDCODE_SEAT`.)
 
 - **In-seat retry before reserve-replace, with retryable/seat-fatal classification.** The
   failover board now retries a failed seat *on the same model* when the failure is
@@ -184,7 +172,7 @@ semantic versioning.
     etc. — instead of the unicode-emoji fallback. Each model resolves to its brand via the
     same exact-then-prefix logic tg-cli uses (`extractBaseModel`): Opus/Fable → Anthropic,
     GPT/o1/o3/Codex → OpenAI, Llama → Meta, GLM/z.ai → the GLM brand tile, and so on — so the
-    8-seat default board (Fable/Opus/Codex/Kimi/GLM/Qwen/DeepSeek/Gemini) renders all real
+    default preset board (Opus/GLM-cc/Kimi/Codex/Qwen/DeepSeek/Gemini/GLM) renders all real
     logos with no odd-one-out. A family with no shipped logo (MiniMax, a bare gateway probe)
     renders a clean two-letter brand monogram — never a generic emoji. The server serves the
     PNGs from an allowlisted `assets/icons/` path.
@@ -272,29 +260,30 @@ semantic versioning.
   z.ai/GLM was not yet an opencode-native provider. **Superseded by review-cli#24 (see the
   top Unreleased entry):** with `commandcode` and `zai` registered as opencode custom
   providers, those default board seats now run agentically through opencode too.)
-- **Priority-ordered failover reviewer pool** — the reviewer board is now a
-  **priority-ordered** list of 8 models (strongest first), and a plain `review` runs a
-  **pool of 4** chosen by **priority + availability** with two layers of failover so the
-  run keeps **4 working reviewers**:
-  - **Startup failover** — the active pool is the **top 4 AVAILABLE** seats by priority;
-    a higher-priority but unavailable seat (no key / not on PATH) is skipped and the
-    next-priority one is pulled up, so you still start with 4 working models.
+- **Priority-ordered failover reviewer pool (historical baseline; superseded by the presets
+  entry above)** — the raw built-in board is now a **priority-ordered** list of 10 models
+  (strongest first), while a plain `review diff` runs the `default` preset (pool 4, no
+  Fable/Sol) and `--preset heavy` runs the full Fable/Sol-capable board. The same failover
+  mechanics still apply:
+  - **Startup failover** — the active pool is the **top N AVAILABLE** seats by priority;
+    a higher-priority but unavailable seat (no key / not on PATH / unpaid provider) is skipped
+    and the next-priority one is pulled up, so you still start with the requested number of
+    working models.
   - **Mid-run failover** — a seat that fails **during** the review (backend error,
     timeout, empty output, or an "unavailable" reply like a paywalled model returning
     *"… is currently unavailable"*) is replaced by the next-priority **reserve**,
-    repeating until 4 working verdicts are produced or the reserve is exhausted (then the
-    run degrades gracefully, logs it, and exits non-zero).
+    repeating until the requested number of working verdicts is produced or the reserve is
+    exhausted (then the run degrades gracefully, logs it, and exits non-zero).
 
   Each seat keeps its own role/lens (priority decides *who* sits; the role decides the
-  *lens*) — a promoted reserve brings its own lens. `--pool N` overrides the default 4
-  (top-N available, same failover); `--pool 0` runs all available. `--show-board` now
-  lists the board in priority order (with a `#` rank), tags each seat `pool`/`reserve`/
-  `unavail`, and shows the live pool. Run-stats `pool_size` reflects the models that
-  actually produced verdicts (a backfilled reserve under its real model id), not the
-  planned ones. Re-rank by reordering `DEFAULT_BOARD` (or a config `board:` list). The
-  default priority order is Fable 5, Opus 4.8, Codex (GPT-5.5), Kimi K2.7, GLM-5.2,
-  Qwen3.7-Max, DeepSeek-V4-Pro, Gemini. The board can **never be disabled** (an explicit
-  `-m` or a config `models:` list still bypasses it; the `--no-board` flag stays removed).
+  *lens*) — a promoted reserve brings its own lens. `--pool N` overrides the selected
+  preset's default; `--pool 0` runs all available seats in that preset/board. `--show-board`
+  lists the selected board in priority order (with a `#` rank), tags each seat
+  `pool`/`reserve`/`unavail`, and shows the live pool. Run-stats `pool_size` reflects the
+  models that actually produced verdicts (a backfilled reserve under its real model id), not
+  the planned ones. Re-rank by selecting a preset, setting `models:`, or defining a config
+  `board:` list. The board can **never be disabled** (an explicit `-m` or a config `models:`
+  list still bypasses it; the `--no-board` flag stays removed).
 - **Seat 3 is `codex` (agentic), not `commandcode:gpt-5.5` (diff-only)** — GPT-5.5 IS
   codex (same model, two routes). The board now seats the AGENTIC codex CLI route
   (`codex exec -s read-only -C <cwd>`), which reads the whole repo and is free, instead
