@@ -28,6 +28,7 @@
     specTitle: document.getElementById('specTitle'),
     specPane: document.getElementById('specPane'),
     layout: document.getElementById('layout'),
+    connectionStatus: document.getElementById('connectionStatus'),
     navBack: document.getElementById('navBack'),
     commentsList: document.getElementById('commentsList'),
     commentsEmpty: document.getElementById('commentsEmpty'),
@@ -55,6 +56,7 @@
   var state = {
     headings: [], // [{level,text,id}]
     comments: [], // server comments
+    commentsLoadError: false,
     drafts: {}, // slot -> {body,kind,quote,section_id,section_title,start,end,updated}
     filter: 'all',
     pendingSelection: null, // {quote, section_id, section_title, start, end}
@@ -76,6 +78,11 @@
   // Poll the comments API on this interval so an OPEN page picks up an agent reply left via
   // `review spec-web reply` (and any other out-of-band change) without a manual refresh.
   var COMMENTS_POLL_MS = 5000;
+  var DEFAULT_COMMENTS_EMPTY_TEXT = 'Select any text in the spec to ask a question or leave a remark.';
+  // SYNC: reviewlib/specweb/static/sw.js CONTENT_CACHE.
+  var CONTENT_CACHE = 'review-specweb-content-v2';
+  var SPECWEB_RESPONSE_HEADER = 'X-Review-Specweb';
+  var SPECWEB_RESPONSE_VALUE = '1';
   // The fixed slot id of the new-note composer draft, and the edit-slot format.
   // SYNC: reviewlib/specweb/store.py NEW_DRAFT_SLOT / edit_draft_slot (a test asserts match).
   var NEW_DRAFT_SLOT = 'new';
@@ -129,6 +136,125 @@
       return r.json();
     });
   }
+  function getJsonWithResponse(url) {
+    return fetch(apiUrl(url)).then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (j) {
+          throw new Error(j.error || r.statusText);
+        });
+      return r.json().then(function (data) {
+        return { data: data, response: r };
+      });
+    });
+  }
+
+  function absoluteUrl(path) {
+    return new URL(path, window.location.href).href;
+  }
+
+  function currentPageUrl() {
+    return window.location.origin + window.location.pathname + window.location.search;
+  }
+
+  function responseAllowsCache(response) {
+    if ((response.headers.get('Cache-Control') || '').indexOf('no-store') >= 0) return false;
+    return response.headers.get(SPECWEB_RESPONSE_HEADER) === SPECWEB_RESPONSE_VALUE;
+  }
+
+  function cacheJson(url, data, response) {
+    if (!response || !responseAllowsCache(response)) return Promise.resolve();
+    if (!window.caches) return Promise.resolve();
+    var headers = { 'Content-Type': 'application/json' };
+    headers[SPECWEB_RESPONSE_HEADER] = SPECWEB_RESPONSE_VALUE;
+    return window.caches.open(CONTENT_CACHE)
+      .then(function (cache) {
+        return cache.put(absoluteUrl(url), new Response(JSON.stringify(data), {
+          headers: headers,
+        }));
+      })
+      .catch(function () {});
+  }
+
+  function cacheCurrentShell() {
+    if (!window.caches) return Promise.resolve();
+    var clone = document.documentElement.cloneNode(true);
+    var list = clone.querySelector('#commentsList');
+    var empty = clone.querySelector('#commentsEmpty');
+    var status = clone.querySelector('#connectionStatus');
+    var count = clone.querySelector('#commentsCount');
+    var pending = clone.querySelector('#pendingTray');
+    var popup = clone.querySelector('#selPopup');
+    var composer = clone.querySelector('#composerBackdrop');
+    var draftNote = clone.querySelector('#composerDraftNote');
+    var body = clone.querySelector('#composerBody');
+    var navBack = clone.querySelector('#navBack');
+    if (list) list.innerHTML = '';
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = DEFAULT_COMMENTS_EMPTY_TEXT;
+    }
+    if (status) status.hidden = true;
+    if (count) count.hidden = true;
+    if (pending) pending.hidden = true;
+    if (popup) popup.hidden = true;
+    if (composer) composer.hidden = true;
+    if (draftNote) draftNote.hidden = true;
+    if (body) {
+      body.value = '';
+      body.textContent = '';
+      body.removeAttribute('value');
+    }
+    if (navBack) navBack.hidden = true;
+    return window.caches.open(CONTENT_CACHE)
+      .then(function (cache) {
+        return cache.put(currentPageUrl(), new Response('<!DOCTYPE html>\n' + clone.outerHTML, {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        }));
+      })
+      .catch(function () {});
+  }
+
+  function cacheSpecAssets() {
+    if (!window.caches || !window.fetch) return Promise.resolve();
+    var urls = {};
+    var nodes = els.specBody.querySelectorAll('[src], [href]');
+    for (var i = 0; i < nodes.length; i++) {
+      var raw = nodes[i].getAttribute('src') || nodes[i].getAttribute('href');
+      if (!raw) continue;
+      try {
+        var url = new URL(raw, window.location.href);
+        if (url.origin === window.location.origin && /\/asset\/[^/]+$/.test(url.pathname)) {
+          urls[url.href] = true;
+        }
+      } catch (e) { /* ignore malformed links in rendered markdown */ }
+    }
+    return window.caches.open(CONTENT_CACHE)
+      .then(function (cache) {
+        return Promise.all(Object.keys(urls).map(function (url) {
+          return fetch(url, { cache: 'no-store' })
+            .then(function (response) {
+              if (response.ok && responseAllowsCache(response)) return cache.put(url, response.clone());
+              return null;
+            })
+            .catch(function () {});
+        }));
+      })
+      .catch(function () {});
+  }
+
+  function showOfflineStatus(offline) {
+    if (els.connectionStatus) els.connectionStatus.hidden = !offline;
+  }
+
+  showOfflineStatus(navigator.onLine === false);
+  window.addEventListener('online', function () { showOfflineStatus(false); });
+  window.addEventListener('offline', function () { showOfflineStatus(true); });
+  if (navigator.serviceWorker) {
+    navigator.serviceWorker.addEventListener('message', function (event) {
+      if (event.data && event.data.type === 'specweb-offline-cache') showOfflineStatus(true);
+      if (event.data && event.data.type === 'specweb-online') showOfflineStatus(false);
+    });
+  }
 
   // Look up a heading id WITHIN the rendered spec pane only. document.getElementById would
   // return an app-shell element when a spec heading's slug collides with a shell id (e.g. a
@@ -145,12 +271,16 @@
 
   // ---- load ---------------------------------------------------------------
   function loadSpec() {
-    return api('GET', '/api/spec')
-      .then(function (data) {
+    return getJsonWithResponse('/api/spec')
+      .then(function (result) {
+        var data = result.data;
         state.headings = data.headings || [];
         els.specBody.innerHTML = data.html || '<p>(empty spec)</p>';
         if (data.title) els.specTitle.textContent = data.title;
         wireInDocLinks();
+        cacheJson(apiUrl('/api/spec'), data, result.response);
+        cacheCurrentShell();
+        cacheSpecAssets();
       })
       .catch(function (e) {
         els.specBody.innerHTML = '<div class="loading">Failed to load spec: ' + esc(e.message) + '</div>';
@@ -241,7 +371,8 @@
   // untouched; reanchorAll() re-locates each comment's quote in the new content (a comment whose
   // quoted text was edited away simply shows as unanchored — never a crash).
   function liveReloadSpec() {
-    return api('GET', '/api/spec').then(function (data) {
+    return getJsonWithResponse('/api/spec').then(function (result) {
+      var data = result.data;
       var anchor = captureScrollAnchor();
       var oldSigs = topBlocks(els.specBody).map(blockSig);
       state.headings = data.headings || [];
@@ -255,6 +386,9 @@
       wireInDocLinks();
       reanchorAll();
       flashChanged(changed);
+      cacheJson(apiUrl('/api/spec'), data, result.response);
+      cacheCurrentShell();
+      cacheSpecAssets();
     }).catch(function () { /* a failed refresh just waits for the next event */ });
   }
 
@@ -279,9 +413,16 @@
 
   function loadComments() {
     return api('GET', '/api/comments').then(function (list) {
+      state.commentsLoadError = false;
       state.comments = Array.isArray(list) ? list : [];
       renderComments();
       reanchorAll();
+    });
+  }
+  function loadCommentsOrEmpty() {
+    return loadComments().catch(function () {
+      state.commentsLoadError = true;
+      renderComments();
     });
   }
   // Drafts are the reviewer's in-progress composer text, persisted server-side (debounced)
@@ -305,6 +446,11 @@
       .catch(function () {
         state.drafts = {};
       });
+  }
+  function loadDraftsOrEmpty() {
+    return loadDrafts().catch(function () {
+      state.drafts = {};
+    });
   }
 
   // In-doc anchor links (e.g. [§9.4](#94-...)) scroll inside the spec pane + flash. Each
@@ -876,7 +1022,10 @@
     // Toggle via the `hidden` attribute (not inline display) so the mobile collapsed CSS
     // rule `.comments-collapsed .comments-empty { display:none }` can still win — an inline
     // display:block would override it and leave the empty message visible when collapsed.
-    els.commentsEmpty.hidden = state.comments.length > 0;
+    els.commentsEmpty.textContent = state.commentsLoadError
+      ? 'Comments are unavailable while this spec is offline.'
+      : DEFAULT_COMMENTS_EMPTY_TEXT;
+    els.commentsEmpty.hidden = state.comments.length > 0 && !state.commentsLoadError;
     els.commentsList.innerHTML = '';
     list.forEach(function (c) {
       els.commentsList.appendChild(renderComment(c));
@@ -1467,7 +1616,7 @@
   wire();
   loadSpec()
     .then(function () {
-      return Promise.all([loadComments(), loadDrafts()]);
+      return Promise.all([loadCommentsOrEmpty(), loadDraftsOrEmpty()]);
     })
     .then(function () {
       restoreDraftOnLoad();

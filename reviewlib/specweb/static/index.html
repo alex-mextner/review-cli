@@ -3,12 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
 <title>Spec review — {{SPEC_TITLE}}</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/app-icon.png">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body data-spec-title="{{SPEC_TITLE}}">
 <header class="topbar">
   <div class="topbar-title">Spec review · <span id="specTitle">{{SPEC_TITLE}}</span></div>
+  <div class="connection-status" id="connectionStatus" hidden role="status">Offline · cached copy</div>
   <button class="back-btn" id="navBack" hidden title="Back to previous position" aria-label="Back to previous position">← Back</button>
 </header>
 
@@ -82,5 +86,12 @@
      server fills {{BASE}} (already escaped); app.js prepends it to every fetch. -->
 <script>window.__SPECWEB_BASE__ = "{{BASE}}";</script>
 <script src="/static/app.js"></script>
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' });
+  });
+}
+</script>
 </body>
 </html>

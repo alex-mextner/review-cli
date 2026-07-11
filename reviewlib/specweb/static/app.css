@@ -29,6 +29,9 @@ body{
 }
 .topbar-title{font-weight:600;letter-spacing:.2px;flex:1;min-width:0;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.connection-status{flex:0 0 auto;border:1px solid #6e5722;background:#2a220f;color:#ffd479;
+  border-radius:999px;padding:2px 8px;font-size:11px;font-weight:600;white-space:nowrap}
+.connection-status[hidden]{display:none}
 /* Back button: appears only after an internal cross-reference jump (JS toggles [hidden]). */
 .back-btn{background:#1c2230;border:1px solid var(--line);color:var(--ink);
   border-radius:8px;padding:5px 11px;font-size:13px;cursor:pointer;line-height:1;

@@ -7,6 +7,9 @@ submit the review, answer inline. Reads are open; writes are origin-guarded.
 Routes
 ------
 GET  /                         -> the reviewer SPA shell (spec rendered server-side into it)
+GET  /manifest.webmanifest     -> installable app metadata
+GET  /sw.js                   -> root-scoped offline service worker
+GET  /offline.html            -> app-level fallback for uncached navigations
 GET  /static/<file>            -> app.css / app.js (allowlisted)
 GET  /asset/<name>             -> a figure referenced by the spec (served from disk)
 GET  /api/health               -> {ok, spec_path, store_path, allowed_origins, ...}
@@ -56,6 +59,33 @@ from .service import DEFAULT_SPECWEB_HOST, DEFAULT_SPECWEB_PORT
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _ALLOWED_STATIC = {"app.js", "app.css"}
 _CONTENT_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
+_SPECWEB_RESPONSE_HEADER = "X-Review-Specweb"
+
+_APP_MANIFEST = {
+    "name": "Review CLI Spec Review",
+    "short_name": "Spec Review",
+    "description": "Review local specifications and keep opened specs available offline.",
+    "id": "/",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "background_color": "#0f1115",
+    "theme_color": "#0f1115",
+    "icons": [
+        {
+            "src": "/app-icon.png",
+            "sizes": "180x180",
+            "type": "image/png",
+            "purpose": "any",
+        },
+        {
+            "src": "/app-icon.svg",
+            "sizes": "any",
+            "type": "image/svg+xml",
+            "purpose": "any maskable",
+        }
+    ],
+}
 
 # Max request body for a write. Comments/answers are free text; 256 KB is generous and
 # caps a runaway/malicious POST before it is read into memory.
@@ -228,12 +258,20 @@ class SpecWebHandler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
     # ---- response helpers ------------------------------------------------- #
-    def _send_json(self, obj, status: int = 200, *, extra_headers: dict | None = None) -> None:
+    def _send_json(
+        self,
+        obj,
+        status: int = 200,
+        *,
+        extra_headers: dict | None = None,
+        cache_control: str = "no-store",
+    ) -> None:
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
+        self.send_header(_SPECWEB_RESPONSE_HEADER, "1")
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -243,6 +281,7 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header(_SPECWEB_RESPONSE_HEADER, "1")
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -343,6 +382,27 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/manifest.webmanifest":
+                return self._send_bytes(
+                    json.dumps(_APP_MANIFEST).encode("utf-8"),
+                    "application/manifest+json",
+                    extra_headers={"Cache-Control": "no-cache"},
+                )
+            if path == "/sw.js":
+                return self._serve_app_file(
+                    "sw.js",
+                    "text/javascript; charset=utf-8",
+                    extra_headers={
+                        "Cache-Control": "no-cache",
+                        "Service-Worker-Allowed": "/",
+                    },
+                )
+            if path == "/offline.html":
+                return self._serve_app_file("offline.html", "text/html; charset=utf-8")
+            if path == "/app-icon.svg":
+                return self._serve_app_file("app-icon.svg", "image/svg+xml")
+            if path == "/app-icon.png":
+                return self._serve_app_file("app-icon.png", "image/png")
             # Static assets (app.js / app.css) are SHARED across specs, served at /static in
             # BOTH modes (single-spec and daemon), so the SPA can load them with an absolute
             # path regardless of which /spec/<name> page it was served from.
@@ -658,6 +718,15 @@ class SpecWebHandler(BaseHTTPRequestHandler):
         ctype = _CONTENT_TYPES.get(p.suffix, "application/octet-stream")
         self._send_bytes(body, ctype)
 
+    def _serve_app_file(
+        self, name: str, content_type: str, *, extra_headers: dict | None = None
+    ) -> None:
+        try:
+            body = (STATIC_DIR / name).read_bytes()
+        except OSError:
+            return self._error(404, f"app asset missing: {name}")
+        self._send_bytes(body, content_type, extra_headers=extra_headers)
+
     def _serve_spec_json(self) -> None:
         ctx = self._ctx
         result = srender.render_spec(ctx.spec_path, asset_base=ctx.asset_base)  # type: ignore[union-attr]
@@ -670,7 +739,8 @@ class SpecWebHandler(BaseHTTPRequestHandler):
                 "html": result.html,
                 "mtime": _spec_mtime(ctx.spec_path),  # type: ignore[union-attr]
                 "headings": [{"level": lv, "text": t, "id": hid} for (lv, t, hid) in result.headings],
-            }
+            },
+            cache_control="no-cache",
         )
 
     def _serve_asset(self, name: str) -> None:
@@ -901,6 +971,9 @@ _NAVIGATOR_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/app-icon.png">
 <title>Spec review — Navigator</title>
 <style>
 :root { color-scheme: light dark; }
@@ -931,6 +1004,13 @@ code { background: #262b36; padding: 1px 6px; border-radius: 6px; font-size: 12p
   <p class="sub">{{COUNT}} spec(s) registered · one daemon, name-based URLs</p>
   {{CARDS}}
 </div>
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' });
+  });
+}
+</script>
 </body>
 </html>
 """
