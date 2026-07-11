@@ -212,14 +212,30 @@ def test_daemon_navigator_empty_registry_shows_hint_not_error():
             d.stop()
 
 
+def test_daemon_exposes_app_shell_routes_at_origin_root():
+    with _TempStoreEnv():
+        d = _Daemon()
+        try:
+            st, _, headers = d.get("/")
+            assert st == 200, st
+            assert headers.get("X-Review-Specweb") == "1", headers
+            for path in ("/manifest.webmanifest", "/sw.js", "/offline.html", "/app-icon.svg"):
+                st, _, headers = d.get(path)
+                assert st == 200, (path, st)
+                assert headers.get("X-Review-Specweb") == "1", (path, headers)
+        finally:
+            d.stop()
+
+
 def test_daemon_serves_spec_by_name_with_prefixed_base_and_assets():
     with _TempStoreEnv():
         name = sregistry.register(FIXTURE)
         d = _Daemon()
         try:
             # the SPA shell carries the per-spec URL prefix for every client fetch
-            st, body, _ = d.get(f"/spec/{name}")
+            st, body, headers = d.get(f"/spec/{name}")
             assert st == 200, st
+            assert headers.get("X-Review-Specweb") == "1", headers
             assert f'window.__SPECWEB_BASE__ = "/spec/{name}"'.encode() in body, body[:600]
             # the rendered spec's figure URLs are prefixed too, and the asset route serves them
             st, body, _ = d.get(f"/spec/{name}/api/spec")

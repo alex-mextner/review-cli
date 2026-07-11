@@ -11,11 +11,19 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
 from pathlib import Path
+
+try:
+    import pytest  # type: ignore
+except Exception:  # pragma: no cover - optional test runner
+    pytest = None  # type: ignore[assignment]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -556,6 +564,167 @@ def test_server_serves_index_spec_and_asset():
             assert hdrs.get("X-Content-Type-Options") == "nosniff", hdrs
         finally:
             s.stop()
+
+
+def test_server_serves_app_manifest_and_root_scoped_service_worker():
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, headers = s.get("/manifest.webmanifest")
+            assert st == 200, st
+            assert headers.get("Content-Type") == "application/manifest+json", headers
+            assert headers.get("X-Review-Specweb") == "1", headers
+            manifest = json.loads(body)
+            assert manifest["start_url"] == "/", manifest
+            assert manifest["scope"] == "/", manifest
+            assert manifest["display"] == "standalone", manifest
+            assert manifest["icons"][0]["src"] == "/app-icon.png", manifest
+            assert manifest["icons"][0]["type"] == "image/png", manifest
+            assert manifest["icons"][0]["purpose"] == "any", manifest
+            assert manifest["icons"][1]["src"] == "/app-icon.svg", manifest
+            assert manifest["icons"][1]["purpose"] == "any maskable", manifest
+
+            st, body, headers = s.get("/sw.js")
+            assert st == 200, st
+            assert "javascript" in headers.get("Content-Type", ""), headers
+            assert headers.get("Service-Worker-Allowed") == "/", headers
+            assert headers.get("X-Review-Specweb") == "1", headers
+            assert "no-cache" in headers.get("Cache-Control", ""), headers
+            worker = body.decode("utf-8")
+            assert 'SHELL_CACHE = "review-specweb-shell-v' in worker, worker
+            assert 'CONTENT_CACHE = "review-specweb-content-v' in worker, worker
+            assert '"/"' in worker, worker
+            assert '"/offline.html"' in worker, worker
+            assert '"/app-icon.png"' in worker, worker
+            assert "request.mode === \"navigate\"" in worker, worker
+            assert "const copy = response.clone();" in worker, worker
+            assert "event.waitUntil(" in worker, worker
+
+            st, body, headers = s.get("/offline.html")
+            assert st == 200, st
+            assert "text/html" in headers.get("Content-Type", ""), headers
+            assert b"offline" in body.lower(), body
+
+            st, body, headers = s.get("/app-icon.svg")
+            assert st == 200, st
+            assert headers.get("Content-Type") == "image/svg+xml", headers
+            assert b"<svg" in body, body
+            st, body, headers = s.get("/app-icon.png")
+            assert st == 200, st
+            assert headers.get("Content-Type") == "image/png", headers
+            assert body.startswith(b"\x89PNG"), body[:8]
+        finally:
+            s.stop()
+
+
+def test_specweb_package_data_includes_pwa_assets():
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    specweb_line = next(
+        line for line in pyproject.splitlines() if line.startswith('"reviewlib.specweb"')
+    )
+    assert '"static/*.html"' in specweb_line, specweb_line
+    assert '"static/*.css"' in specweb_line, specweb_line
+    assert '"static/*.js"' in specweb_line, specweb_line
+    assert '"static/*.svg"' in specweb_line, specweb_line
+    assert '"static/*.png"' in specweb_line, specweb_line
+
+
+def _node_supports_test_runner() -> str | None:
+    node = shutil.which("node")
+    if not node:
+        return None
+    try:
+        out = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        major = int(out.stdout.strip().lstrip("v").split(".", 1)[0])
+    except (ValueError, IndexError):
+        return None
+    return node if major >= 18 else None
+
+
+def test_server_shell_links_manifest_and_registers_root_scope_worker():
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, body, headers = s.get("/")
+            assert st == 200, st
+            assert headers.get("X-Review-Specweb") == "1", headers
+            shell = body.decode("utf-8")
+            assert '<link rel="manifest" href="/manifest.webmanifest">' in shell, shell
+            assert '<link rel="apple-touch-icon" href="/app-icon.png">' in shell, shell
+            assert "navigator.serviceWorker.register('/sw.js', { scope: '/' })" in shell, shell
+            assert 'id="connectionStatus"' in shell, shell
+
+            st, body, _ = s.get("/static/app.js")
+            assert st == 200, st
+            app_js = body.decode("utf-8")
+            assert "var CONTENT_CACHE = 'review-specweb-content-v1';" in app_js, app_js
+            assert "cacheJson(apiUrl('/api/spec'), data);" in app_js, app_js
+            assert "cacheCurrentShell();" in app_js, app_js
+            assert "cacheSpecAssets();" in app_js, app_js
+            assert "Comments are unavailable while this spec is offline." in app_js, app_js
+            assert "var clone = document.documentElement.cloneNode(true);" in app_js, app_js
+            assert "list.innerHTML = '';" in app_js, app_js
+            assert "if (composer) composer.hidden = true;" in app_js, app_js
+            assert "body.removeAttribute('value');" in app_js, app_js
+            assert "'<!DOCTYPE html>\\n' + clone.outerHTML" in app_js, app_js
+            assert "document.documentElement.outerHTML" not in app_js, app_js
+            assert "loadCommentsOrEmpty()" in app_js, app_js
+            assert "loadDraftsOrEmpty()" in app_js, app_js
+        finally:
+            s.stop()
+
+
+def test_specweb_content_cache_names_stay_in_sync():
+    app_js = (REPO_ROOT / "reviewlib" / "specweb" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    sw_js = (REPO_ROOT / "reviewlib" / "specweb" / "static" / "sw.js").read_text(
+        encoding="utf-8"
+    )
+    app_cache = re.search(r"var CONTENT_CACHE = '([^']+)';", app_js)
+    sw_cache = re.search(r'const CONTENT_CACHE = "([^"]+)";', sw_js)
+    assert app_cache and sw_cache
+    assert app_cache.group(1) == sw_cache.group(1)
+
+
+def test_spec_json_is_cacheable_but_review_state_stays_no_store():
+    with _TempStoreEnv():
+        s = _Server()
+        try:
+            st, _, headers = s.get("/api/spec")
+            assert st == 200, st
+            assert headers.get("Cache-Control") == "no-cache", headers
+            st, _, headers = s.get("/api/comments")
+            assert st == 200, st
+            assert headers.get("Cache-Control") == "no-store", headers
+            st, _, headers = s.get("/api/drafts")
+            assert st == 200, st
+            assert headers.get("Cache-Control") == "no-store", headers
+        finally:
+            s.stop()
+
+
+def test_service_worker_offline_semantics():
+    node = _node_supports_test_runner()
+    if node is None:
+        msg = "test_service_worker_offline_semantics needs node >= 18 on PATH"
+        if pytest is not None and os.environ.get("PYTEST_CURRENT_TEST"):
+            pytest.skip(msg)
+        print(f"SKIP {msg}")
+        return
+    result = subprocess.run(
+        [node, "--test", str(REPO_ROOT / "tests" / "specweb_sw.test.js")],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_server_asset_traversal_blocked():

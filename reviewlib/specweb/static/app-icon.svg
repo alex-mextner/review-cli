@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-label="Spec Review">
+  <rect width="192" height="192" rx="40" fill="#0f1115"/>
+  <path d="M54 42h62l28 28v80H54z" fill="#f4f7fb"/>
+  <path d="M116 42v28h28z" fill="#c8d1df"/>
+  <path d="M72 86h48M72 106h64M72 126h42" stroke="#0f1115" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="138" cy="132" r="24" fill="#4f8cff"/>
+  <path d="m127 132 8 8 16-18" fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

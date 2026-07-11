@@ -57,7 +57,7 @@ include = ["reviewlib*"]
 # importable Python), so packages.find alone would drop it — ship it as package data too.
 [tool.setuptools.package-data]
 "reviewlib.dashboard" = ["assets/*.html", "assets/*.js", "assets/*.css"]
-"reviewlib.specweb" = ["static/*.html", "static/*.css", "static/*.js"]
+"reviewlib.specweb" = ["static/*.html", "static/*.css", "static/*.js", "static/*.svg", "static/*.png"]
 
 # Lint config. The default rule set (pyflakes `F` + a pycodestyle `E`/`W` subset) is kept
 # deliberately — it is exactly what surfaced the latent F401/F541/F841/E702 errors this
