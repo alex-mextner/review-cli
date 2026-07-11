@@ -100,7 +100,7 @@ function workerHarness(fetchImpl) {
 
 test('offline reload returns cached spec page and API payload', async () => {
   const harness = workerHarness(async () => { throw new Error('daemon unreachable'); });
-  const content = harness.cacheFor('review-specweb-content-v1');
+  const content = harness.cacheFor('review-specweb-content-v2');
   await content.put(`${ORIGIN}/spec/sample`, new Response('cached shell'));
   await content.put(`${ORIGIN}/spec/sample/api/spec`, new Response('{"html":"cached spec"}'));
 
@@ -113,7 +113,7 @@ test('offline reload returns cached spec page and API payload', async () => {
 
 test('uncached offline navigation returns the app fallback', async () => {
   const harness = workerHarness(async () => { throw new Error('offline'); });
-  await harness.cacheFor('review-specweb-shell-v1').put(
+  await harness.cacheFor('review-specweb-shell-v2').put(
     `${ORIGIN}/offline.html`,
     new Response('This spec is not available offline')
   );
@@ -144,7 +144,7 @@ test('successful spec responses enter the content cache', async () => {
   assert.equal(await (await harness.dispatch(url, 'navigate')).text(), 'fresh spec');
   await harness.drain();
   assert.equal(harness.unregisters(), 0);
-  const cached = await harness.cacheFor('review-specweb-content-v1').match(url);
+  const cached = await harness.cacheFor('review-specweb-content-v2').match(url);
   assert.equal(await cached.text(), 'fresh spec');
 });
 
@@ -157,7 +157,7 @@ test('foreign navigations unregister the root-scoped worker without caching', as
   assert.equal(await (await harness.dispatch(url, 'navigate')).text(), 'foreign app');
   await harness.drain();
   assert.equal(harness.unregisters(), 1);
-  const cached = await harness.cacheFor('review-specweb-shell-v1').match(url);
+  const cached = await harness.cacheFor('review-specweb-shell-v2').match(url);
   assert.equal(cached, undefined);
 });
 
@@ -169,11 +169,11 @@ test('nested daemon API paths are cached without ignoring query parameters', asy
   const url = `${ORIGIN}/spec/team/project/api/spec`;
   assert.equal(await (await harness.dispatch(url)).text(), 'nested spec');
   await harness.drain();
-  const onlineCached = await harness.cacheFor('review-specweb-content-v1').match(url);
+  const onlineCached = await harness.cacheFor('review-specweb-content-v2').match(url);
   assert.equal(await onlineCached.text(), 'nested spec');
 
   const offline = workerHarness(async () => { throw new Error('offline'); });
-  const content = offline.cacheFor('review-specweb-content-v1');
+  const content = offline.cacheFor('review-specweb-content-v2');
   await content.put(`${ORIGIN}/spec/team/project/api/spec`, new Response('cached nested spec'));
   const cached = await offline.dispatch(url);
   assert.equal(await cached.text(), 'cached nested spec');
@@ -190,7 +190,7 @@ test('no-store API responses are not written to content cache', async () => {
   const url = `${ORIGIN}/spec/team/project/api/spec`;
   assert.equal(await (await harness.dispatch(url)).text(), 'private spec');
   await harness.drain();
-  const cached = await harness.cacheFor('review-specweb-content-v1').match(url);
+  const cached = await harness.cacheFor('review-specweb-content-v2').match(url);
   assert.equal(cached, undefined);
 });
 
@@ -200,12 +200,12 @@ test('static shell assets refresh from the network and update shell cache', asyn
     headers: { 'X-Review-Specweb': '1' },
   }));
   const url = `${ORIGIN}/static/app.css`;
-  await harness.cacheFor('review-specweb-shell-v1').put(url, new Response('old css'));
+  await harness.cacheFor('review-specweb-shell-v2').put(url, new Response('old css'));
 
   const response = await harness.dispatch(url);
   assert.equal(await response.text(), 'fresh css');
   await harness.drain();
-  const cached = await harness.cacheFor('review-specweb-shell-v1').match(url);
+  const cached = await harness.cacheFor('review-specweb-shell-v2').match(url);
   assert.equal(await cached.text(), 'fresh css');
 });
 
@@ -214,7 +214,7 @@ test('foreign shell subresources do not poison the shell cache', async () => {
   const url = `${ORIGIN}/static/app.css`;
   assert.equal(await (await harness.dispatch(url)).text(), 'foreign css');
   await harness.drain();
-  const cached = await harness.cacheFor('review-specweb-shell-v1').match(url);
+  const cached = await harness.cacheFor('review-specweb-shell-v2').match(url);
   assert.equal(cached, undefined);
 });
 
@@ -225,7 +225,7 @@ test('foreign content responses do not poison the content cache', async () => {
   assert.equal(await (await harness.dispatch(specUrl)).text(), 'foreign spec');
   assert.equal(await (await harness.dispatch(assetUrl)).text(), 'foreign spec');
   await harness.drain();
-  const content = harness.cacheFor('review-specweb-content-v1');
+  const content = harness.cacheFor('review-specweb-content-v2');
   assert.equal(await content.match(specUrl), undefined);
   assert.equal(await content.match(assetUrl), undefined);
 });

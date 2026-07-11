@@ -238,13 +238,15 @@ def test_daemon_serves_spec_by_name_with_prefixed_base_and_assets():
             assert headers.get("X-Review-Specweb") == "1", headers
             assert f'window.__SPECWEB_BASE__ = "/spec/{name}"'.encode() in body, body[:600]
             # the rendered spec's figure URLs are prefixed too, and the asset route serves them
-            st, body, _ = d.get(f"/spec/{name}/api/spec")
+            st, body, headers = d.get(f"/spec/{name}/api/spec")
             data = json.loads(body)
             assert st == 200 and "<h1" in data["html"]
+            assert headers.get("X-Review-Specweb") == "1", headers
             assert f"/spec/{name}/asset/fig-arch.svg" in data["html"], "asset base not prefixed"
             assert isinstance(data.get("mtime"), float), data.get("mtime")
             st, body, hdrs = d.get(f"/spec/{name}/asset/fig-arch.svg")
             assert st == 200 and b"<svg" in body
+            assert hdrs.get("X-Review-Specweb") == "1", hdrs
             assert "image/svg+xml" in hdrs.get("Content-Type", "")
         finally:
             d.stop()

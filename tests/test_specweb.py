@@ -546,17 +546,22 @@ def test_server_serves_index_spec_and_asset():
     with _TempStoreEnv():
         s = _Server()
         try:
-            st, body, _ = s.get("/")
+            st, body, headers = s.get("/")
             assert st == 200 and b"Spec review" in body
+            assert headers.get("X-Review-Specweb") == "1", headers
             st, body, _ = s.get("/api/spec")
             assert st == 200
             data = json.loads(body)
             assert "<h1" in data["html"] and data["headings"]
             assert "/asset/fig-arch.svg" in data["html"]
+            st, body, hdrs = s.get("/api/spec")
+            assert st == 200, st
+            assert hdrs.get("X-Review-Specweb") == "1", hdrs
             # the figure is served as a real HTTP resource (the whole point)
             st, body, hdrs = s.get("/asset/fig-arch.svg")
             assert st == 200, st
             assert b"<svg" in body
+            assert hdrs.get("X-Review-Specweb") == "1", hdrs
             assert "image/svg+xml" in hdrs.get("Content-Type", "")
             # SVG from a (possibly untrusted) spec must be served inertly: a sandbox CSP
             # kills inline <script> on a direct top-level open + nosniff.
@@ -603,15 +608,18 @@ def test_server_serves_app_manifest_and_root_scoped_service_worker():
             st, body, headers = s.get("/offline.html")
             assert st == 200, st
             assert "text/html" in headers.get("Content-Type", ""), headers
+            assert headers.get("X-Review-Specweb") == "1", headers
             assert b"offline" in body.lower(), body
 
             st, body, headers = s.get("/app-icon.svg")
             assert st == 200, st
             assert headers.get("Content-Type") == "image/svg+xml", headers
+            assert headers.get("X-Review-Specweb") == "1", headers
             assert b"<svg" in body, body
             st, body, headers = s.get("/app-icon.png")
             assert st == 200, st
             assert headers.get("Content-Type") == "image/png", headers
+            assert headers.get("X-Review-Specweb") == "1", headers
             assert body.startswith(b"\x89PNG"), body[:8]
         finally:
             s.stop()
@@ -659,11 +667,31 @@ def test_server_shell_links_manifest_and_registers_root_scope_worker():
             assert "navigator.serviceWorker.register('/sw.js', { scope: '/' })" in shell, shell
             assert 'id="connectionStatus"' in shell, shell
 
-            st, body, _ = s.get("/static/app.js")
+            st, body, headers = s.get("/static/app.js")
             assert st == 200, st
+            assert headers.get("X-Review-Specweb") == "1", headers
             app_js = body.decode("utf-8")
-            assert "var CONTENT_CACHE = 'review-specweb-content-v1';" in app_js, app_js
-            assert "cacheJson(apiUrl('/api/spec'), data);" in app_js, app_js
+            assert "var CONTENT_CACHE = 'review-specweb-content-v2';" in app_js, app_js
+            assert "var SPECWEB_RESPONSE_HEADER = 'X-Review-Specweb';" in app_js, app_js
+            assert "var SPECWEB_RESPONSE_VALUE = '1';" in app_js, app_js
+            assert "response.headers.get(SPECWEB_RESPONSE_HEADER) === SPECWEB_RESPONSE_VALUE" in app_js, app_js
+            assert "headers[SPECWEB_RESPONSE_HEADER] = SPECWEB_RESPONSE_VALUE;" in app_js, app_js
+            assert "if (!response || !responseAllowsCache(response)) return Promise.resolve();" in app_js, app_js
+            assert "cacheJson(apiUrl('/api/spec'), data);" not in app_js, app_js
+            assert app_js.count("cacheJson(apiUrl('/api/spec'), data, result.response);") == 2, app_js
+            st, _, headers = s.get("/static/app.css")
+            assert st == 200, st
+            assert headers.get("X-Review-Specweb") == "1", headers
+
+            st, _, headers = s.get("/manifest.webmanifest")
+            assert st == 200, st
+            assert headers.get("X-Review-Specweb") == "1", headers
+            st, body, headers = s.get("/sw.js")
+            assert st == 200, st
+            assert headers.get("X-Review-Specweb") == "1", headers
+            worker = body.decode("utf-8")
+            assert 'CONTENT_CACHE = "review-specweb-content-v2"' in worker, worker
+            assert 'response.headers.get("X-Review-Specweb") !== "1"' in worker, worker
             assert "cacheCurrentShell();" in app_js, app_js
             assert "cacheSpecAssets();" in app_js, app_js
             assert "Comments are unavailable while this spec is offline." in app_js, app_js

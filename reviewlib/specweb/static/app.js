@@ -80,7 +80,9 @@
   var COMMENTS_POLL_MS = 5000;
   var DEFAULT_COMMENTS_EMPTY_TEXT = 'Select any text in the spec to ask a question or leave a remark.';
   // SYNC: reviewlib/specweb/static/sw.js CONTENT_CACHE.
-  var CONTENT_CACHE = 'review-specweb-content-v1';
+  var CONTENT_CACHE = 'review-specweb-content-v2';
+  var SPECWEB_RESPONSE_HEADER = 'X-Review-Specweb';
+  var SPECWEB_RESPONSE_VALUE = '1';
   // The fixed slot id of the new-note composer draft, and the edit-slot format.
   // SYNC: reviewlib/specweb/store.py NEW_DRAFT_SLOT / edit_draft_slot (a test asserts match).
   var NEW_DRAFT_SLOT = 'new';
@@ -155,16 +157,19 @@
   }
 
   function responseAllowsCache(response) {
-    return !((response.headers.get('Cache-Control') || '').indexOf('no-store') >= 0);
+    if ((response.headers.get('Cache-Control') || '').indexOf('no-store') >= 0) return false;
+    return response.headers.get(SPECWEB_RESPONSE_HEADER) === SPECWEB_RESPONSE_VALUE;
   }
 
   function cacheJson(url, data, response) {
-    if (response && !responseAllowsCache(response)) return Promise.resolve();
+    if (!response || !responseAllowsCache(response)) return Promise.resolve();
     if (!window.caches) return Promise.resolve();
+    var headers = { 'Content-Type': 'application/json' };
+    headers[SPECWEB_RESPONSE_HEADER] = SPECWEB_RESPONSE_VALUE;
     return window.caches.open(CONTENT_CACHE)
       .then(function (cache) {
         return cache.put(absoluteUrl(url), new Response(JSON.stringify(data), {
-          headers: { 'Content-Type': 'application/json' },
+          headers: headers,
         }));
       })
       .catch(function () {});
@@ -228,7 +233,7 @@
         return Promise.all(Object.keys(urls).map(function (url) {
           return fetch(url, { cache: 'no-store' })
             .then(function (response) {
-              if (response.ok) return cache.put(url, response.clone());
+              if (response.ok && responseAllowsCache(response)) return cache.put(url, response.clone());
               return null;
             })
             .catch(function () {});
@@ -366,7 +371,8 @@
   // untouched; reanchorAll() re-locates each comment's quote in the new content (a comment whose
   // quoted text was edited away simply shows as unanchored — never a crash).
   function liveReloadSpec() {
-    return api('GET', '/api/spec').then(function (data) {
+    return getJsonWithResponse('/api/spec').then(function (result) {
+      var data = result.data;
       var anchor = captureScrollAnchor();
       var oldSigs = topBlocks(els.specBody).map(blockSig);
       state.headings = data.headings || [];
@@ -380,7 +386,7 @@
       wireInDocLinks();
       reanchorAll();
       flashChanged(changed);
-      cacheJson(apiUrl('/api/spec'), data);
+      cacheJson(apiUrl('/api/spec'), data, result.response);
       cacheCurrentShell();
       cacheSpecAssets();
     }).catch(function () { /* a failed refresh just waits for the next event */ });

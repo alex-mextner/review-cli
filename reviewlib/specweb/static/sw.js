@@ -1,7 +1,7 @@
 /* Root-scoped app shell for spec-web. Bump SHELL_CACHE when shell assets or cache
  * strategy change; bump CONTENT_CACHE when cached spec/API semantics change. */
-const SHELL_CACHE = "review-specweb-shell-v1";
-const CONTENT_CACHE = "review-specweb-content-v1";
+const SHELL_CACHE = "review-specweb-shell-v2";
+const CONTENT_CACHE = "review-specweb-content-v2";
 const SHELL_PREFIX = "review-specweb-shell-";
 const CONTENT_PREFIX = "review-specweb-content-";
 const OFFLINE_URL = "/offline.html";
