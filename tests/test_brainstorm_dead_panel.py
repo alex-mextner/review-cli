@@ -61,7 +61,7 @@ class _StubBackends:
         self._old = panel.resolve_backend
         from reviewlib.modes.brainstorm import MODERATOR_PROMPT_LEADIN, SYNTHESIS_PROMPT_MARKER
 
-        def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0):
+        def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
             if SYNTHESIS_PROMPT_MARKER in prompt or MODERATOR_PROMPT_LEADIN in prompt:
                 self.moderator_calls += 1
                 body = ("Moderator summary.\nDECISION: CONTINUE"
@@ -268,7 +268,7 @@ def test_midrun_collapse_not_hollow_even_if_moderator_would_stop_over_dead_round
                     SYNTHESIS_PROMPT_MARKER,
                 )
 
-                def _fake(model, prompt, diff, cwd, timeout, round_no=0):
+                def _fake(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
                     if SYNTHESIS_PROMPT_MARKER in prompt:
                         _self.moderator_calls += 1
                         return _result(model, stdout="FINAL SYNTHESIS: ship idea-A.")

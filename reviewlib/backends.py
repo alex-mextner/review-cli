@@ -8,6 +8,7 @@ panel modes so streamed calls print their live-log path to stderr.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -21,10 +22,11 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
-from .process import _run, _run_streamed, git_repo_env, strip_control_sequences, write_sidecar_log
+from .process import _run, _run_streamed, _safe_log_header, git_repo_env, strip_control_sequences, write_sidecar_log
 
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
@@ -35,8 +37,6 @@ GEMINI_ENV_FALLBACKS = (
 # the user knows what to `tail -f`. Enabled by the panel modes (--just-ask/--quorum/
 # --brainstorm); the plain single-diff review path keeps stderr quiet.
 _ANNOUNCE_LOGS = False
-
-
 @dataclass(frozen=True)
 class ReviewResult:
     model: str
@@ -92,9 +92,66 @@ def _claude_api_command(model: str) -> str:
     return f"Anthropic API {_claude_api_model(model)}"
 
 
+def _prompt_with_effort(prompt: str, effort: str | None) -> str:
+    if not effort:
+        return prompt
+    effort_label = "highest" if effort in {"xhigh", "max"} else effort
+    hint = f"Use {effort_label} reasoning effort."
+    if hint in prompt:
+        return prompt
+    return f"{prompt}\n\n{hint}"
+
+
+def _codex_reasoning_effort(effort: str | None) -> str | None:
+    if not effort:
+        return None
+    if effort == "minimal":
+        return "low"
+    if effort == "max":
+        return "xhigh"
+    return effort
+
+
+def _claude_reasoning_effort(effort: str | None) -> str | None:
+    if not effort:
+        return None
+    if effort == "minimal":
+        return "low"
+    return effort
+
+
+def call_backend(
+    backend: Callable[..., ReviewResult],
+    model: str,
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    round_no: int = 0,
+    *,
+    effort: str | None = None,
+) -> ReviewResult:
+    if effort is None:
+        return backend(model, prompt, diff, cwd, timeout, round_no)
+    try:
+        sig = inspect.signature(backend)
+    except (TypeError, ValueError):
+        accepts_effort = False
+    else:
+        effort_param = sig.parameters.get("effort")
+        accepts_effort = (
+            (effort_param is not None and effort_param.kind != inspect.Parameter.POSITIONAL_ONLY)
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        )
+    prompt = _prompt_with_effort(prompt, effort)
+    if accepts_effort:
+        return backend(model, prompt, diff, cwd, timeout, round_no, effort=effort)
+    return backend(model, prompt, diff, cwd, timeout, round_no)
+
+
 def review_with_images(
     model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
-    images: tuple[Path, ...] = (),
+    images: tuple[Path, ...] = (), effort: str | None = None,
 ) -> ReviewResult:
     """Run a backend with raw image attachments when that backend safely supports them.
 
@@ -110,11 +167,14 @@ def review_with_images(
         )
         if unpaid is not None:
             return unpaid
-        return review_claude_cli_with_images(model, prompt, diff, cwd, timeout, round_no, images)
-    return backend(model, prompt, diff, cwd, timeout, round_no)
+        return review_claude_cli_with_images(model, prompt, diff, cwd, timeout, round_no, images, effort=effort)
+    return call_backend(backend, model, prompt, diff, cwd, timeout, round_no, effort=effort)
 
 
-def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_codex(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
     codex_model = model.split(":", 1)[1] if ":" in model else None
     unpaid = unpaid_provider_result(model, backend="codex", command="codex", round_no=round_no)
     if unpaid is not None:
@@ -122,11 +182,15 @@ def review_codex(model: str, prompt: str, diff: str, cwd: Path, timeout: int, ro
     argv = [_which("codex"), "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
     if codex_model:
         argv += ["-m", codex_model]
+    codex_effort = _codex_reasoning_effort(effort)
+    if codex_effort:
+        argv += ["-c", f'model_reasoning_effort="{codex_effort}"']
     argv.append("-")
     command = " ".join(argv[:-1]) + " -"
     proc = _run_streamed(
         argv, cwd=cwd, input_text=_payload(prompt, diff), timeout=timeout,
         backend="codex", round_no=round_no, announce=_ANNOUNCE_LOGS,
+        header_argv0=f"codex -m {_safe_log_header(codex_model)}" if codex_model else None,
     )
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
@@ -398,7 +462,11 @@ def _opencode_runs_in_repo(cwd: Path) -> bool:
     return True
 
 
-def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_opencode(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
+    prompt = _prompt_with_effort(prompt, effort)
     oc_model = model.split(":", 1)[1] if ":" in model else model
     unpaid = unpaid_provider_result(
         model, backend="opencode", command=f"opencode -m {oc_model}", round_no=round_no
@@ -444,7 +512,8 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
             message,
         ]
         proc = _run_streamed(argv, cwd=cwd, timeout=timeout, backend="opencode", round_no=round_no,
-                             announce=_ANNOUNCE_LOGS, header_argv0=f"opencode -m {oc_model}")
+                             announce=_ANNOUNCE_LOGS,
+                             header_argv0=f"opencode -m {_safe_log_header(oc_model)}")
         return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
     # FALLBACK: cwd is not a git repo (e.g. a panel `--just-ask` run from a scratch
@@ -478,7 +547,8 @@ def review_opencode(model: str, prompt: str, diff: str, cwd: Path, timeout: int,
             message,
         ]
         proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", round_no=round_no,
-                             announce=_ANNOUNCE_LOGS, header_argv0=f"opencode -m {oc_model}")
+                             announce=_ANNOUNCE_LOGS,
+                             header_argv0=f"opencode -m {_safe_log_header(oc_model)}")
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
@@ -542,7 +612,11 @@ def _gemini_key() -> str:
 # adapters; `_resolve_key` stays — `_gemini_key` still uses it.
 
 
-def review_gemini(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_gemini(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
+    prompt = _prompt_with_effort(prompt, effort)
     gemini_model = model.split(":", 1)[1] if ":" in model else os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
     command = f"Gemini API {gemini_model}"
     # Gemini is a REST backend — it never goes through `_run_streamed`, so it must emit
@@ -836,6 +910,8 @@ def _openai_compatible_request(
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
         rc = exc.code or 1
+        if _is_payment_preflight_denial(rc, body_text):
+            _cache_payment_preflight_denial(model, rc, body_text)
         _emit_rest_log(backend, command, round_no=round_no, returncode=rc, stdout="", stderr=body_text, started=started)
         return ReviewResult(model=model, command=command, returncode=rc, stdout="", stderr=body_text)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -883,7 +959,11 @@ def _zai_key() -> str:
 ZAI_SUPPORTED_MODES = ("api",)  # z.ai is REST-only; no z.ai CLI exists.
 
 
-def review_zai(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_zai(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
+    prompt = _prompt_with_effort(prompt, effort)
     # api-only: a forced REVIEW_ZAI_MODE=cli is a config error, surfaced as a
     # dead-backend result instead of silently running the api path.
     # `round_no` is accepted (and forwarded) so the panel's uniform 6-arg dispatch
@@ -956,7 +1036,11 @@ def _commandcode_key() -> str:
     )
 
 
-def review_commandcode(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_commandcode(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
+    prompt = _prompt_with_effort(prompt, effort)
     # API-only: a forced REVIEW_COMMANDCODE_MODE=cli is a config error (there is no
     # commandcode CLI), surfaced as a dead-backend result, never a silent api POST.
     # `round_no` is accepted so the panel's uniform 6-arg dispatch does not raise for
@@ -1059,7 +1143,11 @@ def _header_value_is_safe(value: str) -> bool:
     return not any((ord(ch) < 0x20 and ch != "\t") or 0x7F <= ord(ch) <= 0x9F for ch in value)
 
 
-def review_openrouter(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_openrouter(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
+    prompt = _prompt_with_effort(prompt, effort)
     # API-only: a forced REVIEW_OPENROUTER_MODE=cli is a config error (no OpenRouter CLI),
     # surfaced as a dead-backend result, never a silent api POST. `round_no` is accepted so
     # the panel's uniform 6-arg dispatch does not raise (see review_zai for the rationale).
@@ -1154,7 +1242,10 @@ def _anthropic_gateway_provider(base_url: str) -> str | None:
     return None
 
 
-def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_claude_api(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
     """Anthropic Messages API backend — works WITHOUT the claude CLI (needs only a
     key). POSTs to ``{ANTHROPIC_BASE_URL}/v1/messages``; the default base is
     Anthropic, but any Anthropic-compatible gateway works (e.g. CommandCode via
@@ -1166,6 +1257,7 @@ def review_claude_api(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     the CLI variant) on EVERY return path with ``round_no`` threaded — else a claude
     API-mode run would be invisible to the dashboard and missing from stats / brainstorm
     round attribution (codex P2)."""
+    prompt = _prompt_with_effort(prompt, effort)
     claude_model = _claude_api_model(model)
     cfg = _anthropic_api_config()
     command = f"Anthropic API {claude_model}"
@@ -1273,7 +1365,10 @@ def _claude_runtime_gateway_provider() -> str | None:
 
 
 
-def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_claude(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
     """Dispatch the claude/opus backend between the API and CLI variants.
 
     REVIEW_CLAUDE_MODE forces it: ``api`` (HTTP, no claude binary needed) or
@@ -1295,10 +1390,10 @@ def review_claude(model: str, prompt: str, diff: str, cwd: Path, timeout: int, r
         return unpaid
     mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
     if mode == "api":
-        return review_claude_api(model, prompt, diff, cwd, timeout, round_no)
+        return review_claude_api(model, prompt, diff, cwd, timeout, round_no, effort=effort)
     if mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None:
-        return review_claude_api(model, prompt, diff, cwd, timeout, round_no)
-    return review_claude_cli(model, prompt, diff, cwd, timeout, round_no)
+        return review_claude_api(model, prompt, diff, cwd, timeout, round_no, effort=effort)
+    return review_claude_cli(model, prompt, diff, cwd, timeout, round_no, effort=effort)
 
 
 
@@ -1500,9 +1595,24 @@ def _claude_cli_binary() -> tuple[str, bool]:
     return _which("claude-p"), False  # raises a clear error if neither is present
 
 
+@lru_cache(maxsize=8)
+def _claude_cli_supports_effort(binary: str) -> bool:
+    try:
+        proc = subprocess.run(
+            [binary, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    help_text = f"{proc.stdout}\n{proc.stderr}"
+    return "--effort" in help_text
+
+
 def _claude_cli_argv(
     binary: str, direct: bool, model: str | None, cwd: Path, timeout: int,
-    *, image_dir: Path | None = None,
+    *, image_dir: Path | None = None, effort: str | None = None,
 ) -> list[str]:
     """Build the argv for the resolved claude CLI binary.
 
@@ -1530,6 +1640,9 @@ def _claude_cli_argv(
         ]
         if image_dir is not None:
             argv += ["--add-dir", str(image_dir)]
+        claude_effort = _claude_reasoning_effort(effort)
+        if claude_effort and _claude_cli_supports_effort(binary):
+            argv += ["--effort", claude_effort]
         if model:
             argv += ["--model", model]
         return argv
@@ -1545,6 +1658,9 @@ def _claude_cli_argv(
     ]
     if model:
         argv += ["--model", model]
+    claude_effort = _claude_reasoning_effort(effort)
+    if claude_effort and _claude_cli_supports_effort(binary):
+        argv += ["--effort", claude_effort]
     argv += ["-p"]
     return argv
 
@@ -1590,7 +1706,11 @@ def _claude_cli_env() -> dict[str, str]:
     return env
 
 
-def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_claude_cli(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
+    prompt = _prompt_with_effort(prompt, effort)
     claude_model = model.split(":", 1)[1] if ":" in model else None
     # Resolve the binary BEFORE touching trust so a missing CLI raises here, not after
     # _ensure_workspace_trusted has already mutated ~/.claude.json.
@@ -1598,7 +1718,7 @@ def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: in
     # Pre-accept workspace trust for cwd: the headless run cannot answer the
     # interactive "Do you trust this folder?" gate (see _ensure_workspace_trusted).
     _ensure_workspace_trusted(cwd)
-    argv = _claude_cli_argv(binary, direct, claude_model, cwd, timeout)
+    argv = _claude_cli_argv(binary, direct, claude_model, cwd, timeout, effort=effort)
     proc = _run_streamed(
         argv, cwd=cwd, input_text=_payload(prompt, diff), env=_claude_cli_env(),
         timeout=timeout, backend="claude", round_no=round_no, announce=_ANNOUNCE_LOGS,
@@ -1626,21 +1746,22 @@ def review_claude_cli(model: str, prompt: str, diff: str, cwd: Path, timeout: in
 
 def review_claude_cli_with_images(
     model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
-    images: tuple[Path, ...] = (),
+    images: tuple[Path, ...] = (), effort: str | None = None,
 ) -> ReviewResult:
+    prompt = _prompt_with_effort(prompt, effort)
     claude_model = model.split(":", 1)[1] if ":" in model else None
     if os.environ.get(_mode_env_var("claude"), "").strip().lower() == "api":
-        return review_claude(model, prompt, diff, cwd, timeout, round_no)
+        return review_claude(model, prompt, diff, cwd, timeout, round_no, effort=effort)
     binary = _which_optional("claude")
     if not binary:
-        return review_claude(model, prompt, diff, cwd, timeout, round_no)
+        return review_claude(model, prompt, diff, cwd, timeout, round_no, effort=effort)
     with tempfile.TemporaryDirectory(prefix="review-cli-claude-images-") as tmp_raw:
         tmp = Path(tmp_raw)
         staged = _stage_panel_images(images, tmp)
         if not staged:
-            return review_claude_cli(model, prompt, diff, cwd, timeout, round_no)
+            return review_claude_cli(model, prompt, diff, cwd, timeout, round_no, effort=effort)
         _ensure_workspace_trusted(tmp)
-        argv = _claude_cli_argv(binary, True, claude_model, tmp, timeout, image_dir=tmp)
+        argv = _claude_cli_argv(binary, True, claude_model, tmp, timeout, image_dir=tmp, effort=effort)
         proc = _run_streamed(
             argv, cwd=tmp, input_text=_payload(_prompt_with_panel_images(prompt, staged), diff),
             env=_claude_cli_env(), timeout=timeout, backend="claude", round_no=round_no,
@@ -1679,7 +1800,10 @@ def _fake_backend_enabled() -> bool:
     return os.environ.get("REVIEW_FAKE_BACKEND", "").strip().lower() not in ("", "0", "false", "no")
 
 
-def review_fake(model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0) -> ReviewResult:
+def review_fake(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
     """Deterministic, network-free stand-in for a real backend (TEST-ONLY).
 
     Distinguishes the brainstorm prompt shapes by their fixed lead-in text (imported from the
@@ -1693,6 +1817,7 @@ def review_fake(model: str, prompt: str, diff: str, cwd: Path, timeout: int, rou
     run's new rounds are visibly different from the pre-kill ones. `REVIEW_FAKE_DELAY`
     (float seconds, default 0) sleeps per call so an e2e can make a run slow enough to
     reliably SIGTERM it mid-round; the delay still honours `timeout` as an upper bound."""
+    prompt = _prompt_with_effort(prompt, effort)
     import time
 
     # Lazy import (not at module top) so this lower backends layer never imports the higher
@@ -1966,7 +2091,7 @@ def unpaid_provider_result(
 
 
 _PAYMENT_PREFLIGHT_PROVIDERS = frozenset({"commandcode", "fireworks"})
-_PAYMENT_PREFLIGHT_MARKER_CODES = frozenset({401, 403})
+_PAYMENT_PREFLIGHT_MARKER_CODES = frozenset({400, 401, 403})
 _PAYMENT_PREFLIGHT_MARKERS = (
     "account disabled",
     "account suspended",
@@ -1977,9 +2102,19 @@ _PAYMENT_PREFLIGHT_MARKERS = (
     "subscription required",
     "unpaid",
 )
+_PAYMENT_PREFLIGHT_PROVIDER_WIDE_MARKERS = (
+    "account disabled",
+    "account suspended",
+    "insufficient balance",
+    "insufficient credit",
+    "insufficient credits",
+    "payment required",
+    "unpaid",
+)
 _FIREWORKS_DEFAULT_BASE_URL = "https://api.fireworks.ai/inference/v1"
 _PROVIDER_PREFLIGHT_TIMEOUT_SECONDS = 2.0
-_PAYMENT_PREFLIGHT_CACHE: dict[tuple[str, str, str], tuple[bool, int | None]] = {}
+_PAYMENT_PREFLIGHT_PROVIDER_SCOPE = "*"
+_PAYMENT_PREFLIGHT_CACHE: dict[tuple[str, str, str, str], tuple[bool, int | None]] = {}
 _PAYMENT_PREFLIGHT_CACHE_LOCK = threading.Lock()
 
 
@@ -2069,10 +2204,12 @@ def _payment_preflight_credentials(model: str, provider: str) -> tuple[str | Non
     return None, None
 
 
-def _payment_preflight_cache_key(provider: str, url: str, key: str) -> tuple[str, str, str]:
+def _payment_preflight_cache_key(
+    provider: str, url: str, key: str, scope: str = _PAYMENT_PREFLIGHT_PROVIDER_SCOPE,
+) -> tuple[str, str, str, str]:
     # Keep the cache key credential-sensitive without storing the credential itself.
     key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return (provider, url, key_hash)
+    return (provider, url, key_hash, scope)
 
 
 def _is_payment_preflight_denial(code: int | None, body: str) -> bool:
@@ -2084,9 +2221,60 @@ def _is_payment_preflight_denial(code: int | None, body: str) -> bool:
     )
 
 
+def _payment_denial_cache_scope(model: str, code: int | None, body: str) -> str:
+    if code == 402:
+        return _PAYMENT_PREFLIGHT_PROVIDER_SCOPE
+    lowered = body.lower()
+    if any(marker in lowered for marker in _PAYMENT_PREFLIGHT_PROVIDER_WIDE_MARKERS):
+        return _PAYMENT_PREFLIGHT_PROVIDER_SCOPE
+    return model
+
+
 def _payment_preflight_reason(provider: str, model: str, code: int | None) -> str:
     suffix = f"HTTP {code}" if code is not None else "payment/availability denial"
     return f"provider '{provider}' failed payment/availability preflight ({suffix}); skipping {model}"
+
+
+def _cache_payment_preflight_denial(model: str, code: int | None, body: str = "") -> None:
+    provider = effective_provider(model)
+    if provider not in _PAYMENT_PREFLIGHT_PROVIDERS:
+        return
+    key, url = _payment_preflight_credentials(model, provider)
+    if not key or not url:
+        return
+    cache_key = _payment_preflight_cache_key(
+        provider, url, key, _payment_denial_cache_scope(model, code, body)
+    )
+    with _PAYMENT_PREFLIGHT_CACHE_LOCK:
+        _PAYMENT_PREFLIGHT_CACHE[cache_key] = (True, code)
+
+
+def _cached_payment_preflight_result(
+    provider: str,
+    model: str,
+    url: str,
+    key: str,
+) -> tuple[bool, int | None] | None:
+    with _PAYMENT_PREFLIGHT_CACHE_LOCK:
+        return (
+            _PAYMENT_PREFLIGHT_CACHE.get(_payment_preflight_cache_key(provider, url, key, model))
+            or _PAYMENT_PREFLIGHT_CACHE.get(_payment_preflight_cache_key(provider, url, key))
+        )
+
+
+def cached_payment_preflight_unavailable_reason(model: str) -> str | None:
+    """Return a cached payment/entitlement denial without performing network I/O."""
+    provider = effective_provider(model)
+    if provider not in _PAYMENT_PREFLIGHT_PROVIDERS:
+        return None
+    key, url = _payment_preflight_credentials(model, provider)
+    if not key or not url:
+        return None
+    cached = _cached_payment_preflight_result(provider, model, url, key)
+    if cached is None:
+        return None
+    denied, code = cached
+    return _payment_preflight_reason(provider, model, code) if denied else None
 
 
 def _provider_payment_preflight_unavailable_reason(model: str) -> str | None:
@@ -2103,9 +2291,7 @@ def _provider_payment_preflight_unavailable_reason(model: str) -> str | None:
     key, url = _payment_preflight_credentials(model, provider)
     if not key or not url:
         return None
-    cache_key = _payment_preflight_cache_key(provider, url, key)
-    with _PAYMENT_PREFLIGHT_CACHE_LOCK:
-        cached = _PAYMENT_PREFLIGHT_CACHE.get(cache_key)
+    cached = _cached_payment_preflight_result(provider, model, url, key)
     if cached is not None:
         denied, code = cached
         return _payment_preflight_reason(provider, model, code) if denied else None
@@ -2121,13 +2307,23 @@ def _provider_payment_preflight_unavailable_reason(model: str) -> str | None:
     try:
         with urllib.request.urlopen(req, timeout=_PROVIDER_PREFLIGHT_TIMEOUT_SECONDS):
             with _PAYMENT_PREFLIGHT_CACHE_LOCK:
-                _PAYMENT_PREFLIGHT_CACHE[cache_key] = (False, None)
+                provider_cache_key = _payment_preflight_cache_key(provider, url, key)
+                cached = (
+                    _PAYMENT_PREFLIGHT_CACHE.get(_payment_preflight_cache_key(provider, url, key, model))
+                    or _PAYMENT_PREFLIGHT_CACHE.get(provider_cache_key)
+                )
+                if cached is not None and cached[0] is True:
+                    return _payment_preflight_reason(provider, model, cached[1])
+                if cached is None or cached[0] is False:
+                    _PAYMENT_PREFLIGHT_CACHE[provider_cache_key] = (False, None)
             return None
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
         if _is_payment_preflight_denial(exc.code, body):
             with _PAYMENT_PREFLIGHT_CACHE_LOCK:
-                _PAYMENT_PREFLIGHT_CACHE[cache_key] = (True, exc.code)
+                _PAYMENT_PREFLIGHT_CACHE[
+                    _payment_preflight_cache_key(provider, url, key)
+                ] = (True, exc.code)
             return _payment_preflight_reason(provider, model, exc.code)
         return None
     except (urllib.error.URLError, TimeoutError, OSError):
@@ -2306,6 +2502,8 @@ def backend_available(model: str) -> bool:
     if _fake_backend_enabled():
         return True
     if runtime_provider_marked_unpaid(model):
+        return False
+    if cached_payment_preflight_unavailable_reason(model) is not None:
         return False
     backend = resolve_backend(model)
     try:

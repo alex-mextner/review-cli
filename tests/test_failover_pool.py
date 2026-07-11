@@ -63,7 +63,7 @@ class _FakeBackends:
         self._old = panel.resolve_backend
 
         def _resolve(_model: str):
-            def _backend(model, prompt, diff, cwd, timeout, round_no=0):
+            def _backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
                 self.calls.append((model, prompt))
                 rc, out = self.behaviour.get(model, (0, f"ok {model}"))
                 return ReviewResult(model=model, command="fake", returncode=rc, stdout=out, stderr="")
@@ -132,50 +132,36 @@ def test_unusable_short_temporarily_unavailable_sentinel():
 
 # === startup failover (split_pool_reserve) ======================================
 def test_startup_failover_skips_unavailable_top_seat():
-    """Fable (priority #1) unavailable -> the top-4 pool starts at Opus and pulls one
+    """Fable (priority #1) unavailable -> the top-4 pool starts at Sol and pulls one
     more in from the reserve, so it is still 4 WORKING seats."""
     board = list(DEFAULT_BOARD)
     available = {r.model for r in board if r.model != "claude:claude-fable-5"}
     pool, reserve = split_pool_reserve(board, 4, _avail(available))
     assert [r.model for r in pool] == [
+        "codex:gpt-5.6-sol",
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
-        "codex",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ], [r.model for r in pool]
     # Fable is NOT in the pool nor the reserve — it's unavailable.
     assert "claude:claude-fable-5" not in {r.model for r in pool + reserve}
 
 
-def test_fable_backfill_duplicates_performance_lens_accepted_tradeoff():
-    """ACCEPTED TRADE-OFF (review of #57), pinned so it stays a conscious decision: when
-    Fable (#1) drops out, the pool backfills with Kimi (#5), which carries `performance` —
-    the SAME lens as the priority-3 GLM-cc seat. So the post-backfill pool has two
-    `performance` seats and loses the `architect` lens. We DELIBERATELY do not reorder the
-    reserve by lens or make the backfill role-aware: the board's reserve is ordered by MODEL
-    PRIORITY (strength), and keeping that invariant simple is worth more than guaranteeing a
-    distinct lens after every single backfill. The all-available default pool DOES keep four
-    distinct lenses (test_default_pool_roles_are_distinct_no_lens_lost); this pins what
-    happens specifically when the top seat is missing, so a future change to the policy is a
-    visible, intentional edit here rather than a silent regression either way."""
+def test_fable_backfill_keeps_four_distinct_lenses_with_sol():
+    """With Sol inserted after Fable, losing Fable now backfills with Kimi and keeps four
+    distinct lenses: consistency/correctness/performance/quality."""
     board = list(DEFAULT_BOARD)
     available = {r.model for r in board if r.model != "claude:claude-fable-5"}
     pool, _ = split_pool_reserve(board, DEFAULT_POOL_SIZE, _avail(available))
     roles = [r.role for r in pool]
-    # The documented consequence: two `performance` seats (GLM-cc + the Kimi backfill).
-    assert roles.count("performance") == 2, roles
+    assert len(set(roles)) == 4, roles
+    assert set(roles) == {"consistency", "correctness", "performance", "quality"}, roles
     assert "architect" not in roles, roles  # Fable's lens is the one lost, as expected.
 
 
 def test_glm_cc_unavailable_keeps_four_distinct_lenses():
-    """The REASSURING case (review of #57): when GLM-cc itself is unavailable — the most
-    common production scenario, a host with NO `COMMANDCODE_API_KEY` — the pool backfills with
-    Kimi (#5, `performance`) and ends as [Fable, Opus, Codex, Kimi] = the SAME four distinct
-    lenses (architect/correctness/consistency/performance) the pre-#57 board had. So a
-    key-less host loses nothing: the diff-only GLM-cc seat simply drops and the agentic Kimi
-    takes its lens back. This pins that the only coverage cost of the new seat is paid when
-    GLM-cc is PRESENT and a HIGHER seat fails (the Fable case above), never when GLM-cc is the
-    one missing."""
+    """When GLM-cc itself is unavailable, Kimi backfills and the pool still keeps four
+    distinct lenses (architect/consistency/correctness/quality)."""
     board = list(DEFAULT_BOARD)
     available = {r.model for r in board if r.model != GLM_COMMANDCODE_SEAT}
     pool, _ = split_pool_reserve(board, DEFAULT_POOL_SIZE, _avail(available))
@@ -183,7 +169,7 @@ def test_glm_cc_unavailable_keeps_four_distinct_lenses():
     assert GLM_COMMANDCODE_SEAT not in models, models
     roles = [r.role for r in pool]
     assert len(set(roles)) == 4, roles  # four DISTINCT lenses, none lost
-    assert set(roles) == {"architect", "correctness", "consistency", "performance"}, roles
+    assert set(roles) == {"architect", "consistency", "correctness", "quality"}, roles
 
 
 def test_startup_failover_respects_priority_order():
@@ -250,7 +236,7 @@ def test_midrun_unavailable_body_triggers_backfill_fable_case():
     """The exact CTO scenario: Fable is in the startup pool (the cheap probe says
     available — its paywall is invisible) but returns an 'unavailable' body at run time.
     Mid-run failover treats that as a failure and backfills, so the working pool-4 ends as
-    Opus / GLM-cc / Codex / Kimi — Fable replaced by the first reserve (Kimi, #5)."""
+    Sol / Opus / GLM-cc / Kimi — Fable replaced by the first reserve (Kimi, #5)."""
     board = list(DEFAULT_BOARD)
     # Cheap probe: ALL available (Fable's paywall is invisible to it).
     pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in board}))
@@ -263,9 +249,9 @@ def test_midrun_unavailable_body_triggers_backfill_fable_case():
     assert not outcome.degraded
     assert "claude:claude-fable-5" not in outcome.usable_models
     assert set(outcome.usable_models) == {
+        "codex:gpt-5.6-sol",
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
-        "codex",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     }, outcome.usable_models
 

@@ -125,7 +125,7 @@ def test_show_board_works_outside_repo():
         proc = _run(["--show-board"], cwd=d)
         _no_traceback(proc)
         assert proc.returncode == 0, (proc.returncode, proc.stderr)
-        assert "architect" in proc.stdout
+        assert "source: preset:default" in proc.stdout
 
 
 def test_help_works_outside_repo():

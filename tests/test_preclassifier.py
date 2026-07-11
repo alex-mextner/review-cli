@@ -354,11 +354,14 @@ def test_pipeline_check_run_does_not_reuse_plain_keep():
         finally:
             _restore(*old)
         assert log1 == ["gemini"]
-        # Same image but WITH --check selection → must MISS (different namespace) → vision.
+        # Same image but WITH an explicit non-CV-vetoing --check -> must MISS (different
+        # namespace) -> vision. Do not use a locally decidable check such as `selection`
+        # here: cvGate can satisfy it before the vision backend, which would test a
+        # different optimization path than the cache namespace boundary.
         log2: list = []
         old = _patch_vision(VisionVerdict(available=True, verdict="keep", confidence=0.95, backend="gemini"), log2)
         try:
-            pl.run_pipeline(img, models=["gemini"], requested_checks=["selection"], known_good_cache=cache)
+            pl.run_pipeline(img, models=["gemini"], requested_checks=["error-text"], known_good_cache=cache)
         finally:
             _restore(*old)
         assert log2 == ["gemini"], "a --check run must not reuse a plain-run keep — it must escalate to vision"

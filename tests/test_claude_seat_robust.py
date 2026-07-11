@@ -30,6 +30,15 @@ from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.process import strip_control_sequences  # noqa: E402
 
 
+def _with_effort_support(fn):
+    old_supports = _backends._claude_cli_supports_effort
+    _backends._claude_cli_supports_effort = lambda _binary: True
+    try:
+        return fn()
+    finally:
+        _backends._claude_cli_supports_effort = old_supports
+
+
 # --- the strip helper is robust to real TUI noise --------------------------------------
 
 def test_strip_removes_csi_osc_and_c0_control_bytes():
@@ -84,10 +93,10 @@ def test_strip_drops_carriage_return_keeps_tab_and_newline():
 # --- argv construction: direct `claude --print` path -----------------------------------
 
 def test_direct_claude_argv_uses_print_mode_no_tui_flags():
-    argv = _backends._claude_cli_argv(
+    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
         "/usr/local/bin/claude", direct=True, model="claude-opus-4-8",
-        cwd=Path("/tmp/repo"), timeout=120,
-    )
+        cwd=Path("/tmp/repo"), timeout=120, effort="xhigh",
+    ))
     # Genuine print mode, text output (the clean non-TUI path).
     assert "--print" in argv
     assert argv[argv.index("--output-format") + 1] == "text"
@@ -97,6 +106,7 @@ def test_direct_claude_argv_uses_print_mode_no_tui_flags():
     assert "--disable-slash-commands" in argv
     assert "--strict-mcp-config" in argv
     assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
+    assert argv[argv.index("--effort") + 1] == "xhigh"
     # Read-only is enforced by an EMPTY tool allowlist (all built-in tools off), not a
     # denylist — strictly stronger and avoids real `claude` warning on claude-p tool names.
     assert argv[argv.index("--tools") + 1] == ""
@@ -116,17 +126,59 @@ def test_direct_claude_argv_omits_model_when_unspecified():
     assert "--print" in argv
 
 
+def test_direct_claude_argv_maps_minimal_effort_to_low():
+    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
+        "/usr/local/bin/claude", direct=True, model="claude-opus-4-8",
+        cwd=Path("/tmp/repo"), timeout=120, effort="minimal",
+    ))
+    assert argv[argv.index("--effort") + 1] == "low"
+
+
+def test_direct_claude_argv_omits_effort_when_binary_lacks_flag():
+    old_supports = _backends._claude_cli_supports_effort
+    _backends._claude_cli_supports_effort = lambda _binary: False
+    try:
+        argv = _backends._claude_cli_argv(
+            "/usr/local/bin/claude", direct=True, model="claude-opus-4-8",
+            cwd=Path("/tmp/repo"), timeout=120, effort="high",
+        )
+    finally:
+        _backends._claude_cli_supports_effort = old_supports
+    assert "--effort" not in argv
+
+
+def test_claude_effort_probe_degrades_to_prompt_hint_on_probe_failures():
+    old_run = _backends.subprocess.run
+    cases = [
+        OSError("missing"),
+        _backends.subprocess.TimeoutExpired(["claude", "--help"], timeout=5),
+    ]
+    try:
+        for exc in cases:
+            _backends._claude_cli_supports_effort.cache_clear()
+
+            def _raise(*_args, _exc=exc, **_kw):
+                raise _exc
+
+            _backends.subprocess.run = _raise
+            assert _backends._claude_cli_supports_effort("/no/such/claude") is False
+    finally:
+        _backends.subprocess.run = old_run
+        _backends._claude_cli_supports_effort.cache_clear()
+
+
 # --- argv construction: legacy claude-p fallback ---------------------------------------
 
 def test_claude_p_fallback_argv_keeps_wrapper_surface():
-    argv = _backends._claude_cli_argv(
+    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
         "/usr/local/bin/claude-p", direct=False, model="claude-opus-4-8",
-        cwd=Path("/tmp/repo"), timeout=90,
-    )
+        cwd=Path("/tmp/repo"), timeout=90, effort="xhigh",
+    ))
     # The wrapper needs its own --cwd / --tools '' / --timeout-sec / -p surface, but
     # review-cli disables claude-p's wall timer so _run_streamed owns the idle timeout.
     assert argv[argv.index("--cwd") + 1] == "/tmp/repo"
     assert argv[argv.index("--timeout-sec") + 1] == "0"
+    assert argv[argv.index("--effort") + 1] == "xhigh"
     assert "-p" in argv
     assert "--print" not in argv  # claude-p has no --print; -p is its print toggle
     # Same read-only guarantees as the direct path.
@@ -141,6 +193,24 @@ def test_claude_p_fallback_timeout_disables_wrapper_wall_reap():
         cwd=Path("/tmp/repo"), timeout=90,
     )
     assert argv[argv.index("--timeout-sec") + 1] == "0"
+
+
+def test_claude_p_fallback_maps_minimal_effort_to_low():
+    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
+        "/usr/local/bin/claude-p", direct=False, model="claude-opus-4-8",
+        cwd=Path("/tmp/repo"), timeout=90, effort="minimal",
+    ))
+    assert argv[argv.index("--effort") + 1] == "low"
+
+
+def test_direct_claude_image_argv_threads_effort():
+    argv = _with_effort_support(lambda: _backends._claude_cli_argv(
+        "/usr/local/bin/claude", direct=True, model="claude-fable-5",
+        cwd=Path("/tmp/repo"), timeout=90, image_dir=Path("/tmp/images"), effort="xhigh",
+    ))
+    assert argv[argv.index("--tools") + 1] == "Read"
+    assert argv[argv.index("--add-dir") + 1] == "/tmp/images"
+    assert argv[argv.index("--effort") + 1] == "xhigh"
 
 
 # --- binary resolution prefers the direct print binary ---------------------------------
@@ -284,7 +354,7 @@ def test_review_claude_cli_with_images_falls_back_when_no_image_can_be_staged():
 
     captured = {}
 
-    def _fake_review_claude_cli(model, prompt, diff, cwd, timeout, round_no=0):
+    def _fake_review_claude_cli(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         captured["model"] = model
         captured["prompt"] = prompt
         captured["diff"] = diff

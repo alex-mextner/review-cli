@@ -155,7 +155,7 @@ def test_unstaged_review_does_not_touch_marker():
 def test_failed_staged_review_does_not_touch_marker():
     """A staged review whose backend FAILS (rc != 0) must NOT satisfy the gate. The
     marker touch is gated on `ok and staged`, so a failed review leaves it absent."""
-    def _failing_backend(model, prompt, diff, cwd, timeout, round_no=0):
+    def _failing_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         return ReviewResult(model=model, command="fake-fail", returncode=1, stdout="", stderr="boom")
 
     with _EnvSandbox(), tempfile.TemporaryDirectory() as d:

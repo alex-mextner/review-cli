@@ -59,7 +59,7 @@ DEFAULT_SESSION_GAP_SECONDS = 90.0
 _MAX_CALL_WALL = timedelta(seconds=1200)
 
 # ---- per-model health classification ---------------------------------------------------
-# The dashboard's "Models & roles" tab surfaces, per board model, an ok-rate and the
+# The dashboard's "Models & roles" tab surfaces, per default-preset board model, an ok-rate and the
 # dominant failure class so the CTO can see WHY a model is down at a glance. The classes
 # below are the real failure modes observed in `~/Library/Logs/review-cli/*.log` (see the
 # CHANGELOG / the HYP diagnosis): the per-call EXIT code + stderr + body sentinels each
@@ -112,9 +112,11 @@ _BAD_KEY_MARKER = '{"error":"bad key"}'
 # other = Opus. These are the two board claude seats.
 _CLAUDE_FABLE_MODEL = "claude:claude-fable-5"
 _CLAUDE_OPUS_MODEL = "claude:claude-opus-4-8"
-# Backend-name -> board model id for the single-model backends (the agentic codex CLI and
-# the gemini REST route each map to exactly one board seat).
-_SINGLE_MODEL_BACKENDS = {"codex": "codex", "gemini": "gemini"}
+# Backend-name -> board model id for backends with no per-call selector in argv0.
+_SINGLE_MODEL_BACKENDS = {"gemini": "gemini"}
+# Codex header argv0 is `codex -m <model>` when a suffixed model was requested, otherwise
+# it is just the binary path and maps to the bare codex board seat.
+_CODEX_MODEL_RE = re.compile(r"(?:^|\s)-m\s+(?P<model>\S+)")
 # `commandcode API <model>` / `z.ai API <model>` header argv0 reveals the gateway model.
 _API_MODEL_RE = re.compile(r"\bAPI\s+(?P<model>\S+)")
 # opencode header argv0 is `opencode -m <provider/model>` (review_opencode passes it as
@@ -1209,7 +1211,9 @@ def model_id_for_call(call: "CallLog") -> str:
         the board id (`claude:<model>`). Only the CLI wrapper (`claude-p`) hides the model
         (its argv0 is identical for Fable and Opus); there the model is inferred from the
         body — a paywall body = Fable, anything else = the Opus seat.
-      * `codex` / `gemini`: one model each; the backend name IS the board id.
+      * `codex`: a suffixed run records `codex -m <model>` in argv0, so recover
+        `codex:<model>`; otherwise the bare codex CLI maps to `codex`.
+      * `gemini`: one model, so the backend name IS the board id.
       * anything else: fall back to the backend name."""
     backend = call.backend
     if backend == "claude":
@@ -1223,6 +1227,11 @@ def model_id_for_call(call: "CallLog") -> str:
         if _PAYWALL_SENTINEL in _normalize_body(call.body):
             return _CLAUDE_FABLE_MODEL
         return _CLAUDE_OPUS_MODEL
+    if backend == "codex":
+        m = _CODEX_MODEL_RE.search(call.argv0)
+        if m:
+            return f"codex:{m.group('model')}"
+        return backend
     if backend in _SINGLE_MODEL_BACKENDS:
         return _SINGLE_MODEL_BACKENDS[backend]
     if backend == "opencode":
@@ -1242,15 +1251,14 @@ def model_id_for_call(call: "CallLog") -> str:
 
 
 def _board_models() -> list[dict]:
-    """The canonical board model list (id/role/display) the health view covers. Imported
+    """The canonical built-in model list (id/role/display) the health view covers. Imported
     lazily so the parser stays import-light and free of a config dependency at module load.
 
-    Carries the 1-based PRIORITY (DEFAULT_BOARD is priority-ordered, strongest first) so the
-    Models tab and the Errors-tab fallback hint can reason about who the failover pool would
-    promote when a seat is down. The cached source is the frozen DEFAULT_BOARD; this returns
-    FRESH dict copies so a caller can never mutate the shared cache (glm review finding 7 —
-    the lookup runs once per failed call on the runs-list endpoint, so rebuilding the config
-    objects each time was the wasteful part; copying small dicts is cheap)."""
+    Carries the 1-based raw-board PRIORITY so the Models tab and the Errors-tab fallback hint
+    cover optional heavy-preset seats (Fable/Sol) as well as the default preset. This
+    returns FRESH dict copies so a caller can never mutate the shared cache (glm review
+    finding 7 — the lookup runs once per failed call on the runs-list endpoint, so rebuilding
+    the config objects each time was the wasteful part; copying small dicts is cheap)."""
     return [dict(b) for b in _board_models_cached()]
 
 
@@ -1280,7 +1288,7 @@ def _fallback_seat_for(model_id: str) -> dict | None:
     next-priority reserve (config.select_pool / panel.run_board_with_failover). So the honest
     'planned fallback' for a failed seat is simply the next board seat after it.
 
-    `model_id` is a `model_id_for_call` result, which shares the DEFAULT_BOARD id scheme exactly
+    `model_id` is a `model_id_for_call` result, which shares the built-in board id scheme exactly
     (e.g. `commandcode:moonshotai/Kimi-K2.7-Code`, `zai:glm-5.2`), so the exact match below
     resolves every BOARD seat's fallback; an off-board model (e.g. `opencode`) correctly has
     none. Iterates the CACHED board tuple directly (no per-call rebuild — glm review finding 5)."""
@@ -1337,11 +1345,11 @@ def compute_model_health(sessions: list[Session]) -> dict:
     Walks every call across the (already window-bounded) sessions, attributes it to a
     MODEL id (commandcode/z.ai gateway model, Fable-vs-Opus split, etc.), classifies it, and
     rolls up per model: total/ok/fail counts, ok-rate, the dominant failure class, the most
-    recent class, and a `problematic` flag. Board models with NO calls in the window are
-    still listed (status `no_data`) so the view covers the whole board; any non-board model
-    that appears in the logs is appended too. Returns
-    `{"models": [...], "problematic_count": N}`; `problematic_count` is over BOARD models
-    (the tab badge), matching the spec."""
+    recent class, and a `problematic` flag. Built-in raw-board models with NO calls in the
+    window are still listed (status `no_data`) so the view covers optional heavy-preset
+    seats (Fable/Sol) as well as the default preset; any non-board model that appears in
+    the logs is appended too. Returns `{"models": [...], "problematic_count": N}`;
+    `problematic_count` is over built-in board models (the tab badge)."""
     # Gather calls per model, newest-first (sessions arrive newest-first; within a session
     # we keep call order then reverse so the most-recent call leads).
     per_model_classes: dict[str, list[str]] = {}

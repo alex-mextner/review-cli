@@ -470,7 +470,7 @@ class _FakeBackends:
         self._old = panel.resolve_backend
 
         def _resolve(_model: str):
-            def _backend(model, prompt, diff, cwd, timeout, round_no=0):
+            def _backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
                 self.dispatched.append(model)
                 seq = self.behaviour.get(model)
                 if seq is None:
@@ -646,7 +646,7 @@ def test_flat_m_path_retries_transient_seat(tmp_log):
     counts = {"m1": 0}
     try:
         def _resolve(_model):
-            def _b(model, prompt, diff, cwd, timeout, round_no=0):
+            def _b(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
                 i = counts["m1"]
                 counts["m1"] += 1
                 if model == "m1" and i == 0:

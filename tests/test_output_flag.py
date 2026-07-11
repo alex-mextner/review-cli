@@ -295,18 +295,21 @@ def test_real_review_result_text_lands_in_file():
 
         sentinel = "SENTINEL-REVIEW-VERDICT-XYZ"
 
-        def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0):
+        def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
             return backends.ReviewResult(
                 model=model, command="fake", returncode=0, stdout=sentinel, stderr="",
             )
 
         orig_avail = backends.backend_available
-        # The plain `-m` path (mode_review) resolves the backend via
-        # reviewlib.modes.review.resolve_backend — patch exactly that one (and force
-        # availability), nothing else.
+        # The plain `-m` path can dispatch through either the mode helper or the panel
+        # helper depending on config isolation; patch both resolver boundaries so this
+        # test never reaches a real model.
+        from reviewlib import panel  # noqa: PLC0415
         import reviewlib.modes.review as review_mod  # noqa: PLC0415
 
+        orig_panel_resolve = panel.resolve_backend
         orig_mode_resolve = review_mod.resolve_backend
+        panel.resolve_backend = lambda _m: _fake_backend  # type: ignore[assignment]
         review_mod.resolve_backend = lambda _m: _fake_backend  # type: ignore[assignment]
         backends.backend_available = lambda _m: True  # type: ignore[assignment]
         try:
@@ -319,6 +322,7 @@ def test_real_review_result_text_lands_in_file():
             assert sentinel in printed, printed     # and still printed to stdout
             assert rc == 0, rc
         finally:
+            panel.resolve_backend = orig_panel_resolve
             review_mod.resolve_backend = orig_mode_resolve
             backends.backend_available = orig_avail
 

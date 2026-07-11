@@ -84,6 +84,13 @@ test('resolveModel: boundary match DOES fire on a real separator (gpt-5.5 → GP
   assert.equal(m.label, 'GPT');
 });
 
+test('resolveModel: Sol seat resolves specifically, not generic GPT', () => {
+  const m = resolveModel('codex:gpt-5.6-sol');
+  assert.equal(m.key, 'gpt-5.6-sol');
+  assert.equal(m.logo, 'codex');
+  assert.equal(m.label, 'Sol');
+});
+
 test('resolveModel: suffixed ids resolve to the right family', () => {
   assert.equal(resolveModel('opus-4-8').key, 'opus');
   assert.equal(resolveModel('glm-5.2').key, 'glm');
