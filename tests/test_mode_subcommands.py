@@ -261,7 +261,7 @@ def test_brainstorm_with_diff_flag_grounds_on_working_tree_diff():
     grounding = "diff --git a/g b/g\n@@\n+grounded\n"
     captured: dict = {}
 
-    def _fake(topic, models, cwd, timeout, moderators, rounds, max_rounds, diff=""):
+    def _fake(topic, models, cwd, timeout, moderators, rounds, max_rounds, diff="", **_k):
         captured["diff"] = diff
         return 0
 
@@ -296,7 +296,7 @@ def test_just_ask_does_not_auto_grab_diff_but_diff_flag_opts_in():
     def run(argv):
         captured: dict = {}
 
-        def _fake(question, models, diff, cwd, timeout):
+        def _fake(question, models, diff, cwd, timeout, *_a, **_k):
             captured["diff"] = diff
             return 0
 

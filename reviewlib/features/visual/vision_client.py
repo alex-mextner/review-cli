@@ -48,6 +48,10 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ...config import EffortOverride
 
 # The verdict the vision model is FORCED to return (structured output). Kept minimal
 # and bounded; everything is DATA, never re-fed as a prompt (§5). The policy engine
@@ -131,6 +135,14 @@ _CAPABILITIES: dict[str, VisionCapability] = {
 }
 
 
+def effort_for_model(effort_override: "EffortOverride | None", model: str) -> str | None:
+    """The run-scoped effort level for a vision seat (a duck-typed config.EffortOverride),
+    or None. Vision seats carry no per-seat config effort, so the run-scoped `--effort` is
+    the only source; `effort_for` returns None when nothing is overridden. Shared by the
+    companion (compose) and standalone (pipeline) fan-out loops — one resolution rule."""
+    return effort_override.effort_for(model) if effort_override is not None else None
+
+
 def _route_name(model: str) -> str:
     """Map a model string to its backend route name, reusing review's resolution.
 
@@ -138,15 +150,7 @@ def _route_name(model: str) -> str:
     (keeps the vision path decoupled and the unit tests light)."""
     from ... import backends
 
-    fn = backends.resolve_backend(model)
-    return {
-        backends.review_claude: "claude",
-        backends.review_gemini: "gemini",
-        backends.review_codex: "codex",
-        backends.review_opencode: "opencode",
-        backends.review_commandcode: "commandcode",
-        backends.review_zai: "zai",
-    }.get(fn, "opencode")
+    return backends.provider_route_name(model)
 
 
 def capability_for(model: str) -> VisionCapability | None:
@@ -547,6 +551,7 @@ def call_ai_vision(
     cv_signals=None,
     output_schema: dict | None = None,
     timeout_s: int = 60,
+    effort: str | None = None,
 ) -> VisionVerdict:
     """Run the multimodal call by INVOKING THE AGENT CLI (codex/claude/opencode) with the
     image attached — mirroring how review's text backends shell out — and parsing the
@@ -555,6 +560,9 @@ def call_ai_vision(
     fail-closed.
 
     `model` None / a non-vision / unreachable backend → `available=False` (→ `unverified`).
+    `effort` (a run-scoped `--effort` level) is threaded to the CLI reasoning-effort flag
+    the same way the text backends apply it (codex `-c model_reasoning_effort`, claude
+    `--effort`, opencode `--variant`).
     """
     if model is None:
         return VisionVerdict(available=False, verdict=None, error="no vision-capable backend configured")
@@ -573,11 +581,11 @@ def call_ai_vision(
         body = build_gemini_request(sys_prompt, blocks, schema)
         return _call_gemini(model, body, timeout_s)
     if cap.wire == "codex-cli":
-        return _call_codex_cli(model, sys_prompt, blocks, schema, timeout_s)
+        return _call_codex_cli(model, sys_prompt, blocks, schema, timeout_s, effort)
     if cap.wire == "claude-cli":
-        return _call_claude_cli(model, sys_prompt, blocks, schema, timeout_s)
+        return _call_claude_cli(model, sys_prompt, blocks, schema, timeout_s, effort)
     if cap.wire == "opencode-cli":
-        return _call_opencode_cli(model, sys_prompt, blocks, schema, timeout_s)
+        return _call_opencode_cli(model, sys_prompt, blocks, schema, timeout_s, effort)
     return VisionVerdict(
         available=False,
         verdict=None,
@@ -724,7 +732,7 @@ def _cli_verdict_from_output(
     return parse_structured(data, backend=backend)
 
 
-def _call_codex_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int) -> VisionVerdict:
+def _call_codex_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int, effort: str | None = None) -> VisionVerdict:
     """codex vision: `codex exec -i <image> --output-schema <schema> -o <out> -`. Mirrors
     review_codex's `codex exec` invocation; adds the image (`-i`) and the forced output
     schema (`--output-schema`, written to <out>). Resolves the codex model from the alias
@@ -744,6 +752,11 @@ def _call_codex_cli(model: str, system: str, blocks: list[VisionBlock], schema: 
         argv = ["codex", "exec", "-s", "read-only", "--skip-git-repo-check", "-C", str(tmp), "--ephemeral"]
         if codex_model:
             argv += ["-m", codex_model]
+        from ... import backends
+
+        codex_effort = backends._codex_reasoning_effort(effort)
+        if codex_effort:
+            argv += ["-c", f'model_reasoning_effort="{codex_effort}"']
         for img in images:
             argv += ["-i", str(img)]
         argv += ["--output-schema", str(schema_path), "-o", str(out_path), "-"]
@@ -758,7 +771,7 @@ def _call_codex_cli(model: str, system: str, blocks: list[VisionBlock], schema: 
         return _cli_verdict_from_output(out_text or stdout, backend=model, returncode=rc, stderr=stderr, timed_out=timed_out, schema=schema)
 
 
-def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int) -> VisionVerdict:
+def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int, effort: str | None = None) -> VisionVerdict:
     """claude vision: reference the image as `@<path>` in the `-p` prompt; the Read tool
     (scoped to the image dir via --add-dir) loads it. Mirrors review_claude's direct
     headless CLI path, but ENABLES Read (vision needs to load the file). `--json-schema`
@@ -788,6 +801,11 @@ def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema:
         ]
         if claude_model:
             argv += ["--model", claude_model]
+        from ... import backends
+
+        claude_effort = backends._claude_reasoning_effort(effort)
+        if claude_effort and backends._claude_cli_supports_effort("claude"):
+            argv += ["--effort", claude_effort]
         rc, stdout, stderr, timed_out = _run_cli(argv, cwd=tmp, input_text=None, timeout_s=timeout_s, backend="claude-vision")
         # `--output-format json` wraps the answer; the verdict JSON is the `result` field.
         text = stdout
@@ -800,7 +818,7 @@ def _call_claude_cli(model: str, system: str, blocks: list[VisionBlock], schema:
         return _cli_verdict_from_output(text, backend=model, returncode=rc, stderr=stderr, timed_out=timed_out, schema=schema)
 
 
-def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int) -> VisionVerdict:
+def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schema: dict, timeout_s: int, effort: str | None = None) -> VisionVerdict:
     """opencode vision: `opencode run "<prompt>" -m <vision-model> -f <image>`. Mirrors
     review_opencode's `opencode run`; attaches the image with `-f` and routes to the named
     (vision-capable) model. opencode is a provider ROUTER, so the user selects a vision
@@ -841,6 +859,9 @@ def _call_opencode_cli(model: str, system: str, blocks: list[VisionBlock], schem
         # Message FIRST (positional), then flags: the -f array flag is greedy and would
         # otherwise swallow a trailing positional message.
         argv = ["opencode", "run", prompt, "--agent", "read-only-reviewer", "-m", oc_model]
+        variant = backends._opencode_variant(effort)
+        if variant:
+            argv += ["--variant", variant]
         for img in images:
             argv += ["-f", str(img)]
         rc, stdout, stderr, timed_out = _run_cli(argv, cwd=tmp, input_text=None, timeout_s=timeout_s, backend="opencode-vision")

@@ -21,6 +21,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ...config import EffortOverride
 
 from .contract import derive_contract
 from .cv_gate import cv_gate, detect_media_type, prepare_image_for_vision
@@ -33,6 +37,7 @@ from .vision_client import (
     build_output_schema,
     call_ai_vision,
     capability_for,
+    effort_for_model,
     encode_image,
     select_vision_backend,
     select_vision_backends,
@@ -139,6 +144,7 @@ def build_mode_visual_context(
     requested_checks: list[str] | None = None,
     vision_timeout: int = 60,
     require_vision: bool = True,
+    effort_override: EffortOverride | None = None,
 ) -> VisualComposition:
     """Build the composition for a companion mode: run cvGate cheaply, then (Stage 2)
     deliver the image to a vision model and fold the grounded observation into the note.
@@ -182,6 +188,7 @@ def build_mode_visual_context(
         observation = _run_fanout(
             image, expectation, sig, intent,
             models=models or [], requested_checks=requested_checks or [], vision_timeout=vision_timeout,
+            effort_override=effort_override,
         )
         if require_vision:
             vision_error = _vision_error(observation)
@@ -203,7 +210,7 @@ def build_mode_visual_context(
     )
 
 
-def _run_fanout(image, expectation, signals, intent, *, models, requested_checks, vision_timeout) -> VisionVerdict | None:
+def _run_fanout(image, expectation, signals, intent, *, models, requested_checks, vision_timeout, effort_override: EffortOverride | None = None) -> VisionVerdict | None:
     """The single real multimodal call that delivers the image to a vision model with
     the active modules' questions folded in. Returns None when no vision backend is
     configured; callers decide whether that is allowed (explicit --no-ai) or blocking."""
@@ -226,7 +233,7 @@ def _run_fanout(image, expectation, signals, intent, *, models, requested_checks
     blocks = _fanout_blocks(Path(image), expectation, signals, questions, cap)
     return _call_ai_vision_with_fallback(
         backends, blocks=blocks, expectation=expectation, cv_signals=signals,
-        output_schema=schema, timeout_s=vision_timeout,
+        output_schema=schema, timeout_s=vision_timeout, effort_override=effort_override,
     )
 
 
@@ -238,10 +245,10 @@ def _ordered_vision_backends(models: list[str]) -> list[str]:
     return [first] + [model for model in ordered if model != first]
 
 
-def _call_ai_vision_with_fallback(models: list[str], **kwargs) -> VisionVerdict:
+def _call_ai_vision_with_fallback(models: list[str], *, effort_override: EffortOverride | None = None, **kwargs) -> VisionVerdict:
     last: VisionVerdict | None = None
     for model in models:
-        verdict = call_ai_vision(model, **kwargs)
+        verdict = call_ai_vision(model, effort=effort_for_model(effort_override, model), **kwargs)
         if verdict.available and verdict.verdict in VISION_VERDICTS:
             return verdict
         last = verdict

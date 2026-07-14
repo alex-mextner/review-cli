@@ -26,6 +26,10 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..config import EffortOverride
 
 # How a mode treats the git diff by default, BEFORE any composable flag (`--staged`,
 # a piped diff) is applied:
@@ -62,6 +66,12 @@ class ModeContext:
     visual_ctx: object | None = None
     # The moderator backends resolved from --moderator (for panel/brainstorm modes).
     moderators: list[str] = field(default_factory=list)
+    # The run-scoped `--effort` override (config.EffortOverride, imported under TYPE_CHECKING
+    # so the runtime stays cycle-free). Panel modes that build PanelJobs from a flat model
+    # list (quorum / just-ask / brainstorm) resolve each job's effort through it
+    # (`effort_for(model)`); None / an empty override leaves every job at its default (no
+    # effort). The board path (review mode) applies it CLI-side onto the seats, not here.
+    effort_override: "EffortOverride | None" = None
     # Mode-specific extras resolved by the CLI that don't fit the shared fields above.
     # Kept as an open dict so the registry contract doesn't grow a field per mode; a mode
     # that needs none ignores it. The currently defined keys (only the `review` mode reads

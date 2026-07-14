@@ -19,6 +19,10 @@ to vision as before.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ...config import EffortOverride
 
 from .contract import VisualExpectation, derive_contract
 from .cv_gate import cv_gate, detect_media_type, prepare_image_for_vision
@@ -32,6 +36,7 @@ from .vision_client import (
     build_output_schema,
     call_ai_vision,
     capability_for,
+    effort_for_model,
     encode_image,
     select_vision_backend,
     select_vision_backends,
@@ -88,6 +93,7 @@ def run_pipeline(
     project: Path | None = None,
     local_model: bool = True,
     known_good_cache: KnownGoodCache | None = None,
+    effort_override: EffortOverride | None = None,
 ) -> Verdict:
     """Run the full standalone pipeline and return a final `Verdict`.
 
@@ -214,7 +220,7 @@ def run_pipeline(
     blocks = _build_blocks(after, before, expectation, signals, questions, cap)
     vision = _call_ai_vision_with_fallback(
         vision_backends, blocks=blocks, expectation=expectation, cv_signals=signals,
-        output_schema=schema, timeout_s=vision_timeout,
+        output_schema=schema, timeout_s=vision_timeout, effort_override=effort_override,
     )
 
     # --- Stage 3: judge phase + policy decision. --------------------------------
@@ -287,10 +293,10 @@ def _ordered_vision_backends(models: list[str]) -> list[str]:
     return [first] + [model for model in ordered if model != first]
 
 
-def _call_ai_vision_with_fallback(models: list[str], **kwargs) -> object:
+def _call_ai_vision_with_fallback(models: list[str], *, effort_override: EffortOverride | None = None, **kwargs) -> object:
     last = None
     for model in models:
-        verdict = call_ai_vision(model, **kwargs)
+        verdict = call_ai_vision(model, effort=effort_for_model(effort_override, model), **kwargs)
         if verdict.available and verdict.verdict in VISION_VERDICTS:
             return verdict
         last = verdict

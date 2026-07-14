@@ -32,12 +32,15 @@ from .config import (
     QA_TIMEOUT_DEFAULT,
     VISUAL_MODELS,
     BoardConfigError,
+    EffortValueError,
     _expand_alias,
     _effective_pool_size,
     _split_models,
+    apply_effort_override,
     board_from_models,
     load_board,
     load_config,
+    parse_effort_flag,
     preset_names,
     preset_pool_size,
     split_pool_reserve,
@@ -2054,6 +2057,17 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             "never off — --pool only sizes it. N<=0 means all seats. Ignored for explicit -m."
         ),
     )
+    parser.add_argument(
+        "--effort", action="append", default=[], metavar="LEVEL|PROVIDER=LEVEL",
+        help=(
+            "run-scoped reasoning effort, overriding each seat's config effort for THIS run. "
+            "A bare level (minimal/low/medium/high/xhigh/max) applies to every seat; "
+            "PROVIDER=LEVEL (e.g. codex=high, opencode=max) overrides one backend route. "
+            "Repeat or comma-separate; per-provider wins over the global level. "
+            "Reaches the codex, claude, and opencode reasoning-effort levers plus the "
+            "screenshot vision call."
+        ),
+    )
     # NOTE: `--retry` is NOT global — it only applies to the diff REVIEW path (the failover
     # board + the flat `-m` panel), not brainstorm/quorum/just-ask (which call run_panel and
     # never use the retry wrapper). It lives on the diff mode's own option surface
@@ -2600,6 +2614,16 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if getattr(args, "retry", None) is not None:
         os.environ["REVIEW_RETRY_COUNT"] = str(max(0, min(args.retry, max_retry_count())))
 
+    # Run-scoped `--effort` (global flag): parse ONCE into an EffortOverride here so both the
+    # board path (applied CLI-side onto the seats) and the flat-panel modes (threaded via
+    # ModeContext) resolve against the same value. A bad level is user input for THIS run —
+    # fail loudly with exit 2, not the config board's warn-and-drop.
+    try:
+        effort_override = parse_effort_flag(getattr(args, "effort", None))
+    except EffortValueError as exc:
+        print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
+        return 2
+
     config = load_config()
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
 
@@ -2825,6 +2849,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
         except BoardConfigError as exc:
             print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
             return 2
+        # Run-scoped `--effort` OVERRIDES each seat's config effort for this run (falls back
+        # to the seat value where the flag says nothing). Applied once, here, so the failover
+        # board mode_review consumes carries the effective effort — no double application.
+        if board is not None:
+            board = apply_effort_override(board, effort_override)
         return None
 
     # Panel modes are interactive and long-running, so announce each streamed
@@ -2973,6 +3002,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 # process cwd, so `review visual shot.png -C <repo>` finds
                 # <repo>/.review/visual-modules.json (codex P2).
                 project=args.project or str(cwd),
+                effort_override=effort_override,
             )
 
         # COMPANION: a mode (or the default diff-review) runs WITH the image as context.
@@ -2996,6 +3026,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 requested_checks=list(args.check),
                 vision_timeout=args.vision_timeout,
                 require_vision=not args.no_ai,
+                effort_override=effort_override,
             ),
         )
         # The cvGate pre-filter BLOCKS the companion run on an unambiguously-broken
@@ -3033,6 +3064,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     ctx = ModeContext(
         args=args, models=models, diff=diff, cwd=cwd, timeout=timeout,
         with_visual=_with_visual_text, visual_ctx=visual_ctx, moderators=moderators,
+        effort_override=effort_override,
         extra={"diff_from_stdin": diff_from_stdin},
     )
 

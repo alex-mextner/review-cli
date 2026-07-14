@@ -6,12 +6,25 @@ decomposition — zero behaviour change).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..config import EffortOverride
 
 
 def _diff_context_block(diff: str) -> str:
     if not diff.strip():
         return ""
     return f"\n\nAdditional context — a git diff:\n\n```diff\n{diff}\n```"
+
+
+def _run_effort(effort_override: "EffortOverride | None", model: str) -> str | None:
+    """The run-scoped `--effort` level for a flat-panel seat (quorum / just-ask /
+    brainstorm), or None. These modes build PanelJobs from a bare model list with no
+    per-seat config effort, so the run-scoped override (a duck-typed
+    `config.EffortOverride`) is the only source; `effort_for` yields None when nothing is
+    overridden, leaving the job at its default."""
+    return effort_override.effort_for(model) if effort_override is not None else None
 
 
 def _visual_images(ctx) -> tuple[Path, ...]:

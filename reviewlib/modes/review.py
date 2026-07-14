@@ -22,8 +22,15 @@ import argparse
 import concurrent.futures
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from ..backends import ReviewResult, backend_available, resolve_backend, review_with_images
+from ..backends import (
+    ReviewResult,
+    backend_available,
+    call_backend,
+    resolve_backend,
+    review_with_images,
+)
 from ..config import DEFAULT_POOL_SIZE, BoardReviewer, split_pool_reserve
 from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
@@ -36,6 +43,9 @@ from ..retry import retry_default, run_seat_with_retry
 from . import _visual_images
 from .contract import ModeContext, ModeSpec
 
+if TYPE_CHECKING:
+    from ..config import EffortOverride
+
 
 def mode_review(
     models: list[str], prompt: str, diff: str, cwd: Path, timeout: int, staged: bool,
@@ -44,12 +54,16 @@ def mode_review(
     diff_from_stdin: bool = False,
     visual_images: tuple[Path, ...] = (),
     exact_board: bool = False,
+    effort_override: "EffortOverride | None" = None,
 ) -> int:
     if not diff.strip():
         print("No diff to review.", file=sys.stderr)
         return 1
 
     if board:
+        # The board already carries the run-scoped effort — the CLI applied it onto the
+        # seats before handing the board in (apply_effort_override), so the failover path
+        # needs nothing extra here.
         return _mode_review_board(
             board, prompt, diff, cwd, timeout, staged, pool_size, outcome_sink,
             diff_from_stdin, visual_images, exact_board,
@@ -63,16 +77,24 @@ def mode_review(
     # final outcome. The per-call run-stats tally records that final outcome once per seat.
     results: list[ReviewResult] = []
 
+    def _seat_effort(model: str) -> str | None:
+        # The flat `-m` path has no BoardReviewer, so the run-scoped `--effort` is the only
+        # effort source. None (no flag) keeps the dispatch byte-identical to before.
+        return effort_override.effort_for(model) if effort_override is not None else None
+
+    def _dispatch(model: str) -> ReviewResult:
+        backend = resolve_backend(model)
+        effort = _seat_effort(model)
+        if visual_images:
+            if effort is None:
+                return review_with_images(model, prompt, diff, cwd, timeout, 0, visual_images)
+            return review_with_images(model, prompt, diff, cwd, timeout, 0, visual_images, effort=effort)
+        if effort is None:
+            return backend(model, prompt, diff, cwd, timeout)
+        return call_backend(backend, model, prompt, diff, cwd, timeout, effort=effort)
+
     def _run_seat_with_retry(model: str) -> ReviewResult:
-        if not visual_images:
-            return run_seat_with_retry(
-                model, lambda: resolve_backend(model)(model, prompt, diff, cwd, timeout)
-            )
-        return run_seat_with_retry(
-            model, lambda: review_with_images(
-                model, prompt, diff, cwd, timeout, 0, visual_images
-            )
-        )
+        return run_seat_with_retry(model, lambda: _dispatch(model))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
         futures = {pool.submit(_run_seat_with_retry, model): model for model in models}
@@ -207,6 +229,7 @@ def _handler(ctx: ModeContext) -> int:
         return mode_review(
             *base, board=None, diff_from_stdin=diff_from_stdin,
             visual_images=_visual_images(ctx),
+            effort_override=ctx.effort_override,
         )
     return mode_review(
         *base, board=board,

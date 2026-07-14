@@ -975,6 +975,85 @@ def test_stage_images_writes_real_files_with_right_suffix():
         assert paths[0].read_bytes() == _IMG_BYTES
 
 
+# === run-scoped --effort reaches the vision call (and never doubles a flag) ========
+def test_codex_vision_threads_effort_to_reasoning_config():
+    """`effort=` reaches codex vision as a single `-c model_reasoning_effort=...` (max ->
+    xhigh, mirroring the text backend), and is ABSENT with no effort."""
+    cap: dict = {}
+    old = _patch_runner(cap, write_output_file='{"verdict":"keep","confidence":0.9}')
+    try:
+        vc.call_ai_vision("codex", blocks=_blocks(), effort="max")
+    finally:
+        _restore_runner(old)
+    argv = cap["argv"]
+    reasoning = [a for a in argv if a.startswith("model_reasoning_effort=")]
+    assert reasoning == ['model_reasoning_effort="xhigh"'], argv
+    assert argv.count("-c") == 1
+
+    cap2: dict = {}
+    old = _patch_runner(cap2, write_output_file='{"verdict":"keep","confidence":0.9}')
+    try:
+        vc.call_ai_vision("codex", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    assert not any(a.startswith("model_reasoning_effort=") for a in cap2["argv"]), cap2["argv"]
+
+
+def test_claude_vision_threads_effort_once():
+    """`effort=` reaches claude vision as a single `--effort` (minimal -> low), gated by the
+    binary capability probe (stubbed True). No duplicate `--effort`."""
+    import reviewlib.backends as backends
+
+    cap: dict = {}
+    old_probe = backends._claude_cli_supports_effort
+    backends._claude_cli_supports_effort = lambda _binary: True
+    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9}')
+    try:
+        vc.call_ai_vision("claude:opus", blocks=_blocks(), effort="minimal")
+    finally:
+        _restore_runner(old)
+        backends._claude_cli_supports_effort = old_probe
+    argv = cap["argv"]
+    assert argv.count("--effort") == 1, argv
+    assert argv[argv.index("--effort") + 1] == "low"
+
+
+def test_claude_vision_omits_effort_when_binary_lacks_flag():
+    import reviewlib.backends as backends
+
+    cap: dict = {}
+    old_probe = backends._claude_cli_supports_effort
+    backends._claude_cli_supports_effort = lambda _binary: False
+    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9}')
+    try:
+        vc.call_ai_vision("claude:opus", blocks=_blocks(), effort="high")
+    finally:
+        _restore_runner(old)
+        backends._claude_cli_supports_effort = old_probe
+    assert "--effort" not in cap["argv"], cap["argv"]
+
+
+def test_opencode_vision_threads_effort_as_single_variant():
+    """`effort=` reaches opencode vision as a single `--variant`, ABSENT with no effort."""
+    cap: dict = {}
+    old = _patch_runner(cap, stdout='{"verdict":"keep","confidence":0.9}')
+    try:
+        vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks(), effort="high")
+    finally:
+        _restore_runner(old)
+    argv = cap["argv"]
+    assert argv.count("--variant") == 1, argv
+    assert argv[argv.index("--variant") + 1] == "high"
+
+    cap2: dict = {}
+    old = _patch_runner(cap2, stdout='{"verdict":"keep","confidence":0.9}')
+    try:
+        vc.call_ai_vision("oc:fireworks/qwen2-vl", blocks=_blocks())
+    finally:
+        _restore_runner(old)
+    assert "--variant" not in cap2["argv"], cap2["argv"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

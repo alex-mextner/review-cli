@@ -8,8 +8,9 @@ DEFAULT_MODELS panel is untouched.
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from pathlib import Path
 
 DEFAULT_PROMPT = (
@@ -380,6 +381,133 @@ def _normalize_effort(value: object) -> str | None:
         )
         return None
     return effort
+
+
+class EffortValueError(ValueError):
+    """A `--effort` value is not a recognised level. Unlike `_normalize_effort`
+    (which warns + drops a bad CONFIG board entry so a stale file never crashes a
+    run), a bad CLI `--effort` is user input for THIS run and must fail loudly."""
+
+
+def _require_effort(value: str) -> str:
+    """Strict effort parse for run-scoped CLI input: raise on anything not in
+    EFFORT_LEVELS. Shares the level vocabulary with `_normalize_effort`."""
+    level = value.strip().lower()
+    if level not in EFFORT_LEVELS:
+        raise EffortValueError(
+            f"unsupported effort {value!r}; expected one of {', '.join(sorted(EFFORT_LEVELS))}"
+        )
+    return level
+
+
+def _effort_provider_key(model_or_provider: str) -> str:
+    """Canonical backend-route key a `--effort` override is matched on.
+
+    Reuses `backends.provider_route_name` (the SAME resolution `review` uses to pick a
+    seat's backend) so both a `--effort <provider>=<level>` token and a seat's model id
+    collapse to the same route name — `codex`, `claude`, `opencode` (incl. every `oc:`/
+    unknown seat), `gemini`, `commandcode`, `zai`, `openrouter`. Imported lazily to keep
+    `config` import-light and cycle-free (backends never imports config)."""
+    from . import backends
+
+    return backends.provider_route_name(model_or_provider)
+
+
+# Known route keys a `--effort <provider>=<level>` token may target (for the error message
+# when a token is unrecognised). Derived once from the backend routes.
+_EFFORT_PROVIDER_KEYS = ("codex", "claude", "gemini", "opencode", "commandcode", "zai", "openrouter")
+
+
+def _require_provider_key(provider: str) -> str:
+    """Validate a user-supplied `--effort <provider>=...` token and return its canonical
+    route key. A typo (`claud`, `codexx`) that would otherwise fall through to the opencode
+    catch-all raises EffortValueError instead of silently overriding the opencode route."""
+    from . import backends
+
+    if not backends.is_known_backend_token(provider):
+        raise EffortValueError(
+            f"unknown --effort provider {provider!r}; expected one of {', '.join(_EFFORT_PROVIDER_KEYS)}"
+        )
+    return backends.provider_route_name(provider)
+
+
+@dataclass(frozen=True)
+class EffortOverride:
+    """A run-scoped `--effort` override resolved once from the CLI.
+
+    `default` is the global level (a bare `--effort high`); `by_provider` maps a backend
+    route key (see `_effort_provider_key`) to a level (`--effort codex=high`). It OVERRIDES
+    the per-seat config `effort` for a run and falls back to the seat value when it has
+    nothing to say — the resolution seam is `resolve`."""
+
+    default: str | None = None
+    by_provider: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Validate + canonicalize provider keys to backend-route names, so a DIRECT
+        # construction (`EffortOverride(by_provider={"oc": "high"})`) matches the same route
+        # `effort_for` resolves a model to, and a typo'd key (`claud`) fails loudly instead
+        # of silently landing on the opencode catch-all. parse_effort_flag already does this;
+        # this keeps programmatic callers coherent. The result is frozen behind a
+        # MappingProxyType so `frozen=True` is not defeated by an in-place dict mutation.
+        # Frozen dataclass → object.__setattr__.
+        canonical = {_require_provider_key(key): value for key, value in self.by_provider.items()}
+        object.__setattr__(self, "by_provider", MappingProxyType(canonical))
+
+    @property
+    def is_empty(self) -> bool:
+        return self.default is None and not self.by_provider
+
+    def effort_for(self, model_or_provider: str) -> str | None:
+        """The run-scoped level for a model/provider: the per-provider override when set,
+        else the global default, else None (nothing to override — caller keeps the seat)."""
+        if self.is_empty:
+            return None
+        key = _effort_provider_key(model_or_provider)
+        if key in self.by_provider:
+            return self.by_provider[key]
+        return self.default
+
+    def resolve(self, model: str, seat_effort: str | None) -> str | None:
+        """The effective effort for a seat: `effort_for(provider) or seat_effort`. The
+        run-scoped flag WINS when present; otherwise the per-seat config value stands."""
+        return self.effort_for(model) or seat_effort
+
+
+def parse_effort_flag(values: list[str] | None) -> EffortOverride:
+    """Parse repeated/comma-joined `--effort` tokens into an EffortOverride.
+
+    A bare token (`high`) sets the global default; a `provider=level` token
+    (`codex=high`, `opencode=max`) sets a per-provider override, its provider normalised
+    to the same route key seats resolve to. Raises EffortValueError on an unknown level."""
+    default: str | None = None
+    by_provider: dict[str, str] = {}
+    for raw in values or []:
+        for part in raw.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            if "=" in token:
+                provider, _, level = token.partition("=")
+                provider = provider.strip()
+                if not provider:
+                    raise EffortValueError(f"malformed --effort token {token!r}; expected provider=level")
+                by_provider[_require_provider_key(provider)] = _require_effort(level)
+            else:
+                default = _require_effort(token)
+    return EffortOverride(default=default, by_provider=by_provider)
+
+
+def apply_effort_override(
+    board: list[BoardReviewer], override: EffortOverride | None,
+) -> list[BoardReviewer]:
+    """Return a board with each seat's effort resolved through the run-scoped override
+    (`override.resolve(model, seat_effort)`). Identity-returns the board when the override
+    is empty, so the per-seat config effort stands untouched with no `--effort`. Always
+    returns a FRESH list (the seats are frozen/immutable, so the copy is safe to hand on)."""
+    if override is None or override.is_empty:
+        return list(board)
+    return [replace(r, effort=override.resolve(r.model, r.effort)) for r in board]
 
 
 def _always_available(_reviewer: BoardReviewer) -> bool:

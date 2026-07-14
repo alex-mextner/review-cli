@@ -217,7 +217,7 @@ def _capture_cli_brainstorm_diff(argv: list[str], *, stdin_text: str | None,
 
     captured: dict = {"git_called": False}
 
-    def _fake_brainstorm(topic, models, cwd, timeout, moderators, rounds, max_rounds, diff=""):
+    def _fake_brainstorm(topic, models, cwd, timeout, moderators, rounds, max_rounds, diff="", **_k):
         captured["diff"] = diff
         return 0
 

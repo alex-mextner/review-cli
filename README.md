@@ -953,6 +953,14 @@ TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what a
                     the rest are kept in reserve. The board is never off — --pool only sizes
                     it. N<=0 (e.g. --pool 0) runs all seats in the selected preset/board.
                     Ignored for explicit -m.
+--effort LEVEL|PROVIDER=LEVEL
+                    Run-scoped reasoning effort, overriding each seat's config effort for
+                    THIS run. A bare level (minimal/low/medium/high/xhigh/max) applies to
+                    every seat; PROVIDER=LEVEL (e.g. codex=high, opencode=max) overrides one
+                    backend route; per-provider wins over the global level. Repeat or
+                    comma-separate. Reaches the codex/claude/opencode reasoning levers plus
+                    the screenshot vision call; falls back to the seat's config effort where
+                    the flag is silent.
 
 SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
 --diff / --staged   Diff source: working-tree (--diff) or staged (--staged). On the diff
