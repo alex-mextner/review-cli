@@ -9,9 +9,13 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .pipeline import run_pipeline
 from .policy_engine import exit_code_for
+
+if TYPE_CHECKING:
+    from ...config import EffortOverride
 
 # Human-readable one-liner glyphs per verdict.
 _GLYPH = {
@@ -37,6 +41,7 @@ def run_visual_standalone(
     strict: bool,
     project: str | None = None,
     local_model: bool = True,
+    effort_override: EffortOverride | None = None,
 ) -> int:
     after = Path(image).expanduser()
     before_path = Path(before).expanduser() if before else None
@@ -52,6 +57,7 @@ def run_visual_standalone(
         local_model=local_model,
         vision_timeout=vision_timeout,
         project=Path(project).expanduser() if project else None,
+        effort_override=effort_override,
     )
     code = exit_code_for(verdict, strict=strict)
 

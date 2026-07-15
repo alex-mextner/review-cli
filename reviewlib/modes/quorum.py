@@ -9,15 +9,20 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..panel import PanelJob, format_result, run_moderator, run_panel
-from . import _diff_context_block, _visual_images
+from . import _diff_context_block, _run_effort, _visual_images
 from .contract import ModeContext, ModeSpec
+
+if TYPE_CHECKING:
+    from ..config import EffortOverride
 
 
 def mode_quorum(
     question: str, models: list[str], diff: str, cwd: Path, timeout: int,
     moderators: list[str], visual_images: tuple[Path, ...] = (),
+    effort_override: "EffortOverride | None" = None,
 ) -> int:
     expert_prompt = (
         "You are one expert on a panel. Give a clear RECOMMENDATION on the question below. "
@@ -27,7 +32,13 @@ def mode_quorum(
         "Do not edit files or run commands.\n\n"
         f"QUESTION:\n{question}" + _diff_context_block(diff)
     )
-    jobs = [PanelJob(model=model, prompt=expert_prompt, diff="", images=visual_images) for model in models]
+    jobs = [
+        PanelJob(
+            model=model, prompt=expert_prompt, diff="", images=visual_images,
+            effort=_run_effort(effort_override, model),
+        )
+        for model in models
+    ]
     expert_results = run_panel(jobs, cwd, timeout)
 
     transcript = "\n\n".join(
@@ -63,11 +74,11 @@ def _handler(ctx: ModeContext) -> int:
     if images:
         return mode_quorum(
             ctx.with_visual(ctx.args.question), ctx.models, ctx.diff, ctx.cwd, ctx.timeout,
-            ctx.moderators, images,
+            ctx.moderators, images, effort_override=ctx.effort_override,
         )
     return mode_quorum(
         ctx.with_visual(ctx.args.question), ctx.models, ctx.diff, ctx.cwd, ctx.timeout,
-        ctx.moderators,
+        ctx.moderators, effort_override=ctx.effort_override,
     )
 
 

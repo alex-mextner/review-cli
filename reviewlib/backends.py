@@ -120,6 +120,18 @@ def _claude_reasoning_effort(effort: str | None) -> str | None:
     return effort
 
 
+def _opencode_variant(effort: str | None) -> str | None:
+    """The opencode `--variant` value for a review effort level, or None.
+
+    opencode's `--variant` is "provider-specific reasoning effort" (its help lists
+    `high`, `max`, `minimal`) forwarded to whatever provider the seat routes to. review's
+    effort vocabulary is a strict superset of those examples, so the level passes straight
+    through; opencode + the provider decide how to honour it."""
+    if not effort:
+        return None
+    return effort
+
+
 def call_backend(
     backend: Callable[..., ReviewResult],
     model: str,
@@ -509,8 +521,11 @@ def review_opencode(
             str(cwd),
             "-m",
             oc_model,
-            message,
         ]
+        variant = _opencode_variant(effort)
+        if variant:
+            argv += ["--variant", variant]
+        argv.append(message)
         proc = _run_streamed(argv, cwd=cwd, timeout=timeout, backend="opencode", round_no=round_no,
                              announce=_ANNOUNCE_LOGS,
                              header_argv0=f"opencode -m {_safe_log_header(oc_model)}")
@@ -544,8 +559,11 @@ def review_opencode(
             "read-only-reviewer",
             "-m",
             oc_model,
-            message,
         ]
+        variant = _opencode_variant(effort)
+        if variant:
+            argv += ["--variant", variant]
+        argv.append(message)
         proc = _run_streamed(argv, cwd=tmp, timeout=timeout, backend="opencode", round_no=round_no,
                              announce=_ANNOUNCE_LOGS,
                              header_argv0=f"opencode -m {_safe_log_header(oc_model)}")
@@ -2492,6 +2510,38 @@ def resolve_backend(model: str) -> Callable[..., ReviewResult]:
     # instead checks each default's under-transport provider is a named backend and not in
     # the dead-provider denylist, so a stale default can't ride this fallthrough silently.
     return _match_named_backend(model.lower()) or review_opencode
+
+
+def provider_route_name(model: str) -> str:
+    """Canonical backend-route name for a model id, reusing `resolve_backend`.
+
+    Maps a model string to the name of the backend it actually runs on — `codex`,
+    `claude`, `gemini`, `opencode` (incl. every `oc:`/unknown-fallthrough seat),
+    `commandcode`, `zai`, `openrouter`. This is the route KEY a run-scoped `--effort`
+    override matches on (config.EffortOverride) and the same mapping the visual path uses
+    (`features/visual/vision_client._route_name`)."""
+    return {
+        review_claude: "claude",
+        review_gemini: "gemini",
+        review_codex: "codex",
+        review_opencode: "opencode",
+        review_commandcode: "commandcode",
+        review_zai: "zai",
+        review_openrouter: "openrouter",
+    }.get(resolve_backend(model), "opencode")
+
+
+def is_known_backend_token(token: str) -> bool:
+    """Whether a bare token names a backend review RECOGNISES — as opposed to falling
+    through `resolve_backend`'s opencode catch-all. opencode itself (`opencode`/`oc`, or an
+    `opencode:`/`oc:` prefix) counts as recognised; an unknown word does NOT.
+
+    Used to validate a user-supplied `--effort <provider>=<level>` token so a typo
+    (`claud=high`) fails loudly instead of silently landing on the opencode route."""
+    lowered = token.strip().lower()
+    if lowered in ("opencode", "oc") or lowered.startswith(("opencode:", "oc:")):
+        return True
+    return _match_named_backend(lowered) is not None
 
 
 def backend_available(model: str) -> bool:

@@ -15,6 +15,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..panel import (
     PanelJob,
@@ -25,8 +26,11 @@ from ..panel import (
     run_panel,
 )
 from ..process import current_task_code, log_dir
-from . import _visual_images
+from . import _run_effort, _visual_images
 from .contract import ModeContext, ModeSpec
+
+if TYPE_CHECKING:
+    from ..config import EffortOverride
 
 # Stable, distinct exit code for "the panel backends produced nothing" (dead / credential-less
 # backends). A brainstorm that runs its rounds with every seat returning empty used to print a
@@ -155,6 +159,7 @@ def mode_brainstorm(
     resume_log: Path | None = None,
     synthesize_only: bool = False,
     visual_images: tuple[Path, ...] = (),
+    effort_override: "EffortOverride | None" = None,
 ) -> int:
     """Run (or RESUME) a multi-round brainstorm.
 
@@ -305,6 +310,7 @@ def mode_brainstorm(
                     model=model, prompt=prompt, diff=diff,
                     label=f"{persona_name} ({model})", round_no=round_no,
                     images=visual_images,
+                    effort=_run_effort(effort_override, model),
                 ))
 
             round_results = run_panel(jobs, cwd, timeout)
@@ -478,7 +484,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _handler(ctx: ModeContext) -> int:
     images = _visual_images(ctx)
-    kwargs = {"diff": ctx.diff}
+    kwargs = {"diff": ctx.diff, "effort_override": ctx.effort_override}
     if images:
         kwargs["visual_images"] = images
     return mode_brainstorm(
