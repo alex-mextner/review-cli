@@ -31,7 +31,7 @@ from ..backends import (
     resolve_backend,
     review_with_images,
 )
-from ..config import DEFAULT_POOL_SIZE, BoardReviewer, split_pool_reserve
+from ..config import DEFAULT_POOL_SIZE, BoardReviewer, apply_effort_override, split_pool_reserve
 from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
     FailoverOutcome,
@@ -61,9 +61,11 @@ def mode_review(
         return 1
 
     if board:
-        # The board already carries the run-scoped effort — the CLI applied it onto the
-        # seats before handing the board in (apply_effort_override), so the failover path
-        # needs nothing extra here.
+        # Resolve the run-scoped effort onto the seats HERE, so a direct lib/MCP caller that
+        # passes an un-applied board + effort_override gets the override too — not only the CLI
+        # path (which pre-applies). apply_effort_override is idempotent (re-resolving an already
+        # resolved seat yields the same effort), so the CLI's earlier apply stays a no-op.
+        board = apply_effort_override(board, effort_override)
         return _mode_review_board(
             board, prompt, diff, cwd, timeout, staged, pool_size, outcome_sink,
             diff_from_stdin, visual_images, exact_board,

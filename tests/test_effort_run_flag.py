@@ -261,6 +261,58 @@ def test_flat_dash_m_review_path_threads_effort_to_backend(monkeypatch):
     assert calls[-1] == {"model": "codex:gpt-5", "effort": None}
 
 
+def test_board_review_path_applies_effort_override_for_direct_callers(monkeypatch):
+    """`mode_review` called DIRECTLY (lib/MCP style) with a board + effort_override must
+    resolve the override onto the seats itself — not assume the CLI pre-applied it. A board
+    seat configured `effort='low'` with `--effort high` reaches the failover run at `high`."""
+    import reviewlib.modes.review as review_mod
+    from reviewlib.panel import FailoverOutcome
+
+    seen: list = []
+
+    def fake_run_board(pool, reserve, prompt, diff, cwd, timeout, images=()):
+        seen.append(list(pool))
+        return FailoverOutcome(results=[_ok(s.model) for s in pool],
+                               usable=[_ok(s.model) for s in pool],
+                               target=len(pool), degraded=False,
+                               usable_models=[s.model for s in pool])
+
+    monkeypatch.setattr(review_mod, "run_board_with_failover", fake_run_board)
+
+    board = [BoardReviewer("codex:gpt-5", "correctness", "Codex", effort="low")]
+    review_mod.mode_review(
+        ["codex:gpt-5"], "prompt", "a diff", Path("."), 60, False,
+        board=board, exact_board=True, effort_override=parse_effort_flag(["high"]),
+    )
+    assert seen[-1][0].effort == "high"
+
+
+def test_board_review_path_effort_override_is_idempotent_after_cli_apply(monkeypatch):
+    """The CLI pre-applies the override; mode_review applying it AGAIN is a no-op (the seat
+    already carries the resolved effort), so the double-application never mangles it."""
+    import reviewlib.modes.review as review_mod
+    from reviewlib.panel import FailoverOutcome
+
+    seen: list = []
+
+    def fake_run_board(pool, reserve, prompt, diff, cwd, timeout, images=()):
+        seen.append(list(pool))
+        return FailoverOutcome(results=[_ok(s.model) for s in pool],
+                               usable=[_ok(s.model) for s in pool],
+                               target=len(pool), degraded=False,
+                               usable_models=[s.model for s in pool])
+
+    monkeypatch.setattr(review_mod, "run_board_with_failover", fake_run_board)
+
+    override = parse_effort_flag(["high"])
+    pre_applied = apply_effort_override([BoardReviewer("codex:gpt-5", "correctness", "Codex", effort="low")], override)
+    review_mod.mode_review(
+        ["codex:gpt-5"], "prompt", "a diff", Path("."), 60, False,
+        board=pre_applied, exact_board=True, effort_override=override,
+    )
+    assert seen[-1][0].effort == "high"
+
+
 def test_every_real_backend_accepts_effort():
     """Contract guard: every backend `resolve_backend` can return (plus review_with_images)
     must accept an `effort` kwarg, so threading `--effort` through call_backend /
