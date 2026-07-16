@@ -680,6 +680,10 @@ _UNIT_FILES = [
     # `review install-hook tg` (the tg pre-send-photo review-visual gate installer): isolated
     # HOME + a fake tg-cli checkout, no git needed.
     ("test_install_hook_tg.py", {}),
+    # `review install-commit-hook` delegates to `rig apply` when rig is present (agent-tools#282's
+    # shared agenttools_rig_delegate helper). The two delegation cases SKIP when that in-ecosystem
+    # helper isn't installed (bare CI); the rig-absent / helper-missing cases always run.
+    ("test_install_commit_hook_rig_delegate.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in

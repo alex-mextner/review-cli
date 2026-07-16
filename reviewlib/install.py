@@ -812,9 +812,74 @@ def install_hook_tg() -> int:
     return 0
 
 
+def _rig_delegate_helper():
+    """Best-effort import of the shared `agenttools_rig_delegate` lib (agent-tools#282). It
+    is an in-ecosystem editable install, like `agenttools_service` — not always present.
+    Returns the module, or None if it isn't importable, so callers degrade to exactly
+    today's direct install rather than crash."""
+    try:
+        import agenttools_rig_delegate
+    except ImportError:
+        return None
+    return agenttools_rig_delegate
+
+
+def _commit_gate_active() -> bool:
+    """True iff a global commit gate is actually in place: `core.hooksPath` resolves to an
+    absolute dir that holds an executable `pre-commit`. Used as the delegation postcondition —
+    rig's `git_hooks.dispatcher` provisions exactly this (its composed pre-commit runs the
+    `review-gate` stage), so its presence proves rig installed the gate."""
+    cur = subprocess.run(
+        ["git", "config", "--global", "--get", "core.hooksPath"], capture_output=True, text=True
+    )
+    raw = cur.stdout.strip()
+    if not raw:
+        return False
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        return False
+    pre_commit = Path(expanded) / "pre-commit"
+    return pre_commit.is_file() and os.access(pre_commit, os.X_OK)
+
+
 def install_commit_hook() -> int:
     """Install a GLOBAL git pre-commit hook enforcing review-before-commit.
-    Opt-in (not run by install-skill) because it affects every repo."""
+    Opt-in (not run by install-skill) because it affects every repo.
+
+    When rig is present, let rig OWN the git hooks (single source of truth): rig's
+    `git_hooks.dispatcher` composes a global pre-commit whose `review-gate` stage is this
+    command's mechanism (`agent-tools/git-hooks/global-dispatcher/hooks/review-gate`, ported
+    verbatim). Delegation is SCOPED to `rig apply --only git_hooks` so it never reconciles
+    unrelated areas (permissions / GitHub / tools) as a side effect of installing a commit
+    hook.
+
+    Three outcomes:
+      * rig absent, or the shared helper not installed -> the direct installer runs unchanged.
+      * rig present and it FAILS (non-zero) -> surface that exit code as-is (a real rig failure
+        is never swallowed into a fallback — that would recreate the double-write).
+      * rig present, succeeds, BUT the gate is not actually in place afterward (e.g. this repo
+        declares no `git_hooks:` block, so `rig apply` is a no-op for hooks) -> fall back to the
+        direct installer so the user still gets the hook they explicitly asked for. This is
+        distinct from "rig failed": rig simply doesn't manage this gate here."""
+    rig_delegate = _rig_delegate_helper()
+    if rig_delegate is None or not rig_delegate.rig_available():
+        return _install_commit_hook_direct()
+    result = rig_delegate.delegate(["apply", "--only", "git_hooks"])
+    if result.returncode != 0:
+        return result.returncode  # a real rig failure — surfaced, not swallowed
+    if _commit_gate_active():
+        print("review: rig owns the global git hooks (delegated to `rig apply --only git_hooks`).")
+        return 0
+    # rig succeeded but provisions no commit gate here (no git_hooks block) — honor the
+    # explicit request via the direct installer rather than silently leaving no gate.
+    print("review: rig installed no commit gate here — installing directly.")
+    return _install_commit_hook_direct()
+
+
+def _install_commit_hook_direct() -> int:
+    """The direct installer (pre-rig-delegation behavior, unchanged). Writes the global git
+    pre-commit hook + sets `core.hooksPath` itself. Used as the `install_commit_hook`
+    fallback when rig is absent or the delegation helper isn't installed."""
     home = Path.home()
     hooks_dir = home / ".config" / "git" / "hooks"
     # Respect an existing global hooksPath rather than hijacking it.

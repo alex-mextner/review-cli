@@ -46,13 +46,25 @@ def _isolated_home(tmp: str) -> dict:
     Also pins GIT_CONFIG_GLOBAL to a temp file: `install_commit_hook` shells out to
     `git config --global`, which writes $GIT_CONFIG_GLOBAL when set (overriding HOME) — so
     without this a CI/dev env with that var set would mutate the REAL global git config
-    despite the temp HOME (codex review). With it, the global config is fully isolated."""
-    keys = ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "GIT_CONFIG_GLOBAL")
+    despite the temp HOME (codex review). With it, the global config is fully isolated.
+
+    Also isolates `install_commit_hook` from a REAL `rig` on this machine: `install_commit_hook`
+    now delegates to `rig apply` when rig is present (agent-tools#282's shared
+    `agenttools_rig_delegate` helper — see `test_install_commit_hook_rig_delegate.py`). These
+    tests pin the DIRECT installer's own edge cases (foreign hook, unwritable, exec-bit
+    repair, …), so rig is forced ABSENT — otherwise a dev machine with rig actually installed
+    (this one included) would silently delegate here instead of exercising the code under test.
+    A non-executable `RIG_BIN` short-circuits find_rig to None (robust to the helper's
+    well-known-bin probes like /opt/homebrew/bin/rig that a mere PATH trim would miss); PATH is
+    trimmed too as belt-and-suspenders (git still resolves at /usr/bin/git)."""
+    keys = ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "GIT_CONFIG_GLOBAL", "RIG_BIN", "PATH")
     saved = {k: os.environ.get(k) for k in keys}
     os.environ["HOME"] = tmp
     os.environ["XDG_CONFIG_HOME"] = str(Path(tmp) / ".config")
     os.environ["XDG_DATA_HOME"] = str(Path(tmp) / ".local" / "share")
     os.environ["GIT_CONFIG_GLOBAL"] = str(Path(tmp) / ".gitconfig")
+    os.environ["RIG_BIN"] = str(Path(tmp) / "no-rig-here")  # non-executable -> find_rig None
+    os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
     (Path(tmp) / ".claude").mkdir(parents=True, exist_ok=True)
     return saved
 

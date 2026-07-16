@@ -34,6 +34,15 @@ live = ["telethon>=1.34,<2"]
 # The lazy import in reviewlib.cli emits an actionable error (exit 4) if it is missing.
 # NOTE: this extra intentionally has no PyPI packages — the dep is an in-ecosystem local install.
 dashboard = []
+# `review install-commit-hook` delegates to `rig apply` when rig is present (rig's opt-in
+# `git_hooks.dispatcher` provisions the SAME global pre-commit review gate this command used to
+# install directly — two tools writing `core.hooksPath` is exactly the double-write the shared
+# `agenttools_rig_delegate` lib (agent-tools#282, stdlib-only) exists to remove). It is an
+# IN-ECOSYSTEM dependency, not on PyPI, so it cannot be listed as a plain dep either. The import
+# in reviewlib.install is guarded — with it absent, install-commit-hook behaves exactly as before
+# (the direct installer). Install editable from the agent-tools checkout to enable delegation:
+#   pip install -e <agent-tools>/lib/agenttools_rig_delegate
+rig-delegate = []
 
 # Stage 0 (decomposition) packaging — see docs/architecture-visual-verification.md §8.1, D8.
 # The CLI is now a real package (`reviewlib`), so it is exposed via a proper console
