@@ -22,6 +22,7 @@ fake keyed on model id), prove:
 
 Plain-script harness (mirrors tests/test_moderator.py): each test_* is run by __main__.
 """
+
 from __future__ import annotations
 
 import sys
@@ -29,6 +30,25 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+
+import os  # noqa: E402
+import tempfile  # noqa: E402
+
+# This file tests BOARD-LEVEL reserve-replace failover in ISOLATION. Provider-failover
+# (seat-level, same-model-across-providers — reviewlib.provider_failover) is a DISTINCT
+# layer tested in tests/test_provider_failover.py, and it would otherwise change what "a
+# seat fails" means here (a chained seat like GLM-cc would fall over to z.ai instead of
+# failing, so no reserve backfill fires). Neutralise it to an identity chain so these tests
+# exercise reserve-replace alone. Also redirect the last-working cache to a throwaway file
+# so a test never reads/writes the real ~/.cache.
+os.environ.setdefault(
+    "REVIEW_PROVIDER_CACHE", str(Path(tempfile.mkdtemp()) / "last-provider.json")
+)
+# Neutralise seat-level provider-failover to an identity chain, but SCOPED per-test (an
+# autouse fixture under pytest, and around each fn() in __main__) so it never leaks to other
+# suites — a module-level patch permanently poisoned test_provider_failover.py's integration
+# tests at collection time. See tests/_failover_neutralise.py.
+from _failover_neutralise import identity_provider_chain  # noqa: E402
 
 import reviewlib.panel as panel  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
@@ -45,6 +65,18 @@ from reviewlib.panel import (  # noqa: E402
 )
 
 PROMPT = "Review this diff."
+
+try:
+    import pytest  # noqa: E402
+
+    @pytest.fixture(autouse=True)
+    def _neutralise_provider_failover():
+        """Every test in this file runs with seat-level provider-failover neutralised to an
+        identity chain, RESTORED afterwards (never leaks to other suites)."""
+        with identity_provider_chain():
+            yield
+except ImportError:  # plain-script harness (no pytest) applies it in __main__ instead
+    pass
 
 
 # === fake-backend harness =======================================================
@@ -66,7 +98,10 @@ class _FakeBackends:
             def _backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
                 self.calls.append((model, prompt))
                 rc, out = self.behaviour.get(model, (0, f"ok {model}"))
-                return ReviewResult(model=model, command="fake", returncode=rc, stdout=out, stderr="")
+                return ReviewResult(
+                    model=model, command="fake", returncode=rc, stdout=out, stderr=""
+                )
+
             return _backend
 
         panel.resolve_backend = _resolve
@@ -100,15 +135,20 @@ def test_unusable_on_empty_output():
 
 def test_unusable_on_unavailable_sentinel_body():
     """The paywalled-Fable shape: rc=0, short body that is an unavailability notice."""
-    body = ("Claude Fable 5 is currently unavailable. "
-            "Learn more: https://www.anthropic.com/news/fable-mythos-access")
+    body = (
+        "Claude Fable 5 is currently unavailable. "
+        "Learn more: https://www.anthropic.com/news/fable-mythos-access"
+    )
     assert not result_is_usable(ReviewResult("claude:claude-fable-5", "c", 0, body, ""))
 
 
 def test_usable_long_review_mentioning_availability_is_not_misclassified():
     """A genuine LONG review that happens to mention availability must NOT be flagged —
     the sentinel check only fires on a SHORT body."""
-    body = "x" * 500 + " the service is currently unavailable in some regions, consider a retry"
+    body = (
+        "x" * 500
+        + " the service is currently unavailable in some regions, consider a retry"
+    )
     assert result_is_usable(ReviewResult("m", "c", 0, body, ""))
 
 
@@ -241,8 +281,10 @@ def test_midrun_unavailable_body_triggers_backfill_fable_case():
     # Cheap probe: ALL available (Fable's paywall is invisible to it).
     pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in board}))
     assert pool[0].model == "claude:claude-fable-5"  # Fable IS selected at startup
-    fable_body = ("Claude Fable 5 is currently unavailable. "
-                  "Learn more: https://www.anthropic.com/news/fable-mythos-access")
+    fable_body = (
+        "Claude Fable 5 is currently unavailable. "
+        "Learn more: https://www.anthropic.com/news/fable-mythos-access"
+    )
     with _FakeBackends({"claude:claude-fable-5": (0, fable_body)}):
         outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
     assert len(outcome.usable) == 4
@@ -265,7 +307,7 @@ def test_midrun_cascading_failures_walk_the_reserve():
     # reserve[1], reserve[2] succeed -> still 4 usable.
     behaviour = {
         pool[0].model: (1, "boom0"),
-        pool[1].model: (0, ""),          # empty output = failure
+        pool[1].model: (0, ""),  # empty output = failure
         reserve[0].model: (500, "err"),  # first backfill also fails
     }
     with _FakeBackends(behaviour):
@@ -279,7 +321,9 @@ def test_midrun_reserve_exhausted_degrades_gracefully():
     degraded=True — it does NOT crash or hang."""
     board = list(DEFAULT_BOARD)
     # Only the 4 pool seats are available; NO reserve. Two of the pool fail.
-    pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in DEFAULT_BOARD[:4]}))
+    pool, reserve = split_pool_reserve(
+        board, 4, _avail({r.model for r in DEFAULT_BOARD[:4]})
+    )
     assert reserve == []
     behaviour = {pool[0].model: (1, "x"), pool[1].model: (1, "y")}
     with _FakeBackends(behaviour):
@@ -336,11 +380,11 @@ def test_results_include_failed_and_replacement_seats():
     ran_labels = {r.model for r in outcome.results}
     failed_label = f"{pool[0].display} [{pool[0].role}]"
     backfill_label = f"{reserve[0].display} [{reserve[0].role}]"
-    assert failed_label in ran_labels, ran_labels        # the failed seat is in results
-    assert backfill_label in ran_labels, ran_labels      # so is its replacement
-    assert len(outcome.results) == 5                      # 4 pool + 1 backfill
+    assert failed_label in ran_labels, ran_labels  # the failed seat is in results
+    assert backfill_label in ran_labels, ran_labels  # so is its replacement
+    assert len(outcome.results) == 5  # 4 pool + 1 backfill
     assert len(outcome.usable) == 4
-    assert reserve[0].model in outcome.usable_models      # bare id of the backfill
+    assert reserve[0].model in outcome.usable_models  # bare id of the backfill
 
 
 # === lens travels with the promoted reserve =====================================
@@ -365,7 +409,8 @@ if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             try:
-                fn()
+                with identity_provider_chain():
+                    fn()
                 print(f"PASS {name}")
             except AssertionError as exc:
                 failures += 1

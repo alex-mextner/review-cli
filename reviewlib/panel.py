@@ -3,15 +3,22 @@
 Extracted verbatim from the original single-file `bin/review` (Stage 0
 decomposition — zero behaviour change).
 """
+
 from __future__ import annotations
 
 import concurrent.futures
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .backends import ReviewResult, backend_available, call_backend, resolve_backend, review_with_images
+from .backends import (
+    ReviewResult,
+    backend_available,
+    call_backend,
+    resolve_backend,
+    review_with_images,
+)
 from .config import MODERATOR_CANDIDATES, BoardReviewer
 from .process import write_retry_log
 
@@ -182,7 +189,14 @@ def pick_moderator(explicit: str | None, panel: list[str]) -> str:
     return pick_moderators(explicit, panel)[0]
 
 
-def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, diff: str = "", round_no: int = 0) -> ReviewResult:
+def run_moderator(
+    candidates: list[str],
+    prompt: str,
+    cwd: Path,
+    timeout: int,
+    diff: str = "",
+    round_no: int = 0,
+) -> ReviewResult:
     """Run the moderator `prompt` against `candidates` in priority order.
 
     Returns the first result that succeeds (exit 0 with non-empty output). On a
@@ -217,27 +231,54 @@ def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, d
     return result
 
 
-def _run_moderator_inner(candidates: list[str], prompt: str, cwd: Path, timeout: int, diff: str, round_no: int = 0) -> ReviewResult:
+def _run_moderator_inner(
+    candidates: list[str],
+    prompt: str,
+    cwd: Path,
+    timeout: int,
+    diff: str,
+    round_no: int = 0,
+) -> ReviewResult:
     last: ReviewResult | None = None
     for index, model in enumerate(candidates):
         result = run_single(model, prompt, cwd, timeout, diff=diff, round_no=round_no)
         if result.returncode == 0 and result.stdout.strip():
             if index > 0:
-                print(f"[review-cli] moderator fell back to {model} "
-                      f"(higher-priority candidate(s) failed)", file=sys.stderr, flush=True)
+                print(
+                    f"[review-cli] moderator fell back to {model} "
+                    f"(higher-priority candidate(s) failed)",
+                    file=sys.stderr,
+                    flush=True,
+                )
             return result
-        reason = f"exit {result.returncode}" if result.returncode != 0 else "empty output"
+        reason = (
+            f"exit {result.returncode}" if result.returncode != 0 else "empty output"
+        )
         nxt = "trying next" if index + 1 < len(candidates) else "no more candidates"
-        print(f"[review-cli] moderator {model} failed ({reason}); {nxt}", file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] moderator {model} failed ({reason}); {nxt}",
+            file=sys.stderr,
+            flush=True,
+        )
         last = result
     if last is None:
-        return ReviewResult(model="(none)", command="moderator", returncode=127,
-                            stdout="", stderr="no moderator candidates")
+        return ReviewResult(
+            model="(none)",
+            command="moderator",
+            returncode=127,
+            stdout="",
+            stderr="no moderator candidates",
+        )
     if last.returncode == 0 and not last.stdout.strip():
         # Every candidate "succeeded" with empty output. Surface as a failure so
         # quorum/brainstorm don't report success for a synthesis that isn't there.
-        return ReviewResult(model=last.model, command=last.command, returncode=1,
-                            stdout=last.stdout, stderr=last.stderr or "moderator produced no output")
+        return ReviewResult(
+            model=last.model,
+            command=last.command,
+            returncode=1,
+            stdout=last.stdout,
+            stderr=last.stderr or "moderator produced no output",
+        )
     return last
 
 
@@ -257,7 +298,10 @@ class PanelJob:
 
 
 def build_board_job(
-    reviewer: BoardReviewer, base_prompt: str, diff: str, images: tuple[Path, ...] = (),
+    reviewer: BoardReviewer,
+    base_prompt: str,
+    diff: str,
+    images: tuple[Path, ...] = (),
 ) -> PanelJob:
     """One role-lensed PanelJob for a reviewer (no availability check).
 
@@ -271,14 +315,19 @@ def build_board_job(
     prompt = "\n\n".join(parts)
     role_tag = reviewer.role or "general"
     return PanelJob(
-        model=reviewer.model, prompt=prompt, diff=diff,
-        label=f"{reviewer.display} [{role_tag}]", images=images,
+        model=reviewer.model,
+        prompt=prompt,
+        diff=diff,
+        label=f"{reviewer.display} [{role_tag}]",
+        images=images,
         effort=reviewer.effort,
     )
 
 
 def build_board_jobs(
-    board: list[BoardReviewer], base_prompt: str, diff: str,
+    board: list[BoardReviewer],
+    base_prompt: str,
+    diff: str,
     images: tuple[Path, ...] = (),
 ) -> tuple[list[PanelJob], list[BoardReviewer]]:
     """Turn a reviewer board into PanelJobs, skipping unavailable reviewers.
@@ -387,15 +436,23 @@ def run_board_with_failover(
                     _tally_ok(False)
                     if reserve_queue:
                         promoted = reserve_queue.pop(0)
-                        print(f"[review-cli] board: {result.model} failed — promoting "
-                              f"reserve {promoted.display} [{promoted.role or 'general'}] "
-                              f"({promoted.model})", file=sys.stderr, flush=True)
+                        print(
+                            f"[review-cli] board: {result.model} failed — promoting "
+                            f"reserve {promoted.display} [{promoted.role or 'general'}] "
+                            f"({promoted.model})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         # Durable record of the promotion (not stderr-only): a post-mortem /
                         # the dashboard can reconstruct WHICH seat failed and WHICH reserve
                         # backfilled it, with the failing seat's exit code + error channel.
                         write_retry_log(
-                            f"{result.model}->{promoted.model}", kind="promote",
-                            attempt=0, max_attempts=1, delay=0.0, result=result,
+                            f"{result.model}->{promoted.model}",
+                            kind="promote",
+                            attempt=0,
+                            max_attempts=1,
+                            delay=0.0,
+                            result=result,
                         )
                         next_round.append(promoted)
             current = next_round
@@ -405,7 +462,10 @@ def run_board_with_failover(
 
     degraded = len(usable) < target
     return FailoverOutcome(
-        results=all_results, usable=usable, target=target, degraded=degraded,
+        results=all_results,
+        usable=usable,
+        target=target,
+        degraded=degraded,
         usable_models=usable_models,
     )
 
@@ -419,19 +479,28 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
     def _run_job(job: PanelJob) -> ReviewResult:
         if job.images:
             return review_with_images(
-                job.model, job.prompt, job.diff, cwd, timeout, job.round_no, job.images,
+                job.model,
+                job.prompt,
+                job.diff,
+                cwd,
+                timeout,
+                job.round_no,
+                job.images,
                 effort=job.effort,
             )
         return call_backend(
             resolve_backend(job.model),
-            job.model, job.prompt, job.diff, cwd, timeout, job.round_no, effort=job.effort,
+            job.model,
+            job.prompt,
+            job.diff,
+            cwd,
+            timeout,
+            job.round_no,
+            effort=job.effort,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = {
-            pool.submit(_run_job, job): index
-            for index, job in enumerate(jobs)
-        }
+        futures = {pool.submit(_run_job, job): index for index, job in enumerate(jobs)}
         for future in concurrent.futures.as_completed(futures):
             index = futures[future]
             model = jobs[index].label or jobs[index].model
@@ -445,12 +514,20 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
                     stderr=base.stderr,
                 )
             except Exception as exc:  # noqa: BLE001 - report, never crash the panel
-                results[index] = ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc))
+                results[index] = ReviewResult(
+                    model=model,
+                    command="internal",
+                    returncode=127,
+                    stdout="",
+                    stderr=str(exc),
+                )
             _tally_result(results[index].returncode)
     return [r for r in results if r is not None]
 
 
-def run_panel_with_retry(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResult]:
+def run_panel_with_retry(
+    jobs: list[PanelJob], cwd: Path, timeout: int
+) -> list[ReviewResult]:
     """Run jobs in parallel like `run_panel`, but each seat RETRIES itself on a transient
     failure before giving up — same-order results out.
 
@@ -472,20 +549,84 @@ def run_panel_with_retry(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[
     (`run_board_with_failover` / a future direct user) owns the one-per-logical-seat tally;
     when NOT already suppressed, each seat's FINAL outcome is tallied once below, matching
     `run_panel`'s one-call-one-tally contract."""
-    from .retry import run_seat_with_retry  # lazy: breaks the panel<->retry import cycle
+    # Use the SAME unpaid predicate backend_available uses (runtime_provider_marked_unpaid),
+    # so the pool guard's liveness view and the failover chain's drop set never disagree.
+    from .backends import (
+        runtime_provider_marked_unpaid as provider_marked_unpaid,
+    )  # lazy
+    from .provider_failover import (  # lazy: keeps panel import light
+        forget_working_provider,
+        provider_chain,
+        remember_working_provider,
+    )
+    from .retry import (
+        run_seat_with_retry,
+    )  # lazy: breaks the panel<->retry import cycle
 
     if not jobs:
         return []
     results: list[ReviewResult | None] = [None] * len(jobs)
 
     def _seat(job: PanelJob) -> ReviewResult:
-        # The per-attempt runner: ONE dispatch of this seat. Auto-tally is already suppressed
-        # (single-threaded) by the wrapper below, so retries are never each counted — this
-        # closure does NOT touch the global, so parallel seats can't race on it.
-        def _once() -> ReviewResult:
-            return run_panel([job], cwd, timeout)[0]
+        # PROVIDER-FAILOVER (mid-review switchover): a logical model can be served by several
+        # providers. Try them in order — each provider first gets the SAME-provider transient
+        # retry (run_seat_with_retry: backoff on 429/5xx/DNS/timeout/reset), and if it is STILL
+        # unusable we switch this SAME model to its NEXT provider and the review CONTINUES on
+        # the working one. The seat only fails (-> board reserve-replace) when EVERY provider
+        # is exhausted. The provider that produces the verdict is cached as last-working (tried
+        # first next run); a total failure rotates the cache. Unpaid providers are dropped from
+        # the chain up front (never dispatched) — distinct from this call-time failover.
+        label = job.label or job.model
+        chain = provider_chain(
+            job.model,
+            available=backend_available,
+            unpaid=provider_marked_unpaid,
+        )
 
-        return run_seat_with_retry(job.label or job.model, _once)
+        # Auto-tally stays suppressed (single-threaded) by the wrapper below; each inner
+        # dispatch does NOT touch the global, so parallel seats can't race on it.
+        def _attempt(seat_job: PanelJob) -> ReviewResult:
+            def _once() -> ReviewResult:
+                return run_panel([seat_job], cwd, timeout)[0]
+
+            return run_seat_with_retry(label, _once)
+
+        # The last-working cache only helps a model with ALTERNATES (so a chronically-flaky
+        # first provider stops costing a failover each run). A single-provider seat (codex,
+        # gemini, a plain claude id) has nothing to rotate, so skip the lock-serialized
+        # load+atomic-rename write entirely instead of accumulating no-op `{"codex":"codex"}`
+        # entries.
+        multi_provider = len(chain) > 1
+        last: ReviewResult | None = None
+        for idx, provider_model in enumerate(chain):
+            result = _attempt(
+                replace(job, model=provider_model)
+                if provider_model != job.model
+                else job
+            )
+            if result_is_usable(result):
+                if multi_provider:
+                    remember_working_provider(job.model, provider_model)
+                return result
+            last = result
+            if idx + 1 < len(chain):
+                print(
+                    f"[review-cli] seat {label}: provider {provider_model} failed — "
+                    f"switching to {chain[idx + 1]} (review continues)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                write_retry_log(
+                    f"{provider_model}=>{chain[idx + 1]}",
+                    kind="provider-failover",
+                    attempt=idx,
+                    max_attempts=len(chain),
+                    delay=0.0,
+                    result=result,
+                )
+        if multi_provider:
+            forget_working_provider(job.model)
+        return last if last is not None else _attempt(job)
 
     # Suppress the inner auto-tally ONCE, on THIS thread, around the whole parallel run, then
     # tally each seat's final outcome once afterward. A single toggle here (vs one per worker
@@ -504,7 +645,13 @@ def run_panel_with_retry(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[
                 try:
                     results[index] = future.result()
                 except Exception as exc:  # noqa: BLE001 - report, never crash the panel
-                    results[index] = ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc))
+                    results[index] = ReviewResult(
+                        model=model,
+                        command="internal",
+                        returncode=127,
+                        stdout="",
+                        stderr=str(exc),
+                    )
     finally:
         with _TALLY_LOCK:
             _suppress_autotally = prev_suppress
@@ -523,5 +670,11 @@ def run_panel_with_retry(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[
     return [r for r in results if r is not None]
 
 
-def run_single(model: str, prompt: str, cwd: Path, timeout: int, diff: str = "", round_no: int = 0) -> ReviewResult:
-    return run_panel([PanelJob(model=model, prompt=prompt, diff=diff, round_no=round_no)], cwd, timeout)[0]
+def run_single(
+    model: str, prompt: str, cwd: Path, timeout: int, diff: str = "", round_no: int = 0
+) -> ReviewResult:
+    return run_panel(
+        [PanelJob(model=model, prompt=prompt, diff=diff, round_no=round_no)],
+        cwd,
+        timeout,
+    )[0]

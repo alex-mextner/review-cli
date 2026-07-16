@@ -20,6 +20,7 @@ plugin-directory-style mode registry (mirrors features/visual/registry). These t
 All offline: the mode handlers are stubbed WHERE THEY ARE DEFINED (the per-mode modules)
 so no backend is spawned; the diff is faked so no real git is touched.
 """
+
 from __future__ import annotations
 
 import io
@@ -54,6 +55,7 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
             captured["text"] = a[0] if a else None
             captured["args"] = a
             return 0
+
         return _fake
 
     saved = {
@@ -72,12 +74,20 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
     _quorum_mod.mode_quorum = _mk("quorum")
     cli._git_diff = lambda cwd, staged: diff
     cli._is_git_repo = lambda cwd: True
-    cli.load_config = lambda: {"models": ["codex"]}  # deterministic one-seat config board
+    cli.load_config = lambda: {
+        "models": ["codex"]
+    }  # deterministic one-seat config board
     cli._read_stdin_if_piped = lambda: stdin
     old_env = os.environ.get("GEMINI_ENV_FILE")
     old_task = os.environ.get("REVIEW_TASK_CODE")
+    old_fake = os.environ.get("REVIEW_FAKE_BACKEND")
     os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
     os.environ["REVIEW_TASK_CODE"] = "TEST-1"
+    # These tests verify DISPATCH ROUTING (which mode handler runs), not backend liveness.
+    # The pre-dispatch pool-selection guard (reviewlib.pool_guard) would otherwise bail on a
+    # host with too few live backends (CI has none), so force every seat live via the fake
+    # backend — the established seam for hermetic dispatch tests (see backend_available).
+    os.environ["REVIEW_FAKE_BACKEND"] = "1"
     err = io.StringIO()
     out = io.StringIO()
     try:
@@ -88,7 +98,11 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
                 # A bare `review` / `review --flag …` (no verb) prints help and exits via
                 # SystemExit, exactly like `review --help` — capture its code as the rc the
                 # real CLI process would surface (argparse normalizes None -> 0).
-                captured["rc"] = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+                captured["rc"] = (
+                    exc.code
+                    if isinstance(exc.code, int)
+                    else (0 if exc.code is None else 1)
+                )
     finally:
         _review_mod.mode_review = saved["review"]
         _brainstorm_mod.mode_brainstorm = saved["brainstorm"]
@@ -106,6 +120,10 @@ def _run(argv: list[str], *, diff: str = "", stdin: str | None = None) -> dict:
             os.environ.pop("REVIEW_TASK_CODE", None)
         else:
             os.environ["REVIEW_TASK_CODE"] = old_task
+        if old_fake is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = old_fake
     captured["stderr"] = err.getvalue()
     captured["stdout"] = out.getvalue()
     return captured
@@ -134,6 +152,41 @@ def test_ask_alias_dispatches_to_just_ask():
     cap = _run(["ask", "aliased question", "-C", str(REPO_ROOT)])
     assert cap["mode"] == "just-ask", cap
     assert cap["text"] == "aliased question", cap
+
+
+def test_pool_guard_fires_only_for_review_mode():
+    """The pool-selection foolproofing guard (reviewlib.pool_guard) is REVIEW-specific — its
+    proposal/error text says `review diff --preset …` / "review pool". It must NOT fire for
+    quorum / brainstorm / just-ask, which reach the SAME dispatch but keep their own
+    degraded-panel behaviour. Regression: the guard used to run on every mode, emitting
+    review-only instructions (and a behaviour-changing EXIT_UNSATISFIED) for those modes."""
+    calls: list[str] = []
+    saved_guard = cli._evaluate_pool_or_bail
+
+    def _spy(*_a, **_k):
+        calls.append("called")
+        return None  # PROCEED — let dispatch continue to the mode handler
+
+    cli._evaluate_pool_or_bail = _spy
+    try:
+        for argv, want_mode in [
+            (["quorum", "ship it?", "-C", str(REPO_ROOT)], "quorum"),
+            (["brainstorm", "design the cache", "-C", str(REPO_ROOT)], "brainstorm"),
+            (["just-ask", "is this safe?", "-C", str(REPO_ROOT)], "just-ask"),
+        ]:
+            calls.clear()
+            cap = _run(argv)
+            assert cap["mode"] == want_mode, cap
+            assert calls == [], (
+                f"{want_mode} must NOT invoke the review pool guard: {calls}"
+            )
+        # review DOES run the guard (mode.name == 'review').
+        calls.clear()
+        cap = _run(["diff", "-C", str(REPO_ROOT)], diff="diff --git a/x b/x\n+y\n")
+        assert cap["mode"] == "review", cap
+        assert calls == ["called"], f"review must invoke the pool guard: {calls}"
+    finally:
+        cli._evaluate_pool_or_bail = saved_guard
 
 
 def test_quorum_subcommand_dispatches_to_quorum():
@@ -207,7 +260,10 @@ def test_removed_review_verb_points_at_diff():
     """The old stuttering `review review` verb is gone: it prints a one-line `review diff`
     pointer (exit 2), like the removed mode flags — it does NOT run a diff review."""
     cap = _run(["review", "-C", str(REPO_ROOT)], diff="diff --git a/x b/x\n+y\n")
-    assert cap["mode"] is None, ("review review must not dispatch the diff handler", cap)
+    assert cap["mode"] is None, (
+        "review review must not dispatch the diff handler",
+        cap,
+    )
     assert cap["rc"] == 2, cap
     assert "review diff" in cap["stderr"], cap["stderr"]
     assert "--task CODE" in cap["stderr"], cap["stderr"]
@@ -216,7 +272,10 @@ def test_removed_review_verb_points_at_diff():
 
 def test_removed_review_verb_points_at_diff_after_leading_model_option():
     """Leading global options must not hide the removed `review` verb diagnostic."""
-    cap = _run(["-m", "fable5", "review", "-C", str(REPO_ROOT)], diff="diff --git a/x b/x\n+y\n")
+    cap = _run(
+        ["-m", "fable5", "review", "-C", str(REPO_ROOT)],
+        diff="diff --git a/x b/x\n+y\n",
+    )
     assert cap["mode"] is None, ("review -m fable review must not dispatch", cap)
     assert cap["rc"] == 2, cap
     assert "review diff" in cap["stderr"], cap["stderr"]
@@ -277,7 +336,17 @@ def test_brainstorm_with_diff_flag_grounds_on_working_tree_diff():
     cli._read_stdin_if_piped = lambda: None
     try:
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
-            rc = cli.main(["brainstorm", "topic", "--task", "TEST-1", "--diff", "-C", str(REPO_ROOT)])
+            rc = cli.main(
+                [
+                    "brainstorm",
+                    "topic",
+                    "--task",
+                    "TEST-1",
+                    "--diff",
+                    "-C",
+                    str(REPO_ROOT),
+                ]
+            )
     finally:
         _brainstorm_mod.mode_brainstorm = saved
         cli._git_diff = saved_git
@@ -323,7 +392,9 @@ def test_just_ask_does_not_auto_grab_diff_but_diff_flag_opts_in():
 
     rc, diff = run(["just-ask", "Q", "--task", "TEST-1", "-C", str(REPO_ROOT)])
     assert rc == 0 and diff == "", ("no --diff -> no context", diff)
-    rc, diff = run(["just-ask", "Q", "--task", "TEST-1", "--diff", "-C", str(REPO_ROOT)])
+    rc, diff = run(
+        ["just-ask", "Q", "--task", "TEST-1", "--diff", "-C", str(REPO_ROOT)]
+    )
     assert rc == 0 and diff == grounding, ("--diff -> working-tree context", diff)
 
 
@@ -475,10 +546,10 @@ def test_registry_known_subcommands():
 
 def test_registry_get_mode_resolves_subcommand_and_alias():
     assert _registry.get_mode("brainstorm").name == "brainstorm"
-    assert _registry.get_mode("ask").name == "just-ask"   # alias
-    assert _registry.get_mode("diff").name == "review"    # diff verb -> the review mode
+    assert _registry.get_mode("ask").name == "just-ask"  # alias
+    assert _registry.get_mode("diff").name == "review"  # diff verb -> the review mode
     assert _registry.get_mode("visual").name == "visual"  # canonical standalone visual
-    assert _registry.get_mode("review") is None           # the old verb no longer resolves
+    assert _registry.get_mode("review") is None  # the old verb no longer resolves
     assert _registry.get_mode("not-a-mode") is None
 
 
@@ -496,6 +567,7 @@ def test_registry_iter_modes_are_self_describing():
     """Every registered mode exposes the ModeSpec contract fields (name / subcommand /
     diff_policy / handler) — the descriptor a plugin-dir mode would also expose."""
     from reviewlib.modes.contract import DIFF_POLICIES
+
     seen_review_first = _registry.iter_modes()[0].name == "review"
     assert seen_review_first, "the diff-review mode must be the first registered mode"
     for mode in _registry.iter_modes():
@@ -522,8 +594,10 @@ def test_diff_mode_empty_diff_returns_nonzero_no_diff_to_review():
     saved_git = cli._git_diff
     saved_is_git_repo = cli._is_git_repo
     saved_stdin = cli._read_stdin_if_piped
-    cli.load_config = lambda: {"models": ["codex"]}  # explicit models -> flat path, no board
-    cli._git_diff = lambda cwd, staged: ""             # empty diff
+    cli.load_config = lambda: {
+        "models": ["codex"]
+    }  # explicit models -> flat path, no board
+    cli._git_diff = lambda cwd, staged: ""  # empty diff
     cli._is_git_repo = lambda cwd: True
     cli._read_stdin_if_piped = lambda: None
     try:

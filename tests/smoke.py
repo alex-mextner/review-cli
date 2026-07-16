@@ -661,6 +661,10 @@ _UNIT_FILES = [
     ("test_provider_keys.py", {}),
     ("test_reviewer_board.py", {}),
     ("test_effort_run_flag.py", {}),
+    # Pool/model-selection foolproofing (the pre-dispatch guard that turns a non-convergent
+    # -m/--pool selection into an actionable proposal or a targeted per-provider error). Pure
+    # logic, availability+reason injected — no backend, no network.
+    ("test_pool_guard.py", {}),
     # Capability-aware seat resolution from the shared models.yaml manifest (rig-cli#8 consumer
     # side). All offline — writes a fixture manifest to a temp file + points $REVIEW_MODELS_MANIFEST
     # at it; no network, no real agent-tools checkout, no model call.
@@ -672,6 +676,10 @@ _UNIT_FILES = [
     # EXIT_COMMIT_FAILED when the commit subprocess itself (e.g. a rejecting hook) fails.
     ("test_review_commit_checkpoint.py", {}),
     ("test_failover_pool.py", {}),
+    # Provider-failover: the per-model provider chain + last-working cache + the MID-REVIEW
+    # switchover (provider A fails on the call, the model completes via B, board not degraded).
+    # Offline — availability/unpaid injected, cache is a throwaway temp file.
+    ("test_provider_failover.py", {}),
     # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
     # give it a FRESH temp log dir like the other log-touching tests (review-cli#65).
     ("test_concurrency_cap.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

@@ -23,6 +23,7 @@ Proven here, all offline (urllib.request.urlopen faked — NO real network):
 These tests run as a plain script (mirroring tests/test_streaming.py): each
 `test_*` function is invoked by the __main__ block below, no pytest required.
 """
+
 from __future__ import annotations
 
 import json
@@ -134,13 +135,17 @@ def _fake_urlopen(captured: dict, payload: dict):
 
 
 def _http_error(url: str, code: int, body: str) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError(url, code, "preflight failed", {}, io.BytesIO(body.encode("utf-8")))
+    return urllib.error.HTTPError(
+        url, code, "preflight failed", {}, io.BytesIO(body.encode("utf-8"))
+    )
 
 
 def _allow_preflight(req, timeout=None):
     if req.full_url.endswith("/models"):
         return _FakeResp({"data": []})
-    raise AssertionError(f"unexpected provider dispatch in preflight stub: {req.full_url}")
+    raise AssertionError(
+        f"unexpected provider dispatch in preflight stub: {req.full_url}"
+    )
 
 
 # === resolve_backend routing ====================================================
@@ -157,11 +162,17 @@ def test_resolve_backend_routes_zai():
 def test_resolve_backend_routes_commandcode():
     for name in ("commandcode", "command-code", "command_code", "CommandCode"):
         assert backends.resolve_backend(name) is backends.review_commandcode, name
-    assert backends.resolve_backend("commandcode:deepseek/deepseek-coder") is backends.review_commandcode
+    assert (
+        backends.resolve_backend("commandcode:deepseek/deepseek-coder")
+        is backends.review_commandcode
+    )
     # Legacy common-code spellings still resolve (back-compat alias on resolve_backend).
     for legacy in ("common-code", "common_code", "commoncode", "Common-Code"):
         assert backends.resolve_backend(legacy) is backends.review_commandcode, legacy
-    assert backends.resolve_backend("common-code:deepseek-coder") is backends.review_commandcode
+    assert (
+        backends.resolve_backend("common-code:deepseek-coder")
+        is backends.review_commandcode
+    )
 
 
 def test_existing_routes_unchanged():
@@ -207,12 +218,16 @@ def test_zai_request_is_openai_shape():
         finally:
             urllib.request.urlopen = old_open
     # Default endpoint = the GLM Coding-Plan base (serves glm-5.2) + /chat/completions.
-    assert captured["url"] == "https://api.z.ai/api/coding/paas/v4/chat/completions", captured["url"]
+    assert captured["url"] == "https://api.z.ai/api/coding/paas/v4/chat/completions", (
+        captured["url"]
+    )
     assert captured["method"] == "POST"
     # OpenAI request shape — NOT the gemini contents/parts shape.
     body = captured["body"]
     assert "messages" in body and "contents" not in body, body
-    assert body["model"] == "glm-5.2", body  # bare `zai` → ZAI_DEFAULT_MODEL (newest GLM)
+    assert body["model"] == "glm-5.2", (
+        body
+    )  # bare `zai` → ZAI_DEFAULT_MODEL (newest GLM)
     assert body["messages"][0]["role"] == "user"
     assert body["messages"][0]["content"] == "say hi"
     assert body["stream"] is False
@@ -240,7 +255,9 @@ def test_zai_model_suffix_and_env_overrides():
         finally:
             urllib.request.urlopen = old_open
     assert captured["body"]["model"] == "glm-4.6", captured["body"]
-    assert captured["url"] == "https://api.z.ai/api/coding/paas/v4/chat/completions", captured["url"]
+    assert captured["url"] == "https://api.z.ai/api/coding/paas/v4/chat/completions", (
+        captured["url"]
+    )
 
 
 def test_zai_diff_is_fenced_in_message():
@@ -293,7 +310,9 @@ def test_mode_review_keys_by_requested_model_without_keyerror():
         os.environ["COMMANDCODE_API_KEY"] = "k"
         try:
             # staged=False so it doesn't write a review stamp; returns 0 on success.
-            rc = mode_review(["zai", "commandcode"], "review", "+added", REPO_ROOT, 10, False)
+            rc = mode_review(
+                ["zai", "commandcode"], "review", "+added", REPO_ROOT, 10, False
+            )
         finally:
             urllib.request.urlopen = old_open
     assert rc == 0, rc
@@ -315,7 +334,9 @@ def test_commandcode_request_is_openai_shape():
         finally:
             urllib.request.urlopen = old_open
     # Default endpoint = the verified Command Code Provider API + /chat/completions.
-    assert captured["url"] == "https://api.commandcode.ai/provider/v1/chat/completions", captured["url"]
+    assert (
+        captured["url"] == "https://api.commandcode.ai/provider/v1/chat/completions"
+    ), captured["url"]
     body = captured["body"]
     assert "messages" in body and "contents" not in body
     # Bare `commandcode` → COMMANDCODE_DEFAULT_MODEL (an OpenAI-shape, provider-prefixed id).
@@ -366,7 +387,9 @@ def test_commandcode_base_url_and_model_override():
             backends.review_commandcode("commandcode", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
-    assert captured["url"] == "https://example.test/v1/chat/completions", captured["url"]
+    assert captured["url"] == "https://example.test/v1/chat/completions", captured[
+        "url"
+    ]
     assert captured["body"]["model"] == "deepseek/deepseek-coder"
 
 
@@ -387,12 +410,16 @@ def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
         os.environ.pop("COMMANDCODE_BASE_URL", None)
         os.environ.pop("COMMANDCODE_MODEL", None)
         try:
-            backends.review_commandcode("commandcode:zai-org/GLM-5.2", "q", "", REPO_ROOT, 10)
+            backends.review_commandcode(
+                "commandcode:zai-org/GLM-5.2", "q", "", REPO_ROOT, 10
+            )
         finally:
             urllib.request.urlopen = old_open
     assert captured["body"]["model"] == "zai-org/GLM-5.2", captured["body"]
     # And it goes to the default Command Code gateway, not z.ai's host.
-    assert captured["url"] == "https://api.commandcode.ai/provider/v1/chat/completions", captured["url"]
+    assert (
+        captured["url"] == "https://api.commandcode.ai/provider/v1/chat/completions"
+    ), captured["url"]
 
 
 def test_commandcode_glm_seat_id_beats_commandcode_model_env():
@@ -413,7 +440,9 @@ def test_commandcode_glm_seat_id_beats_commandcode_model_env():
         os.environ["COMMANDCODE_MODEL"] = "deepseek/deepseek-v4-flash"
         os.environ.pop("COMMANDCODE_BASE_URL", None)
         try:
-            backends.review_commandcode("commandcode:zai-org/GLM-5.2", "q", "", REPO_ROOT, 10)
+            backends.review_commandcode(
+                "commandcode:zai-org/GLM-5.2", "q", "", REPO_ROOT, 10
+            )
         finally:
             urllib.request.urlopen = old_open
     assert captured["body"]["model"] == "zai-org/GLM-5.2", captured["body"]
@@ -427,7 +456,9 @@ def test_commandcode_forced_cli_mode_is_a_dead_backend_not_a_silent_post():
     must surface as a non-zero ReviewResult and must NOT fall through to the api POST."""
     posted = {"called": False}
 
-    def _should_not_be_called(req, timeout=None):  # pragma: no cover - asserted unreached
+    def _should_not_be_called(
+        req, timeout=None
+    ):  # pragma: no cover - asserted unreached
         posted["called"] = True
         raise AssertionError("api path POSTed despite a forced cli mode")
 
@@ -464,7 +495,10 @@ def test_commandcode_forced_api_mode_is_accepted():
 
 def test_zai_forced_cli_mode_is_a_dead_backend():
     """z.ai is api-only too: REVIEW_ZAI_MODE=cli must fail loudly, not POST."""
-    def _should_not_be_called(req, timeout=None):  # pragma: no cover - asserted unreached
+
+    def _should_not_be_called(
+        req, timeout=None
+    ):  # pragma: no cover - asserted unreached
         raise AssertionError("api path POSTed despite a forced cli mode")
 
     old_open = urllib.request.urlopen
@@ -537,8 +571,9 @@ def test_zai_does_not_send_thinking_field():
 def test_zai_default_base_url_is_the_coding_plan_endpoint():
     """The DEFAULT z.ai base must be the GLM Coding-Plan endpoint (the only one that
     serves the flagship glm-5.2). A standard-plan user overrides via ZAI_BASE_URL."""
-    assert backends.ZAI_DEFAULT_BASE_URL == "https://api.z.ai/api/coding/paas/v4", \
+    assert backends.ZAI_DEFAULT_BASE_URL == "https://api.z.ai/api/coding/paas/v4", (
         backends.ZAI_DEFAULT_BASE_URL
+    )
     assert backends.ZAI_DEFAULT_MODEL == "glm-5.2", backends.ZAI_DEFAULT_MODEL
     # End-to-end: bare `zai` with no overrides hits the coding endpoint.
     captured: dict = {}
@@ -551,7 +586,9 @@ def test_zai_default_base_url_is_the_coding_plan_endpoint():
             backends.review_zai("zai", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
-    assert captured["url"] == "https://api.z.ai/api/coding/paas/v4/chat/completions", captured["url"]
+    assert captured["url"] == "https://api.z.ai/api/coding/paas/v4/chat/completions", (
+        captured["url"]
+    )
 
 
 def test_zai_base_url_env_overrides_to_standard_endpoint():
@@ -568,7 +605,9 @@ def test_zai_base_url_env_overrides_to_standard_endpoint():
             backends.review_zai("zai", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
-    assert captured["url"] == "https://api.z.ai/api/paas/v4/chat/completions", captured["url"]
+    assert captured["url"] == "https://api.z.ai/api/paas/v4/chat/completions", captured[
+        "url"
+    ]
     assert captured["body"]["model"] == "glm-5.1", captured["body"]
 
 
@@ -577,10 +616,49 @@ def test_zai_reasoning_content_fallback_when_content_empty():
     carries message.reasoning_content must NOT fail-closed as "no assistant content".
     Surface the reasoning text (rc=0) so a low-output-budget reasoning reply is usable."""
     cases = (
-        {"choices": [{"message": {"content": "", "reasoning_content": "I think the diff is fine."}}], "usage": {}},
-        {"choices": [{"message": {"reasoning_content": "Only reasoning here, no content key."}}], "usage": {}},
-        {"choices": [{"message": {"content": None, "reasoning_content": "null content, reasoning present."}}], "usage": {}},
-        {"choices": [{"message": {"content": "   ", "reasoning_content": "whitespace content, reasoning present."}}], "usage": {}},
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "I think the diff is fine.",
+                    }
+                }
+            ],
+            "usage": {},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "reasoning_content": "Only reasoning here, no content key."
+                    }
+                }
+            ],
+            "usage": {},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "reasoning_content": "null content, reasoning present.",
+                    }
+                }
+            ],
+            "usage": {},
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "   ",
+                        "reasoning_content": "whitespace content, reasoning present.",
+                    }
+                }
+            ],
+            "usage": {},
+        },
     )
     for payload in cases:
         captured: dict = {}
@@ -600,10 +678,17 @@ def test_zai_prefers_content_over_reasoning_when_both_present():
     """When BOTH content and reasoning_content are present, the final answer (content)
     wins — the reasoning is the chain of thought, not the review."""
     captured: dict = {}
-    payload = {"choices": [{"message": {
-        "content": "FINAL: the change looks correct.",
-        "reasoning_content": "step 1 ... step 2 ...",
-    }}], "usage": {}}
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": "FINAL: the change looks correct.",
+                    "reasoning_content": "step 1 ... step 2 ...",
+                }
+            }
+        ],
+        "usage": {},
+    }
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _fake_urlopen(captured, payload)
     with _EnvSandbox():
@@ -614,7 +699,9 @@ def test_zai_prefers_content_over_reasoning_when_both_present():
             urllib.request.urlopen = old_open
     assert res.returncode == 0, res
     assert "FINAL: the change looks correct." in res.stdout
-    assert "step 1" not in res.stdout  # reasoning not surfaced when a final answer exists
+    assert (
+        "step 1" not in res.stdout
+    )  # reasoning not surfaced when a final answer exists
 
 
 def test_zai_empty_with_no_reasoning_still_fails_closed():
@@ -622,9 +709,18 @@ def test_zai_empty_with_no_reasoning_still_fails_closed():
     reasoning_content must still map to a non-zero dead-backend result."""
     cases = (
         {"choices": [{"message": {"content": ""}}], "usage": {}},
-        {"choices": [{"message": {"content": "", "reasoning_content": ""}}], "usage": {}},
-        {"choices": [{"message": {"content": "", "reasoning_content": "   "}}], "usage": {}},
-        {"choices": [{"message": {"content": "", "reasoning_content": 42}}], "usage": {}},
+        {
+            "choices": [{"message": {"content": "", "reasoning_content": ""}}],
+            "usage": {},
+        },
+        {
+            "choices": [{"message": {"content": "", "reasoning_content": "   "}}],
+            "usage": {},
+        },
+        {
+            "choices": [{"message": {"content": "", "reasoning_content": 42}}],
+            "usage": {},
+        },
     )
     for payload in cases:
         old_open = urllib.request.urlopen
@@ -769,7 +865,9 @@ def test_key_name_precedence_beats_file_order():
             late.write_text("ZAI_API_KEY=primary-in-late-file\n", encoding="utf-8")
             old_fallbacks = backends.GEMINI_ENV_FALLBACKS
             backends.GEMINI_ENV_FALLBACKS = (early, late)
-            os.environ.pop("GEMINI_ENV_FILE", None)  # use GEMINI_ENV_FALLBACKS, not override
+            os.environ.pop(
+                "GEMINI_ENV_FILE", None
+            )  # use GEMINI_ENV_FALLBACKS, not override
             try:
                 # Primary name (ZAI_API_KEY) in the LATER file must beat the
                 # alias (ZHIPU_API_KEY) in the EARLIER file.
@@ -811,13 +909,18 @@ def test_backend_available_reflects_zai_key():
 
 def test_backend_available_reflects_commandcode_key():
     old_open = urllib.request.urlopen
-    urllib.request.urlopen = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("backend_available made network"))
+    urllib.request.urlopen = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("backend_available made network")
+    )
     with _EnvSandbox():
         try:
             assert backends.backend_available("commandcode") is False
             os.environ["COMMANDCODE_API_KEY"] = "user_present"
             assert backends.backend_available("commandcode") is True
-            assert backends.backend_available("commandcode:deepseek/deepseek-coder") is True
+            assert (
+                backends.backend_available("commandcode:deepseek/deepseek-coder")
+                is True
+            )
             # The legacy model-name spelling routes to the same backend (key present).
             assert backends.backend_available("common-code") is True
         finally:
@@ -836,14 +939,19 @@ def test_commandcode_payment_preflight_skips_unpaid_provider_without_chat_post()
         captured.append((req.get_method(), req.full_url))
         if req.full_url.endswith("/models"):
             raise _http_error(req.full_url, 402, "insufficient balance")
-        raise AssertionError(f"unexpected Command Code chat POST after failed preflight: {req.full_url}")
+        raise AssertionError(
+            f"unexpected Command Code chat POST after failed preflight: {req.full_url}"
+        )
 
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _preflight_only
     with _EnvSandbox():
         os.environ["COMMANDCODE_API_KEY"] = "user_present"
         try:
-            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is True
+            assert (
+                backends.backend_available("commandcode:deepseek/deepseek-v4-pro")
+                is True
+            )
             res = backends.review_commandcode(
                 "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
             )
@@ -864,20 +972,27 @@ def test_fireworks_payment_preflight_removes_seat_before_opencode_spawn():
         captured.append((req.get_method(), req.full_url))
         if req.full_url.endswith("/models"):
             raise _http_error(req.full_url, 403, "account suspended")
-        raise AssertionError(f"unexpected Fireworks model dispatch after failed preflight: {req.full_url}")
+        raise AssertionError(
+            f"unexpected Fireworks model dispatch after failed preflight: {req.full_url}"
+        )
 
     old_open = urllib.request.urlopen
     old_which = backends._which
     old_ensure = backends._ensure_opencode_readonly_agent
     urllib.request.urlopen = _preflight_only
     backends._which = lambda name: f"/fake/bin/{name}"
-    backends._ensure_opencode_readonly_agent = (
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("opencode setup ran"))
+    backends._ensure_opencode_readonly_agent = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("opencode setup ran")
     )
     with _EnvSandbox():
         os.environ["FIREWORKS_API_KEY"] = "fw_present"
         try:
-            assert backends.backend_available("oc:fireworks/accounts/fireworks/models/kimi") is True
+            assert (
+                backends.backend_available(
+                    "oc:fireworks/accounts/fireworks/models/kimi"
+                )
+                is True
+            )
             res = backends.review_opencode(
                 "oc:fireworks/accounts/fireworks/models/kimi", "q", "", REPO_ROOT, 10
             )
@@ -909,7 +1024,11 @@ def test_opencode_missing_binary_does_not_run_payment_preflight():
             raised = False
             try:
                 backends.review_opencode(
-                    "oc:fireworks/accounts/fireworks/models/kimi", "q", "", REPO_ROOT, 10
+                    "oc:fireworks/accounts/fireworks/models/kimi",
+                    "q",
+                    "",
+                    REPO_ROOT,
+                    10,
                 )
             except RuntimeError:
                 raised = True
@@ -935,13 +1054,19 @@ def test_payment_preflight_ignores_transient_network_failures():
     with _EnvSandbox():
         os.environ["COMMANDCODE_API_KEY"] = "user_present"
         try:
-            assert backends._provider_payment_preflight_unavailable_reason(
-                "commandcode:deepseek/deepseek-v4-pro"
-            ) is None
+            assert (
+                backends._provider_payment_preflight_unavailable_reason(
+                    "commandcode:deepseek/deepseek-v4-pro"
+                )
+                is None
+            )
             urllib.request.urlopen = _ok
-            assert backends._provider_payment_preflight_unavailable_reason(
-                "commandcode:moonshotai/Kimi-K2.7-Code"
-            ) is None
+            assert (
+                backends._provider_payment_preflight_unavailable_reason(
+                    "commandcode:moonshotai/Kimi-K2.7-Code"
+                )
+                is None
+            )
         finally:
             urllib.request.urlopen = old_open
     assert calls == {"transient": 1, "ok": 1}, calls
@@ -949,55 +1074,76 @@ def test_payment_preflight_ignores_transient_network_failures():
 
 def test_payment_preflight_403_without_billing_marker_is_not_authoritative():
     def _waf(_req, timeout=None):
-        raise _http_error("https://api.commandcode.ai/provider/v1/models", 403, "cloudflare challenge")
+        raise _http_error(
+            "https://api.commandcode.ai/provider/v1/models", 403, "cloudflare challenge"
+        )
 
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _waf
     with _EnvSandbox():
         os.environ["COMMANDCODE_API_KEY"] = "user_present"
         try:
-            assert backends._provider_payment_preflight_unavailable_reason(
-                "commandcode:deepseek/deepseek-v4-pro"
-            ) is None
+            assert (
+                backends._provider_payment_preflight_unavailable_reason(
+                    "commandcode:deepseek/deepseek-v4-pro"
+                )
+                is None
+            )
         finally:
             urllib.request.urlopen = old_open
 
 
 def test_payment_preflight_401_without_billing_marker_is_not_authoritative():
     def _auth_scope(_req, timeout=None):
-        raise _http_error("https://api.commandcode.ai/provider/v1/models", 401, "model listing auth scope denied")
+        raise _http_error(
+            "https://api.commandcode.ai/provider/v1/models",
+            401,
+            "model listing auth scope denied",
+        )
 
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _auth_scope
     with _EnvSandbox():
         os.environ["COMMANDCODE_API_KEY"] = "user_present"
         try:
-            assert backends._provider_payment_preflight_unavailable_reason(
-                "commandcode:deepseek/deepseek-v4-pro"
-            ) is None
+            assert (
+                backends._provider_payment_preflight_unavailable_reason(
+                    "commandcode:deepseek/deepseek-v4-pro"
+                )
+                is None
+            )
         finally:
             urllib.request.urlopen = old_open
 
 
 def test_payment_preflight_generic_500_billing_text_is_not_authoritative():
     def _generic_500(_req, timeout=None):
-        raise _http_error("https://api.commandcode.ai/provider/v1/models", 500, "billing service disabled")
+        raise _http_error(
+            "https://api.commandcode.ai/provider/v1/models",
+            500,
+            "billing service disabled",
+        )
 
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _generic_500
     with _EnvSandbox():
         os.environ["COMMANDCODE_API_KEY"] = "user_present"
         try:
-            assert backends._provider_payment_preflight_unavailable_reason(
-                "commandcode:deepseek/deepseek-v4-pro"
-            ) is None
+            assert (
+                backends._provider_payment_preflight_unavailable_reason(
+                    "commandcode:deepseek/deepseek-v4-pro"
+                )
+                is None
+            )
         finally:
             urllib.request.urlopen = old_open
 
 
 def test_payment_preflight_specific_billing_marker_denies_http_402():
     def _unpaid(_req, timeout=None):
-        raise _http_error("https://api.commandcode.ai/provider/v1/models", 402, "insufficient credits")
+        raise _http_error(
+            "https://api.commandcode.ai/provider/v1/models", 402, "insufficient credits"
+        )
 
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _unpaid
@@ -1014,7 +1160,9 @@ def test_payment_preflight_specific_billing_marker_denies_http_402():
 
 def test_payment_preflight_specific_billing_marker_denies_http_400():
     def _unpaid(_req, timeout=None):
-        raise _http_error("https://api.commandcode.ai/provider/v1/models", 400, "insufficient credits")
+        raise _http_error(
+            "https://api.commandcode.ai/provider/v1/models", 400, "insufficient credits"
+        )
 
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _unpaid
@@ -1035,6 +1183,7 @@ def test_commandcode_chat_billing_marker_caches_provider_skip_for_next_seat():
     def _models_ok_then_chat_unpaid(req, timeout=None):
         calls.append(req.full_url)
         if req.full_url.endswith("/models"):
+
             class _Resp:
                 def __enter__(self):
                     return self
@@ -1094,7 +1243,9 @@ def test_commandcode_model_subscription_denial_only_caches_that_model():
             urllib.request.urlopen = old_open
     assert first.returncode == 400
     assert same_model.returncode == 1
-    assert "preflight" in same_model.stderr and "skipping" in same_model.stderr, same_model.stderr
+    assert "preflight" in same_model.stderr and "skipping" in same_model.stderr, (
+        same_model.stderr
+    )
     assert different_model.returncode == 400
     assert len([url for url in calls if url.endswith("/chat/completions")]) == 2, calls
 
@@ -1123,7 +1274,9 @@ def test_commandcode_chat_nonbilling_http_400_does_not_cache_provider_skip():
             urllib.request.urlopen = old_open
     assert first.returncode == 400
     assert second.returncode == 400
-    assert "preflight" not in second.stderr and "skipping" not in second.stderr, second.stderr
+    assert "preflight" not in second.stderr and "skipping" not in second.stderr, (
+        second.stderr
+    )
     assert len([url for url in calls if url.endswith("/chat/completions")]) == 2, calls
 
 
@@ -1131,7 +1284,9 @@ def test_successful_payment_preflight_does_not_overwrite_existing_provider_denia
     def _models_ok(req, timeout=None):
         if req.full_url.endswith("/models"):
             return _FakeResp({"data": []})
-        raise AssertionError(f"unexpected chat dispatch in preflight stub: {req.full_url}")
+        raise AssertionError(
+            f"unexpected chat dispatch in preflight stub: {req.full_url}"
+        )
 
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _models_ok
@@ -1183,7 +1338,9 @@ def test_successful_payment_preflight_returns_concurrent_provider_denial():
                     backends._payment_preflight_cache_key(provider, url, key)
                 ] = (True, 402)
             return _FakeResp({"data": []})
-        raise AssertionError(f"unexpected chat dispatch in preflight stub: {req.full_url}")
+        raise AssertionError(
+            f"unexpected chat dispatch in preflight stub: {req.full_url}"
+        )
 
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _models_ok_after_denial
@@ -1201,7 +1358,11 @@ def test_successful_payment_preflight_returns_concurrent_provider_denial():
 
 def test_payment_preflight_billing_marker_on_auth_status_denies():
     def _auth_with_marker(_req, timeout=None):
-        raise _http_error("https://api.commandcode.ai/provider/v1/models", 401, "payment required for model list scope")
+        raise _http_error(
+            "https://api.commandcode.ai/provider/v1/models",
+            401,
+            "payment required for model list scope",
+        )
 
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _auth_with_marker
@@ -1245,13 +1406,26 @@ def test_payment_preflight_success_is_cached_for_dispatch():
     with _EnvSandbox():
         os.environ["COMMANDCODE_API_KEY"] = "user_present"
         try:
-            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is True
-            assert backends.provider_preflight_result(
-                "commandcode:deepseek/deepseek-v4-pro", backend="commandcode", command="commandcode API x"
-            ) is None
-            assert backends.provider_preflight_result(
-                "commandcode:moonshotai/Kimi-K2.7-Code", backend="commandcode", command="commandcode API y"
-            ) is None
+            assert (
+                backends.backend_available("commandcode:deepseek/deepseek-v4-pro")
+                is True
+            )
+            assert (
+                backends.provider_preflight_result(
+                    "commandcode:deepseek/deepseek-v4-pro",
+                    backend="commandcode",
+                    command="commandcode API x",
+                )
+                is None
+            )
+            assert (
+                backends.provider_preflight_result(
+                    "commandcode:moonshotai/Kimi-K2.7-Code",
+                    backend="commandcode",
+                    command="commandcode API y",
+                )
+                is None
+            )
         finally:
             urllib.request.urlopen = old_open
     assert calls["n"] == 1, calls
@@ -1275,7 +1449,10 @@ def test_backend_available_uses_cached_payment_denial_without_network():
                 backends._payment_preflight_cache_key(provider, url, key)
             ] = (True, 402)
         try:
-            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is False
+            assert (
+                backends.backend_available("commandcode:deepseek/deepseek-v4-pro")
+                is False
+            )
         finally:
             urllib.request.urlopen = old_open
 
@@ -1285,7 +1462,9 @@ def test_visual_opencode_availability_does_not_use_payment_preflight():
 
     old_open = urllib.request.urlopen
     old_which = vision_client.shutil.which
-    urllib.request.urlopen = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("vision availability made network"))
+    urllib.request.urlopen = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("vision availability made network")
+    )
     vision_client.shutil.which = lambda name: f"/fake/bin/{name}"
     with _EnvSandbox():
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1295,9 +1474,12 @@ def test_visual_opencode_availability_does_not_use_payment_preflight():
                 {"fireworks": {"options": {"apiKey": "fw_present"}}},
             )
             try:
-                assert vision_client.vision_backend_available(
-                    "oc:fireworks/accounts/fireworks/models/gpt-4o"
-                ) is True
+                assert (
+                    vision_client.vision_backend_available(
+                        "oc:fireworks/accounts/fireworks/models/gpt-4o"
+                    )
+                    is True
+                )
             finally:
                 urllib.request.urlopen = old_open
                 vision_client.shutil.which = old_which
@@ -1357,9 +1539,12 @@ def test_payment_preflight_uses_opencode_config_base_url_with_config_key():
                 },
             )
             try:
-                assert backends._provider_payment_preflight_unavailable_reason(
-                    "oc:fireworks/accounts/fireworks/models/gpt-4o"
-                ) is None
+                assert (
+                    backends._provider_payment_preflight_unavailable_reason(
+                        "oc:fireworks/accounts/fireworks/models/gpt-4o"
+                    )
+                    is None
+                )
             finally:
                 urllib.request.urlopen = old_open
     assert captured["url"] == "https://proxy.example.test/fireworks/v1/models", captured
@@ -1378,7 +1563,9 @@ def test_payment_preflight_uses_opencode_config_base_url_with_auth_key():
     urllib.request.urlopen = _capture
     with _EnvSandbox():
         with tempfile.TemporaryDirectory() as tmpdir:
-            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {"fireworks": {"key": "fw_auth_key"}})
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(
+                tmpdir, {"fireworks": {"key": "fw_auth_key"}}
+            )
             os.environ["OC_CONFIG_FILE"] = _write_oc_config(
                 tmpdir,
                 {
@@ -1390,9 +1577,12 @@ def test_payment_preflight_uses_opencode_config_base_url_with_auth_key():
                 },
             )
             try:
-                assert backends._provider_payment_preflight_unavailable_reason(
-                    "oc:fireworks/accounts/fireworks/models/gpt-4o"
-                ) is None
+                assert (
+                    backends._provider_payment_preflight_unavailable_reason(
+                        "oc:fireworks/accounts/fireworks/models/gpt-4o"
+                    )
+                    is None
+                )
             finally:
                 urllib.request.urlopen = old_open
     assert captured["url"] == "https://proxy.example.test/fireworks/v1/models", captured
@@ -1424,9 +1614,12 @@ def test_payment_preflight_uses_opencode_config_base_url_with_env_key():
                 },
             )
             try:
-                assert backends._provider_payment_preflight_unavailable_reason(
-                    "oc:fireworks/accounts/fireworks/models/gpt-4o"
-                ) is None
+                assert (
+                    backends._provider_payment_preflight_unavailable_reason(
+                        "oc:fireworks/accounts/fireworks/models/gpt-4o"
+                    )
+                    is None
+                )
             finally:
                 urllib.request.urlopen = old_open
     assert captured["url"] == "https://proxy.example.test/fireworks/v1/models", captured
@@ -1460,6 +1653,7 @@ def test_payment_preflight_denial_is_cached_for_provider_key_url():
 
 def test_preflight_failed_provider_does_not_make_startup_split_do_network():
     """Startup failover is a cheap offline check; runtime dispatch owns payment preflight."""
+
     def _no_network(req, timeout=None):
         raise AssertionError(f"startup availability made network: {req.full_url}")
 
@@ -1471,7 +1665,9 @@ def test_preflight_failed_provider_does_not_make_startup_split_do_network():
         os.environ["FIREWORKS_API_KEY"] = "fw_present"
         try:
             board = [
-                BoardReviewer("oc:fireworks/accounts/fireworks/models/kimi", "tests", "Fireworks"),
+                BoardReviewer(
+                    "oc:fireworks/accounts/fireworks/models/kimi", "tests", "Fireworks"
+                ),
                 BoardReviewer("codex", "correctness", "Codex"),
             ]
             pool, reserve = split_pool_reserve(
@@ -1480,7 +1676,9 @@ def test_preflight_failed_provider_does_not_make_startup_split_do_network():
         finally:
             urllib.request.urlopen = old_open
             backends._which = old_which
-    assert [seat.model for seat in pool] == ["oc:fireworks/accounts/fireworks/models/kimi"], pool
+    assert [seat.model for seat in pool] == [
+        "oc:fireworks/accounts/fireworks/models/kimi"
+    ], pool
     assert [seat.model for seat in reserve] == ["codex"], reserve
 
 
@@ -1491,14 +1689,28 @@ def test_backend_available_skips_unpaid_provider_before_key_or_cli_checks():
     with _EnvSandbox():
         try:
             os.environ["COMMANDCODE_API_KEY"] = "user_present"
-            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is True
+            assert (
+                backends.backend_available("commandcode:deepseek/deepseek-v4-pro")
+                is True
+            )
             os.environ["REVIEW_UNPAID_PROVIDERS"] = " commandcode, fireworks "
             assert backends.backend_available("commandcode") is False
-            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is False
+            assert (
+                backends.backend_available("commandcode:deepseek/deepseek-v4-pro")
+                is False
+            )
             # These return False without needing opencode on PATH because the entitlement
             # denylist is checked before the backend's CLI/auth probe.
-            assert backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro") is False
-            assert backends.backend_available("oc:fireworks/accounts/fireworks/models/fable-5") is False
+            assert (
+                backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro")
+                is False
+            )
+            assert (
+                backends.backend_available(
+                    "oc:fireworks/accounts/fireworks/models/fable-5"
+                )
+                is False
+            )
         finally:
             urllib.request.urlopen = old_open
 
@@ -1507,17 +1719,32 @@ def test_unpaid_oc_provider_skip_wins_even_when_opencode_auth_exists():
     """Pin the unpaid branch for `oc:` seats, not merely a missing-opencode false result."""
     old_which = backends._which
     old_open = urllib.request.urlopen
-    backends._which = lambda name: "/fake/bin/opencode" if name == "opencode" else old_which(name)
+    backends._which = lambda name: (
+        "/fake/bin/opencode" if name == "opencode" else old_which(name)
+    )
     urllib.request.urlopen = _allow_preflight
     try:
         with _EnvSandbox():
             with tempfile.TemporaryDirectory() as tmp:
                 auth = Path(tmp) / "auth.json"
-                auth.write_text(json.dumps({"commandcode": {"key": "opencode-key"}}), encoding="utf-8")
+                auth.write_text(
+                    json.dumps({"commandcode": {"key": "opencode-key"}}),
+                    encoding="utf-8",
+                )
                 os.environ["OC_AUTH_FILE"] = str(auth)
-                assert backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro") is True
+                assert (
+                    backends.backend_available(
+                        "oc:commandcode/deepseek/deepseek-v4-pro"
+                    )
+                    is True
+                )
                 os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
-                assert backends.backend_available("oc:commandcode/deepseek/deepseek-v4-pro") is False
+                assert (
+                    backends.backend_available(
+                        "oc:commandcode/deepseek/deepseek-v4-pro"
+                    )
+                    is False
+                )
     finally:
         backends._which = old_which
         urllib.request.urlopen = old_open
@@ -1525,7 +1752,9 @@ def test_unpaid_oc_provider_skip_wins_even_when_opencode_auth_exists():
 
 def test_oc_zai_requires_opencode_auth_not_zai_rest_key():
     old_which = backends._which
-    backends._which = lambda name: "/fake/bin/opencode" if name == "opencode" else old_which(name)
+    backends._which = lambda name: (
+        "/fake/bin/opencode" if name == "opencode" else old_which(name)
+    )
     try:
         with _EnvSandbox():
             with tempfile.TemporaryDirectory() as tmp:
@@ -1545,20 +1774,33 @@ def test_configured_unpaid_provider_skips_without_env():
         os.environ["COMMANDCODE_API_KEY"] = "user_present"
         try:
             backends.configure_unpaid_providers(["commandcode"])
-            assert backends.backend_available("commandcode:deepseek/deepseek-v4-pro") is False
+            assert (
+                backends.backend_available("commandcode:deepseek/deepseek-v4-pro")
+                is False
+            )
         finally:
             backends._CONFIG_UNPAID_PROVIDERS = saved
 
 
 def test_configure_unpaid_providers_accepts_saved_frozenset():
+    saved = backends._CONFIG_UNPAID_PROVIDERS
     with _EnvSandbox():
-        backends.configure_unpaid_providers(frozenset({"commandcode"}))
-        assert backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro") is True
+        try:
+            backends.configure_unpaid_providers(frozenset({"commandcode"}))
+            assert (
+                backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro")
+                is True
+            )
+        finally:
+            backends._CONFIG_UNPAID_PROVIDERS = saved
 
 
 def test_commandcode_unpaid_provider_does_not_post():
     """Explicit `-m commandcode:*` fails fast when billing is disabled."""
-    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+
+    def _should_not_post(
+        req, timeout=None
+    ):  # pragma: no cover - asserted by not raising
         raise AssertionError("commandcode POSTed despite REVIEW_UNPAID_PROVIDERS")
 
     old_open = urllib.request.urlopen
@@ -1579,7 +1821,9 @@ def test_commandcode_unpaid_provider_does_not_post():
 def test_codex_unpaid_provider_does_not_spawn_cli():
     """Agent CLI providers are also gated before PATH lookup or subprocess spawn."""
     old_which = backends._which
-    backends._which = lambda _name: (_ for _ in ()).throw(AssertionError("codex CLI was probed"))
+    backends._which = lambda _name: (_ for _ in ()).throw(
+        AssertionError("codex CLI was probed")
+    )
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "codex"
         try:
@@ -1593,13 +1837,15 @@ def test_codex_unpaid_provider_does_not_spawn_cli():
 def test_opencode_unpaid_provider_does_not_spawn_cli():
     """`oc:provider/model` seats are skipped before read-only agent setup or launch."""
     old_ensure = backends._ensure_opencode_readonly_agent
-    backends._ensure_opencode_readonly_agent = (
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("opencode setup ran"))
+    backends._ensure_opencode_readonly_agent = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("opencode setup ran")
     )
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
         try:
-            res = backends.review_opencode("oc:commandcode/deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10)
+            res = backends.review_opencode(
+                "oc:commandcode/deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
+            )
         finally:
             backends._ensure_opencode_readonly_agent = old_ensure
     assert res.returncode == 1, res
@@ -1609,7 +1855,9 @@ def test_opencode_unpaid_provider_does_not_spawn_cli():
 def test_claude_unpaid_alias_provider_does_not_spawn_cli():
     """Unexpanded Claude aliases must be skipped before CLI probing or launch."""
     old_which = backends._which_optional
-    backends._which_optional = lambda _name: (_ for _ in ()).throw(AssertionError("claude CLI was probed"))
+    backends._which_optional = lambda _name: (_ for _ in ()).throw(
+        AssertionError("claude CLI was probed")
+    )
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
         try:
@@ -1624,10 +1872,22 @@ def test_unpaid_provider_uses_canonical_commandcode_aliases():
     """Legacy command/common-code spellings must hit the same payment gate."""
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "commandcode"
-        assert backends.effective_provider("command-code:deepseek/deepseek-v4-pro") == "commandcode"
-        assert backends.effective_provider("common-code:deepseek/deepseek-v4-pro") == "commandcode"
-        assert backends.provider_marked_unpaid("command-code:deepseek/deepseek-v4-pro") is True
-        assert backends.provider_marked_unpaid("common-code:deepseek/deepseek-v4-pro") is True
+        assert (
+            backends.effective_provider("command-code:deepseek/deepseek-v4-pro")
+            == "commandcode"
+        )
+        assert (
+            backends.effective_provider("common-code:deepseek/deepseek-v4-pro")
+            == "commandcode"
+        )
+        assert (
+            backends.provider_marked_unpaid("command-code:deepseek/deepseek-v4-pro")
+            is True
+        )
+        assert (
+            backends.provider_marked_unpaid("common-code:deepseek/deepseek-v4-pro")
+            is True
+        )
 
 
 def test_unpaid_provider_uses_canonical_zai_aliases():
@@ -1666,14 +1926,23 @@ def test_unpaid_provider_env_uses_canonical_commandcode_aliases():
     """Aliases are normalized in the env/config value, not only in model ids."""
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "common-code"
-        assert backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro") is True
+        assert (
+            backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro")
+            is True
+        )
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "cc"
-        assert backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro") is True
+        assert (
+            backends.provider_marked_unpaid("commandcode:deepseek/deepseek-v4-pro")
+            is True
+        )
 
 
 def test_zai_unpaid_provider_does_not_post():
     """Every direct REST provider must fail fast when billing is disabled, not only commandcode."""
-    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+
+    def _should_not_post(
+        req, timeout=None
+    ):  # pragma: no cover - asserted by not raising
         raise AssertionError("z.ai POSTed despite REVIEW_UNPAID_PROVIDERS")
 
     old_open = urllib.request.urlopen
@@ -1691,7 +1960,10 @@ def test_zai_unpaid_provider_does_not_post():
 
 def test_zai_unpaid_alias_provider_does_not_post():
     """Accepted z.ai aliases are gated before the REST request, not only the zai prefix."""
-    def _should_not_post(req, timeout=None):  # pragma: no cover - asserted by not raising
+
+    def _should_not_post(
+        req, timeout=None
+    ):  # pragma: no cover - asserted by not raising
         raise AssertionError("z.ai alias POSTed despite REVIEW_UNPAID_PROVIDERS")
 
     old_open = urllib.request.urlopen
@@ -1711,15 +1983,21 @@ def test_unpaid_provider_logs_use_model_specific_headers():
     """Unpaid sidecar logs still need exact model argv0s for dashboard attribution."""
     emitted = []
     old_emit = backends._emit_rest_log
-    backends._emit_rest_log = (
-        lambda backend, command, **kwargs: emitted.append((backend, command))
+    backends._emit_rest_log = lambda backend, command, **kwargs: emitted.append(
+        (backend, command)
     )
     with _EnvSandbox():
         try:
-            os.environ["REVIEW_UNPAID_PROVIDERS"] = "zai,commandcode,openrouter,claude,gemini"
+            os.environ["REVIEW_UNPAID_PROVIDERS"] = (
+                "zai,commandcode,openrouter,claude,gemini"
+            )
             backends.review_zai("z.ai:glm-5.2", "q", "", REPO_ROOT, 10)
-            backends.review_commandcode("commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10)
-            backends.review_openrouter("openrouter:anthropic/claude-3.5-sonnet", "q", "", REPO_ROOT, 10)
+            backends.review_commandcode(
+                "commandcode:deepseek/deepseek-v4-pro", "q", "", REPO_ROOT, 10
+            )
+            backends.review_openrouter(
+                "openrouter:anthropic/claude-3.5-sonnet", "q", "", REPO_ROOT, 10
+            )
             backends.review_claude("claude:claude-fable-5", "q", "", REPO_ROOT, 10)
             backends.review_gemini("gemini:gemini-3.5-flash", "q", "", REPO_ROOT, 10)
         finally:
@@ -1743,7 +2021,10 @@ def test_gemini_bare_seat_resolves_to_current_default_model():
     dead seat that would inflate the self-merge quorum's distinct-model count.
     """
     captured: dict = {}
-    payload = {"candidates": [{"content": {"parts": [{"text": "looks good"}]}}], "usageMetadata": {}}
+    payload = {
+        "candidates": [{"content": {"parts": [{"text": "looks good"}]}}],
+        "usageMetadata": {},
+    }
     old_open = urllib.request.urlopen
     old_key = backends._gemini_key
     old_model = os.environ.pop("GEMINI_MODEL", None)
@@ -1757,7 +2038,9 @@ def test_gemini_bare_seat_resolves_to_current_default_model():
         backends._gemini_key = old_key
         if old_model is not None:
             os.environ["GEMINI_MODEL"] = old_model
-    assert "models/gemini-3.5-flash:generateContent" in captured["url"], captured.get("url")
+    assert "models/gemini-3.5-flash:generateContent" in captured["url"], captured.get(
+        "url"
+    )
     assert result.command == "Gemini API gemini-3.5-flash", result.command
     assert result.returncode == 0, result.stderr
 
@@ -1766,7 +2049,10 @@ def test_gemini_model_env_override_still_honored():
     """An explicit $GEMINI_MODEL must still win over the default -- the fix only
     moves the FALLBACK, it must not hardcode the model."""
     captured: dict = {}
-    payload = {"candidates": [{"content": {"parts": [{"text": "ok"}]}}], "usageMetadata": {}}
+    payload = {
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+        "usageMetadata": {},
+    }
     old_open = urllib.request.urlopen
     old_key = backends._gemini_key
     old_model = os.environ.get("GEMINI_MODEL")
@@ -1783,7 +2069,9 @@ def test_gemini_model_env_override_still_honored():
             os.environ.pop("GEMINI_MODEL", None)
         else:
             os.environ["GEMINI_MODEL"] = old_model
-    assert "models/gemini-3.1-flash-lite:generateContent" in captured["url"], captured.get("url")
+    assert "models/gemini-3.1-flash-lite:generateContent" in captured["url"], (
+        captured.get("url")
+    )
     assert result.command == "Gemini API gemini-3.1-flash-lite", result.command
 
 
@@ -1808,12 +2096,19 @@ def test_unpaid_provider_log_failure_still_returns_skip_result():
 def test_claude_with_images_unpaid_provider_does_not_spawn_cli():
     """The Claude raw-image special case must not bypass the unpaid-provider gate."""
     old_which = backends._which_optional
-    backends._which_optional = lambda _name: (_ for _ in ()).throw(AssertionError("claude CLI was probed"))
+    backends._which_optional = lambda _name: (_ for _ in ()).throw(
+        AssertionError("claude CLI was probed")
+    )
     with _EnvSandbox():
         os.environ["REVIEW_UNPAID_PROVIDERS"] = "claude"
         try:
             res = backends.review_with_images(
-                "claude:claude-opus-4-8", "q", "", REPO_ROOT, 10, images=(Path("shot.png"),)
+                "claude:claude-opus-4-8",
+                "q",
+                "",
+                REPO_ROOT,
+                10,
+                images=(Path("shot.png"),),
             )
         finally:
             backends._which_optional = old_which
@@ -1858,7 +2153,10 @@ def test_zai_http_error_maps_to_returncode():
 
     def _raise(req, timeout=None):
         raise urllib.error.HTTPError(
-            req.full_url, 401, "Unauthorized", hdrs=None,
+            req.full_url,
+            401,
+            "Unauthorized",
+            hdrs=None,
             fp=__import__("io").BytesIO(b'{"error":"bad key"}'),
         )
 
@@ -1951,11 +2249,19 @@ def test_zai_malformed_json_maps_to_returncode():
 def test_resolve_backend_routes_openrouter():
     for name in ("openrouter", "OpenRouter", "OPENROUTER"):
         assert backends.resolve_backend(name) is backends.review_openrouter, name
-    assert backends.resolve_backend("openrouter:anthropic/claude-3.5-sonnet") is backends.review_openrouter
-    assert backends.resolve_backend("openrouter:openai/gpt-4o") is backends.review_openrouter
+    assert (
+        backends.resolve_backend("openrouter:anthropic/claude-3.5-sonnet")
+        is backends.review_openrouter
+    )
+    assert (
+        backends.resolve_backend("openrouter:openai/gpt-4o")
+        is backends.review_openrouter
+    )
     # OpenRouter must NOT steal opencode's `oc:`/`opencode:` agentic routing.
     assert backends.resolve_backend("oc:fireworks/x") is backends.review_opencode
-    assert backends.resolve_backend("opencode:provider/model") is backends.review_opencode
+    assert (
+        backends.resolve_backend("opencode:provider/model") is backends.review_opencode
+    )
 
 
 def test_openrouter_request_is_openai_shape():
@@ -1972,7 +2278,9 @@ def test_openrouter_request_is_openai_shape():
             res = backends.review_openrouter("openrouter", "say hi", "", REPO_ROOT, 30)
         finally:
             urllib.request.urlopen = old_open
-    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions", captured["url"]
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions", captured[
+        "url"
+    ]
     assert captured["method"] == "POST"
     body = captured["body"]
     assert "messages" in body and "contents" not in body, body
@@ -1994,8 +2302,14 @@ def test_openrouter_model_suffix_preserves_slug_and_variant():
     cases = (
         ("openrouter:anthropic/claude-3.5-sonnet", "anthropic/claude-3.5-sonnet"),
         ("openrouter:openai/gpt-4o", "openai/gpt-4o"),
-        ("openrouter:anthropic/claude-3.5-sonnet:beta", "anthropic/claude-3.5-sonnet:beta"),
-        ("openrouter:meta-llama/llama-3.1-70b-instruct:free", "meta-llama/llama-3.1-70b-instruct:free"),
+        (
+            "openrouter:anthropic/claude-3.5-sonnet:beta",
+            "anthropic/claude-3.5-sonnet:beta",
+        ),
+        (
+            "openrouter:meta-llama/llama-3.1-70b-instruct:free",
+            "meta-llama/llama-3.1-70b-instruct:free",
+        ),
     )
     for seat, wire in cases:
         captured: dict = {}
@@ -2022,7 +2336,9 @@ def test_openrouter_diff_is_fenced_in_message():
     with _EnvSandbox():
         os.environ["OPENROUTER_API_KEY"] = "k"
         try:
-            backends.review_openrouter("openrouter", "review this", "+added line", REPO_ROOT, 10)
+            backends.review_openrouter(
+                "openrouter", "review this", "+added line", REPO_ROOT, 10
+            )
         finally:
             urllib.request.urlopen = old_open
     content = captured["body"]["messages"][0]["content"]
@@ -2043,7 +2359,9 @@ def test_openrouter_base_url_and_model_env_override():
             backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
-    assert captured["url"] == "https://proxy.example.test/v1/chat/completions", captured["url"]
+    assert captured["url"] == "https://proxy.example.test/v1/chat/completions", (
+        captured["url"]
+    )
     assert captured["body"]["model"] == "google/gemini-flash-1.5", captured["body"]
 
 
@@ -2058,7 +2376,9 @@ def test_openrouter_suffix_beats_model_env():
         os.environ["OPENROUTER_API_KEY"] = "k"
         os.environ["OPENROUTER_MODEL"] = "should/be-ignored"
         try:
-            backends.review_openrouter("openrouter:openai/gpt-4o", "q", "", REPO_ROOT, 10)
+            backends.review_openrouter(
+                "openrouter:openai/gpt-4o", "q", "", REPO_ROOT, 10
+            )
         finally:
             urllib.request.urlopen = old_open
     assert captured["body"]["model"] == "openai/gpt-4o", captured["body"]
@@ -2091,7 +2411,9 @@ def test_openrouter_optional_attribution_headers_from_env():
             backends.review_openrouter("openrouter", "q", "", REPO_ROOT, 10)
         finally:
             urllib.request.urlopen = old_open
-    assert captured2["headers"].get("http-referer") == "https://review.example", captured2["headers"]
+    assert captured2["headers"].get("http-referer") == "https://review.example", (
+        captured2["headers"]
+    )
     assert captured2["headers"].get("x-title") == "review-cli", captured2["headers"]
     # The bearer auth is untouched by the optional headers.
     assert captured2["headers"].get("authorization") == "Bearer k"
@@ -2110,17 +2432,33 @@ def test_openrouter_extra_headers_cannot_shadow_authorization():
         urllib.request.urlopen = _fake_urlopen(captured, payload)
         try:
             backends._openai_compatible_request(
-                model="openrouter", api_model="openrouter/auto", label="openrouter",
-                base_url="https://openrouter.ai/api/v1", key="real-key",
-                prompt="q", diff="", timeout=10, backend="openrouter",
-                extra_headers={stray: "Bearer STOLEN", "content-type": "text/evil", "X-Title": "t"},
+                model="openrouter",
+                api_model="openrouter/auto",
+                label="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                key="real-key",
+                prompt="q",
+                diff="",
+                timeout=10,
+                backend="openrouter",
+                extra_headers={
+                    stray: "Bearer STOLEN",
+                    "content-type": "text/evil",
+                    "X-Title": "t",
+                },
             )
         finally:
             urllib.request.urlopen = old_open
         # _fake_urlopen lower-cases every captured header name, so a single normalized
         # `authorization`/`content-type` entry proves the stray was dropped (no duplicate).
-        assert captured["headers"].get("authorization") == "Bearer real-key", (stray, captured["headers"])
-        assert captured["headers"].get("content-type") == "application/json", (stray, captured["headers"])
+        assert captured["headers"].get("authorization") == "Bearer real-key", (
+            stray,
+            captured["headers"],
+        )
+        assert captured["headers"].get("content-type") == "application/json", (
+            stray,
+            captured["headers"],
+        )
         assert captured["headers"].get("x-title") == "t", (stray, captured["headers"])
 
 
@@ -2171,7 +2509,9 @@ def test_openrouter_whitespace_env_falls_back_to_default():
         finally:
             urllib.request.urlopen = old_open
     assert captured["body"]["model"] == "openrouter/auto", captured["body"]
-    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions", captured["url"]
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions", captured[
+        "url"
+    ]
 
 
 def test_openrouter_control_char_attribution_header_is_dropped():
@@ -2215,14 +2555,19 @@ def test_openrouter_non_latin1_attribution_header_is_dropped():
             urllib.request.urlopen = old_open
     assert res.returncode == 0, res
     assert "x-title" not in captured["headers"], captured["headers"]
-    assert captured["headers"].get("http-referer") == "https://café.example", captured["headers"]
+    assert captured["headers"].get("http-referer") == "https://café.example", captured[
+        "headers"
+    ]
 
 
 def test_openrouter_missing_key_is_a_dead_backend_result():
     """The no-key path through review_openrouter itself (the `except RuntimeError` branch):
     a missing OPENROUTER_API_KEY must yield a NON-zero ReviewResult (not raise out of the
     panel as an internal 127), and must not POST."""
-    def _should_not_be_called(req, timeout=None):  # pragma: no cover - asserted unreached
+
+    def _should_not_be_called(
+        req, timeout=None
+    ):  # pragma: no cover - asserted unreached
         raise AssertionError("api path POSTed despite a missing key")
 
     old_open = urllib.request.urlopen
@@ -2264,7 +2609,9 @@ def test_backend_available_reflects_openrouter_key():
         assert backends.backend_available("openrouter") is False
         os.environ["OPENROUTER_API_KEY"] = "sk-or-v1-present"
         assert backends.backend_available("openrouter") is True
-        assert backends.backend_available("openrouter:anthropic/claude-3.5-sonnet") is True
+        assert (
+            backends.backend_available("openrouter:anthropic/claude-3.5-sonnet") is True
+        )
 
 
 def test_backend_available_false_for_forced_openrouter_cli_mode():
@@ -2279,7 +2626,10 @@ def test_backend_available_false_for_forced_openrouter_cli_mode():
 
 def test_openrouter_forced_cli_mode_is_a_dead_backend():
     """OpenRouter is api-only: REVIEW_OPENROUTER_MODE=cli must fail loudly, never POST."""
-    def _should_not_be_called(req, timeout=None):  # pragma: no cover - asserted unreached
+
+    def _should_not_be_called(
+        req, timeout=None
+    ):  # pragma: no cover - asserted unreached
         raise AssertionError("api path POSTed despite a forced cli mode")
 
     old_open = urllib.request.urlopen
@@ -2321,7 +2671,10 @@ def test_openrouter_http_error_maps_to_returncode():
 
     def _raise(req, timeout=None):
         raise urllib.error.HTTPError(
-            req.full_url, 401, "Unauthorized", hdrs=None,
+            req.full_url,
+            401,
+            "Unauthorized",
+            hdrs=None,
             fp=__import__("io").BytesIO(b'{"error":"invalid key"}'),
         )
 
@@ -2361,7 +2714,12 @@ def test_mode_review_includes_an_openrouter_seat_without_keyerror():
         os.environ["OPENROUTER_API_KEY"] = "k"
         try:
             rc = mode_review(
-                ["openrouter:anthropic/claude-3.5-sonnet"], "review", "+added", REPO_ROOT, 10, False
+                ["openrouter:anthropic/claude-3.5-sonnet"],
+                "review",
+                "+added",
+                REPO_ROOT,
+                10,
+                False,
             )
         finally:
             urllib.request.urlopen = old_open
@@ -2399,9 +2757,17 @@ def test_oc_bare_opencode_skips_provider_check():
 
 def test_oc_provider_from_model_extracts_prefix():
     """_oc_provider_from_model peels oc:/opencode: prefix and returns provider."""
-    assert backends._oc_provider_from_model("oc:anthropic/claude-3-5-sonnet") == "anthropic"
-    assert backends._oc_provider_from_model("opencode:deepseek/deepseek-v3") == "deepseek"
-    assert backends._oc_provider_from_model("oc:commandcode/moonshotai/kimi") == "commandcode"
+    assert (
+        backends._oc_provider_from_model("oc:anthropic/claude-3-5-sonnet")
+        == "anthropic"
+    )
+    assert (
+        backends._oc_provider_from_model("opencode:deepseek/deepseek-v3") == "deepseek"
+    )
+    assert (
+        backends._oc_provider_from_model("oc:commandcode/moonshotai/kimi")
+        == "commandcode"
+    )
     assert backends._oc_provider_from_model("opencode") is None
     assert backends._oc_provider_from_model("codex") is None
 
@@ -2414,17 +2780,24 @@ def test_backend_available_oc_anthropic_env_var():
     logic rather than binary presence.
     """
     saved_which = backends._which_optional
-    backends._which_optional = lambda name: "/fake/bin/opencode" if name == "opencode" else saved_which(name)
+    backends._which_optional = lambda name: (
+        "/fake/bin/opencode" if name == "opencode" else saved_which(name)
+    )
     try:
         with _EnvSandbox():
             with tempfile.TemporaryDirectory() as tmpdir:
                 # Empty auth.json + no key → unavailable.
                 os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
                 os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
-                assert backends.backend_available("oc:anthropic/claude-sonnet-4-5") is False
+                assert (
+                    backends.backend_available("oc:anthropic/claude-sonnet-4-5")
+                    is False
+                )
                 # Set env var → available.
                 os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test"
-                assert backends.backend_available("oc:anthropic/claude-sonnet-4-5") is True
+                assert (
+                    backends.backend_available("oc:anthropic/claude-sonnet-4-5") is True
+                )
     finally:
         backends._which_optional = saved_which
 
@@ -2463,7 +2836,14 @@ def test_backend_available_oc_provider_via_opencode_json():
             os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
             os.environ["OC_CONFIG_FILE"] = _write_oc_config(
                 tmpdir,
-                {"customprovider": {"options": {"baseURL": "https://api.example.com", "apiKey": "sk-custom"}}},
+                {
+                    "customprovider": {
+                        "options": {
+                            "baseURL": "https://api.example.com",
+                            "apiKey": "sk-custom",
+                        }
+                    }
+                },
             )
             assert backends._oc_provider_auth_available("customprovider") is True
 
@@ -2512,6 +2892,52 @@ def test_oc_config_has_provider_key_missing_file():
     with _EnvSandbox():
         os.environ["OC_CONFIG_FILE"] = "/nonexistent/no-such-dir/opencode.json"
         assert backends._oc_config_has_provider_key("anthropic") is False
+
+
+def test_unavailable_reason_is_none_iff_available():
+    """backend_available is the boolean over backend_unavailable_reason — they must never
+    disagree. A missing commandcode key => a non-None reason AND backend_available False."""
+    with _EnvSandbox():
+        # No COMMANDCODE_API_KEY set in the sandbox → down, with a concrete reason.
+        reason = backends.backend_unavailable_reason("commandcode")
+        assert reason is not None
+        assert backends.backend_available("commandcode") is False
+        assert (
+            backends.backend_unavailable_reason("commandcode") is None
+        ) == backends.backend_available("commandcode")
+
+
+def test_unavailable_reason_for_unpaid_provider_names_the_provider():
+    """A provider on the unpaid list gets its dedicated unpaid reason BEFORE any key/CLI
+    probe or network preflight — the pre-dispatch drop the config `unpaid_providers` key
+    (and REVIEW_UNPAID_PROVIDERS) is for."""
+    saved = backends._CONFIG_UNPAID_PROVIDERS
+    with _EnvSandbox():
+        try:
+            backends.configure_unpaid_providers(["commandcode"])
+            reason = backends.backend_unavailable_reason(
+                "commandcode:moonshotai/Kimi-K2.7-Code"
+            )
+            assert reason is not None
+            assert "commandcode" in reason
+            assert "unpaid" in reason.lower()
+            assert (
+                backends.backend_available("commandcode:moonshotai/Kimi-K2.7-Code")
+                is False
+            )
+        finally:
+            backends._CONFIG_UNPAID_PROVIDERS = saved
+
+
+def test_unavailable_reason_missing_gemini_key_mentions_the_env_var():
+    """A down gemini seat surfaces the actual missing-key message, not a generic blank."""
+    with _EnvSandbox():
+        for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            os.environ.pop(name, None)
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/no-such-dir/.env"
+        reason = backends.backend_unavailable_reason("gemini:gemini-2.5-flash")
+        assert reason is not None
+        assert "GEMINI_API_KEY" in reason
 
 
 if __name__ == "__main__":
