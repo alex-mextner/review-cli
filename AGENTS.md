@@ -164,11 +164,18 @@ GitHub / tools) as a side effect of installing a commit hook. Three outcomes:
 
 - rig **fails** (non-zero) -> surface that exit code as-is (a real rig failure is never
   swallowed into the fallback — that would recreate the double-write).
-- rig **succeeds and the gate is in place** (`_commit_gate_active()`: `core.hooksPath` resolves
-  to a dir with an executable `pre-commit`) -> rig owns it, return 0.
+- rig **succeeds and the REVIEW gate is in place** (`_commit_gate_active()`: `core.hooksPath`
+  resolves to a dir with an executable `pre-commit` that is either the direct marker gate OR is
+  rig's composer that BOTH references `review-gate` AND is accompanied by an executable
+  `review-gate` sibling stage file — an UNRELATED pre-existing global hook, and a bare orphan
+  `review-gate` file next to an ordinary hook that never invokes it, both do NOT count) -> rig
+  owns it,
+  return 0.
 - rig **succeeds but provisions no gate here** (the repo declares no `git_hooks:` block, so the
-  scoped apply is a no-op for hooks) -> fall back to `_install_commit_hook_direct` so the user
-  still gets the hook they asked for. This is distinct from a rig failure.
+  scoped apply is a no-op for hooks) -> fall back to `_install_commit_hook_direct`, which installs
+  the gate when `core.hooksPath`'s pre-commit slot is free, or reports a `NOT ours` conflict
+  (rc 1) WITHOUT clobbering when a foreign hook already occupies it. This is distinct from a rig
+  failure.
 
 rig absent, or the helper not installed (`pip install -e <agent-tools>/lib/agenttools_rig_delegate`,
 the `rig-delegate` extra) -> `_install_commit_hook_direct` runs exactly as before.

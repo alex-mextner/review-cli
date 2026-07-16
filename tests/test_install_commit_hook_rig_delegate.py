@@ -118,15 +118,31 @@ def _restore(saved: dict) -> None:
 
 
 def _write_fake_rig(
-    path: Path, *, exit_code: int = 0, record: "Path | None" = None, provision_gate: bool = False
+    path: Path,
+    *,
+    exit_code: int = 0,
+    record: "Path | None" = None,
+    provision_gate: bool = False,
+    provision_unrelated: bool = False,
 ) -> None:
     """A stub `rig` executable that records its argv and exits `exit_code`. When
-    `provision_gate` is set it also SETS `core.hooksPath` + writes an executable pre-commit
-    there — simulating rig's `git_hooks.dispatcher` actually installing the gate, so the
-    caller's postcondition check (`_commit_gate_active`) passes."""
+    `provision_gate` is set it SETS `core.hooksPath` + writes a COMPOSING pre-commit that runs
+    an executable `review-gate` sibling — faithfully simulating rig's `git_hooks.dispatcher`
+    installing the REVIEW gate, so the caller's postcondition (`_commit_gate_active`) passes.
+    When `provision_unrelated` is set it instead leaves an UNRELATED executable pre-commit (no
+    `review-gate` sibling, no marker) — a user's pre-existing global hook — which the
+    postcondition must REJECT (it is not the review gate)."""
     record_line = f'echo "$@" >> "{record}"\n' if record is not None else ""
     provision = ""
     if provision_gate:
+        provision = (
+            'hd="$HOME/.config/git/hooks"; mkdir -p "$hd"; '
+            'printf "#!/bin/sh\\nexec \\"$(dirname \\"$0\\")/review-gate\\" \\"$@\\"\\n" '
+            '> "$hd/pre-commit"; chmod +x "$hd/pre-commit"; '
+            'printf "#!/bin/sh\\nexit 0\\n" > "$hd/review-gate"; chmod +x "$hd/review-gate"; '
+            'git config --global core.hooksPath "$hd";\n'
+        )
+    elif provision_unrelated:
         provision = (
             'hd="$HOME/.config/git/hooks"; mkdir -p "$hd"; '
             'printf "#!/bin/sh\\nexit 0\\n" > "$hd/pre-commit"; chmod +x "$hd/pre-commit"; '
@@ -202,6 +218,35 @@ def test_install_commit_hook_falls_back_when_rig_succeeds_but_provisions_no_gate
 
 
 @_needs_helper
+def test_install_commit_hook_falls_back_when_rig_leaves_only_an_unrelated_hook():
+    """rig exits 0 and `core.hooksPath` points at an executable pre-commit — but it is an
+    UNRELATED hook (no `review-gate` sibling, no marker), e.g. a user's pre-existing global
+    pre-commit. The postcondition REJECTS it (not the review gate) so delegation falls back to
+    the direct installer instead of falsely reporting 'rig owns the gate'. The direct installer
+    then finds a FOREIGN hook occupying the path and refuses to clobber it — a `NOT ours`
+    conflict (rc 1), NEVER a silent double-write (codex review). The foreign hook is preserved.
+    This drives the REAL fallback (no stub) so the asserted behavior is the production one."""
+    if not _HELPER_AVAILABLE:  # standalone __main__ runner ignores the pytest mark above
+        pytest.skip("agenttools_rig_delegate not installed; delegation covered by agent-tools#282")
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        try:
+            rig_bin = Path(tmp) / "rig"
+            _write_fake_rig(rig_bin, exit_code=0, provision_unrelated=True)
+            os.environ["RIG_BIN"] = str(rig_bin)
+
+            rc, out = _capture(install.install_commit_hook)
+
+            # Fallback ran; the direct installer refused to overwrite the foreign hook.
+            assert rc == 1, out
+            assert "NOT ours" in out, out
+            foreign = Path(tmp) / ".config" / "git" / "hooks" / "pre-commit"
+            assert foreign.read_text(encoding="utf-8") == "#!/bin/sh\nexit 0\n"
+        finally:
+            _restore(saved)
+
+
+@_needs_helper
 def test_install_commit_hook_surfaces_a_failing_rigs_exit_code_without_falling_back():
     """A present-but-failing rig (non-zero) must NOT trigger the fallback — that would silently
     re-create the double-write the delegation exists to prevent."""
@@ -258,6 +303,126 @@ def test_install_commit_hook_consumer_contract_with_injected_helper():
             assert calls["args"] == ["apply", "--only", "git_hooks"]
             assert rc == 3, "a non-zero rig exit must be surfaced as-is"
             direct_stub.assert_not_called()
+        finally:
+            _restore(saved)
+
+
+# --- _commit_gate_active(): the delegation postcondition, tested DIRECTLY --------------------
+# These need NO `agenttools_rig_delegate` helper, so they run UNCONDITIONALLY in clean CI (the
+# helper-gated integration tests above SKIP there) — closing the "regression guard silently
+# skipped" gap the codex review flagged. Each seeds `core.hooksPath` + a hook shape and asserts
+# whether the postcondition recognizes it as the REVIEW gate.
+
+
+def _seed_hookspath(tmp: str) -> Path:
+    hooks_dir = Path(tmp) / ".config" / "git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "config", "--global", "core.hooksPath", str(hooks_dir)],
+        capture_output=True, text=True, env=os.environ,
+    )
+    return hooks_dir
+
+
+def _write_exec(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_precommit_template_carries_the_marker():
+    """Pin the invariant the accept-path relies on: the direct pre-commit template embeds the
+    marker `_commit_gate_active()` looks for. If the marker is ever refactored out of the body,
+    this fails loudly instead of silently breaking the accept-path (opus review)."""
+    assert install._PRECOMMIT_MARKER in install._PRECOMMIT
+
+
+def test_commit_gate_active_false_without_hookspath():
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        try:
+            assert install._commit_gate_active() is False
+        finally:
+            _restore(saved)
+
+
+def test_commit_gate_active_rejects_an_unrelated_executable_hook():
+    """A user's pre-existing global pre-commit that is NOT the review gate (no marker, no
+    `review-gate` sibling) must NOT satisfy the postcondition (codex review)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        try:
+            hooks_dir = _seed_hookspath(tmp)
+            _write_exec(hooks_dir / "pre-commit", "#!/bin/sh\n# my own linter\nexit 0\n")
+            assert install._commit_gate_active() is False
+        finally:
+            _restore(saved)
+
+
+def test_commit_gate_active_accepts_the_direct_marker_gate():
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        try:
+            hooks_dir = _seed_hookspath(tmp)
+            _write_exec(hooks_dir / "pre-commit", install._PRECOMMIT)
+            assert install._commit_gate_active() is True
+        finally:
+            _restore(saved)
+
+
+def test_commit_gate_active_accepts_rig_composer_with_executable_review_gate():
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        try:
+            hooks_dir = _seed_hookspath(tmp)
+            _write_exec(
+                hooks_dir / "pre-commit",
+                '#!/bin/sh\nexec "$(dirname "$0")/review-gate" "$@"\n',
+            )
+            _write_exec(hooks_dir / "review-gate", "#!/bin/sh\nexit 0\n")
+            assert install._commit_gate_active() is True
+        finally:
+            _restore(saved)
+
+
+def test_commit_gate_active_rejects_composer_when_review_gate_sibling_is_missing():
+    """A composer that MENTIONS review-gate but has no executable `review-gate` sibling is not a
+    live gate — reject it, so a half-provisioned dispatcher can't masquerade as the review gate."""
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        try:
+            hooks_dir = _seed_hookspath(tmp)
+            _write_exec(
+                hooks_dir / "pre-commit",
+                '#!/bin/sh\nexec "$(dirname "$0")/review-gate" "$@"\n',
+            )  # no review-gate file written
+            assert install._commit_gate_active() is False
+        finally:
+            _restore(saved)
+
+
+def test_commit_gate_active_rejects_unrelated_hook_beside_an_orphan_review_gate_file():
+    """An UNRELATED pre-commit (its body never references `review-gate`) sitting next to a
+    leftover/orphan executable `review-gate` file must NOT pass: the orphan file alone is not the
+    gate if the composer doesn't invoke it (codex review, round 2). Both signals are required."""
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        try:
+            hooks_dir = _seed_hookspath(tmp)
+            _write_exec(hooks_dir / "pre-commit", "#!/bin/sh\n# my own linter\nexit 0\n")
+            _write_exec(hooks_dir / "review-gate", "#!/bin/sh\nexit 0\n")  # orphan, not invoked
+            assert install._commit_gate_active() is False
+        finally:
+            _restore(saved)
+
+
+def test_commit_gate_active_false_when_pre_commit_not_executable():
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = _isolated_home(tmp)
+        try:
+            hooks_dir = _seed_hookspath(tmp)
+            (hooks_dir / "pre-commit").write_text(install._PRECOMMIT, encoding="utf-8")
+            (hooks_dir / "pre-commit").chmod(0o644)  # correct content, but git would skip it
+            assert install._commit_gate_active() is False
         finally:
             _restore(saved)
 

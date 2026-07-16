@@ -825,10 +825,17 @@ def _rig_delegate_helper():
 
 
 def _commit_gate_active() -> bool:
-    """True iff a global commit gate is actually in place: `core.hooksPath` resolves to an
-    absolute dir that holds an executable `pre-commit`. Used as the delegation postcondition —
-    rig's `git_hooks.dispatcher` provisions exactly this (its composed pre-commit runs the
-    `review-gate` stage), so its presence proves rig installed the gate."""
+    """True iff a global commit gate is in place AND it is the REVIEW gate — not merely any
+    executable `pre-commit`. `core.hooksPath` must resolve to an absolute dir whose executable
+    `pre-commit` enforces review-before-commit, which one of two mechanisms provides:
+      * rig's `git_hooks.dispatcher` — a COMPOSING pre-commit that runs an executable
+        `review-gate` sibling stage in the same dir; or
+      * the direct installer — a self-contained pre-commit carrying `_PRECOMMIT_MARKER`.
+    An UNRELATED pre-existing global `pre-commit` (any other executable file) must NOT satisfy
+    this postcondition. If it did, `rig apply --only git_hooks` exiting 0 on a repo that
+    declares no gate would let a user's unrelated global hook masquerade as the review gate:
+    delegation would print "rig owns the hooks" and return 0, silently leaving the user
+    without the review gate they explicitly asked for (codex review)."""
     cur = subprocess.run(
         ["git", "config", "--global", "--get", "core.hooksPath"], capture_output=True, text=True
     )
@@ -838,8 +845,33 @@ def _commit_gate_active() -> bool:
     expanded = os.path.expanduser(raw)
     if not os.path.isabs(expanded):
         return False
-    pre_commit = Path(expanded) / "pre-commit"
-    return pre_commit.is_file() and os.access(pre_commit, os.X_OK)
+    hooks_dir = Path(expanded)
+    pre_commit = hooks_dir / "pre-commit"
+    if not (pre_commit.is_file() and os.access(pre_commit, os.X_OK)):
+        return False
+    try:
+        body = pre_commit.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        # Unreadable (permissions) or raced-away between the stat and the read — treat as
+        # "gate not provably in place" so the caller falls back to the direct installer
+        # instead of crashing the whole `install-commit-hook` on a traceback.
+        return False
+    if _PRECOMMIT_MARKER in body:
+        return True  # the direct self-contained gate
+    # rig's composing dispatcher (agent-tools `git-hooks/global-dispatcher/hooks/`) is installed
+    # INTO `core.hooksPath` as a set of sibling files — verified against rig: its `pre-commit`
+    # composer runs `"$HOOK_DIR/review-gate"` (HOOK_DIR == core.hooksPath), and rig-cli's own drift
+    # check enumerates `pre-commit/commit-msg/pre-push/review-gate` as the composers living in that
+    # one dir. So the review stage IS a same-dir `review-gate` sibling of the composed pre-commit.
+    # Require BOTH signals to prove it — each closes one false-positive direction the other leaves
+    # open (codex review, two rounds): the composer's pre-commit body must reference `review-gate`
+    # (an orphan/leftover `review-gate` file next to an UNRELATED hook that never invokes it does
+    # not count) AND an executable `review-gate` file must actually be present (a mere comment-only
+    # mention with no stage file does not count). An ordinary unrelated user hook satisfies
+    # neither (a contrived hook that both comments the token AND leaves a stray stage file is
+    # not worth guarding beyond this).
+    review_gate = hooks_dir / "review-gate"
+    return "review-gate" in body and review_gate.is_file() and os.access(review_gate, os.X_OK)
 
 
 def install_commit_hook() -> int:
