@@ -1817,8 +1817,13 @@ def test_cli_explicit_models_disable_board():
     # Avoid touching a real config file / git diff: feed the diff via stdin and
     # point the env file at nothing so no provider key resolves.
     old_stdin = sys.stdin
+    # ROUTING test (explicit -m disables the board), not a pool-assembly test. The piped diff
+    # is non-empty, so on a backend-less host the review-mode pool guard would bail (exit 10)
+    # before the stubbed handler runs; force every seat live via the fake backend seam.
+    old_fake = os.environ.get("REVIEW_FAKE_BACKEND")
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        os.environ["REVIEW_FAKE_BACKEND"] = "1"
         import io
 
         sys.stdin = io.StringIO("+added line\n")
@@ -1830,6 +1835,10 @@ def test_cli_explicit_models_disable_board():
         _review_mod.mode_review = old
         cli.load_config = old_load_config
         sys.stdin = old_stdin
+        if old_fake is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = old_fake
 
 
 def test_cli_explicit_models_override_config_models_and_board():

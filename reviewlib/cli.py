@@ -3729,14 +3729,17 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if rc is not None:
         return rc
     if board:
-        # Foolproofing (review mode ONLY): bail with a proposal / targeted per-provider error
-        # when the live subset can't satisfy the requested pool size, instead of silently
-        # running a degenerate panel (reviewlib.pool_guard). The proposal/error text is
-        # review-specific (`review diff --preset …`, "review pool"), so it must NOT fire for
-        # the other panel modes (quorum / brainstorm / just-ask / visual) that reach this
-        # dispatch — they keep their own degraded-panel behaviour. Inert on the happy path +
-        # fake backend.
-        if mode.name == "review":
+        # Foolproofing (review mode + a NON-EMPTY diff ONLY): bail with a proposal / targeted
+        # per-provider error when the live subset can't satisfy the requested pool size,
+        # instead of silently running a degenerate panel (reviewlib.pool_guard). Gated on:
+        #   * mode.name == "review" — the proposal/error text is review-specific
+        #     (`review diff --preset …`, "review pool"), so it must NOT fire for the other
+        #     panel modes (quorum / brainstorm / just-ask / visual) that reach this dispatch;
+        #   * a non-empty diff — an EMPTY diff runs NO panel (mode_review short-circuits with
+        #     "No diff to review", exit 1), so there is no pool to assemble and the guard must
+        #     not preempt that no-op with an EXIT_UNSATISFIED. Inert on the happy path + fake
+        #     backend.
+        if mode.name == "review" and diff.strip():
             guard_rc = _evaluate_pool_or_bail(
                 config,
                 config_models,
@@ -3788,10 +3791,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # foolproofing guard STILL applies here — an explicit selection whose live subset can't
     # converge must not silently run a degenerate flat panel either (the board path isn't the
     # only advertised case). The user's selection IS `models` (the flat `-m` list). Gated to
-    # the review mode ONLY: the same flat dispatch is shared by quorum / brainstorm /
-    # just-ask, whose panels must keep their own behaviour and never see review-specific
-    # proposal text (`review diff --preset …`).
-    if mode.name == "review":
+    # the review mode ONLY (the flat dispatch is shared by quorum / brainstorm / just-ask,
+    # whose panels keep their own behaviour and never see review-specific proposal text) AND
+    # to a non-empty diff (an empty diff runs no panel — see the board-path note above).
+    if mode.name == "review" and diff.strip():
         guard_rc = _evaluate_pool_or_bail(
             config,
             config_models,

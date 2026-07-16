@@ -27,6 +27,7 @@ path: it exercises `main()`'s actual exit + would surface any uncaught
 traceback). Offline: every assertion here uses a meta flag or a path that
 short-circuits BEFORE any backend call, so no API keys / network are needed.
 """
+
 from __future__ import annotations
 
 import io
@@ -98,10 +99,10 @@ def test_diff_subcommand_outside_repo_is_graceful():
         assert proc.returncode == EXIT_NOT_A_REPO, (proc.returncode, proc.stderr)
         err = (proc.stdout + proc.stderr).lower()
         # 3-part message: WHAT / WHY / HOW
-        assert "not in a git repository" in err, err          # WHAT
-        assert "diff review needs a repo" in err, err          # WHY
+        assert "not in a git repository" in err, err  # WHAT
+        assert "diff review needs a repo" in err, err  # WHY
         assert "just-ask" in err and "quorum" in err and "brainstorm" in err, err  # HOW
-        assert "cd into a repo" in err, err                    # HOW (alternative)
+        assert "cd into a repo" in err, err  # HOW (alternative)
 
 
 def test_diff_staged_outside_repo_is_graceful():
@@ -194,15 +195,31 @@ def test_piped_diff_outside_repo_does_not_require_git():
 
     _review_mod.mode_review = _fake_review
     cli._read_stdin_if_piped = lambda: piped
-    cli.load_config = lambda: {"models": ["codex"]}  # deterministic one-seat config board
+    cli.load_config = lambda: {
+        "models": ["codex"]
+    }  # deterministic one-seat config board
+    # ROUTING test (stdin-diff precedence reaches the handler), NOT a pool-assembly test. On a
+    # backend-less host the pre-dispatch pool guard would otherwise bail (exit 10) before the
+    # stubbed handler runs, so force every seat live via the fake backend — the established
+    # hermetic-dispatch seam (see backend_available / test_mode_subcommands).
+    saved_fake = os.environ.get("REVIEW_FAKE_BACKEND")
+    os.environ["REVIEW_FAKE_BACKEND"] = "1"
     err = io.StringIO()
     try:
-        with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
+        with (
+            tempfile.TemporaryDirectory() as d,
+            redirect_stderr(err),
+            redirect_stdout(io.StringIO()),
+        ):
             rc = cli._dispatch(["diff", "--task", "TEST-1", "-C", d])
     finally:
         _review_mod.mode_review = saved_handler
         cli._read_stdin_if_piped = saved_stdin
         cli.load_config = saved_cfg
+        if saved_fake is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = saved_fake
     assert captured.get("ran"), "the review handler never ran on a piped diff"
     assert captured.get("diff") == piped, captured.get("diff")
     assert rc == 0, rc
@@ -233,14 +250,22 @@ def test_panel_staged_outside_repo_degrades_gracefully():
     cli.load_config = lambda: {"models": ["codex"]}
     err = io.StringIO()
     try:
-        with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
-            rc = cli._dispatch(["just-ask", "what is this", "--task", "TEST-1", "--staged", "-C", d])
+        with (
+            tempfile.TemporaryDirectory() as d,
+            redirect_stderr(err),
+            redirect_stdout(io.StringIO()),
+        ):
+            rc = cli._dispatch(
+                ["just-ask", "what is this", "--task", "TEST-1", "--staged", "-C", d]
+            )
     finally:
         _ja_mod.mode_just_ask = saved_handler
         cli._read_stdin_if_piped = saved_stdin
         cli.load_config = saved_cfg
     assert captured.get("ran"), "just-ask never ran with --staged outside a repo"
-    assert (captured.get("diff") or "") == "", captured.get("diff")  # degraded to no context
+    assert (captured.get("diff") or "") == "", captured.get(
+        "diff"
+    )  # degraded to no context
     assert rc != EXIT_NOT_A_REPO, rc
     assert "not in a git repository" not in err.getvalue().lower(), err.getvalue()
 
@@ -259,9 +284,47 @@ def test_real_repo_empty_diff_is_not_treated_as_not_a_repo():
         proc = _run(["diff"], cwd=repo)
         _no_traceback(proc)
         assert proc.returncode != EXIT_NOT_A_REPO, (proc.returncode, proc.stderr)
-        assert proc.returncode == 1, (proc.returncode, proc.stderr)  # existing empty-diff contract
+        assert proc.returncode == 1, (
+            proc.returncode,
+            proc.stderr,
+        )  # existing empty-diff contract
         assert "No diff to review." in (proc.stdout + proc.stderr), proc.stderr
         assert "not in a git repository" not in (proc.stdout + proc.stderr).lower()
+
+
+def test_empty_diff_bypasses_pool_guard_even_with_no_live_backend():
+    """Regression: the review-mode pool guard is gated on a NON-EMPTY diff. An empty diff runs
+    NO panel, so even on a host with ZERO live backends `review diff` must fall through to
+    mode_review's "No diff to review." (exit 1) — NOT bail with EXIT_UNSATISFIED (10). Forces
+    every backend DOWN and dispatches an empty-diff review in a real repo; pins that the guard
+    is bypassed (not merely "not reached because a backend happened to be live")."""
+    import reviewlib.backends as backends
+    from reviewlib.pool_guard import EXIT_UNSATISFIED
+
+    saved_avail = backends.backend_available
+    saved_reason = backends.backend_unavailable_reason
+    saved_cfg = cli.load_config
+    saved_stdin = cli._read_stdin_if_piped
+    backends.backend_available = lambda _m: False  # NO live backend at all
+    backends.backend_unavailable_reason = lambda _m: "no backend (test)"
+    cli.load_config = lambda: {"models": ["codex", "gemini"]}
+    cli._read_stdin_if_piped = lambda: None
+    err = io.StringIO()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                rc = cli._dispatch(["diff", "--task", "TEST-1", "-C", str(repo)])
+    finally:
+        backends.backend_available = saved_avail
+        backends.backend_unavailable_reason = saved_reason
+        cli.load_config = saved_cfg
+        cli._read_stdin_if_piped = saved_stdin
+    assert rc != EXIT_UNSATISFIED, (rc, err.getvalue())  # the guard did NOT fire
+    assert rc == 1, (rc, err.getvalue())  # existing empty-diff contract
+    assert "No diff to review." in err.getvalue(), err.getvalue()
 
 
 def test_git_diff_normalizes_spawn_failures_to_runtimeerror():
@@ -277,7 +340,9 @@ def test_git_diff_normalizes_spawn_failures_to_runtimeerror():
         except RuntimeError:
             pass  # expected — normalized
         except Exception as exc:  # noqa: BLE001
-            raise AssertionError(f"missing cwd leaked {type(exc).__name__}, not RuntimeError") from exc
+            raise AssertionError(
+                f"missing cwd leaked {type(exc).__name__}, not RuntimeError"
+            ) from exc
         else:
             raise AssertionError("missing cwd did not raise at all")
 
@@ -294,7 +359,9 @@ def test_git_diff_normalizes_spawn_failures_to_runtimeerror():
             except RuntimeError:
                 pass  # expected — TimeoutExpired normalized to RuntimeError
             except Exception as exc:  # noqa: BLE001
-                raise AssertionError(f"timeout leaked {type(exc).__name__}, not RuntimeError") from exc
+                raise AssertionError(
+                    f"timeout leaked {type(exc).__name__}, not RuntimeError"
+                ) from exc
             else:
                 raise AssertionError("timeout did not raise at all")
     finally:
@@ -324,14 +391,22 @@ def test_brainstorm_missing_cwd_degrades_without_traceback():
     cli.load_config = lambda: {"models": ["codex"], "brainstorm_models": ["codex"]}
     err = io.StringIO()
     try:
-        with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
+        with (
+            tempfile.TemporaryDirectory() as d,
+            redirect_stderr(err),
+            redirect_stdout(io.StringIO()),
+        ):
             missing = str(Path(d) / "gone")
-            rc = cli._dispatch(["brainstorm", "topic", "--task", "TEST-1", "--diff", "-C", missing])
+            rc = cli._dispatch(
+                ["brainstorm", "topic", "--task", "TEST-1", "--diff", "-C", missing]
+            )
     finally:
         _bs_mod.mode_brainstorm = saved_handler
         cli._read_stdin_if_piped = saved_stdin
         cli.load_config = saved_cfg
-    assert captured.get("ran"), "brainstorm never ran (the missing-cwd diff probe was not caught)"
+    assert captured.get("ran"), (
+        "brainstorm never ran (the missing-cwd diff probe was not caught)"
+    )
     assert (captured.get("diff") or "") == "", captured.get("diff")
     assert rc != EXIT_NOT_A_REPO, rc
 
@@ -387,13 +462,22 @@ def test_no_git_mode_runs_when_git_binary_is_missing_or_wedged():
         for boom in (_boom_missing, _boom_timeout):
             cli._run = boom
             err = io.StringIO()
-            with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
+            with (
+                tempfile.TemporaryDirectory() as d,
+                redirect_stderr(err),
+                redirect_stdout(io.StringIO()),
+            ):
                 # Must not raise: the toplevel probe in `_effective_cwd` swallows the spawn
                 # failure and degrades to "review the dir as-is", then just-ask runs.
-                rc = cli._dispatch(["just-ask", "what is this", "--task", "TEST-1", "-C", d])
+                rc = cli._dispatch(
+                    ["just-ask", "what is this", "--task", "TEST-1", "-C", d]
+                )
             assert rc == 0, (boom.__name__, rc)
             assert "Traceback" not in err.getvalue(), (boom.__name__, err.getvalue())
-            assert "FileNotFoundError" not in err.getvalue(), (boom.__name__, err.getvalue())
+            assert "FileNotFoundError" not in err.getvalue(), (
+                boom.__name__,
+                err.getvalue(),
+            )
     finally:
         cli._run = saved_run
         _ja_mod.mode_just_ask = saved_handler
@@ -439,17 +523,33 @@ def test_panel_staged_in_repo_degrades_when_git_diff_raises():
     cli._git_diff = _raise_diff
     err = io.StringIO()
     try:
-        with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
+        with (
+            tempfile.TemporaryDirectory() as d,
+            redirect_stderr(err),
+            redirect_stdout(io.StringIO()),
+        ):
             repo = Path(d) / "repo"
             repo.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
-            rc = cli._dispatch(["just-ask", "what is this", "--task", "TEST-1", "--staged", "-C", str(repo)])
+            rc = cli._dispatch(
+                [
+                    "just-ask",
+                    "what is this",
+                    "--task",
+                    "TEST-1",
+                    "--staged",
+                    "-C",
+                    str(repo),
+                ]
+            )
     finally:
         _ja_mod.mode_just_ask = saved_handler
         cli._read_stdin_if_piped = saved_stdin
         cli.load_config = saved_cfg
         cli._git_diff = saved_gitdiff
-    assert captured.get("ran"), "just-ask never ran (the git-diff failure was not caught)"
+    assert captured.get("ran"), (
+        "just-ask never ran (the git-diff failure was not caught)"
+    )
     assert (captured.get("diff") or "") == "", captured.get("diff")
     assert rc != EXIT_NOT_A_REPO, rc
 
@@ -475,7 +575,11 @@ def test_required_review_in_repo_fails_gracefully_when_git_diff_raises():
     cli._git_diff = _raise_diff
     err = io.StringIO()
     try:
-        with tempfile.TemporaryDirectory() as d, redirect_stderr(err), redirect_stdout(io.StringIO()):
+        with (
+            tempfile.TemporaryDirectory() as d,
+            redirect_stderr(err),
+            redirect_stdout(io.StringIO()),
+        ):
             repo = Path(d) / "repo"
             repo.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
@@ -486,11 +590,13 @@ def test_required_review_in_repo_fails_gracefully_when_git_diff_raises():
         cli.load_config = saved_cfg
         cli._git_diff = saved_gitdiff
     assert rc == EXIT_GIT_DIFF_FAILED, rc
-    assert rc != EXIT_NOT_A_REPO, "a git-diff failure must NOT be reported as 'not a repo'"
+    assert rc != EXIT_NOT_A_REPO, (
+        "a git-diff failure must NOT be reported as 'not a repo'"
+    )
     msg = err.getvalue()
     assert "could not read the git diff" in msg, msg
-    assert "index file corrupt" in msg, msg          # the underlying cause is surfaced
-    assert "Traceback" not in msg, msg               # no raw traceback
+    assert "index file corrupt" in msg, msg  # the underlying cause is surfaced
+    assert "Traceback" not in msg, msg  # no raw traceback
     assert "not in a git repository" not in msg.lower(), msg  # not the wrong message
     # The stdin fix hint must point at the CURRENT verb + required task code, not the
     # bare `review` (which now exits 2 on a piped diff) — codex review finding.
