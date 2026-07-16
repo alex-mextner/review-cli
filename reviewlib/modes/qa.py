@@ -31,6 +31,7 @@ ignoring ``ctx.models`` / ``--pool`` — a panel of testers fighting one SUT/por
 INVARIANT: the no-suites gate is the load-bearing contract of the whole mode. Do NOT let a
 future change spawn an agent before ``resolve_suites`` has returned a non-empty list.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -174,7 +175,8 @@ def _fail_no_suites(sut_path: Path, suites_arg: str, *, exit_code: int) -> int:
         "         #   Expected:\n"
         "         #   - inline error 'password required', no network call\n"
         f"       review qa {sut_path} --suites docs/tests/suites/*.md",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     return exit_code
 
@@ -238,7 +240,10 @@ def _handler(ctx: ModeContext) -> int:
     bot_route = _resolve_hermetic_bot(ctx, sut_path)
     if bot_route is not None:
         return _run_bot_hermetic(
-            ctx, sut_path, suites, bot_config=bot_route,
+            ctx,
+            sut_path,
+            suites,
+            bot_config=bot_route,
             exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
         )
 
@@ -252,7 +257,10 @@ def _handler(ctx: ModeContext) -> int:
     web_route = _resolve_deterministic_web(ctx, sut_path)
     if web_route is not None:
         return _run_web_deterministic(
-            ctx, sut_path, suites, web_config=web_route,
+            ctx,
+            sut_path,
+            suites,
+            web_config=web_route,
             exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
         )
 
@@ -266,12 +274,17 @@ def _handler(ctx: ModeContext) -> int:
     ext_route = _resolve_deterministic_ext(ctx, sut_path)
     if ext_route is not None:
         return _run_ext_deterministic(
-            ctx, sut_path, suites, ext_config=ext_route,
+            ctx,
+            sut_path,
+            suites,
+            ext_config=ext_route,
             exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
         )
 
     return _run_with_env(
-        ctx, sut_path, suites,
+        ctx,
+        sut_path,
+        suites,
         exit_blocked=EXIT_QA_SUT_BOOT_FAILED,
         exit_no_env=EXIT_QA_NO_ENV,
         exit_unhealthy=EXIT_QA_ENV_UNHEALTHY,
@@ -395,13 +408,23 @@ def _resolve_kind(ctx: ModeContext, sut_path: Path, config: object | None) -> st
         return ctx.args.kind
     from ..qa.config import SutConfig
 
-    if isinstance(config, SutConfig) and config.kind in ("web", "ext", "backend", "bot"):
+    if isinstance(config, SutConfig) and config.kind in (
+        "web",
+        "ext",
+        "backend",
+        "bot",
+    ):
         return config.kind
     return _detect_kind(sut_path)
 
 
 def _run_bot_hermetic(
-    ctx: ModeContext, sut_path: Path, suites: list[Path], *, bot_config, exit_blocked: int,
+    ctx: ModeContext,
+    sut_path: Path,
+    suites: list[Path],
+    *,
+    bot_config,
+    exit_blocked: int,
 ) -> int:
     """Drive the bot Tier-1 HERMETIC harness: start the fake Telegram, boot the SUT bot against
     it, inject/capture per case, classify, and map the verdict to an exit code — the SAME
@@ -425,8 +448,12 @@ def _run_bot_hermetic(
     from ..qa.suites import load_suites_text
 
     if ctx.args.max_cases is not None and ctx.args.max_cases < 0:
-        print("[review-cli] qa: --max-cases must be >= 0 (got "
-              f"{ctx.args.max_cases}); 0 means 'no cap'.", file=sys.stderr, flush=True)
+        print(
+            "[review-cli] qa: --max-cases must be >= 0 (got "
+            f"{ctx.args.max_cases}); 0 means 'no cap'.",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
     strict = bool(getattr(ctx.args, "strict", False))
     report_path = _report_path(ctx, sut_path)
@@ -441,29 +468,53 @@ def _run_bot_hermetic(
     # through to the un-caged executor or fakes a pass. The raw suite PATHS (not loaded text) are
     # passed so the gate-ok branch can load them itself.
     if bot_config.is_live:
-        live_max = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
-        return _run_bot_live(report_path, sut_path, strict=strict, exit_blocked=exit_blocked,
-                             in_place=ctx.args.in_place, suites=suites, max_cases=live_max)
+        live_max = (
+            ctx.args.max_cases
+            if ctx.args.max_cases and ctx.args.max_cases > 0
+            else None
+        )
+        return _run_bot_live(
+            report_path,
+            sut_path,
+            strict=strict,
+            exit_blocked=exit_blocked,
+            in_place=ctx.args.in_place,
+            suites=suites,
+            max_cases=live_max,
+        )
 
-    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    max_cases = (
+        ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    )
     suite_text = load_suites_text(suites, max_cases=max_cases)
 
     print(
         f"[review-cli] qa: testing BOT SUT {sut_path} (kind=bot, driver=hermetic-mock, "
         f"isolation={'in-place' if ctx.args.in_place else 'worktree'}, "
         f"cases<= {ctx.args.max_cases or 'all'}). Report -> {report_path}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
-    if not ctx.args.in_place and is_git_worktree(sut_path) and has_uncommitted_changes(sut_path):
-        print("[review-cli] qa: WARNING — the SUT has uncommitted changes, but the default "
-              "isolated worktree boots the bot from committed HEAD, not your working-tree "
-              "edits. Commit/stash, or use --in-place to boot the working tree.",
-              file=sys.stderr, flush=True)
+    if (
+        not ctx.args.in_place
+        and is_git_worktree(sut_path)
+        and has_uncommitted_changes(sut_path)
+    ):
+        print(
+            "[review-cli] qa: WARNING — the SUT has uncommitted changes, but the default "
+            "isolated worktree boots the bot from committed HEAD, not your working-tree "
+            "edits. Commit/stash, or use --in-place to boot the working tree.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     try:
         transcript = _drive_bot_in_isolation(
-            sut_path=sut_path, suite_text=suite_text, bot_config=bot_config,
-            in_place=ctx.args.in_place, exit_blocked=exit_blocked,
+            sut_path=sut_path,
+            suite_text=suite_text,
+            bot_config=bot_config,
+            in_place=ctx.args.in_place,
+            exit_blocked=exit_blocked,
         )
     except DirtyInPlaceError as exc:
         print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
@@ -472,19 +523,29 @@ def _run_bot_hermetic(
         print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
         return exit_blocked
 
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place)
+    _write_bot_report(
+        report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place
+    )
     verdict, findings, max_sev, cases = parse_qa_results(transcript)
     print(
         f"[review-cli] qa: VERDICT={verdict} findings={findings}"
         f"{f' (worst {max_sev})' if max_sev else ''}; backend=hermetic-bot; "
         f"report={report_path}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
-    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+    return verdict_to_exit_code(
+        verdict, findings=findings, strict=strict, exit_blocked=exit_blocked
+    )
 
 
 def _drive_bot_in_isolation(
-    *, sut_path: Path, suite_text: str, bot_config, in_place: bool, exit_blocked: int,
+    *,
+    sut_path: Path,
+    suite_text: str,
+    bot_config,
+    in_place: bool,
+    exit_blocked: int,
 ) -> str:
     """Run the hermetic bot test in the SUT (``--in-place``) or an isolated worktree (default).
     Refuses ``--in-place`` over a dirty tree (an un-caged-equivalent runaway guard is moot here
@@ -497,18 +558,28 @@ def _drive_bot_in_isolation(
     if in_place:
         _guard_in_place(backend="hermetic-bot", in_place=True, sut_path=sut_path)
         return run_hermetic_bot_test(
-            suite_text=suite_text, bot_config=bot_config, cwd=sut_path, sut_path=sut_path,
+            suite_text=suite_text,
+            bot_config=bot_config,
+            cwd=sut_path,
+            sut_path=sut_path,
             exit_boot_failed=exit_blocked,
         )
     with IsolatedSut(sut_path) as worktree:
         return run_hermetic_bot_test(
-            suite_text=suite_text, bot_config=bot_config, cwd=worktree, sut_path=sut_path,
+            suite_text=suite_text,
+            bot_config=bot_config,
+            cwd=worktree,
+            sut_path=sut_path,
             exit_boot_failed=exit_blocked,
         )
 
 
 def _write_bot_report(
-    report_path: Path, transcript: str, *, sut_path: Path, in_place: bool,
+    report_path: Path,
+    transcript: str,
+    *,
+    sut_path: Path,
+    in_place: bool,
     backend: str = "hermetic-bot",
 ) -> None:
     """Persist a run's ``## QA RESULTS`` transcript to ``--report`` (0600, mirroring the
@@ -536,12 +607,20 @@ def _write_bot_report(
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(transcript + footer)
     except OSError as exc:
-        print(f"[review-cli] qa: could not write bot report to {report_path}: {exc}",
-              file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] qa: could not write bot report to {report_path}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _run_web_deterministic(
-    ctx: ModeContext, sut_path: Path, suites: list[Path], *, web_config, exit_blocked: int,
+    ctx: ModeContext,
+    sut_path: Path,
+    suites: list[Path],
+    *,
+    web_config,
+    exit_blocked: int,
 ) -> int:
     """Drive the web Tier-1 DETERMINISTIC harness: bring the app's dev server up, health-gate it
     reachable, open a headless Chromium page, run each case's goto/click/fill + DOM assertions,
@@ -572,8 +651,12 @@ def _run_web_deterministic(
     from ..qa.web_harness import playwright_available
 
     if ctx.args.max_cases is not None and ctx.args.max_cases < 0:
-        print("[review-cli] qa: --max-cases must be >= 0 (got "
-              f"{ctx.args.max_cases}); 0 means 'no cap'.", file=sys.stderr, flush=True)
+        print(
+            "[review-cli] qa: --max-cases must be >= 0 (got "
+            f"{ctx.args.max_cases}); 0 means 'no cap'.",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
     strict = bool(getattr(ctx.args, "strict", False))
     report_path = _report_path(ctx, sut_path)
@@ -587,10 +670,18 @@ def _run_web_deterministic(
     # failure would be mis-attributed to a live run that BLOCKs on creds regardless. It NEVER falls
     # through to the un-caged executor or fakes a pass.
     if web_config.is_live:
-        return _run_web_live(report_path, sut_path, web_config, strict=strict,
-                             exit_blocked=exit_blocked, in_place=ctx.args.in_place)
+        return _run_web_live(
+            report_path,
+            sut_path,
+            web_config,
+            strict=strict,
+            exit_blocked=exit_blocked,
+            in_place=ctx.args.in_place,
+        )
 
-    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    max_cases = (
+        ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    )
     suite_text = load_suites_text(suites, max_cases=max_cases)
 
     # TIER-2 LIVE branch: a `driver: agent-browser` web block drives a REAL browser against a
@@ -599,33 +690,58 @@ def _run_web_deterministic(
     # when it is, the live driver is invoked (today it raises LiveTierUnavailable → BLOCKED, the
     # live run is tracked in #82). It NEVER falls through to the un-caged executor or fakes a pass.
     if web_config.is_live:
-        return _run_web_live(report_path, sut_path, web_config, strict=strict,
-                             exit_blocked=exit_blocked, in_place=ctx.args.in_place)
+        return _run_web_live(
+            report_path,
+            sut_path,
+            web_config,
+            strict=strict,
+            exit_blocked=exit_blocked,
+            in_place=ctx.args.in_place,
+        )
 
     print(
         f"[review-cli] qa: testing WEB SUT {sut_path} (kind=web, driver=playwright, "
         f"base_url={web_config.base_url}, "
         f"isolation={'in-place' if ctx.args.in_place else 'worktree'}, "
         f"cases<= {ctx.args.max_cases or 'all'}). Report -> {report_path}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
-    if not ctx.args.in_place and is_git_worktree(sut_path) and has_uncommitted_changes(sut_path):
-        print("[review-cli] qa: WARNING — the SUT has uncommitted changes, but the default "
-              "isolated worktree serves committed HEAD, not your working-tree edits. "
-              "Commit/stash, or use --in-place to serve the working tree.",
-              file=sys.stderr, flush=True)
+    if (
+        not ctx.args.in_place
+        and is_git_worktree(sut_path)
+        and has_uncommitted_changes(sut_path)
+    ):
+        print(
+            "[review-cli] qa: WARNING — the SUT has uncommitted changes, but the default "
+            "isolated worktree serves committed HEAD, not your working-tree edits. "
+            "Commit/stash, or use --in-place to serve the working tree.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # Gate the heavy Playwright dependency up front so an un-installed browser is a clear,
     # actionable BLOCKED (with the install command) rather than a crash mid-run.
     available, reason = playwright_available()
     if not available:
-        return _emit_web_blocked(report_path, sut_path, web_config, reason, exit_blocked,
-                                 strict=strict, in_place=ctx.args.in_place)
+        return _emit_web_blocked(
+            report_path,
+            sut_path,
+            web_config,
+            reason,
+            exit_blocked,
+            strict=strict,
+            in_place=ctx.args.in_place,
+        )
 
     try:
         transcript = _drive_web_in_isolation(
-            sut_path=sut_path, suite_text=suite_text, web_config=web_config,
-            report_path=report_path, in_place=ctx.args.in_place, exit_blocked=exit_blocked,
+            sut_path=sut_path,
+            suite_text=suite_text,
+            web_config=web_config,
+            report_path=report_path,
+            in_place=ctx.args.in_place,
+            exit_blocked=exit_blocked,
         )
     except DirtyInPlaceError as exc:
         print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
@@ -634,21 +750,35 @@ def _run_web_deterministic(
         print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
         return exit_blocked
 
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place,
-                      backend="playwright-web")
+    _write_bot_report(
+        report_path,
+        transcript,
+        sut_path=sut_path,
+        in_place=ctx.args.in_place,
+        backend="playwright-web",
+    )
     verdict, findings, max_sev, cases = parse_qa_results(transcript)
     print(
         f"[review-cli] qa: VERDICT={verdict} findings={findings}"
         f"{f' (worst {max_sev})' if max_sev else ''}; backend=playwright-web; "
         f"report={report_path}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
-    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+    return verdict_to_exit_code(
+        verdict, findings=findings, strict=strict, exit_blocked=exit_blocked
+    )
 
 
 def _emit_web_blocked(
-    report_path: Path, sut_path: Path, web_config, reason: str, exit_blocked: int,
-    *, strict: bool, in_place: bool,
+    report_path: Path,
+    sut_path: Path,
+    web_config,
+    reason: str,
+    exit_blocked: int,
+    *,
+    strict: bool,
+    in_place: bool,
 ) -> int:
     """Emit a controlled BLOCKED for a web run that cannot use a real browser (Playwright off /
     not installed). Writes the same ``## QA RESULTS`` contract (so the report is consistent) and
@@ -661,11 +791,19 @@ def _emit_web_blocked(
 
     print(f"[review-cli] qa: web run BLOCKED — {reason}", file=sys.stderr, flush=True)
     transcript = WebRunResult(blocked_reason=reason).to_qa_results(
-        sut_path=sut_path, base_url=web_config.base_url)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
-                      backend="playwright-web")
+        sut_path=sut_path, base_url=web_config.base_url
+    )
+    _write_bot_report(
+        report_path,
+        transcript,
+        sut_path=sut_path,
+        in_place=in_place,
+        backend="playwright-web",
+    )
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
-    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+    return verdict_to_exit_code(
+        verdict, findings=findings, strict=strict, exit_blocked=exit_blocked
+    )
 
 
 # --- TIER-2 LIVE entry points (gated; SKIP LOUD when creds absent; live run = #82) ------------
@@ -693,8 +831,14 @@ def _live_blocked_reason(kind: str, exit_blocked: int) -> str:
 
 
 def _run_bot_live(
-    report_path: Path, sut_path: Path, *, strict: bool, exit_blocked: int, in_place: bool,
-    suites: list[Path] | tuple[Path, ...] = (), max_cases: int | None = None,
+    report_path: Path,
+    sut_path: Path,
+    *,
+    strict: bool,
+    exit_blocked: int,
+    in_place: bool,
+    suites: list[Path] | tuple[Path, ...] = (),
+    max_cases: int | None = None,
 ) -> int:
     """Run (or SKIP-LOUD) the bot Tier-2 LIVE tier: real-Telegram MTProto. When the creds gate is
     NOT satisfied, emits a controlled BLOCKED naming the exact missing creds (the SKIP-LOUD path —
@@ -713,28 +857,49 @@ def _run_bot_live(
     if not gate.ok:
         # SKIP-LOUD: no creds → a controlled BLOCKED naming exactly what to provision. The suite is
         # never loaded on this branch (so a suite-stage failure can't mask the missing-creds reason).
-        print(f"[review-cli] qa: bot Tier-2 LIVE run BLOCKED — {gate.reason}",
-              file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] qa: bot Tier-2 LIVE run BLOCKED — {gate.reason}",
+            file=sys.stderr,
+            flush=True,
+        )
         transcript = BotRunResult(blocked_reason=gate.reason).to_qa_results(
-            sut_path=sut_path, bring_up=LIVE_BRING_UP)
+            sut_path=sut_path, bring_up=LIVE_BRING_UP
+        )
     else:
         # Creds present → load the suite and drive the REAL bot over MTProto.
         from ..qa.live_bot_runner import run_live_bot_suite
         from ..qa.suites import load_suites_text
 
         suite_text = load_suites_text(list(suites), max_cases=max_cases)
-        print(f"[review-cli] qa: bot Tier-2 LIVE run driving real Telegram (MTProto) for SUT "
-              f"{sut_path}. Report -> {report_path}", file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] qa: bot Tier-2 LIVE run driving real Telegram (MTProto) for SUT "
+            f"{sut_path}. Report -> {report_path}",
+            file=sys.stderr,
+            flush=True,
+        )
         transcript = run_live_bot_suite(
-            suite_text=suite_text, sut_path=sut_path, exit_blocked=exit_blocked)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
-                      backend="bot-live")
+            suite_text=suite_text, sut_path=sut_path, exit_blocked=exit_blocked
+        )
+    _write_bot_report(
+        report_path,
+        transcript,
+        sut_path=sut_path,
+        in_place=in_place,
+        backend="bot-live",
+    )
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
-    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+    return verdict_to_exit_code(
+        verdict, findings=findings, strict=strict, exit_blocked=exit_blocked
+    )
 
 
 def _run_web_live(
-    report_path: Path, sut_path: Path, web_config, *, strict: bool, exit_blocked: int,
+    report_path: Path,
+    sut_path: Path,
+    web_config,
+    *,
+    strict: bool,
+    exit_blocked: int,
     in_place: bool,
 ) -> int:
     """Run (or SKIP-LOUD) the web Tier-2 LIVE tier: a real browser against a deployed test site.
@@ -746,22 +911,41 @@ def _run_web_live(
     from ..qa.web_driver import WebRunResult
 
     reason = _live_blocked_reason("web", exit_blocked)
-    print(f"[review-cli] qa: web Tier-2 LIVE run BLOCKED — {reason}", file=sys.stderr, flush=True)
+    print(
+        f"[review-cli] qa: web Tier-2 LIVE run BLOCKED — {reason}",
+        file=sys.stderr,
+        flush=True,
+    )
     # The LIVE web target lives in REVIEW_QA_WEB_BASE_URL (the live block legitimately omits the
     # Tier-1 base_url), so report THAT as the target, falling back to the config's base_url.
     import os
 
-    live_url = os.environ.get("REVIEW_QA_WEB_BASE_URL", "").strip() or web_config.base_url
+    live_url = (
+        os.environ.get("REVIEW_QA_WEB_BASE_URL", "").strip() or web_config.base_url
+    )
     transcript = WebRunResult(blocked_reason=reason).to_qa_results(
-        sut_path=sut_path, base_url=live_url)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
-                      backend="web-live")
+        sut_path=sut_path, base_url=live_url
+    )
+    _write_bot_report(
+        report_path,
+        transcript,
+        sut_path=sut_path,
+        in_place=in_place,
+        backend="web-live",
+    )
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
-    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+    return verdict_to_exit_code(
+        verdict, findings=findings, strict=strict, exit_blocked=exit_blocked
+    )
 
 
 def _run_ext_live(
-    report_path: Path, sut_path: Path, ext_config, *, strict: bool, exit_blocked: int,
+    report_path: Path,
+    sut_path: Path,
+    ext_config,
+    *,
+    strict: bool,
+    exit_blocked: int,
     in_place: bool,
 ) -> int:
     """Run (or SKIP-LOUD) the ext Tier-2 LIVE tier: real VS Code + window-screenshot visual
@@ -773,17 +957,34 @@ def _run_ext_live(
     from ..qa.ext_driver import ExtRunResult
 
     reason = _live_blocked_reason("ext", exit_blocked)
-    print(f"[review-cli] qa: ext Tier-2 LIVE run BLOCKED — {reason}", file=sys.stderr, flush=True)
+    print(
+        f"[review-cli] qa: ext Tier-2 LIVE run BLOCKED — {reason}",
+        file=sys.stderr,
+        flush=True,
+    )
     transcript = ExtRunResult(blocked_reason=reason).to_qa_results(
-        sut_path=sut_path, extension_path=ext_config.extension_path)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
-                      backend="ext-live")
+        sut_path=sut_path, extension_path=ext_config.extension_path
+    )
+    _write_bot_report(
+        report_path,
+        transcript,
+        sut_path=sut_path,
+        in_place=in_place,
+        backend="ext-live",
+    )
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
-    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+    return verdict_to_exit_code(
+        verdict, findings=findings, strict=strict, exit_blocked=exit_blocked
+    )
 
 
 def _drive_web_in_isolation(
-    *, sut_path: Path, suite_text: str, web_config, report_path: Path, in_place: bool,
+    *,
+    sut_path: Path,
+    suite_text: str,
+    web_config,
+    report_path: Path,
+    in_place: bool,
     exit_blocked: int,
 ) -> str:
     """Run the deterministic web test in the SUT (``--in-place``) or an isolated worktree
@@ -796,18 +997,31 @@ def _drive_web_in_isolation(
     if in_place:
         _guard_in_place(backend="playwright-web", in_place=True, sut_path=sut_path)
         return _bring_up_and_drive_web(
-            cwd=sut_path, sut_path=sut_path, suite_text=suite_text, web_config=web_config,
-            out_dir=out_dir, exit_blocked=exit_blocked,
+            cwd=sut_path,
+            sut_path=sut_path,
+            suite_text=suite_text,
+            web_config=web_config,
+            out_dir=out_dir,
+            exit_blocked=exit_blocked,
         )
     with IsolatedSut(sut_path) as worktree:
         return _bring_up_and_drive_web(
-            cwd=worktree, sut_path=sut_path, suite_text=suite_text, web_config=web_config,
-            out_dir=out_dir, exit_blocked=exit_blocked,
+            cwd=worktree,
+            sut_path=sut_path,
+            suite_text=suite_text,
+            web_config=web_config,
+            out_dir=out_dir,
+            exit_blocked=exit_blocked,
         )
 
 
 def _bring_up_and_drive_web(
-    *, cwd: Path, sut_path: Path, suite_text: str, web_config, out_dir: Path | None,
+    *,
+    cwd: Path,
+    sut_path: Path,
+    suite_text: str,
+    web_config,
+    out_dir: Path | None,
     exit_blocked: int,
 ) -> str:
     """Bring the dev server up (when a ``command`` is declared), ALWAYS health-gate the target
@@ -825,12 +1039,15 @@ def _bring_up_and_drive_web(
         if web_config.command:
             try:
                 server = boot_web_server(
-                    command=list(web_config.command), cwd=cwd, extra_env=web_config.env,
+                    command=list(web_config.command),
+                    cwd=cwd,
+                    extra_env=web_config.env,
                     exit_boot_failed=exit_blocked,
                 )
             except WebHarnessError as exc:
                 return WebRunResult(blocked_reason=str(exc)).to_qa_results(
-                    sut_path=sut_path, base_url=web_config.base_url)
+                    sut_path=sut_path, base_url=web_config.base_url
+                )
         # ALWAYS health-gate before driving — for BOTH the just-booted dev server AND the
         # command-omitted "already-running base_url" path (README). A down target must BLOCK
         # (infra failure, exit 8), not become a report-only navigation FAIL (exit 0) that callers
@@ -838,19 +1055,24 @@ def _bring_up_and_drive_web(
         # tail is attached; for an already-running target the message names it as unreachable.
         ready_url = web_config.base_url + web_config.ready_path
         if not wait_until_reachable(
-            ready_url, timeout_s=web_config.ready_timeout_s, server=server,
+            ready_url,
+            timeout_s=web_config.ready_timeout_s,
+            server=server,
         ):
             return WebRunResult(
                 blocked_reason=_unreachable_reason(ready_url, web_config, server),
             ).to_qa_results(sut_path=sut_path, base_url=web_config.base_url)
         return run_web_test(
-            suite_text=suite_text, base_url=web_config.base_url, sut_path=sut_path,
+            suite_text=suite_text,
+            base_url=web_config.base_url,
+            sut_path=sut_path,
             out_dir=out_dir,
         )
     except Exception as exc:  # noqa: BLE001 — any unexpected error becomes a controlled BLOCKED
         print(f"[review-cli] qa: web harness error: {exc}", file=sys.stderr, flush=True)
-        return WebRunResult(blocked_reason=f"unexpected web harness error: {exc}").to_qa_results(
-            sut_path=sut_path, base_url=web_config.base_url)
+        return WebRunResult(
+            blocked_reason=f"unexpected web harness error: {exc}"
+        ).to_qa_results(sut_path=sut_path, base_url=web_config.base_url)
     finally:
         if server is not None:
             server.reap()
@@ -882,7 +1104,12 @@ def _web_out_dir(report_path: Path) -> Path:
 
 
 def _run_ext_deterministic(
-    ctx: ModeContext, sut_path: Path, suites: list[Path], *, ext_config, exit_blocked: int,
+    ctx: ModeContext,
+    sut_path: Path,
+    suites: list[Path],
+    *,
+    ext_config,
+    exit_blocked: int,
 ) -> int:
     """Drive the ext Tier-1 DETERMINISTIC harness: launch an isolated VS Code with the extension
     on ``--extensionDevelopmentPath``, connect over CDP, run each case's commands/opens + window
@@ -913,8 +1140,12 @@ def _run_ext_deterministic(
     from ..qa.suites import load_suites_text
 
     if ctx.args.max_cases is not None and ctx.args.max_cases < 0:
-        print("[review-cli] qa: --max-cases must be >= 0 (got "
-              f"{ctx.args.max_cases}); 0 means 'no cap'.", file=sys.stderr, flush=True)
+        print(
+            "[review-cli] qa: --max-cases must be >= 0 (got "
+            f"{ctx.args.max_cases}); 0 means 'no cap'.",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
     strict = bool(getattr(ctx.args, "strict", False))
     report_path = _report_path(ctx, sut_path)
@@ -929,10 +1160,18 @@ def _run_ext_deterministic(
     # to a live run that BLOCKs on creds regardless. It NEVER falls through to the un-caged
     # executor or fakes a pass.
     if ext_config.is_live:
-        return _run_ext_live(report_path, sut_path, ext_config, strict=strict,
-                             exit_blocked=exit_blocked, in_place=ctx.args.in_place)
+        return _run_ext_live(
+            report_path,
+            sut_path,
+            ext_config,
+            strict=strict,
+            exit_blocked=exit_blocked,
+            in_place=ctx.args.in_place,
+        )
 
-    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    max_cases = (
+        ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    )
     suite_text = load_suites_text(suites, max_cases=max_cases)
 
     print(
@@ -940,25 +1179,44 @@ def _run_ext_deterministic(
         f"extension_path={ext_config.extension_path}, "
         f"isolation={'in-place' if ctx.args.in_place else 'worktree'}, "
         f"cases<= {ctx.args.max_cases or 'all'}). Report -> {report_path}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
-    if not ctx.args.in_place and is_git_worktree(sut_path) and has_uncommitted_changes(sut_path):
-        print("[review-cli] qa: WARNING — the SUT has uncommitted changes, but the default "
-              "isolated worktree loads the extension from committed HEAD, not your working-tree "
-              "edits. Commit/stash, or use --in-place to test the working tree.",
-              file=sys.stderr, flush=True)
+    if (
+        not ctx.args.in_place
+        and is_git_worktree(sut_path)
+        and has_uncommitted_changes(sut_path)
+    ):
+        print(
+            "[review-cli] qa: WARNING — the SUT has uncommitted changes, but the default "
+            "isolated worktree loads the extension from committed HEAD, not your working-tree "
+            "edits. Commit/stash, or use --in-place to test the working tree.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # Gate the heavy VS Code launch up front so an un-enabled / un-installed runtime is a clear,
     # actionable BLOCKED (with the enable/install command) rather than a crash mid-run.
     available, reason = vscode_available()
     if not available:
-        return _emit_ext_blocked(report_path, sut_path, ext_config, reason, exit_blocked,
-                                 strict=strict, in_place=ctx.args.in_place)
+        return _emit_ext_blocked(
+            report_path,
+            sut_path,
+            ext_config,
+            reason,
+            exit_blocked,
+            strict=strict,
+            in_place=ctx.args.in_place,
+        )
 
     try:
         transcript = _drive_ext_in_isolation(
-            sut_path=sut_path, suite_text=suite_text, ext_config=ext_config,
-            report_path=report_path, in_place=ctx.args.in_place, exit_blocked=exit_blocked,
+            sut_path=sut_path,
+            suite_text=suite_text,
+            ext_config=ext_config,
+            report_path=report_path,
+            in_place=ctx.args.in_place,
+            exit_blocked=exit_blocked,
         )
     except DirtyInPlaceError as exc:
         print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
@@ -967,21 +1225,35 @@ def _run_ext_deterministic(
         print(f"[review-cli] qa: {exc}", file=sys.stderr, flush=True)
         return exit_blocked
 
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=ctx.args.in_place,
-                      backend="vscode-ext")
+    _write_bot_report(
+        report_path,
+        transcript,
+        sut_path=sut_path,
+        in_place=ctx.args.in_place,
+        backend="vscode-ext",
+    )
     verdict, findings, max_sev, cases = parse_qa_results(transcript)
     print(
         f"[review-cli] qa: VERDICT={verdict} findings={findings}"
         f"{f' (worst {max_sev})' if max_sev else ''}; backend=vscode-ext; "
         f"report={report_path}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
-    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+    return verdict_to_exit_code(
+        verdict, findings=findings, strict=strict, exit_blocked=exit_blocked
+    )
 
 
 def _emit_ext_blocked(
-    report_path: Path, sut_path: Path, ext_config, reason: str, exit_blocked: int,
-    *, strict: bool, in_place: bool,
+    report_path: Path,
+    sut_path: Path,
+    ext_config,
+    reason: str,
+    exit_blocked: int,
+    *,
+    strict: bool,
+    in_place: bool,
 ) -> int:
     """Emit a controlled BLOCKED for an ext run that cannot launch a real VS Code (REVIEW_QA_VSCODE
     off / no node runtime). Writes the same ``## QA RESULTS`` contract (so the report is consistent)
@@ -994,15 +1266,28 @@ def _emit_ext_blocked(
 
     print(f"[review-cli] qa: ext run BLOCKED — {reason}", file=sys.stderr, flush=True)
     transcript = ExtRunResult(blocked_reason=reason).to_qa_results(
-        sut_path=sut_path, extension_path=ext_config.extension_path)
-    _write_bot_report(report_path, transcript, sut_path=sut_path, in_place=in_place,
-                      backend="vscode-ext")
+        sut_path=sut_path, extension_path=ext_config.extension_path
+    )
+    _write_bot_report(
+        report_path,
+        transcript,
+        sut_path=sut_path,
+        in_place=in_place,
+        backend="vscode-ext",
+    )
     verdict, findings, _max_sev, _cases = parse_qa_results(transcript)
-    return verdict_to_exit_code(verdict, findings=findings, strict=strict, exit_blocked=exit_blocked)
+    return verdict_to_exit_code(
+        verdict, findings=findings, strict=strict, exit_blocked=exit_blocked
+    )
 
 
 def _drive_ext_in_isolation(
-    *, sut_path: Path, suite_text: str, ext_config, report_path: Path, in_place: bool,
+    *,
+    sut_path: Path,
+    suite_text: str,
+    ext_config,
+    report_path: Path,
+    in_place: bool,
     exit_blocked: int,
 ) -> str:
     """Run the deterministic ext test in the SUT (``--in-place``) or an isolated worktree
@@ -1019,13 +1304,23 @@ def _drive_ext_in_isolation(
     if in_place:
         _guard_in_place(backend="vscode-ext", in_place=True, sut_path=sut_path)
         return _launch_and_drive_ext(
-            cwd=sut_path, sut_path=sut_path, suite_text=suite_text, ext_config=ext_config,
-            out_dir=out_dir, exit_blocked=exit_blocked, in_place=True,
+            cwd=sut_path,
+            sut_path=sut_path,
+            suite_text=suite_text,
+            ext_config=ext_config,
+            out_dir=out_dir,
+            exit_blocked=exit_blocked,
+            in_place=True,
         )
     with IsolatedSut(sut_path) as worktree:
         return _launch_and_drive_ext(
-            cwd=worktree, sut_path=sut_path, suite_text=suite_text, ext_config=ext_config,
-            out_dir=out_dir, exit_blocked=exit_blocked, in_place=False,
+            cwd=worktree,
+            sut_path=sut_path,
+            suite_text=suite_text,
+            ext_config=ext_config,
+            out_dir=out_dir,
+            exit_blocked=exit_blocked,
+            in_place=False,
         )
 
 
@@ -1053,21 +1348,30 @@ def _warn_abs_path_escapes_worktree(cwd: Path, in_place: bool, ext_config) -> No
 
     if in_place:
         return
-    for label, raw in (("extension_path", ext_config.extension_path),
-                       ("workspace", ext_config.workspace)):
+    for label, raw in (
+        ("extension_path", ext_config.extension_path),
+        ("workspace", ext_config.workspace),
+    ):
         if raw and _path_escapes(cwd, raw):
             print(
                 f"[review-cli] qa: WARNING — sut.ext {label}={raw!r} resolves OUTSIDE the isolated "
                 f"worktree ({cwd}), so the ext run is NOT isolated (VS Code loads it from the real "
                 "path, not the worktree copy). Use a path relative to the SUT that stays inside it, "
                 "or pass --in-place if you intend to run against the real checkout.",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
 
 
 def _launch_and_drive_ext(
-    *, cwd: Path, sut_path: Path, suite_text: str, ext_config, out_dir: Path | None,
-    exit_blocked: int, in_place: bool = False,
+    *,
+    cwd: Path,
+    sut_path: Path,
+    suite_text: str,
+    ext_config,
+    out_dir: Path | None,
+    exit_blocked: int,
+    in_place: bool = False,
 ) -> str:
     """Launch the isolated VS Code (extension on ``--extensionDevelopmentPath``), drive the suite,
     and return the ``## QA RESULTS`` transcript — with GUARANTEED VS Code teardown (the session
@@ -1083,19 +1387,29 @@ def _launch_and_drive_ext(
     extension_path = str((cwd / ext_config.extension_path).resolve())
     try:
         return run_ext_test(
-            suite_text=suite_text, extension_path=extension_path, sut_path=sut_path,
-            out_dir=out_dir, automation_factory=_ext_automation_factory(
-                extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked,
-                extra_env=dict(ext_config.env)),
+            suite_text=suite_text,
+            extension_path=extension_path,
+            sut_path=sut_path,
+            out_dir=out_dir,
+            automation_factory=_ext_automation_factory(
+                extension_path=extension_path,
+                workspace=workspace,
+                exit_blocked=exit_blocked,
+                extra_env=dict(ext_config.env),
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — any unexpected error becomes a controlled BLOCKED
         print(f"[review-cli] qa: ext harness error: {exc}", file=sys.stderr, flush=True)
-        return ExtRunResult(blocked_reason=f"unexpected ext harness error: {exc}").to_qa_results(
-            sut_path=sut_path, extension_path=ext_config.extension_path)
+        return ExtRunResult(
+            blocked_reason=f"unexpected ext harness error: {exc}"
+        ).to_qa_results(sut_path=sut_path, extension_path=ext_config.extension_path)
 
 
 def _ext_automation_factory(
-    *, extension_path: str, workspace: Path, exit_blocked: int,
+    *,
+    extension_path: str,
+    workspace: Path,
+    exit_blocked: int,
     extra_env: dict[str, str] | None = None,
 ):
     """The real isolated-VS-Code automation context manager bound to this run's resolved
@@ -1106,13 +1420,21 @@ def _ext_automation_factory(
     from ..qa.ext_harness import vscode_session
 
     return vscode_session(
-        extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked,
-        extra_env=extra_env)
+        extension_path=extension_path,
+        workspace=workspace,
+        exit_blocked=exit_blocked,
+        extra_env=extra_env,
+    )
 
 
 def _run_with_env(
-    ctx: ModeContext, sut_path: Path, suites: list[Path], *,
-    exit_blocked: int, exit_no_env: int, exit_unhealthy: int,
+    ctx: ModeContext,
+    sut_path: Path,
+    suites: list[Path],
+    *,
+    exit_blocked: int,
+    exit_no_env: int,
+    exit_unhealthy: int,
 ) -> int:
     """Phase 3 wrapper: bring the SUT env up (when one is declared), run the executor against
     it, and GUARANTEE teardown of what we brought up on every exit path.
@@ -1139,17 +1461,24 @@ def _run_with_env(
     if not _env_declared(sut_path, config, ctx.args.stage_url):
         # No env declared anywhere — the agent does its own local bring-up per the runbook
         # (the Phase-2 behavior). Nothing for the deterministic env layer to own.
-        return _run_executor(ctx, sut_path, suites, exit_blocked=exit_blocked, endpoints={})
+        return _run_executor(
+            ctx, sut_path, suites, exit_blocked=exit_blocked, endpoints={}
+        )
 
     # --keep-env (the flag) OR sut.teardown.keep_on_failure (the config) keeps an unhealthy
     # env up for triage. Both are honored — the config docstring + the --keep-env help both
     # promise "or the config field", so a SUT declaring keep_on_failure: true must take effect
     # without the flag (review finding: the config field was dead).
-    keep_env = bool(ctx.args.keep_env) or (config is not None and config.teardown.keep_on_failure)
+    keep_env = bool(ctx.args.keep_env) or (
+        config is not None and config.teardown.keep_on_failure
+    )
     try:
         handle = bring_up_env(
-            sut_path=sut_path, config=config, stage_url_override=ctx.args.stage_url,
-            exit_no_env=exit_no_env, exit_unhealthy=exit_unhealthy,
+            sut_path=sut_path,
+            config=config,
+            stage_url_override=ctx.args.stage_url,
+            exit_no_env=exit_no_env,
+            exit_unhealthy=exit_unhealthy,
             keep_env=keep_env,
         )
     except EnvError as exc:
@@ -1168,8 +1497,12 @@ def _run_with_env(
         bring_up = "none"
     try:
         return _run_executor(
-            ctx, sut_path, suites, exit_blocked=exit_blocked,
-            endpoints=handle.endpoints, bring_up=bring_up,
+            ctx,
+            sut_path,
+            suites,
+            exit_blocked=exit_blocked,
+            endpoints=handle.endpoints,
+            bring_up=bring_up,
         )
     finally:
         # GUARANTEED teardown on EVERY exit path (return, finding, exception, timeout). Only
@@ -1192,14 +1525,21 @@ def _env_declared(sut_path: Path, config: object | None, stage_url: str | None) 
 
     if stage_url or os.environ.get("REVIEW_QA_STAGE_URL", "").strip():
         return True
-    if isinstance(config, SutConfig) and (config.stage is not None or config.bringup is not None):
+    if isinstance(config, SutConfig) and (
+        config.stage is not None or config.bringup is not None
+    ):
         return True
     return _find_setup_hook(sut_path) is not None
 
 
 def _run_executor(
-    ctx: ModeContext, sut_path: Path, suites: list[Path], *,
-    exit_blocked: int, endpoints: dict | None = None, bring_up: str = "local",
+    ctx: ModeContext,
+    sut_path: Path,
+    suites: list[Path],
+    *,
+    exit_blocked: int,
+    endpoints: dict | None = None,
+    bring_up: str = "local",
 ) -> int:
     """Build the tester prompt + run the single-seat write/exec launcher, then map the
     parsed verdict to an exit code. Split from ``_handler`` so the gate stays the first,
@@ -1223,6 +1563,7 @@ def _run_executor(
         SutIsolationError,
         UnsupportedTesterError,
         build_tester_prompt,
+        resolve_tester_effort,
         resolved_tester_backend,
         resolved_tester_model,
         run_tester,
@@ -1235,7 +1576,8 @@ def _run_executor(
         print(
             f"[review-cli] qa: --max-cases must be >= 0 (got {ctx.args.max_cases}); "
             "0 means 'no cap' (run the full suite).",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
         return 2
 
@@ -1250,9 +1592,14 @@ def _run_executor(
 
     kind = _effective_kind(ctx, sut_path)
     # max_cases == 0 means "no cap" (run all); a positive N caps to the first N cases.
-    max_cases = ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
-    suites_text = _with_endpoint_note(load_suites_text(suites, max_cases=max_cases),
-                                      bring_up=bring_up, endpoints=endpoints)
+    max_cases = (
+        ctx.args.max_cases if ctx.args.max_cases and ctx.args.max_cases > 0 else None
+    )
+    suites_text = _with_endpoint_note(
+        load_suites_text(suites, max_cases=max_cases),
+        bring_up=bring_up,
+        endpoints=endpoints,
+    )
     strict = bool(getattr(ctx.args, "strict", False))
 
     # SECURITY: build the prompt at the ACTUAL run cwd, not sut_path. The prompt fences the
@@ -1264,8 +1611,13 @@ def _run_executor(
 
     def _prompt_builder(run_cwd: Path) -> str:
         return build_tester_prompt(
-            kind=kind, suites_text=suites_text, sut_path=run_cwd, bring_up=bring_up,
-            stage_url=stage_url, strict=strict, in_place=ctx.args.in_place,
+            kind=kind,
+            suites_text=suites_text,
+            sut_path=run_cwd,
+            bring_up=bring_up,
+            stage_url=stage_url,
+            strict=strict,
+            in_place=ctx.args.in_place,
         )
 
     report_path = _report_path(ctx, sut_path)
@@ -1280,20 +1632,31 @@ def _run_executor(
     # would make bare `review qa` pick codex over the documented claude default — review).
     backend = resolved_tester_backend(explicit_models)
     model = resolved_tester_model(explicit_models)
+    # Run-scoped --effort (review-cli#127 harvest): qa is single-seat, so resolve the level
+    # for THIS tester's BACKEND (a scoped `codex=high` beats the bare global default). Scoping
+    # on `backend`, not a pinned model suffix, is load-bearing — see resolve_tester_effort.
+    effort = resolve_tester_effort(ctx.effort_override, backend)
     env_note = f", env={bring_up}" if bring_up != "local" else ""
     model_note = f":{model}" if model else ""
     print(
         f"[review-cli] qa: testing SUT {sut_path} (kind={kind}, backend={backend}{model_note}, "
         f"isolation={'in-place' if ctx.args.in_place else 'worktree'}{env_note}, cases<= "
         f"{ctx.args.max_cases or 'all'}). Report -> {report_path}",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     _warn_if_dirty_worktree_run(ctx, sut_path)
 
     try:
         outcome = run_tester(
-            prompt_builder=_prompt_builder, sut_path=sut_path, timeout=ctx.timeout,
-            in_place=ctx.args.in_place, report_path=report_path, backend=backend, model=model,
+            prompt_builder=_prompt_builder,
+            sut_path=sut_path,
+            timeout=ctx.timeout,
+            in_place=ctx.args.in_place,
+            report_path=report_path,
+            backend=backend,
+            model=model,
+            effort=effort,
         )
     except DirtyInPlaceError as exc:
         # A user/usage error (you asked for --in-place over a dirty tree), NOT an infra/boot
@@ -1307,7 +1670,10 @@ def _run_executor(
 
     print(_summarize_outcome(outcome, report_path), file=sys.stderr, flush=True)
     return verdict_to_exit_code(
-        outcome.verdict, findings=outcome.findings, strict=strict, exit_blocked=exit_blocked,
+        outcome.verdict,
+        findings=outcome.findings,
+        strict=strict,
+        exit_blocked=exit_blocked,
     )
 
 
@@ -1346,7 +1712,8 @@ def _warn_if_dirty_worktree_run(ctx: ModeContext, sut_path: Path) -> None:
             "will exercise stale code; a PASS would not cover your uncommitted changes. "
             "Commit/stash them first, or use --in-place to test the working tree directly "
             "(refused if the tree is dirty — commit/stash, then --in-place).",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
 
 
@@ -1371,7 +1738,10 @@ def _report_path(ctx: ModeContext, sut_path: Path) -> Path:
     # finding). Second-precision alone collides under a fast repeat.
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     rand = os.urandom(3).hex()
-    safe_sut = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in sut_path.name) or "sut"
+    safe_sut = (
+        "".join(c if (c.isalnum() or c in "-_.") else "_" for c in sut_path.name)
+        or "sut"
+    )
     return log_dir() / f"qa-{safe_sut}-{stamp}-{rand}.md"
 
 
@@ -1444,9 +1814,15 @@ _JS_BOT_MARKERS = frozenset({"telegraf", "grammy"})
 # Python distribution names, in PEP 503-CANONICAL form (lower-case, separators collapsed to a
 # single `-`). `pytelegrambotapi` is the PyPI distribution of the "telebot" import package — the
 # common one — so the dist name, not the import name, is what a requirements file carries.
-_PY_BOT_MARKERS = frozenset({
-    "python-telegram-bot", "aiogram", "pyrogram", "telethon", "pytelegrambotapi",
-})
+_PY_BOT_MARKERS = frozenset(
+    {
+        "python-telegram-bot",
+        "aiogram",
+        "pyrogram",
+        "telethon",
+        "pytelegrambotapi",
+    }
+)
 
 
 def _canon_dist(name: str) -> str:
@@ -1482,7 +1858,9 @@ def _requirements_deps(sut_path: Path) -> set[str]:
     out: set[str] = set()
     for raw in text.splitlines():
         line = raw.strip()
-        if not line or line.startswith(("#", "-")):  # skip blanks, comments, `-r`/`-e`/options
+        if not line or line.startswith(
+            ("#", "-")
+        ):  # skip blanks, comments, `-r`/`-e`/options
             continue
         name = _dist_name(line)
         if name:
@@ -1511,10 +1889,16 @@ def _pyproject_deps(sut_path: Path) -> set[str]:
         deps = project.get("dependencies")
         if isinstance(deps, list):
             out |= {n for n in (_dist_name(str(d)) for d in deps) if n}
-    poetry = (data.get("tool") or {}).get("poetry") if isinstance(data.get("tool"), dict) else None
+    poetry = (
+        (data.get("tool") or {}).get("poetry")
+        if isinstance(data.get("tool"), dict)
+        else None
+    )
     if isinstance(poetry, dict) and isinstance(poetry.get("dependencies"), dict):
         # Poetry keys ARE the distribution names (the value is the version constraint).
-        out |= {_canon_dist(k) for k in poetry["dependencies"] if _canon_dist(k) != "python"}
+        out |= {
+            _canon_dist(k) for k in poetry["dependencies"] if _canon_dist(k) != "python"
+        }
     return out
 
 
@@ -1524,11 +1908,13 @@ def _toml_loader():
     happens to have ``tomli`` without making it a hard dependency (review keeps a minimal dep set)."""
     try:
         import tomllib
+
         return tomllib.loads
     except ImportError:
         pass
     try:
         import tomli
+
         return tomli.loads
     except ImportError:
         return None
@@ -1539,9 +1925,13 @@ def _dist_name(spec: str) -> str:
     stripped of an extras group, version constraint, environment marker, or URL — in PEP 503
     CANONICAL form (lower-case, separators collapsed). `aiogram[fast]>=3,<4 ; python_version>'3.8'`
     -> `aiogram`; `python_telegram_bot>=20` -> `python-telegram-bot`. `""` when no name."""
-    head = re.split(r"[\s;]", spec.strip(), maxsplit=1)[0]  # drop markers / trailing tokens
-    head = head.split("@", 1)[0]            # drop a direct URL reference (`name @ url`)
-    head = re.split(r"[<>=!~\[\(]", head, maxsplit=1)[0]  # drop extras / version constraint
+    head = re.split(r"[\s;]", spec.strip(), maxsplit=1)[
+        0
+    ]  # drop markers / trailing tokens
+    head = head.split("@", 1)[0]  # drop a direct URL reference (`name @ url`)
+    head = re.split(r"[<>=!~\[\(]", head, maxsplit=1)[
+        0
+    ]  # drop extras / version constraint
     return _canon_dist(head) if head.strip() else ""
 
 
@@ -1566,11 +1956,15 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     remaining flags (``--bring-up``, ``--harness``, ``--scaffold-env``, ``--out`` artifact
     sink) arrive with their owning phases."""
     parser.add_argument(
-        "sut_path", nargs="?", default=None,
+        "sut_path",
+        nargs="?",
+        default=None,
         help="path to the System-Under-Test repo/checkout (default: the -C value, else cwd)",
     )
     parser.add_argument(
-        "--suites", default=DEFAULT_SUITES_GLOB, metavar="PATH",
+        "--suites",
+        default=DEFAULT_SUITES_GLOB,
+        metavar="PATH",
         help=(
             "glob, directory, or file of human-authored test-case suites "
             f"(default: {DEFAULT_SUITES_GLOB}, relative to the SUT). MUST resolve to >=1 "
@@ -1578,7 +1972,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--kind", choices=("web", "ext", "backend", "bot", "auto"), default="auto",
+        "--kind",
+        choices=("web", "ext", "backend", "bot", "auto"),
+        default="auto",
         help="SUT shape; drives which runbook the tester prompt activates. 'auto' (default) "
         "runs cheap stdlib detection and falls back to 'backend' when inconclusive. 'bot' with "
         "a sut.bot mock config runs the DETERMINISTIC Tier-1 hermetic harness (fake Telegram + "
@@ -1593,29 +1989,39 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "no un-caged agent).",
     )
     parser.add_argument(
-        "--in-place", action="store_true",
+        "--in-place",
+        action="store_true",
         help="run the tester in the SUT working tree instead of an isolated git worktree "
         "(riskier; opt-in). The safe default is a throwaway worktree, removed on exit.",
     )
     parser.add_argument(
-        "--report", default=None, metavar="PATH",
+        "--report",
+        default=None,
+        metavar="PATH",
         help="where to write the full tester transcript + accounting footer (default: "
         "review-cli's log dir, OUTSIDE the SUT tree, so a clean checkout stays clean).",
     )
     parser.add_argument(
-        "--max-cases", type=int, default=1, metavar="N",
+        "--max-cases",
+        type=int,
+        default=1,
+        metavar="N",
         help="cap the number of cases exercised this run (cost control). Default 1 (a "
         "cheap smoke); pass a larger N or 0 for 'no cap' to run the full suite. Negative "
         "values are rejected.",
     )
     parser.add_argument(
-        "--stage-url", default=None, metavar="URL",
+        "--stage-url",
+        default=None,
+        metavar="URL",
         help="an EXISTING stage/preview env to test against instead of booting locally. If "
         "reachable, qa REUSES it and never tears it down (you own it). Overrides any "
         "sut.stage in the qa config.",
     )
     parser.add_argument(
-        "--config", default=None, metavar="PATH",
+        "--config",
+        default=None,
+        metavar="PATH",
         help="env-harness config for the SUT bring-up (default: docs/tests/qa.yaml, relative "
         "to the SUT). Declares the stage / compose bring-up / health gate, OR (kind=bot) a "
         "sut.bot mock block that drives the hermetic Tier-1 bot harness, OR (kind=web) a "
@@ -1625,7 +2031,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "qa/setup.sh hook if present, else skips env bring-up.",
     )
     parser.add_argument(
-        "--keep-env", action="store_true",
+        "--keep-env",
+        action="store_true",
         help="on an UNHEALTHY bring-up, skip teardown and leave the env up for triage, "
         "printing the exact manual `down` command (a reused stage is never torn down "
         "regardless).",
