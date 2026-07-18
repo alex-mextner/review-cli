@@ -3,10 +3,13 @@
 **multi-model code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. CLI-first, harness-agnostic.**
 
 > The review/quorum/brainstorm/just-ask/visual modes are **read-only** (the agents are
-> caged — they cannot edit, run shell, or hit the network). The **`qa`** mode is the one
-> exception: it runs an **un-caged write/exec tester** that drives a System-Under-Test (see
-> [QA — agent-as-tester](#qa--agent-as-tester-review-qa) for the safety model). Don't assume
-> every subcommand is read-only.
+> caged — they cannot edit, run shell, or hit the network), with two explicit, narrow
+> exceptions. The **`qa`** mode runs an **un-caged write/exec tester** that drives a
+> System-Under-Test (see [QA — agent-as-tester](#qa--agent-as-tester-review-qa) for the
+> safety model). And **`review diff --staged --commit`** creates a checkpoint commit of
+> the staged diff it just reviewed (opt-in via `--commit`; see
+> [Diff review](#diff-review-review-diff) below). Don't assume every subcommand is
+> read-only.
 
 Runs your git diff through multiple AI backends **in parallel**, collects their findings,
 and prints them side by side. Core review modes let you go from a quick pre-commit
@@ -133,8 +136,32 @@ the **`diff`** subcommand (`review diff`); **a diff is required**.
 ```bash
 review diff --task HYP-742
 review diff --staged --task HYP-742
+review diff --staged --task HYP-742 --commit
 git show --format= --no-ext-diff HEAD | review diff --task HYP-742 -m gemini,codex
 ```
+
+> **Never use `git reset --hard` to discard a bad attempt mid-review** — a review→fix→
+> re-review loop that resets hard can destroy unrelated uncommitted work from other
+> sessions/agents sharing the same checkout (it has happened). Use `git checkout --
+> <file>` to discard specific files, or `review diff --staged --commit` (below) to
+> checkpoint progress instead — undo a bad checkpoint safely with `git reset --soft
+> HEAD~1`, which does not touch untracked/foreign files.
+
+**Checkpointing a multi-round fix loop (`--commit`).** An agent iterating review → fix
+findings → re-review may need several attempts, and a bad attempt needs a SAFE way back —
+not `git reset --hard`. `--commit` (requires `--staged`) creates a real `git commit` of the
+staged diff right after the review completes, so a bad next attempt can be undone with `git
+reset --soft HEAD~1` instead. It checkpoints the *reviewed* diff, not a *clean* one: a
+review that reports open findings still gets checkpointed (the pool producing usable
+verdicts is what gates it, not "zero findings") — that's intentional, the same rule the
+existing `--staged` commit-hook stamp already follows. The checkpoint is a real commit, so
+it runs the repo's own commit-msg/pre-commit hooks; if a hook rejects it, `--commit` fails
+loudly with a distinct exit code rather than silently skipping the checkpoint. `--commit`
+without `--staged` is a usage error (there is no unstaged/piped diff to checkpoint against).
+A review is multi-minute, so `--commit` also re-checks the staged index right before
+committing and refuses (same distinct exit code) if it drifted from what was actually
+reviewed — it never commits changes another process/session staged in the meantime. This
+is the recommended default for any review loop that might need multiple rounds.
 
 ---
 

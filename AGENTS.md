@@ -4,7 +4,7 @@ Agent-facing notes for working IN this repo. (User-facing docs live in `README.m
 
 ## What this is
 
-multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic.
+multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic — with one explicit, narrow opt-in exception: `review diff --staged --commit` creates a checkpoint commit of the staged diff it just reviewed (see "Fix loops" below).
 
 Operationally, `review` fans a git diff (or a question / topic) out to several model
 backends in parallel and prints their findings.
@@ -48,6 +48,32 @@ a fan-out mode — it is wired in `cli._dispatch` like `dashboard` and its logic
 lib (`reviewlib/sessions.py`); it deliberately does NOT register a `ModeSpec`, so it never
 collides with the mode registry. `task` is also a MANAGEMENT command: it reads run-stats and
 dashboard logs to list task iterations, models used, and detailed transcripts.
+
+### Fix loops — never `git reset --hard` mid-review-cycle
+
+There is no fix-loop/agent-orchestration code inside review-cli itself: `review diff` is
+SINGLE-SHOT (it runs the review once and prints findings), and the review → fix findings →
+re-review cycle is something the CALLING agent does manually, outside this tool. That means
+the discipline below is on the CALLER, not something this CLI can enforce by itself — but
+this tool gives the caller a safe primitive for it.
+
+**Never use `git reset --hard` to discard a bad fix attempt mid-loop** — it can destroy
+unrelated uncommitted work belonging to a DIFFERENT session/agent sharing the same checkout
+(this has happened in production: a fix-loop agent reset hard mid-cycle and wiped another
+session's uncommitted changes). Safe alternatives: `git checkout -- <file>` to discard
+specific files, or `review diff --staged --commit` to checkpoint each round with a real
+commit — undo a bad checkpoint with `git reset --soft HEAD~1`, which does NOT touch
+untracked/foreign files (unlike `reset --hard`, which wipes everything in the working tree
+regardless of who it belongs to).
+
+`--commit` (requires `--staged`) is the recommended default for any multi-round fix loop:
+it checkpoints the *reviewed* staged diff, not a *clean* one — a review with open findings
+still gets committed (the checkpoint gates on the pool producing usable verdicts, the same
+`ok` that gates the existing `--staged` commit-hook stamp, NOT on "zero findings"). The
+commit runs the repo's own commit-msg/pre-commit hooks; a hook rejection fails `--commit`
+loudly with its own exit code rather than silently skipping the checkpoint. See
+`reviewlib/modes/review.py` (`EXIT_COMMIT_REQUIRES_STAGED` / `EXIT_COMMIT_FAILED`,
+`_checkpoint_if_requested`) and the README's "Diff review" section for the full contract.
 
 ### Option scoping — global vs subcommand
 

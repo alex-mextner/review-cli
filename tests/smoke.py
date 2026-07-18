@@ -40,6 +40,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset({
     "test_qa_executor.py",
     "test_qa_mode.py",
     "test_review_marker.py",
+    "test_review_commit_checkpoint.py",
     "test_run_stats.py",
     "test_staged_diff_honors_c_repo.py",
 })
@@ -297,6 +298,25 @@ def test_non_git_dir_fails_gracefully_with_stable_code():
     # A no-git mode + meta flags still work from a non-git dir.
     assert_in("the question to ask", review_out("just-ask", "-C", nongit, "--help"))
     assert_in("codex", review_out("-C", nongit, "--list-defaults"))
+
+
+def test_commit_flag_requires_staged():
+    """`review diff --commit` without `--staged` is a usage error that fails BEFORE any
+    backend is dispatched (task-coded per the global gate, so pass --task to get past
+    that unrelated check and actually exercise the --commit validation). Confirms the
+    argv -> argparse -> _handler -> mode_review wiring end-to-end, not just via the
+    direct mode_review() calls in test_review_commit_checkpoint.py."""
+    _require_git("--commit E2E smoke")
+    repo = _tmp()
+    subprocess.run(["git", "init", "-q"], cwd=repo, env=_smoke_env(), check=True)
+    p = run("diff", "--commit", "--task", "SMOKE-COMMIT", "-C", repo, stdin="")
+    if p.returncode != 11:
+        raise SmokeError(
+            f"expected EXIT_COMMIT_REQUIRES_STAGED=11, got {p.returncode}\n{p.stdout}\n{p.stderr}"
+        )
+    out = p.stdout + p.stderr
+    assert_in("--commit requires --staged", out)
+    assert_not_in("Traceback (most recent call last)", out)
 
 
 def test_visual_flags_in_help():
@@ -568,6 +588,11 @@ _UNIT_FILES = [
     # at it; no network, no real agent-tools checkout, no model call.
     ("test_manifest_capability.py", {}),
     ("test_review_marker.py", {}),
+    # `review diff --staged --commit` (the checkpoint-commit feature): the usage gate
+    # (--commit requires --staged), the checkpoint gate shared with the marker/stamp
+    # (ok/staged/not-piped), the real `git commit` it makes, and the distinct
+    # EXIT_COMMIT_FAILED when the commit subprocess itself (e.g. a rejecting hook) fails.
+    ("test_review_commit_checkpoint.py", {}),
     ("test_failover_pool.py", {}),
     # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
     # give it a FRESH temp log dir like the other log-touching tests (review-cli#65).

@@ -37,6 +37,27 @@ semantic versioning.
   error, exception, or failure diagnostic. Because arbitrary error text has no reliable
   cvGate pixel signature, the new `error-text` module has no CV pre-filter and only blocks
   when the vision answer explicitly sets `error_text_visible=true`.
+- **`review diff --staged --commit` — a safe checkpoint for multi-round fix loops, and a
+  documented warning against `git reset --hard` mid-review.** An agent iterating review →
+  fix findings → re-review may need several attempts, and until now the only way to
+  discard a bad attempt was `git reset --hard` — which can destroy unrelated uncommitted
+  work from a DIFFERENT session/agent sharing the same checkout (this happened in
+  production). `--commit` (REQUIRES `--staged`; a usage error otherwise, distinct exit
+  code, no silent fallback to `git commit -a`) creates a real `git commit` of the staged
+  diff right after the review completes, so a bad next attempt can be undone with the safe
+  `git reset --soft HEAD~1` instead — it does not touch untracked/foreign files. The
+  checkpoint gate mirrors the existing `--staged` commit-hook stamp's three conditions
+  exactly (`ok`, `staged`, not `diff_from_stdin` for a piped diff): it checkpoints the
+  *reviewed* diff, not a *clean* one — a review reporting open findings still gets
+  committed, since `ok` means the pool produced usable verdicts, not "zero findings". The
+  commit runs the repo's own commit-msg/pre-commit hooks (never bypassed with
+  `--no-verify`); if a hook rejects it, `--commit` fails loudly with its own distinct exit
+  code rather than silently skipping the checkpoint. Because a review is multi-minute,
+  `--commit` also re-reads the staged index right before committing and refuses (same
+  distinct exit code) if it drifted from the diff that was actually reviewed — a TOCTOU
+  guard against silently committing unreviewed/unrelated work another process/session
+  staged in the meantime. README/AGENTS.md now explicitly warn against `git reset --hard`
+  mid-review-cycle and name the safe alternatives.
 - **Review iterations are now task-coded (review-cli#108).** All recorded review modes now
   require `--task CODE` (or `$REVIEW_TASK_CODE`) before dispatch, and the code is persisted
   into run-stats plus per-call/brainstorm logs. `review task [CODE]` lists task iterations,

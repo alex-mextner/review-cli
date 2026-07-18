@@ -16,10 +16,13 @@ is a PRIORITY-ordered list, the active pool is the top-N AVAILABLE seats (startu
 failover), and a seat that fails DURING the run is replaced by the next-priority
 reserve (mid-run failover) so the run still yields N working verdicts when possible.
 """
+
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,7 +34,12 @@ from ..backends import (
     resolve_backend,
     review_with_images,
 )
-from ..config import DEFAULT_POOL_SIZE, BoardReviewer, apply_effort_override, split_pool_reserve
+from ..config import (
+    DEFAULT_POOL_SIZE,
+    BoardReviewer,
+    apply_effort_override,
+    split_pool_reserve,
+)
 from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
     FailoverOutcome,
@@ -39,23 +47,63 @@ from ..panel import (
     format_result,
     run_board_with_failover,
 )
+from ..process import _run, git_repo_env
 from ..retry import retry_default, run_seat_with_retry
 from . import _visual_images
 from .contract import ModeContext, ModeSpec
+
+# Stable, per-class exit codes for the `--commit` checkpoint feature (structured-exit-codes),
+# continuing the numbering discipline started in cli.py (EXIT_NOT_A_REPO=3 … EXIT_QA_ENV_
+# UNHEALTHY=9) and features/visual/policy_engine.py (EXIT_BLOCK_STRICT=10). 11/12 are the next
+# free integers — distinct from every class above so a script/hook can tell "you misused
+# --commit" apart from "the checkpoint commit itself failed" apart from any other exit class.
+#
+# --commit REQUIRES --staged: a checkpoint commits the reviewed STAGED diff, and there is no
+# such thing as checkpointing an unstaged/piped diff. This is a hard usage ERROR, not a silent
+# no-op and not an implicit `--staged` (a smaller surprise is still a surprise) and NEVER a
+# fallback to `git commit -a` (which would sweep in unrelated unstaged changes — exactly the
+# "sweep everything" accident class this whole feature exists to prevent).
+EXIT_COMMIT_REQUIRES_STAGED = 11
+# The review itself succeeded (`ok`) and the checkpoint gate was satisfied (staged, not
+# piped), but the actual `git commit` subprocess FAILED (a commit-msg/pre-commit hook
+# rejected it, "nothing to commit", or any other nonzero). The user explicitly asked for a
+# checkpoint guarantee and did not get one — that must be a visible, distinct failure, never
+# silently swallowed as if the review itself failed (which already has its own 0/1 result).
+EXIT_COMMIT_FAILED = 12
 
 if TYPE_CHECKING:
     from ..config import EffortOverride
 
 
 def mode_review(
-    models: list[str], prompt: str, diff: str, cwd: Path, timeout: int, staged: bool,
-    board: list[BoardReviewer] | None = None, pool_size: int = DEFAULT_POOL_SIZE,
+    models: list[str],
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    staged: bool,
+    board: list[BoardReviewer] | None = None,
+    pool_size: int = DEFAULT_POOL_SIZE,
     outcome_sink: list[FailoverOutcome] | None = None,
     diff_from_stdin: bool = False,
     visual_images: tuple[Path, ...] = (),
     exact_board: bool = False,
     effort_override: "EffortOverride | None" = None,
+    commit: bool = False,
 ) -> int:
+    # --commit REQUIRES --staged (see the exit-code block above). Checked BEFORE the (paid)
+    # panel dispatch, not after — a usage mistake should fail fast, not after burning a full
+    # multi-model review the checkpoint could never have used anyway.
+    if commit and not staged:
+        print(
+            "[review-cli] --commit requires --staged: a checkpoint commits the reviewed "
+            "STAGED diff, and there is no such thing as checkpointing an unstaged/piped "
+            "diff.\n  fix: add --staged (`review diff --staged --commit`), or drop --commit.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return EXIT_COMMIT_REQUIRES_STAGED
+
     if not diff.strip():
         print("No diff to review.", file=sys.stderr)
         return 1
@@ -67,8 +115,18 @@ def mode_review(
         # resolved seat yields the same effort), so the CLI's earlier apply stays a no-op.
         board = apply_effort_override(board, effort_override)
         return _mode_review_board(
-            board, prompt, diff, cwd, timeout, staged, pool_size, outcome_sink,
-            diff_from_stdin, visual_images, exact_board,
+            board,
+            prompt,
+            diff,
+            cwd,
+            timeout,
+            staged,
+            pool_size,
+            outcome_sink,
+            diff_from_stdin,
+            visual_images,
+            exact_board,
+            commit,
         )
 
     # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets in-seat
@@ -82,15 +140,21 @@ def mode_review(
     def _seat_effort(model: str) -> str | None:
         # The flat `-m` path has no BoardReviewer, so the run-scoped `--effort` is the only
         # effort source. None (no flag) keeps the dispatch byte-identical to before.
-        return effort_override.effort_for(model) if effort_override is not None else None
+        return (
+            effort_override.effort_for(model) if effort_override is not None else None
+        )
 
     def _dispatch(model: str) -> ReviewResult:
         backend = resolve_backend(model)
         effort = _seat_effort(model)
         if visual_images:
             if effort is None:
-                return review_with_images(model, prompt, diff, cwd, timeout, 0, visual_images)
-            return review_with_images(model, prompt, diff, cwd, timeout, 0, visual_images, effort=effort)
+                return review_with_images(
+                    model, prompt, diff, cwd, timeout, 0, visual_images
+                )
+            return review_with_images(
+                model, prompt, diff, cwd, timeout, 0, visual_images, effort=effort
+            )
         if effort is None:
             return backend(model, prompt, diff, cwd, timeout)
         return call_backend(backend, model, prompt, diff, cwd, timeout, effort=effort)
@@ -105,7 +169,15 @@ def mode_review(
             try:
                 results.append(future.result())
             except Exception as exc:  # noqa: BLE001 - report, never crash the panel
-                results.append(ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc)))
+                results.append(
+                    ReviewResult(
+                        model=model,
+                        command="internal",
+                        returncode=127,
+                        stdout="",
+                        stderr=str(exc),
+                    )
+                )
             # One tally per logical seat (its FINAL outcome after any retry). No-op outside a
             # CLI-driven run; this flat path runs its own executor, so it tallies here.
             _tally_result(results[-1].returncode)
@@ -114,11 +186,18 @@ def mode_review(
     print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))
     ok = all(result.returncode == 0 for result in results)
     _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
+    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd, diff)
+    if override is not None:
+        return override
     return 0 if ok else 1
 
 
 def _stamp_if_staged_commit_review(
-    ok: bool, staged: bool, diff_from_stdin: bool, cwd: Path, diff: str,
+    ok: bool,
+    staged: bool,
+    diff_from_stdin: bool,
+    cwd: Path,
+    diff: str,
 ) -> None:
     """Write the diff-scoped review-stamp and touch the session marker iff this review
     genuinely satisfies the staged commit gate. Shared by the flat and board paths so the
@@ -138,11 +217,382 @@ def _stamp_if_staged_commit_review(
         _touch_review_marker()
 
 
+_CHECKPOINT_COMMIT_MESSAGE = "chore: checkpoint via review diff --staged --commit"
+
+# Matches `git commit`'s own stdout summary line — `[branch abc1234] message`, for the
+# repo's very first commit `[branch (root-commit) abc1234] message`, or in detached HEAD
+# `[detached HEAD abc1234] message` (codex P2 on review-cli#120: "detached HEAD" is TWO
+# words where every other ref-description is one token, so it needs its own alternative —
+# tried first, or `\S+` would greedily match just "detached" and the rest wouldn't line
+# up). Git prints this using the SHA it just created, BEFORE running the post-commit hook
+# — see `_parse_new_commit_sha` for why that ordering is exactly what makes this reliable,
+# and why `_parse_new_commit_sha` still cross-checks the match rather than trusting it
+# blind (a hook can print its OWN stdout into the same captured stream).
+_COMMIT_SUMMARY_RE = re.compile(
+    r"^\[(?:detached HEAD|\S+)(?:\s+\(root-commit\))?\s+([0-9a-fA-F]+)\]", re.MULTILINE
+)
+
+
+def _current_staged_diff(cwd: Path) -> str | None:
+    """Re-derive the CURRENT staged diff, anchored `-C <cwd>` AND pinned via
+    `git_repo_env(cwd)` — the exact same invocation shape as `cli._git_diff` (review-
+    cli#71/#72), so a foreign GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE can't divert the
+    comparison to the wrong repo. Returns None on ANY failure (spawn error, timeout,
+    non-zero git diff) — the caller treats "can't verify" the same as "verification
+    failed": don't commit."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--cached"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _parse_new_commit_sha(cwd: Path, commit_stdout: str) -> str | None:
+    """Extract the SHA `git commit` reports it just created, from ITS OWN stdout summary
+    line — never `git rev-parse HEAD` read after the fact (codex P1 on review-cli#120):
+    a post-commit hook, or a concurrent session sharing the checkout, can advance HEAD
+    past our commit before we get to read it, and a naive `rev-parse HEAD` would then
+    verify/undo THAT later commit instead of ours — up to and including resetting away a
+    completely unrelated commit that just happened to land in the window. Git prints the
+    summary line using the commit it just made, BEFORE invoking the post-commit hook, so
+    it always names OUR commit regardless of what happens afterward.
+
+    `commit_stdout` is the WHOLE captured stream, which also carries anything a
+    pre-commit/commit-msg hook printed before git's own summary line (codex P2 on
+    review-cli#120: a hook that happens to print something bracket-shaped could win a
+    naive "first regex match"). So every candidate match is checked against reality: it
+    must resolve to a real object (`rev-parse --verify`) whose commit message is EXACTLY
+    `_CHECKPOINT_COMMIT_MESSAGE` — a coincidental bracket-shaped hook line practically
+    never also names a real object with that exact message. Returns the first candidate
+    that checks out, or None if none do — the caller treats that as "can't verify,"
+    refusing to touch history rather than guess."""
+    for m in _COMMIT_SUMMARY_RE.finditer(commit_stdout):
+        try:
+            proc = _run(
+                ["git", "-C", str(cwd), "rev-parse", "--verify", m.group(1)],
+                cwd=cwd,
+                env=git_repo_env(cwd),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode != 0 or not proc.stdout.strip():
+            continue
+        sha = proc.stdout.strip()
+        try:
+            subject_proc = _run(
+                ["git", "-C", str(cwd), "log", "-1", "--format=%s", sha],
+                cwd=cwd,
+                env=git_repo_env(cwd),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if (
+            subject_proc.returncode == 0
+            and subject_proc.stdout.strip() == _CHECKPOINT_COMMIT_MESSAGE
+        ):
+            return sha
+    return None
+
+
+def _resolve_parent(cwd: Path, sha: str) -> tuple[str, str | None]:
+    """Resolve `sha`'s parent, distinguishing a POSITIVELY CONFIRMED root commit (zero
+    parents) from a lookup that merely FAILED (git error, corrupt repo, permissions) —
+    conflating the two (codex P2 on review-cli#120) let a transient failure masquerade as
+    "root commit", and the caller (`_undo_checkpoint_commit`) would then `update-ref -d
+    HEAD` — un-borning the WHOLE branch — for a commit that might not be root at all.
+
+    Returns `("root", None)` only when `git rev-list --parents` positively reports zero
+    parents, `("parent", <sha>)` for exactly one, or `("unknown", None)` for anything
+    else (lookup failure, a merge commit with 2+ parents — this feature only ever makes
+    plain commits, so that shape itself means "not the commit we think it is"). Callers
+    MUST refuse to act on "unknown" rather than guess."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "rev-list", "--parents", "-n", "1", sha],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown", None
+    if proc.returncode != 0:
+        return "unknown", None
+    parts = proc.stdout.split()
+    if len(parts) == 1:
+        return "root", None
+    if len(parts) == 2:
+        return "parent", parts[1]
+    return "unknown", None
+
+
+def _empty_tree_sha(cwd: Path) -> str | None:
+    """This repo's empty-tree object hash, used to diff a root commit (no parent)
+    against "nothing" — computed via `git mktree` on empty input rather than the
+    hardcoded SHA-1 constant `4b825dc642...` (codex P2 on review-cli#120: that constant
+    is wrong in a `--object-format=sha256` repo, where it would make every root-commit
+    checkpoint mismatch and undo a perfectly good commit). `mktree` writes using
+    whatever object format THIS repo is configured for, so it is correct either way."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "mktree"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            input_text="",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return proc.stdout.strip()
+
+
+def _commit_diff(cwd: Path, sha: str) -> str | None:
+    """The diff `sha` actually introduces (against its parent, or this repo's empty tree
+    for a CONFIRMED root commit) — used to verify AFTER the fact that a just-made commit
+    contains exactly the reviewed diff and nothing a hook smuggled in. None on any
+    failure OR on an unresolvable parent status (the caller treats "can't verify" as
+    "verification failed": don't trust the commit, but also don't guess at an undo)."""
+    status, parent = _resolve_parent(cwd, sha)
+    if status == "unknown":
+        return None
+    base = _empty_tree_sha(cwd) if status == "root" else parent
+    if base is None:
+        return None
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "diff", "--no-ext-diff", base, sha],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _undo_checkpoint_commit(cwd: Path, sha: str) -> bool:
+    """Undo a just-made checkpoint commit WITHOUT touching the index/working tree — so
+    whatever a hook staged is left exactly as-is for the user to inspect, same spirit as
+    `git reset --soft HEAD~1` (documented as the safe undo for this feature). A CONFIRMED
+    root commit has no parent to reset to, so it's un-born instead.
+
+    Uses `git update-ref <ref> <new> <old>` — a compare-and-swap, not a blind `git reset
+    --soft`/`update-ref -d` (codex P1 on review-cli#120): those act on whatever HEAD
+    currently is, and if HEAD has ALREADY moved past `sha` (a post-commit hook, or a
+    concurrent session, making its own commit on top), a blind reset would silently drag
+    that later, unrelated commit's ref-value back too — discarding it as if it never
+    happened. The CAS only succeeds when the ref's CURRENT value is exactly `sha`;
+    otherwise it fails and nothing is touched, which is exactly the outcome we want when
+    we can no longer be sure `sha` is still what HEAD points to.
+
+    Returns True iff an undo actually ran. Returns False — touching NOTHING — when the
+    parent status is "unknown" (refusing to guess whether it's root — codex P2 on
+    review-cli#120) OR when the CAS itself was rejected (HEAD moved). The caller surfaces
+    either case as a distinct "could not safely undo" message."""
+    status, parent = _resolve_parent(cwd, sha)
+    if status == "unknown":
+        return False
+    if status == "root":
+        proc = _run(
+            ["git", "-C", str(cwd), "update-ref", "-d", "HEAD", sha],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+        )
+    else:
+        proc = _run(
+            ["git", "-C", str(cwd), "update-ref", "HEAD", parent, sha],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+        )
+    return proc.returncode == 0
+
+
+def _verify_checkpoint_matches_review(cwd: Path, sha: str, reviewed_diff: str) -> str:
+    """Post-commit gate (codex review finding on this feature's own PR, review-cli#120):
+    a pre-commit hook that auto-formats/lint-`--fix`es and RE-STAGES files, then exits 0,
+    lets `git commit` succeed — but the tree it commits is read from the index AS IT
+    STANDS when the hook finishes, which can now hold MORE than `reviewed_diff`. The
+    TOCTOU guard in `_checkpoint_commit` only catches drift BEFORE `git commit` runs; it
+    cannot catch a hook that mutates the index AS A SIDE EFFECT of that same call, since
+    the tree snapshot is taken after the hook exits, not before.
+
+    So this re-diffs `sha` (the commit `git commit` JUST created — resolved by the
+    caller via `_parse_new_commit_sha`, NOT a fresh `rev-parse HEAD`) against its parent
+    and compares it to `reviewed_diff`. A mismatch means the hook smuggled in
+    extra/different content — the commit is undone (`_undo_checkpoint_commit`,
+    index/worktree left alone so nothing is lost) and a non-empty detail string is
+    returned. Empty string means verified clean.
+    """
+    committed_diff = _commit_diff(cwd, sha)
+    if committed_diff is not None and committed_diff == reviewed_diff:
+        return ""
+    if not _undo_checkpoint_commit(cwd, sha):
+        return (
+            "the commit at "
+            + sha
+            + " may hold more than the reviewed diff, but it could "
+            "NOT be safely undone — either its parentage couldn't be positively confirmed, "
+            "or HEAD has already moved past it (a post-commit hook or a concurrent session "
+            "made another commit), so undoing would risk touching history that isn't ours. "
+            "Nothing was changed; inspect `git show "
+            + sha
+            + "` / `git log -1` and clean up "
+            "manually if it holds more than the reviewed diff."
+        )
+    return (
+        "a pre-commit hook modified the index during the commit (e.g. auto-format/"
+        "lint --fix re-staging files) — the resulting commit would have held more than "
+        "the reviewed diff, so it was undone (index/working tree were left untouched). "
+        "Inspect `git status`/`git diff --cached`, review the hook's changes separately, "
+        "then re-run the checkpoint."
+    )
+
+
+def _checkpoint_commit(cwd: Path, reviewed_diff: str) -> tuple[bool, str]:
+    """Create the real checkpoint commit of the currently-staged index.
+
+    Anchored `-C <cwd>` AND a pinned `git_repo_env(cwd)` (review-cli#71/#72, the same
+    reasoning as `cli._git_diff`): a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE pointing
+    at a FOREIGN repo must not divert this commit to the wrong tree.
+
+    TOCTOU guard (codex review finding on this feature's own PR): a review is
+    multi-minute / multi-model, leaving a window in which another process or session
+    sharing the same checkout could stage additional changes. Before committing, this
+    re-reads the CURRENT staged diff (`_current_staged_diff`) and refuses to checkpoint
+    if it no longer matches `reviewed_diff` — otherwise `--commit` could silently commit
+    unreviewed/unrelated staged work, which is exactly the "sweep in someone else's
+    changes" accident class this whole feature exists to prevent.
+
+    A SECOND guard runs AFTER the commit (`_verify_checkpoint_matches_review`): the first
+    guard cannot see a pre-commit hook that mutates the index as a side effect of the
+    commit it is itself gating (codex P1 on review-cli#120) — only re-diffing the
+    finished commit catches that.
+
+    This is a REAL `git commit` — it runs the repo's own commit-msg/pre-commit hooks
+    (lint/typecheck/tests, conventional-commit format) and can genuinely fail on a red
+    tree or a malformed message. It never passes `--no-verify`: bypassing that gate is
+    exactly the kind of accident this feature exists to prevent, not reproduce under a
+    new flag. Returns `(succeeded, detail)` — `detail` is empty on success, else a short
+    explanation (drift detected, spawn error, hook mismatch, or git's own stderr/stdout)
+    for the caller to report.
+    """
+    current_diff = _current_staged_diff(cwd)
+    if current_diff is None:
+        return (
+            False,
+            "could not re-read the staged diff to verify it is still the reviewed one",
+        )
+    if current_diff != reviewed_diff:
+        return False, (
+            "the staged diff changed since the review ran (another process/session may "
+            "have touched the index) — refusing to checkpoint a diff that was never reviewed"
+        )
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "commit", "-m", _CHECKPOINT_COMMIT_MESSAGE],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"git commit could not run: {exc}"
+    if proc.returncode != 0:
+        return False, proc.stderr.strip() or proc.stdout.strip() or "git commit failed"
+    new_sha = _parse_new_commit_sha(cwd, proc.stdout)
+    if new_sha is None:
+        return False, (
+            "the commit succeeded but its SHA could not be parsed from git's own output "
+            "to verify it — nothing was undone; inspect `git log -1` manually"
+        )
+    mismatch_detail = _verify_checkpoint_matches_review(cwd, new_sha, reviewed_diff)
+    if mismatch_detail:
+        return False, mismatch_detail
+    return True, ""
+
+
+def _checkpoint_if_requested(
+    commit: bool,
+    ok: bool,
+    diff_from_stdin: bool,
+    cwd: Path,
+    diff: str,
+) -> int | None:
+    """Create the `--commit` checkpoint commit after a review, if requested.
+
+    Called only after `mode_review` has already validated commit-implies-staged up
+    front, so `staged` is always True here by construction — the remaining gate mirrors
+    `_stamp_if_staged_commit_review`'s other two conditions (`ok`, not `diff_from_stdin`).
+
+    Precisely: this CHECKPOINTS the reviewed staged diff after the review completes —
+    it does NOT mean "commits when the review passes". `ok` means the pool produced
+    usable verdicts, not that the diff is clean; a review that reports open findings
+    still has `ok=True` and still gets checkpointed (findings are informational, the
+    same as the existing `--staged` stamp gate). That is intended, not a bug.
+
+    Returns `None` to leave the review's own 0/1 result standing (covers: `--commit`
+    not requested; the gate not satisfied — the review failed, or the diff was piped —
+    in which case a note is printed but the review's own result is untouched; or the
+    checkpoint commit itself succeeded). Returns `EXIT_COMMIT_FAILED` to OVERRIDE an
+    otherwise-successful review's exit code when the review passed, the gate was
+    satisfied, but the `git commit` subprocess itself failed — the user asked for a
+    checkpoint guarantee and did not get one, so that must be visible, never silently
+    swallowed.
+    """
+    if not commit:
+        return None
+    if not ok:
+        print(
+            "[review-cli] --commit: the review did not succeed — no checkpoint created.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    if diff_from_stdin:
+        print(
+            "[review-cli] --commit: the diff was piped on stdin, not the git index — no "
+            "checkpoint created (a pipe reviews arbitrary input; --commit checkpoints the "
+            "staged index).",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    succeeded, detail = _checkpoint_commit(cwd, diff)
+    if succeeded:
+        print(
+            "[review-cli] --commit: checkpoint commit created.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    print(
+        "[review-cli] --commit: the review succeeded but the checkpoint commit itself "
+        f"FAILED — no checkpoint was created.\n  git commit failed: {detail}\n"
+        "  fix: check the repo's commit-msg/pre-commit hooks (lint/typecheck/tests may be "
+        "blocking it), then re-run `review diff --staged --commit`.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return EXIT_COMMIT_FAILED
+
+
 def _mode_review_board(
-    board: list[BoardReviewer], prompt: str, diff: str, cwd: Path, timeout: int,
-    staged: bool, pool_size: int, outcome_sink: list[FailoverOutcome] | None,
-    diff_from_stdin: bool = False, visual_images: tuple[Path, ...] = (),
+    board: list[BoardReviewer],
+    prompt: str,
+    diff: str,
+    cwd: Path,
+    timeout: int,
+    staged: bool,
+    pool_size: int,
+    outcome_sink: list[FailoverOutcome] | None,
+    diff_from_stdin: bool = False,
+    visual_images: tuple[Path, ...] = (),
     exact_board: bool = False,
+    commit: bool = False,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -166,29 +616,43 @@ def _mode_review_board(
     if exact_board:
         pool, reserve = list(board), []
     else:
-        pool, reserve = split_pool_reserve(board, pool_size, lambda r: backend_available(r.model))
+        pool, reserve = split_pool_reserve(
+            board, pool_size, lambda r: backend_available(r.model)
+        )
     if not pool:
-        print("[review-cli] board: no reviewers are available — configure at least one "
-              "backend key/CLI (e.g. COMMANDCODE_API_KEY, GEMINI_API_KEY, codex/claude on "
-              "PATH).", file=sys.stderr, flush=True)
+        print(
+            "[review-cli] board: no reviewers are available — configure at least one "
+            "backend key/CLI (e.g. COMMANDCODE_API_KEY, GEMINI_API_KEY, codex/claude on "
+            "PATH).",
+            file=sys.stderr,
+            flush=True,
+        )
         return 1
 
-    outcome = run_board_with_failover(pool, reserve, prompt, diff, cwd, timeout, visual_images)
+    outcome = run_board_with_failover(
+        pool, reserve, prompt, diff, cwd, timeout, visual_images
+    )
     if outcome_sink is not None:
         outcome_sink.append(outcome)
 
     print("\n\n---\n\n".join(format_result(r) for r in outcome.results))
 
     if outcome.degraded:
-        print(f"[review-cli] board: degraded — only {len(outcome.usable)} of "
-              f"{outcome.target} seats produced a usable verdict (reserve exhausted).",
-              file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] board: degraded — only {len(outcome.usable)} of "
+            f"{outcome.target} seats produced a usable verdict (reserve exhausted).",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # Success gate: the pool refilled to its target of usable verdicts (NOT degraded).
     # A failed-then-replaced seat is handled, so it must not block — only a real
     # shortfall (reserve exhausted) does.
     ok = not outcome.degraded
     _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
+    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd, diff)
+    if override is not None:
+        return override
     return 0 if ok else 1
 
 
@@ -200,12 +664,32 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     the global list is only truly-global options; codex P1 on #46). The other shared options
     (-m / -C / --pool / --prompt / --staged / --visual …) come from the CLI's global surface."""
     parser.add_argument(
-        "--retry", type=int, default=None, metavar="N",
+        "--retry",
+        type=int,
+        default=None,
+        metavar="N",
         help=(
             "in-seat retries on a TRANSIENT failure (429/529/5xx/timeout/overloaded) before "
             "falling to the reserve (default from $REVIEW_RETRY_COUNT, else "
             f"{retry_default()}); applies to the failover board AND the flat -m panel. A "
             "SEAT-FATAL failure (auth/bad-model/501/refusal) is never retried. 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--commit",
+        action="store_true",
+        help=(
+            "checkpoint the reviewed diff with a real `git commit` after the review "
+            "completes — REQUIRES --staged (errors otherwise, exit "
+            f"{EXIT_COMMIT_REQUIRES_STAGED}). This checkpoints the reviewed staged diff, "
+            "it does NOT mean 'commits only when the review passes': a review with open "
+            "findings still gets checkpointed (same as the existing --staged stamp gate) "
+            "— findings are informational. Runs the repo's own commit-msg/pre-commit "
+            "hooks; a hook rejection fails the checkpoint distinctly (exit "
+            f"{EXIT_COMMIT_FAILED}), never bypassed with --no-verify. Undo a bad "
+            "checkpoint with `git reset --soft HEAD~1` (safe — leaves untracked/foreign "
+            "files alone); never `git reset --hard` mid-review-cycle (wipes uncommitted "
+            "work, including anyone else's, in a shared checkout)."
         ),
     )
 
@@ -223,23 +707,33 @@ def _handler(ctx: ModeContext) -> int:
     # A diff piped on stdin (vs read from `git diff --cached`) must not satisfy the staged
     # commit gate even under --staged — see _stamp_if_staged_commit_review.
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
+    commit = bool(getattr(ctx.args, "commit", False))
     base = (
-        ctx.models, ctx.with_visual(ctx.args.prompt), ctx.diff, ctx.cwd, ctx.timeout,
+        ctx.models,
+        ctx.with_visual(ctx.args.prompt),
+        ctx.diff,
+        ctx.cwd,
+        ctx.timeout,
         ctx.args.staged,
     )
     if board is None:
         return mode_review(
-            *base, board=None, diff_from_stdin=diff_from_stdin,
+            *base,
+            board=None,
+            diff_from_stdin=diff_from_stdin,
             visual_images=_visual_images(ctx),
             effort_override=ctx.effort_override,
+            commit=commit,
         )
     return mode_review(
-        *base, board=board,
+        *base,
+        board=board,
         pool_size=ctx.extra.get("pool_size", DEFAULT_POOL_SIZE),
         outcome_sink=ctx.extra.get("outcome_sink"),
         diff_from_stdin=diff_from_stdin,
         visual_images=_visual_images(ctx),
         exact_board=bool(ctx.extra.get("exact_board", False)),
+        commit=commit,
     )
 
 
@@ -251,7 +745,7 @@ MODE = ModeSpec(
     subcommand="diff",
     diff_policy="require",
     stats_mode="review",
-    summary="diff review across the reviewer board (requires a diff)",
+    summary="diff review across the reviewer board (requires a diff; --staged --commit checkpoints progress)",
     handler=_handler,
     add_arguments=_add_arguments,
     announce_logs=False,
