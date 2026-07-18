@@ -16,6 +16,7 @@ invokes the real CLI appends to the user's real ~/.config/review-cli/run-stats.j
 Child review processes also run with a throwaway HOME/XDG_CONFIG_HOME so smoke assertions
 exercise the repo defaults instead of the developer's local review-cli config.yaml.
 """
+
 from __future__ import annotations
 
 import os
@@ -54,7 +55,9 @@ def _redirect_run_stats() -> None:
     mutate the pytest process's environment for unrelated tests (glm review finding). Only
     creates the temp dir when the env var is unset (no leaked dirs on repeated calls)."""
     if not os.environ.get("REVIEW_STATS_FILE"):
-        os.environ["REVIEW_STATS_FILE"] = str(Path(tempfile.mkdtemp()) / "run-stats.jsonl")
+        os.environ["REVIEW_STATS_FILE"] = str(
+            Path(tempfile.mkdtemp()) / "run-stats.jsonl"
+        )
 
 
 def _smoke_home() -> str:
@@ -133,29 +136,39 @@ def review_out(*args: str, **kw) -> str:
     """
     p = run(*args, **kw)
     if p.returncode != 0:
-        raise SmokeError(f"`review {' '.join(args)}` exited {p.returncode}\n{p.stdout}\n{p.stderr}")
+        raise SmokeError(
+            f"`review {' '.join(args)}` exited {p.returncode}\n{p.stdout}\n{p.stderr}"
+        )
     return p.stdout + p.stderr
 
 
 def assert_in(needle: str, haystack: str, what: str = "") -> None:
     if needle not in haystack:
-        raise SmokeError(f"expected {needle!r} in output {what}\n--- output ---\n{haystack[:2000]}")
+        raise SmokeError(
+            f"expected {needle!r} in output {what}\n--- output ---\n{haystack[:2000]}"
+        )
 
 
 def assert_not_in(needle: str, haystack: str, what: str = "") -> None:
     if needle in haystack:
-        raise SmokeError(f"did NOT expect {needle!r} in output {what}\n--- output ---\n{haystack[:2000]}")
+        raise SmokeError(
+            f"did NOT expect {needle!r} in output {what}\n--- output ---\n{haystack[:2000]}"
+        )
 
 
 def assert_fails(*args: str, **kw) -> subprocess.CompletedProcess:
     """The CLI must EXIT NON-ZERO for these args (the bash `! review …` idiom)."""
     p = run(*args, **kw)
     if p.returncode == 0:
-        raise SmokeError(f"`review {' '.join(args)}` unexpectedly SUCCEEDED (expected non-zero)")
+        raise SmokeError(
+            f"`review {' '.join(args)}` unexpectedly SUCCEEDED (expected non-zero)"
+        )
     return p
 
 
-def run_unit(test_file: str, *, env: dict[str, str] | None = None, timeout: int = 600) -> None:
+def run_unit(
+    test_file: str, *, env: dict[str, str] | None = None, timeout: int = 600
+) -> None:
     """Run a standalone ``tests/test_*.py`` unit file as a subprocess (matching how it ran under
     smoke.sh) and require exit 0, surfacing its captured output on failure."""
     p = subprocess.run(
@@ -174,31 +187,51 @@ def _tmp() -> str:
 
 
 def _has(mod: str) -> bool:
-    return subprocess.run(
-        [sys.executable, "-c", f"import {mod}"],
-        capture_output=True,
-        env=_smoke_env(),
-    ).returncode == 0
+    return (
+        subprocess.run(
+            [sys.executable, "-c", f"import {mod}"],
+            capture_output=True,
+            env=_smoke_env(),
+        ).returncode
+        == 0
+    )
 
 
 def _git_unavailable_reason() -> str | None:
     global _GIT_UNAVAILABLE_REASON
     if _GIT_UNAVAILABLE_REASON is not None:
-        return _GIT_UNAVAILABLE_REASON if isinstance(_GIT_UNAVAILABLE_REASON, str) else None
+        return (
+            _GIT_UNAVAILABLE_REASON
+            if isinstance(_GIT_UNAVAILABLE_REASON, str)
+            else None
+        )
     try:
         version = subprocess.run(
-            ["git", "--version"], capture_output=True, text=True, env=_smoke_env(), timeout=15,
+            ["git", "--version"],
+            capture_output=True,
+            text=True,
+            env=_smoke_env(),
+            timeout=15,
         )
         if version.returncode != 0:
-            reason = (version.stdout + version.stderr).strip() or f"`git --version` exited {version.returncode}"
+            reason = (
+                version.stdout + version.stderr
+            ).strip() or f"`git --version` exited {version.returncode}"
             _GIT_UNAVAILABLE_REASON = reason
             return reason
         with tempfile.TemporaryDirectory() as d:
             init = subprocess.run(
-                ["git", "init", "-q"], cwd=d, capture_output=True, text=True, env=_smoke_env(), timeout=30,
+                ["git", "init", "-q"],
+                cwd=d,
+                capture_output=True,
+                text=True,
+                env=_smoke_env(),
+                timeout=30,
             )
         if init.returncode != 0:
-            reason = (init.stdout + init.stderr).strip() or f"`git init` exited {init.returncode}"
+            reason = (
+                init.stdout + init.stderr
+            ).strip() or f"`git init` exited {init.returncode}"
             _GIT_UNAVAILABLE_REASON = reason
             return reason
     except (OSError, subprocess.SubprocessError) as exc:
@@ -232,9 +265,17 @@ def test_shim_bootstrap_from_outside_repo_with_pythonpath_cleared():
     if not os.access(shim, os.X_OK):
         raise SmokeError(f"shim missing its exec bit: {shim}")
     env = {k: v for k, v in _smoke_env().items() if k != "PYTHONPATH"}
-    p = subprocess.run([str(shim), "--list-defaults"], capture_output=True, text=True, env=env, cwd=_tmp())
+    p = subprocess.run(
+        [str(shim), "--list-defaults"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=_tmp(),
+    )
     if p.returncode != 0:
-        raise SmokeError(f"shim from outside repo exited {p.returncode}\n{p.stdout}\n{p.stderr}")
+        raise SmokeError(
+            f"shim from outside repo exited {p.returncode}\n{p.stdout}\n{p.stderr}"
+        )
     assert_in("codex", p.stdout)
 
 
@@ -255,7 +296,11 @@ def test_brainstorm_only_flags_are_scoped():
 
 
 def test_removed_mode_flags_error_helpfully():
-    for flag, hint in (("--brainstorm", "review brainstorm"), ("--quorum", "review quorum"), ("--just-ask", "review just-ask")):
+    for flag, hint in (
+        ("--brainstorm", "review brainstorm"),
+        ("--quorum", "review quorum"),
+        ("--just-ask", "review just-ask"),
+    ):
         p = assert_fails(flag, "x")
         assert_in(hint, p.stdout + p.stderr)
 
@@ -278,7 +323,7 @@ def test_diff_subcommand_and_review_review_pointer():
     assert_in("codex", review_out("--list-defaults"))
     assert_in("codex", review_out("diff", "--list-defaults"))
     assert_in("review diff", review_out())  # bare review points at the new verb
-    p = assert_fails("review")             # `review review` is gone -> usage exit 2
+    p = assert_fails("review")  # `review review` is gone -> usage exit 2
     assert_in("review diff", p.stdout + p.stderr)
 
 
@@ -287,7 +332,9 @@ def test_non_git_dir_fails_gracefully_with_stable_code():
     nongit = _tmp()
     p = run("diff", "-C", nongit, stdin="")
     if p.returncode != 3:
-        raise SmokeError(f"expected EXIT_NOT_A_REPO=3, got {p.returncode}\n{p.stdout}\n{p.stderr}")
+        raise SmokeError(
+            f"expected EXIT_NOT_A_REPO=3, got {p.returncode}\n{p.stdout}\n{p.stderr}"
+        )
     out = p.stdout + p.stderr
     assert_in("not in a git repository", out)
     assert_in("diff review needs a repo", out)
@@ -334,14 +381,26 @@ def test_board_flags_and_listing():
     assert_not_in("--no-board", top)
     board = review_out("--show-board")
     for needle in (
-        "source: preset:default", "claude:claude-opus-4-8",
-        "oc:commandcode/deepseek/deepseek-v4-pro", "oc:zai/glm-5.2", "contracts", "8 seats", "#1",
+        "source: preset:default",
+        "claude:claude-opus-4-8",
+        "oc:commandcode/deepseek/deepseek-v4-pro",
+        "oc:zai/glm-5.2",
+        "contracts",
+        "8 seats",
+        "#1",
         # The CTO-directed GLM-5.2-via-commandcode seat (default preset, diff-only keyed HTTP).
-        "commandcode:zai-org/GLM-5.2", "GLM-cc",
+        "commandcode:zai-org/GLM-5.2",
+        "GLM-cc",
     ):
         assert_in(needle, board, "in --show-board")
     heavy = review_out("--show-board", "--preset", "heavy")
-    for needle in ("source: preset:heavy", "architect", "claude:claude-fable-5", "codex:gpt-5.6-sol", "10 seats"):
+    for needle in (
+        "source: preset:heavy",
+        "architect",
+        "claude:claude-fable-5",
+        "codex:gpt-5.6-sol",
+        "10 seats",
+    ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
@@ -387,7 +446,9 @@ def test_retry_flag_surface_and_export():
     for val in ("9999", "-4", "0", "3"):
         p = run("diff", "--staged", "--retry", val, "-C", empty)
         if p.returncode == 2:
-            raise SmokeError(f"--retry {val} was an argparse usage error (should clamp):\n{p.stderr}")
+            raise SmokeError(
+                f"--retry {val} was an argparse usage error (should clamp):\n{p.stderr}"
+            )
 
 
 def test_output_flag():
@@ -420,7 +481,8 @@ def test_specweb_subcommands():
 def test_single_file_cli_always_parses():
     subprocess.run(
         [sys.executable, "-c", "import ast; ast.parse(open('bin/review').read())"],
-        cwd=str(REPO), check=True,
+        cwd=str(REPO),
+        check=True,
     )
 
 
@@ -447,7 +509,9 @@ def test_dashboard_managed_surface_and_lib_absent_fallback():
         # `status` with nothing running reports a clean state + stable exit 3, no traceback.
         p = run("dashboard", "status", env={"XDG_STATE_HOME": _tmp()})
         if p.returncode != 3:
-            raise SmokeError(f"dashboard status (nothing running) expected exit 3, got {p.returncode}")
+            raise SmokeError(
+                f"dashboard status (nothing running) expected exit 3, got {p.returncode}"
+            )
         assert_not_in("Traceback (most recent call last)", p.stdout + p.stderr)
     else:
         # A genuine lifecycle action without the lib: stable exit 4 + actionable error, no
@@ -465,19 +529,25 @@ def test_dashboard_managed_surface_and_lib_absent_fallback():
             out = p.stdout + p.stderr
             assert_in("agenttools_service", out, what=f"(dashboard {action})")
             assert_in("pip install", out.lower(), what=f"(dashboard {action})")
-            assert_not_in("Traceback (most recent call last)", out, what=f"(dashboard {action})")
+            assert_not_in(
+                "Traceback (most recent call last)", out, what=f"(dashboard {action})"
+            )
         # The bare-HELP contract does NOT depend on the lib: bare `review dashboard` AND a
         # help-only `review dashboard --help` print help + launch nothing (exit 0), advertising
         # every action — this is the lib-absent fallback the CI gate exercises.
         bare = run("dashboard")
         if bare.returncode != 0:
-            raise SmokeError(f"lib-absent bare `dashboard` expected exit 0, got {bare.returncode}")
+            raise SmokeError(
+                f"lib-absent bare `dashboard` expected exit 0, got {bare.returncode}"
+            )
         for action in ("run", "start", "stop", "status", "enable", "disable"):
             assert_in(action, bare.stdout + bare.stderr)
         assert_not_in("Traceback (most recent call last)", bare.stdout + bare.stderr)
         help_out = run("dashboard", "--help")
         if help_out.returncode != 0:
-            raise SmokeError(f"lib-absent `dashboard --help` expected exit 0, got {help_out.returncode}")
+            raise SmokeError(
+                f"lib-absent `dashboard --help` expected exit 0, got {help_out.returncode}"
+            )
         assert_in("status", help_out.stdout + help_out.stderr)
 
 
@@ -493,7 +563,9 @@ def _node_supports_test_runner() -> str | None:
     if not node:
         return None
     try:
-        out = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=15)
+        out = subprocess.run(
+            [node, "--version"], capture_output=True, text=True, timeout=15
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
@@ -524,12 +596,16 @@ def test_dashboard_js_unit():
     try:
         p = subprocess.run(
             [node, "--test", str(js_test)],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
     except subprocess.TimeoutExpired as exc:
         raise SmokeError(f"dashboard JS unit tests timed out: {exc}") from exc
     if p.returncode != 0:
-        raise SmokeError(f"dashboard JS unit tests failed (node exit {p.returncode})\n{p.stdout}\n{p.stderr}")
+        raise SmokeError(
+            f"dashboard JS unit tests failed (node exit {p.returncode})\n{p.stdout}\n{p.stderr}"
+        )
 
 
 # --- resumable sessions listing (against a temp log dir) ------------------------------------
@@ -547,7 +623,9 @@ def test_sessions_listing():
     )
     env = {"REVIEW_LOG_DIR": str(sess_dir)}
     assert_in("smoke-complete", review_out("sessions", env=env))
-    assert_not_in("smoke-dead", review_out("sessions", env=env))  # default hides interrupted
+    assert_not_in(
+        "smoke-dead", review_out("sessions", env=env)
+    )  # default hides interrupted
     all_out = review_out("sessions", "-a", env=env)
     assert_in("smoke-dead", all_out)
     assert_in("interrupted", all_out)
@@ -610,6 +688,9 @@ _UNIT_FILES = [
     # streams a fake transcript via the same plumbing, so give it a FRESH temp log dir. The
     # LIVE-backend DoD inside this file is gated on REVIEW_QA_LIVE=1 and skips in CI.
     ("test_qa_executor.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # Run-scoped --effort honored by the qa write/exec tester (review-cli#127 harvest):
+    # deterministic argv/prompt assertions on the codex/claude tester spawns, no live backend.
+    ("test_qa_effort.py", {}),
     # The Phase-3 SUT-env lifecycle: stage-reuse / setup.sh-hook bring-up / health-gate /
     # GUARANTEED teardown (incl. on a throw + via the atexit hook) + config parsing. All
     # deterministic — a stdlib HTTP server for stage/health, shell setup.sh hooks for
@@ -688,11 +769,20 @@ _UNIT_FILES = [
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in
 # _UNIT_FILES — a new file that isn't listed would silently never run, so assert coverage below.
-_VISUAL_UNIT_FILES = frozenset({
-    "test_cv_gate.py", "test_vision_client.py", "test_policy_engine.py", "test_pipeline.py",
-    "test_preclassifier.py", "test_visual_compose.py", "test_visual_registry.py",
-    "test_selection_highlight.py", "test_error_text_module.py", "test_visual_fanout.py",
-})
+_VISUAL_UNIT_FILES = frozenset(
+    {
+        "test_cv_gate.py",
+        "test_vision_client.py",
+        "test_policy_engine.py",
+        "test_pipeline.py",
+        "test_preclassifier.py",
+        "test_visual_compose.py",
+        "test_visual_registry.py",
+        "test_selection_highlight.py",
+        "test_error_text_module.py",
+        "test_visual_fanout.py",
+    }
+)
 
 
 def _unit_env(spec: dict) -> dict[str, str]:
@@ -705,12 +795,16 @@ def test_every_unit_file_is_run():
     on_disk = {p.name for p in (REPO / "tests").glob("test_*.py")}
     listed = {f for f, _ in _UNIT_FILES} | _VISUAL_UNIT_FILES
     missing = on_disk - listed
-    assert not missing, f"unit test files not run by smoke.py: {sorted(missing)} — add them to _UNIT_FILES"
+    assert not missing, (
+        f"unit test files not run by smoke.py: {sorted(missing)} — add them to _UNIT_FILES"
+    )
 
 
 def test_reviewlib_unit_files():
     for fname, env_spec in _UNIT_FILES:
-        reason = _git_unavailable_reason() if fname in _GIT_REQUIRED_UNIT_FILES else None
+        reason = (
+            _git_unavailable_reason() if fname in _GIT_REQUIRED_UNIT_FILES else None
+        )
         if reason:
             print(f"SKIP unit {fname}: need a working git binary ({reason})")
             continue
@@ -720,7 +814,12 @@ def test_reviewlib_unit_files():
 def test_visual_verification_suite():
     """Stage-1 visual-verification suite. Needs ImageMagick v7 (`magick`) + Pillow; on a bare
     CI without them, SKIP loudly (they are not a runtime requirement) rather than fail."""
-    have_magick = subprocess.run(["bash", "-lc", "command -v magick"], capture_output=True).returncode == 0
+    have_magick = (
+        subprocess.run(
+            ["bash", "-lc", "command -v magick"], capture_output=True
+        ).returncode
+        == 0
+    )
     if not (have_magick and _has("PIL")):
         msg = "visual-verification: need ImageMagick (`magick`) + Pillow (pip install -e '.[test]')"
         # Only emit a pytest SKIP when pytest is the ACTIVE runner (PYTEST_CURRENT_TEST is set
@@ -735,16 +834,27 @@ def test_visual_verification_suite():
         # Standalone runner: signal SKIP (main() reports it, does NOT count as a failure).
         raise _SkipCheck(msg)
     for fname in (
-        "test_cv_gate.py", "test_vision_client.py", "test_policy_engine.py", "test_pipeline.py",
-        "test_preclassifier.py", "test_visual_compose.py", "test_visual_registry.py",
-        "test_selection_highlight.py", "test_error_text_module.py", "test_visual_fanout.py",
+        "test_cv_gate.py",
+        "test_vision_client.py",
+        "test_policy_engine.py",
+        "test_pipeline.py",
+        "test_preclassifier.py",
+        "test_visual_compose.py",
+        "test_visual_registry.py",
+        "test_selection_highlight.py",
+        "test_error_text_module.py",
+        "test_visual_fanout.py",
     ):
         run_unit(fname)
 
 
 # --- standalone runner (CI: `python tests/smoke.py`) ----------------------------------------
 def _all_tests():
-    return [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
+    return [
+        (n, f)
+        for n, f in sorted(globals().items())
+        if n.startswith("test_") and callable(f)
+    ]
 
 
 def main() -> int:
@@ -767,7 +877,9 @@ def main() -> int:
             failures += 1
             print(f"ERROR {name}: {type(exc).__name__}: {exc}")
             traceback.print_exc()
-    print(f"\n{'OK' if not failures else 'FAILED'}: {len(tests)} checks, {failures} failures, {skipped} skipped")
+    print(
+        f"\n{'OK' if not failures else 'FAILED'}: {len(tests)} checks, {failures} failures, {skipped} skipped"
+    )
     return 1 if failures else 0
 
 

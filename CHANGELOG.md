@@ -5,6 +5,14 @@ semantic versioning.
 
 ## Unreleased
 
+- **`review qa` now honors the run-scoped `--effort` flag (review-cli#127).** The `--effort`
+  flag (#150) lifted every review-panel seat's reasoning effort, but the qa write/exec tester —
+  a single seat that rides `claude-p`/`codex`, not the panel — silently ignored it. The resolved
+  level (a scoped `codex=high` beats the bare global default) now threads into the tester spawn:
+  the codex tester gets `-c model_reasoning_effort=<level>` (same builder as the read-only codex
+  seat; `max`->`xhigh`), the claude tester gets `--effort <level>` when its binary advertises the
+  flag, and both get the universal prompt-level hint so the level is never a silent no-op. This
+  closes the gap #150's reviewers flagged ("don't expose `--effort` to qa unless it is honored").
 - **Diff review presets and the Sol seat are now built in.** A plain `review diff` now runs the
   `default` preset: pool 4, high effort, and no Fable/Sol by default. Use `--preset light` for a
   cheaper pool 2 at medium effort, or `--preset heavy` for release/risky changes with Fable, Sol

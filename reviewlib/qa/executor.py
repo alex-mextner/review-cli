@@ -31,6 +31,7 @@ COST CAP. Single-seat, serial, one long timeout (NOT the short panel default), a
 caller trims to ``--max-cases`` before the suites text reaches the prompt. Token + wall
 accounting is surfaced in ``QaRunOutcome`` and the report footer.
 """
+
 from __future__ import annotations
 
 import os
@@ -54,7 +55,9 @@ _QA_RESULTS_HEADER = "## QA RESULTS"
 # anchor (no trailing chars) would reject that and mis-classify a perfectly valid FAIL as
 # UNKNOWN -> exit 1 (a false infra-fail on a report-only run). So we anchor only the LEAD
 # (start-of-line + the keyword) and let the verdict word be followed by anything.
-_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(PASS|FAIL|BLOCKED)\b", re.IGNORECASE | re.MULTILINE)
+_VERDICT_RE = re.compile(
+    r"^\s*VERDICT:\s*(PASS|FAIL|BLOCKED)\b", re.IGNORECASE | re.MULTILINE
+)
 _CASES_RE = re.compile(
     r"^\s*CASES:\s*(\d+)\s+run,\s*(\d+)\s+passed,\s*(\d+)\s+failed,\s*(\d+)\s+blocked",
     re.IGNORECASE | re.MULTILINE,
@@ -128,7 +131,9 @@ def build_tester_prompt(
         _prompt_bringup(bring_up, stage_url),
         _prompt_runbook(kind),
         _prompt_suites(suites_text),
-        _prompt_output_contract(sut_path=sut_path, kind=kind, target=target, strict=strict),
+        _prompt_output_contract(
+            sut_path=sut_path, kind=kind, target=target, strict=strict
+        ),
     ]
     return "\n\n".join(parts)
 
@@ -254,7 +259,9 @@ def _prompt_suites(suites_text: str) -> str:
     )
 
 
-def _prompt_output_contract(*, sut_path: Path, kind: str, target: str, strict: bool) -> str:
+def _prompt_output_contract(
+    *, sut_path: Path, kind: str, target: str, strict: bool
+) -> str:
     """The machine-parsed ``## QA RESULTS`` contract the parser reads. The markers
     (``## QA RESULTS``, ``CASES:``, ``VERDICT:``, the ``[P0..P3]`` finding bullets) MUST
     match ``parse_qa_results``."""
@@ -374,7 +381,9 @@ def _extract_cases(block: str) -> dict:
     return {"run": run, "passed": passed, "failed": failed, "blocked": blocked}
 
 
-def verdict_to_exit_code(verdict: str, *, findings: int, strict: bool, exit_blocked: int) -> int:
+def verdict_to_exit_code(
+    verdict: str, *, findings: int, strict: bool, exit_blocked: int
+) -> int:
     """Map a parsed verdict to the qa process exit code (spec §6, report-only resolution).
 
     REPORT-ONLY by default: a FAIL verdict or any finding is NOT an infra failure — it
@@ -459,7 +468,9 @@ class IsolatedSut:
         rel = self._sut_relpath_in_repo()
         parent = self.base_dir or Path(tempfile.gettempdir())
         parent.mkdir(parents=True, exist_ok=True)
-        self.worktree_path = Path(tempfile.mkdtemp(prefix=_QA_WORKTREE_PREFIX, dir=str(parent)))
+        self.worktree_path = Path(
+            tempfile.mkdtemp(prefix=_QA_WORKTREE_PREFIX, dir=str(parent))
+        )
         # mkdtemp made the dir; `git worktree add` needs it to NOT exist, so remove it first.
         shutil.rmtree(self.worktree_path, ignore_errors=True)
         # `_run(timeout=120)` can RAISE TimeoutExpired (a wedged git) — NOT just return
@@ -468,9 +479,17 @@ class IsolatedSut:
         # SutIsolationError so the handler maps it to a controlled BLOCKED (review finding).
         try:
             proc = _run(
-                _git_argv("-C", str(self.sut_path), "worktree", "add", "--detach",
-                          str(self.worktree_path), "HEAD"),
-                cwd=self.sut_path, timeout=120,
+                _git_argv(
+                    "-C",
+                    str(self.sut_path),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(self.worktree_path),
+                    "HEAD",
+                ),
+                cwd=self.sut_path,
+                timeout=120,
             )
         except (subprocess.SubprocessError, OSError, RuntimeError) as exc:
             self._cleanup_partial()
@@ -496,8 +515,11 @@ class IsolatedSut:
         if self.worktree_path is not None:
             shutil.rmtree(self.worktree_path, ignore_errors=True)
         try:
-            _run(_git_argv("-C", str(self.sut_path), "worktree", "prune"),
-                 cwd=self.sut_path, timeout=30)
+            _run(
+                _git_argv("-C", str(self.sut_path), "worktree", "prune"),
+                cwd=self.sut_path,
+                timeout=30,
+            )
         except (subprocess.SubprocessError, OSError, RuntimeError):
             pass
 
@@ -507,7 +529,8 @@ class IsolatedSut:
         try:
             proc = _run(
                 _git_argv("-C", str(self.sut_path), "rev-parse", "--show-toplevel"),
-                cwd=self.sut_path, timeout=30,
+                cwd=self.sut_path,
+                timeout=30,
             )
         except (subprocess.SubprocessError, OSError, RuntimeError):
             return ""
@@ -526,9 +549,16 @@ class IsolatedSut:
         removed_cleanly = False
         try:
             proc = _run(
-                _git_argv("-C", str(self.sut_path), "worktree", "remove", "--force",
-                          str(self.worktree_path)),
-                cwd=self.sut_path, timeout=60,
+                _git_argv(
+                    "-C",
+                    str(self.sut_path),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(self.worktree_path),
+                ),
+                cwd=self.sut_path,
+                timeout=60,
             )
             removed_cleanly = proc.returncode == 0
         except (subprocess.SubprocessError, OSError, RuntimeError):
@@ -540,8 +570,11 @@ class IsolatedSut:
         # dangling worktree registrations in the SUT repo (review finding).
         if not removed_cleanly:
             try:
-                _run(_git_argv("-C", str(self.sut_path), "worktree", "prune"),
-                     cwd=self.sut_path, timeout=30)
+                _run(
+                    _git_argv("-C", str(self.sut_path), "worktree", "prune"),
+                    cwd=self.sut_path,
+                    timeout=30,
+                )
             except (subprocess.SubprocessError, OSError, RuntimeError):
                 pass
 
@@ -564,7 +597,8 @@ def is_git_worktree(path: Path) -> bool:
     try:
         proc = _run(
             _git_argv("-C", str(path), "rev-parse", "--is-inside-work-tree"),
-            cwd=path, timeout=30,
+            cwd=path,
+            timeout=30,
         )
     except (subprocess.SubprocessError, OSError, RuntimeError):
         return False
@@ -596,7 +630,8 @@ def _git_state(path: Path) -> str:
     try:
         inside = _run(
             _git_argv("-C", str(path), "rev-parse", "--is-inside-work-tree"),
-            cwd=path, timeout=30,
+            cwd=path,
+            timeout=30,
         )
     except (subprocess.SubprocessError, OSError, RuntimeError):
         return "unknown"
@@ -604,13 +639,18 @@ def _git_state(path: Path) -> str:
     if inside.returncode != 0:
         # git ran but said "not a repository" -> confident non-git; any OTHER non-zero is a
         # surprising failure -> unknown (fail closed). git uses exit 128 for "not a git repo".
-        return "clean-nongit" if "not a git repo" in (inside.stderr or "").lower() else "unknown"
+        return (
+            "clean-nongit"
+            if "not a git repo" in (inside.stderr or "").lower()
+            else "unknown"
+        )
     if out != "true":
         return "clean-nongit"
     try:
         status = _run(
             _git_argv("-C", str(path), "status", "--porcelain"),
-            cwd=path, timeout=30,
+            cwd=path,
+            timeout=30,
         )
     except (subprocess.SubprocessError, OSError, RuntimeError):
         return "unknown"
@@ -696,7 +736,11 @@ def validate_tester_choice(models: "list[str] | None" = None) -> None:
 
 
 def _spawn_claude_writeexec(
-    prompt: str, cwd: Path, timeout: int, model: str | None = None,
+    prompt: str,
+    cwd: Path,
+    timeout: int,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Spawn Claude Code headless UN-CAGED in ``cwd`` — the deliberate inverse of the
     read-only ``review_claude_cli`` spawn (``backends.py:1175``). NO ``--disallowedTools``,
@@ -721,12 +765,26 @@ def _spawn_claude_writeexec(
     # headless safety gate BLOCKS on an untrusted folder — so without this, bare
     # `review qa` (default claude seat) could hang/fail on the trust prompt before testing
     # (review P1). qa makes a new temp worktree every run, so this is load-bearing here.
-    from ..backends import _ensure_workspace_trusted, _remove_workspace_trust
+    from ..backends import (
+        _claude_cli_supports_effort,
+        _claude_reasoning_effort,
+        _ensure_workspace_trusted,
+        _prompt_with_effort,
+        _remove_workspace_trust,
+    )
 
     _ensure_workspace_trusted(cwd)
+    # Run-scoped --effort (review-cli#127 harvest): pass `--effort <level>` ONLY when the
+    # resolved claude binary advertises it (some claude-p builds don't), mirroring #150's
+    # capability-gated read-only claude seat. The universal prompt hint carries the level
+    # either way, so an effort request is never silently dropped.
+    prompt = _prompt_with_effort(prompt, effort)
+    _ce = _claude_reasoning_effort(effort)
+    claude_effort = _ce if _ce and _claude_cli_supports_effort(claude_p) else None
     argv = [
         claude_p,
-        "--cwd", str(cwd),
+        "--cwd",
+        str(cwd),
         # bypassPermissions auto-grants every tool (the un-caged tester profile). The
         # explicit --allowedTools list is belt-and-suspenders, NOT the security boundary
         # (the worktree is) and NOT strictly needed under bypassPermissions — kept because
@@ -734,8 +792,16 @@ def _spawn_claude_writeexec(
         # tester's toolset. claude-p parses --allowedTools as nargs (verified by a working
         # live run); if a future build made it single-valued the tail would leak as
         # positionals, so keep it adjacent to the permission flag, before --output-format.
-        "--permission-mode", "bypassPermissions",
-        "--allowedTools", "Bash", "Edit", "MultiEdit", "Write", "Read", "Glob", "Grep",
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Bash",
+        "Edit",
+        "MultiEdit",
+        "Write",
+        "Read",
+        "Glob",
+        "Grep",
         # CLEAN final text, not the lossy TUI scrape. claude-p drives an interactive TUI
         # agent; an agentic run's stdout is box-drawing chrome + a spinner, NOT the agent's
         # text — so a plain `-p` run buries the literal `## QA RESULTS` block and the parser
@@ -756,17 +822,26 @@ def _spawn_claude_writeexec(
         # `codex exec` emits structured text); the claude seat returns clean text wherever
         # claude-p is a real `claude -p` JSONL backend. The mocked-tester DoD covers the
         # plumbing deterministically regardless of which live backend is installed.
-        "--output-format", "json",
-        "--timeout-sec", str(timeout),
+        "--output-format",
+        "json",
+        "--timeout-sec",
+        str(timeout),
         # Forward an explicit model when one was requested (`-m claude:<model>` /
         # REVIEW_QA_TESTER_MODEL); otherwise claude-p uses its own default (review-cli#60).
         *(["--model", model] if model else []),
+        *(["--effort", claude_effort] if claude_effort else []),
         "-p",
     ]
     try:
         proc = _run_streamed(
-            argv, cwd=cwd, input_text=prompt, timeout=timeout + 30,
-            backend="qa-claude", round_no=0, announce=True, timeout_mode="wall",
+            argv,
+            cwd=cwd,
+            input_text=prompt,
+            timeout=timeout + 30,
+            backend="qa-claude",
+            round_no=0,
+            announce=True,
+            timeout_mode="wall",
         )
     finally:
         # Reap the trust entry we seeded — but ONLY for an EPHEMERAL `review-qa-wt-*` worktree, so
@@ -778,12 +853,17 @@ def _spawn_claude_writeexec(
     return _completed_with_text(proc, _extract_claude_final_text(proc.stdout))
 
 
-def _completed_with_text(proc: subprocess.CompletedProcess, text: str) -> subprocess.CompletedProcess:
+def _completed_with_text(
+    proc: subprocess.CompletedProcess, text: str
+) -> subprocess.CompletedProcess:
     """A copy of ``proc`` whose ``stdout`` is the cleaned final text (the rest preserved).
     Lets the spawn normalize the backend's raw stdout into the transcript the parser reads
     without the caller caring whether it came from JSON or plain text."""
     return subprocess.CompletedProcess(
-        args=proc.args, returncode=proc.returncode, stdout=text, stderr=proc.stderr,
+        args=proc.args,
+        returncode=proc.returncode,
+        stdout=text,
+        stderr=proc.stderr,
     )
 
 
@@ -827,7 +907,11 @@ def _result_text_from_json(data: object) -> str | None:
 
 
 def _spawn_codex_writeexec(
-    prompt: str, cwd: Path, timeout: int, model: str | None = None,
+    prompt: str,
+    cwd: Path,
+    timeout: int,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Spawn codex UN-CAGED in ``cwd`` — ``codex exec -s workspace-write --full-auto``, the
     explicit opposite of ``review_codex``'s ``-s read-only`` (``backends.py:74``). The
@@ -838,17 +922,38 @@ def _spawn_codex_writeexec(
 
     ``model`` (review-cli#60): when given, ``-m <model>`` pins codex's model (e.g.
     ``review qa -m codex:gpt-5.5``); ``None`` uses codex's own default."""
+    # Run-scoped --effort (review-cli#127 harvest): honour the level the SAME way the
+    # read-only codex seat does (`-c model_reasoning_effort=...`, shared #150 mapping), plus
+    # the universal prompt hint so it is never a silent no-op. `max` maps to `xhigh`.
+    from ..backends import _codex_reasoning_effort, _prompt_with_effort
+
+    prompt = _prompt_with_effort(prompt, effort)
+    codex_effort = _codex_reasoning_effort(effort)
     # --ephemeral, like the read-only codex backend (backends.py:74): a qa prompt carries
     # suite text, logs, and SUT details — without ephemeral mode the run persists in codex
     # session state and could contaminate a later run (review security finding).
     argv = [
-        _which("codex"), "exec", "-s", "workspace-write", "--full-auto", "--ephemeral",
+        _which("codex"),
+        "exec",
+        "-s",
+        "workspace-write",
+        "--full-auto",
+        "--ephemeral",
+        *(["-c", f'model_reasoning_effort="{codex_effort}"'] if codex_effort else []),
         *(["-m", model] if model else []),
-        "-C", str(cwd), "-",
+        "-C",
+        str(cwd),
+        "-",
     ]
     return _run_streamed(
-        argv, cwd=cwd, input_text=prompt, timeout=timeout + 30,
-        backend="qa-codex", round_no=0, announce=True, timeout_mode="wall",
+        argv,
+        cwd=cwd,
+        input_text=prompt,
+        timeout=timeout + 30,
+        backend="qa-codex",
+        round_no=0,
+        announce=True,
+        timeout_mode="wall",
     )
 
 
@@ -857,7 +962,12 @@ def _fake_tester_enabled() -> bool:
     in-process responder (NO subprocess, NO model). It lets CI exercise the FULL
     executor/judge plumbing — prompt build, worktree isolation, parse, verdict->exit — with
     no live backend. OFF unless the var is set to a truthy value."""
-    return os.environ.get("REVIEW_QA_FAKE_TESTER", "").strip().lower() not in ("", "0", "false", "no")
+    return os.environ.get("REVIEW_QA_FAKE_TESTER", "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+    )
 
 
 def _fake_tester_run(prompt: str, cwd: Path) -> subprocess.CompletedProcess:
@@ -879,7 +989,8 @@ def _fake_tester_run(prompt: str, cwd: Path) -> subprocess.CompletedProcess:
     print(
         "[review-cli] qa: WARNING — REVIEW_QA_FAKE_TESTER is set; producing a FAKE tester "
         "result with NO real backend spawned. Unset it for a real qa run.",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     forced = os.environ.get("REVIEW_QA_FAKE_VERDICT", "").strip().upper()
     if forced in (VERDICT_PASS, VERDICT_FAIL, VERDICT_BLOCKED):
@@ -904,7 +1015,9 @@ def _fake_tester_run(prompt: str, cwd: Path) -> subprocess.CompletedProcess:
         "### BLOCKED\nnone\n\n"
         f"VERDICT: {verdict}\n"
     )
-    return subprocess.CompletedProcess(args=["<fake-tester>"], returncode=0, stdout=transcript, stderr="")
+    return subprocess.CompletedProcess(
+        args=["<fake-tester>"], returncode=0, stdout=transcript, stderr=""
+    )
 
 
 def _fake_drive_sut(cwd: Path) -> str:
@@ -933,6 +1046,7 @@ def run_tester(
     report_path: Path | None = None,
     backend: str | None = None,
     model: str | None = None,
+    effort: str | None = None,
 ) -> QaRunOutcome:
     """Run ONE write/exec tester against the SUT and return the parsed outcome.
 
@@ -961,11 +1075,17 @@ def run_tester(
     started = time.monotonic()
     try:
         if in_place:
-            proc = _dispatch_tester(backend, prompt_builder(sut_path), sut_path, timeout, model)
+            proc = _dispatch_tester(
+                backend, prompt_builder(sut_path), sut_path, timeout, model, effort
+            )
         else:
             with IsolatedSut(sut_path) as worktree:
-                proc = _dispatch_tester(backend, prompt_builder(worktree), worktree, timeout, model)
-        outcome = _build_outcome(proc, backend=backend, wall=time.monotonic() - started, model=model)
+                proc = _dispatch_tester(
+                    backend, prompt_builder(worktree), worktree, timeout, model, effort
+                )
+        outcome = _build_outcome(
+            proc, backend=backend, wall=time.monotonic() - started, model=model
+        )
     except (RuntimeError, OSError) as exc:
         # The backend could not be LAUNCHED (missing `claude-p`/`codex` -> `_which` RuntimeError;
         # a Popen/exec OSError). "Couldn't run the tester" must be a controlled non-zero qa
@@ -989,7 +1109,9 @@ def run_tester(
     # Persist the report on EVERY path — including a BLOCKED launch failure — so the "Report ->
     # …" the handler prints always corresponds to a real file (review finding).
     if report_path is not None:
-        _write_report(report_path, outcome=outcome, sut_path=sut_path, in_place=in_place)
+        _write_report(
+            report_path, outcome=outcome, sut_path=sut_path, in_place=in_place
+        )
     return outcome
 
 
@@ -1015,8 +1137,14 @@ def _launch_failed_outcome(backend: str, exc: Exception, wall: float) -> QaRunOu
         f"### BLOCKED\n- could not launch the {backend} tester: {exc}\n\nVERDICT: BLOCKED\n"
     )
     return QaRunOutcome(
-        verdict=VERDICT_BLOCKED, findings=0, max_severity=None, transcript=msg,
-        backend=backend, model=model, returncode=1, wall_seconds=wall,
+        verdict=VERDICT_BLOCKED,
+        findings=0,
+        max_severity=None,
+        transcript=msg,
+        backend=backend,
+        model=model,
+        returncode=1,
+        wall_seconds=wall,
         stderr=str(exc),
     )
 
@@ -1052,18 +1180,45 @@ def _guard_in_place(*, backend: str, in_place: bool, sut_path: Path) -> None:
         )
 
 
+def resolve_tester_effort(effort_override: object, backend: str) -> str | None:
+    """The run-scoped effort level for the single-seat qa tester, or None.
+
+    qa runs ONE write/exec tester, so the effort resolves against the tester's BACKEND
+    (``codex``/``claude``) — NOT a pinned model. ``EffortOverride`` scopes overrides by
+    PROVIDER ROUTE, and ``resolved_tester_model`` returns a bare suffix (e.g. ``gpt-5.5``)
+    that ``effort_for`` would misclassify as the opencode catch-all, so
+    ``review qa -m codex:gpt-5.5 --effort codex=high`` would drop the scoped level and a bare
+    global level could wrongly override a scoped one (review-cli#127 review P1). Keying on the
+    already-resolved backend name is the correct provider token. ``None`` override -> ``None``
+    (no --effort passed) keeps the spawn byte-identical to before."""
+    if effort_override is None:
+        return None
+    return effort_override.effort_for(backend)  # type: ignore[attr-defined]
+
+
 def _dispatch_tester(
-    backend: str, prompt: str, cwd: Path, timeout: int, model: str | None = None,
+    backend: str,
+    prompt: str,
+    cwd: Path,
+    timeout: int,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> subprocess.CompletedProcess:
+    # The fake in-process tester takes the prompt VERBATIM (no effort mutation) so the
+    # deterministic CI plumbing stays byte-stable; only a real backend spawn honours effort.
     if _fake_tester_enabled():
         return _fake_tester_run(prompt, cwd)
     if backend == "codex":
-        return _spawn_codex_writeexec(prompt, cwd, timeout, model)
-    return _spawn_claude_writeexec(prompt, cwd, timeout, model)
+        return _spawn_codex_writeexec(prompt, cwd, timeout, model, effort)
+    return _spawn_claude_writeexec(prompt, cwd, timeout, model, effort)
 
 
 def _build_outcome(
-    proc: subprocess.CompletedProcess, *, backend: str, wall: float, model: str | None = None,
+    proc: subprocess.CompletedProcess,
+    *,
+    backend: str,
+    wall: float,
+    model: str | None = None,
 ) -> QaRunOutcome:
     transcript = proc.stdout or ""
     verdict, findings, max_sev, cases = parse_qa_results(transcript)
@@ -1076,11 +1231,18 @@ def _build_outcome(
     # honest about which model actually ran (review-cli#60).
     model = model or ("codex" if backend == "codex" else "claude")
     return QaRunOutcome(
-        verdict=verdict, findings=findings, max_severity=max_sev,
-        transcript=transcript, backend=backend, model=model,
-        returncode=proc.returncode, wall_seconds=wall,
-        cases_run=cases_run, cases_passed=cases.get("passed"),
-        cases_failed=cases.get("failed"), cases_blocked=cases.get("blocked"),
+        verdict=verdict,
+        findings=findings,
+        max_severity=max_sev,
+        transcript=transcript,
+        backend=backend,
+        model=model,
+        returncode=proc.returncode,
+        wall_seconds=wall,
+        cases_run=cases_run,
+        cases_passed=cases.get("passed"),
+        cases_failed=cases.get("failed"),
+        cases_blocked=cases.get("blocked"),
         stderr=proc.stderr or "",
     )
 
@@ -1142,7 +1304,9 @@ def _honor_pass_only_with_cases(verdict: str, cases_run: int | None) -> str:
     return verdict
 
 
-def _write_report(report_path: Path, *, outcome: QaRunOutcome, sut_path: Path, in_place: bool) -> None:
+def _write_report(
+    report_path: Path, *, outcome: QaRunOutcome, sut_path: Path, in_place: bool
+) -> None:
     """Persist the full transcript + a cost/accounting footer to ``--report``. Best-effort:
     a write failure is surfaced on stderr but never fails the run (the transcript is also
     returned to the caller).
@@ -1176,5 +1340,8 @@ def _write_report(report_path: Path, *, outcome: QaRunOutcome, sut_path: Path, i
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(outcome.transcript + footer)
     except OSError as exc:
-        print(f"[review-cli] qa: could not write report to {report_path}: {exc}",
-              file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] qa: could not write report to {report_path}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
