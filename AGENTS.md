@@ -150,6 +150,44 @@ settings.json) is reported as `! conflict`, left as-is, and the command exits no
 keep that honest — when you add an install target, return whether it changed so the summary
 stays accurate.
 
+### `install-commit-hook` delegates to `rig apply` when rig is present
+
+`install_commit_hook` writes a GLOBAL git pre-commit hook (`core.hooksPath`). When
+[rig](https://github.com/alex-mextner/rig-cli) is also on the machine, its
+`git_hooks.dispatcher` provisions the SAME mechanism as one stage of its composed pre-commit
+(`agent-tools/git-hooks/global-dispatcher/hooks/review-gate` — ported verbatim from this
+command) — two tools writing `core.hooksPath` is the exact double-write the shared
+`agenttools_rig_delegate` lib (agent-tools#282, stdlib-only) exists to remove. `install_commit_hook`
+guard-imports it (`_rig_delegate_helper`) and, when rig is present, delegates **scoped**:
+`delegate(["apply", "--only", "git_hooks"])` — never reconciling unrelated areas (permissions /
+GitHub / tools) as a side effect of installing a commit hook. Three outcomes:
+
+- rig **fails** (non-zero) -> surface that exit code as-is (a real rig failure is never
+  swallowed into the fallback — that would recreate the double-write).
+- rig **succeeds and the REVIEW gate is in place** (`_commit_gate_active()`: `core.hooksPath`
+  resolves to a dir with an executable `pre-commit` that is either the direct marker gate OR is
+  rig's composer that BOTH references `review-gate` AND is accompanied by an executable
+  `review-gate` sibling stage file — an UNRELATED pre-existing global hook, and a bare orphan
+  `review-gate` file next to an ordinary hook that never invokes it, both do NOT count) -> rig
+  owns it,
+  return 0.
+- rig **succeeds but provisions no gate here** (the repo declares no `git_hooks:` block, so the
+  scoped apply is a no-op for hooks) -> fall back to `_install_commit_hook_direct`, which installs
+  the gate when `core.hooksPath`'s pre-commit slot is free, or reports a `NOT ours` conflict
+  (rc 1) WITHOUT clobbering when a foreign hook already occupies it. This is distinct from a rig
+  failure.
+
+rig absent, or the helper not installed (`pip install -e <agent-tools>/lib/agenttools_rig_delegate`,
+the `rig-delegate` extra) -> `_install_commit_hook_direct` runs exactly as before.
+
+**`install-skill`'s SessionStart hook does NOT delegate.** rig's own `tools:` provisioning
+(`riglib/tools.py` in rig-cli) runs THIS repo's `install.sh`, which itself calls `review
+install-skill` — rig is a CONSUMER of `install-skill`, not an independent provider of the same
+hook. Delegating `install-skill` to `rig apply` would risk a `review install-skill` -> `rig
+apply` -> (`tools:` block) -> `install.sh` -> `review install-skill` cycle on a machine that
+lists `review` under its `tools.items`. `install-hook tg` is unrelated to rig entirely (a
+tg-cli descriptor; rig has no equivalent) and likewise does not delegate.
+
 ## Visual review proof
 
 `review visual` / `review <text-mode> --visual` is not proven by a normal text-mode answer. Before reporting that a
