@@ -5,6 +5,7 @@ decomposition — zero behaviour change). The reviewer-board layer (role lenses 
 `board:` config, HYP-741) is additive: with no `board:` in config.yaml the legacy
 DEFAULT_MODELS panel is untouched.
 """
+
 from __future__ import annotations
 
 import sys
@@ -67,7 +68,7 @@ def _agentic(seat: str) -> str:
     if seat.startswith("oc:"):
         return seat
     if seat.startswith("opencode:"):
-        return "oc:" + seat[len("opencode:"):]
+        return "oc:" + seat[len("opencode:") :]
     if ":" not in seat:
         return f"oc:{seat}"
     provider, model = seat.split(":", 1)
@@ -90,6 +91,13 @@ VISUAL_MODELS = (
 # Friendly aliases for claude models, expanded in _split_models() and the
 # default/config paths, so `-m fable5` == `-m claude:claude-fable-5`.
 MODEL_ALIASES = {
+    # opus is a MODEL, not a backend token — bare `opus` used to fall through
+    # `_match_named_backend` to the opencode catch-all (`opencode -m opus`), whose agentic
+    # backend infra-fails and blocks review quorums. Pin it to the reliable claude-direct
+    # provider. (Provider-failover's DEFAULT_PROVIDER_CHAINS then adds opencode as the
+    # FAILOVER alternate, not the default.)
+    "opus": "claude:claude-opus-4-8",
+    "opus48": "claude:claude-opus-4-8",
     "fable": "claude:claude-fable-5",
     "fable5": "claude:claude-fable-5",
     "sol": SOL_SEAT,
@@ -294,7 +302,9 @@ DEFAULT_BOARD = (
     # priority 7 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(_agentic("commandcode:Qwen/Qwen3.7-Max"), "security", "Qwen"),
     # priority 8 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
-    BoardReviewer(_agentic("commandcode:deepseek/deepseek-v4-pro"), "tests", "DeepSeek"),
+    BoardReviewer(
+        _agentic("commandcode:deepseek/deepseek-v4-pro"), "tests", "DeepSeek"
+    ),
     # priority 9 — Gemini.
     BoardReviewer("gemini", "contracts", "Gemini"),
     # priority 10 (LAST-RESORT reserve) — GLM-5.2 (his z.ai subscription, the newest GLM),
@@ -320,8 +330,7 @@ HEAVY_PRESET_BOARD = tuple(
     for i, r in enumerate(DEFAULT_BOARD)
 )
 LIGHT_PRESET_BOARD = tuple(
-    BoardReviewer(r.model, r.role, r.display, "medium")
-    for r in DEFAULT_PRESET_BOARD
+    BoardReviewer(r.model, r.role, r.display, "medium") for r in DEFAULT_PRESET_BOARD
 )
 
 PRESET_BOARDS = {
@@ -356,7 +365,9 @@ def preset_pool_size(name: str | None) -> int:
     try:
         return PRESET_POOL_SIZES[name]
     except KeyError as exc:
-        raise ValueError(f"unknown preset {name!r}; expected one of {', '.join(preset_names())}") from exc
+        raise ValueError(
+            f"unknown preset {name!r}; expected one of {', '.join(preset_names())}"
+        ) from exc
 
 
 def preset_board(name: str | None) -> list[BoardReviewer]:
@@ -365,7 +376,9 @@ def preset_board(name: str | None) -> list[BoardReviewer]:
     try:
         return [replace(r) for r in PRESET_BOARDS[name]]
     except KeyError as exc:
-        raise ValueError(f"unknown preset {name!r}; expected one of {', '.join(preset_names())}") from exc
+        raise ValueError(
+            f"unknown preset {name!r}; expected one of {', '.join(preset_names())}"
+        ) from exc
 
 
 def _normalize_effort(value: object) -> str | None:
@@ -598,7 +611,7 @@ def _resolve_capability_model(spec: str) -> str | None:
 
     spec = spec.strip()
     if spec.startswith("role:"):
-        return _manifest.resolve_role(spec[len("role:"):].strip())
+        return _manifest.resolve_role(spec[len("role:") :].strip())
     return _manifest.resolve_capability(spec)
 
 
@@ -633,11 +646,15 @@ def _capability_fail_reason(capability: str) -> str:
         if role_match is not None:
             # Suggest the role's CANONICAL casing (the manifest key), so the hint never dead-ends
             # on a case mismatch (`capability: Architect` -> hint `role:architect`, which resolves).
-            return (f"capability {spec!r} is a ROLE name, not a capability tag — write "
-                    f"'capability: role:{role_match}' to use the manifest's role map")
-    return (f"capability {spec!r} could not be resolved from the model manifest "
-            "(unknown capability tag / no model carries the tag / unknown role / no manifest "
-            "reachable — is agent-tools lib/contracts/models.yaml present?)")
+            return (
+                f"capability {spec!r} is a ROLE name, not a capability tag — write "
+                f"'capability: role:{role_match}' to use the manifest's role map"
+            )
+    return (
+        f"capability {spec!r} could not be resolved from the model manifest "
+        "(unknown capability tag / no model carries the tag / unknown role / no manifest "
+        "reachable — is agent-tools lib/contracts/models.yaml present?)"
+    )
 
 
 def _resolve_entry_model(entry: dict) -> str | None:
@@ -652,15 +669,22 @@ def _resolve_entry_model(entry: dict) -> str | None:
     if isinstance(capability, str) and capability.strip():
         resolved = _resolve_capability_model(capability)
         if resolved is None:
-            print(f"[review-cli] board entry ignored ({_capability_fail_reason(capability)}): "
-                  f"{entry!r}", file=sys.stderr, flush=True)
+            print(
+                f"[review-cli] board entry ignored ({_capability_fail_reason(capability)}): "
+                f"{entry!r}",
+                file=sys.stderr,
+                flush=True,
+            )
             return None
         # Run the resolved seat through the SAME alias normalization the literal `model:` path
         # uses, so an equivalent value (e.g. a manifest id that happens to be an alias) can't
         # behave differently between the two paths.
         return _expand_alias(resolved)
-    print(f"[review-cli] board entry ignored (missing 'model' or 'capability'): {entry!r}",
-          file=sys.stderr, flush=True)
+    print(
+        f"[review-cli] board entry ignored (missing 'model' or 'capability'): {entry!r}",
+        file=sys.stderr,
+        flush=True,
+    )
     return None
 
 
@@ -669,8 +693,11 @@ def _parse_board_entry(entry: object) -> BoardReviewer | None:
     it's unusable so `load_board` skips it. A seat comes from a literal `model:` or a
     capability-resolved `capability:` (rig-cli#8)."""
     if not isinstance(entry, dict):
-        print(f"[review-cli] board entry ignored (not a mapping): {entry!r}",
-              file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] board entry ignored (not a mapping): {entry!r}",
+            file=sys.stderr,
+            flush=True,
+        )
         return None
     model = _resolve_entry_model(entry)
     if model is None:
@@ -678,16 +705,24 @@ def _parse_board_entry(entry: object) -> BoardReviewer | None:
     role = entry.get("role")
     role = role.strip() if isinstance(role, str) else ""
     if role and role not in REVIEW_ROLES:
-        print(f"[review-cli] board reviewer {model!r}: unknown role {role!r} — "
-              f"using the generic review prompt (known roles: "
-              f"{', '.join(sorted(REVIEW_ROLES))})", file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] board reviewer {model!r}: unknown role {role!r} — "
+            f"using the generic review prompt (known roles: "
+            f"{', '.join(sorted(REVIEW_ROLES))})",
+            file=sys.stderr,
+            flush=True,
+        )
     name = entry.get("name")
-    display = name.strip() if isinstance(name, str) and name.strip() else _display_name(model)
+    display = (
+        name.strip() if isinstance(name, str) and name.strip() else _display_name(model)
+    )
     effort = _normalize_effort(entry.get("effort"))
     return BoardReviewer(model=model, role=role, display=display, effort=effort)
 
 
-def load_board(config: dict | None = None, *, preset: str | None = None) -> list[BoardReviewer]:
+def load_board(
+    config: dict | None = None, *, preset: str | None = None
+) -> list[BoardReviewer]:
     """Resolve the active reviewer board.
 
     A `board:` key in config.yaml (a list of `{model | capability, role[, name]}`
@@ -741,7 +776,10 @@ def load_board(config: dict | None = None, *, preset: str | None = None) -> list
 
 
 def board_from_models(
-    models: list[str], config: dict | None = None, *, preset: str | None = None,
+    models: list[str],
+    config: dict | None = None,
+    *,
+    preset: str | None = None,
 ) -> list[BoardReviewer]:
     """Build a priority reviewer board from a config `models:` roster.
 
@@ -751,7 +789,9 @@ def board_from_models(
     preset is explicit, it overlays config metadata so preset effort cannot be downgraded
     by a saved board entry.
     """
-    metadata: dict[str, BoardReviewer] = {reviewer.model: reviewer for reviewer in DEFAULT_BOARD}
+    metadata: dict[str, BoardReviewer] = {
+        reviewer.model: reviewer for reviewer in DEFAULT_BOARD
+    }
     raw_board = (config or {}).get("board") if isinstance(config, dict) else None
     if isinstance(raw_board, list):
         for entry in raw_board:
@@ -762,8 +802,12 @@ def board_from_models(
     preset_default_effort: str | None = None
     if preset:
         preset_reviewers = preset_board(preset)
-        preset_effort_by_model = {reviewer.model: reviewer.effort for reviewer in preset_reviewers}
-        preset_default_effort = next((reviewer.effort for reviewer in preset_reviewers if reviewer.effort), None)
+        preset_effort_by_model = {
+            reviewer.model: reviewer.effort for reviewer in preset_reviewers
+        }
+        preset_default_effort = next(
+            (reviewer.effort for reviewer in preset_reviewers if reviewer.effort), None
+        )
         for reviewer in preset_reviewers:
             base = metadata.get(reviewer.model)
             if base is None:
@@ -779,16 +823,27 @@ def board_from_models(
     board: list[BoardReviewer] = []
     for model in models:
         reviewer = metadata.get(model)
-        preset_model_effort = preset_effort_by_model.get(model, preset_default_effort) if preset else None
+        preset_model_effort = (
+            preset_effort_by_model.get(model, preset_default_effort) if preset else None
+        )
         if reviewer is None:
-            board.append(BoardReviewer(model=model, role="", display=_display_name(model), effort=preset_model_effort))
+            board.append(
+                BoardReviewer(
+                    model=model,
+                    role="",
+                    display=_display_name(model),
+                    effort=preset_model_effort,
+                )
+            )
         else:
-            board.append(BoardReviewer(
-                model=model,
-                role=reviewer.role,
-                display=reviewer.display,
-                effort=preset_model_effort if preset else reviewer.effort,
-            ))
+            board.append(
+                BoardReviewer(
+                    model=model,
+                    role=reviewer.role,
+                    display=reviewer.display,
+                    effort=preset_model_effort if preset else reviewer.effort,
+                )
+            )
     return board
 
 

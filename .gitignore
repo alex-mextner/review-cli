@@ -22,3 +22,6 @@ uv.lock
 # not committed (binary bloat; the dashboard is verified by running it, not stored PNGs).
 # Anchored to the repo root so it never hides an intentional nested screenshots/ asset dir.
 /screenshots/
+
+# Live tier-2 bot credentials (never commit)
+.env.live
