@@ -185,6 +185,280 @@ def test_jobs_dir_falls_back_when_it_exists_but_is_not_writable(tmp_path, monkey
         os.chmod(preexisting_but_readonly, stat.S_IRWXU)
 
 
+def test_write_job_rejects_a_malformed_id_before_touching_the_filesystem(
+    tmp_path, monkeypatch
+):
+    """codex review (review-cli#162 follow-up, PR #164): `write_job()` used to open the
+    LOCK file (`_job_lock` -> `os.open`) before `job_path()` ever validated the job-id
+    shape — so a path-shaped `job_id` (an absolute path or a `../` traversal) could
+    create/lock an arbitrary file OUTSIDE `jobs_dir()` before `InvalidJobId` was ever
+    raised. Validation now runs in `_job_lock_path` too (the same choke point
+    `job_path` uses), so a malformed id must raise BEFORE any file appears anywhere —
+    not just eventually, from a DIFFERENT function than the one that actually failed
+    first."""
+    jobs_dir = tmp_path / "jobs"
+    monkeypatch.setenv("REVIEW_JOBS_DIR", str(jobs_dir))
+    outside_target = tmp_path / "outside.lock"
+    malformed_id = f"../{outside_target.stem}"
+    try:
+        _j.write_job(malformed_id, status="running")
+        raise AssertionError("expected InvalidJobId for a path-traversal job id")
+    except _j.InvalidJobId:
+        pass
+    # Nothing was created anywhere — neither inside jobs_dir (which may not even exist
+    # yet) nor at the traversal target outside it.
+    assert not outside_target.exists()
+    assert not jobs_dir.exists() or not any(jobs_dir.iterdir())
+
+
+def test_jobs_dir_fallback_is_discoverable_from_a_fresh_process_state(
+    tmp_path, monkeypatch
+):
+    """codex review (review-cli#162 follow-up, PR #164): once BOTH the standard jobs
+    location AND the fixed uid-keyed temp path are unusable, `jobs_dir()`'s last
+    resort mints a brand-new `tempfile.mkdtemp()` directory — which is random by
+    design. Simulating a totally independent LATER process (no module-level cache,
+    since that only helps repeat calls within the SAME process) must still find the
+    SAME directory a prior process minted, via the fixed pointer file — not silently
+    create a second, different one that a `review status`/`review jobs` call could
+    never find the original job record in."""
+    import tempfile as _tempfile
+
+    fake_temp_root = tmp_path / "fake-temp-root"
+    fake_temp_root.mkdir()
+    unwritable_std = tmp_path / "std-jobs"
+    unwritable_std.mkdir(mode=0o500)
+    try:
+        monkeypatch.setenv("REVIEW_JOBS_DIR", str(unwritable_std))
+        monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(fake_temp_root))
+        # Also make the FIXED uid-keyed temp path unusable so this hits the mkdtemp tier.
+        stale_fixed = fake_temp_root / f"review-cli-jobs-{os.getuid()}"
+        stale_fixed.mkdir(mode=0o500)
+        try:
+            first = _j.jobs_dir()
+            # Simulate a totally fresh process: clear the per-process memoization cache
+            # (a fresh process would never have populated it) and call again.
+            _j._jobs_dir_fallback_cache = None
+            second = _j.jobs_dir()
+            assert first == second
+        finally:
+            os.chmod(stale_fixed, 0o700)
+    finally:
+        os.chmod(unwritable_std, 0o700)
+        _j._jobs_dir_fallback_cache = None
+
+
+def test_read_job_finds_a_record_in_the_secondary_pointer_dir_after_sandbox_widens(
+    tmp_path, monkeypatch
+):
+    """codex review (review-cli#162 follow-up, PR #164, round 2): a job's bookkeeping
+    write and a LATER read of it can resolve `jobs_dir()` to two DIFFERENT
+    directories even without any code bug — e.g. a `--detach` spawn hits the
+    mkdtemp() fallback tier (records a pointer) while the standard cache location is
+    still unwritable, but by the time `review status` is called the sandbox grant
+    has WIDENED and the standard location is writable again, so `jobs_dir()` no
+    longer even reaches the fallback tier and never looks at the pointer. Simulates
+    exactly this: write a job record directly into a fallback dir (with a pointer),
+    then call `read_job`/`list_jobs` against a jobs_dir() that resolves to the
+    STANDARD (writable) location — the record must still be found.
+
+    Deliberately does NOT use `$REVIEW_JOBS_DIR` (codex review round 3: secondary
+    discovery is intentionally skipped entirely when that override is set — an
+    explicit override means "use exactly this directory", and every test in this
+    suite otherwise relies on it for isolation, so honoring it here would make the
+    fix accidentally test itself out of existence for the one case it's supposed to
+    help). Instead monkeypatches `Path.home()` so the STANDARD (no-override)
+    resolution branch lands under an isolated fake home."""
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.delenv("REVIEW_JOBS_DIR", raising=False)
+    fallback_dir = tmp_path / "fallback-jobs"
+    fallback_dir.mkdir()
+
+    monkeypatch.setattr(_j, "_read_fallback_pointer", lambda: fallback_dir)
+
+    job_id = _j.new_job_id()
+    (fallback_dir / f"{job_id}.json").write_text(
+        '{"job_id": "%s", "status": "done", "pid": 1}' % job_id, encoding="utf-8"
+    )
+
+    rec = _j.read_job(job_id)
+    assert rec is not None and rec["status"] == "done"
+    all_jobs = _j.list_jobs()
+    assert any(j["job_id"] == job_id for j in all_jobs)
+
+
+def test_secondary_jobs_dir_skips_discovery_when_review_jobs_dir_is_set(
+    tmp_path, monkeypatch
+):
+    """codex review (review-cli#162 follow-up, PR #164, round 3): an explicit
+    `$REVIEW_JOBS_DIR` override must NOT be silently widened by also consulting the
+    machine-wide pointer — that would leak unrelated job records (potentially
+    carrying another run's prompt/diff in its `argv`) across a boundary the caller
+    set up specifically to isolate. `_secondary_jobs_dir()` must return None whenever
+    the override is present, even if a pointer to a genuinely different directory
+    exists."""
+    override_dir = tmp_path / "override-jobs"
+    override_dir.mkdir()
+    other_dir = tmp_path / "unrelated-other-jobs"
+    other_dir.mkdir()
+    monkeypatch.setenv("REVIEW_JOBS_DIR", str(override_dir))
+    monkeypatch.setattr(_j, "_read_fallback_pointer", lambda: other_dir)
+    assert _j._secondary_jobs_dir() is None
+
+
+def test_open_pointer_lock_refuses_a_foreign_owned_lock_file(tmp_path, monkeypatch):
+    """codex review (review-cli#162 follow-up, PR #164, round 3): the lock file lives
+    at an equally predictable path as the pointer it protects. A foreign-owned but
+    world-writable regular file pre-planted there would pass the `os.open` (its perm
+    bits allow it), but `flock(LOCK_EX)` could then block INDEFINITELY on whatever
+    that OTHER user's process is doing with the same file — turning a best-effort
+    coordination mechanism into a hang. `_open_pointer_lock` must check ownership
+    and raise BEFORE ever calling `flock`, not after."""
+    import tempfile as _tempfile
+
+    fake_temp_root = tmp_path / "fake-temp-root"
+    fake_temp_root.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(fake_temp_root))
+
+    class _ForeignStat:
+        st_uid = os.getuid() + 1  # never actually equals our own uid
+
+    monkeypatch.setattr(os, "fstat", lambda fd: _ForeignStat())
+    try:
+        _j._open_pointer_lock()
+        raise AssertionError("expected OSError for a foreign-owned lock file")
+    except OSError:
+        pass
+
+
+def test_read_fallback_pointer_does_not_hang_on_a_preplanted_fifo(
+    tmp_path, monkeypatch
+):
+    """codex review (review-cli#162 follow-up, PR #164, round 4): another local user
+    could plant a FIFO (not a symlink, so `O_NOFOLLOW` alone doesn't stop it) at the
+    pointer's predictable path. A blocking `O_RDONLY` open on a FIFO with no writer
+    hangs forever — `O_NONBLOCK` must make the open return immediately, and the
+    subsequent `stat.S_ISREG` check must then reject it as "not a regular file"
+    rather than trying to read from it."""
+    import tempfile as _tempfile
+
+    fake_temp_root = tmp_path / "fake-temp-root"
+    fake_temp_root.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(fake_temp_root))
+    os.mkfifo(_j._fallback_pointer_path())
+    # No writer ever opens the other end — if this hangs, the test itself times out
+    # (pytest's default has no global timeout, but a hang here would block the whole
+    # suite; a passing run proves it returned promptly).
+    assert _j._read_fallback_pointer() is None
+
+
+def test_write_fallback_pointer_refuses_a_foreign_owned_regular_file(
+    tmp_path, monkeypatch
+):
+    """codex review (review-cli#162 follow-up, PR #164, round 4): a foreign-owned but
+    world-writable regular file could already sit at the pointer's predictable path.
+    `_write_fallback_pointer` must NOT truncate/overwrite it — that would mean this
+    process modifying a file it doesn't own just because loose permissions allowed
+    the write. Simulated via a monkeypatched `Path.lstat` reporting a foreign owner
+    for the pointer path specifically."""
+    import tempfile as _tempfile
+
+    fake_temp_root = tmp_path / "fake-temp-root"
+    fake_temp_root.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(fake_temp_root))
+    pointer_path = _j._fallback_pointer_path()
+    pointer_path.write_text("original content owned by someone else")
+
+    real_lstat = Path.lstat
+
+    class _ForeignStat:
+        st_uid = os.getuid() + 1
+        st_mode = 0o100644  # a regular file, just foreign-owned
+
+    def _fake_lstat(self, *a, **k):
+        if self == pointer_path:
+            return _ForeignStat()
+        return real_lstat(self, *a, **k)
+
+    monkeypatch.setattr(Path, "lstat", _fake_lstat)
+    _j._write_fallback_pointer(tmp_path / "some-new-fallback-dir")
+    assert pointer_path.read_text() == "original content owned by someone else"
+
+
+def test_write_fallback_pointer_is_atomic_no_empty_read_window(tmp_path, monkeypatch):
+    """codex review (review-cli#162 follow-up, PR #164, round 4): the pointer is
+    published via a same-directory temp file + `os.replace`, not a truncate-in-place
+    write — so a reader can never observe a transient EMPTY pointer file mid-write.
+    Proven here by asserting no `.tmp*` sibling survives and the final content is
+    exactly what was written in one shot (a truncate-in-place version would still
+    pass this specific assertion, but this at least pins the visible contract; the
+    atomicity itself is inherent to `os.replace` being a single syscall)."""
+    import tempfile as _tempfile
+
+    fake_temp_root = tmp_path / "fake-temp-root"
+    fake_temp_root.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(fake_temp_root))
+    target = tmp_path / "the-fallback-dir"
+    _j._write_fallback_pointer(target)
+    pointer_path = _j._fallback_pointer_path()
+    assert pointer_path.read_text() == str(target)
+    leftovers = list(fake_temp_root.glob("*.tmp*"))
+    assert leftovers == []
+
+
+def test_fallback_pointer_rejects_a_symlinked_pointer_file(tmp_path, monkeypatch):
+    """codex review (review-cli#162 follow-up, PR #164): the pointer file lives at a
+    PREDICTABLE path under the shared system temp root. Another local user could
+    pre-plant a symlink there pointing at a directory THEY control, hoping
+    `_read_fallback_pointer` naively trusts it and redirects this process's job
+    bookkeeping (secret-bearing argv) somewhere the attacker can read. `O_NOFOLLOW`
+    must make the read fail closed (treated as "nothing recorded yet"), never follow
+    the symlink.
+
+    Monkeypatches `tempfile.gettempdir()` to an isolated `tmp_path` (codex review,
+    round 2) — a prior version of this test deleted and replaced the REAL, LIVE
+    pointer file under the actual shared system temp dir, which on this
+    multi-agent machine could erase discovery metadata for a genuinely running
+    `--detach` job while this test suite happened to execute."""
+    import tempfile as _tempfile
+
+    fake_temp_root = tmp_path / "fake-temp-root"
+    fake_temp_root.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(fake_temp_root))
+    attacker_dir = tmp_path / "attacker-controlled"
+    attacker_dir.mkdir()
+    pointer_path = _j._fallback_pointer_path()
+    pointer_path.symlink_to(attacker_dir / "fake-pointer.txt")
+    assert _j._read_fallback_pointer() is None
+
+
+def test_fallback_pointer_write_refuses_to_follow_a_preexisting_symlink(
+    tmp_path, monkeypatch
+):
+    """codex review (review-cli#162 follow-up, PR #164): if a symlink already sits at
+    the pointer's predictable path, `_write_fallback_pointer` must NOT follow it and
+    truncate whatever it points at (the write side of the same symlink-attack
+    surface `_read_fallback_pointer`'s `O_NOFOLLOW` guards on the read side) — it
+    must fail closed (best-effort, no exception) and leave the symlink's target
+    untouched.
+
+    Same isolation fix as the sibling test above — never touch the real, live
+    pointer file under the actual shared system temp dir."""
+    import tempfile as _tempfile
+
+    fake_temp_root = tmp_path / "fake-temp-root"
+    fake_temp_root.mkdir()
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(fake_temp_root))
+    victim = tmp_path / "victim-file.txt"
+    victim.write_text("do not touch me")
+    pointer_path = _j._fallback_pointer_path()
+    pointer_path.symlink_to(victim)
+    _j._write_fallback_pointer(tmp_path / "some-fallback-dir")
+    assert victim.read_text() == "do not touch me"
+
+
 if __name__ == "__main__":
     failures = []
     for name, fn in list(globals().items()):

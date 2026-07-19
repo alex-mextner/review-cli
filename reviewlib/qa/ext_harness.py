@@ -40,6 +40,7 @@ reaped, and the session is always closed (try/finally) — an ext run leaks neit
 window nor a node process. The runner sets a per-action timeout, so a hung command can never
 wedge the run.
 """
+
 from __future__ import annotations
 
 import json
@@ -124,7 +125,13 @@ class ExtHarnessError(RuntimeError):
 
 # --- the heavy-dep gate (mirrors the web harness's playwright_available) --------------
 def _flag_enabled(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no", "off")
+    return os.environ.get(name, "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def vscode_available() -> tuple[bool, str]:
@@ -203,7 +210,10 @@ class ShellRunnerAutomation:
     the Electron tree). A launch failure raises ``ExtHarnessError`` (a controlled BLOCKED)."""
 
     def __init__(
-        self, proc: subprocess.Popen, stderr_tail: _StderrTail, stdout_reader: _StdoutLineReader,
+        self,
+        proc: subprocess.Popen,
+        stderr_tail: _StderrTail,
+        stdout_reader: _StdoutLineReader,
     ):
         self._proc = proc
         self._stderr_tail = stderr_tail
@@ -248,15 +258,21 @@ class ShellRunnerAutomation:
             req_id = self._next_id
             payload = json.dumps({"id": req_id, "op": op, **args})
             if self._proc.stdin is None:
-                raise ExtActionError("the VS Code runner has no stdin to send the request to")
+                raise ExtActionError(
+                    "the VS Code runner has no stdin to send the request to"
+                )
             try:
                 self._proc.stdin.write(payload + "\n")
                 self._proc.stdin.flush()
             except (OSError, ValueError) as exc:
-                raise ExtActionError(f"could not send {op!r} to the runner: {exc}") from exc
+                raise ExtActionError(
+                    f"could not send {op!r} to the runner: {exc}"
+                ) from exc
             reply = self._read_reply(req_id, op)
         if not reply.get("ok"):
-            raise ExtActionError(f"{op} failed: {reply.get('error', 'unknown runner error')}")
+            raise ExtActionError(
+                f"{op} failed: {reply.get('error', 'unknown runner error')}"
+            )
         return reply.get("result")
 
     def _read_reply(self, req_id: int, op: str) -> dict:
@@ -381,7 +397,11 @@ class _VSCodeSession:
     runner never signals ``ready``) raises ``ExtHarnessError`` (a controlled BLOCKED)."""
 
     def __init__(
-        self, *, extension_path: str, workspace: Path, exit_blocked: int,
+        self,
+        *,
+        extension_path: str,
+        workspace: Path,
+        exit_blocked: int,
         extra_env: dict[str, str] | None = None,
     ):
         self._extension_path = extension_path
@@ -391,6 +411,7 @@ class _VSCodeSession:
         self._proc: subprocess.Popen | None = None
         self._stderr_tail: _StderrTail | None = None
         self._stdout_reader: _StdoutLineReader | None = None
+        self._reaper_handle: tuple[subprocess.Popen, int | None] | None = None
 
     def __enter__(self) -> ShellRunnerAutomation:
         runner_cmd = _runner_command()
@@ -418,19 +439,43 @@ class _VSCodeSession:
         try:
             self._proc = subprocess.Popen(  # noqa: S603 — runtime + script resolved above
                 [*runner_cmd, str(script)],
-                cwd=str(self._workspace), env=env, start_new_session=True,
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=str(self._workspace),
+                env=env,
+                start_new_session=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
         except (OSError, ValueError) as exc:
             raise ExtHarnessError(
                 f"could not launch the ext runner {runner_cmd!r}: {exc}",
                 exit_code=self._exit_blocked,
             ) from exc
+        # Registered with the SAME signal-reaper/backstop registry a backend model
+        # child uses (codex review, review-cli#162 follow-up) — without this, an
+        # external SIGTERM/SIGINT (or the internal backstop) reaped only
+        # `_run_streamed`'s children and left the whole runner+Electron+VS Code tree
+        # behind, since `_VSCodeSession._terminate()`'s own teardown only runs from a
+        # live interpreter's normal control flow, not from a raw signal.
+        from ..process import register_external_child
+
+        self._reaper_handle = register_external_child(self._proc)
         self._stderr_tail = _StderrTail(self._proc.stderr)
         # One stdout reader for the whole session — used by _await_ready AND handed to the
         # automation, so a single thread owns the stream (two readers would race on readline).
         self._stdout_reader = _StdoutLineReader(self._proc.stdout)
-        self._await_ready()
+        try:
+            self._await_ready()
+        except BaseException:
+            # `__enter__` raising means Python NEVER calls `__exit__` (context-manager
+            # protocol) — so without this, a runner that never signals ready (or
+            # exits early) would leave its process group unreaped AND its
+            # `_reaper_handle` stuck in `_LIVE_CHILDREN` forever (codex review,
+            # review-cli#162 follow-up). `_terminate()` is idempotent, so calling it
+            # here and then again from a caller's own cleanup (if any) is harmless.
+            self._terminate()
+            raise
         return ShellRunnerAutomation(self._proc, self._stderr_tail, self._stdout_reader)
 
     def _await_ready(self) -> None:
@@ -492,10 +537,18 @@ class _VSCodeSession:
         except (OSError, ValueError):
             pass
         _terminate_group(proc)
+        if self._reaper_handle is not None:
+            from ..process import unregister_external_child
+
+            unregister_external_child(self._reaper_handle)
+            self._reaper_handle = None
 
 
 def vscode_session(
-    *, extension_path: str, workspace: Path, exit_blocked: int,
+    *,
+    extension_path: str,
+    workspace: Path,
+    exit_blocked: int,
     extra_env: dict[str, str] | None = None,
 ) -> _VSCodeSession:
     """A context manager yielding a real ``ShellRunnerAutomation`` and guaranteeing VS Code
@@ -504,8 +557,11 @@ def vscode_session(
     ``vscode_available()`` FIRST — this assumes the runtime is present (it is only reached on the
     real path)."""
     return _VSCodeSession(
-        extension_path=extension_path, workspace=workspace, exit_blocked=exit_blocked,
-        extra_env=extra_env)
+        extension_path=extension_path,
+        workspace=workspace,
+        exit_blocked=exit_blocked,
+        extra_env=extra_env,
+    )
 
 
 # --- process-group reaping (mirrors web_harness; shared shape) -------------------------

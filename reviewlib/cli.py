@@ -2525,9 +2525,15 @@ def _spawn_detached_job(raw: list[str]) -> int:
         if stdin_fd != subprocess.DEVNULL:
             os.close(stdin_fd)
 
-    # pid-only update: deliberately omits `status` so it can never regress a terminal
-    # status the child may have already written (see docstring).
-    jobs.write_job(job_id, pid=proc.pid)
+    # pid + resolved log_path update: deliberately omits `status` so it can never
+    # regress a terminal status the child may have already written (see docstring).
+    # `log_path` is re-sent here because `_open_log_with_fallback` above may have
+    # replaced it with a fallback path AFTER the initial record (written before the
+    # open was even attempted) already recorded the ORIGINAL, possibly-inaccessible
+    # one — without this, `review status`/its JSON output/log-tail all pointed at a
+    # path the sandboxed caller was never able to write to, even though the process
+    # was logging successfully elsewhere (codex review, review-cli#162 follow-up).
+    jobs.write_job(job_id, pid=proc.pid, log_path=str(log_path))
 
     print(f"[review-cli] detached job {job_id} started (pid {proc.pid})")
     print(f"[review-cli]   log:    {log_path}")

@@ -229,12 +229,40 @@ def _reregister_child(
     return new
 
 
+def register_external_child(
+    proc: subprocess.Popen, pgid: int | None = None
+) -> tuple[subprocess.Popen, int | None]:
+    """Public wrapper around `_register_child` for callers OUTSIDE this module's own
+    `_run_streamed` — the `reviewlib.qa` harnesses (`web_harness.py`, `bot_harness.py`,
+    `ext_harness.py`) each `Popen(..., start_new_session=True)` a SUT process the exact
+    same way a backend child is spawned, but were never added to `_LIVE_CHILDREN` — so
+    an external SIGTERM (or the internal backstop) reaped only model-backend children
+    and left the isolated SUT process group behind (codex review, review-cli#162
+    follow-up). `pgid` defaults to `proc.pid` (the session/group leader's pid, since
+    `start_new_session=True` always makes the child its own group leader) — the same
+    convention `_run_streamed` uses when its own `os.getpgid()` lookup is skipped.
+    Callers MUST pass the returned handle to `unregister_external_child` in a
+    `finally` once the process is reaped through its own normal teardown path."""
+    if pgid is None:
+        pgid = proc.pid
+    return _register_child(proc, pgid)
+
+
+def unregister_external_child(handle: tuple[subprocess.Popen, int | None]) -> None:
+    """Public wrapper around `_unregister_child` — see `register_external_child`."""
+    _unregister_child(handle)
+
+
 def kill_live_children() -> None:
     """Reap every still-registered backend child's process group. Best-effort, never
     raises — called from the backstop's `_fire` right before its hard exit, AND from
     `install_signal_reaper`'s SIGTERM/SIGINT handler, so a wedged/killed run's backend
     subprocesses don't outlive the terminated CLI. Each child is in its own session, so
     this kills the backends WITHOUT touching the CLI's/caller's group.
+
+    Also reaps any EXTERNALLY registered child (see `register_external_child`) — the
+    `reviewlib.qa` harnesses' SUT processes are registered the same way and torn down
+    by this same best-effort sweep.
 
     KILL-FIRST, never blocking. Unlike `_kill_tree` (the per-call path, which politely
     SIGTERMs then waits up to 3s before SIGKILL — the right etiquette for a normal

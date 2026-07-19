@@ -20,6 +20,7 @@ All deterministic: a stdlib HTTP fake + a stdlib-only subprocess bot fixture, no
 token, no model. The per-case waits are shrunk via the REVIEW_QA_BOT_*_TIMEOUT_S env so the
 suite runs in seconds. Runnable standalone (``python3 tests/test_qa_bot.py``) or under pytest.
 """
+
 from __future__ import annotations
 
 import os
@@ -67,7 +68,9 @@ def test_fake_captures_outbound_send_message():
     fake = bh.FakeTelegram()
     fake.start()
     try:
-        resp = _post(fake, "sendMessage", {"chat_id": bh.TEST_CHAT_ID, "text": "hi there"})
+        resp = _post(
+            fake, "sendMessage", {"chat_id": bh.TEST_CHAT_ID, "text": "hi there"}
+        )
         assert resp["ok"] is True
         assert resp["result"]["text"] == "hi there"
         assert len(fake.outbound) == 1
@@ -99,7 +102,10 @@ def test_fake_decodes_form_urlencoded_body():
         url = f"{fake.base_url()}/bottoken/sendMessage"
         body = b"chat_id=-100&text=form+encoded+reply"
         req = urllib.request.Request(
-            url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+            url,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         urllib.request.urlopen(req, timeout=5).read()  # noqa: S310 — loopback fake
         assert fake.outbound[0].text == "form encoded reply", fake.outbound
     finally:
@@ -127,7 +133,11 @@ def test_parse_send_expect_grammar():
     )
     cases = bd.parse_bot_cases(suite)
     assert [c.title for c in cases] == ["greet", "tap", "quiet"]
-    assert cases[0].send == "/start" and cases[0].expect == ("welcome",) and cases[0].expect_no == ("error",)
+    assert (
+        cases[0].send == "/start"
+        and cases[0].expect == ("welcome",)
+        and cases[0].expect_no == ("error",)
+    )
     assert cases[1].send_callback == "confirm:1" and cases[1].runnable
     assert cases[2].expect_silent is True
 
@@ -135,7 +145,9 @@ def test_parse_send_expect_grammar():
 def test_prose_only_case_is_not_runnable():
     """A ``## Case:`` with no Send/Send-callback is a prose-only case the hermetic driver can't
     inject — it must parse as non-runnable so the driver BLOCKS it (not a silent skip)."""
-    cases = bd.parse_bot_cases("## Case: manual thing\nSteps:\n- do it by hand\nExpected:\n- ok\n")
+    cases = bd.parse_bot_cases(
+        "## Case: manual thing\nSteps:\n- do it by hand\nExpected:\n- ok\n"
+    )
     assert cases[0].runnable is False
 
 
@@ -145,7 +157,9 @@ def _call(text: str) -> bh.OutboundCall:
 
 
 def test_classify_pass_on_matching_reply():
-    case = bd.BotCase(title="t", send="/start", expect=("welcome",), expect_no=("error",))
+    case = bd.BotCase(
+        title="t", send="/start", expect=("welcome",), expect_no=("error",)
+    )
     r = bd._classify(case, [_call("Welcome aboard!")])
     assert r.status == bd.PASS, r
 
@@ -187,8 +201,13 @@ def test_expectations_met_predicate():
     so the driver keeps the window open for a delayed later message (no early-return false-fail)."""
     case = bd.BotCase(title="t", send="/help", expect=("commands", "echo"))
     assert bd._expectations_met(case, []) is False
-    assert bd._expectations_met(case, [_call("Available commands:")]) is False  # 'echo' not yet
-    assert bd._expectations_met(case, [_call("Available commands:"), _call("/echo")]) is True
+    assert (
+        bd._expectations_met(case, [_call("Available commands:")]) is False
+    )  # 'echo' not yet
+    assert (
+        bd._expectations_met(case, [_call("Available commands:"), _call("/echo")])
+        is True
+    )
     # an Expect-no substring keeps it unsatisfied even if Expects are present
     case2 = bd.BotCase(title="t", send="/x", expect=("ok",), expect_no=("error",))
     assert bd._expectations_met(case2, [_call("ok but error")]) is False
@@ -229,7 +248,10 @@ def test_delayed_multi_message_reply_passes():
         cfg = BotConfig(driver="mock", command=("python3", "bot.py"))
         transcript = bd.run_hermetic_bot_test(
             suite_text="# S\n## Case: start\nSend: /start\nExpect: welcome\n",
-            bot_config=cfg, cwd=d, sut_path=Path("/sut/delayed"), exit_boot_failed=8,
+            bot_config=cfg,
+            cwd=d,
+            sut_path=Path("/sut/delayed"),
+            exit_boot_failed=8,
         )
         verdict, _f, _s, _c = parse_qa_results(transcript)
         assert verdict == "PASS", transcript  # the later message's 'welcome' is matched
@@ -243,10 +265,12 @@ def test_run_result_renders_parseable_contract():
     bot path and the un-caged path share one machine-parsed contract."""
     from reviewlib.qa.executor import parse_qa_results
 
-    result = bd.BotRunResult(results=[
-        bd.CaseResult("a", bd.PASS, "ok"),
-        bd.CaseResult("b", bd.FAIL, "missing 'x'", "P1"),
-    ])
+    result = bd.BotRunResult(
+        results=[
+            bd.CaseResult("a", bd.PASS, "ok"),
+            bd.CaseResult("b", bd.FAIL, "missing 'x'", "P1"),
+        ]
+    )
     text = result.to_qa_results(sut_path=Path("/sut"))
     verdict, findings, max_sev, cases = parse_qa_results(text)
     assert verdict == "FAIL" and findings == 1 and max_sev == "P1"
@@ -261,17 +285,29 @@ def test_run_result_pass_plus_blocked_is_not_pass():
     """A mix of a PASSing case and a BLOCKED case (an authored case the driver couldn't
     exercise) must roll up to BLOCKED, NOT a silent PASS — an unexercised authored case is not a
     green run (review finding)."""
-    result = bd.BotRunResult(results=[
-        bd.CaseResult("ran", bd.PASS, "ok"),
-        bd.CaseResult("prose-only", bd.BLOCKED, "no Send: directive"),
-    ])
+    result = bd.BotRunResult(
+        results=[
+            bd.CaseResult("ran", bd.PASS, "ok"),
+            bd.CaseResult("prose-only", bd.BLOCKED, "no Send: directive"),
+        ]
+    )
     assert result.verdict == bd.BLOCKED, result
     # and it surfaces in the report's verdict line, so verdict_to_exit_code treats it as infra.
     from reviewlib.qa.executor import parse_qa_results, verdict_to_exit_code
 
-    verdict, findings, _s, cases = parse_qa_results(result.to_qa_results(sut_path=Path("/s")))
-    assert verdict == "BLOCKED" and cases == {"run": 2, "passed": 1, "failed": 0, "blocked": 1}
-    assert verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8) == 8
+    verdict, findings, _s, cases = parse_qa_results(
+        result.to_qa_results(sut_path=Path("/s"))
+    )
+    assert verdict == "BLOCKED" and cases == {
+        "run": 2,
+        "passed": 1,
+        "failed": 0,
+        "blocked": 1,
+    }
+    assert (
+        verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8)
+        == 8
+    )
 
 
 # --- safety ---------------------------------------------------------------------------
@@ -279,8 +315,13 @@ def test_boot_refuses_real_chat_id():
     """A hermetic run with a real-looking TG_CHAT_ID in the env must fail closed — a bot that
     ignores TG_API_BASE could otherwise reach the user's real chat."""
     try:
-        bh.boot_bot(command=["true"], cwd=Path("/tmp"), api_base="http://127.0.0.1:1",
-                    extra_env={"TG_CHAT_ID": "123456789"}, exit_boot_failed=8)
+        bh.boot_bot(
+            command=["true"],
+            cwd=Path("/tmp"),
+            api_base="http://127.0.0.1:1",
+            extra_env={"TG_CHAT_ID": "123456789"},
+            exit_boot_failed=8,
+        )
         raise AssertionError("expected BotHarnessError for a real chat id")
     except bh.BotHarnessError as exc:
         assert "hermetic" in str(exc) and exc.exit_code == 8
@@ -288,9 +329,41 @@ def test_boot_refuses_real_chat_id():
 
 def test_boot_allows_synthetic_test_chat_id():
     """A synthetic -100999… test chat id is fine (it can't be a real human)."""
-    bot = bh.boot_bot(command=["true"], cwd=Path("/tmp"), api_base="http://127.0.0.1:1",
-                      extra_env={"TG_CHAT_ID": "-1009990001"}, exit_boot_failed=8)
+    bot = bh.boot_bot(
+        command=["true"],
+        cwd=Path("/tmp"),
+        api_base="http://127.0.0.1:1",
+        extra_env={"TG_CHAT_ID": "-1009990001"},
+        exit_boot_failed=8,
+    )
     bot.reap()
+
+
+def test_boot_bot_registers_with_the_signal_reaper():
+    """review-cli#162 follow-up (codex review): `boot_bot` must register the SUT bot
+    process with `process._LIVE_CHILDREN` — the same registry `install_signal_reaper`'s
+    SIGTERM/SIGINT handler and the internal backstop's `kill_live_children()` sweep —
+    so an external signal reaps this SUT process too, not only `_run_streamed`'s own
+    backend children. `sleep 5` (not `true`) so the pid is still live long enough to
+    assert on before `reap()` tears it down."""
+    from reviewlib import process as proc_mod
+
+    bot = bh.boot_bot(
+        command=["sleep", "5"],
+        cwd=Path("/tmp"),
+        api_base="http://127.0.0.1:1",
+        extra_env={"TG_CHAT_ID": "-1009990001"},
+        exit_boot_failed=8,
+    )
+    try:
+        with proc_mod._LIVE_CHILDREN_LOCK:
+            live_pids = {p.pid for p, _pgid in proc_mod._LIVE_CHILDREN}
+        assert bot.proc.pid in live_pids
+    finally:
+        bot.reap()
+    with proc_mod._LIVE_CHILDREN_LOCK:
+        live_pids_after = {p.pid for p, _pgid in proc_mod._LIVE_CHILDREN}
+    assert bot.proc.pid not in live_pids_after
 
 
 def test_reap_kills_forked_child_after_leader_exits():
@@ -312,8 +385,12 @@ def test_reap_kills_forked_child_after_leader_exits():
             "sys.exit(0)\n"
         )
         pidfile = d / "child.pid"
-        bot = bh.boot_bot(command=["python3", "wrap.py", str(pidfile)], cwd=d,
-                          api_base="http://127.0.0.1:1", exit_boot_failed=8)
+        bot = bh.boot_bot(
+            command=["python3", "wrap.py", str(pidfile)],
+            cwd=d,
+            api_base="http://127.0.0.1:1",
+            exit_boot_failed=8,
+        )
         # wait for the wrapper to exit and record the child pid
         bot.proc.wait(timeout=10)
         for _ in range(50):
@@ -373,8 +450,14 @@ def test_dod_buggy_bot_verdicts_fail_with_finding():
     assert findings >= 1 and max_sev == "P1", transcript
     assert "welcome" in transcript  # the missing-substring proof
     # report-only by default (a found bug exits 0); --strict flips it to 10.
-    assert verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8) == 0
-    assert verdict_to_exit_code(verdict, findings=findings, strict=True, exit_blocked=8) == 10
+    assert (
+        verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8)
+        == 0
+    )
+    assert (
+        verdict_to_exit_code(verdict, findings=findings, strict=True, exit_blocked=8)
+        == 10
+    )
 
 
 def test_dod_teardown_leaves_no_bot_process():
@@ -401,11 +484,16 @@ def test_unwired_sender_blocks_with_tg_api_base_pointer():
     try:
         # An 'unwired' bot: it just sleeps, never polling the fake (the worst case the probe
         # exists to catch). Keep its runtime short so reap is instant.
-        (d / "bot.py").write_text("import time\nfor _ in range(200): time.sleep(0.05)\n")
+        (d / "bot.py").write_text(
+            "import time\nfor _ in range(200): time.sleep(0.05)\n"
+        )
         cfg = BotConfig(driver="mock", command=("python3", "bot.py"))
         transcript = bd.run_hermetic_bot_test(
             suite_text="# S\n## Case: start\nSend: /start\nExpect: welcome\n",
-            bot_config=cfg, cwd=d, sut_path=Path("/sut/unwired"), exit_boot_failed=8,
+            bot_config=cfg,
+            cwd=d,
+            sut_path=Path("/sut/unwired"),
+            exit_boot_failed=8,
         )
         verdict, _f, _s, _c = parse_qa_results(transcript)
         assert verdict == "BLOCKED", transcript
@@ -424,12 +512,17 @@ def test_dead_bot_blocks_with_crash_output():
 
     d = Path(tempfile.mkdtemp(prefix="qa-deadbot-"))
     try:
-        (d / "bot.py").write_text("import sys\nprint('boom: missing config', file=sys.stderr)\n"
-                                  "print('boom: missing config')\nsys.exit(3)\n")
+        (d / "bot.py").write_text(
+            "import sys\nprint('boom: missing config', file=sys.stderr)\n"
+            "print('boom: missing config')\nsys.exit(3)\n"
+        )
         cfg = BotConfig(driver="mock", command=("python3", "bot.py"))
         transcript = bd.run_hermetic_bot_test(
             suite_text="# S\n## Case: start\nSend: /start\nExpect: hi\n",
-            bot_config=cfg, cwd=d, sut_path=Path("/sut/dead"), exit_boot_failed=8,
+            bot_config=cfg,
+            cwd=d,
+            sut_path=Path("/sut/dead"),
+            exit_boot_failed=8,
         )
         verdict, _f, _s, _c = parse_qa_results(transcript)
         assert verdict == "BLOCKED", transcript
@@ -452,7 +545,10 @@ def test_launch_failure_blocks():
         cfg = BotConfig(driver="mock", command=("this-binary-does-not-exist-xyz",))
         transcript = bd.run_hermetic_bot_test(
             suite_text="# S\n## Case: start\nSend: /start\nExpect: hi\n",
-            bot_config=cfg, cwd=d, sut_path=Path("/sut/nolaunch"), exit_boot_failed=8,
+            bot_config=cfg,
+            cwd=d,
+            sut_path=Path("/sut/nolaunch"),
+            exit_boot_failed=8,
         )
         verdict, _f, _s, _c = parse_qa_results(transcript)
         assert verdict == "BLOCKED", transcript
@@ -500,7 +596,10 @@ def test_chatty_bot_does_not_deadlock_on_full_pipe():
         cfg = BotConfig(driver="mock", command=("python3", "bot.py"))
         transcript = bd.run_hermetic_bot_test(
             suite_text="# S\n## Case: start\nSend: /start\nExpect: welcome\n",
-            bot_config=cfg, cwd=d, sut_path=Path("/sut/chatty"), exit_boot_failed=8,
+            bot_config=cfg,
+            cwd=d,
+            sut_path=Path("/sut/chatty"),
+            exit_boot_failed=8,
         )
         verdict, _f, _s, _c = parse_qa_results(transcript)
         assert verdict == "PASS", transcript  # reached the poll despite the log flood
@@ -586,12 +685,14 @@ def test_bot_config_skip_probe_string_false_is_false():
         cfg_dir = sut / "docs" / "tests"
         cfg_dir.mkdir(parents=True)
         (cfg_dir / "qa.yaml").write_text(
-            "sut:\n  kind: bot\n  bot:\n    command: [python3, bot.py]\n    skip_probe: 'false'\n")
+            "sut:\n  kind: bot\n  bot:\n    command: [python3, bot.py]\n    skip_probe: 'false'\n"
+        )
         config = load_qa_config(sut, None)
         assert config.bot.skip_probe is False
         # a garbage value is a clean error, not a silent True
         (cfg_dir / "qa.yaml").write_text(
-            "sut:\n  kind: bot\n  bot:\n    command: [python3, bot.py]\n    skip_probe: maybe\n")
+            "sut:\n  kind: bot\n  bot:\n    command: [python3, bot.py]\n    skip_probe: maybe\n"
+        )
         try:
             load_qa_config(sut, None)
             raise AssertionError("expected QaConfigError for a non-boolean skip_probe")
@@ -650,7 +751,9 @@ def test_resolve_routes_on_qa_yaml_kind_under_auto():
     from reviewlib.modes.qa import _detect_kind, _resolve_hermetic_bot
 
     sut = _FIXTURES / "bot-good"
-    assert _detect_kind(sut) == "backend"  # no dep marker → package detection says backend
+    assert (
+        _detect_kind(sut) == "backend"
+    )  # no dep marker → package detection says backend
     ctx = _fake_ctx(kind="auto", config=None)
     assert _resolve_hermetic_bot(ctx, sut) is not None  # but sut.kind: bot routes it
 
@@ -673,7 +776,9 @@ def test_effective_kind_honors_qa_yaml_kind_in_fallback():
         (cfg_dir / "qa.yaml").write_text("sut:\n  kind: bot\n")
         assert _detect_kind(sut) == "backend"  # no dep marker
         ctx = _fake_ctx(kind="auto", config=None)
-        assert _effective_kind(ctx, sut) == "bot"  # but the executor path now honors sut.kind
+        assert (
+            _effective_kind(ctx, sut) == "bot"
+        )  # but the executor path now honors sut.kind
     finally:
         shutil.rmtree(sut, ignore_errors=True)
 
@@ -695,7 +800,10 @@ def _post(fake: bh.FakeTelegram, method: str, payload: dict) -> dict:
 
     url = f"{fake.base_url()}/bottoken/{method}"
     req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 — loopback fake
         return json.loads(resp.read().decode())
 
@@ -711,7 +819,10 @@ def _run_fixture(name: str) -> str:
     suite_text = load_suites_text(suite_files, max_cases=None)
     cfg = BotConfig(driver="mock", command=("python3", "bot.py"))
     return bd.run_hermetic_bot_test(
-        suite_text=suite_text, bot_config=cfg, cwd=sut.resolve(), sut_path=sut.resolve(),
+        suite_text=suite_text,
+        bot_config=cfg,
+        cwd=sut.resolve(),
+        sut_path=sut.resolve(),
         exit_boot_failed=8,
     )
 

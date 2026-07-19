@@ -23,6 +23,7 @@ RESULTS emission fully. A LIVE-browser variant of the DoD is gated on REVIEW_QA_
 SKIPs when Chromium isn't installed (so it runs locally / in a browser-provisioned CI but never
 blocks normal CI). Runnable standalone (``python3 tests/test_qa_web.py``) or under pytest.
 """
+
 from __future__ import annotations
 
 import os
@@ -100,7 +101,9 @@ def test_fill_preserves_attribute_selector_equals():
 
 def test_prose_only_case_is_not_runnable():
     """A case with no driveable directive is non-runnable (the driver BLOCKS it)."""
-    c = wd.parse_web_cases("## Case: just words\nThis is a description with no directives.\n")[0]
+    c = wd.parse_web_cases(
+        "## Case: just words\nThis is a description with no directives.\n"
+    )[0]
     assert c.runnable is False
 
 
@@ -136,7 +139,9 @@ class _RoutedFakePage:
     stripped, head/script/style dropped) to match the real page's ``inner_text("body")`` — NOT
     raw HTML (review finding). base-relative goto resolves against ``base``."""
 
-    def __init__(self, routes: dict, *, base: str = "http://fake", click_map: dict | None = None):
+    def __init__(
+        self, routes: dict, *, base: str = "http://fake", click_map: dict | None = None
+    ):
         self.routes = routes
         self.base = base.rstrip("/")
         self.click_map = click_map or {}
@@ -157,7 +162,7 @@ class _RoutedFakePage:
         self.fills[selector] = value
 
     def text_content(self) -> str:
-        return _body_text(self.routes.get(self._url[len(self.base):], "404 not found"))
+        return _body_text(self.routes.get(self._url[len(self.base) :], "404 not found"))
 
     def current_url(self) -> str:
         return self._url
@@ -168,16 +173,22 @@ class _RoutedFakePage:
 
 def test_pass_when_all_assertions_hold():
     page = _RoutedFakePage({"/": "Welcome home"})
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: home\nGoto: /\nExpect-text: Welcome\nExpect-no: error\n"), page=page)
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases(
+            "## Case: home\nGoto: /\nExpect-text: Welcome\nExpect-no: error\n"
+        ),
+        page=page,
+    )
     assert res.verdict == "PASS"
     assert res.results[0].status == "PASS"
 
 
 def test_fail_on_missing_text_with_proof():
     page = _RoutedFakePage({"/": "Hello stranger"})
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: home\nGoto: /\nExpect-text: Welcome\n"), page=page)
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases("## Case: home\nGoto: /\nExpect-text: Welcome\n"),
+        page=page,
+    )
     assert res.verdict == "FAIL"
     assert res.results[0].status == "FAIL"
     assert "Welcome" in res.results[0].detail
@@ -185,27 +196,39 @@ def test_fail_on_missing_text_with_proof():
 
 def test_fail_on_forbidden_text():
     page = _RoutedFakePage({"/": "Fatal error: boom"})
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: home\nGoto: /\nExpect-no: error\n"), page=page)
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases("## Case: home\nGoto: /\nExpect-no: error\n"),
+        page=page,
+    )
     assert res.results[0].status == "FAIL"
     assert "forbidden" in res.results[0].detail
 
 
 def test_fail_on_url_assertion():
-    page = _RoutedFakePage({"/": "x", "/dashboard": "Dashboard"},
-                           click_map={"text=Login": "/dashboard"})
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: redirect\nGoto: /\nClick: text=Login\nExpect-url: /settings\n"), page=page)
+    page = _RoutedFakePage(
+        {"/": "x", "/dashboard": "Dashboard"}, click_map={"text=Login": "/dashboard"}
+    )
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases(
+            "## Case: redirect\nGoto: /\nClick: text=Login\nExpect-url: /settings\n"
+        ),
+        page=page,
+    )
     assert res.results[0].status == "FAIL"
     assert "url" in res.results[0].detail.lower()
 
 
 def test_pass_on_url_and_text_after_click():
-    page = _RoutedFakePage({"/": "x", "/dashboard": "Welcome back"},
-                           click_map={"text=Login": "/dashboard"})
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: login\nGoto: /\nClick: text=Login\nExpect-url: /dashboard\n"
-        "Expect-text: Welcome back\n"), page=page)
+    page = _RoutedFakePage(
+        {"/": "x", "/dashboard": "Welcome back"}, click_map={"text=Login": "/dashboard"}
+    )
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases(
+            "## Case: login\nGoto: /\nClick: text=Login\nExpect-url: /dashboard\n"
+            "Expect-text: Welcome back\n"
+        ),
+        page=page,
+    )
     assert res.verdict == "PASS"
 
 
@@ -213,16 +236,20 @@ def test_action_failure_is_a_fail_not_a_crash():
     """A click on a missing selector raises WebActionError inside the driver — classified as a
     FAIL with the failing selector, never an escaping traceback."""
     page = _RoutedFakePage({"/": "x"})
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: click missing\nGoto: /\nClick: #nope\n"), page=page)
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases("## Case: click missing\nGoto: /\nClick: #nope\n"),
+        page=page,
+    )
     assert res.results[0].status == "FAIL"
     assert "#nope" in res.results[0].detail
 
 
 def test_prose_only_case_blocks_the_run():
     page = _RoutedFakePage({"/": "x"})
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: prose\njust words, no directives\n"), page=page)
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases("## Case: prose\njust words, no directives\n"),
+        page=page,
+    )
     assert res.results[0].status == "BLOCKED"
     assert res.verdict == "BLOCKED"  # an unexercised authored case is not a green run
 
@@ -231,8 +258,12 @@ def test_mixed_pass_and_prose_block_is_blocked_not_pass():
     """A suite mixing a passing structured case with a prose-only case verdicts BLOCKED (the
     prose case was not exercised), never PASS — mirrors the bot driver's same invariant."""
     page = _RoutedFakePage({"/": "Welcome"})
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: ok\nGoto: /\nExpect-text: Welcome\n## Case: prose\njust words\n"), page=page)
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases(
+            "## Case: ok\nGoto: /\nExpect-text: Welcome\n## Case: prose\njust words\n"
+        ),
+        page=page,
+    )
     assert {r.status for r in res.results} == {"PASS", "BLOCKED"}
     assert res.verdict == "BLOCKED"
 
@@ -240,16 +271,24 @@ def test_mixed_pass_and_prose_block_is_blocked_not_pass():
 # --- the QA RESULTS contract round-trips through the executor parser -------------------
 def test_qa_results_contract_parses():
     page = _RoutedFakePage({"/": "Hello stranger"})
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: home\nGoto: /\nExpect-text: Welcome\n"), page=page)
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases("## Case: home\nGoto: /\nExpect-text: Welcome\n"),
+        page=page,
+    )
     transcript = res.to_qa_results(sut_path=Path("/tmp/sut"), base_url="http://fake")
     verdict, findings, max_sev, cases = parse_qa_results(transcript)
     assert verdict == "FAIL"
     assert findings == 1 and max_sev == "P1"
     assert cases == {"run": 1, "passed": 0, "failed": 1, "blocked": 0}
     # report-only FAIL is exit 0; under --strict it flips to 10.
-    assert verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8) == 0
-    assert verdict_to_exit_code(verdict, findings=findings, strict=True, exit_blocked=8) == 10
+    assert (
+        verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8)
+        == 0
+    )
+    assert (
+        verdict_to_exit_code(verdict, findings=findings, strict=True, exit_blocked=8)
+        == 10
+    )
 
 
 def test_blocked_transcript_maps_to_boot_failed():
@@ -257,7 +296,10 @@ def test_blocked_transcript_maps_to_boot_failed():
     transcript = res.to_qa_results(sut_path=Path("/tmp/sut"), base_url="http://x")
     verdict, findings, _sev, _cases = parse_qa_results(transcript)
     assert verdict == "BLOCKED"
-    assert verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8) == 8
+    assert (
+        verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8)
+        == 8
+    )
 
 
 def test_text_assertions_match_body_not_head_or_attributes():
@@ -271,14 +313,22 @@ def test_text_assertions_match_body_not_head_or_attributes():
     )
     page = _RoutedFakePage({"/": html})
     # Expect-text on a head/comment/attribute string -> NOT found in body text -> FAIL.
-    res = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: head text invisible\nGoto: /\nExpect-text: SECRETTITLE\n"), page=page)
+    res = wd.run_web_suite(
+        cases=wd.parse_web_cases(
+            "## Case: head text invisible\nGoto: /\nExpect-text: SECRETTITLE\n"
+        ),
+        page=page,
+    )
     assert res.results[0].status == "FAIL"
     # Expect-no on the same head string -> body has no such text -> the forbidden string is
     # absent -> PASS (a raw-HTML match would have wrongly FAILed this).
-    res2 = wd.run_web_suite(cases=wd.parse_web_cases(
-        "## Case: forbidden only in head\nGoto: /\nExpect-no: HIDDENCOMMENT\n"
-        "Expect-text: Visible hello\n"), page=page)
+    res2 = wd.run_web_suite(
+        cases=wd.parse_web_cases(
+            "## Case: forbidden only in head\nGoto: /\nExpect-no: HIDDENCOMMENT\n"
+            "Expect-text: Visible hello\n"
+        ),
+        page=page,
+    )
     assert res2.results[0].status == "PASS"
 
 
@@ -297,7 +347,9 @@ def test_web_config_accepts_live_agent_browser_driver_flags_is_live():
     flagged is_live (and may omit base_url, which it reads from REVIEW_QA_WEB_BASE_URL at the
     gate); the live RUN is still gated behind creds at dispatch. A genuinely-unknown driver is
     still rejected loud."""
-    cfg = WebConfig(driver="agent-browser")  # no base_url -> allowed for the live driver
+    cfg = WebConfig(
+        driver="agent-browser"
+    )  # no base_url -> allowed for the live driver
     assert cfg.is_live
     try:
         WebConfig(base_url="http://x", driver="garbage")
@@ -334,7 +386,10 @@ def test_playwright_off_by_default_is_a_clear_skip():
 def _serve_dir(directory: Path) -> tuple[ThreadingHTTPServer, str]:
     """Start a real loopback HTTP server for ``directory`` on an ephemeral port; return
     (server, base_url). Lets the reachability tests exercise the REAL HTTP probe path."""
-    handler = lambda *a, **k: SimpleHTTPRequestHandler(*a, directory=str(directory), **k)  # noqa: E731
+
+    def handler(*a, **k):
+        return SimpleHTTPRequestHandler(*a, directory=str(directory), **k)
+
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     host, port = server.server_address[:2]
@@ -366,7 +421,9 @@ def test_boot_server_health_gate_and_reap_no_browser():
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     server = wh.boot_web_server(
-        command=["python3", "serve.py"], cwd=sut, extra_env={"PORT": str(port)},
+        command=["python3", "serve.py"],
+        cwd=sut,
+        extra_env={"PORT": str(port)},
         exit_boot_failed=8,
     )
     try:
@@ -381,12 +438,42 @@ def test_boot_server_health_gate_and_reap_no_browser():
     server.reap()
 
 
+def test_boot_server_registers_with_the_signal_reaper():
+    """review-cli#162 follow-up (codex review): `boot_web_server` must register the dev
+    server with `process._LIVE_CHILDREN` — the same registry `install_signal_reaper`'s
+    SIGTERM/SIGINT handler and the internal backstop's `kill_live_children()` sweep —
+    so an external signal (or a wedged run) reaps this SUT process too, not only
+    `_run_streamed`'s own backend children. Before this fix, a QA web run's dev server
+    was invisible to that registry entirely."""
+    from reviewlib import process as proc_mod
+
+    sut = (_FIXTURES / "web-good").resolve()
+    server = wh.boot_web_server(
+        command=["python3", "serve.py"],
+        cwd=sut,
+        extra_env={"PORT": "0"},
+        exit_boot_failed=8,
+    )
+    try:
+        with proc_mod._LIVE_CHILDREN_LOCK:
+            live_pids = {p.pid for p, _pgid in proc_mod._LIVE_CHILDREN}
+        assert server.proc.pid in live_pids
+    finally:
+        server.reap()
+    with proc_mod._LIVE_CHILDREN_LOCK:
+        live_pids_after = {p.pid for p, _pgid in proc_mod._LIVE_CHILDREN}
+    assert server.proc.pid not in live_pids_after
+
+
 def test_boot_server_bad_command_is_a_controlled_blocked():
     """A dev-server command that cannot be launched raises WebHarnessError carrying the boot-failed
     exit class — a controlled BLOCKED, never a raw OSError traceback."""
     try:
         wh.boot_web_server(
-            command=["this-binary-does-not-exist-xyz"], cwd=_FIXTURES, exit_boot_failed=8)
+            command=["this-binary-does-not-exist-xyz"],
+            cwd=_FIXTURES,
+            exit_boot_failed=8,
+        )
     except wh.WebHarnessError as exc:
         assert exc.exit_code == 8
     else:
@@ -448,10 +535,16 @@ def test_command_omitted_unreachable_target_blocks_not_fails():
     from reviewlib.qa.config import WebConfig
 
     # No command + a base_url nothing listens on -> the gate must fail and BLOCK.
-    cfg = WebConfig(base_url="http://127.0.0.1:1", command=(), ready_path="/", ready_timeout_s=1)
+    cfg = WebConfig(
+        base_url="http://127.0.0.1:1", command=(), ready_path="/", ready_timeout_s=1
+    )
     transcript = _bring_up_and_drive_web(
-        cwd=_FIXTURES, sut_path=_FIXTURES, suite_text="## Case: x\nGoto: /\nExpect-text: hi\n",
-        web_config=cfg, out_dir=None, exit_blocked=8,
+        cwd=_FIXTURES,
+        sut_path=_FIXTURES,
+        suite_text="## Case: x\nGoto: /\nExpect-text: hi\n",
+        web_config=cfg,
+        out_dir=None,
+        exit_blocked=8,
     )
     verdict, _findings, _sev, _cases = parse_qa_results(transcript)
     assert verdict == "BLOCKED", transcript
@@ -485,7 +578,10 @@ def test_dod_good_fixture_passes():
     assert verdict == "PASS", transcript
     assert findings == 0
     assert cases == {"run": 2, "passed": 2, "failed": 0, "blocked": 0}
-    assert verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8) == 0
+    assert (
+        verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8)
+        == 0
+    )
 
 
 def test_dod_buggy_fixture_fails_with_a_finding():
@@ -495,8 +591,14 @@ def test_dod_buggy_fixture_fails_with_a_finding():
     assert findings >= 1 and max_sev == "P1"
     assert cases["failed"] >= 1
     # report-only: a found bug exits 0 (the report carries it); --strict flips it to 10.
-    assert verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8) == 0
-    assert verdict_to_exit_code(verdict, findings=findings, strict=True, exit_blocked=8) == 10
+    assert (
+        verdict_to_exit_code(verdict, findings=findings, strict=False, exit_blocked=8)
+        == 0
+    )
+    assert (
+        verdict_to_exit_code(verdict, findings=findings, strict=True, exit_blocked=8)
+        == 10
+    )
 
 
 # --- the LIVE-browser DoD (gated; SKIPs without Chromium) -----------------------------
@@ -523,7 +625,9 @@ def test_live_browser_dod_good_passes():
     otherwise so normal CI (no browser) is unaffected. This is the end-to-end proof that the
     PlaywrightPage + dev-server bring-up + health gate all work against a real browser."""
     if not _playwright_browser_ready():
-        _skip("REVIEW_QA_PLAYWRIGHT=1 + a Chromium browser (python -m playwright install chromium)")
+        _skip(
+            "REVIEW_QA_PLAYWRIGHT=1 + a Chromium browser (python -m playwright install chromium)"
+        )
         return
     transcript = _run_fixture_live("web-good")
     verdict, _findings, _sev, _cases = parse_qa_results(transcript)
@@ -532,7 +636,9 @@ def test_live_browser_dod_good_passes():
 
 def test_live_browser_dod_buggy_fails():
     if not _playwright_browser_ready():
-        _skip("REVIEW_QA_PLAYWRIGHT=1 + a Chromium browser (python -m playwright install chromium)")
+        _skip(
+            "REVIEW_QA_PLAYWRIGHT=1 + a Chromium browser (python -m playwright install chromium)"
+        )
         return
     transcript = _run_fixture_live("web-buggy")
     verdict, findings, _sev, _cases = parse_qa_results(transcript)
@@ -565,13 +671,18 @@ def _run_fixture_live(name: str) -> str:
     server = None
     try:
         server = wh.boot_web_server(
-            command=list(cfg.web.command), cwd=sut.resolve(),
-            extra_env={**cfg.web.env, "PORT": str(port)}, exit_boot_failed=8,
+            command=list(cfg.web.command),
+            cwd=sut.resolve(),
+            extra_env={**cfg.web.env, "PORT": str(port)},
+            exit_boot_failed=8,
         )
         ready = base_url + cfg.web.ready_path
-        assert wh.wait_until_reachable(ready, timeout_s=cfg.web.ready_timeout_s, server=server), \
-            f"dev server never reachable at {ready}\n{server.output_tail()}"
-        return wd.run_web_test(suite_text=suite_text, base_url=base_url, sut_path=sut.resolve())
+        assert wh.wait_until_reachable(
+            ready, timeout_s=cfg.web.ready_timeout_s, server=server
+        ), f"dev server never reachable at {ready}\n{server.output_tail()}"
+        return wd.run_web_test(
+            suite_text=suite_text, base_url=base_url, sut_path=sut.resolve()
+        )
     finally:
         if server is not None:
             server.reap()

@@ -309,6 +309,82 @@ def test_killed_detached_job_is_reconciled_not_stuck_running():
         assert final.get("status") == "unknown-terminated", final
 
 
+def test_detached_job_pid_update_persists_the_actual_fallback_log_path(monkeypatch):
+    """codex review (review-cli#162 follow-up, PR #164): the job record's `log_path`
+    is written BEFORE `_open_log_with_fallback` opens the log file, so if that open
+    falls back to a DIFFERENT path than the one already recorded, the record used to
+    keep pointing at the ORIGINAL, inaccessible path forever — `review status` (and
+    its JSON output / log-tail feature) reported a path the process never actually
+    wrote to. The pid-update write after `Popen` now re-sends the RESOLVED
+    `log_path`.
+
+    In-process, white-box test rather than the e2e `_run_cli` style the rest of this
+    file uses: a prior version of this test pointed `$REVIEW_JOBS_DIR` at an
+    unwritable directory, but `jobs.jobs_dir()` detects that BEFORE `_spawn_detached_job`
+    ever builds `log_path` from it and falls back FIRST — so `log_path` was built from
+    the already-resolved fallback directory from the start, `_open_log_with_fallback`
+    never had to replace anything, and the test could not tell "the fix threads the
+    resolved path through" apart from "jobs_dir() already fell back" (codex review: the
+    test passed even with the fix reverted). This version monkeypatches
+    `cli._open_log_with_fallback` to force ONLY the log-file open (never the stdin
+    spool) to land at a different, obviously-distinct path than the one already
+    recorded — isolating the exact substitution the fix is responsible for."""
+    from reviewlib import cli, jobs as jobs_mod, process as process_mod
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        repo = _make_repo(tmp)
+        env = _env(tmp, fake_delay=0.2)
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+
+        forced_log_path = tmp / "forced-fallback" / "the.log"
+        forced_log_path.parent.mkdir(parents=True)
+        real_open_log_with_fallback = process_mod._open_log_with_fallback
+
+        def _fake_open_log_with_fallback(path, flags=process_mod._LOG_OPEN_FLAGS):
+            if path.name.endswith(".log"):
+                fd = os.open(
+                    str(forced_log_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                return fd, forced_log_path
+            return real_open_log_with_fallback(path, flags)
+
+        monkeypatch.setattr(
+            cli, "_open_log_with_fallback", _fake_open_log_with_fallback
+        )
+        # Simulate a tty (no piped stdin) — under pytest's captured stdin,
+        # `sys.stdin.isatty()` is False and a real `.read()` raises, since this test
+        # calls `_spawn_detached_job` directly rather than through a real subprocess
+        # with real inherited stdin.
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+        raw = [*_review_diff_args(repo), "--task", "TEST-1"]
+        rc = cli._spawn_detached_job(raw)
+        assert rc == 0
+
+        recorded = None
+        for candidate in jobs_mod.jobs_dir().glob("*.json"):
+            data = json.loads(candidate.read_text())
+            if Path(data.get("log_path", "")) != forced_log_path:
+                continue
+            recorded = data
+            break
+        assert recorded is not None, (
+            "no job record's log_path matches the forced fallback path — the "
+            "pid-update write did not re-send the resolved log_path"
+        )
+        assert recorded["pid"] > 0
+        # Let the short-lived detached child actually finish before the tempdir this
+        # test created is torn down — it's writing into `tmp` via the forced log fd.
+        for _ in range(50):
+            try:
+                os.kill(recorded["pid"], 0)
+            except OSError:
+                break
+            time.sleep(0.1)
+
+
 if __name__ == "__main__":
     failures = []
     for name, fn in list(globals().items()):

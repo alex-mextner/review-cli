@@ -38,6 +38,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import sys
 import time
 import uuid
@@ -76,6 +77,172 @@ TERMINAL_STATUSES = frozenset({"done", "failed", "unknown-terminated"})
 _jobs_dir_fallback_cache: Path | None = None
 
 
+def _fallback_pointer_path() -> Path:
+    """A FIXED, well-known location recording where the last-resort `mkdtemp()`
+    directory actually landed — the one thing about that directory that ISN'T random.
+    Lives directly under the temp root (NOT inside the unwritable fixed uid-keyed
+    subdir this tier only exists because we couldn't use), keyed by uid so a shared
+    multi-user box doesn't cross-report between users."""
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / f".review-cli-jobs-{os.getuid()}.pointer"
+
+
+def _fallback_pointer_lock_path() -> Path:
+    """The lock file guarding the pointer's read-or-mint-and-record sequence — a
+    SEPARATE fixed path from the pointer itself (never the pointer + a suffix swap,
+    same reasoning as `_job_lock_path`: the lock must exist even before the pointer
+    file itself does, for the very first process to hit this tier)."""
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / f".review-cli-jobs-{os.getuid()}.pointer.lock"
+
+
+def _open_pointer_lock() -> int:
+    """Open (creating if needed) and take an exclusive `flock` on the pointer's own
+    lock file, returning the fd for the caller to release via
+    `fcntl.flock(fd, fcntl.LOCK_UN)` + `os.close(fd)`. Serializes the WHOLE
+    read-pointer-or-mint-a-new-directory-and-record-it sequence across processes
+    (codex review, review-cli#162 follow-up): without this, two `--detach` calls
+    entering this tier at the same moment could each mint a DIFFERENT `mkdtemp()`
+    directory and race the pointer write — the loser's job bookkeeping would then live
+    somewhere a later `review status`/`review jobs` (which finds the pointer's WINNING
+    value) can never look. `O_NOFOLLOW` for the same symlink-attack reason
+    `_read_fallback_pointer`/`_write_fallback_pointer` use on the pointer file itself —
+    the lock file lives at an equally predictable path.
+
+    Verifies OWNERSHIP before ever attempting the (blocking) `flock` (codex review,
+    review-cli#162 follow-up round 3): a foreign-owned but world-writable regular
+    file pre-planted at this predictable path would pass the `os.open` above (perm
+    bits allow it), but `flock(LOCK_EX)` could then block INDEFINITELY on whatever
+    that OTHER user's process is doing with its own lock on the same file — turning
+    a best-effort coordination mechanism into a hang. Raises `OSError` on a
+    foreign-owned file so the caller's existing except-clause falls back to an
+    uncoordinated `mkdtemp()` instead of ever calling `flock` on it."""
+    path = _fallback_pointer_lock_path()
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid():
+            raise OSError(
+                f"{path} is owned by uid {st.st_uid}, not us — refusing to lock it"
+            )
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_fallback_pointer() -> Path | None:
+    """The directory a PRIOR process (in this same fallback tier) recorded via
+    `_write_fallback_pointer`, if it still exists, is actually writable, and — the
+    hardening this function exists for (codex review, review-cli#162 follow-up) — is
+    OWNED BY US and not reached through a symlink. Both the pointer FILE and the
+    directory it names are checked this way: a shared multi-user temp root means
+    another local user could pre-plant a symlink or a foreign-owned directory at
+    these predictable paths, hoping a naive `read_text`/`is_dir` trusts it and
+    redirects this process's job bookkeeping (secret-bearing argv, possibly) into
+    somewhere they control. `O_NOFOLLOW` makes the open itself fail on a symlinked
+    pointer file; the `st_uid` checks cover a foreign-owned regular file/directory a
+    symlink isn't even needed for. Returns None (never raises) on ANY of these —
+    treated identically to "no prior process recorded anything yet", so the caller
+    falls through to minting its own directory rather than trusting anything
+    suspicious."""
+    pointer = _fallback_pointer_path()
+    try:
+        # O_NONBLOCK: another local user could pre-plant a FIFO (not a symlink, so
+        # O_NOFOLLOW alone doesn't stop it) at this predictable path — a blocking
+        # O_RDONLY open on a FIFO with no writer hangs indefinitely, turning a
+        # best-effort lookup into a hang for every future `review status`/`review
+        # jobs` call (codex review, review-cli#162 follow-up round 4). O_NONBLOCK
+        # makes that open return immediately instead.
+        fd = os.open(str(pointer), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        # Reject anything that isn't a plain regular file (a FIFO/socket/device
+        # planted at this path, even one O_NONBLOCK let us open) OR isn't ours.
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            recorded = fh.read().strip()
+    except OSError:
+        return None
+    finally:
+        # `os.fdopen` above takes ownership of `fd` and closes it on context exit —
+        # but every EARLIER return path (bad fstat, wrong type/owner, or the mode
+        # checks failing) left it open. Closing an already-closed fd is a silent
+        # no-op in CPython (fdopen sets an internal "closed" flag), so this is safe
+        # to run unconditionally rather than tracking whether fdopen ever ran (codex
+        # review, review-cli#162 follow-up round 4: every early return here leaked
+        # the descriptor — repeated lookups could exhaust the process's fd limit).
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if not recorded:
+        return None
+    candidate = Path(recorded)
+    try:
+        if candidate.is_symlink():
+            return None
+        cst = candidate.stat()
+    except OSError:
+        return None
+    if cst.st_uid != os.getuid():
+        return None
+    if candidate.is_dir() and probe_writable_dir(candidate):
+        return candidate
+    return None
+
+
+def _write_fallback_pointer(path: Path) -> None:
+    """Best-effort: record the last-resort directory at the fixed pointer location so
+    a LATER, independent process can find it via `_read_fallback_pointer`. A failure
+    here must never break the caller — the fallback directory itself is already
+    usable even if no other process ever learns where it is.
+
+    Written via a same-directory temp file + `os.replace` (mirroring `_atomic_write`)
+    rather than truncate-then-write in place, so a concurrent `_read_fallback_pointer`
+    can never observe a transient EMPTY file mid-write (codex review, review-cli#162
+    follow-up round 4: the previous truncate-in-place version had exactly that
+    window). `O_NOFOLLOW` on the temp file's own creation refuses to write through a
+    pre-existing symlink at ITS path (an unlikely but equally predictable name);
+    ownership is checked on the FINAL pointer path before the atomic rename — if a
+    foreign-owned regular file already sits there, this refuses to overwrite it
+    rather than silently truncating another user's file (codex review, review-cli#162
+    follow-up round 4: the previous version's `O_TRUNC` had no ownership check at
+    all, so it would have clobbered a foreign file the permission bits merely
+    allowed writing to)."""
+    pointer = _fallback_pointer_path()
+    try:
+        existing_st = pointer.lstat()
+    except OSError:
+        existing_st = None
+    if existing_st is not None and (
+        stat.S_ISLNK(existing_st.st_mode) or existing_st.st_uid != os.getuid()
+    ):
+        return
+    tmp = pointer.with_name(pointer.name + f".tmp{os.getpid()}")
+    try:
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+    except OSError:
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(path))
+        os.replace(tmp, pointer)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def jobs_dir() -> Path:
     """Predictable per-user dir for job records + their default log/result files.
 
@@ -94,9 +261,15 @@ def jobs_dir() -> Path:
     more confusing failure than a review that just can't persist its transcript log.
     The last-resort `mkdtemp()` branch is memoized per-process (see
     `_jobs_dir_fallback_cache`) so repeat calls converge on ONE directory; a caller that
-    spawns a CHILD process across this fallback (`cli._spawn_detached_job`) must still
-    propagate the resolved path via `$REVIEW_JOBS_DIR` explicitly — this cache only
-    covers calls within the SAME process."""
+    spawns a CHILD process across this fallback (`cli._spawn_detached_job`) also
+    propagates the resolved path via `$REVIEW_JOBS_DIR` explicitly for that child. For
+    any OTHER, independent process (no inherited env, e.g. a later `review status
+    <job-id>`/`review jobs` invocation) this tier also checks a fixed pointer file
+    (`_read_fallback_pointer`) recording where a PRIOR process in this same fallback
+    tier landed, before minting its own brand-new `mkdtemp()` directory (codex review,
+    review-cli#162 follow-up: without this, every cold process independently
+    recomputed a different random directory and could never find a job recorded by a
+    different process)."""
     global _jobs_dir_fallback_cache
     if _jobs_dir_fallback_cache is not None and _jobs_dir_fallback_cache.is_dir():
         return _jobs_dir_fallback_cache
@@ -144,8 +317,39 @@ def jobs_dir() -> Path:
             if not probe_writable_dir(base):
                 raise OSError(f"{base} exists but is not writable")
         except OSError:
-            base = Path(tempfile.mkdtemp(prefix="review-cli-jobs-"))
-            _jobs_dir_fallback_cache = base
+            # The WHOLE read-pointer-or-mint-and-record sequence runs under the
+            # pointer's own lock (codex review, review-cli#162 follow-up): two
+            # concurrent first-time fallbacks racing this unlocked would each mint a
+            # DIFFERENT `mkdtemp()` directory and the last pointer write would win,
+            # stranding the loser's job bookkeeping somewhere `review status`/`review
+            # jobs` (which only ever looks at the pointer's final value) can never
+            # find.
+            try:
+                lock_fd = _open_pointer_lock()
+            except OSError:
+                # The lock file itself lives at an equally predictable path — another
+                # local user could have pre-created a symlink, a foreign-owned file,
+                # or a directory there. Never let that turn into a hard failure here
+                # (codex review, review-cli#162 follow-up): fall back to minting an
+                # UNCOORDINATED `mkdtemp()` directory. Losing cross-process
+                # coordination in this already-extreme corner case is strictly better
+                # than the seat/job dying outright.
+                base = Path(tempfile.mkdtemp(prefix="review-cli-jobs-"))
+                _jobs_dir_fallback_cache = base
+            else:
+                try:
+                    pointed = _read_fallback_pointer()
+                    if pointed is not None:
+                        base = pointed
+                    else:
+                        base = Path(tempfile.mkdtemp(prefix="review-cli-jobs-"))
+                        _write_fallback_pointer(base)
+                finally:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(lock_fd)
+                _jobs_dir_fallback_cache = base
     try:
         base.chmod(0o700)
     except OSError:
@@ -161,13 +365,28 @@ def new_job_id() -> str:
     return f"{stamp}-{uuid.uuid4().hex[:8]}"
 
 
-def job_path(job_id: str) -> Path:
-    """`jobs_dir() / f"{job_id}.json"` — the SOLE choke point every read/write in this
-    module funnels through, which is why job-id validation lives here: any caller
-    (`review status`/`wait`'s CLI positional, `$REVIEW_JOB_ID`) is covered by this one
-    check rather than needing to be re-validated at each call site."""
+def _validate_job_id(job_id: str) -> None:
+    """Raise `InvalidJobId` for anything that isn't `new_job_id()`'s exact shape — a
+    path-traversal attempt (`../../etc/passwd`) or an absolute path (`/tmp/x`)
+    smuggled in via a CLI positional or `$REVIEW_JOB_ID`. Called FIRST, before either
+    `job_path()` OR `_job_lock_path()` touches the filesystem (codex review,
+    review-cli#162 follow-up): the lock path used to be built and OPENED before this
+    check ran, so a malformed id could create/lock an arbitrary `<id>.lock` file
+    outside `jobs_dir()` before `InvalidJobId` was ever raised. Both path-builders
+    below call this before constructing anything, so there is exactly one place a
+    malformed id can slip through, not two independently-guarded ones that could
+    drift out of sync."""
     if not _JOB_ID_RE.match(job_id):
         raise InvalidJobId(job_id)
+
+
+def job_path(job_id: str) -> Path:
+    """`jobs_dir() / f"{job_id}.json"` — the SOLE choke point every RECORD read/write
+    in this module funnels through, which is why job-id validation (`_validate_job_id`)
+    runs here: any caller (`review status`/`wait`'s CLI positional, `$REVIEW_JOB_ID`)
+    is covered by this one check rather than needing to be re-validated at each call
+    site."""
+    _validate_job_id(job_id)
     return jobs_dir() / f"{job_id}.json"
 
 
@@ -192,7 +411,13 @@ def _atomic_write(path: Path, data: dict[str, Any]) -> None:
 def _job_lock_path(job_id: str) -> Path:
     # Deliberately NOT `job_path()` + a suffix swap — the lock must exist even for a
     # job-id that has no `.json` record YET (the parent's very first write), so it is
-    # keyed the same way but built directly from `jobs_dir()`.
+    # keyed the same way but built directly from `jobs_dir()`. Still runs the SAME
+    # `_validate_job_id` check `job_path()` does, and runs it FIRST, before anything
+    # below touches the filesystem (codex review, review-cli#162 follow-up: this used
+    # to be unvalidated, so `_job_lock()` could `os.open()` a lock file built from a
+    # malformed id — e.g. an absolute path — OUTSIDE `jobs_dir()` entirely, before
+    # `write_job()`'s later `job_path()` call ever got a chance to raise).
+    _validate_job_id(job_id)
     return jobs_dir() / f"{job_id}.lock"
 
 
@@ -234,18 +459,66 @@ def write_job(job_id: str, **fields: Any) -> Path:
             os.close(lock_fd)
 
 
+def _secondary_jobs_dir() -> Path | None:
+    """The pointer-recorded fallback jobs dir, if one is on record and it differs from
+    what `jobs_dir()` resolves to for THIS call — or None. Read-only: unlike
+    `jobs_dir()`'s own fallback branch, this never mints or writes anything, it only
+    checks whether a POSSIBLY DIFFERENT process left something behind at the pointer.
+
+    This exists because a job's bookkeeping and a LATER read of it can legitimately
+    resolve `jobs_dir()` to two different directories even in the shipped call graph
+    (codex review, review-cli#162 follow-up): if the standard CACHE location becomes
+    writable again BETWEEN a `--detach` spawn (which hit the mkdtemp fallback tier and
+    recorded a pointer) and a later `review status`/`review jobs` call (which no
+    longer hits that tier at all, since the standard location now succeeds) — e.g. a
+    sandbox grant that widened, or a permissions fix applied mid-session — the later
+    call's own `jobs_dir()` would return the STANDARD location and never even look at
+    the pointer, silently reporting the job as `unknown`/absent even though its record
+    still exists, untouched, in the fallback dir from before. Checking this secondary
+    location on every miss closes that gap without requiring the two calls' failure
+    modes to match.
+
+    Skips secondary discovery ENTIRELY when `$REVIEW_JOBS_DIR` is set (codex review,
+    review-cli#162 follow-up round 2): an explicit override is the caller declaring
+    "use exactly this directory, and no other" — tests rely on this for isolation
+    (every test in this suite sets it to a throwaway tmp dir), and a real caller that
+    sets it is doing so ON PURPOSE (a sandboxed CI runner pinning a known-writable
+    path). Silently also consulting the machine-wide pointer would leak unrelated
+    records (including another run's `argv`, which can carry prompts) across that
+    boundary. This narrows the scope of this mitigation to the DEFAULT (no override)
+    case — the same one the original bug report actually described; a fuller fix
+    (tracking every historical fallback directory, not just the single most-recent
+    pointer, and distinguishing "readable" from "writable" when validating a
+    candidate) is a genuine architecture question tracked in review-cli#163, not
+    patched in here."""
+    if os.environ.get("REVIEW_JOBS_DIR"):
+        return None
+    primary = jobs_dir()
+    pointed = _read_fallback_pointer()
+    if pointed is None or pointed == primary:
+        return None
+    return pointed
+
+
 def read_job(job_id: str) -> dict[str, Any] | None:
     """The raw recorded fields for `job_id`, or None if no such job exists, the job-id
     is malformed (`InvalidJobId` — treated the same as "doesn't exist" for a READ; see
     `job_path`), or the file is corrupt (a torn read of a job mid-write by another
     process — `_atomic_write`'s rename makes this rare, but a reader must not crash on
-    it)."""
+    it). Falls through to `_secondary_jobs_dir()` on a miss in the primary location —
+    see its docstring for why the SAME job-id lookup can legitimately need to check
+    two different directories."""
     try:
         path = job_path(job_id)
     except InvalidJobId:
         return None
     if not path.exists():
-        return None
+        secondary = _secondary_jobs_dir()
+        if secondary is None:
+            return None
+        path = secondary / f"{job_id}.json"
+        if not path.exists():
+            return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -255,14 +528,23 @@ def read_job(job_id: str) -> dict[str, Any] | None:
 def list_jobs() -> list[dict[str, Any]]:
     """Every recorded job, oldest first (job ids sort chronologically — see `new_job_id`).
     Skips any record that fails to parse rather than raising, so one corrupt file can't
-    hide every other job from `review jobs`."""
-    out: list[dict[str, Any]] = []
-    for p in sorted(jobs_dir().glob("*.json")):
-        try:
-            out.append(json.loads(p.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError):
-            continue
-    return out
+    hide every other job from `review jobs`. Merges in `_secondary_jobs_dir()`'s
+    records too (deduped by job_id, primary wins a collision) — see its docstring."""
+    seen: dict[str, dict[str, Any]] = {}
+    dirs = [jobs_dir()]
+    secondary = _secondary_jobs_dir()
+    if secondary is not None:
+        dirs.append(secondary)
+    for d in dirs:
+        for p in sorted(d.glob("*.json")):
+            job_id = p.stem
+            if job_id in seen:
+                continue
+            try:
+                seen[job_id] = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+    return [seen[k] for k in sorted(seen)]
 
 
 def is_pid_alive(pid: int) -> bool:
