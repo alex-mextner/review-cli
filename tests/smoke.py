@@ -29,22 +29,24 @@ REPO = Path(__file__).resolve().parent.parent
 REVIEW = str(REPO / "bin" / "review")
 _SMOKE_HOME: str | None = None
 _GIT_UNAVAILABLE_REASON: str | None | bool = None
-_GIT_REQUIRED_UNIT_FILES = frozenset({
-    "test_cwd.py",
-    "test_dashboard.py",
-    "test_deploy_sh.py",
-    "test_inseat_retry.py",
-    "test_install_state.py",
-    "test_no_git_repo.py",
-    "test_opencode_realrepo.py",
-    "test_output_flag.py",
-    "test_qa_executor.py",
-    "test_qa_mode.py",
-    "test_review_marker.py",
-    "test_review_commit_checkpoint.py",
-    "test_run_stats.py",
-    "test_staged_diff_honors_c_repo.py",
-})
+_GIT_REQUIRED_UNIT_FILES = frozenset(
+    {
+        "test_cwd.py",
+        "test_dashboard.py",
+        "test_deploy_sh.py",
+        "test_inseat_retry.py",
+        "test_install_state.py",
+        "test_no_git_repo.py",
+        "test_opencode_realrepo.py",
+        "test_output_flag.py",
+        "test_qa_executor.py",
+        "test_qa_mode.py",
+        "test_review_marker.py",
+        "test_review_commit_checkpoint.py",
+        "test_run_stats.py",
+        "test_staged_diff_honors_c_repo.py",
+    }
+)
 
 
 def _redirect_run_stats() -> None:
@@ -748,6 +750,15 @@ _UNIT_FILES = [
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_backstop.py", {}),
+    # External SIGTERM/SIGINT child reaper (review-cli#160) and its `--detach`/`jobs`/
+    # `status`/`wait` companion feature. Both spawn real subprocesses (a throwaway
+    # backend child + the actual `bin/review` CLI with the deterministic fake backend)
+    # but need no network/creds/real model CLIs.
+    ("test_signal_reaper.py", {}),
+    ("test_detach_jobs.py", {}),
+    # Log-dir/log-file sandboxed-write fallback (review-cli#162): a seat must survive an
+    # unwritable log location rather than crashing before its backend subprocess spawns.
+    ("test_log_dir_fallback.py", {}),
     # From main's review-UX-chain (review-cli#44): help defaults, install hook text / state, topic help.
     ("test_help_defaults.py", {}),
     ("test_install_hook_text.py", {}),

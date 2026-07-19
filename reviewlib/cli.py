@@ -6,6 +6,7 @@ acquisition, model selection, and dispatch to the mode functions. All behaviour
 lives in the sibling modules — this file is the thin entry the Stage 0
 decomposition was about.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -14,6 +15,7 @@ import io
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
@@ -21,6 +23,7 @@ from typing import TYPE_CHECKING, TextIO
 from . import backends
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
+from .process import _open_log_with_fallback, install_signal_reaper
 from .config import (
     CONFIG_PATH,
     DEFAULT_PRESET,
@@ -115,9 +118,15 @@ EXIT_QA_NO_SUITES = 6
 # and from no-suites (6), so CI tells "infra broke" apart from "a bug was found". The
 # NO_ENV / ENV_UNHEALTHY classes belong to the (later) compose env harness — reserved here
 # as 7/9 so the executor's BLOCKED code (8) sits between them in the same coherent block.
-EXIT_QA_NO_ENV = 7          # no stage AND no bring-up config for a backend/bot SUT (env harness, later)
-EXIT_QA_SUT_BOOT_FAILED = 8  # the tester could not bring the SUT up at all (VERDICT: BLOCKED)
-EXIT_QA_ENV_UNHEALTHY = 9   # bring-up succeeded but the health gate timed out (env harness, later)
+EXIT_QA_NO_ENV = (
+    7  # no stage AND no bring-up config for a backend/bot SUT (env harness, later)
+)
+EXIT_QA_SUT_BOOT_FAILED = (
+    8  # the tester could not bring the SUT up at all (VERDICT: BLOCKED)
+)
+EXIT_QA_ENV_UNHEALTHY = (
+    9  # bring-up succeeded but the health gate timed out (env harness, later)
+)
 
 # RETIRED Phase-1 scaffold code. Phase 1 returned 70 from the suites-resolved-but-no-executor
 # branch ("not implemented yet"). Phase 2 lands the executor, so that branch is GONE — the
@@ -142,8 +151,12 @@ def _is_git_repo(cwd: Path) -> bool:
     rev-parse` -> `_run` forwards `timeout=` straight to subprocess.run, which raises). `_run`
     is `text=True, stdout=PIPE`, so `proc.stdout` is always a str (never None)."""
     try:
-        proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd,
-                    env=git_repo_env(cwd), timeout=10)
+        proc = _run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0 and proc.stdout.strip().lower() == "true"
@@ -156,10 +169,11 @@ def _fail_not_a_repo(cwd: Path) -> int:
     print(
         f"[review-cli] not in a git repository ({cwd}).\n"
         "  the diff review needs a repo to diff (it reviews your working-tree / staged changes).\n"
-        "  fix: run a mode that needs no git — `review just-ask \"...\" --task CODE` / "
-        "`review quorum \"...\" --task CODE` / `review brainstorm \"...\" --task CODE` — "
+        '  fix: run a mode that needs no git — `review just-ask "..." --task CODE` / '
+        '`review quorum "..." --task CODE` / `review brainstorm "..." --task CODE` — '
         "or cd into a repo and re-run.",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     return EXIT_NOT_A_REPO
 
@@ -174,7 +188,8 @@ def _fail_git_diff(cwd: Path, exc: Exception) -> int:
         f"  git diff failed: {exc}\n"
         "  fix: check the repo is healthy (`git status`), or pipe a diff on stdin "
         "(`git diff | review diff --task CODE`).",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     return EXIT_GIT_DIFF_FAILED
 
@@ -243,24 +258,29 @@ def _effective_cwd(raw: str, *, warn: bool = True) -> Path:
         # (git_repo_env) so a leaked GIT_DIR/GIT_WORK_TREE can't resolve the toplevel to an
         # UNRELATED repo — the same #71 footgun the diff probe guards against.
         try:
-            proc = _run(["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
-                        cwd=resolved, env=git_repo_env(resolved), timeout=10)
+            proc = _run(
+                ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
+                cwd=resolved,
+                env=git_repo_env(resolved),
+                timeout=10,
+            )
         except (OSError, subprocess.TimeoutExpired):
             proc = None
         if proc is not None and proc.returncode == 0 and proc.stdout.strip():
             return Path(proc.stdout.strip())
     if warn:
-        print(f"[review-cli] warning: {resolved} is not inside a git repository; "
-              "reviewing it as-is — pass -C <project-root> to point review at your repo.",
-              file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] warning: {resolved} is not inside a git repository; "
+            "reviewing it as-is — pass -C <project-root> to point review at your repo.",
+            file=sys.stderr,
+            flush=True,
+        )
     return resolved
 
 
 # Shared between the `__serve` parser and the managed-service parser so the two surfaces never
 # drift on what `--host` means (loopback-only by default; 0.0.0.0 exposes over Tailscale).
-_DASHBOARD_HOST_HELP = (
-    "interface to bind (default: 127.0.0.1 loopback-only; 0.0.0.0 exposes over Tailscale)"
-)
+_DASHBOARD_HOST_HELP = "interface to bind (default: 127.0.0.1 loopback-only; 0.0.0.0 exposes over Tailscale)"
 
 # Printed (exit 4) when a genuine lifecycle action is requested but the shared service lib is
 # absent. Kept as a module constant so the smoke test can grep it and it stays aligned with the
@@ -312,16 +332,29 @@ def _dashboard_serve(rest: list[str]) -> int:
     Binds 127.0.0.1 by default; ``--host 0.0.0.0`` exposes it over Tailscale (mirrors
     ``review spec-web``). Imported lazily so the dashboard's stdlib HTTP stack never loads on
     the hot review path (and a stray import error in dashboard code can't break `review`)."""
-    sub = argparse.ArgumentParser(prog="review dashboard __serve",
-                                  description="Run the review-cli dashboard web server (blocking).")
+    sub = argparse.ArgumentParser(
+        prog="review dashboard __serve",
+        description="Run the review-cli dashboard web server (blocking).",
+    )
     sub.add_argument("--host", default="127.0.0.1", help=_DASHBOARD_HOST_HELP)
-    sub.add_argument("--port", type=int, default=None, help="port to bind (default: a free ephemeral port)")
-    sub.add_argument("--no-open", action="store_true", help="do not open a browser window")
-    sub.add_argument("--verbose", action="store_true", help="log every HTTP request to stderr")
+    sub.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="port to bind (default: a free ephemeral port)",
+    )
+    sub.add_argument(
+        "--no-open", action="store_true", help="do not open a browser window"
+    )
+    sub.add_argument(
+        "--verbose", action="store_true", help="log every HTTP request to stderr"
+    )
     ns = sub.parse_args(rest)
     from .dashboard import run_dashboard
 
-    return run_dashboard(port=ns.port, host=ns.host, open_browser=not ns.no_open, verbose=ns.verbose)
+    return run_dashboard(
+        port=ns.port, host=ns.host, open_browser=not ns.no_open, verbose=ns.verbose
+    )
 
 
 def _dashboard_subcommand(rest: list[str]) -> int:
@@ -385,9 +418,15 @@ def _dashboard_subcommand(rest: list[str]) -> int:
         prog="review dashboard",
         description="review-cli dashboard as a managed service (run/start/status/stop/enable/disable).",
     )
-    parser.add_argument("--host", default=DEFAULT_DASHBOARD_HOST, help=_DASHBOARD_HOST_HELP)
-    parser.add_argument("--port", type=int, default=DEFAULT_DASHBOARD_PORT,
-                        help=f"port to bind the managed dashboard (default: {DEFAULT_DASHBOARD_PORT})")
+    parser.add_argument(
+        "--host", default=DEFAULT_DASHBOARD_HOST, help=_DASHBOARD_HOST_HELP
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_DASHBOARD_PORT,
+        help=f"port to bind the managed dashboard (default: {DEFAULT_DASHBOARD_PORT})",
+    )
     subs = parser.add_subparsers(dest="action")
     # Parse FIRST, then build the manager factory over the parsed namespace. The factory closes
     # over `ns`, so `ns` must exist before any action can invoke it; registering the subcommands
@@ -437,26 +476,64 @@ def _sessions_subcommand(rest: list[str]) -> int:
         prog="review sessions",
         description="List or resume brainstorm sessions (parsed from the discussion logs).",
     )
-    sub.add_argument("-a", "--all", action="store_true",
-                     help="list ALL sessions incl. dead/interrupted (no synthesis); default lists recent completed")
-    sub.add_argument("-s", "--resume", metavar="ID", default=None,
-                     help="resume the session with this id (short id or unambiguous prefix): continue the round loop and synthesize")
-    sub.add_argument("--force", action="store_true",
-                     help="with --resume on an already-completed session, re-synthesize anyway")
+    sub.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="list ALL sessions incl. dead/interrupted (no synthesis); default lists recent completed",
+    )
+    sub.add_argument(
+        "-s",
+        "--resume",
+        metavar="ID",
+        default=None,
+        help="resume the session with this id (short id or unambiguous prefix): continue the round loop and synthesize",
+    )
+    sub.add_argument(
+        "--force",
+        action="store_true",
+        help="with --resume on an already-completed session, re-synthesize anyway",
+    )
     # Resume reuses the saved panel/moderator by default; -m / --moderator override.
-    sub.add_argument("-m", "--model", action="append", default=[],
-                     help="override the resume panel (repeat or comma-separate); default = the saved session's panel")
-    sub.add_argument("-C", "--cwd", default=".", help="repository directory (resume diff/agentic cwd)")
-    sub.add_argument("--moderator", default=None, help="override the resume moderator; default = the saved session's moderator")
+    sub.add_argument(
+        "-m",
+        "--model",
+        action="append",
+        default=[],
+        help="override the resume panel (repeat or comma-separate); default = the saved session's panel",
+    )
+    sub.add_argument(
+        "-C",
+        "--cwd",
+        default=".",
+        help="repository directory (resume diff/agentic cwd)",
+    )
+    sub.add_argument(
+        "--moderator",
+        default=None,
+        help="override the resume moderator; default = the saved session's moderator",
+    )
     # Grounding diff on resume: the original `--diff`/`--staged` grounding is NOT persisted
     # in the discussion log, so a resumed grounded brainstorm would otherwise continue
     # UNgrounded. These flags re-attach the current working-tree (--diff) or staged
     # (--staged) diff as grounding for the resumed rounds + synthesis (opt-in, like the
     # brainstorm mode's own grounding). Absent -> the resume runs ungrounded.
-    sub.add_argument("--diff", action="store_true", help="re-attach the working-tree diff as grounding for the resumed rounds")
-    sub.add_argument("--staged", action="store_true", help="re-attach the staged diff (git diff --cached) as grounding for the resumed rounds")
-    sub.add_argument("--timeout", type=int, default=None,
-                     help=f"per-call timeout seconds for the resumed rounds (default {PANEL_TIMEOUT_DEFAULT})")
+    sub.add_argument(
+        "--diff",
+        action="store_true",
+        help="re-attach the working-tree diff as grounding for the resumed rounds",
+    )
+    sub.add_argument(
+        "--staged",
+        action="store_true",
+        help="re-attach the staged diff (git diff --cached) as grounding for the resumed rounds",
+    )
+    sub.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help=f"per-call timeout seconds for the resumed rounds (default {PANEL_TIMEOUT_DEFAULT})",
+    )
     ns = sub.parse_args(rest)
 
     if ns.resume:
@@ -469,12 +546,18 @@ def _sessions_subcommand(rest: list[str]) -> int:
         if not ns.all:
             print("(pass -a/--all to include dead/interrupted sessions.)")
         return 0
-    header = "all sessions (incl. interrupted)" if ns.all else "recent completed sessions"
-    print(f"Brainstorm {header} — newest first; resume with `review sessions -s <id>`:\n")
+    header = (
+        "all sessions (incl. interrupted)" if ns.all else "recent completed sessions"
+    )
+    print(
+        f"Brainstorm {header} — newest first; resume with `review sessions -s <id>`:\n"
+    )
     for s in sessions:
         ts = s.timestamp.strftime("%Y-%m-%d %H:%M UTC") if s.timestamp else "?"
         topic = (s.topic[:60] + "…") if len(s.topic) > 61 else (s.topic or "(no topic)")
-        print(f"  {s.session_id}  [{s.status:<11}]  r{s.completed_rounds}  {ts}  {topic}")
+        print(
+            f"  {s.session_id}  [{s.status:<11}]  r{s.completed_rounds}  {ts}  {topic}"
+        )
     return 0
 
 
@@ -493,8 +576,12 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
         print(f"[review sessions] {exc}", file=sys.stderr, flush=True)
         return 2
     if sess is None:
-        print(f"[review sessions] no session with id '{ns.resume}'. "
-              "Run `review sessions -a` to list available ids.", file=sys.stderr, flush=True)
+        print(
+            f"[review sessions] no session with id '{ns.resume}'. "
+            "Run `review sessions -a` to list available ids.",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
 
     cwd = _effective_cwd(ns.cwd)
@@ -504,14 +591,18 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
     if explicit_models:
         models = explicit_models
     else:
-        models = [m for m in sess.panel if backends.backend_available(m)] or sess.panel or list(DEFAULT_MODELS)
+        models = (
+            [m for m in sess.panel if backends.backend_available(m)]
+            or sess.panel
+            or list(DEFAULT_MODELS)
+        )
     # Moderator: explicit --moderator override > the saved session moderator > picked.
     # The log records the moderator FALLBACK CHAIN joined with `>` (e.g. `claude:..>codex`),
     # so the saved value must be SPLIT back into candidates — passing the whole `a>b>c`
     # string as one explicit seed would make `pick_moderators` try an invalid single
     # backend id before falling back. Take the FIRST (highest-priority) saved candidate as
     # the explicit seed; pick_moderators rebuilds the rest of the priority order.
-    saved_mod = (sess.moderator.split(">")[0].strip() if sess.moderator else "")
+    saved_mod = sess.moderator.split(">")[0].strip() if sess.moderator else ""
     mod_seed = ns.moderator or (saved_mod or None)
     moderators = pick_moderators(mod_seed, models)
     timeout = ns.timeout if ns.timeout is not None else PANEL_TIMEOUT_DEFAULT
@@ -526,15 +617,24 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
         except RuntimeError:
             diff = ""
 
-    print(f"[review sessions] resuming '{sess.session_id}' ({sess.status}, "
-          f"{sess.completed_rounds} round(s) done): {sess.topic}", file=sys.stderr, flush=True)
+    print(
+        f"[review sessions] resuming '{sess.session_id}' ({sess.status}, "
+        f"{sess.completed_rounds} round(s) done): {sess.topic}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     # Panel modes announce their live-log paths (the resumed rounds stream to the log).
     backends._ANNOUNCE_LOGS = True
     try:
         return _sessions.resume_session(
-            sess, models=models, cwd=cwd, timeout=timeout,
-            moderators=moderators, diff=diff, force=ns.force,
+            sess,
+            models=models,
+            cwd=cwd,
+            timeout=timeout,
+            moderators=moderators,
+            diff=diff,
+            force=ns.force,
         )
     except _sessions.SessionAlreadyCompleteError as exc:
         # A refused resume (already-complete, no --force) did NO requested work. Return the
@@ -622,7 +722,10 @@ def _session_for_task_iteration(
         delta = abs((_session_started_utc(session) - started).total_seconds())
         if delta > _TASK_SESSION_MATCH_WINDOW_SECONDS:
             continue
-        if all_iterations and _closest_iteration_for_session(session, all_iterations) != iteration:
+        if (
+            all_iterations
+            and _closest_iteration_for_session(session, all_iterations) != iteration
+        ):
             continue
         if best_delta is None or delta < best_delta:
             best = session
@@ -652,8 +755,11 @@ def _task_subcommand(rest: list[str]) -> int:
         description="Show review iterations, models, and transcripts for one task code.",
     )
     parser.add_argument("code", nargs="?", help="task/issue code, e.g. HYP-742")
-    parser.add_argument("--detail", metavar="N|SESSION",
-                        help="print the full transcript for an iteration number or session id")
+    parser.add_argument(
+        "--detail",
+        metavar="N|SESSION",
+        help="print the full transcript for an iteration number or session id",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON")
     parser.add_argument(
         "--check",
@@ -665,11 +771,15 @@ def _task_subcommand(rest: list[str]) -> int:
         "history never satisfies it either (fail-closed)",
     )
     parser.add_argument(
-        "--min-iter", type=int, default=3,
+        "--min-iter",
+        type=int,
+        default=3,
         help="review-bar floor: PASSED recorded iterations (default 3)",
     )
     parser.add_argument(
-        "--min-models", type=int, default=3,
+        "--min-models",
+        type=int,
+        default=3,
         help="review-bar floor: distinct models among the PASSED iterations (default 3)",
     )
     ns = parser.parse_args(rest)
@@ -689,7 +799,9 @@ def _task_subcommand(rest: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
-        return _quorum_check_subcommand(ns.code, ns.min_iter, ns.min_models, as_json=ns.json)
+        return _quorum_check_subcommand(
+            ns.code, ns.min_iter, ns.min_models, as_json=ns.json
+        )
 
     if not ns.code:
         summaries = task_summaries()
@@ -744,12 +856,16 @@ def _task_subcommand(rest: list[str]) -> int:
         used_session_ids: set[str] = set()
         for item in iterations:
             idx = int(item["iteration"])
-            session = _session_for_task_iteration(item, sessions, iterations, used_session_ids)
+            session = _session_for_task_iteration(
+                item, sessions, iterations, used_session_ids
+            )
             if session is not None:
                 used_session_ids.add(session.session_id)
             models = ", ".join(item.get("models") or []) or "-"
             duration = fmt_duration(float(item.get("duration_seconds") or 0))
-            suffix = f" · session {session.session_id}" if session else " · logs not found"
+            suffix = (
+                f" · session {session.session_id}" if session else " · logs not found"
+            )
             print(
                 f"  iteration {idx}: {item.get('ts', '?')} · {item.get('mode', '?')} "
                 f"· pool={item.get('pool_size', 0)} · models: {models} "
@@ -766,7 +882,168 @@ def _task_subcommand(rest: list[str]) -> int:
     return 0
 
 
-def _quorum_check_subcommand(code: str, min_iter: int, min_models: int, *, as_json: bool) -> int:
+def _jobs_subcommand(rest: list[str]) -> int:
+    """`review jobs [--json]` — list every recorded `--detach` job, newest first.
+
+    Status is the RECONCILED value (`jobs.job_status`): a job whose recorded state is
+    still "running" but whose pid is gone is shown as "unknown-terminated" rather than
+    a stale "running" that never resolves."""
+    from . import jobs
+
+    parser = argparse.ArgumentParser(
+        prog="review jobs",
+        description="List detached (`--detach`) review jobs.",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    ns = parser.parse_args(rest)
+
+    records = [jobs.job_status(rec["job_id"]) or rec for rec in jobs.list_jobs()]
+    records.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
+
+    if ns.json:
+        import json as _json
+
+        print(_json.dumps(records, indent=2))
+        return 0
+
+    if not records:
+        print("No detached jobs recorded.")
+        return 0
+
+    for rec in records:
+        started = rec.get("started_at")
+        when = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))
+            if started
+            else "?"
+        )
+        print(
+            f"  {rec.get('job_id')}  {rec.get('status', '?'):<18} "
+            f"mode={rec.get('mode', '?')} pid={rec.get('pid', '?')} started={when}"
+        )
+    return 0
+
+
+def _job_exit_code(rec: dict) -> int:
+    """The exit code `status`/`wait` report for a job record: 0 while still running,
+    the job's OWN recorded `exit_code` once it finished ("done" or "failed" — NOT
+    collapsed to a bare 0/1, so a caller scripting against a specific code (2, 10, 124,
+    …) sees the real value), or 1 for "unknown-terminated" (the process died before it
+    could record one — no exit code exists to report)."""
+    status = rec.get("status")
+    if status == "running":
+        return 0
+    if status in ("done", "failed"):
+        code = rec.get("exit_code")
+        return code if isinstance(code, int) else 1
+    return 1  # unknown-terminated, or any unrecognized status
+
+
+def _status_subcommand(rest: list[str]) -> int:
+    """`review status <job-id> [--json] [--tail N]` — inspect one detached job.
+
+    Exit code mirrors the job (`_job_exit_code`): 0 while running, the job's OWN
+    recorded exit code once it finished, 1 for "unknown-terminated", 2 for an unknown
+    job-id (a usage error, like any other bad argument)."""
+    from . import jobs
+
+    parser = argparse.ArgumentParser(
+        prog="review status",
+        description="Show one detached (`--detach`) review job's status.",
+    )
+    parser.add_argument("job_id", help="job id printed by `--detach` / `review jobs`")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--tail",
+        type=int,
+        default=20,
+        metavar="N",
+        help="lines of log to show (default 20)",
+    )
+    ns = parser.parse_args(rest)
+
+    rec = jobs.job_status(ns.job_id)
+    if rec is None:
+        print(f"[review status] no such job: {ns.job_id}", file=sys.stderr)
+        return 2
+
+    if ns.json:
+        import json as _json
+
+        print(_json.dumps(rec, indent=2))
+        return _job_exit_code(rec)
+
+    print(f"job {rec['job_id']}: {rec.get('status', '?')}")
+    print(f"  mode:   {rec.get('mode', '?')}")
+    print(f"  pid:    {rec.get('pid', '?')}")
+    print(f"  log:    {rec.get('log_path', '?')}")
+    print(f"  result: {rec.get('result_path', '?')}")
+    if rec.get("exit_code") is not None:
+        print(f"  exit:   {rec['exit_code']}")
+    log_path = rec.get("log_path")
+    if ns.tail > 0 and log_path:
+        lines = jobs.tail_lines(Path(log_path), ns.tail)
+        if lines:
+            print(f"\n--- last {len(lines)} log line(s) ---")
+            for line in lines:
+                print(f"  {line}")
+    return _job_exit_code(rec)
+
+
+def _wait_subcommand(rest: list[str]) -> int:
+    """`review wait <job-id> [--timeout SECS] [--poll SECS]` — block until a detached
+    job finishes (or the wait itself times out).
+
+    For a human terminal or an unbounded background caller — NOT for a subagent with
+    its own short foreground cap (that caller should poll `review status` instead;
+    blocking here defeats the entire point of `--detach`). Default timeout mirrors the
+    internal run backstop's 4h ceiling, since no detached review can legitimately run
+    longer than that. Exit code mirrors the job's own recorded exit code
+    (`_job_exit_code`) once it finishes — NOT collapsed to a bare 0/1 — so a caller
+    scripting against a specific code (2, 10, 124, …) sees the real value; 1 for
+    "unknown-terminated" or this wait's own timeout, 2 for an unknown job-id."""
+    from . import jobs
+    from .backstop import MAX_BACKSTOP_SECONDS
+
+    parser = argparse.ArgumentParser(
+        prog="review wait",
+        description="Block until a detached (`--detach`) review job finishes.",
+    )
+    parser.add_argument("job_id", help="job id printed by `--detach` / `review jobs`")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=MAX_BACKSTOP_SECONDS,
+        metavar="SECS",
+        help=f"give up waiting after this many seconds (default {MAX_BACKSTOP_SECONDS})",
+    )
+    parser.add_argument(
+        "--poll", type=float, default=2.0, metavar="SECS", help="poll interval"
+    )
+    ns = parser.parse_args(rest)
+
+    deadline = time.monotonic() + max(1, ns.timeout)
+    while True:
+        rec = jobs.job_status(ns.job_id)
+        if rec is None:
+            print(f"[review wait] no such job: {ns.job_id}", file=sys.stderr)
+            return 2
+        if rec.get("status") in jobs.TERMINAL_STATUSES:
+            print(f"job {rec['job_id']}: {rec['status']}")
+            return _job_exit_code(rec)
+        if time.monotonic() >= deadline:
+            print(
+                f"[review wait] timed out after {ns.timeout}s waiting for {ns.job_id} "
+                f"(still {rec.get('status', '?')})",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(max(0.1, ns.poll))
+
+
+def _quorum_check_subcommand(
+    code: str, min_iter: int, min_models: int, *, as_json: bool
+) -> int:
     """`review task CODE --check [--min-iter N] [--min-models M]`.
 
     Exit 0 iff CODE has >= min_iter PASSED recorded iterations across >= min_models
@@ -784,7 +1061,10 @@ def _quorum_check_subcommand(code: str, min_iter: int, min_models: int, *, as_js
         return 0 if result["passed"] else 1
 
     if "error" in result:
-        print(f"review bar NOT met for {result['task_code']}: {result['error']}", file=sys.stderr)
+        print(
+            f"review bar NOT met for {result['task_code']}: {result['error']}",
+            file=sys.stderr,
+        )
         return 1
 
     passed_iter = result["passed_iterations"]
@@ -807,7 +1087,9 @@ def _quorum_check_subcommand(code: str, min_iter: int, min_models: int, *, as_js
     return 1
 
 
-def _task_detail(code: str, selector: str, iterations: list[dict], sessions: list, *, as_json: bool) -> int:
+def _task_detail(
+    code: str, selector: str, iterations: list[dict], sessions: list, *, as_json: bool
+) -> int:
     session = None
     iteration_no: int | None = None
     if selector.isdigit():
@@ -816,9 +1098,15 @@ def _task_detail(code: str, selector: str, iterations: list[dict], sessions: lis
             print("[review task] --detail iteration must be >= 1", file=sys.stderr)
             return 2
         if iterations:
-            record = next((item for item in iterations if item.get("iteration") == iteration_no), None)
+            record = next(
+                (item for item in iterations if item.get("iteration") == iteration_no),
+                None,
+            )
             if record is None:
-                print(f"No review iteration {iteration_no} found for task {code}.", file=sys.stderr)
+                print(
+                    f"No review iteration {iteration_no} found for task {code}.",
+                    file=sys.stderr,
+                )
                 return 1
             session = _session_for_task_iteration(record, sessions, iterations)
         elif iteration_no - 1 < len(sessions):
@@ -826,9 +1114,15 @@ def _task_detail(code: str, selector: str, iterations: list[dict], sessions: lis
     else:
         session = next((s for s in sessions if s.session_id == selector), None)
         if session is not None:
-            iteration_no = _iteration_for_session(session, iterations) or sessions.index(session) + 1
+            iteration_no = (
+                _iteration_for_session(session, iterations)
+                or sessions.index(session) + 1
+            )
     if session is None:
-        print(f"No conversation logs found for task {code} detail {selector}.", file=sys.stderr)
+        print(
+            f"No conversation logs found for task {code} detail {selector}.",
+            file=sys.stderr,
+        )
         return 1
     detail = session.to_detail()
     if as_json:
@@ -847,8 +1141,12 @@ def _task_detail(code: str, selector: str, iterations: list[dict], sessions: lis
         print("\n## Brainstorm transcript")
         print(session.brainstorm.body.rstrip())
     for idx, call in enumerate(session.calls, start=1):
-        status = "error" if call.has_error else ("running" if not call.completed else "ok")
-        print(f"\n## Call {idx}: {call.backend} r{call.round} [{status}] {call.filename}")
+        status = (
+            "error" if call.has_error else ("running" if not call.completed else "ok")
+        )
+        print(
+            f"\n## Call {idx}: {call.backend} r{call.round} [{status}] {call.filename}"
+        )
         if call.body:
             print(call.body)
         if call.stderr_lines:
@@ -889,7 +1187,9 @@ The daemon serves EVERY registered spec by name at /spec/<name> on ONE port (nav
 so one port / Tailscale mapping covers all specs instead of a server per spec."""
 
 # The lifecycle actions handled by the shared agenttools_service ServiceManager.
-_SPECWEB_LIFECYCLE = frozenset({"start", "status", "stop", "run", "enable", "disable", "__serve"})
+_SPECWEB_LIFECYCLE = frozenset(
+    {"start", "status", "stop", "run", "enable", "disable", "__serve"}
+)
 
 
 def _spec_web(argv: list[str]) -> int:
@@ -946,7 +1246,9 @@ def _spec_web_host_port(rest: list[str], *, defaults: bool = True):
 
     parser = argparse.ArgumentParser(prog="review spec-web", add_help=False)
     parser.add_argument("--host", default=DEFAULT_SPECWEB_HOST if defaults else None)
-    parser.add_argument("--port", type=int, default=DEFAULT_SPECWEB_PORT if defaults else None)
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_SPECWEB_PORT if defaults else None
+    )
     parser.add_argument("--agent", default=None)
     return parser.parse_known_args(rest)
 
@@ -1047,7 +1349,9 @@ def _spec_web_print_registry(host: str, port: int) -> None:
         print(f"[review spec-web] navigator {url}")
     specs = registry.list_specs()
     if not specs:
-        print("[review spec-web] no specs registered yet — add one with `review spec-web add <spec.md>`")
+        print(
+            "[review spec-web] no specs registered yet — add one with `review spec-web add <spec.md>`"
+        )
         return
     for rec in specs:
         urls = " ".join(daemon_spec_urls(rec["name"], host, port))
@@ -1105,13 +1409,17 @@ def _spec_web_add(rest: list[str], *, watch: bool) -> int:
             # BLOCKING single-spec server, the opposite of what was asked (and what the
             # backstop classifier assumes). Refuse loudly rather than silently blocking.
             print(_SPECWEB_MISSING_LIB, file=sys.stderr)
-            print("[review spec-web] add/--no-watch need the daemon; without the lib the only "
-                  "mode is the blocking single-spec server (`review spec-web <spec.md>`).",
-                  file=sys.stderr)
+            print(
+                "[review spec-web] add/--no-watch need the daemon; without the lib the only "
+                "mode is the blocking single-spec server (`review spec-web <spec.md>`).",
+                file=sys.stderr,
+            )
             return 4
         # Lib-less host: preserve the classic single-spec foreground server (full backward-compat).
-        print("[review spec-web] shared service lib absent — falling back to a single-spec server.",
-              file=sys.stderr)
+        print(
+            "[review spec-web] shared service lib absent — falling back to a single-spec server.",
+            file=sys.stderr,
+        )
         return _spec_web_legacy_foreground(spec, ns)
 
     if ns.seed is not None and _spec_web_seed(spec, ns.seed) != 0:
@@ -1139,7 +1447,9 @@ def _spec_web_add(rest: list[str], *, watch: bool) -> int:
     if ns.open_browser and urls:
         _spec_web_open_browser(urls[0])
     if watch and not ns.no_watch:
-        print("[review spec-web] waiting for a submit (Ctrl-C to stop; the daemon keeps running).")
+        print(
+            "[review spec-web] waiting for a submit (Ctrl-C to stop; the daemon keeps running)."
+        )
         return watch_submits(spec, exit_on_submit=ns.exit_on_submit, baseline=baseline)
     return 0
 
@@ -1154,8 +1464,11 @@ def _spec_web_ensure_running(mgr, *, agent: str | None = None) -> int | None:
         return None
     rc = _spec_web_require_agent("start", agent)
     if rc is not None:
-        print("[review spec-web] the daemon is not running and cannot be auto-started "
-              "without --agent.", file=sys.stderr)
+        print(
+            "[review spec-web] the daemon is not running and cannot be auto-started "
+            "without --agent.",
+            file=sys.stderr,
+        )
         return rc
     # AlreadyRunningError lives in agenttools_daemon (the pidfile layer agenttools_service
     # builds on) — it is NOT re-exported by agenttools_service. Imported only on the
@@ -1233,7 +1546,9 @@ def _spec_web_list(rest: list[str]) -> int:
 
     specs = registry.list_specs()
     if not specs:
-        print("[review spec-web] no specs registered. Add one with `review spec-web add <spec.md>`.")
+        print(
+            "[review spec-web] no specs registered. Add one with `review spec-web add <spec.md>`."
+        )
         return 0
     for rec in specs:
         try:
@@ -1242,7 +1557,9 @@ def _spec_web_list(rest: list[str]) -> int:
             comments = []
         openc = sum(1 for c in comments if c.get("status") in ("pending", "submitted"))
         flag = "" if rec["exists"] else "  (file missing)"
-        print(f"  {rec['name']:<28} {openc} open / {len(comments)} total  {rec['path']}{flag}")
+        print(
+            f"  {rec['name']:<28} {openc} open / {len(comments)} total  {rec['path']}{flag}"
+        )
     return 0
 
 
@@ -1255,7 +1572,9 @@ def _spec_web_remove(rest: list[str]) -> int:
 
     name = rest[0]
     if registry.unregister(name):
-        print(f"[review spec-web] removed '{name}' (its comment store is left on disk).")
+        print(
+            f"[review spec-web] removed '{name}' (its comment store is left on disk)."
+        )
         return 0
     print(f"[review spec-web] no registered spec named '{name}'.", file=sys.stderr)
     return 1
@@ -1272,7 +1591,9 @@ def _spec_web_watch(rest: list[str]) -> int:
     parser.add_argument("target", help="a registered spec NAME or a spec PATH")
     parser.add_argument("--exit-on-submit", dest="exit_on_submit", action="store_true")
     parser.add_argument(
-        "--emit-current", dest="emit_current", action="store_true",
+        "--emit-current",
+        dest="emit_current",
+        action="store_true",
         help="re-emit the batch already in the store before watching (recover a failed live delivery)",
     )
     ns, _ = parser.parse_known_args(rest)
@@ -1283,10 +1604,15 @@ def _spec_web_watch(rest: list[str]) -> int:
     if spec is None:
         spec = Path(ns.target).expanduser()
     if not spec.is_file():
-        print(f"[review spec-web watch] no such spec (name or path): {ns.target}", file=sys.stderr)
+        print(
+            f"[review spec-web watch] no such spec (name or path): {ns.target}",
+            file=sys.stderr,
+        )
         return 1
     print(f"[review spec-web] watching {spec} for a submit (Ctrl-C to stop).")
-    return watch_submits(spec, exit_on_submit=ns.exit_on_submit, emit_current=ns.emit_current)
+    return watch_submits(
+        spec, exit_on_submit=ns.exit_on_submit, emit_current=ns.emit_current
+    )
 
 
 def _spec_web_reply(argv: list[str]) -> int:
@@ -1301,10 +1627,22 @@ def _spec_web_reply(argv: list[str]) -> int:
         prog="review spec-web reply",
         description="Answer a reviewer's spec-web question/remark (shown in the UI + sent to tg).",
     )
-    parser.add_argument("comment_id", help="the id of the comment/question to answer (from the structured review)")
+    parser.add_argument(
+        "comment_id",
+        help="the id of the comment/question to answer (from the structured review)",
+    )
     parser.add_argument("answer", help="the answer text")
-    parser.add_argument("--spec", required=True, metavar="FILE", help="path to the spec markdown file (the store is keyed per spec)")
-    parser.add_argument("--no-tg", action="store_true", help="do not deliver the reply to Telegram (UI only)")
+    parser.add_argument(
+        "--spec",
+        required=True,
+        metavar="FILE",
+        help="path to the spec markdown file (the store is keyed per spec)",
+    )
+    parser.add_argument(
+        "--no-tg",
+        action="store_true",
+        help="do not deliver the reply to Telegram (UI only)",
+    )
     ns = parser.parse_args(argv)
 
     from .specweb.store import AGENT_AUTHOR, SpecStore
@@ -1321,9 +1659,15 @@ def _spec_web_reply(argv: list[str]) -> int:
     store = SpecStore(spec)
     rec = store.add_reply(ns.comment_id, body=answer, author=AGENT_AUTHOR)
     if rec is None:
-        print(f"[review spec-web reply] unknown comment id: {ns.comment_id}", file=sys.stderr)
+        print(
+            f"[review spec-web reply] unknown comment id: {ns.comment_id}",
+            file=sys.stderr,
+        )
         return 1
-    print(f"[review spec-web reply] replied to {ns.comment_id} (now {rec.get('status')}); shown in the spec-web UI.", flush=True)
+    print(
+        f"[review spec-web reply] replied to {ns.comment_id} (now {rec.get('status')}); shown in the spec-web UI.",
+        flush=True,
+    )
 
     if not ns.no_tg:
         _spec_web_reply_to_tg(spec, rec, answer)
@@ -1339,7 +1683,10 @@ def _spec_web_reply_to_tg(spec: Path, comment: dict, answer: str) -> None:
 
     exe = shutil.which("tg")
     if not exe:
-        print("[review spec-web reply] tg not on PATH — reply saved to the UI only (no Telegram).", flush=True)
+        print(
+            "[review spec-web reply] tg not on PATH — reply saved to the UI only (no Telegram).",
+            flush=True,
+        )
         return
     question = (comment.get("body") or "").strip()
     quote = (comment.get("quote") or "").strip()
@@ -1355,19 +1702,33 @@ def _spec_web_reply_to_tg(spec: Path, comment: dict, answer: str) -> None:
     lines = [f"Spec: {spec.name}"]
     if quote:
         lines.append(f"On: “{_clip(quote, 200)}”")
-    lines.append(f"{'Question' if kind == 'question' else 'Remark'}: {_clip(question, 600)}")
+    lines.append(
+        f"{'Question' if kind == 'question' else 'Remark'}: {_clip(question, 600)}"
+    )
     lines.append(f"Agent answer: {_clip(answer, 3000)}")
     message = "\n".join(lines)
     try:
         proc = subprocess.run(
-            [exe, "--tag", "ANSWER", "--title", f"Spec-web reply — {spec.name}", message],
-            capture_output=True, text=True, timeout=30,
+            [
+                exe,
+                "--tag",
+                "ANSWER",
+                "--title",
+                f"Spec-web reply — {spec.name}",
+                message,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if proc.returncode == 0:
             print("[review spec-web reply] delivered to Telegram via tg.", flush=True)
         else:
             err = (proc.stderr or proc.stdout or "").strip()
-            print(f"[review spec-web reply] tg delivery failed (exit {proc.returncode}): {err}", flush=True)
+            print(
+                f"[review spec-web reply] tg delivery failed (exit {proc.returncode}): {err}",
+                flush=True,
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"[review spec-web reply] tg delivery error: {exc}", flush=True)
 
@@ -1555,7 +1916,19 @@ def _is_persistent_server_invocation(argv: list[str]) -> bool:
 # spec-web actions that BLOCK (a persistent server / a submit-watch loop) and so must bypass the
 # `-o` tee + run backstop; everything else (lifecycle management, register, list) returns fast.
 _SPECWEB_FAST_ACTIONS = frozenset(
-    {"reply", "start", "status", "stop", "enable", "disable", "add", "list", "remove", "-h", "--help"}
+    {
+        "reply",
+        "start",
+        "status",
+        "stop",
+        "enable",
+        "disable",
+        "add",
+        "list",
+        "remove",
+        "-h",
+        "--help",
+    }
 )
 
 
@@ -1640,26 +2013,50 @@ class _Tee(io.TextIOBase):
 # must be passed through untouched — even if it happens to look like `-o`/`--output`
 # (e.g. `review --just-ask --output` where `--output` is the question text, or a
 # `--prompt -o…`). This keeps the light pre-scan from stealing another flag's value.
-_VALUE_TAKING_OPTS = frozenset({
-    "-m", "--model", "-C", "--cwd", "--task", "-o", "--output", "--prompt", "--timeout",
-    "--pool", "--preset", "--moderator", "--rounds", "--max-rounds",
-    "--visual", "--before", "--intent", "--expect", "--check",
-    "--vision-timeout", "--project",
-    # `--retry N` is a diff-mode-only int option (reviewlib/modes/review.py). It consumes a
-    # value, so the `-o` pre-scan must skip its argument — otherwise `--retry -o…`-shaped input
-    # would have the retry count mis-read as the output flag.
-    "--retry",
-    # `review spec-web reply <id> <answer> --spec <path>`: the value after --spec is a spec
-    # path that could look like an option (e.g. `--spec -odd-name.md`); list it so the `-o`
-    # pre-scan never steals it.
-    "--spec",
-    # The qa mode's VALUE-taking flags (modes/qa.py): `--suites <glob/dir/file>`,
-    # `--kind <shape>`, `--report <path>`, `--max-cases <N>`, plus the Phase-3 env flags
-    # `--stage-url <URL>` and `--config <path>`. Their values can look like an option (a path,
-    # `-1`), so the `-o` pre-scan must skip each one's argument. `--in-place` / `--keep-env`
-    # are boolean flags (no value) and are deliberately NOT listed.
-    "--suites", "--kind", "--report", "--max-cases", "--stage-url", "--config",
-})
+_VALUE_TAKING_OPTS = frozenset(
+    {
+        "-m",
+        "--model",
+        "-C",
+        "--cwd",
+        "--task",
+        "-o",
+        "--output",
+        "--prompt",
+        "--timeout",
+        "--pool",
+        "--preset",
+        "--moderator",
+        "--rounds",
+        "--max-rounds",
+        "--visual",
+        "--before",
+        "--intent",
+        "--expect",
+        "--check",
+        "--vision-timeout",
+        "--project",
+        # `--retry N` is a diff-mode-only int option (reviewlib/modes/review.py). It consumes a
+        # value, so the `-o` pre-scan must skip its argument — otherwise `--retry -o…`-shaped input
+        # would have the retry count mis-read as the output flag.
+        "--retry",
+        # `review spec-web reply <id> <answer> --spec <path>`: the value after --spec is a spec
+        # path that could look like an option (e.g. `--spec -odd-name.md`); list it so the `-o`
+        # pre-scan never steals it.
+        "--spec",
+        # The qa mode's VALUE-taking flags (modes/qa.py): `--suites <glob/dir/file>`,
+        # `--kind <shape>`, `--report <path>`, `--max-cases <N>`, plus the Phase-3 env flags
+        # `--stage-url <URL>` and `--config <path>`. Their values can look like an option (a path,
+        # `-1`), so the `-o` pre-scan must skip each one's argument. `--in-place` / `--keep-env`
+        # are boolean flags (no value) and are deliberately NOT listed.
+        "--suites",
+        "--kind",
+        "--report",
+        "--max-cases",
+        "--stage-url",
+        "--config",
+    }
+)
 
 
 def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
@@ -1689,7 +2086,9 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
     # Exclude it from the value-taking set for a `task` invocation so this pre-scan
     # doesn't mistake a following `-o FILE` for --check's (nonexistent) value.
     value_taking_opts = (
-        _VALUE_TAKING_OPTS - {"--check"} if argv and argv[0] == "task" else _VALUE_TAKING_OPTS
+        _VALUE_TAKING_OPTS - {"--check"}
+        if argv and argv[0] == "task"
+        else _VALUE_TAKING_OPTS
     )
     while i < len(argv):
         tok = argv[i]
@@ -1736,9 +2135,18 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
     return out, rest
 
 
-_LEADING_MODE_VALUE_OPTS = frozenset({
-    "-m", "--model", "-C", "--cwd", "--task", "--timeout", "--pool", "--preset",
-})
+_LEADING_MODE_VALUE_OPTS = frozenset(
+    {
+        "-m",
+        "--model",
+        "-C",
+        "--cwd",
+        "--task",
+        "--timeout",
+        "--pool",
+        "--preset",
+    }
+)
 _LEADING_MODE_FLAG_OPTS = frozenset({"--list-defaults", "--show-board"})
 _LEADING_MODE_INLINE_SHORT_OPTS = ("-m", "-C")
 
@@ -1749,7 +2157,10 @@ def _is_leading_inline_short_option(tok: str) -> bool:
         len(tok) > 2
         and tok.startswith("-")
         and not tok.startswith("--")
-        and any(tok.startswith(opt) and tok != opt for opt in _LEADING_MODE_INLINE_SHORT_OPTS)
+        and any(
+            tok.startswith(opt) and tok != opt
+            for opt in _LEADING_MODE_INLINE_SHORT_OPTS
+        )
     )
 
 
@@ -1771,7 +2182,7 @@ def _normalize_leading_mode_options(argv: list[str]) -> list[str]:
             return argv
         if not tok.startswith("-"):
             if tok in known_subcommands() and moved:
-                return [tok, *moved, *argv[i + 1:]]
+                return [tok, *moved, *argv[i + 1 :]]
             return argv
         if tok in _LEADING_MODE_VALUE_OPTS:
             if i + 1 >= len(argv):
@@ -1783,7 +2194,11 @@ def _normalize_leading_mode_options(argv: list[str]) -> list[str]:
             moved.append(tok)
             i += 1
             continue
-        if any(tok.startswith(f"{opt}=") for opt in _LEADING_MODE_VALUE_OPTS if opt.startswith("--")):
+        if any(
+            tok.startswith(f"{opt}=")
+            for opt in _LEADING_MODE_VALUE_OPTS
+            if opt.startswith("--")
+        ):
             moved.append(tok)
             i += 1
             continue
@@ -1807,28 +2222,324 @@ def _write_output_file(path: Path, text: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point: arm the internal run backstop around a review run, then dispatch.
+    """Entry point: install the child-reaper, then either detach a background job or
+    run the review inline (arming the internal backstop around it).
 
     `review` advertises NO external timeout — agents must not wrap it in a short
     shell `timeout` (the panel/brainstorm modes only emit their synthesis at the very
-    end). The ONLY time bound is this INTERNAL last-resort backstop, capped at <=4h
-    (`reviewlib.backstop`): a watchdog that force-terminates a genuinely wedged run so
-    "no external timeout" can never mean "runs forever". A healthy run finishes in
-    minutes, far under the ceiling, and the watchdog is cancelled cleanly on return.
+    end). Two escape hatches exist for a caller that genuinely cannot block for the
+    whole run: the INTERNAL last-resort backstop (below, capped at <=4h,
+    `reviewlib.backstop`) bounds a run that wedges past its own per-call deadlines, and
+    `--detach` (`_spawn_detached_job`, review-cli#160 companion feature) lets the
+    CALLER stop blocking at all — it spawns the review as a session-detached background
+    process and returns almost immediately with a job-id (`review status <job-id>` /
+    `review jobs` poll it afterwards).
 
-    The persistent SERVER subcommands (`dashboard`, `spec-web`) are deliberately
-    long-lived (they run until Ctrl-C), so they bypass the backstop entirely — bounding
-    them would kill the server at the ceiling, and a lowered env var would kill it almost
-    at once (codex P2). Every other path (the review/panel run and the instant
-    subcommands) is wrapped.
-
-    This is also where `-o FILE` is handled: the flag is pre-scanned out of argv (so it
-    works for every dispatch path, including the bare subcommands), and when present the
-    whole dispatch runs under a stdout TEE whose captured text is persisted to FILE via
-    Python — bypassing the shell redirect (and thus zsh noclobber). The file is always
-    written; stdout still prints live.
+    This function also finalizes a DETACHED job's terminal status: when
+    `$REVIEW_JOB_ID` is set (only true inside a child `_spawn_detached_job` itself
+    spawned), the body's return code — or the code of a propagating `SystemExit` — is
+    recorded via `reviewlib.jobs.write_job` before this process exits, so `review
+    status` never has to guess from a raw exit code alone.
     """
+    # Reap live backend children on an EXTERNAL SIGTERM/SIGINT (a caller's `kill <pid>`,
+    # a harness timing out this process, or Ctrl-C) — not just an internal backstop
+    # fire. See `process.install_signal_reaper` for why this is a distinct gap
+    # (review-cli#160): the internal backstop only reaps when ITS OWN watchdog fires
+    # from a live interpreter; an external signal's default disposition kills the
+    # process before any `finally` runs, orphaning session-isolated backend children.
+    install_signal_reaper()
+
     raw = sys.argv[1:] if argv is None else argv
+    detach, raw = _extract_detach_flag(raw)
+    if detach:
+        return _spawn_detached_job(raw)
+
+    job_id = os.environ.get("REVIEW_JOB_ID")
+    if not job_id:
+        return _main_dispatch(raw)
+
+    # Detached-child finalization path: run the SAME body as a normal foreground call,
+    # then durably record how it ended — including a SystemExit (argparse usage error,
+    # `--help`, or a deliberate `sys.exit`), which otherwise propagates past a plain
+    # `return` and would leave the job record stuck at "running" forever.
+    from . import jobs
+
+    rc = 1
+    try:
+        rc = _main_dispatch(raw)
+    except SystemExit as exc:
+        code = exc.code
+        rc = 0 if code is None else (code if isinstance(code, int) else 1)
+        raise
+    finally:
+        # Best-effort, like every other job-record write in this module: `$REVIEW_JOB_ID`
+        # is only ever set by OUR OWN `_spawn_detached_job` in the shipped call graph, but
+        # it is still an inherited environment variable — a malformed/tampered value must
+        # never crash the finalizer and mask the review's own real result (codex review:
+        # `jobs.write_job` raises `InvalidJobId` for anything that isn't a well-formed id).
+        try:
+            jobs.write_job(
+                job_id,
+                status="done" if rc == 0 else "failed",
+                exit_code=rc,
+                finished_at=time.time(),
+            )
+        except jobs.InvalidJobId:
+            print(
+                f"[review-cli] $REVIEW_JOB_ID is not a valid job id ({job_id!r}) — "
+                "not recording a job status.",
+                file=sys.stderr,
+            )
+    return rc
+
+
+def _extract_detach_flag(argv: list[str]) -> tuple[bool, list[str]]:
+    """Pull a bare `--detach` flag out of argv before dispatch (review-cli#160
+    companion feature), mirroring `_extract_output_path`'s pre-scan so `--detach` works
+    uniformly ahead of every mode's own parser. Boolean, no value: unlike `-o` there is
+    no glued/`=`-value form to recognize. Scanning stops at the first `--`
+    (end-of-options) and skips the value of any preceding value-taking option, so
+    `--prompt --detach` (the flag as literal prompt TEXT) is never misread as the
+    switch."""
+    out = False
+    rest: list[str] = []
+    i = 0
+    value_for_previous = False
+    value_taking_opts = (
+        _VALUE_TAKING_OPTS - {"--check"}
+        if argv and argv[0] == "task"
+        else _VALUE_TAKING_OPTS
+    )
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            rest.extend(argv[i:])
+            break
+        if value_for_previous:
+            rest.append(tok)
+            value_for_previous = False
+            i += 1
+            continue
+        if tok == "--detach":
+            out = True
+            i += 1
+            continue
+        rest.append(tok)
+        if tok in value_taking_opts:
+            value_for_previous = True
+        i += 1
+    return out, rest
+
+
+def _reviewlib_repo_root() -> str:
+    """The directory CONTAINING the `reviewlib` package this process is actually
+    running (its parent), suitable for `$PYTHONPATH`. `python -m reviewlib` only finds
+    the package if it is importable — true for a `pip install`, but NOT guaranteed for
+    the symlink-install path (`bin/review`'s shim inserts the repo root into ITS OWN
+    `sys.path`, which a spawned `python -m reviewlib` subprocess does not inherit). Every
+    install shape reaches this same line already having imported `reviewlib`
+    successfully (we ARE `reviewlib.cli`), so its resolved `__file__` always answers
+    correctly regardless of how THIS process found the package."""
+    import reviewlib
+
+    return str(Path(reviewlib.__file__).resolve().parent.parent)
+
+
+def _spawn_detached_job(raw: list[str]) -> int:
+    """Implement `--detach`: spawn a SECOND, full `review` invocation (the same argv,
+    minus `--detach`) as a session-detached background process, record it as a job, and
+    return almost immediately — the caller never blocks for the review itself.
+
+    Reuses `python -m reviewlib` (rather than resolving a `review` on PATH, which can be
+    a live-symlink into a DIFFERENT checkout — see `dashboard/service.py
+    _review_argv0`) so the detached child is guaranteed to run the exact code this
+    process is running, no live-symlink ambiguity — with `$PYTHONPATH` set to THIS
+    process's own resolved repo root (`_reviewlib_repo_root`) so a symlink-only install
+    (whose `sys.path` insert lives in the `bin/review` shim, not something a spawned
+    `python -m reviewlib` inherits) still finds the package. The child is started in its
+    OWN session (`start_new_session=True`) — same isolation `_run_streamed` gives
+    backend children — so it outlives this process's exit and is bounded the same way
+    (its own `install_signal_reaper` + `run_backstop`, wired the moment its `main()`
+    runs).
+
+    A piped diff (`git diff | review diff --detach`) is read HERE and spooled to a file
+    that becomes the child's stdin — the child's own process starts with a fresh, empty
+    stdin, so without this the piped input would silently vanish and the child would
+    fall back to reviewing the live working tree (or fail outside a repo) instead of the
+    diff the caller actually asked for.
+
+    A caller's own `-o FILE` is honored as the job's result file; otherwise a default
+    result path under `jobs.jobs_dir()` is used and passed to the child so the review's
+    normal `-o` machinery (including the quorum stamp) writes there. The job record is
+    written TWICE and never touches `status` after the first write: (1) BEFORE `Popen`,
+    with everything except `pid` — this happens-before the child can possibly exist, so
+    the child's OWN terminal-status write (in `main`'s finally) can never race a "does
+    this job exist yet" gap; (2) immediately after `Popen`, adding ONLY `pid` — no
+    `status` key — so even if the child finishes and writes its terminal status BETWEEN
+    these two writes, this second write cannot stomp it back to "running" (`jobs.
+    write_job`'s read-modify-write would otherwise silently regress a `done`/`failed`
+    record for a review fast enough to race its own parent). Persistent SERVER
+    subcommands (`dashboard`, `spec-web`) already have their own start/stop lifecycle —
+    ANY of their subactions rejects `--detach` (not just the blocking foreground server)
+    rather than double-daemonizing.
+    """
+    if raw and raw[0] in _SERVER_SUBCOMMANDS:
+        print(
+            "[review-cli] --detach is not supported for dashboard/spec-web — they "
+            "already have their own start/stop lifecycle (`review dashboard start`).",
+            file=sys.stderr,
+        )
+        return 2
+    if not raw:
+        print(
+            "[review-cli] --detach requires a mode (e.g. `review diff --detach`)",
+            file=sys.stderr,
+        )
+        return 2
+
+    from . import jobs
+
+    job_id = jobs.new_job_id()
+    # Resolved ONCE and reused for every path below (and propagated to the child via
+    # $REVIEW_JOBS_DIR further down) — `jobs_dir()`'s own last-resort fallback tier
+    # mints a brand-new `tempfile.mkdtemp()` directory the FIRST time it's hit in this
+    # process, so calling it repeatedly without pinning the result could scatter this
+    # one job's result/log/stdin paths across different directories, and the SPAWNED
+    # CHILD (a separate process, with its own memoization) could resolve yet a THIRD
+    # directory of its own if it ever recomputed the fallback independently (codex
+    # review, review-cli#162 follow-up).
+    this_jobs_dir = jobs.jobs_dir()
+    user_output, _ = _extract_output_path(list(raw))
+    result_path = (
+        user_output
+        if user_output is not None
+        else this_jobs_dir / f"{job_id}.result.txt"
+    )
+    log_path = this_jobs_dir / f"{job_id}.log"
+    child_argv = [sys.executable, "-m", "reviewlib", *raw]
+    if user_output is None:
+        # Insert BEFORE a `--` end-of-options marker if `raw` has one, not append at the
+        # tail — appending after `--` would make the generated `-o`/its value land as an
+        # extra POSITIONAL argument instead of an option, corrupting any invocation with
+        # its own `--` (e.g. `review just-ask --task X --detach -- --flag-like-question`
+        # — codex review).
+        insert_at = len(child_argv)
+        if "--" in raw:
+            insert_at = len(child_argv) - len(raw) + raw.index("--")
+        child_argv[insert_at:insert_at] = ["-o", str(result_path)]
+
+    env = dict(os.environ)
+    env["REVIEW_JOB_ID"] = job_id
+    # Pin the child to the SAME resolved jobs dir this process just used — without
+    # this, a child that later calls `jobs.jobs_dir()` itself (e.g. inside its own
+    # `main()` finally-block job-status write) could independently recompute the
+    # last-resort `mkdtemp()` fallback and land in a DIFFERENT directory than the
+    # parent, splitting one job's bookkeeping across two locations (codex review,
+    # review-cli#162 follow-up). A no-op when the standard location is writable (both
+    # processes already agree on the same fixed path in that case).
+    env["REVIEW_JOBS_DIR"] = str(this_jobs_dir)
+    repo_root = _reviewlib_repo_root()
+    existing_pp = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+    )
+
+    # Spool a piped diff to a file the child inherits as its OWN stdin — its process
+    # otherwise starts with nothing piped in, silently discarding the caller's input.
+    piped_input = None if sys.stdin.isatty() else sys.stdin.read()
+    stdin_path = this_jobs_dir / f"{job_id}.stdin" if piped_input else None
+
+    # Write the initial record BEFORE Popen (see docstring): the child cannot possibly
+    # exist yet, so its own terminal-status write can never race a job that doesn't
+    # exist on disk yet.
+    jobs.write_job(
+        job_id,
+        status="running",
+        mode=raw[0],
+        argv=raw,
+        cwd=os.getcwd(),
+        log_path=str(log_path),
+        result_path=str(result_path),
+        started_at=time.time(),
+    )
+
+    # Both file opens go through the SAME review-cli#162 sandboxed-write fallback
+    # `_run_streamed`'s own log open uses — a `--detach` job's bookkeeping files are
+    # exactly as likely to hit a sandboxed caller's write deny-list as the review's own
+    # transcript log, and a job whose OWN log/stdin can't be opened must not silently
+    # fail to even start.
+    log_fd, log_path = _open_log_with_fallback(log_path)
+    stdin_fd = subprocess.DEVNULL
+    if stdin_path is not None:
+        # O_RDWR, not the log-file default O_WRONLY: this fd is written once here and
+        # then handed to the CHILD as its stdin below, which needs to READ from it. A
+        # write-only fd made the child's read fail with EBADF, silently discarding the
+        # piped diff — the detached child fell back to reviewing the live working tree
+        # instead (codex review, review-cli#162 follow-up).
+        stdin_fd, stdin_path = _open_log_with_fallback(
+            stdin_path, flags=os.O_RDWR | os.O_CREAT | os.O_TRUNC
+        )
+        if stdin_path == Path(os.devnull):
+            # `_open_log_with_fallback`'s devnull tier is a fine last resort for a
+            # WRITE-only transcript log (losing a nice-to-have log beats crashing the
+            # seat), but silently using it here would be WRONG: a write to
+            # `os.devnull` is discarded, so the spawned child's read returns EOF
+            # immediately and it falls back to reviewing the LIVE WORKING TREE instead
+            # of the piped diff the caller asked for — wrong input, no error at all
+            # (codex review, review-cli#162 follow-up). Fail loud instead: this is an
+            # extreme double-failure (both the standard jobs dir AND the whole system
+            # temp root are unwritable), not the single-failure case this fix targets.
+            os.close(stdin_fd)
+            os.close(log_fd)
+            print(
+                "[review-cli] cannot spool the piped diff to any writable location "
+                "(the jobs dir and the system temp dir are both unwritable) — "
+                "refusing to silently review the wrong input. Set $REVIEW_JOBS_DIR to "
+                "a writable path, or drop --detach and pipe the diff to a synchronous "
+                "run instead.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        os.write(stdin_fd, piped_input.encode("utf-8"))
+        os.lseek(stdin_fd, 0, os.SEEK_SET)
+        # Unlink now: the fd stays valid (POSIX keeps the inode alive while any fd
+        # references it) and Popen below inherits it, so the child can still read the
+        # spooled diff — but no `<job>.stdin` file lingers on disk afterward (codex
+        # review: nothing previously cleaned this up).
+        try:
+            stdin_path.unlink()
+        except OSError:
+            pass
+    try:
+        proc = subprocess.Popen(
+            child_argv,
+            stdin=stdin_fd,
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    finally:
+        os.close(log_fd)
+        if stdin_fd != subprocess.DEVNULL:
+            os.close(stdin_fd)
+
+    # pid-only update: deliberately omits `status` so it can never regress a terminal
+    # status the child may have already written (see docstring).
+    jobs.write_job(job_id, pid=proc.pid)
+
+    print(f"[review-cli] detached job {job_id} started (pid {proc.pid})")
+    print(f"[review-cli]   log:    {log_path}")
+    print(f"[review-cli]   result: {result_path}")
+    print(f"[review-cli]   check:  review status {job_id}")
+    return 0
+
+
+def _main_dispatch(raw: list[str]) -> int:
+    """The body of a normal (non-`--detach`) `main()` call: `-o` handling, the backstop,
+    and dispatch. Split out of `main()` so a detached child (see `_spawn_detached_job`)
+    can run the identical path while `main()` wraps it with job-status finalization."""
     output_path, raw = _extract_output_path(list(raw))
     raw = _normalize_leading_mode_options(raw)
 
@@ -1892,11 +2603,12 @@ def main(argv: list[str] | None = None) -> int:
                 _write_output_file(output_path, captured.getvalue())
             except OSError as exc:
                 write_error = exc
-                print(f"[review-cli] -o: could not write {output_path}: {exc}",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"[review-cli] -o: could not write {output_path}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     return 1 if write_error is not None else rc
-
-
 
 
 def _model_default_help(mode: ModeSpec | None) -> str:
@@ -1999,7 +2711,9 @@ def _moderator_default_help() -> str:
     return " -> ".join(MODERATOR_CANDIDATES).replace("%", "%%")
 
 
-def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
+def _add_global_options(
+    parser: argparse.ArgumentParser, *, mode: ModeSpec | None
+) -> None:
     """Add the TRULY-GLOBAL options — the only ones the top-level `review --help` should
     list (ROADMAP "Subcommand-only options belong in the subcommand help, not the global
     list"): `-m/--model`, `-C/--cwd`, `-o/--output`, `--timeout`, `--list-defaults`,
@@ -2009,12 +2723,17 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
     Configurable options show their EFFECTIVE default value (ROADMAP "Help must show ACTUAL
     defaults"), resolving the config cascade + the mode where relevant (`--model`)."""
     parser.add_argument(
-        "-m", "--model", action="append", default=[],
+        "-m",
+        "--model",
+        action="append",
+        default=[],
         help=f"model/backend to run; repeat or comma-separate (default: {_model_default_help(mode)})",
     )
     parser.add_argument("-C", "--cwd", default=".", help="repository directory")
     parser.add_argument(
-        "--task", metavar="CODE", default=None,
+        "--task",
+        metavar="CODE",
+        default=None,
         help=(
             "task/issue code for this review iteration (required for recorded review "
             "modes; standalone visual without diff is exempt; may also be supplied by "
@@ -2022,7 +2741,10 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
         ),
     )
     parser.add_argument(
-        "-o", "--output", metavar="FILE", default=None,
+        "-o",
+        "--output",
+        metavar="FILE",
+        default=None,
         help=(
             "write the result to FILE via Python (creates parent dirs, overwrites) "
             "while still printing to stdout. Use this instead of `review … > FILE`, "
@@ -2030,7 +2752,9 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
         ),
     )
     parser.add_argument(
-        "--timeout", type=int, default=None,
+        "--timeout",
+        type=int,
+        default=None,
         help=(
             "per-call timeout seconds; REST uses wall/request timeout; review/panel "
             "agent CLIs use idle/silence timeout with a 20m floor for values >=60 "
@@ -2038,8 +2762,23 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             f"caps (requested defaults: review 1200, panel 240, qa {QA_TIMEOUT_DEFAULT})"
         ),
     )
-    parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
-    parser.add_argument("--show-board", action="store_true", help="print the active reviewer board (model -> role, availability) and exit")
+    parser.add_argument(
+        "--detach",
+        action="store_true",
+        help=(
+            "spawn this review as a session-detached background process and return "
+            "almost immediately with a job-id (see `review jobs`/`review status`/"
+            "`review wait`); not supported on dashboard/spec-web"
+        ),
+    )
+    parser.add_argument(
+        "--list-defaults", action="store_true", help="print default models and exit"
+    )
+    parser.add_argument(
+        "--show-board",
+        action="store_true",
+        help="print the active reviewer board (model -> role, availability) and exit",
+    )
     if mode is None or mode.name == "review":
         parser.add_argument(
             "--preset",
@@ -2053,7 +2792,10 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             ),
         )
     parser.add_argument(
-        "--pool", type=int, default=None, metavar="N",
+        "--pool",
+        type=int,
+        default=None,
+        metavar="N",
         help=(
             "how many of the board's seats to run (default "
             f"{preset_pool_size('default')} for default/heavy, {preset_pool_size('light')} "
@@ -2063,7 +2805,10 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
         ),
     )
     parser.add_argument(
-        "--effort", action="append", default=[], metavar="LEVEL|PROVIDER=LEVEL",
+        "--effort",
+        action="append",
+        default=[],
+        metavar="LEVEL|PROVIDER=LEVEL",
         help=(
             "run-scoped reasoning effort, overriding each seat's config effort for THIS run. "
             "A bare level (minimal/low/medium/high/xhigh/max) applies to every seat; "
@@ -2080,7 +2825,9 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
     # (AGENTS.md: the global list is only truly-global options). codex P1 on #46.
 
 
-def _add_visual_options(parser: argparse.ArgumentParser, *, include_visual_flag: bool = True) -> None:
+def _add_visual_options(
+    parser: argparse.ArgumentParser, *, include_visual_flag: bool = True
+) -> None:
     """Add the composable `--visual` feature flags as their own argument GROUP. These are
     SUBCOMMAND-scoped, NOT global (ROADMAP): `--visual` rides any subcommand, so they live
     on every MODE parser but must NOT clutter the top-level `review --help`. Grouping them
@@ -2092,17 +2839,62 @@ def _add_visual_options(parser: argparse.ArgumentParser, *, include_visual_flag:
     )
     group = parser.add_argument_group(group_title)
     if include_visual_flag:
-        group.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; rides text subcommands (e.g. `review brainstorm \"Q\" --task CODE --visual IMAGE`; prefer `review visual IMAGE` for standalone)")
-    group.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
-    group.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
-    group.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
-    group.add_argument("--check", action="append", default=[], metavar="NAME", help="force-activate a visual module by name (repeatable)")
-    group.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
-    group.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
-    group.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
-    group.add_argument("--no-local-model", action="store_true", help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)")
-    group.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
-    group.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
+        group.add_argument(
+            "--visual",
+            metavar="IMAGE",
+            help='image to verify/attach; rides text subcommands (e.g. `review brainstorm "Q" --task CODE --visual IMAGE`; prefer `review visual IMAGE` for standalone)',
+        )
+    group.add_argument(
+        "--before",
+        metavar="IMAGE",
+        help="baseline image for diff-aware judgement / no-effect bypass",
+    )
+    group.add_argument(
+        "--intent",
+        metavar="TEXT",
+        help="free-text edit intent (untrusted; may only tighten the contract)",
+    )
+    group.add_argument(
+        "--expect",
+        metavar="KIND",
+        help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text",
+    )
+    group.add_argument(
+        "--check",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="force-activate a visual module by name (repeatable)",
+    )
+    group.add_argument(
+        "--json", action="store_true", help="emit the structured visual verdict as JSON"
+    )
+    group.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 10 on a blocking visual verdict (gate use)",
+    )
+    group.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="run cvGate only (no vision call) — fast CI smoke / offline",
+    )
+    group.add_argument(
+        "--no-local-model",
+        action="store_true",
+        help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)",
+    )
+    group.add_argument(
+        "--vision-timeout",
+        type=int,
+        default=60,
+        help="per vision-call timeout seconds (default 60)",
+    )
+    group.add_argument(
+        "--project",
+        default=None,
+        help="project root for per-project visual modules (default --cwd)",
+    )
 
 
 def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> None:
@@ -2120,16 +2912,27 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
     # --diff / --staged select the diff source. They matter to the diff review (its diff is
     # required) and brainstorm/panel grounding; keep them on every mode parser (a mode that
     # ignores one is harmless) but OFF the top-level overview.
-    parser.add_argument("--diff", action="store_true", help="use the working-tree diff (default for the diff review; optional grounding for brainstorm)")
-    parser.add_argument("--staged", action="store_true", help="use the staged diff (git diff --cached) instead of the working-tree diff")
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="use the working-tree diff (default for the diff review; optional grounding for brainstorm)",
+    )
+    parser.add_argument(
+        "--staged",
+        action="store_true",
+        help="use the staged diff (git diff --cached) instead of the working-tree diff",
+    )
 
     # --prompt is the DIFF REVIEW's prompt override only.
     if mode.name == "review":
-        parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="override the diff-review prompt")
+        parser.add_argument(
+            "--prompt", default=DEFAULT_PROMPT, help="override the diff-review prompt"
+        )
     # --moderator steers the quorum / brainstorm synthesis only.
     if mode.name in ("quorum", "brainstorm"):
         parser.add_argument(
-            "--moderator", default=None,
+            "--moderator",
+            default=None,
             help=f"moderator backend (default: auto-pick, first available of {_moderator_default_help()})",
         )
 
@@ -2145,29 +2948,65 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
 
 # Flags that live ONLY on a subcommand parser (NOT the global top-level parser), per the
 # option-scoping. When one of these LEADS a no-subcommand invocation (e.g. the old pre-commit
-    # `review --staged`, or `review --visual shot.png`), the top-level parser would reject it with
+# `review --staged`, or `review --visual shot.png`), the top-level parser would reject it with
 # argparse's opaque "unrecognized arguments", losing the `review diff` migration pointer. The
 # pre-parse guard below catches them and emits the friendly pointer instead.
-_SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
-    "--diff", "--staged", "--prompt", "--moderator", "--rounds", "--max-rounds",
-    "--visual", "--before", "--intent", "--expect", "--check", "--json", "--strict",
-    "--no-ai", "--no-local-model", "--vision-timeout", "--project", "--retry", "--commit",
-    # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
-    # etc. must get the friendly "use the subcommand" pointer, not argparse's opaque error.
-    # Phase 3 adds the SUT-env flags `--stage-url` / `--config` / `--keep-env`.
-    "--suites", "--kind", "--in-place", "--report", "--max-cases",
-    "--stage-url", "--config", "--keep-env",
-})
+_SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset(
+    {
+        "--diff",
+        "--staged",
+        "--prompt",
+        "--moderator",
+        "--rounds",
+        "--max-rounds",
+        "--visual",
+        "--before",
+        "--intent",
+        "--expect",
+        "--check",
+        "--json",
+        "--strict",
+        "--no-ai",
+        "--no-local-model",
+        "--vision-timeout",
+        "--project",
+        "--retry",
+        "--commit",
+        # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
+        # etc. must get the friendly "use the subcommand" pointer, not argparse's opaque error.
+        # Phase 3 adds the SUT-env flags `--stage-url` / `--config` / `--keep-env`.
+        "--suites",
+        "--kind",
+        "--in-place",
+        "--report",
+        "--max-cases",
+        "--stage-url",
+        "--config",
+        "--keep-env",
+    }
+)
 
 # The BARE management subcommands `_dispatch` handles directly (NOT mode verbs in
 # known_subcommands(), and NOT the diff review): they have their OWN flag parsers (e.g.
 # `review sessions -s <id> --diff --moderator …`). The verb-less migration guard must leave
 # them alone — a `--diff`/`--moderator` after `sessions` belongs to that subparser, not a
 # missing `review diff`.
-_BARE_SUBCOMMANDS: frozenset[str] = frozenset({
-    "install-skill", "install-commit-hook", "install-hook", "dashboard", "sessions",
-    "task", "trust-module", "register-module", "spec-web",
-})
+_BARE_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        "install-skill",
+        "install-commit-hook",
+        "install-hook",
+        "dashboard",
+        "sessions",
+        "task",
+        "trust-module",
+        "register-module",
+        "spec-web",
+        "jobs",
+        "status",
+        "wait",
+    }
+)
 
 
 def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
@@ -2182,8 +3021,10 @@ def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
     Self-contained (checks the no-subcommand condition itself) so it is safe to call in
     `main()` BEFORE the `-o` tee is armed — a usage error must NOT write/truncate the `-o`
     file (like the removed-flags guards)."""
-    if argv and not argv[0].startswith("-") and (
-        argv[0] in known_subcommands() or argv[0] in _BARE_SUBCOMMANDS
+    if (
+        argv
+        and not argv[0].startswith("-")
+        and (argv[0] in known_subcommands() or argv[0] in _BARE_SUBCOMMANDS)
     ):
         return None  # a recognized subcommand (mode or management) owns these flags
     for tok in argv:
@@ -2194,7 +3035,7 @@ def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
                 "  use:  review visual IMAGE [--diff] [options]\n"
                 if tok.split("=", 1)[0] == "--visual"
                 else "  use:  review diff --task CODE [options]   "
-                     "(e.g. `review diff --staged --task CODE`)\n"
+                "(e.g. `review diff --staged --task CODE`)\n"
             )
             print(
                 "review: no subcommand given. The diff review is now `review diff` "
@@ -2202,7 +3043,8 @@ def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
                 "subcommand.\n"
                 f"{use_line}"
                 "  (run `review --help` for all subcommands)",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             return 2
     return None
@@ -2304,23 +3146,33 @@ See also: `review --help` (overview), `review --show-board`, `review <mode> --he
 # topic -> (one-line summary for the main-help listing, zero-arg renderer). Add a topic =
 # add an entry here; the main-help pointer + dispatch pick it up with no other edit.
 HELP_TOPICS: dict[str, tuple[str, "object"]] = {
-    "config": ("config file, the model/board selection cascade, keys/auth", _help_topic_config),
+    "config": (
+        "config file, the model/board selection cascade, keys/auth",
+        _help_topic_config,
+    ),
 }
 
 
 def _subcommand_epilog() -> str:
-    topics = "\n".join(f"  review help {t:<8} {summary}" for t, (summary, _) in HELP_TOPICS.items())
-    return "subcommands:\n" + "\n".join(
-        f"  {m.subcommand:<11} {m.summary}" for m in iter_modes()
-    ) + (
-        "\n  dashboard   managed web dashboard over review-cli runs (run/start/status/stop/enable/disable)"
-        "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
-        "\n  task        show review iterations and transcripts for one task code"
-        "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
-        "\n  install-skill / install-commit-hook / install-hook tg / register-module"
-        "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
-        + topics
-        + "\n  see `review help config` for configuration."
+    topics = "\n".join(
+        f"  review help {t:<8} {summary}" for t, (summary, _) in HELP_TOPICS.items()
+    )
+    return (
+        "subcommands:\n"
+        + "\n".join(f"  {m.subcommand:<11} {m.summary}" for m in iter_modes())
+        + (
+            "\n  dashboard   managed web dashboard over review-cli runs (run/start/status/stop/enable/disable)"
+            "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
+            "\n  task        show review iterations and transcripts for one task code"
+            "\n  jobs        list detached (--detach) review jobs"
+            "\n  status      show one detached job's status, paths, and a log tail (`status <job-id>`)"
+            "\n  wait        block until a detached job finishes (`wait <job-id>`)"
+            "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
+            "\n  install-skill / install-commit-hook / install-hook tg / register-module"
+            "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
+            + topics
+            + "\n  see `review help config` for configuration."
+        )
     )
 
 
@@ -2357,7 +3209,8 @@ def _build_mode_parser(mode: ModeSpec) -> argparse.ArgumentParser:
     is `review <subcommand>` and it carries the global options + the mode-relevant flags +
     the composable visual group + the mode's own positional)."""
     parser = argparse.ArgumentParser(
-        prog=f"review {mode.subcommand}", description=mode.summary,
+        prog=f"review {mode.subcommand}",
+        description=mode.summary,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_mode_options(parser, mode=mode)
@@ -2384,13 +3237,16 @@ def _reject_removed_flags(argv: list[str]) -> int | None:
         bare = tok.split("=", 1)[0]
         sub = REMOVED_MODE_FLAGS.get(bare)
         if sub is not None:
-            task_hint = " --task CODE" if sub in {"brainstorm", "just-ask", "quorum"} else ""
+            task_hint = (
+                " --task CODE" if sub in {"brainstorm", "just-ask", "quorum"} else ""
+            )
             print(
                 f"review: `{bare}` is no longer a flag — it is now the `{sub}` subcommand.\n"
-                f"  use:  review {sub} \"<your text>\"{task_hint} [options]\n"
+                f'  use:  review {sub} "<your text>"{task_hint} [options]\n'
                 f"  (modes are subcommands now: brainstorm / just-ask / quorum; "
                 f"run `review --help`)",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             return 2
         removed = REMOVED_FLAGS.get(bare)
@@ -2399,7 +3255,8 @@ def _reject_removed_flags(argv: list[str]) -> int | None:
                 f"review: `{bare}` was removed and is no longer accepted.\n"
                 f"  why:  {removed.reason}\n"
                 f"  fix:  {removed.fix}",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             return 2
     return None
@@ -2420,7 +3277,8 @@ def _reject_removed_subcommand(argv: list[str]) -> int | None:
             f"now `review {replacement}`.\n"
             f"  use:  review {replacement} --task CODE [options]\n"
             f"  (run `review --help` for all subcommands)",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
         return 2
     return None
@@ -2437,7 +3295,11 @@ def _leading_removed_subcommand(argv: list[str]) -> str | None:
         if tok in _LEADING_MODE_VALUE_OPTS:
             i += 2
             continue
-        if any(tok.startswith(f"{opt}=") for opt in _LEADING_MODE_VALUE_OPTS if opt.startswith("--")):
+        if any(
+            tok.startswith(f"{opt}=")
+            for opt in _LEADING_MODE_VALUE_OPTS
+            if opt.startswith("--")
+        ):
             i += 1
             continue
         if tok in _LEADING_MODE_FLAG_OPTS:
@@ -2465,24 +3327,34 @@ def _help_subcommand(rest: list[str]) -> int:
     the tee's `finally` with `completed=False`, so no write happens. The SUCCESS paths (the
     topic listing / a valid topic) still `return 0`: that output is real and SHOULD be teed."""
     if not rest:
-        print("review help topics:\n" + "\n".join(
-            f"  {t:<10} {summary}" for t, (summary, _) in HELP_TOPICS.items()
-        ) + "\n\nRun `review help <topic>` (or `review --help <topic>`) for the full reference.")
+        print(
+            "review help topics:\n"
+            + "\n".join(
+                f"  {t:<10} {summary}" for t, (summary, _) in HELP_TOPICS.items()
+            )
+            + "\n\nRun `review help <topic>` (or `review --help <topic>`) for the full reference."
+        )
         return 0
     # Exactly one topic token — extra trailing args are a usage error, not silently dropped
     # (codex review: `review help config --bogus` / `review --help config extra` must NOT
     # exit 0 ignoring the tail).
     if len(rest) > 1:
-        print(f"review help: takes a single topic, got extra arguments: {' '.join(rest[1:])}\n"
-              f"  use:  review help <topic>   (topics: {', '.join(HELP_TOPICS)})",
-              file=sys.stderr, flush=True)
+        print(
+            f"review help: takes a single topic, got extra arguments: {' '.join(rest[1:])}\n"
+            f"  use:  review help <topic>   (topics: {', '.join(HELP_TOPICS)})",
+            file=sys.stderr,
+            flush=True,
+        )
         raise SystemExit(2)
     topic = rest[0]
     entry = HELP_TOPICS.get(topic)
     if entry is None:
         known = ", ".join(HELP_TOPICS)
-        print(f"review help: unknown topic '{topic}'. Known topics: {known}.",
-              file=sys.stderr, flush=True)
+        print(
+            f"review help: unknown topic '{topic}'. Known topics: {known}.",
+            file=sys.stderr,
+            flush=True,
+        )
         raise SystemExit(2)
     _summary, render = entry
     text = render()
@@ -2538,6 +3410,16 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # `review task CODE` — task-scoped run-stat iterations + log transcripts.
     if argv and argv[0] == "task":
         return _task_subcommand(argv[1:])
+    # `review jobs` / `review status <job-id>` / `review wait <job-id>` — the
+    # `--detach` companion commands (review-cli#160): inspect or block on a
+    # session-detached background review started elsewhere. Bare subcommands, same
+    # reasoning as `sessions`/`task` above.
+    if argv and argv[0] == "jobs":
+        return _jobs_subcommand(argv[1:])
+    if argv and argv[0] == "status":
+        return _status_subcommand(argv[1:])
+    if argv and argv[0] == "wait":
+        return _wait_subcommand(argv[1:])
     # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
     # install-skill) so they don't clutter the main review argparse surface. Project
     # modules load by default (trust-by-default); trust-module only pins under the
@@ -2546,7 +3428,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
         from .features.visual.registry import trust_module
 
         if len(argv) < 2:
-            print("usage: review trust-module <name> [--project DIR]  (only needed under REVIEW_UNTRUSTED_MODULES=1)", file=sys.stderr)
+            print(
+                "usage: review trust-module <name> [--project DIR]  (only needed under REVIEW_UNTRUSTED_MODULES=1)",
+                file=sys.stderr,
+            )
             return 2
         proj = None
         rest = argv[2:]
@@ -2588,7 +3473,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # an unknown verb — routes to the TOP-LEVEL parser, which serves --help / --list-defaults
     # / --show-board and otherwise prints HELP (a bare `review` no longer runs a diff review:
     # that was the mistake this migration fixes — use `review diff`). ----------------------
-    is_subcommand = bool(argv) and not argv[0].startswith("-") and argv[0] in known_subcommands()
+    is_subcommand = (
+        bool(argv) and not argv[0].startswith("-") and argv[0] in known_subcommands()
+    )
     if is_subcommand:
         mode = get_mode(argv[0])
         assert mode is not None  # known_subcommands() guarantees it
@@ -2605,7 +3492,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         rc = _reject_subcommand_only_flag_without_verb(argv)
         if rc is not None:
             return rc
-        mode = diff_mode()  # only used by the meta-flag handlers (--list-defaults / --show-board)
+        mode = (
+            diff_mode()
+        )  # only used by the meta-flag handlers (--list-defaults / --show-board)
         rest = argv
         parser = _build_top_level_parser()
 
@@ -2618,7 +3507,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # board path never has to thread the value through every panel signature. Clamped to the
     # ceiling so a stray `--retry 9999` can't pin a dead seat for minutes.
     if getattr(args, "retry", None) is not None:
-        os.environ["REVIEW_RETRY_COUNT"] = str(max(0, min(args.retry, max_retry_count())))
+        os.environ["REVIEW_RETRY_COUNT"] = str(
+            max(0, min(args.retry, max_retry_count()))
+        )
 
     # Run-scoped `--effort` (global flag): parse ONCE into an EffortOverride here so both the
     # board path (applied CLI-side onto the seats) and the flat-panel modes (threaded via
@@ -2638,23 +3529,34 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # blank/whitespace entries — is NOT a real preference.
     config_models = _split_models(config.get("models") or [])
     config_visual_models = _split_models(config.get("visual_models") or [])
-    config_has_board = isinstance(config.get("board"), list) and bool(config.get("board"))
+    config_has_board = isinstance(config.get("board"), list) and bool(
+        config.get("board")
+    )
     explicit_models = _split_models(args.model)
     explicit_preset = getattr(args, "preset", None) is not None
     preset_applies = mode.name == "review"
     if explicit_preset and preset_applies:
         active_preset = args.preset
-    elif preset_applies and not explicit_models and not config_models and not config_has_board:
+    elif (
+        preset_applies
+        and not explicit_models
+        and not config_models
+        and not config_has_board
+    ):
         active_preset = DEFAULT_PRESET
     else:
         active_preset = None
-    effective_pool_size = args.pool if args.pool is not None else preset_pool_size(active_preset)
+    effective_pool_size = (
+        args.pool if args.pool is not None else preset_pool_size(active_preset)
+    )
 
     if args.list_defaults:
         if explicit_models:
             effective = explicit_models
         elif mode.name == "visual":
-            effective = config_visual_models or [_expand_alias(x) for x in VISUAL_MODELS]
+            effective = config_visual_models or [
+                _expand_alias(x) for x in VISUAL_MODELS
+            ]
         elif mode.name == "review" and active_preset is not None:
             try:
                 effective = [r.model for r in load_board(config, preset=active_preset)]
@@ -2670,9 +3572,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
                 return 2
         elif mode.name == "brainstorm":
-            effective = _split_models(config.get("brainstorm_models") or []) or config_models or [
-                _expand_alias(x) for x in DEFAULT_MODELS
-            ]
+            effective = (
+                _split_models(config.get("brainstorm_models") or [])
+                or config_models
+                or [_expand_alias(x) for x in DEFAULT_MODELS]
+            )
         else:
             effective = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
         print("\n".join(effective))
@@ -2682,8 +3586,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # Resolve cwd up front so the agentic/diff-only labels reflect whether opencode
         # would actually run in a real repo for THIS -C (it's diff-only outside a repo).
         return _show_board(
-            config, effective_pool_size, _effective_cwd(args.cwd),
-            preset=active_preset, explicit_models=explicit_models,
+            config,
+            effective_pool_size,
+            _effective_cwd(args.cwd),
+            preset=active_preset,
+            explicit_models=explicit_models,
         )
 
     piped_input = _read_stdin_if_piped()
@@ -2699,7 +3606,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         try:
             task_code = normalize_task_code(raw_task)
         except ValueError as exc:
-            print(f"[review-cli] invalid --task CODE: {exc}", file=sys.stderr, flush=True)
+            print(
+                f"[review-cli] invalid --task CODE: {exc}", file=sys.stderr, flush=True
+            )
             return 2
         if task_code is None:
             print(
@@ -2736,14 +3645,16 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 "\nreview: a diff was piped in but no subcommand given. The diff review is "
                 "now `review diff` (a bare `review` no longer runs one). "
                 "Run `git diff | review diff --task CODE`.",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             raise SystemExit(2)
         if rest:
             print(
                 "\nreview: no subcommand given. The diff review is now `review diff` "
                 "(a bare `review` no longer runs one). Run `review diff --task CODE [options]`.",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             raise SystemExit(2)
         raise SystemExit(0)
@@ -2769,7 +3680,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if explicit_models:
         models = explicit_models
     elif is_brainstorm:
-        src = _split_models(config.get("brainstorm_models") or []) or config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        src = (
+            _split_models(config.get("brainstorm_models") or [])
+            or config_models
+            or [_expand_alias(x) for x in DEFAULT_MODELS]
+        )
         models = [m for m in src if backends.backend_available(m)]
         if not models:
             models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
@@ -2780,7 +3695,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if explicit_models:
         visual_models = explicit_models
     else:
-        visual_models = config_visual_models or [_expand_alias(x) for x in VISUAL_MODELS]
+        visual_models = config_visual_models or [
+            _expand_alias(x) for x in VISUAL_MODELS
+        ]
     # Timeout default by mode. qa is the carve-out: it is technically a "panel mode" (non-
     # review), but a tester run boots a SUT and drives a whole suite with an un-caged agent —
     # tens of minutes, not the short PANEL_TIMEOUT_DEFAULT (240s) the chat panels use. Give it
@@ -2819,7 +3736,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # BEFORE the COMPANION visual fan-out, so a doomed config never spends a paid vision
     # call.
     use_board = not panel_mode and (
-        not explicit_models or bool(config_models) or config_has_board or active_preset is not None
+        not explicit_models
+        or bool(config_models)
+        or config_has_board
+        or active_preset is not None
     )
     board: list | None = None
     board_validated = False
@@ -2839,11 +3759,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         try:
             if explicit_models:
                 try:
-                    board = board_from_models(explicit_models, config, preset=active_preset)
+                    board = board_from_models(
+                        explicit_models, config, preset=active_preset
+                    )
                 except BoardConfigError as exc:
                     print(
                         f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
-                        file=sys.stderr, flush=True,
+                        file=sys.stderr,
+                        flush=True,
                     )
                     board = board_from_models(explicit_models, {}, preset=active_preset)
             elif active_preset is not None:
@@ -2886,8 +3809,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # hard-requires it (the pre-commit gate). So brainstorm is excluded from needs_diff
     # and routed through the caught/optional probe below.
     needs_diff = (
-        args.staged or (mode.name == "review" and not visual_mode)
-    ) and not is_brainstorm and not is_visual_subcommand
+        (args.staged or (mode.name == "review" and not visual_mode))
+        and not is_brainstorm
+        and not is_visual_subcommand
+    )
     if diff is None and needs_diff:
         # This path attaches the working-tree / staged diff. Outside a git repo it must NOT
         # raise a raw `git diff` traceback. Two cases:
@@ -2974,7 +3899,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
             print(
                 "[review-cli] qa: --visual is not supported (the tester produces its OWN "
                 "visual proof by driving the SUT). Drop --visual.",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             return 2
 
@@ -3000,7 +3926,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 no_ai=args.no_ai,
                 # Stage-2a cost-saver default ON; --no-local-model OR `local_model: false`
                 # in config.yaml disables it (CLI flag wins over config).
-                local_model=(not args.no_local_model) and (config.get("local_model", True) is not False),
+                local_model=(not args.no_local_model)
+                and (config.get("local_model", True) is not False),
                 vision_timeout=args.vision_timeout,
                 as_json=args.json,
                 strict=args.strict,
@@ -3041,7 +3968,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # --visual blank.png` would run the review and stamp success). Exit 10 under
         # --strict (the gate/hook block code), else a non-zero advisory exit.
         if visual_ctx.prefilter_verdict == "rollback":
-            print(f"[review visual] ROLLBACK (pre-filter, mode blocked): {visual_ctx.prefilter_reason}")
+            print(
+                f"[review visual] ROLLBACK (pre-filter, mode blocked): {visual_ctx.prefilter_reason}"
+            )
             # An unreadable/missing image is a USAGE error (exit 1), matching the
             # standalone exit-code map — scripts/hooks rely on the distinction between
             # "unreadable input" (1) and "blocking content verdict under --strict" (10).
@@ -3049,7 +3978,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 return 1
             return 10 if args.strict else 1
         if visual_ctx.vision_error:
-            print(f"[review visual] UNVERIFIED (mode blocked): {visual_ctx.vision_error}")
+            print(
+                f"[review visual] UNVERIFIED (mode blocked): {visual_ctx.vision_error}"
+            )
             if visual_ctx.vision_timed_out:
                 return 124
             return 10 if args.strict else 1
@@ -3068,8 +3999,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
     moderator_arg = getattr(args, "moderator", None)
     moderators = pick_moderators(moderator_arg, models) if panel_mode else []
     ctx = ModeContext(
-        args=args, models=models, diff=diff, cwd=cwd, timeout=timeout,
-        with_visual=_with_visual_text, visual_ctx=visual_ctx, moderators=moderators,
+        args=args,
+        models=models,
+        diff=diff,
+        cwd=cwd,
+        timeout=timeout,
+        with_visual=_with_visual_text,
+        visual_ctx=visual_ctx,
+        moderators=moderators,
         effort_override=effort_override,
         extra={"diff_from_stdin": diff_from_stdin},
     )
@@ -3086,7 +4023,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # per-round pool — and the ETA key — is the slot count, not len(models) (codex
         # P2: don't undercount a 1-2 model panel). brainstorm_pool mirrors that.
         return _run_mode_with_stats(
-            mode.stats_mode, brainstorm_pool(models),
+            mode.stats_mode,
+            brainstorm_pool(models),
             lambda: mode.handler(ctx),
             task_code=task_code,
         )
@@ -3101,14 +4039,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
         qa_seat = [resolved_tester_backend(_split_models(args.model or []))]
         return _run_mode_with_stats(
-            mode.stats_mode, qa_seat, lambda: mode.handler(ctx),
+            mode.stats_mode,
+            qa_seat,
+            lambda: mode.handler(ctx),
             task_code=task_code,
         )
 
     if mode.name not in ("review", "visual"):
         # just-ask / quorum: a flat multi-model panel; pool_size == len(models).
         return _run_mode_with_stats(
-            mode.stats_mode, models, lambda: mode.handler(ctx),
+            mode.stats_mode,
+            models,
+            lambda: mode.handler(ctx),
             task_code=task_code,
         )
 
@@ -3128,7 +4070,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             planned_pool = list(board)
         else:
             planned_pool, _ = split_pool_reserve(
-                board, review_pool_size, lambda r: backends.backend_available(r.model),
+                board,
+                review_pool_size,
+                lambda r: backends.backend_available(r.model),
             )
         eta_models = [r.model for r in planned_pool]
         outcome_sink: list = []
@@ -3147,14 +4091,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
             return outcome_sink[0].usable_models if outcome_sink else []
 
         return _run_mode_with_stats(
-            mode.stats_mode, eta_models, lambda: mode.handler(ctx),
+            mode.stats_mode,
+            eta_models,
+            lambda: mode.handler(ctx),
             models_after=_ran_models,
             task_code=task_code,
         )
     # Flat review path (no board): ctx.extra has no "board" key, so the handler reads
     # board=None and takes the legacy flat call shape.
     return _run_mode_with_stats(
-        mode.stats_mode, models, lambda: mode.handler(ctx),
+        mode.stats_mode,
+        models,
+        lambda: mode.handler(ctx),
         task_code=task_code,
     )
 
@@ -3192,8 +4140,12 @@ def _seat_reads_repo(model: str, cwd_is_repo: bool) -> bool:
 
 
 def _show_board(
-    config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | None = None,
-    *, preset: str | None = None, explicit_models: list[str] | None = None,
+    config: dict,
+    pool_size: int = DEFAULT_POOL_SIZE,
+    cwd: Path | None = None,
+    *,
+    preset: str | None = None,
+    explicit_models: list[str] | None = None,
 ) -> int:
     """Print the active reviewer board as a PRIORITY-ordered failover pool.
 
@@ -3218,7 +4170,8 @@ def _show_board(
             except BoardConfigError as exc:
                 print(
                     f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
-                    file=sys.stderr, flush=True,
+                    file=sys.stderr,
+                    flush=True,
                 )
                 board = board_from_models(exact_models, {}, preset=preset)
             source = f"explicit -m{f' + preset:{preset}' if preset else ''}"
@@ -3230,7 +4183,11 @@ def _show_board(
             source = "config.yaml (models:)"
         else:
             board = load_board(config)
-            source = "config.yaml (board:)" if isinstance(config.get("board"), list) and config.get("board") else "default"
+            source = (
+                "config.yaml (board:)"
+                if isinstance(config.get("board"), list) and config.get("board")
+                else "default"
+            )
     except BoardConfigError as exc:
         print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
         return 2
@@ -3243,16 +4200,24 @@ def _show_board(
     avail = [backends.backend_available(r.model) for r in board]
     available_count = sum(avail)
     exact_board = bool(exact_models)
-    pool_filled = len(board) if exact_board else _effective_pool_size(available_count, pool_size)
+    pool_filled = (
+        len(board) if exact_board else _effective_pool_size(available_count, pool_size)
+    )
     sized = " (sized by preset/--pool)" if pool_size != DEFAULT_POOL_SIZE else ""
     if exact_board:
-        print(f"Reviewer board ({len(board)} explicit seats, source: {source}; "
-              "exact -m run = every listed seat is attempted; --pool is ignored):\n")
+        print(
+            f"Reviewer board ({len(board)} explicit seats, source: {source}; "
+            "exact -m run = every listed seat is attempted; --pool is ignored):\n"
+        )
     else:
-        pool_target = "all AVAILABLE seats" if pool_size <= 0 else f"top {pool_size} AVAILABLE"
-        print(f"Reviewer board ({len(board)} seats, priority-ordered, source: {source}; "
-              f"live pool = {pool_target} by priority{sized}, "
-              f"{pool_filled} filled, the rest reserve — size with --pool N):\n")
+        pool_target = (
+            "all AVAILABLE seats" if pool_size <= 0 else f"top {pool_size} AVAILABLE"
+        )
+        print(
+            f"Reviewer board ({len(board)} seats, priority-ordered, source: {source}; "
+            f"live pool = {pool_target} by priority{sized}, "
+            f"{pool_filled} filled, the rest reserve — size with --pool N):\n"
+        )
     name_w = max((len(r.display) for r in board), default=0)
     role_w = max((len(r.role or "general") for r in board), default=0)
     effort_w = max((len(r.effort or "-") for r in board), default=1)
@@ -3267,10 +4232,13 @@ def _show_board(
         elif backends.runtime_provider_marked_unpaid(reviewer.model):
             status = (
                 "will attempt (provider unpaid/disabled)"
-                if exact_board else "SKIPPED (provider unpaid/disabled)"
+                if exact_board
+                else "SKIPPED (provider unpaid/disabled)"
             )
         else:
-            status = "will attempt (no key/CLI)" if exact_board else "SKIPPED (no key/CLI)"
+            status = (
+                "will attempt (no key/CLI)" if exact_board else "SKIPPED (no key/CLI)"
+            )
         role = (reviewer.role or "general").ljust(role_w)
         effort = (reviewer.effort or "-").ljust(effort_w)
         if exact_board:
@@ -3281,34 +4249,48 @@ def _show_board(
             tier = "pool   " if seen_available < pool_filled else "reserve"
             seen_available += 1
         prio = f"#{index + 1}"
-        scope = "agentic" if _seat_reads_repo(reviewer.model, cwd_is_repo) else "diff-only"
-        print(f"  {prio:>3}  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  "
-              f"{reviewer.model}  [{status}]  ({scope})  effort={effort}")
-    print("\nScope: `agentic` seats (codex / opencode / claude-CLI) run read-only in the "
-          "real repo and can read any project file; `diff-only` seats (gemini / z.ai / "
-          "commandcode / claude-API) are stateless HTTP calls that see only the diff.")
+        scope = (
+            "agentic" if _seat_reads_repo(reviewer.model, cwd_is_repo) else "diff-only"
+        )
+        print(
+            f"  {prio:>3}  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  "
+            f"{reviewer.model}  [{status}]  ({scope})  effort={effort}"
+        )
+    print(
+        "\nScope: `agentic` seats (codex / opencode / claude-CLI) run read-only in the "
+        "real repo and can read any project file; `diff-only` seats (gemini / z.ai / "
+        "commandcode / claude-API) are stateless HTTP calls that see only the diff."
+    )
     if exact_board:
-        print("\nWith explicit `-m`, review-cli attempts exactly the listed models in order. "
-              "`--pool` and reserve failover do not slice or reorder explicit seats.")
+        print(
+            "\nWith explicit `-m`, review-cli attempts exactly the listed models in order. "
+            "`--pool` and reserve failover do not slice or reorder explicit seats."
+        )
     elif pool_size <= 0:
-        print("\nA plain `review diff` runs all AVAILABLE seats by priority (--pool 0); "
-              "a higher-priority seat that is unavailable is skipped, and a seat that "
-              "fails mid-run is recorded while the remaining available seats continue. "
-              "`--pool N` sizes the pool.")
+        print(
+            "\nA plain `review diff` runs all AVAILABLE seats by priority (--pool 0); "
+            "a higher-priority seat that is unavailable is skipped, and a seat that "
+            "fails mid-run is recorded while the remaining available seats continue. "
+            "`--pool N` sizes the pool."
+        )
     else:
-        print(f"\nA plain `review diff` runs the top {pool_size} AVAILABLE seats by "
-              f"priority (--pool {pool_size}); a higher-priority seat that is "
-              f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "
-              f"pool keeps {pool_size} working reviewers. `--pool N` sizes the pool; "
-              f"`--pool 0` runs all available seats.")
+        print(
+            f"\nA plain `review diff` runs the top {pool_size} AVAILABLE seats by "
+            f"priority (--pool {pool_size}); a higher-priority seat that is "
+            f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "
+            f"pool keeps {pool_size} working reviewers. `--pool N` sizes the pool; "
+            f"`--pool 0` runs all available seats."
+        )
     if not all(avail):
-        print("Unavailable reviewers drop out and are backfilled from the reserve; the "
-              "board degrades gracefully only if the reserve is exhausted. The default "
-              "agentic seats (`oc:…` Kimi/GLM/Qwen/DeepSeek, codex, claude) need their CLI "
-              "on PATH — `oc:` seats need the `opencode` binary plus its own provider auth "
-              "(`opencode auth login`), NOT review-cli's COMMANDCODE_API_KEY/ZAI_API_KEY. "
-              "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "
-              "diff-only `commandcode:`/`zai:` backends for `-m cc`/`-m glm` and config seats.)")
+        print(
+            "Unavailable reviewers drop out and are backfilled from the reserve; the "
+            "board degrades gracefully only if the reserve is exhausted. The default "
+            "agentic seats (`oc:…` Kimi/GLM/Qwen/DeepSeek, codex, claude) need their CLI "
+            "on PATH — `oc:` seats need the `opencode` binary plus its own provider auth "
+            "(`opencode auth login`), NOT review-cli's COMMANDCODE_API_KEY/ZAI_API_KEY. "
+            "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "
+            "diff-only `commandcode:`/`zai:` backends for `-m cc`/`-m glm` and config seats.)"
+        )
     return 0
 
 

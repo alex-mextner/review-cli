@@ -5,6 +5,58 @@ semantic versioning.
 
 ## Unreleased
 
+- **A sandboxed caller's unwritable log location no longer kills the whole seat
+  (review-cli#162).** `log_dir()` (`~/Library/Logs/review-cli` on macOS,
+  `$XDG_STATE_HOME/review-cli/logs` elsewhere) and the per-call log file it opens are
+  both outside most agent-harness sandbox allow-lists, which commonly permit writes
+  only under the system temp dir. Before this fix, a denied `mkdir` or file `open`
+  raised an uncaught `PermissionError`/`OSError` straight out of `_run_streamed`
+  *before the backend subprocess was even spawned* — silently killing that seat
+  (observed live as a Fable/claude-p seat dying with "Operation not permitted"; every
+  seat shares the identical code path, so this was never actually fable-specific —
+  fable is simply the slowest seat, ~15 minutes, and so the most likely to still be
+  running if a time-scoped sandbox grant is the trigger). `log_dir()` and the new
+  `_open_log_with_fallback()` now catch the failure, print a loud stderr line naming
+  the fix (disable the sandbox, or set `$REVIEW_LOG_DIR` to an allowed path), and
+  retry under a writable temp-dir fallback instead of crashing the seat. Covered by
+  `tests/test_log_dir_fallback.py`, including an end-to-end `_run_streamed` call
+  against a deliberately unwritable (chmod 0) log directory that still runs the real
+  backend subprocess and returns its result.
+
+- **External SIGTERM/SIGINT now reap live backend children — no more orphaned reviewer
+  subprocesses (review-cli#160, duplicate #159).** A `review` process killed or timed out
+  from OUTSIDE (an agent's `kill <pid>`, a harness timeout, Ctrl-C) left its spawned
+  backend children (`claude`/`codex`/`opencode` model-runners, and their own
+  descendants) running — Python's default SIGTERM disposition terminates the process
+  with no `finally`/`atexit`, and each backend child runs in its own session
+  (`start_new_session=True`, so the internal per-call reap can bound its whole process
+  tree) which also means an external signal to `review` never reaches it. Orphans were
+  observed alive 3.5h+ after their run had already exited. `reviewlib.process.
+  install_signal_reaper()` (wired at the top of `cli.main`) now reaps every registered
+  live child (`kill_live_children()`, the same reap the internal 4h backstop already
+  used) before re-delivering the same signal to the process, so it still dies with the
+  correct exit status. Covered by `tests/test_signal_reaper.py`, which sends a REAL
+  external SIGTERM/SIGINT to a child process holding a REAL spawned backend and asserts
+  the backend is dead afterward.
+
+- **New `--detach` / `review jobs` / `review status` / `review wait` — background
+  review jobs (review-cli#160 companion).** A caller with its own short foreground cap
+  (a capped subagent shell tool, a tight pre-commit budget) previously had no supported
+  way to avoid blocking for a whole review other than wrapping it in an external
+  timeout — explicitly the wrong move (`review` only emits panel/brainstorm synthesis
+  at the very end). `--detach` spawns the identical review as a session-detached
+  background process (`python -m reviewlib`, its own session) and returns almost
+  immediately with a job-id; `review jobs` lists recorded jobs, `review status
+  <job-id>` shows status/paths/a log tail, and `review wait <job-id>` blocks until
+  done (for an unbounded caller, not a capped one). The detached run reuses the exact
+  same code path as a synchronous run — backstop, the new signal reaper above, `-o`/
+  quorum-stamp output — so its result is valid for `gh ship`'s review-quorum gate.
+  Covered by `tests/test_detach_jobs.py` (a real `bin/review` subprocess with the
+  deterministic fake backend): immediate return, running -> done transition, the
+  detached result matching a synchronous run byte-for-byte, `wait` returning the job's
+  exit code, and a killed detached job reconciling to `unknown-terminated` instead of
+  reporting "running" forever.
+
 - **`review qa` now honors the run-scoped `--effort` flag (review-cli#127).** The `--effort`
   flag (#150) lifted every review-panel seat's reasoning effort, but the qa write/exec tester —
   a single seat that rides `claude-p`/`codex`, not the panel — silently ignored it. The resolved
