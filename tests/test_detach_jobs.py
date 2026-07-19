@@ -309,7 +309,7 @@ def test_killed_detached_job_is_reconciled_not_stuck_running():
         assert final.get("status") == "unknown-terminated", final
 
 
-def test_detached_job_pid_update_persists_the_actual_fallback_log_path(monkeypatch):
+def test_detached_job_pid_update_persists_the_actual_fallback_log_path():
     """codex review (review-cli#162 follow-up, PR #164): the job record's `log_path`
     is written BEFORE `_open_log_with_fallback` opens the log file, so if that open
     falls back to a DIFFERENT path than the one already recorded, the record used to
@@ -325,64 +325,82 @@ def test_detached_job_pid_update_persists_the_actual_fallback_log_path(monkeypat
     the already-resolved fallback directory from the start, `_open_log_with_fallback`
     never had to replace anything, and the test could not tell "the fix threads the
     resolved path through" apart from "jobs_dir() already fell back" (codex review: the
-    test passed even with the fix reverted). This version monkeypatches
-    `cli._open_log_with_fallback` to force ONLY the log-file open (never the stdin
-    spool) to land at a different, obviously-distinct path than the one already
-    recorded — isolating the exact substitution the fix is responsible for."""
+    test passed even with the fix reverted). This version forces ONLY the log-file
+    open (never the stdin spool) to land at a different, obviously-distinct path
+    than the one already recorded — isolating the exact substitution the fix is
+    responsible for.
+
+    Manual save/restore (no pytest `monkeypatch` fixture): `tests/smoke.py` runs
+    this file's `__main__` block directly (no pytest), which cannot inject fixture
+    arguments — a `monkeypatch`-taking test here crashes that runner with "missing
+    1 required positional argument" (CI: this exact failure, review-cli#162
+    follow-up round 5)."""
     from reviewlib import cli, jobs as jobs_mod, process as process_mod
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         repo = _make_repo(tmp)
         env = _env(tmp, fake_delay=0.2)
-        for key, value in env.items():
-            monkeypatch.setenv(key, value)
-
-        forced_log_path = tmp / "forced-fallback" / "the.log"
-        forced_log_path.parent.mkdir(parents=True)
+        saved_env = {k: os.environ.get(k) for k in env}
         real_open_log_with_fallback = process_mod._open_log_with_fallback
+        real_isatty = sys.stdin.isatty
+        try:
+            os.environ.update(env)
 
-        def _fake_open_log_with_fallback(path, flags=process_mod._LOG_OPEN_FLAGS):
-            if path.name.endswith(".log"):
-                fd = os.open(
-                    str(forced_log_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-                )
-                return fd, forced_log_path
-            return real_open_log_with_fallback(path, flags)
+            forced_log_path = tmp / "forced-fallback" / "the.log"
+            forced_log_path.parent.mkdir(parents=True)
 
-        monkeypatch.setattr(
-            cli, "_open_log_with_fallback", _fake_open_log_with_fallback
-        )
-        # Simulate a tty (no piped stdin) — under pytest's captured stdin,
-        # `sys.stdin.isatty()` is False and a real `.read()` raises, since this test
-        # calls `_spawn_detached_job` directly rather than through a real subprocess
-        # with real inherited stdin.
-        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+            def _fake_open_log_with_fallback(path, flags=process_mod._LOG_OPEN_FLAGS):
+                if path.name.endswith(".log"):
+                    fd = os.open(
+                        str(forced_log_path),
+                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                        0o600,
+                    )
+                    return fd, forced_log_path
+                return real_open_log_with_fallback(path, flags)
 
-        raw = [*_review_diff_args(repo), "--task", "TEST-1"]
-        rc = cli._spawn_detached_job(raw)
-        assert rc == 0
+            cli._open_log_with_fallback = _fake_open_log_with_fallback
+            # Simulate a tty (no piped stdin) — under pytest's captured stdin (or
+            # this file's own standalone `__main__` runner, whose stdin is also not
+            # a real tty), `sys.stdin.isatty()` is False and a real `.read()`
+            # raises, since this test calls `_spawn_detached_job` directly rather
+            # than through a real subprocess with real inherited stdin.
+            sys.stdin.isatty = lambda: True
 
-        recorded = None
-        for candidate in jobs_mod.jobs_dir().glob("*.json"):
-            data = json.loads(candidate.read_text())
-            if Path(data.get("log_path", "")) != forced_log_path:
-                continue
-            recorded = data
-            break
-        assert recorded is not None, (
-            "no job record's log_path matches the forced fallback path — the "
-            "pid-update write did not re-send the resolved log_path"
-        )
-        assert recorded["pid"] > 0
-        # Let the short-lived detached child actually finish before the tempdir this
-        # test created is torn down — it's writing into `tmp` via the forced log fd.
-        for _ in range(50):
-            try:
-                os.kill(recorded["pid"], 0)
-            except OSError:
+            raw = [*_review_diff_args(repo), "--task", "TEST-1"]
+            rc = cli._spawn_detached_job(raw)
+            assert rc == 0
+
+            recorded = None
+            for candidate in jobs_mod.jobs_dir().glob("*.json"):
+                data = json.loads(candidate.read_text())
+                if Path(data.get("log_path", "")) != forced_log_path:
+                    continue
+                recorded = data
                 break
-            time.sleep(0.1)
+            assert recorded is not None, (
+                "no job record's log_path matches the forced fallback path — the "
+                "pid-update write did not re-send the resolved log_path"
+            )
+            assert recorded["pid"] > 0
+            # Let the short-lived detached child actually finish before the tempdir
+            # this test created is torn down — it's writing into `tmp` via the
+            # forced log fd.
+            for _ in range(50):
+                try:
+                    os.kill(recorded["pid"], 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
+        finally:
+            cli._open_log_with_fallback = real_open_log_with_fallback
+            sys.stdin.isatty = real_isatty
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":

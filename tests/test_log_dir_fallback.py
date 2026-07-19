@@ -466,13 +466,13 @@ if __name__ == "__main__":
             with tempfile.TemporaryDirectory() as d:
 
                 class _Env:
-                    """Standalone monkeypatch shim: `setenv` (existing) plus `setattr`,
-                    the second capability the new fallback tests need (patching
-                    `_fallback_log_dir`/`tempfile.gettempdir` to force the double-
-                    failure branches) — codex review flagged the shim as
-                    setenv-only, which raised AttributeError under this standalone
-                    runner (used by `tests/smoke.py`) even though pytest's real
-                    monkeypatch supports both."""
+                    """Standalone monkeypatch shim: `setenv`/`setattr` (existing) plus
+                    `delenv`, the third capability a later fallback test needs
+                    (clearing `$REVIEW_JOBS_DIR` so the no-override code path is
+                    exercised) — codex review flagged the shim as missing this too,
+                    which raised AttributeError under this standalone runner (used by
+                    `tests/smoke.py`) even though pytest's real monkeypatch supports
+                    it."""
 
                     def __init__(self):
                         self._saved_env: dict[str, str | None] = {}
@@ -481,6 +481,13 @@ if __name__ == "__main__":
                     def setenv(self, k, v):
                         self._saved_env.setdefault(k, os.environ.get(k))
                         os.environ[k] = v
+
+                    def delenv(self, k, raising=True):
+                        self._saved_env.setdefault(k, os.environ.get(k))
+                        had = k in os.environ
+                        os.environ.pop(k, None)
+                        if raising and not had:
+                            raise KeyError(k)
 
                     def setattr(self, obj, name, value):
                         had = hasattr(obj, name)
