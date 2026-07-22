@@ -2243,7 +2243,7 @@ CONFIG FILE
                        `review qa` uses its timeout as a
                        wall-clock QA cost cap.
   Model ids accept the friendly aliases (e.g. `fable5` -> claude:claude-fable-5,
-  `glm` -> zai:glm-5.2, `cc` -> commandcode).
+  `glm` -> zai:glm-5.2, `cc` -> commandcode, `grok`/`grok45` -> oc:xai/grok-4.5).
 
 SELECTION CASCADE, by mode:
   review diff           : explicit -m requested models  >  explicit --preset  >
@@ -2293,7 +2293,12 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
       window. Values under 60s stay exact for tests/probes; otherwise the normal 20m floor
       applies unless REVIEW_IDLE_TIMEOUT_SECONDS is set. QA and vision calls keep wall-clock
       timeout caps.
-  codex / opencode carry their own CLI auth (no key here).
+  codex / opencode carry their own CLI auth (no key here). The Grok/xai board seat
+    (GROK_SEAT) is one of these: opencode's own XAI_API_KEY env var, an inline
+    options.apiKey in opencode.json, or `opencode providers login` (OAuth) all work.
+    review-cli reads the local auth files to PROBE non-empty-ness at startup (deciding
+    seat availability) but never logs or transmits the credential value anywhere —
+    opencode is what actually sends it, at call time.
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
 """
@@ -3304,7 +3309,7 @@ def _show_board(
     if not all(avail):
         print("Unavailable reviewers drop out and are backfilled from the reserve; the "
               "board degrades gracefully only if the reserve is exhausted. The default "
-              "agentic seats (`oc:…` Kimi/GLM/Qwen/DeepSeek, codex, claude) need their CLI "
+              "agentic seats (`oc:…` Kimi/GLM/Qwen/DeepSeek/Grok, codex, claude) need their CLI "
               "on PATH — `oc:` seats need the `opencode` binary plus its own provider auth "
               "(`opencode auth login`), NOT review-cli's COMMANDCODE_API_KEY/ZAI_API_KEY. "
               "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "

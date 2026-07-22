@@ -5,6 +5,52 @@ semantic versioning.
 
 ## Unreleased
 
+- **New default board seat: Grok 4.5 via opencode's native `xai` provider
+  (`GROK_SEAT = "oc:xai/grok-4.5"`).** Added as priority-10 in `DEFAULT_BOARD`
+  (`reviewlib/config.py`), on-by-default — it participates in every normal
+  `review diff` run exactly like the existing seats, no opt-in flag required.
+  (`review quorum`/`review brainstorm` use the separate flat `DEFAULT_MODELS`
+  panel, not the board, so Grok does not participate there — only `review diff`
+  is board-based.) Agentic (reads the repo read-only, like the other `oc:`
+  seats); unlike Kimi/GLM/Qwen/DeepSeek there is no diff-only REST fallback for
+  this provider, and unlike zai/commandcode it has no bare/colon-form default-
+  model resolution either, so a bare `-m xai` or colon-form `-m xai:<model>`
+  would hand opencode a broken invocation shape (opencode wants `provider/model`,
+  not `provider:model`, and bare `xai` has no default model) — same as typing
+  any other unrecognized provider string, since `resolve_backend`'s existing
+  generic catch-all still sends an unmatched id to opencode; this change does
+  not add new routing for these forms and does not close that pre-existing,
+  general catch-all gap (out of scope here). Rather than giving
+  `_match_named_backend` a bare-token branch that would make these broken
+  forms look like a deliberately-supported route, `default_routes_live`'s
+  under-transport check
+  gained a documented `_AGENTIC_ONLY_PROVIDERS` exemption set
+  (`reviewlib/backends.py`) so the #25 anti-rot guard still accepts `GROK_SEAT`
+  as a safe DEFAULT without `_match_named_backend`/`default_routes_live`
+  treating bare/colon `xai` as valid ids. Fixed a real bug found while wiring this up:
+  `_oc_auth_has_provider` only recognized opencode's keyed-API auth.json shape
+  (`{"type": "api", "key": ...}`) and silently reported an OAuth-authenticated
+  provider (xai's `opencode providers login` flow, `{"type": "oauth", "access":
+  ..., "refresh": ...}`) as having no credential — the new Grok seat would have
+  reported unavailable on this exact host despite `opencode run -m xai/grok-4.5`
+  working. Now discriminates by the entry's own `type`: `key` for `"api"` (deepseek/
+  commandcode/zai), `access` OR `refresh` for `"oauth"` (opencode auto-refreshes an
+  expired `access` from `refresh`, so a refresh-only entry still counts as usable), and
+  a field-name-agnostic fallback (excluding the purely-metadata `type`/`expires` fields)
+  for any unrecognized future auth type — so a genuinely new auth shape doesn't silently
+  drop its seat either. All dict-assuming logic stays inside the fail-closed exception
+  boundary, so a corrupted non-dict entry reports no credential instead of raising and
+  aborting board selection. Placed directly ABOVE the deliberately-
+  slow z.ai GLM last-resort seat (review-cli#65), not below it: the seat's own
+  first dogfooding pass (`review diff` against this change) flagged that
+  appending it after GLM meant deep mid-run failover always paid GLM's
+  pathological-slowness cost before ever reaching Grok. New `grok`/`grok45`
+  aliases in `MODEL_ALIASES`. Board/doc tests, README, and the embedded
+  install-skill text updated for the 11-seat board. Filed review-cli#166
+  (out of scope here) for a pre-existing, unrelated gap this review surfaced:
+  `_oc_config_has_provider_key` accepts a whitespace-only or non-string inline
+  `options.apiKey` as a valid credential for ANY provider, not just xai.
+
 - **`review qa` now honors the run-scoped `--effort` flag (review-cli#127).** The `--effort`
   flag (#150) lifted every review-panel seat's reasoning effort, but the qa write/exec tester —
   a single seat that rides `claude-p`/`codex`, not the panel — silently ignored it. The resolved

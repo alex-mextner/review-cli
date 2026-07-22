@@ -385,8 +385,11 @@ def test_board_flags_and_listing():
         "claude:claude-opus-4-8",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "oc:zai/glm-5.2",
+        # Grok — verifies the 9-seat count above is actually seats 1-9 with Grok present,
+        # not merely a matching total (review of #166).
+        "oc:xai/grok-4.5",
         "contracts",
-        "8 seats",
+        "9 seats",
         "#1",
         # The CTO-directed GLM-5.2-via-commandcode seat (default preset, diff-only keyed HTTP).
         "commandcode:zai-org/GLM-5.2",
@@ -399,7 +402,9 @@ def test_board_flags_and_listing():
         "architect",
         "claude:claude-fable-5",
         "codex:gpt-5.6-sol",
-        "10 seats",
+        # Grok — same rationale as the default-board needle above.
+        "oc:xai/grok-4.5",
+        "11 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
     assert_in("agentic", board.lower())

@@ -898,6 +898,7 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | `commandcode:<model>` / `cc` | api | Command Code OpenAI-compatible Provider API — needs `COMMANDCODE_API_KEY` |
 | `openrouter:<model>` / `openrouter` | api | OpenRouter OpenAI-compatible aggregator (400+ models) — needs `OPENROUTER_API_KEY` (bare `openrouter` → `openrouter/auto`) |
 | `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer --dir <repo>` (reads the real repo, read-only) |
+| `oc:xai/grok-4.5` / `grok` / `grok45` | cli | Grok 4.5 via opencode's native `xai` provider (oauth-authenticated via `opencode providers login`); GROK_SEAT, the default board's priority-10 seat |
 | anything else | cli | Treated as an opencode model id |
 
 **Transport split.** Each backend declares which transports it supports — `cli`, `api`,
@@ -1061,7 +1062,7 @@ out of the box — no config file required.
 
 ### Priority-ordered failover pool
 
-The raw built-in board is a **priority-ordered** list of 10 models — strongest first — and
+The raw built-in board is a **priority-ordered** list of 11 models — strongest first — and
 a plain `review diff` runs the `default` preset: a **pool of 4** without Fable/Sol, at high effort.
 Use `--preset light` for a quick/cheap pool of 2 at medium effort, and `--preset heavy` for
 release/risky changes: Fable, Sol, Opus, and GLM-cc at `xhigh` effort, with the remaining
@@ -1086,7 +1087,7 @@ the panel still covers a broad set of facets.
 
 `--pool N` overrides the preset default (the top-N available, with the same failover);
 `--pool 0` runs **all available** seats in the selected preset/board. Use
-`--preset heavy --pool 0` for all 10 built-in seats. The board is **never disabled** —
+`--preset heavy --pool 0` for all 11 built-in seats. The board is **never disabled** —
 `--pool` only sizes the pool.
 
 The built-in board, in **priority order** (the `tier` column shows the `heavy` preset split
@@ -1103,12 +1104,13 @@ on a fully-keyed environment):
 | 7 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
 | 8 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
 | 9 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
-| 10 | reserve (last) | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom (z.ai subscription route; **deprioritized to last-resort — pathologically slow under load**, review-cli#65) |
+| 10 | reserve | Grok | `oc:xai/grok-4.5` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (opencode's native xai provider, oauth-authenticated; agentic, no diff-only REST fallback exists) |
+| 11 | reserve (last) | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom (z.ai subscription route; **deprioritized to last-resort — pathologically slow under load**, review-cli#65) |
 
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
 the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
 Anthropic API only on a host that lacks the CLI but has an API key), Codex via the codex
-CLI, and Kimi/z.ai-GLM/Qwen/DeepSeek through opencode (`oc:provider/model`) — all run
+CLI, and Kimi/z.ai-GLM/Qwen/DeepSeek/Grok through opencode (`oc:provider/model`) — all run
 read-only *inside* `-C` and can open any project file, not just the diff. Two seats are
 always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-4
 **GLM-cc** seat (`commandcode:zai-org/GLM-5.2` — opencode's `commandcode` provider does not
@@ -1164,7 +1166,7 @@ review --show-board        # active default preset board; add --preset heavy to 
 export REVIEW_TASK_CODE=HYP-742
 review diff                # default failover pool: the top 4 AVAILABLE seats by priority
 review diff --pool 0       # run all available default-preset seats
-review diff --preset heavy --pool 0  # run all 10 built-in seats, including Fable/Sol
+review diff --preset heavy --pool 0  # run all 11 built-in seats, including Fable/Sol
 review diff --pool 2       # run the top 2 available seats (with failover)
 review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
 review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
@@ -1190,7 +1192,7 @@ configured `board:`   >   default preset
   the configured board metadata to only the requested models. The board can otherwise
   never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
   pool (default 4 for the default preset; `--pool 0` runs all available seats in the
-  selected preset/board; `--preset heavy --pool 0` currently covers all 10 built-ins).
+  selected preset/board; `--preset heavy --pool 0` currently covers all 11 built-ins).
   `--pool` does not reduce an explicit `-m` list:
   every requested `-m` seat is attempted.
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
@@ -1206,7 +1208,7 @@ When `models:` is present,
 `models:`. When `models:` is absent, `board:` is the full priority-ordered board.
 An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
 warning); a single malformed entry is skipped (the valid ones are kept). With **no**
-`models:` or `board:` configured, the CLI uses the default preset; the raw 10-seat board
+`models:` or `board:` configured, the CLI uses the default preset; the raw 11-seat board
 above is used by `--preset heavy` or as the source for explicit configured boards. A `board:` that is
 **present but has no usable entry at all** is a hard error (non-zero exit) — it never
 silently falls back to the paid default board.
@@ -1226,14 +1228,14 @@ board:
   - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
 ```
 
-**Optional heavyweight seats** (NOT enabled by default — the board stays at 10). Add
+**Optional heavyweight seats** (NOT enabled by default — the board stays at 11). Add
 either to your `board:` list for an extra 1M-context resilience / holistic-senior
 pass; both run agentically through opencode's commandcode provider (needs opencode +
 `opencode auth login`, like the default `oc:` seats):
 
 ```yaml
 board:
-  # ... the 10 built-in seats ...
+  # ... the 11 built-in seats ...
   - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
   - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
 ```
@@ -1268,6 +1270,22 @@ idle timeout as every other subprocess backend: progress output keeps the call a
 a fully silent call is reaped after the idle window and reserve backfill can take over. To
 run an older GLM, override the seat in a `config.yaml` `board:` list (e.g.
 `{ model: "oc:zai/glm-5.1", role: quality }`).
+
+**Grok board reviewer (agentic, via opencode's native `xai` provider):** `oc:xai/grok-4.5`
+(`GROK_SEAT`) authenticates through opencode's own xai provider config, same as the
+commandcode/zai seats above — any of: `opencode providers login` (OAuth, the flow verified
+live on this host — `opencode providers list` shows "xAI | oauth"), an inline
+`options.apiKey` in `~/.config/opencode/opencode.json`'s `xai` provider block, or a plain
+`XAI_API_KEY` env var (opencode's own convention, not review-cli's — no
+review-cli-specific xai env var exists). Unlike the commandcode/zai seats, xai has no
+diff-only REST fallback in review-cli and no bare/colon-form default model -- `-m xai`
+(bare, no model) and `-m xai:grok-4.5` (colon-form; opencode wants `provider/model`, not
+`provider:model`) are NOT valid. A bare `-m xai/grok-4.5` (no `oc:` prefix) DOES also reach
+opencode correctly at runtime via the generic catch-all (any unrecognized id still routes
+to opencode for back-compat) -- but only `oc:xai/grok-4.5` is the documented, DEFAULT-safe
+seat spelling that `default_routes_live`'s #25 anti-rot guard accepts; the bare form is
+not protected by that guard and isn't what `GROK_SEAT` uses. Same startup-probe/
+graceful-degradation and idle-timeout behavior as the other agentic seats.
 
 **Advanced timeout env:** `REVIEW_IDLE_TIMEOUT_SECONDS=N` overrides the review/panel
 subprocess idle window for CLI seats; `0` disables idle reap and uses wall-clock
