@@ -25,6 +25,7 @@ and loops it, running each provider through `run_seat_with_retry`. Pure/injectab
 availability + unpaid predicates and the cache path are parameters, so tests exercise the
 chain and the cache with no backend and no real cache file. See tests/test_provider_failover.py.
 """
+
 from __future__ import annotations
 
 import json
@@ -115,6 +116,66 @@ def _base_chain(model: str, overrides: dict[str, list[str]] | None) -> list[str]
     return chain
 
 
+def _default_head(key: str, overrides: dict[str, list[str]] | None) -> str | None:
+    """The FIRST provider of `key`'s chain per config overrides / DEFAULT_PROVIDER_CHAINS,
+    or None for a single-provider model with no chain at all."""
+    if overrides and key in overrides and overrides[key]:
+        return overrides[key][0]
+    chain = DEFAULT_PROVIDER_CHAINS.get(key)
+    return chain[0] if chain else None
+
+
+def _requested_is_default_selection(
+    model: str, expanded: str, overrides: dict[str, list[str]] | None
+) -> bool:
+    """True iff `model` is a bare logical alias (`opus`, `glm52`) or the default provider
+    spelled out directly — as opposed to an EXPLICIT pin of a specific alternate concrete
+    provider (e.g. `-m commandcode:zai-org/GLM-5.2`). Only this default-selection case is
+    eligible for the last-working-cache reorder (codex P2 on review-cli#157: 'Keep explicit
+    provider ahead of cache') — reordering an explicit pin behind a cached alternate would
+    silently break its routing/billing/auth guarantee.
+
+    A BARE ALIAS is always eligible, full stop: `model != expanded` proves `_expand_alias`
+    actually rewrote it, which only happens for a known alias — regardless of where a
+    config `provider_chains:` override puts that alias's own head. Comparing the alias's
+    canonical expansion against the (possibly REORDERED) override head would otherwise make
+    a legitimate bare-alias request lose the reorder whenever an override's head differs
+    from the alias's canonical target (e.g. an override putting `oc:zai/glm-5.2` first while
+    `glm52` still canonically expands to `zai:glm-5.2`) — a real gap a review flagged.
+    Only when NO alias fired (`model == expanded`, a concrete spelling typed directly) do we
+    fall back to comparing against the resolved default head, to still allow the head
+    spelled out literally (`-m zai:glm-5.2`) while excluding a genuine alternate pin."""
+    # Both sides normalized identically (strip + lower) before comparing — `_expand_alias`
+    # itself does not strip, so comparing an unstripped `expanded` against a stripped
+    # `model` could disagree on whitespace-padded input (review of #157, finding 3).
+    if model.strip().lower() != expanded.strip().lower():
+        return True
+    default_head = _default_head(logical_key(model), overrides)
+    return default_head is None or expanded.lower() == default_head.lower()
+
+
+def is_default_provider_selection(
+    model: str, overrides: dict[str, list[str]] | None = None
+) -> bool:
+    """Public wrapper over `_requested_is_default_selection`: True iff `model` is a bare
+    logical alias / the default provider spelled out directly, False for an EXPLICIT pin of
+    a specific alternate concrete provider.
+
+    A CALLER writing the last-working cache (`remember_working_provider`/
+    `forget_working_provider`) must gate the write the SAME way `provider_chain` gates the
+    cache-reorder READ — otherwise a one-off explicit pin (`-m commandcode:zai-org/GLM-5.2`)
+    silently trains or clears the cache entry a later BARE alias request (`-m glm52`) reads,
+    rebiasing (or wiping) default routing based on a request that was never the default
+    selection to begin with (review of #157: 'cache write isn't gated the way the read
+    is'). Both `reviewlib.panel`'s board path and `reviewlib.modes.review`'s flat path use
+    this before their `remember_working_provider`/`forget_working_provider` calls."""
+    return _requested_is_default_selection(
+        model,
+        _expand_alias(model),
+        overrides if overrides is not None else _CONFIG_OVERRIDES,
+    )
+
+
 def provider_chain(
     model: str,
     *,
@@ -126,23 +187,55 @@ def provider_chain(
     """The ordered list of concrete providers to try for `model`, MID-REVIEW failover order.
 
     Drops `unpaid` providers up front (never dispatched), then drops cheaply-unavailable
-    providers (no key/CLI — calling them just wastes a call), then moves the cached
-    last-working provider to the FRONT. Never returns empty: if every alternate is filtered
-    out, the requested spelling is kept so the seat fails with its real reason (not silently)."""
-    chain = _base_chain(model, overrides if overrides is not None else _CONFIG_OVERRIDES)
+    providers (no key/CLI — calling them just wastes a call), then — ONLY for a bare logical
+    alias / default-head request, never for an explicit concrete provider pin — moves the
+    cached last-working provider to the FRONT. Never returns empty: if every alternate is
+    filtered out, the requested spelling is kept so the seat fails with its real reason (not
+    silently)."""
+    resolved_overrides = overrides if overrides is not None else _CONFIG_OVERRIDES
+    chain = _base_chain(model, resolved_overrides)
     expanded = _expand_alias(model)
     # Unpaid providers are NEVER dispatched. If EVERY provider is unpaid, fall back to the
     # requested spelling ALONE (fails once with its unpaid reason) — do NOT resurrect the
     # whole disabled chain and iterate misleading failover attempts over dead providers.
     paid = [c for c in chain if not unpaid(c)] or [expanded]
     reachable = [c for c in paid if available(c)] or paid
-    cached = _cached_provider(model, cache_path)
-    if cached and cached in reachable:
-        reachable = [cached, *[c for c in reachable if c != cached]]
+    if _requested_is_default_selection(model, expanded, resolved_overrides):
+        cached = _cached_provider(model, cache_path)
+        if cached and cached in reachable:
+            reachable = [cached, *[c for c in reachable if c != cached]]
     # de-dupe preserving order (a cached==head or overrides could double an entry)
     seen: set[str] = set()
     ordered = [c for c in reachable if not (c in seen or seen.add(c))]
     return ordered
+
+
+def any_provider_available(
+    model: str,
+    *,
+    available: Callable[[str], bool],
+    unpaid: Callable[[str], bool],
+    overrides: dict[str, list[str]] | None = None,
+) -> bool:
+    """A plain liveness probe for `model` that agrees with what `provider_chain` will
+    actually dispatch: True iff `model` itself OR any later provider in its failover chain
+    is reachable AND not paywalled.
+
+    WHY: a caller that just needs "is this seat usable right now" (the pool guard) must not
+    call raw `available(model)` on the requested spelling alone — that marks a seat DOWN
+    when its head provider lacks a key/CLI even though a live failover alternate exists
+    (codex P2 on review-cli#157: no ZAI_API_KEY but authenticated oc:zai). Unlike
+    `provider_chain`, this never falls back to "keep everything so the seat can fail loud" —
+    it is a pure query, not a dispatch plan.
+
+    `_base_chain` NEVER returns empty (it always starts with the expanded requested
+    spelling, even for a single-provider model with no chain entry), so `any(...)` over it
+    can't spuriously read False just because a custom `-m` model has no multi-provider
+    chain — see test_any_provider_available_for_a_single_provider_no_chain_model."""
+    chain = _base_chain(
+        model, overrides if overrides is not None else _CONFIG_OVERRIDES
+    )
+    return any(not unpaid(c) and available(c) for c in chain)
 
 
 # --- last-working-provider cache --------------------------------------------------------
@@ -186,7 +279,9 @@ def _write_cache(cache: dict[str, str], cache_path: Path | None) -> None:
         pass  # cache is an optimization; never fail a review on a cache write
 
 
-def remember_working_provider(model: str, provider: str, *, cache_path: Path | None = None) -> None:
+def remember_working_provider(
+    model: str, provider: str, *, cache_path: Path | None = None
+) -> None:
     """Record `provider` as the last-working provider for `model`'s logical key (tried first
     next run). No-op when it already IS the cached value, to avoid needless writes."""
     key = logical_key(model)

@@ -119,7 +119,7 @@ def _stub_resolve_backend(rc_by_model: dict[str, int] | int = 0):
 
 def _with_backend_stub(resolver):
     """Swap resolve_backend in BOTH namespaces that dispatch backends, AND force every seat
-    available.
+    available/paid.
 
     panel.run_panel (just-ask/quorum/brainstorm/board) and the plain `-m` path in
     modes.review each import resolve_backend into their own module namespace, so a
@@ -127,7 +127,14 @@ def _with_backend_stub(resolver):
     namespaces (backends / panel / modes.review): with the dispatch mocked these tests
     exercise stats/ETA wiring, not liveness, and the pre-dispatch pool-selection guard
     (reviewlib.pool_guard) must not bail on a host lacking these backends' keys/CLIs.
-    Returns a restore fn.
+
+    It ALSO stubs `runtime_provider_marked_unpaid` -> False in `backends` + `modes.review`
+    (mirrors the `backend_available` stubbing above): the pool guard's liveness probe
+    (`provider_failover.any_provider_available`) and the flat `-m` path's provider-failover
+    cascade both consult the REAL unpaid state alongside `backend_available`, so a host
+    whose `~/.config/review-cli/config.yaml` marks e.g. `gemini` unpaid would otherwise leak
+    that into these dispatch-mocked tests and spuriously trip the guard (the same leak class
+    tests/conftest.py's autouse fixture exists to contain). Returns a restore fn.
     """
     from reviewlib import backends as _backends
     from reviewlib.modes import review as _review_mode
@@ -137,11 +144,15 @@ def _with_backend_stub(resolver):
     saved_avail_b = _backends.backend_available
     saved_avail_p = _panel.backend_available
     saved_avail_r = _review_mode.backend_available
+    saved_unpaid_b = _backends.runtime_provider_marked_unpaid
+    saved_unpaid_r = _review_mode.runtime_provider_marked_unpaid
     _panel.resolve_backend = resolver
     _review_mode.resolve_backend = resolver
     _backends.backend_available = lambda _m: True
     _panel.backend_available = lambda _m: True
     _review_mode.backend_available = lambda _m: True
+    _backends.runtime_provider_marked_unpaid = lambda _m: False
+    _review_mode.runtime_provider_marked_unpaid = lambda _m: False
 
     def restore():
         _panel.resolve_backend = saved_panel
@@ -149,6 +160,8 @@ def _with_backend_stub(resolver):
         _backends.backend_available = saved_avail_b
         _panel.backend_available = saved_avail_p
         _review_mode.backend_available = saved_avail_r
+        _backends.runtime_provider_marked_unpaid = saved_unpaid_b
+        _review_mode.runtime_provider_marked_unpaid = saved_unpaid_r
 
     return restore
 

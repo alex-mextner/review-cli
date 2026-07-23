@@ -3009,6 +3009,36 @@ def _evaluate_pool_or_bail(
         requested, explicit = pool_arg, True
     else:
         requested, explicit = 0, False
+    # The guard's liveness probe must agree with what will actually be DISPATCHED: a plain
+    # `backends.backend_available(model)` marks a seat down whenever its head provider lacks
+    # a key/CLI, even when a later provider in its failover chain (reviewlib.provider_failover)
+    # is live — e.g. no ZAI_API_KEY but authenticated oc:zai. `any_provider_available` checks
+    # the WHOLE chain, so the guard never proposes/bails on a seat provider_chain would have
+    # routed around at call time (codex P2 on review-cli#157). The import is lazy (function
+    # top would be fine too, but this mirrors the other lazy provider_failover import below).
+    from .provider_failover import any_provider_available
+
+    def _guard_available(model: str) -> bool:
+        return any_provider_available(
+            model,
+            available=backends.backend_available,
+            unpaid=backends.runtime_provider_marked_unpaid,
+        )
+
+    def _guard_reason(model: str) -> str | None:
+        # `backend_unavailable_reason` probes only the requested (head) spelling, and — by
+        # construction — already agrees with `_guard_available` whenever the head itself is
+        # what's down (it embeds the same `runtime_provider_marked_unpaid` check
+        # `any_provider_available` uses). The one gap: if it ever returned None while
+        # `_guard_available` says the WHOLE chain is down (every provider unavailable/unpaid,
+        # a shape only reachable with mismatched injected predicates today, e.g. in a test),
+        # the guard would bail with a blank reason. Fail safe with a synthesized one rather
+        # than ship a misleading empty message (review of #157).
+        reason = backends.backend_unavailable_reason(model)
+        if reason is not None or _guard_available(model):
+            return reason
+        return f"{model}: no provider in its failover chain is currently available"
+
     decision = evaluate_selection(
         user_board=user_seats,
         requested_size=requested,
@@ -3019,8 +3049,8 @@ def _evaluate_pool_or_bail(
         candidates=lambda: _pool_guard_candidates(
             config, config_models, config_has_board, default_pool
         ),
-        available=backends.backend_available,
-        reason=backends.backend_unavailable_reason,
+        available=_guard_available,
+        reason=_guard_reason,
     )
     if decision.kind == PROCEED:
         return None

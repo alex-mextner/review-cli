@@ -556,6 +556,7 @@ def run_panel_with_retry(
     )  # lazy
     from .provider_failover import (  # lazy: keeps panel import light
         forget_working_provider,
+        is_default_provider_selection,
         provider_chain,
         remember_working_provider,
     )
@@ -596,7 +597,14 @@ def run_panel_with_retry(
         # gemini, a plain claude id) has nothing to rotate, so skip the lock-serialized
         # load+atomic-rename write entirely instead of accumulating no-op `{"codex":"codex"}`
         # entries.
-        multi_provider = len(chain) > 1
+        #
+        # The WRITE side must be gated the SAME way `provider_chain`'s cache-reorder READ is
+        # (`is_default_provider_selection`): an explicit alternate pin (`-m
+        # commandcode:zai-org/GLM-5.2`) succeeding/failing must not train/clear the shared
+        # logical-key cache entry a later BARE alias request (`-m glm52`) reads — otherwise
+        # a one-off pin silently rebiases (or wipes) default routing (review of #157: "cache
+        # write isn't gated the way the read is").
+        cache_eligible = len(chain) > 1 and is_default_provider_selection(job.model)
         last: ReviewResult | None = None
         for idx, provider_model in enumerate(chain):
             result = _attempt(
@@ -605,7 +613,7 @@ def run_panel_with_retry(
                 else job
             )
             if result_is_usable(result):
-                if multi_provider:
+                if cache_eligible:
                     remember_working_provider(job.model, provider_model)
                 return result
             last = result
@@ -624,7 +632,7 @@ def run_panel_with_retry(
                     delay=0.0,
                     result=result,
                 )
-        if multi_provider:
+        if cache_eligible:
             forget_working_provider(job.model)
         return last if last is not None else _attempt(job)
 
