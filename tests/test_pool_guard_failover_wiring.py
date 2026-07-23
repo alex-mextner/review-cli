@@ -129,6 +129,28 @@ def test_guard_synthesizes_a_reason_when_the_head_reason_is_blank():
     ), err.getvalue()
 
 
+def test_chain_aware_available_agrees_with_the_guard_on_a_head_down_alternate_live_seat():
+    """`cli._chain_aware_available` is the ONE liveness predicate the guard, the ETA's
+    `planned_pool` split, and the real board dispatch split (`_mode_review_board`) all
+    share — codex P1 on review of #157: before this fix only the guard was chain-aware,
+    so it could approve a pool size the (raw) split then silently shrank. This proves the
+    shared function itself agrees with `any_provider_available` (the guard's own
+    liveness check) for the exact head-down/alternate-live shape the P1 was about;
+    `test_board_startup_split_includes_a_seat_whose_head_is_down_but_has_a_live_alternate`
+    (tests/test_provider_failover.py) proves the REAL dispatch split honors it end to end."""
+
+    def _available(model: str) -> bool:
+        return model == "oc:zai/glm-5.2"
+
+    with _PatchBackends(available=_available, reason=lambda _m: None):
+        assert cli._chain_aware_available("zai:glm-5.2") is True, (
+            "a live failover alternate must count as available"
+        )
+        assert cli._chain_aware_available("codex") is False, (
+            "a single-provider model with no live provider must be unavailable"
+        )
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

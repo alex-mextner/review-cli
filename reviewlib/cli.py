@@ -2982,6 +2982,28 @@ def _pool_guard_candidates(
     return candidates
 
 
+def _chain_aware_available(model: str) -> bool:
+    """The failover-chain-aware liveness probe: True iff `model` OR any later provider in
+    its `reviewlib.provider_failover` chain is reachable and paid.
+
+    This is THE single liveness predicate every pre-dispatch decision about a seat must
+    share — the pool guard, the startup pool/reserve SPLIT (`split_pool_reserve`, both here
+    for the ETA and in `modes.review._mode_review_board` for the REAL dispatch), and the
+    ETA's `planned_pool`. Before this fix the guard alone became chain-aware while the split
+    stayed on raw `backend_available`, so the guard could approve a pool size the split then
+    silently shrank (a two-seat board where one seat's head is down but its failover
+    alternate is live: the guard says 'fine, 2 live', the split — still raw — says '1 live',
+    and dispatch quietly runs a smaller pool than what was approved). Codex P1 on review of
+    #157: 'the chain-aware guard approves seats that board dispatch still removes.'"""
+    from .provider_failover import any_provider_available
+
+    return any_provider_available(
+        model,
+        available=backends.backend_available,
+        unpaid=backends.runtime_provider_marked_unpaid,
+    )
+
+
 def _evaluate_pool_or_bail(
     config: dict,
     config_models: list[str],
@@ -3009,33 +3031,18 @@ def _evaluate_pool_or_bail(
         requested, explicit = pool_arg, True
     else:
         requested, explicit = 0, False
-    # The guard's liveness probe must agree with what will actually be DISPATCHED: a plain
-    # `backends.backend_available(model)` marks a seat down whenever its head provider lacks
-    # a key/CLI, even when a later provider in its failover chain (reviewlib.provider_failover)
-    # is live — e.g. no ZAI_API_KEY but authenticated oc:zai. `any_provider_available` checks
-    # the WHOLE chain, so the guard never proposes/bails on a seat provider_chain would have
-    # routed around at call time (codex P2 on review-cli#157). The import is lazy (function
-    # top would be fine too, but this mirrors the other lazy provider_failover import below).
-    from .provider_failover import any_provider_available
-
-    def _guard_available(model: str) -> bool:
-        return any_provider_available(
-            model,
-            available=backends.backend_available,
-            unpaid=backends.runtime_provider_marked_unpaid,
-        )
 
     def _guard_reason(model: str) -> str | None:
         # `backend_unavailable_reason` probes only the requested (head) spelling, and — by
-        # construction — already agrees with `_guard_available` whenever the head itself is
-        # what's down (it embeds the same `runtime_provider_marked_unpaid` check
+        # construction — already agrees with `_chain_aware_available` whenever the head
+        # itself is what's down (it embeds the same `runtime_provider_marked_unpaid` check
         # `any_provider_available` uses). The one gap: if it ever returned None while
-        # `_guard_available` says the WHOLE chain is down (every provider unavailable/unpaid,
-        # a shape only reachable with mismatched injected predicates today, e.g. in a test),
-        # the guard would bail with a blank reason. Fail safe with a synthesized one rather
-        # than ship a misleading empty message (review of #157).
+        # `_chain_aware_available` says the WHOLE chain is down (every provider
+        # unavailable/unpaid, a shape only reachable with mismatched injected predicates
+        # today, e.g. in a test), the guard would bail with a blank reason. Fail safe with a
+        # synthesized one rather than ship a misleading empty message (review of #157).
         reason = backends.backend_unavailable_reason(model)
-        if reason is not None or _guard_available(model):
+        if reason is not None or _chain_aware_available(model):
             return reason
         return f"{model}: no provider in its failover chain is currently available"
 
@@ -3049,7 +3056,7 @@ def _evaluate_pool_or_bail(
         candidates=lambda: _pool_guard_candidates(
             config, config_models, config_has_board, default_pool
         ),
-        available=_guard_available,
+        available=_chain_aware_available,
         reason=_guard_reason,
     )
     if decision.kind == PROCEED:
@@ -3789,10 +3796,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         if explicit_models:
             planned_pool = list(board)
         else:
+            # Chain-aware (`_chain_aware_available`), matching the pool guard above AND the
+            # REAL dispatch split in `modes.review._mode_review_board` — a raw
+            # `backend_available` here would let the ETA plan a smaller pool than the guard
+            # just approved (codex P1 on review of #157).
             planned_pool, _ = split_pool_reserve(
                 board,
                 review_pool_size,
-                lambda r: backends.backend_available(r.model),
+                lambda r: _chain_aware_available(r.model),
             )
         eta_models = [r.model for r in planned_pool]
         outcome_sink: list = []

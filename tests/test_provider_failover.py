@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import tempfile
 from pathlib import Path
+from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -227,6 +228,21 @@ def test_cached_provider_still_reorders_the_default_head_spelled_out_directly():
     assert chain[0] == "oc:zai/glm-5.2", chain
 
 
+def test_requested_is_default_selection_strips_both_sides_of_the_head_comparison():
+    """Both `expanded` and `default_head` normalize identically (strip + lower) before
+    comparing (opus review of #157): a `default_head` sourced from a config
+    `provider_chains:` override can itself carry whitespace, and the fix that added
+    `.strip()` here was initially one-sided (only `expanded` was stripped, `default_head`
+    was not), so a padded override head would compare unequal to a clean requested
+    spelling even though they're the same provider."""
+    from reviewlib.provider_failover import _requested_is_default_selection
+
+    override = {"glm-5.2": [" zai:glm-5.2 ", "oc:zai/glm-5.2"]}
+    assert (
+        _requested_is_default_selection("zai:glm-5.2", "zai:glm-5.2", override) is True
+    )
+
+
 # === any_provider_available: a plain liveness probe across the failover chain =====
 def test_any_provider_available_true_when_a_later_chain_provider_is_live():
     """A caller (the pool guard) must not mark a model 'down' just because its DEFAULT
@@ -337,10 +353,20 @@ class _ProviderFakeBackends:
     paid, points the cache at a throwaway file, and disables in-seat retry (so a failure
     goes STRAIGHT to provider-failover, no backoff delay)."""
 
-    def __init__(self, behaviour: dict[str, tuple[int, str]]):
+    def __init__(
+        self,
+        behaviour: dict[str, tuple[int, str]],
+        *,
+        available: Callable[[str], bool] | None = None,
+    ):
         self.behaviour = behaviour
         self.dispatched: list[str] = []
         self.cache = str(Path(tempfile.mkdtemp()) / "last-provider.json")
+        # Defaults to "every provider reachable" (the switchover tests care about the
+        # DISPATCH-time chain, not the pool guard / startup split). A caller proving the
+        # startup pool/reserve SPLIT is chain-aware (codex P1 on review of #157) passes its
+        # own mixed available/unavailable predicate here instead.
+        self._available = available if available is not None else (lambda _m: True)
 
     def __enter__(self):
         self._old_resolve = _panel.resolve_backend
@@ -367,7 +393,7 @@ class _ProviderFakeBackends:
             return _backend
 
         _panel.resolve_backend = _resolve
-        _panel.backend_available = lambda _m: True
+        _panel.backend_available = self._available
         _backends.runtime_provider_marked_unpaid = lambda _m: False
         os.environ["REVIEW_PROVIDER_CACHE"] = self.cache
         os.environ["REVIEW_RETRY_COUNT"] = "0"
@@ -639,6 +665,64 @@ def test_board_explicit_pin_success_does_not_train_the_default_cache():
     cache_path = Path(fb.cache)
     cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
     assert "glm-5.2" not in cache, cache
+
+
+def test_board_startup_split_includes_a_seat_whose_head_is_down_but_has_a_live_alternate():
+    """codex P1 on review of #157: the pool guard's chain-aware liveness must AGREE with
+    the STARTUP pool/reserve SPLIT (`reviewlib.modes.review._mode_review_board`'s
+    `split_pool_reserve` call), or the guard can approve a pool size the split then silently
+    shrinks. A two-seat board (pool_size=2) where GLM's head provider (zai:glm-5.2) is down
+    but its opencode alternate (oc:zai/glm-5.2) is live must put GLM in the startup POOL (it
+    fails over internally at dispatch time via `panel._seat`), not the reserve — a raw
+    (non-chain-aware) split would mark GLM 'unavailable' and shrink the pool to 1 seat with
+    an EMPTY reserve, degrading a perfectly recoverable board for no reason.
+
+    Drives the REAL split via `mode_review(board=...)` (not `run_board_with_failover`
+    directly, which takes an ALREADY-split pool/reserve and so wouldn't exercise the split
+    predicate this fix changed)."""
+    glm_seat = BoardReviewer("zai:glm-5.2", "quality", "GLM")
+    codex_seat = BoardReviewer("codex", "consistency", "Codex")
+    behaviour = {
+        "zai:glm-5.2": (1, "connection refused"),  # head down
+        "oc:zai/glm-5.2": (0, "ok via opencode"),  # failover alternate is live
+        "codex": (0, "ok via codex"),
+    }
+
+    def _available(model: str) -> bool:
+        return model in ("oc:zai/glm-5.2", "codex")
+
+    with _ProviderFakeBackends(behaviour, available=_available) as fb:
+        old_review_avail = _review_mod.backend_available
+        # `_mode_review_board`'s split reads `backend_available` from `modes.review`'s OWN
+        # imported name (not a live `reviewlib.backends`/`reviewlib.panel` lookup), so it
+        # must be patched here too, same class of leak the earlier flat-path fixes closed.
+        _review_mod.backend_available = _available
+        try:
+            outcome_sink: list = []
+            rc = _review_mod.mode_review(
+                [],
+                "Review this.",
+                "+x",
+                REPO_ROOT,
+                5,
+                False,
+                board=[glm_seat, codex_seat],
+                pool_size=2,
+                outcome_sink=outcome_sink,
+            )
+        finally:
+            _review_mod.backend_available = old_review_avail
+        assert rc == 0, "the board should not have degraded"
+        outcome = outcome_sink[0]
+        assert not outcome.degraded, (
+            "the board degraded — GLM's live failover alternate was not used"
+        )
+        assert len(outcome.usable) == 2, outcome
+    # GLM actually dispatched through its failover alternate (the down head is filtered out
+    # of the chain before dispatch, same as any cheaply-unavailable provider — see
+    # `provider_chain`'s `reachable` filter — so only the alternate is attempted), proving
+    # GLM ran as a POOL seat, not skipped as unavailable / left to an empty reserve.
+    assert "oc:zai/glm-5.2" in fb.dispatched, fb.dispatched
 
 
 if __name__ == "__main__":

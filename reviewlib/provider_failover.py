@@ -151,7 +151,9 @@ def _requested_is_default_selection(
     if model.strip().lower() != expanded.strip().lower():
         return True
     default_head = _default_head(logical_key(model), overrides)
-    return default_head is None or expanded.lower() == default_head.lower()
+    return (
+        default_head is None or expanded.strip().lower() == default_head.strip().lower()
+    )
 
 
 def is_default_provider_selection(

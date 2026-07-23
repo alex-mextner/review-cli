@@ -706,9 +706,22 @@ def _mode_review_board(
     if exact_board:
         pool, reserve = list(board), []
     else:
-        pool, reserve = split_pool_reserve(
-            board, pool_size, lambda r: backend_available(r.model)
-        )
+        # Chain-aware, matching the pool guard (cli._chain_aware_available) — a raw
+        # `backend_available` here would silently shrink the pool the guard just approved:
+        # a seat whose head provider is down but has a live failover alternate is REAL live
+        # (provider_chain would route around it at dispatch time), so the startup split must
+        # agree (codex P1 on review of #157: 'the chain-aware guard approves seats that
+        # board dispatch still removes').
+        from ..provider_failover import any_provider_available
+
+        def _chain_aware_available(r: BoardReviewer) -> bool:
+            return any_provider_available(
+                r.model,
+                available=backend_available,
+                unpaid=runtime_provider_marked_unpaid,
+            )
+
+        pool, reserve = split_pool_reserve(board, pool_size, _chain_aware_available)
     if not pool:
         print(
             "[review-cli] board: no reviewers are available — configure at least one "
