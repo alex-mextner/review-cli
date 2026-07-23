@@ -8,6 +8,7 @@ call is ever made. The stats store is redirected to a temp file via $REVIEW_STAT
 (and the per-call log dir via $REVIEW_LOG_DIR) so the real ~/.config store is never
 touched.
 """
+
 from __future__ import annotations
 
 import io
@@ -23,6 +24,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+# Some tests drive the real board dispatch (mode_review -> panel). Redirect the
+# provider-failover last-working cache to a throwaway file (never touch the real
+# ~/.cache/review-cli), and neutralise provider-failover to an identity chain: these tests
+# exercise stats/ETA + reserve-replace degrade, NOT the seat-level provider switchover
+# (which is tested in tests/test_provider_failover.py). Without this a chained seat (glm)
+# would fall over to another provider instead of failing, breaking the degrade scenario.
+os.environ.setdefault(
+    "REVIEW_PROVIDER_CACHE", str(Path(tempfile.mkdtemp()) / "last-provider.json")
+)
+# SCOPED per-test (autouse fixture / __main__ wrapper), NOT module-level — a module-level
+# patch poisons other suites at collection time. See tests/_failover_neutralise.py.
+from _failover_neutralise import identity_provider_chain  # noqa: E402
+
 from reviewlib import cli as _cli  # noqa: E402
 from reviewlib import panel as _panel  # noqa: E402
 from reviewlib import stats as _stats  # noqa: E402
@@ -31,6 +45,18 @@ from reviewlib.install import SKILL_BLURB, SKILL_MD  # noqa: E402
 
 TASK = "HYP-742"
 TASK_ARGS = ["--task", TASK]
+
+try:
+    import pytest  # noqa: E402
+
+    @pytest.fixture(autouse=True)
+    def _neutralise_provider_failover():
+        """Seat-level provider-failover neutralised to an identity chain per-test and
+        RESTORED afterwards, so it never leaks to other suites."""
+        with identity_provider_chain():
+            yield
+except ImportError:  # plain-script harness applies it in __main__ instead
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +83,9 @@ class _TmpStore:
     def records(self) -> list[dict]:
         if not self.path.exists():
             return []
-        return [json.loads(ln) for ln in self.path.read_text().splitlines() if ln.strip()]
+        return [
+            json.loads(ln) for ln in self.path.read_text().splitlines() if ln.strip()
+        ]
 
 
 def _stub_resolve_backend(rc_by_model: dict[str, int] | int = 0):
@@ -67,6 +95,7 @@ def _stub_resolve_backend(rc_by_model: dict[str, int] | int = 0):
     The returned backend callable matches resolve_backend(model)(model, prompt, diff,
     cwd, timeout) so it drops into panel.run_panel unchanged.
     """
+
     def resolver(model: str):
         # round_no is the 6th arg panel.run_panel threads through (added with the
         # round-aware board/brainstorm path). Default it so the stub matches BOTH the
@@ -75,28 +104,65 @@ def _stub_resolve_backend(rc_by_model: dict[str, int] | int = 0):
         # as a failure (codex: success path left under-tested).
         def backend(m, prompt, diff, cwd, timeout, round_no=0, effort=None):
             rc = rc_by_model if isinstance(rc_by_model, int) else rc_by_model.get(m, 0)
-            return ReviewResult(model=m, command=f"stub {m}", returncode=rc,
-                                stdout=f"output from {m}", stderr="")
+            return ReviewResult(
+                model=m,
+                command=f"stub {m}",
+                returncode=rc,
+                stdout=f"output from {m}",
+                stderr="",
+            )
+
         return backend
+
     return resolver
 
 
 def _with_backend_stub(resolver):
-    """Swap resolve_backend in BOTH namespaces that dispatch backends.
+    """Swap resolve_backend in BOTH namespaces that dispatch backends, AND force every seat
+    available/paid.
 
     panel.run_panel (just-ask/quorum/brainstorm/board) and the plain `-m` path in
     modes.review each import resolve_backend into their own module namespace, so a
-    stub must replace both. Returns a restore fn.
+    stub must replace both. It ALSO stubs `backend_available` -> True in all three probe
+    namespaces (backends / panel / modes.review): with the dispatch mocked these tests
+    exercise stats/ETA wiring, not liveness, and the pre-dispatch pool-selection guard
+    (reviewlib.pool_guard) must not bail on a host lacking these backends' keys/CLIs.
+
+    It ALSO stubs `runtime_provider_marked_unpaid` -> False in `backends` + `modes.review`
+    (mirrors the `backend_available` stubbing above): the pool guard's liveness probe
+    (`provider_failover.any_provider_available`) and the flat `-m` path's provider-failover
+    cascade both consult the REAL unpaid state alongside `backend_available`, so a host
+    whose `~/.config/review-cli/config.yaml` marks e.g. `gemini` unpaid would otherwise leak
+    that into these dispatch-mocked tests and spuriously trip the guard (the same leak class
+    tests/conftest.py's autouse fixture exists to contain). Returns a restore fn.
     """
+    from reviewlib import backends as _backends
     from reviewlib.modes import review as _review_mode
+
     saved_panel = _panel.resolve_backend
     saved_review = _review_mode.resolve_backend
+    saved_avail_b = _backends.backend_available
+    saved_avail_p = _panel.backend_available
+    saved_avail_r = _review_mode.backend_available
+    saved_unpaid_b = _backends.runtime_provider_marked_unpaid
+    saved_unpaid_r = _review_mode.runtime_provider_marked_unpaid
     _panel.resolve_backend = resolver
     _review_mode.resolve_backend = resolver
+    _backends.backend_available = lambda _m: True
+    _panel.backend_available = lambda _m: True
+    _review_mode.backend_available = lambda _m: True
+    _backends.runtime_provider_marked_unpaid = lambda _m: False
+    _review_mode.runtime_provider_marked_unpaid = lambda _m: False
 
     def restore():
         _panel.resolve_backend = saved_panel
         _review_mode.resolve_backend = saved_review
+        _backends.backend_available = saved_avail_b
+        _panel.backend_available = saved_avail_p
+        _review_mode.backend_available = saved_avail_r
+        _backends.runtime_provider_marked_unpaid = saved_unpaid_b
+        _review_mode.runtime_provider_marked_unpaid = saved_unpaid_r
+
     return restore
 
 
@@ -171,12 +237,30 @@ def test_record_run_passed_true_and_false_are_persisted():
 
 def test_task_summaries_group_iterations_and_models():
     with _TmpStore():
-        _stats.record_run(task_code="HYP-742", mode="review", models=["codex"],
-                          duration_seconds=10, ok_count=1, fail_count=0)
-        _stats.record_run(task_code="HYP-742", mode="quorum", models=["codex", "gemini"],
-                          duration_seconds=20, ok_count=2, fail_count=0)
-        _stats.record_run(task_code="HYP-999", mode="review", models=["claude"],
-                          duration_seconds=30, ok_count=1, fail_count=0)
+        _stats.record_run(
+            task_code="HYP-742",
+            mode="review",
+            models=["codex"],
+            duration_seconds=10,
+            ok_count=1,
+            fail_count=0,
+        )
+        _stats.record_run(
+            task_code="HYP-742",
+            mode="quorum",
+            models=["codex", "gemini"],
+            duration_seconds=20,
+            ok_count=2,
+            fail_count=0,
+        )
+        _stats.record_run(
+            task_code="HYP-999",
+            mode="review",
+            models=["claude"],
+            duration_seconds=30,
+            ok_count=1,
+            fail_count=0,
+        )
         summaries = _stats.task_summaries()
         by_code = {s["task_code"]: s for s in summaries}
         assert by_code["HYP-742"]["iterations"] == 2
@@ -189,10 +273,22 @@ def test_task_summaries_group_iterations_and_models():
 
 def test_cli_task_list_json_includes_multiple_tasks():
     with _TmpStore():
-        _stats.record_run(task_code="HYP-742", mode="review", models=["codex"],
-                          duration_seconds=10, ok_count=1, fail_count=0)
-        _stats.record_run(task_code="HYP-999", mode="quorum", models=["gemini"],
-                          duration_seconds=20, ok_count=1, fail_count=0)
+        _stats.record_run(
+            task_code="HYP-742",
+            mode="review",
+            models=["codex"],
+            duration_seconds=10,
+            ok_count=1,
+            fail_count=0,
+        )
+        _stats.record_run(
+            task_code="HYP-999",
+            mode="quorum",
+            models=["gemini"],
+            duration_seconds=20,
+            ok_count=1,
+            fail_count=0,
+        )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
             rc = _cli.main(["task", "--json"])
@@ -215,8 +311,14 @@ def test_cli_task_subcommand_rejects_global_task_flag():
 
 def test_record_run_file_is_0600():
     with _TmpStore() as store:
-        _stats.record_run(task_code=TASK, mode="review", models=["codex"], duration_seconds=1.0,
-                          ok_count=1, fail_count=0)
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+        )
         mode = store.path.stat().st_mode & 0o777
         assert mode == 0o600, oct(mode)
 
@@ -229,16 +331,38 @@ def test_record_run_tightens_preexisting_permissive_file():
         store.path.write_text("")  # pre-create
         os.chmod(store.path, 0o644)
         assert store.path.stat().st_mode & 0o777 == 0o644
-        _stats.record_run(task_code=TASK, mode="review", models=["codex"], duration_seconds=1.0,
-                          ok_count=1, fail_count=0)
-        assert store.path.stat().st_mode & 0o777 == 0o600, oct(store.path.stat().st_mode & 0o777)
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+        )
+        assert store.path.stat().st_mode & 0o777 == 0o600, oct(
+            store.path.stat().st_mode & 0o777
+        )
         assert len(store.records()) == 1
 
 
 def test_record_run_appends_not_truncates():
     with _TmpStore() as store:
-        _stats.record_run(task_code=TASK, mode="review", models=["a"], duration_seconds=1.0, ok_count=1, fail_count=0)
-        _stats.record_run(task_code=TASK, mode="review", models=["a", "b"], duration_seconds=2.0, ok_count=2, fail_count=0)
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["a"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["a", "b"],
+            duration_seconds=2.0,
+            ok_count=2,
+            fail_count=0,
+        )
         assert len(store.records()) == 2
 
 
@@ -248,8 +372,13 @@ def test_record_run_appends_not_truncates():
 def test_eta_mode_plus_pool_average():
     with _TmpStore():
         for secs in (360, 380, 400):
-            _stats.record_run(mode="brainstorm", models=["a", "b", "c", "d"],
-                              duration_seconds=secs, ok_count=4, fail_count=0)
+            _stats.record_run(
+                mode="brainstorm",
+                models=["a", "b", "c", "d"],
+                duration_seconds=secs,
+                ok_count=4,
+                fail_count=0,
+            )
         eta = _stats.estimate_eta("brainstorm", 4)
         assert eta is not None
         assert eta["basis"] == "mode+pool"
@@ -266,8 +395,13 @@ def test_eta_falls_back_to_pool_only():
     with _TmpStore():
         # Only review/4 exists; ask for quorum/4 -> pool-only fallback (any mode).
         for secs in (120, 180):
-            _stats.record_run(mode="review", models=["a", "b", "c", "d"],
-                              duration_seconds=secs, ok_count=4, fail_count=0)
+            _stats.record_run(
+                mode="review",
+                models=["a", "b", "c", "d"],
+                duration_seconds=secs,
+                ok_count=4,
+                fail_count=0,
+            )
         eta = _stats.estimate_eta("quorum", 4)
         assert eta is not None and eta["basis"] == "pool"
         assert eta["samples"] == 2
@@ -310,8 +444,16 @@ def test_stats_never_raise_on_unexpandable_path():
     os.environ["REVIEW_STATS_FILE"] = "~nosuchuser-zzz/run-stats.jsonl"
     try:
         # record_run must return False, not raise.
-        assert _stats.record_run(mode="review", models=["a"], duration_seconds=1.0,
-                                 ok_count=1, fail_count=0) is False
+        assert (
+            _stats.record_run(
+                mode="review",
+                models=["a"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+            )
+            is False
+        )
         # estimate_eta / eta_line / announce_eta must degrade to "no history", not raise.
         assert _stats.estimate_eta("review", 1) is None
         assert "no history yet" in _stats.eta_line("review", 1)
@@ -405,7 +547,9 @@ def test_cli_invalid_task_code_fails_before_dispatch():
         for bad in ("multi word", "x" * 121, "bad\ncode"):
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
-                rc = _cli.main(["diff", "--task", bad, "-C", str(REPO_ROOT), "-m", "codex"])
+                rc = _cli.main(
+                    ["diff", "--task", bad, "-C", str(REPO_ROOT), "-m", "codex"]
+                )
             assert rc == 2, (bad, rc)
             assert "invalid --task CODE" in err.getvalue(), (bad, err.getvalue())
     finally:
@@ -418,6 +562,7 @@ def test_cli_invalid_task_code_fails_before_dispatch():
 
 def _git_init_with_diff() -> tempfile.TemporaryDirectory:
     import subprocess
+
     d = tempfile.TemporaryDirectory()
     repo = Path(d.name)
     # Neutralize any global review pre-commit gate (core.hooksPath on this machine)
@@ -449,7 +594,9 @@ def test_cli_review_run_records_stat_and_announces_eta():
             assert rc == 0, rc
             # ETA line went to stderr.
             assert "[review] pool=2 (review)" in err.getvalue()
-            assert "do NOT timeout" in err.getvalue() or "Do NOT timeout" in err.getvalue()
+            assert (
+                "do NOT timeout" in err.getvalue() or "Do NOT timeout" in err.getvalue()
+            )
             # Exactly one stat record with the real mode + pool + per-call counts.
             recs = store.records()
             assert len(recs) == 1, recs
@@ -515,9 +662,11 @@ def test_read_stdin_if_piped_treats_unreadable_capture_as_no_input():
 
 def test_cli_standalone_visual_does_not_record_review_task_code_env():
     if not shutil.which("magick"):
-        _skip("standalone `review visual` drives the real cvGate, which hard-requires "
-              "ImageMagick v7's `magick` binary (absent on this host) — same gate as "
-              "test_visual_verification_suite in smoke.py.")
+        _skip(
+            "standalone `review visual` drives the real cvGate, which hard-requires "
+            "ImageMagick v7's `magick` binary (absent on this host) — same gate as "
+            "test_visual_verification_suite in smoke.py."
+        )
     with _TmpStore() as store:
         tests_dir = str(REPO_ROOT / "tests")
         if tests_dir not in sys.path:
@@ -548,7 +697,12 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
     The board is pinned to the preset boards and config to {} so the test is independent of
     the dev machine's config.yaml; backends are stubbed (no model call)."""
     from reviewlib import backends as _backends
-    from reviewlib.config import DEFAULT_BOARD, DEFAULT_PRESET_BOARD, HEAVY_PRESET_BOARD, LIGHT_PRESET_BOARD
+    from reviewlib.config import (
+        DEFAULT_BOARD,
+        DEFAULT_PRESET_BOARD,
+        HEAVY_PRESET_BOARD,
+        LIGHT_PRESET_BOARD,
+    )
     from reviewlib.modes import review as _review_mode
 
     with _TmpStore() as store:
@@ -568,6 +722,7 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
         saved_cfg = _cli.load_config
         saved_lb = _cli.load_board
         _cli.load_config = lambda: {}
+
         def _load_board(_cfg, **kw):
             preset = kw.get("preset")
             if preset == "default":
@@ -630,7 +785,12 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
     single run-stats record + captured stderr under "_stderr"; tolerates exit 1 (the
     degraded path)."""
     from reviewlib import backends as _backends
-    from reviewlib.config import DEFAULT_BOARD, DEFAULT_PRESET_BOARD, HEAVY_PRESET_BOARD, LIGHT_PRESET_BOARD
+    from reviewlib.config import (
+        DEFAULT_BOARD,
+        DEFAULT_PRESET_BOARD,
+        HEAVY_PRESET_BOARD,
+        LIGHT_PRESET_BOARD,
+    )
     from reviewlib.modes import review as _review_mode
 
     with _TmpStore() as store:
@@ -645,6 +805,7 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
         saved_cfg = _cli.load_config
         saved_lb = _cli.load_board
         _cli.load_config = lambda: {}
+
         def _load_board(_cfg, **kw):
             preset = kw.get("preset")
             if preset == "default":
@@ -688,7 +849,7 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
     r = _run_board_review_with_resolver(["--preset", "heavy"], resolver)
     assert r["_rc"] == 0, r
     assert r["mode"] == "review"
-    assert r["pool_size"] == 4, r            # backfilled back up to 4
+    assert r["pool_size"] == 4, r  # backfilled back up to 4
     assert "claude:claude-fable-5" not in r["models"], r
     assert "codex:gpt-5.6-sol" in r["models"], r
     # The promoted reserve is the first reserve seat (Kimi, #5), recorded by its real id.
@@ -696,7 +857,7 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
     # GLM-cc is in the planned pool itself (it didn't fail), so it is recorded directly.
     assert "commandcode:zai-org/GLM-5.2" in r["models"], r
     assert "[review] pool=4 (review)" in r["_stderr"]  # ETA still keys on the planned 4
-    assert "promoting reserve" in r["_stderr"]          # failover actually fired
+    assert "promoting reserve" in r["_stderr"]  # failover actually fired
 
 
 def test_cli_failover_exhausted_reserve_degrades_exit_1():
@@ -713,7 +874,7 @@ def test_cli_failover_exhausted_reserve_degrades_exit_1():
     r = _run_board_review_with_resolver([], resolver)
     assert r["_rc"] == 1, r
     assert "degraded" in r["_stderr"], r["_stderr"]
-    assert set(r["models"]) == ok, r        # only the seats that produced verdicts
+    assert set(r["models"]) == ok, r  # only the seats that produced verdicts
     assert r["pool_size"] == 2, r
 
 
@@ -733,12 +894,18 @@ def test_cli_exact_board_records_all_explicit_attempted_models_on_partial_failur
         }
         try:
             with redirect_stderr(io.StringIO()), _capture_stdout():
-                rc = _cli.main([
-                    "diff", *TASK_ARGS,
-                    "-C", d.name,
-                    "-m", "codex",
-                    "-m", "gemini",
-                ])
+                rc = _cli.main(
+                    [
+                        "diff",
+                        *TASK_ARGS,
+                        "-C",
+                        d.name,
+                        "-m",
+                        "codex",
+                        "-m",
+                        "gemini",
+                    ]
+                )
             assert rc == 1, rc
             r = store.records()[0]
             assert r["models"] == ["codex", "gemini"], r
@@ -777,6 +944,7 @@ def test_cli_no_dispatch_run_is_not_recorded_but_eta_still_printed():
     """A clean tree (no diff) dispatches zero backends -> no ~0s record poisoning the
     ETA average, but the ETA line is still printed (costs nothing, warns the agent)."""
     import subprocess
+
     with _TmpStore() as store:
         d = tempfile.TemporaryDirectory()
         repo = Path(d.name)
@@ -845,8 +1013,13 @@ def test_cli_second_run_eta_uses_first_runs_history():
     with _TmpStore() as store:
         # Seed one review/2 record, then a fresh review/2 run must announce a
         # mode+pool ETA computed from it (basis "this size", not "no history").
-        _stats.record_run(mode="review", models=["codex", "gemini"],
-                          duration_seconds=90.0, ok_count=2, fail_count=0)
+        _stats.record_run(
+            mode="review",
+            models=["codex", "gemini"],
+            duration_seconds=90.0,
+            ok_count=2,
+            fail_count=0,
+        )
         d = _git_init_with_diff()
         restore = _with_backend_stub(_stub_resolve_backend(0))
         log = tempfile.mkdtemp()
@@ -874,12 +1047,23 @@ def test_cli_task_command_lists_iterations_and_detail_transcript():
         os.environ["REVIEW_TASK_CODE"] = TASK
         try:
             started = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
-            _stats.record_run(task_code=TASK, mode="review", models=["codex"],
-                              duration_seconds=1.2, ok_count=1, fail_count=0,
-                              started=started)
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                duration_seconds=1.2,
+                ok_count=1,
+                fail_count=0,
+                started=started,
+            )
             write_sidecar_log(
-                "codex", round_no=0, argv0="codex", returncode=0,
-                stdout="TRANSCRIPT-LINE from codex\n", stderr="", started=started,
+                "codex",
+                round_no=0,
+                argv0="codex",
+                returncode=0,
+                stdout="TRANSCRIPT-LINE from codex\n",
+                stderr="",
+                started=started,
             )
             out = io.StringIO()
             with redirect_stderr(io.StringIO()), redirect_stdout(out):
@@ -955,15 +1139,32 @@ def test_cli_task_detail_matches_logs_by_timestamp_not_iteration_index():
         try:
             first = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
             second = datetime(2026, 6, 1, 10, 3, tzinfo=timezone.utc)
-            _stats.record_run(task_code=TASK, mode="review", models=["codex"],
-                              duration_seconds=1.0, ok_count=1, fail_count=0,
-                              started=first)
-            _stats.record_run(task_code=TASK, mode="review", models=["gemini"],
-                              duration_seconds=1.0, ok_count=1, fail_count=0,
-                              started=second)
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                started=first,
+            )
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["gemini"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                started=second,
+            )
             write_sidecar_log(
-                "gemini", round_no=0, argv0="gemini", returncode=0,
-                stdout="SECOND-ITERATION-TRANSCRIPT\n", stderr="", started=second,
+                "gemini",
+                round_no=0,
+                argv0="gemini",
+                returncode=0,
+                stdout="SECOND-ITERATION-TRANSCRIPT\n",
+                stderr="",
+                started=second,
             )
 
             out = io.StringIO()
@@ -1012,8 +1213,21 @@ def test_cli_brainstorm_records_persona_slot_pool_not_raw_models():
         # also stubbed (returns ok), so each round is instant. Cap rounds via --rounds.
         try:
             with redirect_stderr(io.StringIO()), _capture_stdout():
-                _cli.main(["brainstorm", "topic", *TASK_ARGS, "-C", d.name, "-m", "codex,gemini",
-                           "--rounds", "1", "--max-rounds", "1"])
+                _cli.main(
+                    [
+                        "brainstorm",
+                        "topic",
+                        *TASK_ARGS,
+                        "-C",
+                        d.name,
+                        "-m",
+                        "codex,gemini",
+                        "--rounds",
+                        "1",
+                        "--max-rounds",
+                        "1",
+                    ]
+                )
             recs = store.records()
             assert len(recs) == 1, recs
             r = recs[0]
@@ -1040,8 +1254,9 @@ def test_moderator_empty_output_tallies_as_fail_not_ok():
 
     # Stub run_single so the only candidate returns rc 0 but empty stdout.
     saved = p.run_single
-    p.run_single = lambda model, prompt, cwd, timeout, diff="", round_no=0: ReviewResult(
-        model=model, command="stub", returncode=0, stdout="", stderr="")
+    p.run_single = lambda model, prompt, cwd, timeout, diff="", round_no=0: (
+        ReviewResult(model=model, command="stub", returncode=0, stdout="", stderr="")
+    )
     p.begin_call_tally()
     try:
         res = p.run_moderator(["codex"], "p", Path("."), 5)
@@ -1068,8 +1283,12 @@ def test_moderator_success_tallies_one_ok_despite_fallback():
     def runner(model, prompt, cwd, timeout, diff="", round_no=0):
         calls["n"] += 1
         if model == "bad":
-            return ReviewResult(model=model, command="stub", returncode=1, stdout="", stderr="boom")
-        return ReviewResult(model=model, command="stub", returncode=0, stdout="synthesis", stderr="")
+            return ReviewResult(
+                model=model, command="stub", returncode=1, stdout="", stderr="boom"
+            )
+        return ReviewResult(
+            model=model, command="stub", returncode=0, stdout="synthesis", stderr=""
+        )
 
     p.run_single = runner
     p.begin_call_tally()
@@ -1092,7 +1311,12 @@ def test_skill_md_warns_never_short_timeout():
     assert "timeout" in low
     assert "minutes" in low
     # mentions that the tool prints the expected duration at startup
-    assert "eta" in low or "prints a one-line eta" in low or "expected duration" in low or "pool size" in low
+    assert (
+        "eta" in low
+        or "prints a one-line eta" in low
+        or "expected duration" in low
+        or "pool size" in low
+    )
 
 
 def test_skill_blurb_warns_never_short_timeout():
@@ -1398,8 +1622,15 @@ def test_quorum_check_rejects_zero_or_negative_thresholds_directly():
     0 >= 0 for a task with only failed/unverdicted iterations (codex review
     finding: the CLI-only check let a lib caller bypass the fail-closed floor)."""
     with _TmpStore():
-        _stats.record_run(task_code=TASK, mode="review", models=["codex"],
-                          duration_seconds=1.0, ok_count=0, fail_count=1, passed=False)
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+        )
         for min_iter, min_models in ((0, 1), (1, 0), (-1, 1), (1, -1)):
             result = _stats.quorum_check(TASK, min_iter=min_iter, min_models=min_models)
             assert result["passed"] is False, (min_iter, min_models, result)
@@ -1485,7 +1716,9 @@ def test_cli_check_custom_thresholds():
         )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
-            rc = _cli.main(["task", TASK, "--check", "--min-iter", "1", "--min-models", "2"])
+            rc = _cli.main(
+                ["task", TASK, "--check", "--min-iter", "1", "--min-models", "2"]
+            )
         assert rc == 0, rc
         assert "review bar met" in out.getvalue()
 
@@ -1654,7 +1887,8 @@ if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             try:
-                fn()
+                with identity_provider_chain():
+                    fn()
                 print(f"PASS {name}")
             except _Skip as exc:
                 skipped += 1
@@ -1665,5 +1899,7 @@ if __name__ == "__main__":
             except Exception as exc:  # noqa: BLE001
                 failures += 1
                 print(f"ERROR {name}: {type(exc).__name__}: {exc}")
-    print(f"\n{'FAILED' if failures else 'OK'}: {failures} failure(s), {skipped} skipped")
+    print(
+        f"\n{'FAILED' if failures else 'OK'}: {failures} failure(s), {skipped} skipped"
+    )
     sys.exit(1 if failures else 0)

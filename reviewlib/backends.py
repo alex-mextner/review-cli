@@ -2545,43 +2545,57 @@ def is_known_backend_token(token: str) -> bool:
 
 
 def backend_available(model: str) -> bool:
-    """Cheap availability probe so moderator selection never picks a dead backend."""
+    """Cheap availability probe so moderator selection never picks a dead backend.
+
+    Thin boolean over `backend_unavailable_reason` (the single source of truth for BOTH
+    "is it live?" and "why not?") so the two can never drift."""
+    return backend_unavailable_reason(model) is None
+
+
+def backend_unavailable_reason(model: str) -> str | None:
+    """Human-readable reason `model`'s backend is NOT live right now, or None if it is.
+
+    Mirrors `backend_available`'s probe exactly but surfaces WHY a seat is dead so the
+    pool-selection guard (reviewlib.pool_guard) can annotate every printed model list with
+    per-seat health (live / down + reason). Never raises: a probe RuntimeError (missing
+    key/CLI) becomes its message; unpaid/paywalled providers get their dedicated reason."""
     # TEST-ONLY: under the fake backend EVERY model is reachable (it is faked in-process,
     # no key/CLI needed). Without this the panel/moderator selection would prune the faked
     # models as "unavailable" on a host lacking the real CLIs (e.g. CI), defeating the e2e.
     if _fake_backend_enabled():
-        return True
+        return None
     if runtime_provider_marked_unpaid(model):
-        return False
-    if cached_payment_preflight_unavailable_reason(model) is not None:
-        return False
+        return runtime_unpaid_provider_error(model)
+    preflight = cached_payment_preflight_unavailable_reason(model)
+    if preflight is not None:
+        return preflight
     backend = resolve_backend(model)
     try:
         if backend is review_gemini:
             _gemini_key()
-            return True
+            return None
         if backend is review_zai:
             # Honor a forced mode: REVIEW_ZAI_MODE=cli makes review_zai a dead
             # backend, so it must NOT report available (resolve_backend_mode raises
-            # on the unsupported mode → caught below → False). Codex P2.
+            # on the unsupported mode → caught below → reason). Codex P2.
             resolve_backend_mode("zai", ZAI_SUPPORTED_MODES, "api")
             _zai_key()
-            return True
+            return None
         if backend is review_commandcode:
             # Same as z.ai: a forced REVIEW_COMMANDCODE_MODE=cli is unrunnable, so the
             # probe must reflect that instead of selecting a backend that only fails.
             resolve_backend_mode("commandcode", COMMANDCODE_SUPPORTED_MODES, "api")
             _commandcode_key()
-            return True
+            return None
         if backend is review_openrouter:
             # Same api-only contract: a forced REVIEW_OPENROUTER_MODE=cli is unrunnable, so
             # the probe reports unavailable rather than selecting a backend that only fails.
             resolve_backend_mode("openrouter", OPENROUTER_SUPPORTED_MODES, "api")
             _openrouter_key()
-            return True
+            return None
         if backend is review_codex:
             _which("codex")
-            return True
+            return None
         if backend is review_claude:
             # Mirror the dispatcher so availability matches what would actually run:
             # a forced mode is available only via that one variant; otherwise it's
@@ -2589,19 +2603,27 @@ def backend_available(model: str) -> bool:
             # binary or the legacy `claude-p` wrapper — review-cli#76).
             mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
             if mode == "api":
-                return _claude_api_available_for_model(model)
+                if _claude_api_available_for_model(model):
+                    return None
+                return "claude: no API key for this model (REVIEW_CLAUDE_MODE=api)"
             if mode == "cli":
-                return _have_claude_cli()
+                if _have_claude_cli():
+                    return None
+                return "claude: CLI not found on PATH (REVIEW_CLAUDE_MODE=cli)"
             if _have_claude_cli():
-                return True
-            return _claude_api_available_for_model(model)
+                return None
+            if _claude_api_available_for_model(model):
+                return None
+            return "claude: no `claude` CLI on PATH and no API key"
         if backend is review_opencode:
             _which("opencode")
             provider = _oc_provider_from_model(model)
             if provider is None:
                 # Bare 'opencode' (no oc: prefix) — binary check is sufficient.
-                return True
-            return _oc_provider_auth_available(provider)
-    except RuntimeError:
-        return False
-    return False
+                return None
+            if _oc_provider_auth_available(provider):
+                return None
+            return f"opencode: provider {provider!r} not authenticated (run `opencode auth login`)"
+    except RuntimeError as exc:
+        return str(exc)
+    return "backend unavailable"

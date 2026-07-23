@@ -25,7 +25,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
+
+from dataclasses import replace
 
 from ..backends import (
     ReviewResult,
@@ -33,6 +35,7 @@ from ..backends import (
     call_backend,
     resolve_backend,
     review_with_images,
+    runtime_provider_marked_unpaid,
 )
 from ..config import (
     DEFAULT_POOL_SIZE,
@@ -45,6 +48,7 @@ from ..panel import (
     FailoverOutcome,
     _tally_result,
     format_result,
+    result_is_usable,
     run_board_with_failover,
 )
 from ..process import _run, git_repo_env
@@ -73,6 +77,90 @@ EXIT_COMMIT_FAILED = 12
 
 if TYPE_CHECKING:
     from ..config import EffortOverride
+
+
+def _flat_seat_with_provider_failover(
+    model: str, dispatch: Callable[[str], ReviewResult]
+) -> ReviewResult:
+    """The flat `-m` path's per-seat runner: SAME provider-failover cascade as the board
+    path (reviewlib.panel's `_seat`), applied to a single flat seat.
+
+    Each provider in `model`'s chain first gets the in-seat transient retry
+    (`run_seat_with_retry`); a still-unusable result FAILS OVER to the chain's next provider,
+    continuing the review — the seat only reports failure once every provider is exhausted.
+    The provider that produces a usable verdict is cached as last-working (tried first next
+    run); a total failure rotates the cache. Returned results always carry `model` (the
+    caller-facing name), never the concrete provider spelling, so callers keying results by
+    the ORIGINAL requested model (as `mode_review`'s flat path does) still find them.
+
+    `dispatch` is called with the CONCRETE provider spelling for each attempt (not the
+    original `model`), so a per-provider `--effort <route>=<level>` override
+    (`_seat_effort`/`EffortOverride.effort_for`, keyed on the backend ROUTE) resolves against
+    whichever provider is ACTUALLY running at that attempt — e.g. after `zai:glm-5.2` fails
+    over to `oc:zai/glm-5.2`, an `--effort opencode=high` override applies (the seat now
+    genuinely runs the opencode route) while a `--effort zai=high` override no longer does.
+    This is intentional (raised as a 'please confirm' item on review of #157): a route-keyed
+    override exists to size whichever backend executes, not the originally-requested route.
+    See test_flat_failover_effort_follows_the_actually_dispatched_provider_route.
+
+    `dispatch` is wrapped per-attempt so a RAISE (not just a nonzero `ReviewResult`) from
+    one provider still fails over to the next, instead of aborting the whole seat and
+    skipping the rest of the chain. The board path gets this for free because `run_panel`'s
+    `_run_job` already catches every exception and normalizes it to a failed `ReviewResult`
+    before its provider-failover loop (`panel._seat`) ever sees it; the flat path's
+    `dispatch` has no such wrapper, so this cascade must do it itself (codex review of
+    #157). See test_flat_m_failover_survives_a_provider_that_raises_instead_of_returning.
+
+    The last-working-cache WRITE (`remember_working_provider`/`forget_working_provider`) is
+    gated the SAME way `provider_chain`'s cache-reorder READ is
+    (`is_default_provider_selection`): an explicit alternate pin (`-m
+    commandcode:zai-org/GLM-5.2`) succeeding/failing must not train/clear the shared
+    logical-key cache entry a later BARE alias request (`-m glm52`) reads (review of #157:
+    'cache write isn't gated the way the read is')."""
+    from ..provider_failover import (
+        forget_working_provider,
+        is_default_provider_selection,
+        provider_chain,
+        remember_working_provider,
+    )
+
+    def _safe_dispatch(provider_model: str) -> ReviewResult:
+        try:
+            return dispatch(provider_model)
+        except Exception as exc:  # noqa: BLE001 - normalize so failover can continue
+            return ReviewResult(
+                model=provider_model,
+                command="internal",
+                returncode=127,
+                stdout="",
+                stderr=str(exc),
+            )
+
+    chain = provider_chain(
+        model, available=backend_available, unpaid=runtime_provider_marked_unpaid
+    )
+    cache_eligible = len(chain) > 1 and is_default_provider_selection(model)
+    last: ReviewResult | None = None
+    for idx, provider_model in enumerate(chain):
+        result = run_seat_with_retry(
+            model, lambda pm=provider_model: _safe_dispatch(pm)
+        )
+        if result_is_usable(result):
+            if cache_eligible:
+                remember_working_provider(model, provider_model)
+            return replace(result, model=model)
+        last = result
+        if idx + 1 < len(chain):
+            print(
+                f"[review-cli] seat {model}: provider {provider_model} failed — "
+                f"switching to {chain[idx + 1]} (review continues)",
+                file=sys.stderr,
+                flush=True,
+            )
+    if cache_eligible:
+        forget_working_provider(model)
+    final = last if last is not None else _safe_dispatch(model)
+    return replace(final, model=model)
 
 
 def mode_review(
@@ -129,12 +217,12 @@ def mode_review(
             commit,
         )
 
-    # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets in-seat
-    # retry on a transient failure (`--retry` / $REVIEW_RETRY_COUNT) — not just the board path.
-    # Each seat's per-attempt dispatch goes through `resolve_backend` (kept as THIS module's
-    # name so existing tests that stub `review.resolve_backend` still drive the fakes), wrapped
-    # in `run_seat_with_retry` which retries the same seat on a transient class and returns the
-    # final outcome. The per-call run-stats tally records that final outcome once per seat.
+    # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets BOTH
+    # in-seat retry on a transient failure (`--retry` / $REVIEW_RETRY_COUNT) AND provider
+    # failover (reviewlib.provider_failover) — not just the board path (codex P2 on
+    # review-cli#157: "Apply provider failover to flat -m reviews"). Each provider first gets
+    # the same-provider retry; a still-unusable result switches this SAME model to its NEXT
+    # provider, so the seat only fails once every provider is exhausted.
     results: list[ReviewResult] = []
 
     def _seat_effort(model: str) -> str | None:
@@ -159,11 +247,13 @@ def mode_review(
             return backend(model, prompt, diff, cwd, timeout)
         return call_backend(backend, model, prompt, diff, cwd, timeout, effort=effort)
 
-    def _run_seat_with_retry(model: str) -> ReviewResult:
-        return run_seat_with_retry(model, lambda: _dispatch(model))
+    def _run_seat_with_failover(model: str) -> ReviewResult:
+        return _flat_seat_with_provider_failover(model, _dispatch)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
-        futures = {pool.submit(_run_seat_with_retry, model): model for model in models}
+        futures = {
+            pool.submit(_run_seat_with_failover, model): model for model in models
+        }
         for future in concurrent.futures.as_completed(futures):
             model = futures[future]
             try:
@@ -616,9 +706,22 @@ def _mode_review_board(
     if exact_board:
         pool, reserve = list(board), []
     else:
-        pool, reserve = split_pool_reserve(
-            board, pool_size, lambda r: backend_available(r.model)
-        )
+        # Chain-aware, matching the pool guard (cli._chain_aware_available) — a raw
+        # `backend_available` here would silently shrink the pool the guard just approved:
+        # a seat whose head provider is down but has a live failover alternate is REAL live
+        # (provider_chain would route around it at dispatch time), so the startup split must
+        # agree (codex P1 on review of #157: 'the chain-aware guard approves seats that
+        # board dispatch still removes').
+        from ..provider_failover import any_provider_available
+
+        def _chain_aware_available(r: BoardReviewer) -> bool:
+            return any_provider_available(
+                r.model,
+                available=backend_available,
+                unpaid=runtime_provider_marked_unpaid,
+            )
+
+        pool, reserve = split_pool_reserve(board, pool_size, _chain_aware_available)
     if not pool:
         print(
             "[review-cli] board: no reviewers are available — configure at least one "

@@ -29,22 +29,24 @@ REPO = Path(__file__).resolve().parent.parent
 REVIEW = str(REPO / "bin" / "review")
 _SMOKE_HOME: str | None = None
 _GIT_UNAVAILABLE_REASON: str | None | bool = None
-_GIT_REQUIRED_UNIT_FILES = frozenset({
-    "test_cwd.py",
-    "test_dashboard.py",
-    "test_deploy_sh.py",
-    "test_inseat_retry.py",
-    "test_install_state.py",
-    "test_no_git_repo.py",
-    "test_opencode_realrepo.py",
-    "test_output_flag.py",
-    "test_qa_executor.py",
-    "test_qa_mode.py",
-    "test_review_marker.py",
-    "test_review_commit_checkpoint.py",
-    "test_run_stats.py",
-    "test_staged_diff_honors_c_repo.py",
-})
+_GIT_REQUIRED_UNIT_FILES = frozenset(
+    {
+        "test_cwd.py",
+        "test_dashboard.py",
+        "test_deploy_sh.py",
+        "test_inseat_retry.py",
+        "test_install_state.py",
+        "test_no_git_repo.py",
+        "test_opencode_realrepo.py",
+        "test_output_flag.py",
+        "test_qa_executor.py",
+        "test_qa_mode.py",
+        "test_review_marker.py",
+        "test_review_commit_checkpoint.py",
+        "test_run_stats.py",
+        "test_staged_diff_honors_c_repo.py",
+    }
+)
 
 
 def _redirect_run_stats() -> None:
@@ -661,6 +663,15 @@ _UNIT_FILES = [
     ("test_provider_keys.py", {}),
     ("test_reviewer_board.py", {}),
     ("test_effort_run_flag.py", {}),
+    # Pool/model-selection foolproofing (the pre-dispatch guard that turns a non-convergent
+    # -m/--pool selection into an actionable proposal or a targeted per-provider error). Pure
+    # logic, availability+reason injected — no backend, no network.
+    ("test_pool_guard.py", {}),
+    # The guard's liveness probe must be provider-failover-chain-aware, not just the
+    # requested spelling (review of #157). Offline — backends.backend_available /
+    # .backend_unavailable_reason / .runtime_provider_marked_unpaid are patched with manual
+    # save/restore; no real backend/network.
+    ("test_pool_guard_failover_wiring.py", {}),
     # Capability-aware seat resolution from the shared models.yaml manifest (rig-cli#8 consumer
     # side). All offline — writes a fixture manifest to a temp file + points $REVIEW_MODELS_MANIFEST
     # at it; no network, no real agent-tools checkout, no model call.
@@ -672,6 +683,10 @@ _UNIT_FILES = [
     # EXIT_COMMIT_FAILED when the commit subprocess itself (e.g. a rejecting hook) fails.
     ("test_review_commit_checkpoint.py", {}),
     ("test_failover_pool.py", {}),
+    # Provider-failover: the per-model provider chain + last-working cache + the MID-REVIEW
+    # switchover (provider A fails on the call, the model completes via B, board not degraded).
+    # Offline — availability/unpaid injected, cache is a throwaway temp file.
+    ("test_provider_failover.py", {}),
     # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
     # give it a FRESH temp log dir like the other log-touching tests (review-cli#65).
     ("test_concurrency_cap.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
