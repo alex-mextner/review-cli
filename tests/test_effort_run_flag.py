@@ -426,6 +426,7 @@ def test_every_real_backend_accepts_effort():
         "gemini",
         "oc:zai/glm-5",
         "opencode",
+        "omp:kimi-code/k3",
         "commandcode:deepseek",
         "zai:glm-5.2",
         "openrouter:anthropic/claude",
@@ -442,4 +443,5 @@ def test_provider_route_name_maps_seats_to_routes():
     assert backends.provider_route_name("gemini") == "gemini"
     assert backends.provider_route_name("oc:zai/glm-5") == "opencode"
     assert backends.provider_route_name("opencode") == "opencode"
+    assert backends.provider_route_name("omp:kimi-code/k3") == "omp"
     assert backends.provider_route_name("commandcode:deepseek") == "commandcode"

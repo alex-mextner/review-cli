@@ -1242,6 +1242,16 @@ def model_id_for_call(call: "CallLog") -> str:
         if m:
             return f"oc:{m.group('model')}"
         return backend
+    if backend == "omp":
+        # `omp -m <provider/model>` -> board id `omp:<provider/model>` (review_omp passes
+        # it as header_argv0) — mirrors the opencode -> `oc:` mapping above, so every omp
+        # seat gets its own health row instead of collapsing to one `omp` row (the
+        # review-cli#24 class of bug). A bare omp call with no `-m` stays the backend
+        # name so it doesn't mis-attribute to a real seat.
+        m = _OPENCODE_MODEL_RE.search(call.argv0)
+        if m:
+            return f"omp:{m.group('model')}"
+        return backend
     prefix = _BACKEND_BOARD_PREFIX.get(backend)
     if prefix is not None:
         m = _API_MODEL_RE.search(call.argv0)
