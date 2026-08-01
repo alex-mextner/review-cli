@@ -34,6 +34,7 @@ from .backends import (
     review_commandcode,
     review_gemini,
     review_opencode,
+    review_omp,
     review_openrouter,
     review_zai,
 )
@@ -124,6 +125,7 @@ __all__ = [
     "review_gemini",
     "review_claude",
     "review_opencode",
+    "review_omp",
     "review_zai",
     "review_commandcode",
     "review_openrouter",

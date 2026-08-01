@@ -2592,7 +2592,7 @@ def test_every_resolvable_backend_accepts_panel_round_no_dispatch():
     # (called by the review_claude dispatcher), never returned by resolve_backend.
     resolvable = [
         b.review_codex, b.review_gemini, b.review_zai, b.review_commandcode,
-        b.review_claude, b.review_claude_cli, b.review_opencode,
+        b.review_claude, b.review_claude_cli, b.review_opencode, b.review_omp,
     ]
     for fn in resolvable:
         params = list(inspect.signature(fn).parameters)

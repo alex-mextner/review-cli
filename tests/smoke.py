@@ -656,6 +656,11 @@ _UNIT_FILES = [
     ("test_staged_diff_honors_c_repo.py", {}),
     ("test_output_flag.py", {}),
     ("test_opencode_realrepo.py", {}),
+    # The omp (Oh My Pi) agentic read-only backend (review-cli#174): routing, the
+    # `@payloadfile` launch contract, the offline sqlite auth probe, unpaid gating,
+    # board scope label + dashboard attribution. Hermetic — fake _which/_run_streamed
+    # and a throwaway OMP_AUTH_DB; no real omp binary, no network.
+    ("test_omp_backend.py", {}),
     ("test_readonly_agent.py", {}),
     ("test_specweb.py", {}),
     ("test_specweb_daemon.py", {}),

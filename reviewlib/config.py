@@ -419,7 +419,7 @@ def _effort_provider_key(model_or_provider: str) -> str:
     Reuses `backends.provider_route_name` (the SAME resolution `review` uses to pick a
     seat's backend) so both a `--effort <provider>=<level>` token and a seat's model id
     collapse to the same route name — `codex`, `claude`, `opencode` (incl. every `oc:`/
-    unknown seat), `gemini`, `commandcode`, `zai`, `openrouter`. Imported lazily to keep
+    unknown seat), `omp`, `gemini`, `commandcode`, `zai`, `openrouter`. Imported lazily to keep
     `config` import-light and cycle-free (backends never imports config)."""
     from . import backends
 

@@ -570,6 +570,122 @@ def review_opencode(
     return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
+# Oh My Pi (omp) — agentic read-only seat (review-cli#174).
+#
+# TRANSPORT: omp does NOT read the prompt from stdin (an empty-message error), and passing
+# a large prompt+diff as an argv message would hit the same ~1 MB ARG_MAX ceiling opencode
+# has. omp message args support `@file` prefixing ("prefix files with @"), so the payload
+# is written to a private temp dir (NEVER inside the reviewed repo) and passed as
+# `@<path>`, which dodges ARG_MAX entirely (verified live against omp v17).
+#
+# READ-ONLY CAGE — three layers, each VERIFIED live against omp v17.1.8 (review of #174):
+#   1. `--tools read,grep,glob` restricts the built-in tool set to the read-only subset
+#      (no bash/edit/write — asked to run a shell command, the caged seat answers it has
+#      no bash tool). `--no-extensions` + `--no-skills` + `--no-session` keep the run
+#      free of discovered extensions/skills and ephemeral.
+#   2. NEUTRAL CWD + `--add-dir <repo>`: omp discovers and EXECUTES project-shipped code
+#      from its launch cwd — a hostile repo's `.mcp.json` spawns its MCP server command
+#      and `.omp/tools/*.js` is imported at startup, BOTH despite layer 1 (verified:
+#      marker files were created). Neither has a config kill switch for the `.omp/tools`
+#      walk. So omp is launched from a fresh empty temp dir (no repo root above it, so no
+#      project discovery), and the reviewed repo is mounted read-only as a workspace via
+#      `--add-dir` — the read/grep/glob tools still open any project file (verified), but
+#      nothing in the repo is ever executed (verified: no markers).
+#   3. A `--config` overlay disables `fetch` (omp's read tool accepts https URLs, an
+#      outbound exfiltration channel for a prompt-injected seat — verified; with
+#      `fetch.enabled: false` the same URL read fails) and `mcp.enableProjectConfig`
+#      (belt-and-braces behind layer 2, in case discovery ever scans `--add-dir` roots).
+#
+# SCOPE / LIMITATION: the repo's rules/AGENTS.md are still readable prompt CONTEXT (as
+# with codex) — the cage bounds what the seat can DO (read-only local tools, no egress),
+# not what text it is shown; a hostile repo can attempt prompt injection via file
+# contents, same as any agentic reviewer. The model string after `omp:` is passed to
+# omp's `--model` fuzzy selector verbatim (`omp:kimi-code/k3` -> `--model kimi-code/k3`).
+_OMP_READONLY_TOOLS = "read,grep,glob"
+
+# The per-run `--config` overlay carrying cage layer 3 (see the comment block above).
+_OMP_CAGE_OVERLAY = (
+    "# review-cli omp read-only seat (review-cli#174): no outbound network via the read\n"
+    "# tool's URL path (fetch backs it), and never execute project-shipped MCP config.\n"
+    "fetch:\n"
+    "  enabled: false\n"
+    "mcp:\n"
+    "  enableProjectConfig: false\n"
+)
+
+OMP_SUPPORTED_MODES = ("cli",)  # CLI-only — no omp REST transport exists.
+
+
+def review_omp(
+    model: str, prompt: str, diff: str, cwd: Path, timeout: int, round_no: int = 0,
+    effort: str | None = None,
+) -> ReviewResult:
+    omp_model = model.split(":", 1)[1] if ":" in model else None
+    command = (
+        f"omp -p --no-session --tools {_OMP_READONLY_TOOLS}"
+        + (f" --model {omp_model}" if omp_model else "")
+        + " @<payloadfile>"
+    )
+    unpaid = unpaid_provider_result(model, backend="omp", command=command, round_no=round_no)
+    if unpaid is not None:
+        return unpaid
+    # CLI-only: a forced REVIEW_OMP_MODE=api is a config error — surface it as a
+    # dead-backend result (mirrors review_zai's forced-mode path), never silently run.
+    try:
+        resolve_backend_mode("omp", OMP_SUPPORTED_MODES, "cli")
+    except RuntimeError as exc:
+        _emit_rest_log("omp", command, round_no=round_no, returncode=1, stdout="", stderr=str(exc))
+        return ReviewResult(model=model, command=command, returncode=1, stdout="", stderr=str(exc))
+    # AGENTIC, read-only: omp can READ any project file (mounted via `--add-dir`) — not
+    # just the diff embedded in the prompt — while the three-layer cage (see the module
+    # comment above) makes mutation, exec, and egress impossible.
+    message = (
+        f"{prompt}\n\nYou are reviewing a real git repository mounted at `{cwd}` in "
+        "READ-ONLY mode: read any project file under that directory with your read "
+        "tools, but do not edit, write, run commands, or access the network. "
+        + (
+            f"Focus on this diff:\n\n```diff\n{diff}\n```"
+            # `not diff.isspace()` tests emptiness WITHOUT the full-size copy
+            # `.strip()` would allocate just for truthiness.
+            if diff and not diff.isspace()
+            else "Answer based on the repository and the prompt."
+        )
+    )
+    argv = [
+        _which("omp"),
+        "-p",
+        "--no-session",
+        "--no-extensions",
+        "--no-skills",
+        "--tools",
+        _OMP_READONLY_TOOLS,
+        "--add-dir",
+        str(cwd),
+    ]
+    if omp_model:
+        argv += ["--model", omp_model]
+    if effort:
+        # review's effort vocabulary (minimal/low/medium/high/xhigh/max) is a strict
+        # subset of omp's `--thinking` levels (those plus off/auto) — pass through.
+        argv += ["--thinking", effort]
+    # The sandbox dir is the NEUTRAL launch cwd (cage layer 2): a fresh empty temp dir
+    # with no repo root above it, so omp's project discovery (`.mcp.json`, `.omp/tools`,
+    # `.claude/tools`) finds nothing to execute. It also holds the payload + overlay.
+    with tempfile.TemporaryDirectory(prefix="review-cli-omp-") as sandbox:
+        box = Path(sandbox)
+        payload = box / "payload.md"
+        payload.write_text(message, encoding="utf-8")
+        cage = box / "cage.yml"
+        cage.write_text(_OMP_CAGE_OVERLAY, encoding="utf-8")
+        argv += ["--config", str(cage), f"@{payload}"]
+        proc = _run_streamed(
+            argv, cwd=box, timeout=timeout, backend="omp", round_no=round_no,
+            announce=_ANNOUNCE_LOGS,
+            header_argv0=f"omp -m {_safe_log_header(omp_model)}" if omp_model else None,
+        )
+    return ReviewResult(model=model, command=command, returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+
 def _read_env_key(env_file: Path, var: str = "GEMINI_API_KEY") -> str | None:
     try:
         for line in env_file.read_text(encoding="utf-8").splitlines():
@@ -1913,6 +2029,12 @@ def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
     # either, so the order relative to the opencode catch-all below is irrelevant.
     if lowered == "openrouter" or lowered.startswith("openrouter:"):
         return review_openrouter
+    # Oh My Pi (omp) — agentic read-only CLI seat (review-cli#174). `omp` plus
+    # `omp:<provider>/<model>` (e.g. omp:kimi-code/k3); the selector after `omp:` goes
+    # to omp's `--model` fuzzy matcher verbatim. `omp:` shares no prefix with `oc:`/
+    # `opencode:`, but an explicit branch keeps the seat off the catch-all fallthrough.
+    if lowered == "omp" or lowered.startswith("omp:"):
+        return review_omp
     # fable IS claude-p. Route any fable form to review_claude defensively, so an
     # unexpanded `fable`/`fable5` can NEVER fall through to the review_opencode
     # default (which would hit fireworks — the wrong provider entirely).
@@ -2439,6 +2561,114 @@ def _oc_provider_auth_available(provider: str) -> bool:
     return provider not in _OC_PROVIDER_ENV_VARS
 
 
+# Env var that overrides the omp auth db path in tests (mirrors OC_AUTH_FILE for the
+# opencode probe), so the availability tests never touch the real ~/.omp/agent/agent.db.
+_OMP_AUTH_DB_ENV = "OMP_AUTH_DB"
+
+
+def _omp_auth_db() -> Path:
+    """The auth db omp ITSELF would use for this process (verified against omp v17):
+    `PI_CODING_AGENT_DIR` replaces the agent storage dir outright; else `OMP_PROFILE`
+    (= `--profile`) isolates state under ~/.omp/profiles/<name>/agent; else the default
+    ~/.omp/agent. Probing any OTHER db would misreport a runnable authenticated CLI as
+    unauthenticated (codex review of #174). The OMP_AUTH_DB test override wins first."""
+    override = os.environ.get(_OMP_AUTH_DB_ENV, "").strip()
+    if override:
+        return Path(override)
+    agent_dir = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
+    if agent_dir:
+        return Path(agent_dir) / "agent.db"
+    profile = os.environ.get("OMP_PROFILE", "").strip()
+    if profile:
+        return Path.home() / ".omp" / "profiles" / profile / "agent" / "agent.db"
+    return Path.home() / ".omp" / "agent" / "agent.db"
+
+
+def _omp_provider_from_model(model: str) -> str | None:
+    """Extract the provider an `omp:` seat authenticates against.
+
+    Returns None for a bare 'omp' (binary check + any usable credential is enough).
+    'omp:kimi-code/k3' → 'kimi-code'; 'omp:openai/gpt-5.5' → 'openai'.
+    """
+    lowered = model.lower()
+    if not lowered.startswith("omp:"):
+        return None
+    selector = lowered[len("omp:"):]
+    return selector.split("/", 1)[0] or None
+
+
+# In-process memo for the omp auth probe (glm review of #174): `--show-board` and the
+# pool guard probe EVERY omp seat, and a naive probe re-opens the same sqlite db per
+# seat. The memo is keyed on the db's (main, -wal) mtimes — WAL writes (a mid-process
+# `omp` login/logout) may not touch the main db file — so a credential change is still
+# picked up on the very next probe, and one stamp miss hydrates ALL live providers in a
+# single read, so N omp seats genuinely cost ONE db read per board pass. A FAILED probe
+# (locked/corrupt db) is NOT cached — the next probe retries instead of serving a stale
+# "unauthenticated" until the db file happens to change.
+_OMP_AUTH_CACHE: dict[str, tuple[tuple[int, int], frozenset[str]]] = {}
+
+
+def _omp_db_stamp(db: Path) -> tuple[int, int] | None:
+    """The (main, -wal) mtime pair for the auth db, or None when the db does not exist."""
+    try:
+        main = db.stat().st_mtime_ns
+    except OSError:
+        return None
+    try:
+        wal = db.with_name(db.name + "-wal").stat().st_mtime_ns
+    except OSError:
+        wal = 0
+    return (main, wal)
+
+
+def _omp_auth_probe(db: Path) -> frozenset[str] | None:
+    """One OFFLINE read of omp's auth db: the set of providers with a NON-disabled
+    credential row (`auth_credentials.disabled_cause` marks dead ones), or None when the
+    probe itself failed (missing/corrupt db, schema drift, a locked file, a python build
+    without sqlite3) — callers treat None as 'unauthenticated' but must NOT cache it.
+    omp keeps OAuth/API credentials in `auth_credentials` keyed by `provider`. The db is
+    opened READ-ONLY via a file: URI so the probe can never create or mutate it. The
+    imports stay inside the try (lazy AND failure-proof; repeat imports are a
+    sys.modules lookup, so this costs nothing per probe)."""
+    try:
+        import sqlite3  # noqa: PLC0415
+        from urllib.parse import quote  # noqa: PLC0415
+
+        # Read-only offline probe: a long lock wait is pointless here, and a short one
+        # bounds the worst case to N seats x 0.5s on a contended db (glm review of #174).
+        conn = sqlite3.connect(f"file:{quote(str(db))}?mode=ro", uri=True, timeout=0.5)
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT provider FROM auth_credentials WHERE disabled_cause IS NULL"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — any sqlite/schema failure reads as unauthenticated
+        return None
+    return frozenset(row[0] for row in rows if isinstance(row[0], str))
+
+
+def _omp_auth_available(provider: str | None) -> bool:
+    """Cheap OFFLINE omp auth probe: True iff the seat's provider has a usable
+    credential (or ANY provider does, for a bare `omp` seat). One stamp miss hydrates
+    every live provider in a single db read (`_OMP_AUTH_CACHE`), so probing N omp seats
+    costs one db read per board pass; see `_omp_auth_probe` for the read itself."""
+    db = _omp_auth_db()
+    stamp = _omp_db_stamp(db)
+    if stamp is None:
+        return False
+    key = str(db)
+    entry = _OMP_AUTH_CACHE.get(key)
+    if entry is None or entry[0] != stamp:
+        live = _omp_auth_probe(db)
+        if live is None:
+            return False  # probe failure — deliberately NOT cached (retry next time)
+        entry = (stamp, live)
+        _OMP_AUTH_CACHE[key] = entry
+    providers = entry[1]
+    return bool(providers) if provider is None else provider in providers
+
+
 def _oc_provider_from_model(model: str) -> str | None:
     """Extract the underlying provider from an oc:/opencode: model string.
 
@@ -2525,6 +2755,7 @@ def provider_route_name(model: str) -> str:
         review_gemini: "gemini",
         review_codex: "codex",
         review_opencode: "opencode",
+        review_omp: "omp",
         review_commandcode: "commandcode",
         review_zai: "zai",
         review_openrouter: "openrouter",
@@ -2624,6 +2855,21 @@ def backend_unavailable_reason(model: str) -> str | None:
             if _oc_provider_auth_available(provider):
                 return None
             return f"opencode: provider {provider!r} not authenticated (run `opencode auth login`)"
+        if backend is review_omp:
+            # Same contract as z.ai/commandcode: a forced REVIEW_OMP_MODE=api is
+            # unrunnable, so the probe reports unavailable instead of selecting a
+            # backend that only fails (the raise is caught below → reason).
+            resolve_backend_mode("omp", OMP_SUPPORTED_MODES, "cli")
+            _which("omp")
+            provider = _omp_provider_from_model(model)
+            if _omp_auth_available(provider):
+                return None
+            if provider is None:
+                return "omp: no usable credentials in ~/.omp/agent/agent.db (run `omp setup`)"
+            return (
+                f"omp: provider {provider!r} not authenticated "
+                f"(run `omp setup`; check `omp token {provider}`)"
+            )
     except RuntimeError as exc:
         return str(exc)
     return "backend unavailable"

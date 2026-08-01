@@ -5,6 +5,24 @@ semantic versioning.
 
 ## Unreleased
 
+- **New `omp:` backend — Oh My Pi agentic read-only seats (review-cli#174).** A board or
+  `-m` seat spelled `omp:<provider>/<model>` (e.g. `omp:kimi-code/k3`) now routes to a
+  first-class omp backend instead of falling through to the opencode catch-all. The seat
+  runs `omp -p --no-session --no-extensions --no-skills --tools read,grep,glob --add-dir
+  <repo> --config <cage-overlay>` from a NEUTRAL temp cwd — agentic (it can read any
+  project file) and caged read-only with no egress: omp executes project-shipped
+  `.mcp.json`/`.omp/tools` from its launch cwd and its read tool fetches URLs (both
+  verified against omp v17), so the launch dir is an empty temp dir, the repo is mounted
+  read-only via `--add-dir`, and a per-run overlay disables `fetch` + project MCP. The
+  prompt+diff travels as an `@<tempfile>` message arg — omp does not read prompts from
+  stdin, and the `@file` transport dodges the ~1 MB ARG_MAX ceiling argv-passing would
+  hit. `--effort` maps to omp's `--thinking` flag; `REVIEW_OMP_MODE=api` fails loudly
+  (CLI-only). Availability is probed offline (binary on PATH + a non-disabled credential
+  row for the seat's provider in omp's auth db, honoring `PI_CODING_AGENT_DIR` /
+  `OMP_PROFILE`, memoized per db mtime), the seat is `unpaid_providers:`-gateable as
+  provider `omp`, `--show-board` labels it `agentic`, and the dashboard attributes
+  `omp -m <sel>` calls to the `omp:<sel>` seat (mirroring the `oc:` mapping,
+  review-cli#24).
 - **`review qa` now honors the run-scoped `--effort` flag (review-cli#127).** The `--effort`
   flag (#150) lifted every review-panel seat's reasoning effort, but the qa write/exec tester —
   a single seat that rides `claude-p`/`codex`, not the panel — silently ignored it. The resolved

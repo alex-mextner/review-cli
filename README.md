@@ -898,12 +898,13 @@ Each backend runs as a **`cli`** subprocess, a **`api`** REST call, or both:
 | `commandcode:<model>` / `cc` | api | Command Code OpenAI-compatible Provider API — needs `COMMANDCODE_API_KEY` |
 | `openrouter:<model>` / `openrouter` | api | OpenRouter OpenAI-compatible aggregator (400+ models) — needs `OPENROUTER_API_KEY` (bare `openrouter` → `openrouter/auto`) |
 | `oc:<model>` / `opencode:<model>` | cli | `opencode run --agent read-only-reviewer --dir <repo>` (reads the real repo, read-only) |
+| `omp:<provider>/<model>` / `omp` | cli | `omp -p --no-session --tools read,grep,glob --add-dir <repo> @<payloadfile>` (reads the real repo, read-only) |
 | anything else | cli | Treated as an opencode model id |
 
 **Transport split.** Each backend declares which transports it supports — `cli`, `api`,
 or both — shown in the *Transport* column above. `REVIEW_<NAME>_MODE` forces one; forcing
 a mode a backend doesn't support is a hard error, never a silent fall-through. (Today:
-codex/opencode are cli-only, gemini/z.ai/commandcode/openrouter are api-only, claude does
+codex/opencode/omp are cli-only, gemini/z.ai/commandcode/openrouter are api-only, claude does
 both and auto-picks — CLI if the binary is present, API when it isn't and a key is set.)
 
 The opencode backend is **agentic and read-only**: it runs in the **real `-C`
@@ -920,6 +921,29 @@ It falls back to an isolated temp dir (diff-only) in two cases:
   re-enable `write`/`bash` (verified: project config wins, and no opencode env flag
   suppresses it), so to keep the sandbox trustworthy on a potentially adversarial repo,
   review refuses to run agentically there and reviews the diff in a clean dir instead.
+
+The **omp (Oh My Pi) backend** (`omp:<provider>/<model>`, e.g. `omp:kimi-code/k3`) is
+likewise **agentic and read-only**: it reads the real `-C` repository with the tool
+set restricted to `read,grep,glob` (`--tools`), extension/skill discovery disabled
+(`--no-extensions --no-skills`), and no session persisted (`--no-session`). Two
+hardened boundaries, both verified live against omp v17 (review of review-cli#174):
+
+- omp **executes project-shipped code from its launch cwd** (a repo's `.mcp.json`
+  spawns its MCP server command; `.omp/tools/*.js` is imported at startup), so omp is
+  launched from a **neutral empty temp dir** and the repo is mounted read-only as a
+  workspace via `--add-dir` — every project file stays readable, nothing in the repo
+  is ever executed.
+- omp's `read` tool accepts **https URLs**, an outbound exfiltration channel for a
+  prompt-injected seat, so a per-run `--config` overlay disables `fetch` (which backs
+  the URL path) and project MCP config.
+
+The prompt+diff is handed over as an `@<tempfile>` message arg — omp does not read
+prompts from stdin, and the `@file` transport dodges the ~1 MB ARG_MAX ceiling
+argv-passing would hit. The selector after `omp:` goes to omp's `--model` fuzzy
+matcher verbatim. Availability is probed offline: the `omp` binary on PATH plus a
+non-disabled credential row for the seat's provider in omp's own auth db
+(`~/.omp/agent/agent.db`, honoring `PI_CODING_AGENT_DIR` / `OMP_PROFILE`) —
+authenticated via omp's own setup (`omp setup`), never a review-cli key.
 
 > **Note on commandcode / z.ai (review-cli#24).** These were historically kept as raw
 > diff-only `api` backends — opencode's `@ai-sdk/openai-compatible` adapter did not
@@ -1251,6 +1275,11 @@ Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`
 
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
 Codex is the #6 board seat (GPT-5.5 IS codex — the agentic CLI route, free).
+
+**omp (Oh My Pi) seats (`omp:<provider>/<model>`):** must be on PATH and authenticated
+via omp's own setup (`omp setup`; `omp token <provider>` shows the stored credential).
+The startup probe reads omp's auth db read-only and skips the seat (filling from the
+next reserve) when the binary or a usable credential for the seat's provider is missing.
 
 **Kimi / Qwen / DeepSeek / GLM board reviewers (agentic, via opencode):** since
 review-cli#24 these default board seats are `oc:commandcode/…` / `oc:zai/glm-5.2` —

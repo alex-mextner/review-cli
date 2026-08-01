@@ -2359,7 +2359,7 @@ def _add_global_options(
             "A bare level (minimal/low/medium/high/xhigh/max) applies to every seat; "
             "PROVIDER=LEVEL (e.g. codex=high, opencode=max) overrides one backend route. "
             "Repeat or comma-separate; per-provider wins over the global level. "
-            "Reaches the codex, claude, and opencode reasoning-effort levers plus the "
+            "Reaches the codex, claude, opencode, and omp reasoning-effort levers plus the "
             "screenshot vision call."
         ),
     )
@@ -2677,7 +2677,7 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
       window. Values under 60s stay exact for tests/probes; otherwise the normal 20m floor
       applies unless REVIEW_IDLE_TIMEOUT_SECONDS is set. QA and vision calls keep wall-clock
       timeout caps.
-  codex / opencode carry their own CLI auth (no key here).
+  codex / opencode / omp carry their own CLI auth (no key here).
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
 """
@@ -3875,6 +3875,10 @@ def _seat_reads_repo(model: str, cwd_is_repo: bool) -> bool:
     backend = backends.resolve_backend(model)
     if backend is backends.review_codex:
         return True
+    if backend is backends.review_omp:
+        # omp runs read-only (`--tools read,grep,glob`) in the real cwd like codex —
+        # agentic regardless of whether `-C` is a git repo.
+        return True
     if backend is backends.review_opencode:
         return cwd_is_repo
     if backend is backends.review_claude:
@@ -4009,7 +4013,7 @@ def _show_board(
             f"{reviewer.model}  [{status}]  ({scope})  effort={effort}"
         )
     print(
-        "\nScope: `agentic` seats (codex / opencode / claude-CLI) run read-only in the "
+        "\nScope: `agentic` seats (codex / opencode / omp / claude-CLI) run read-only in the "
         "real repo and can read any project file; `diff-only` seats (gemini / z.ai / "
         "commandcode / claude-API) are stateless HTTP calls that see only the diff."
     )
