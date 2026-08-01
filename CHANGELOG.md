@@ -9,11 +9,16 @@ semantic versioning.
   `-m` seat spelled `omp:<provider>/<model>` (e.g. `omp:kimi-code/k3`) now routes to a
   first-class omp backend instead of falling through to the opencode catch-all. The seat
   runs `omp -p --no-session --no-extensions --no-skills --tools read,grep,glob --add-dir
-  <repo> --config <cage-overlay>` from a NEUTRAL temp cwd — agentic (it can read any
-  project file) and caged read-only with no egress: omp executes project-shipped
-  `.mcp.json`/`.omp/tools` from its launch cwd and its read tool fetches URLs (both
-  verified against omp v17), so the launch dir is an empty temp dir, the repo is mounted
-  read-only via `--add-dir`, and a per-run overlay disables `fetch` + project MCP. The
+  `<repo> --config <cage-overlay>` from a NEUTRAL temp cwd with a SANITIZED HOME —
+  agentic (it can read any project file) and caged read-only with no egress: omp
+  executes project-shipped `.mcp.json`/`.omp/tools` from its launch cwd, mounts
+  user-scope MCP servers whose tools run arbitrary code, its read tool fetches URLs,
+  and the xd:// device transport carries write/edit/bash around `--tools` (all four
+  verified against omp v17), so the launch dir is an empty temp dir, HOME points at an
+  empty subdir (PI_CODING_AGENT_DIR keeps auth), the repo is mounted read-only via
+  `--add-dir`, and a per-run overlay disables `fetch`, `tools.xdev`, and project MCP.
+  All boundaries are covered by permanent live assertions (tests/test_omp_cage_live.py,
+  opt-in via REVIEW_OMP_CAGE_LIVE=1). The
   prompt+diff travels as an `@<tempfile>` message arg — omp does not read prompts from
   stdin, and the `@file` transport dodges the ~1 MB ARG_MAX ceiling argv-passing would
   hit. `--effort` maps to omp's `--thinking` flag; `REVIEW_OMP_MODE=api` fails loudly

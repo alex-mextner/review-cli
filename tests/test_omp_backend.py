@@ -45,12 +45,14 @@ class _Captured:
         self.payload_text: str | None = None
         self.payload_path: Path | None = None
         self.cage_text: str | None = None
+        self.env: dict | None = None
 
-    def __call__(self, argv, cwd, timeout, backend, round_no=0, announce=False, header_argv0=None):
+    def __call__(self, argv, cwd, timeout, backend, round_no=0, announce=False, header_argv0=None, env=None):
         self.argv = list(argv)
         self.cwd = Path(cwd)
         self.timeout = timeout
         self.header_argv0 = header_argv0
+        self.env = env
         at_args = [a for a in self.argv if a.startswith("@")]
         if at_args:
             self.payload_path = Path(at_args[-1][1:])
@@ -197,12 +199,23 @@ def test_omp_launches_print_ephemeral_readonly_with_at_file_payload():
         # ...with the repo mounted read-only as a workspace instead.
         assert "--add-dir" in argv, argv
         assert Path(argv[argv.index("--add-dir") + 1]) == repo, argv
+        # The seat's HOME is SANITIZED (kills user-scope MCP discovery: ~/.claude.json
+        # et al. — the MCP-exec hole), while PI_CODING_AGENT_DIR pins the REAL agent
+        # dir so provider auth still resolves; OMP_PROFILE is dropped so nothing
+        # re-derives profile paths from the fake HOME.
+        env = cap.env or {}
+        assert env.get("HOME") == str(cap.cwd / "home"), env.get("HOME")
+        assert env.get("HOME") != os.path.expanduser("~"), env.get("HOME")
+        assert env.get("PI_CODING_AGENT_DIR") == str(review_backends._omp_agent_dir()), env
+        assert "OMP_PROFILE" not in env, env
         # The neutral launch cwd (and the payload with it) is cleaned up after the run.
         assert not cap.cwd.exists(), cap.cwd
-        # The config overlay disables the read tool's URL path (fetch) and project MCP.
+        # The config overlay disables the read tool's URL path (fetch), the xd:// device
+        # transport (which carries write/edit/bash around --tools), and project MCP.
         assert "--config" in argv, argv
         cage = cap.cage_text or ""
         assert "enabled: false" in cage, cage
+        assert "xdev: false" in cage, cage
         assert "enableProjectConfig: false" in cage, cage
         # The model selector after `omp:` goes to --model verbatim.
         assert "--model" in argv, argv
@@ -491,6 +504,40 @@ def test_omp_auth_probe_hydrates_all_providers_in_one_read():
         finally:
             review_backends._omp_auth_probe = orig_probe
     assert len(calls) == 1, calls  # 4 probes, 1 db read
+
+
+def test_omp_seat_env_pins_profile_agent_dir():
+    """With OMP_PROFILE set, the seat env must pin PI_CODING_AGENT_DIR at the PROFILE's
+    agent dir (auth resolves) AND drop OMP_PROFILE itself (nothing re-derives profile
+    paths from the fake HOME) — the composition the launch-contract test doesn't set up."""
+    saved = os.environ.get("OMP_PROFILE")
+    os.environ["OMP_PROFILE"] = "work"
+    try:
+        with _capture_omp() as cap:
+            with tempfile.TemporaryDirectory() as d:
+                review_backends.review_omp("omp:kimi-code/k3", "q", "", Path(d), 10)
+            env = cap.env or {}
+            expected = str(Path.home() / ".omp" / "profiles" / "work" / "agent")
+            assert env.get("PI_CODING_AGENT_DIR") == expected, env
+            assert "OMP_PROFILE" not in env, env
+    finally:
+        if saved is None:
+            os.environ.pop("OMP_PROFILE", None)
+        else:
+            os.environ["OMP_PROFILE"] = saved
+
+
+def test_omp_cage_overlay_is_valid_yaml_with_expected_keys():
+    """The cage overlay is the security boundary's third layer — pin it as PARSED YAML
+    (a typo that still looks right in a string assert would silently drop a layer)."""
+    import yaml  # noqa: PLC0415
+
+    overlay = yaml.safe_load(review_backends._OMP_CAGE_OVERLAY)
+    assert overlay == {
+        "fetch": {"enabled": False},
+        "tools": {"xdev": False},
+        "mcp": {"enableProjectConfig": False},
+    }, overlay
 
 
 def test_omp_exported_from_facade():

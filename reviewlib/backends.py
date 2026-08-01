@@ -583,32 +583,42 @@ def review_opencode(
 #      (no bash/edit/write — asked to run a shell command, the caged seat answers it has
 #      no bash tool). `--no-extensions` + `--no-skills` + `--no-session` keep the run
 #      free of discovered extensions/skills and ephemeral.
-#   2. NEUTRAL CWD + `--add-dir <repo>`: omp discovers and EXECUTES project-shipped code
-#      from its launch cwd — a hostile repo's `.mcp.json` spawns its MCP server command
-#      and `.omp/tools/*.js` is imported at startup, BOTH despite layer 1 (verified:
-#      marker files were created). Neither has a config kill switch for the `.omp/tools`
-#      walk. So omp is launched from a fresh empty temp dir (no repo root above it, so no
-#      project discovery), and the reviewed repo is mounted read-only as a workspace via
-#      `--add-dir` — the read/grep/glob tools still open any project file (verified), but
-#      nothing in the repo is ever executed (verified: no markers).
+#   2. NEUTRAL CWD + SANITIZED HOME + `--add-dir <repo>`: omp discovers and EXECUTES
+#      project-shipped code from its launch cwd — a hostile repo's `.mcp.json` spawns its
+#      MCP server command and `.omp/tools/*.js` is imported at startup, BOTH despite
+#      layer 1 (verified: marker files were created). And user-scope MCP servers
+#      (~/.claude.json, cursor/vscode mcp.json, …) stay mounted regardless of cwd — their
+#      tools run arbitrary code (verified: node_repl executed JS inside the caged seat).
+#      So omp is launched from a fresh empty temp dir (no project discovery) with HOME
+#      pointed at an empty subdir of it (no user-scope MCP discovery), while
+#      PI_CODING_AGENT_DIR pins omp's real agent dir so provider auth still resolves
+#      (verified). The reviewed repo is mounted read-only as a workspace via `--add-dir`
+#      — the read/grep/glob tools still open any project file, but nothing in the repo
+#      and no user MCP server is ever executed.
 #   3. A `--config` overlay disables `fetch` (omp's read tool accepts https URLs, an
 #      outbound exfiltration channel for a prompt-injected seat — verified; with
-#      `fetch.enabled: false` the same URL read fails) and `mcp.enableProjectConfig`
-#      (belt-and-braces behind layer 2, in case discovery ever scans `--add-dir` roots).
+#      `fetch.enabled: false` the same URL read fails), `tools.xdev` (the `xd://` device
+#      transport CARRIES the write/edit/bash device tools around `--tools` — verified:
+#      without this a "caged" seat created files; with it the seat reports no write
+#      tool), and `mcp.enableProjectConfig` (belt-and-braces behind layer 2).
 #
-# SCOPE / LIMITATION: the repo's rules/AGENTS.md are still readable prompt CONTEXT (as
-# with codex) — the cage bounds what the seat can DO (read-only local tools, no egress),
-# not what text it is shown; a hostile repo can attempt prompt injection via file
-# contents, same as any agentic reviewer. The model string after `omp:` is passed to
-# omp's `--model` fuzzy selector verbatim (`omp:kimi-code/k3` -> `--model kimi-code/k3`).
+# SCOPE / LIMITATION: the cage bounds what the seat can DO (read-only local tools, no
+# egress, no project/user code execution) — it does NOT scope READS: the read tool opens
+# any absolute path (e.g. ~/.ssh), and file contents can carry prompt injection, same as
+# any agentic reviewer; review transcripts are the containment for that (read-only data
+# flow), not the sandbox. The model string after `omp:` is passed to omp's `--model`
+# fuzzy selector verbatim (`omp:kimi-code/k3` -> `--model kimi-code/k3`).
 _OMP_READONLY_TOOLS = "read,grep,glob"
 
 # The per-run `--config` overlay carrying cage layer 3 (see the comment block above).
 _OMP_CAGE_OVERLAY = (
     "# review-cli omp read-only seat (review-cli#174): no outbound network via the read\n"
-    "# tool's URL path (fetch backs it), and never execute project-shipped MCP config.\n"
+    "# tool's URL path (fetch backs it), no xd:// device transport (it carries\n"
+    "# write/edit/bash around --tools), and never execute project-shipped MCP config.\n"
     "fetch:\n"
     "  enabled: false\n"
+    "tools:\n"
+    "  xdev: false\n"
     "mcp:\n"
     "  enableProjectConfig: false\n"
 )
@@ -668,18 +678,36 @@ def review_omp(
         # review's effort vocabulary (minimal/low/medium/high/xhigh/max) is a strict
         # subset of omp's `--thinking` levels (those plus off/auto) — pass through.
         argv += ["--thinking", effort]
-    # The sandbox dir is the NEUTRAL launch cwd (cage layer 2): a fresh empty temp dir
-    # with no repo root above it, so omp's project discovery (`.mcp.json`, `.omp/tools`,
-    # `.claude/tools`) finds nothing to execute. It also holds the payload + overlay.
+    # The sandbox dir is the NEUTRAL launch cwd AND the seat's HOME (cage layer 2): a
+    # fresh empty temp dir with no repo root above it, so omp's project discovery
+    # (`.mcp.json`, `.omp/tools`, `.claude/tools`) finds nothing, and its user-scope MCP
+    # discovery (~/.claude.json etc.) sees an empty home. PI_CODING_AGENT_DIR pins the
+    # REAL agent dir so provider auth still resolves; OMP_PROFILE is dropped so nothing
+    # re-derives profile paths from the fake HOME (its profile-scoped settings are user
+    # workflow, not reviewer context, and the auth db is pinned explicitly). NOTE: this
+    # layer assumes omp resolves `~` via the HOME env var (not getpwuid) — verified
+    # live: with HOME redirected, the seat has no user-scope MCP tools
+    # (tests/test_omp_cage_live.py). The dir also holds payload + overlay.
     with tempfile.TemporaryDirectory(prefix="review-cli-omp-") as sandbox:
         box = Path(sandbox)
+        home = box / "home"
+        home.mkdir()
         payload = box / "payload.md"
         payload.write_text(message, encoding="utf-8")
         cage = box / "cage.yml"
         cage.write_text(_OMP_CAGE_OVERLAY, encoding="utf-8")
         argv += ["--config", str(cage), f"@{payload}"]
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("HOME", "XDG_CONFIG_HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE")
+        }
+        # Sanitized XDG_CONFIG_HOME too — user-scope discovery that keys off XDG
+        # instead of HOME must not escape the cage either (review of #174).
+        env["HOME"] = str(home)
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        env["PI_CODING_AGENT_DIR"] = str(_omp_agent_dir())
         proc = _run_streamed(
-            argv, cwd=box, timeout=timeout, backend="omp", round_no=round_no,
+            argv, cwd=box, env=env, timeout=timeout, backend="omp", round_no=round_no,
             announce=_ANNOUNCE_LOGS,
             header_argv0=f"omp -m {_safe_log_header(omp_model)}" if omp_model else None,
         )
@@ -2566,22 +2594,32 @@ def _oc_provider_auth_available(provider: str) -> bool:
 _OMP_AUTH_DB_ENV = "OMP_AUTH_DB"
 
 
+def _omp_agent_dir() -> Path:
+    """omp's agent storage dir for THIS process (verified against omp v17):
+    `PI_CODING_AGENT_DIR` replaces it outright; else `OMP_PROFILE` (= `--profile`)
+    isolates state under ~/.omp/profiles/<name>/agent; else the default ~/.omp/agent.
+    Shared by the auth probe and the seat launch — the seat runs with a SANITIZED HOME
+    and pins this explicitly so auth still resolves there."""
+    agent_dir = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
+    if agent_dir:
+        # Absolutize (after expanding any `~`): a RELATIVE override would resolve
+        # against a different cwd in the seat's sandbox than in the probe's process
+        # (review of #174).
+        return Path(os.path.abspath(os.path.expanduser(agent_dir)))
+    profile = os.environ.get("OMP_PROFILE", "").strip()
+    if profile:
+        return Path.home() / ".omp" / "profiles" / profile / "agent"
+    return Path.home() / ".omp" / "agent"
+
+
 def _omp_auth_db() -> Path:
-    """The auth db omp ITSELF would use for this process (verified against omp v17):
-    `PI_CODING_AGENT_DIR` replaces the agent storage dir outright; else `OMP_PROFILE`
-    (= `--profile`) isolates state under ~/.omp/profiles/<name>/agent; else the default
-    ~/.omp/agent. Probing any OTHER db would misreport a runnable authenticated CLI as
-    unauthenticated (codex review of #174). The OMP_AUTH_DB test override wins first."""
+    """The auth db omp ITSELF would use for this process (`_omp_agent_dir` + agent.db;
+    codex review of #174 — probing any OTHER db would misreport a runnable
+    authenticated CLI as unauthenticated). The OMP_AUTH_DB test override wins first."""
     override = os.environ.get(_OMP_AUTH_DB_ENV, "").strip()
     if override:
         return Path(override)
-    agent_dir = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
-    if agent_dir:
-        return Path(agent_dir) / "agent.db"
-    profile = os.environ.get("OMP_PROFILE", "").strip()
-    if profile:
-        return Path.home() / ".omp" / "profiles" / profile / "agent" / "agent.db"
-    return Path.home() / ".omp" / "agent" / "agent.db"
+    return _omp_agent_dir() / "agent.db"
 
 
 def _omp_provider_from_model(model: str) -> str | None:

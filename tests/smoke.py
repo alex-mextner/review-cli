@@ -661,6 +661,10 @@ _UNIT_FILES = [
     # board scope label + dashboard attribution. Hermetic — fake _which/_run_streamed
     # and a throwaway OMP_AUTH_DB; no real omp binary, no network.
     ("test_omp_backend.py", {}),
+    # The LIVE half of the omp cage: real-omp probes that the write/xdev, user-MCP,
+    # and project-config execution holes stay closed (each was verified open pre-fix).
+    # Opt-in via REVIEW_OMP_CAGE_LIVE=1 — self-skips in ~1s otherwise (CI stays hermetic).
+    ("test_omp_cage_live.py", {}),
     ("test_readonly_agent.py", {}),
     ("test_specweb.py", {}),
     ("test_specweb_daemon.py", {}),

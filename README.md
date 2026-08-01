@@ -929,13 +929,17 @@ set restricted to `read,grep,glob` (`--tools`), extension/skill discovery disabl
 hardened boundaries, both verified live against omp v17 (review of review-cli#174):
 
 - omp **executes project-shipped code from its launch cwd** (a repo's `.mcp.json`
-  spawns its MCP server command; `.omp/tools/*.js` is imported at startup), so omp is
-  launched from a **neutral empty temp dir** and the repo is mounted read-only as a
-  workspace via `--add-dir` — every project file stays readable, nothing in the repo
-  is ever executed.
-- omp's `read` tool accepts **https URLs**, an outbound exfiltration channel for a
-  prompt-injected seat, so a per-run `--config` overlay disables `fetch` (which backs
-  the URL path) and project MCP config.
+  spawns its MCP server command; `.omp/tools/*.js` is imported at startup) and mounts
+  **user-scope MCP servers** (`~/.claude.json` et al.) whose tools run arbitrary code,
+  so omp is launched from a **neutral empty temp dir** with **HOME pointed at an empty
+  subdir** (`PI_CODING_AGENT_DIR` pins omp's real agent dir so auth still resolves) and
+  the repo is mounted read-only as a workspace via `--add-dir` — every project file
+  stays readable, no project or user-scope code is ever executed.
+- omp's `read` tool accepts **https URLs** (an outbound exfiltration channel) and the
+  `xd://` device transport carries write/edit/bash **around `--tools`**, so a per-run
+  `--config` overlay disables `fetch`, `tools.xdev`, and project MCP config. All three
+  boundaries are covered by permanent LIVE assertions
+  (`REVIEW_OMP_CAGE_LIVE=1 python3 tests/test_omp_cage_live.py`).
 
 The prompt+diff is handed over as an `@<tempfile>` message arg — omp does not read
 prompts from stdin, and the `@file` transport dodges the ~1 MB ARG_MAX ceiling
