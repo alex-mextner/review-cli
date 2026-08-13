@@ -772,6 +772,21 @@ _UNIT_FILES = [
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_backstop.py", {}),
+    # review-cli#180: the $REVIEW_CLI_ACTIVE reentrancy guard that stops a codex/claude/
+    # opencode backend from re-invoking `review` on the same worktree (each level of
+    # recursion re-roots into a fresh OS session via `start_new_session=True`, so the
+    # existing process-GROUP kill/backstop machinery structurally cannot bound it — an
+    # env var is the one signal that survives that). Exercises main()'s guard wiring, a
+    # real nested `bin/review` subprocess, and an end-to-end regression against a
+    # stubbed codex binary that attempts self-reinvocation.
+    ("test_reentrancy_guard.py", {}),
+    # review-cli#180: the codex execpolicy `.rules` guard (`install.
+    # install_codex_recursion_guard`) — the closest available equivalent to the claude
+    # backend's `--tools ""` / opencode's `bash: deny` for a backend whose core
+    # capability IS shell exec. Hermetic install/idempotency/content checks always run;
+    # the integration check against codex's own `execpolicy check` engine SKIPs when
+    # the `codex` CLI isn't on PATH.
+    ("test_codex_recursion_guard_rules.py", {}),
     # From main's review-UX-chain (review-cli#44): help defaults, install hook text / state, topic help.
     ("test_help_defaults.py", {}),
     ("test_install_hook_text.py", {}),
