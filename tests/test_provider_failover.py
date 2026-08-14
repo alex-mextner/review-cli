@@ -559,6 +559,73 @@ def test_flat_m_seat_switches_provider_midreview_and_completes():
         assert json.loads(Path(fb.cache).read_text()).get("glm-5.2") == "oc:zai/glm-5.2"
 
 
+def test_flat_m_tallies_tokens_from_every_dispatch_attempt_not_just_the_final_one():
+    """codex review finding: the flat `-m` path's per-seat tally used to count only the
+    seat's FINAL ReviewResult, undercounting a seat whose first provider attempt also
+    spent real tokens before failing over. Provider A dispatches (and is tallied) with
+    real tokens, then fails; provider B dispatches (and is tallied) with real tokens and
+    succeeds. The recorded total must be the SUM of both attempts, not just B's -- and
+    not MORE than the sum either (would mean B got double-counted)."""
+    old_resolve = _review_mod.resolve_backend
+    old_avail = _review_mod.backend_available
+    old_unpaid = _review_mod.runtime_provider_marked_unpaid
+    old_env = {
+        k: os.environ.get(k) for k in ("REVIEW_PROVIDER_CACHE", "REVIEW_RETRY_COUNT")
+    }
+
+    def _resolve(model):
+        def _backend(m, prompt, diff, cwd, timeout, round_no=0, effort=None):
+            if m == "zai:glm-5.2":
+                return _backends.ReviewResult(
+                    model=m,
+                    command="fake",
+                    returncode=1,
+                    stdout="",
+                    stderr="boom",
+                    prompt_tokens=50,
+                    output_tokens=10,
+                )
+            return _backends.ReviewResult(
+                model=m,
+                command="fake",
+                returncode=0,
+                stdout="real review",
+                stderr="",
+                prompt_tokens=200,
+                output_tokens=40,
+            )
+
+        return _backend
+
+    try:
+        _review_mod.resolve_backend = _resolve
+        _review_mod.backend_available = lambda _m: True
+        _review_mod.runtime_provider_marked_unpaid = lambda _m: False
+        os.environ["REVIEW_PROVIDER_CACHE"] = str(
+            Path(tempfile.mkdtemp()) / "last-provider.json"
+        )
+        os.environ["REVIEW_RETRY_COUNT"] = "0"
+        _panel.begin_call_tally()
+        rc = _review_mod.mode_review(
+            ["zai:glm-5.2"], "Review this.", "+x", REPO_ROOT, 5, False, board=None
+        )
+        tally = _panel.end_call_tally()
+        assert rc == 0, "seat should have completed via the failover provider"
+        assert tally["prompt_tokens"] == 250, tally  # 50 (failed A) + 200 (ok B)
+        assert tally["output_tokens"] == 50, tally  # 10 (failed A) + 40 (ok B)
+    finally:
+        _review_mod.resolve_backend = old_resolve
+        _review_mod.backend_available = old_avail
+        _review_mod.runtime_provider_marked_unpaid = old_unpaid
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if _panel._call_tally is not None:
+            _panel.end_call_tally()
+
+
 def test_flat_m_all_providers_fail_reports_the_final_failure():
     """When EVERY provider of a flat seat's model fails, the flat path (no board, no
     reserve) reports the seat's failure rather than silently succeeding."""

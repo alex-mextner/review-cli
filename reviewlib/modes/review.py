@@ -139,15 +139,23 @@ def _flat_seat_with_provider_failover(
 
     def _safe_dispatch(provider_model: str) -> ReviewResult:
         try:
-            return dispatch(provider_model)
+            result = dispatch(provider_model)
         except Exception as exc:  # noqa: BLE001 - normalize so failover can continue
-            return ReviewResult(
+            result = ReviewResult(
                 model=provider_model,
                 command="internal",
                 returncode=127,
                 stdout="",
                 stderr=str(exc),
             )
+        # Tally tokens for EVERY real dispatch attempt, not just the seat's final
+        # outcome: `run_seat_with_retry` below can invoke this multiple times for
+        # ONE provider (in-seat retry) and the chain loop invokes it again per
+        # provider on failover -- each call is a real backend round-trip that may
+        # have spent real tokens (codex review finding: tallying only the final
+        # result undercounted a seat that needed a retry or a provider failover).
+        _tally_tokens(result)
+        return result
 
     chain = provider_chain(
         model, available=backend_available, unpaid=runtime_provider_marked_unpaid
@@ -313,11 +321,13 @@ def mode_review(
             # cooling-down seat can no longer report differently to run-stats than it does
             # to the review's own pass/fail result.
             _tally_ok(result_is_usable(results[-1]))
-            # codex review finding: this flat path's own executor never called
-            # _tally_tokens, so `-m`/configured-model reviews (the most common
-            # invocation) always persisted 0/0 real token counts even when the
-            # dispatched REST backends carried real usage.
-            _tally_tokens(results[-1])
+            # Token tallying happens PER DISPATCH ATTEMPT inside `_safe_dispatch`
+            # above (codex review finding: tallying only the seat's final result
+            # here undercounted a seat that needed an in-seat retry or a provider
+            # failover -- each such attempt is a separate real backend call). Do
+            # NOT also tally `results[-1]` here -- it was already counted once as
+            # the last `_safe_dispatch` call that produced it; tallying it again
+            # would double-count that one attempt.
 
     by_model = {result.model: result for result in results}
     print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))

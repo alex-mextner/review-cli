@@ -74,9 +74,12 @@ from pathlib import Path
 # per-harness `review stat` report. This module's `prompt_tokens`/`output_tokens`
 # instead come from the SAME run's in-memory `ReviewResult` fields, aggregated once
 # per run for the lighter-weight ETA/quorum-gate store. Both trace back to the same
-# underlying provider usage payload and should agree; they are not two independent
-# measurements to reconcile, just two different aggregation granularities over one
-# source of truth.
+# underlying provider usage payload, so they are two different aggregation
+# granularities over one source of truth, not two independent measurements — but
+# nothing in either module actively verifies the two stay in agreement; a scoping
+# divergence between `_REST_USAGE_BACKENDS` and what actually sets `ReviewResult`'s
+# token fields would drift silently. Worth a reconciliation check if this ever
+# needs to be load-bearing rather than directional.
 STATS_VERSION = 4
 _TASK_CODE_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,120}$")
 

@@ -313,7 +313,8 @@ def _run_moderator_inner(
     if last.returncode == 0 and not last.stdout.strip():
         # Every candidate "succeeded" with empty output. Surface as a failure so
         # quorum/brainstorm don't report success for a synthesis that isn't there.
-        # `replace()`, not hand reconstruction -- see the run_panel relabel site above.
+        # `replace()`, not hand reconstruction -- so a future field on ReviewResult
+        # (see the run_panel relabel site below) survives this rewrite automatically.
         return replace(
             last, returncode=1, stderr=last.stderr or "moderator produced no output"
         )
