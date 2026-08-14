@@ -202,9 +202,11 @@ def test_record_run_writes_correct_shape():
         assert r["duration_seconds"] == 372.5
         assert r["ok_count"] == 9 and r["fail_count"] == 1
         assert "ts" in r
-        # NO secrets/keys/prompts — model names only.
+        # NO secrets/keys/raw prompt text — model names + aggregate token COUNTS only.
+        # `"prompt":` would be a leaked prompt field; `"prompt_tokens":` (an int count,
+        # v4) is fine and must not trip this guard.
         blob = json.dumps(r)
-        assert "prompt" not in blob and "api" not in blob.lower()
+        assert '"prompt":' not in blob and "api" not in blob.lower()
         # No `passed=` kwarg given -> verdict UNKNOWN -> the key is omitted entirely
         # (not written as null), so a reader can tell "never told us" from "told us False".
         assert "passed" not in r
@@ -233,6 +235,101 @@ def test_record_run_passed_true_and_false_are_persisted():
         recs = store.records()
         assert recs[0]["passed"] is True
         assert recs[1]["passed"] is False
+
+
+def test_record_run_defaults_token_fields_to_zero():
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+        )
+        r = store.records()[0]
+        assert r["prompt_tokens"] == 0
+        assert r["output_tokens"] == 0
+
+
+def test_record_run_persists_real_token_counts():
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini", "claude"],
+            duration_seconds=4.5,
+            ok_count=2,
+            fail_count=0,
+            prompt_tokens=1500,
+            output_tokens=420,
+        )
+        r = store.records()[0]
+        assert r["prompt_tokens"] == 1500
+        assert r["output_tokens"] == 420
+        assert r["v"] == 4
+
+
+def test_task_summaries_sums_tokens_across_iterations():
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            prompt_tokens=100,
+            output_tokens=20,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["claude"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            prompt_tokens=250,
+            output_tokens=60,
+        )
+        summaries = _stats.task_summaries()
+        assert len(summaries) == 1
+        assert summaries[0]["prompt_tokens"] == 350
+        assert summaries[0]["output_tokens"] == 80
+
+
+def test_task_summaries_pre_v4_record_with_no_token_keys_does_not_crash():
+    """A record written before v4 has no prompt_tokens/output_tokens keys at all.
+    task_summaries() must skip it silently (contribute 0), never crash, and a LATER
+    v4 record in the same task must still sum correctly on top of it."""
+    with _TmpStore() as store:
+        legacy = {
+            "v": 3,
+            "ts": "2026-01-01T00:00:00+00:00",
+            "mode": "review",
+            "pool_size": 1,
+            "models": ["codex"],
+            "duration_seconds": 1.0,
+            "ok_count": 1,
+            "fail_count": 0,
+            "task_code": TASK,
+        }
+        store.path.write_text(json.dumps(legacy) + "\n")
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            prompt_tokens=100,
+            output_tokens=20,
+        )
+        summaries = _stats.task_summaries()
+        assert len(summaries) == 1
+        assert summaries[0]["iterations"] == 2
+        assert summaries[0]["prompt_tokens"] == 100
+        assert summaries[0]["output_tokens"] == 20
 
 
 def test_task_summaries_group_iterations_and_models():
@@ -1263,8 +1360,11 @@ def test_moderator_empty_output_tallies_as_fail_not_ok():
         # run_moderator converts all-empty success into a failure result.
         assert res.returncode != 0, res
         tally = p.end_call_tally()
-        # Exactly one moderator call, counted as a FAIL (not ok).
-        assert tally == {"ok": 0, "fail": 1}, tally
+        # Exactly one moderator call, counted as a FAIL (not ok). Stubbed run_single
+        # bypasses run_panel entirely, so no real backend ever set token fields -> 0.
+        assert tally == {"ok": 0, "fail": 1, "prompt_tokens": 0, "output_tokens": 0}, (
+            tally
+        )
     finally:
         p.run_single = saved
         # ensure the tally is cleared even if asserts above raised
@@ -1296,10 +1396,82 @@ def test_moderator_success_tallies_one_ok_despite_fallback():
         res = p.run_moderator(["bad", "good"], "p", Path("."), 5)
         assert res.returncode == 0 and res.model == "good", res
         tally = p.end_call_tally()
-        assert tally == {"ok": 1, "fail": 0}, tally  # one logical moderator call, ok
+        # one logical moderator call, ok; stubbed run_single bypasses run_panel, so 0 tokens.
+        assert tally == {"ok": 1, "fail": 0, "prompt_tokens": 0, "output_tokens": 0}, (
+            tally
+        )
         assert calls["n"] == 2  # but it did try both candidates
     finally:
         p.run_single = saved
+
+
+def test_run_panel_tally_sums_real_token_counts_across_calls():
+    """`run_panel` is the single funnel every mode dispatches through (run_single,
+    run_moderator, run_panel_with_retry, run_board_with_failover all sit on top of
+    it) -- stubbing `call_backend` here at the lowest level pins that the active
+    tally accumulates REAL `ReviewResult.prompt_tokens`/`output_tokens` regardless
+    of which higher-level entry point was used."""
+    from reviewlib import panel as p
+
+    saved = p.call_backend
+
+    def fake_call_backend(*args, **kwargs):
+        return ReviewResult(
+            model="stub",
+            command="stub",
+            returncode=0,
+            stdout="ok",
+            stderr="",
+            prompt_tokens=100,
+            output_tokens=25,
+        )
+
+    p.call_backend = fake_call_backend
+    p.begin_call_tally()
+    try:
+        results = p.run_panel(
+            [p.PanelJob(model="gemini", prompt="p"), p.PanelJob(model="gemini", prompt="p")], Path("."), 5
+        )
+        assert len(results) == 2
+        tally = p.end_call_tally()
+        assert tally == {
+            "ok": 2,
+            "fail": 0,
+            "prompt_tokens": 200,
+            "output_tokens": 50,
+        }, tally
+    finally:
+        p.call_backend = saved
+        if p._call_tally is not None:
+            p.end_call_tally()
+
+
+def test_run_panel_preserves_token_fields_through_label_relabel():
+    """`run_panel` rebuilds each result to apply the job's display label
+    (`jobs[index].label or base.model`) -- pins that this reconstruction carries the
+    REAL backend's token fields through instead of silently dropping them back to
+    the dataclass default 0."""
+    from reviewlib import panel as p
+
+    saved = p.call_backend
+    p.call_backend = lambda *a, **k: ReviewResult(
+        model="raw-model",
+        command="stub",
+        returncode=0,
+        stdout="ok",
+        stderr="",
+        prompt_tokens=42,
+        output_tokens=7,
+    )
+    try:
+        results = p.run_panel(
+            [p.PanelJob(model="gemini", prompt="p", label="Architect")], Path("."), 5
+        )
+        assert results[0].model == "Architect"
+        assert results[0].prompt_tokens == 42
+        assert results[0].output_tokens == 7
+    finally:
+        p.call_backend = saved
         if p._call_tally is not None:
             p.end_call_tally()
 

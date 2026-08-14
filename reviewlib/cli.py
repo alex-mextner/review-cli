@@ -1943,6 +1943,8 @@ def _run_mode_with_stats(
         elapsed = time.monotonic() - start
         tally = end_call_tally()
         ok_count, fail_count = tally["ok"], tally["fail"]
+        prompt_tokens = tally["prompt_tokens"]
+        output_tokens = tally["output_tokens"]
         recorded_models = pool_models
         if models_after is not None:
             try:
@@ -2016,6 +2018,8 @@ def _run_mode_with_stats(
                 fail_count=fail_count,
                 started=started,
                 passed=verdict,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
             )
 
 

@@ -56,6 +56,15 @@ class ReviewResult:
     returncode: int
     stdout: str
     stderr: str
+    # Real token usage, set ONLY at the REST call sites that parse a provider's own
+    # usage payload (gemini/openai-shape/anthropic below). Every other construction
+    # site (every CLI/agentic backend, every error path) leaves these at the default
+    # 0 — "no usage data for this call", never scraped from stdout text, so an
+    # agentic backend that happens to quote a usage-shaped line in its own output
+    # (a real cross-contamination case review-cli hit before, see tokenstats.py's
+    # `_REST_USAGE_BACKENDS`) can never be misattributed here.
+    prompt_tokens: int = 0
+    output_tokens: int = 0
 
 
 def _which(name: str) -> str:
@@ -1035,7 +1044,13 @@ def review_gemini(
             started=started,
         )
         return ReviewResult(
-            model=model, command=command, returncode=0, stdout=stdout, stderr=""
+            model=model,
+            command=command,
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+            prompt_tokens=int(usage.get("promptTokenCount", 0) or 0),
+            output_tokens=int(usage.get("candidatesTokenCount", 0) or 0),
         )
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
@@ -1366,7 +1381,13 @@ def _openai_compatible_request(
             started=started,
         )
         return ReviewResult(
-            model=model, command=command, returncode=0, stdout=stdout, stderr=""
+            model=model,
+            command=command,
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
         )
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
@@ -1924,7 +1945,13 @@ def review_claude_api(
             started=started,
         )
         return ReviewResult(
-            model=model, command=command, returncode=rc, stdout=stdout, stderr=""
+            model=model,
+            command=command,
+            returncode=rc,
+            stdout=stdout,
+            stderr="",
+            prompt_tokens=int(usage.get("input_tokens", 0) or 0),
+            output_tokens=int(usage.get("output_tokens", 0) or 0),
         )
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")

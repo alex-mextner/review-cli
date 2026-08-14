@@ -796,7 +796,9 @@ def test_panel_parallel_retries_tally_one_per_logical_seat(tmp_log):
         assert len(outcome.usable) == 4
         assert not outcome.degraded
         # Exactly 4 logical seats, all ok; the retried attempts are NOT counted as fails.
-        assert tally == {"ok": 4, "fail": 0}, tally
+        assert tally == {"ok": 4, "fail": 0, "prompt_tokens": 0, "output_tokens": 0}, (
+            tally
+        )
         # No reserve was needed (every seat recovered on its own retry).
         assert reserve[0].model not in fb.dispatched
     finally:
@@ -822,7 +824,9 @@ def test_panel_tally_one_per_seat_across_reserve_replace(tmp_log):
         assert len(outcome.usable) == 4 and not outcome.degraded
         # 4 logical seats: the dead pool seat is 1 fail, its reserve replacement is 1 ok, the
         # other 3 pool seats are ok -> 4 ok + 1 fail. NOT inflated by the backfill round.
-        assert tally == {"ok": 4, "fail": 1}, tally
+        assert tally == {"ok": 4, "fail": 1, "prompt_tokens": 0, "output_tokens": 0}, (
+            tally
+        )
     finally:
         os.environ.pop("REVIEW_RETRY_COUNT", None)
 
@@ -890,7 +894,7 @@ def test_tally_result_is_suppression_aware(tmp_log):
     # Both suppressed -> zero counted. Then an UN-suppressed call DOES count.
     panel._tally_result(0)
     tally = panel.end_call_tally()
-    assert tally == {"ok": 1, "fail": 0}, tally
+    assert tally == {"ok": 1, "fail": 0, "prompt_tokens": 0, "output_tokens": 0}, tally
 
 
 # === flat `-m` path also retries (not just the board) ==========================

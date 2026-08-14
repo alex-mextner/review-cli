@@ -34,6 +34,7 @@ Privacy: the store holds model NAMES only — never prompts, diffs, or keys. It 
 created 0600 (same posture as the per-call logs, which can hold secrets) even
 though it shouldn't carry any.
 """
+
 from __future__ import annotations
 
 import json
@@ -54,7 +55,18 @@ from pathlib import Path
 # report-only by design). Readers must treat "no key" as unknown either way, never
 # crash, and — for the quorum gate specifically — fail-closed (unknown counts as
 # not-passed; see quorum_check).
-STATS_VERSION = 3
+#
+# v4 adds "prompt_tokens"/"output_tokens": int — aggregate REAL token usage summed
+# across every backend call in the run (panel.py's call tally, fed from
+# `ReviewResult.prompt_tokens`/`output_tokens`, which backends.py sets ONLY at the
+# REST call sites that parse a provider's own usage payload — gemini/OpenAI-shape
+# z.ai|commandcode|openrouter/anthropic). A CLI/agentic backend (codex, opencode,
+# omp, claude in CLI mode) never sets these, so it contributes 0, same as any error
+# path that never got a successful usage payload. 0 therefore means "no REST usage
+# data for this run" — NOT necessarily "zero tokens spent" — and a record with no
+# "prompt_tokens"/"output_tokens" key at all predates v4; both cases must be read
+# the same way (unknown/absent), never treated as a confirmed zero-token run.
+STATS_VERSION = 4
 _TASK_CODE_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,120}$")
 
 
@@ -70,7 +82,9 @@ def normalize_task_code(value: str | None) -> str | None:
     if not code:
         return None
     if not _TASK_CODE_RE.match(code):
-        raise ValueError("task code must be one non-whitespace token, max 120 characters")
+        raise ValueError(
+            "task code must be one non-whitespace token, max 120 characters"
+        )
     return code
 
 
@@ -112,6 +126,8 @@ def record_run(
     fail_count: int,
     started: datetime | None = None,
     passed: bool | None = None,
+    prompt_tokens: int = 0,
+    output_tokens: int = 0,
 ) -> bool:
     """Append one run record to the JSONL store. Best-effort: never raises.
 
@@ -131,6 +147,10 @@ def record_run(
     (e.g. ``qa``, which is report-only — see the ``mode == "qa"`` branch in
     ``cli.py``'s ``_run_mode_with_stats``): a missing ``passed`` key means "verdict
     unknown", not specifically "written before v3".
+
+    ``prompt_tokens``/``output_tokens`` are aggregate REAL token counts for the run
+    (see the v4 STATS_VERSION comment above) — default 0, which means "no REST usage
+    data", not a confirmed zero-token run.
     """
     try:
         clean_task = normalize_task_code(task_code)
@@ -145,6 +165,8 @@ def record_run(
         "duration_seconds": round(float(duration_seconds), 3),
         "ok_count": int(ok_count),
         "fail_count": int(fail_count),
+        "prompt_tokens": int(prompt_tokens),
+        "output_tokens": int(output_tokens),
     }
     if clean_task is not None:
         record["task_code"] = clean_task
@@ -162,7 +184,9 @@ def record_run(
             # broader perms and keep them forever. fchmod on every write so the 0600
             # privacy guarantee holds for pre-existing files too.
             os.fchmod(fd, 0o600)
-            os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8"))
+            os.write(
+                fd, (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+            )
         finally:
             os.close(fd)
         return True
@@ -177,7 +201,9 @@ def _load_records() -> list[dict]:
     """Read every well-formed JSONL record. Skips junk lines; never raises."""
     out: list[dict] = []
     try:
-        raw = stats_path().read_text(encoding="utf-8")  # stats_path() may raise RuntimeError
+        raw = stats_path().read_text(
+            encoding="utf-8"
+        )  # stats_path() may raise RuntimeError
     except Exception:  # noqa: BLE001 — unreadable/unexpandable store -> no history, never crash
         return out
     for line in raw.splitlines():
@@ -325,6 +351,8 @@ def task_summaries() -> list[dict]:
                 "duration_seconds": 0.0,
                 "ok_count": 0,
                 "fail_count": 0,
+                "prompt_tokens": 0,
+                "output_tokens": 0,
             },
         )
         group["iterations"] += 1
@@ -343,7 +371,7 @@ def task_summaries() -> list[dict]:
         dur = record.get("duration_seconds")
         if isinstance(dur, (int, float)):
             group["duration_seconds"] += float(dur)
-        for key in ("ok_count", "fail_count"):
+        for key in ("ok_count", "fail_count", "prompt_tokens", "output_tokens"):
             value = record.get(key)
             if isinstance(value, int):
                 group[key] += value
@@ -375,11 +403,14 @@ def estimate_eta(mode: str, pool_size: int) -> dict | None:
         durs = [
             float(r["duration_seconds"])
             for r in matching
-            if isinstance(r.get("duration_seconds"), (int, float)) and r["duration_seconds"] >= 0
+            if isinstance(r.get("duration_seconds"), (int, float))
+            and r["duration_seconds"] >= 0
         ]
         return (sum(durs) / len(durs)) if durs else None
 
-    exact = [r for r in records if r.get("mode") == mode and r.get("pool_size") == pool_size]
+    exact = [
+        r for r in records if r.get("mode") == mode and r.get("pool_size") == pool_size
+    ]
     avg = _avg(exact)
     if avg is not None:
         return {"avg_seconds": avg, "samples": len(exact), "basis": "mode+pool"}
