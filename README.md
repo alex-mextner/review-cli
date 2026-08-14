@@ -532,18 +532,19 @@ review stat --json                 # machine-readable
 
 **Token/cost honesty, same posture as `review dashboard`'s Metrics panel:** review-cli has
 never recorded real token/cost numbers in its stats store (`reviewlib.stats`) — only a
-handful of REST backends (`z.ai`, `commandcode`, `gemini`, and `claude` in API mode) ever
-had a token count to begin with, because they alone get a structured JSON response with a
-`usage` field; the four agentic CLI harnesses this command breaks out by name — `oc`
-(opencode), `omp` (Oh My Pi), `codex`, and `claude` in its default CLI mode — carry **no**
-token number in any call log review-cli writes today, because review-cli invokes each of
-them in its plain human-readable-stdout mode. This is not because the underlying tools
-have nothing to offer: verified live, `codex exec --json`, `opencode run --format json`,
-`omp --mode json`, and `claude -p --output-format json` each emit an exact usage object
-(the last two also emit a real cost in USD) — but that structured mode *replaces* the
-tool's readable stdout wholesale, and review-cli's live-log tailing plus its paywall/auth/
-context-pollution detection all currently scan that readable stdout as prose. Wiring it in
-is tracked separately (review-cli#186), not silently left unfixed. `cc` aliases to the
+handful of REST backends (`z.ai`, `commandcode`, `gemini`, `openrouter`, and `claude` in
+API mode) ever had a token count to begin with, because they alone get a structured JSON
+response with a `usage` field; the four agentic CLI harnesses this command breaks out by
+name — `oc` (opencode), `omp` (Oh My Pi), `codex`, and `claude` in its default CLI mode —
+carry **no** token number in any call log review-cli writes today, because review-cli
+invokes each of them in its plain human-readable-stdout mode. This is not because the
+underlying tools have nothing to offer: verified live, `codex exec --json`, `opencode
+run --format json`, `omp --mode json`, and `claude -p --output-format json` each emit an
+exact usage object (the last two also emit a real cost in USD) — but that structured
+mode *replaces* the tool's readable stdout wholesale, and review-cli's live-log tailing
+plus its paywall/auth/context-pollution detection all currently scan that readable
+stdout as prose. Wiring it in is tracked separately (review-cli#186), not silently left
+unfixed. `cc` aliases to the
 single `commandcode` backend (`reviewlib.config.MODEL_ALIASES`), not a distinct harness.
 `--harness` accepts this and other common short aliases directly (`glm`/`zai`/`oc`/`cc`
 all normalize to the underlying backend name — see `--harness`'s own help text), so you

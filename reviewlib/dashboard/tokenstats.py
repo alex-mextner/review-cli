@@ -55,7 +55,8 @@ Given that, this module reports TWO tiers, never conflating them:
     exactly the metric the investigation itself used to find the real outliers (a 6.5MB
     single call, codex logs averaging ~400KB vs claude's ~2.6KB).
   * ``tokens_real`` — an EXACT token count, but ONLY for the handful of calls from a REST
-    backend that emits it itself (z.ai, commandcode, gemini, claude in API mode) — see
+    backend that emits it itself (z.ai, commandcode, gemini, openrouter, claude in API
+    mode) — see
     ``extract_usage_tokens``'s docstring for why this is scoped this narrowly (a real
     cross-contamination case was found where one seat's quoted output, containing its
     OWN usage line, appeared inside a DIFFERENT seat's call log).
