@@ -13,6 +13,7 @@ Plain-script harness (mirrors tests/test_pool_guard.py): each test_* is run by _
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -637,14 +638,16 @@ def test_flat_m_tallies_tokens_across_an_in_seat_retry_of_the_same_provider():
     old_avail = _review_mod.backend_available
     old_unpaid = _review_mod.runtime_provider_marked_unpaid
     old_env = {
-        k: os.environ.get(k) for k in ("REVIEW_PROVIDER_CACHE", "REVIEW_RETRY_COUNT")
+        k: os.environ.get(k)
+        for k in ("REVIEW_PROVIDER_CACHE", "REVIEW_RETRY_COUNT", "REVIEW_LOG_DIR")
     }
-    calls = {"n": 0}
+    calls: list[str] = []
+    tmp_dir = tempfile.mkdtemp()
 
     def _resolve(model):
         def _backend(m, prompt, diff, cwd, timeout, round_no=0, effort=None):
-            calls["n"] += 1
-            if calls["n"] == 1:
+            calls.append(m)
+            if len(calls) == 1:
                 return _backends.ReviewResult(
                     model=m,
                     command="fake",
@@ -670,10 +673,13 @@ def test_flat_m_tallies_tokens_across_an_in_seat_retry_of_the_same_provider():
         _review_mod.resolve_backend = _resolve
         _review_mod.backend_available = lambda _m: True
         _review_mod.runtime_provider_marked_unpaid = lambda _m: False
-        os.environ["REVIEW_PROVIDER_CACHE"] = str(
-            Path(tempfile.mkdtemp()) / "last-provider.json"
-        )
+        os.environ["REVIEW_PROVIDER_CACHE"] = str(Path(tmp_dir) / "last-provider.json")
         os.environ["REVIEW_RETRY_COUNT"] = "1"
+        # A transient failure writes a durable retry-event log (write_retry_log) --
+        # redirect it into the same throwaway dir instead of the user's real
+        # ~/.config/review-cli (codex review finding: this test previously polluted
+        # the real log directory on every run).
+        os.environ["REVIEW_LOG_DIR"] = tmp_dir
         # No sleeper override available through mode_review()'s public surface -- accepts
         # the real ~0.5s base backoff (retry.py's _BASE_DELAY_SECONDS) for this one retry.
         _panel.begin_call_tally()
@@ -682,7 +688,10 @@ def test_flat_m_tallies_tokens_across_an_in_seat_retry_of_the_same_provider():
         )
         tally = _panel.end_call_tally()
         assert rc == 0, "seat should have completed on the in-seat retry"
-        assert calls["n"] == 2, "expected exactly one retry of the SAME provider"
+        # Both attempts must have dispatched the SAME provider -- an in-seat retry, not
+        # a provider failover (Fable review finding: the prior version of this test
+        # never checked this, so it couldn't tell the two paths apart).
+        assert calls == ["zai:glm-5.2", "zai:glm-5.2"], calls
         assert tally["prompt_tokens"] == 210, tally  # 30 (failed) + 180 (retried ok)
         assert tally["output_tokens"] == 40, tally  # 5 (failed) + 35 (retried ok)
     finally:
@@ -696,6 +705,7 @@ def test_flat_m_tallies_tokens_across_an_in_seat_retry_of_the_same_provider():
                 os.environ[k] = v
         if _panel._call_tally is not None:
             _panel.end_call_tally()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_flat_m_all_providers_fail_reports_the_final_failure():
