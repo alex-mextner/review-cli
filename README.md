@@ -147,6 +147,28 @@ git show --format= --no-ext-diff HEAD | review diff --task HYP-742 -m gemini,cod
 > checkpoint progress instead — undo a bad checkpoint safely with `git reset --soft
 > HEAD~1`, which does not touch untracked/foreign files.
 
+**Diff size cap.** The auto-detected diff is capped at 300,000 bytes by default
+(`$REVIEW_DIFF_MAX_BYTES`, `<= 0` disables it) at DISPATCH time, before it is sent to
+every backend — for `review diff`'s own two dispatch paths, and centrally for
+`brainstorm`/`quorum`/`just-ask` too. `brainstorm` in particular auto-probes the
+working-tree diff *by default* (no `--diff` needed) and sends it to every persona every
+round plus the moderator — an oversized diff there was the worst token-burn multiplier
+the 2026-08 investigation found, roughly an order of magnitude worse than the single
+`review diff` panel. A real 6.5MB / 583-file diff (a debug harness's screenshot/video
+capture scripts touching hundreds of files) was found being sent whole to every seat —
+git already collapses each binary file to a one-line stub, so the cost is oversized
+*text*. An over-cap diff is truncated with a visible marker naming the real total, not
+silently dropped — scope the review (`git diff -- <path>`) or raise the cap to see the
+full change. A diff piped on stdin (`git diff | review diff ...` / `... | review
+just-ask ...`) is NEVER capped, in any mode — the user already explicitly, and
+deliberately, scoped what they piped in. The cap never touches the canonical diff
+`review diff --staged --commit`'s checkpoint re-derives to verify its integrity — but a
+STAGED diff big enough to actually get truncated for dispatch REFUSES the checkpoint
+(exit `EXIT_COMMIT_DIFF_TRUNCATED`) and skips the plain `--staged` commit-gate stamp too,
+rather than certifying a partial review as "the full diff was reviewed": a stderr warning
+alone doesn't protect non-interactive automation from silently checkpointing a diff no
+seat fully saw. Scope the review or raise the cap, then re-run.
+
 **Checkpointing a multi-round fix loop (`--commit`).** An agent iterating review → fix
 findings → re-review may need several attempts, and a bad attempt needs a SAFE way back —
 not `git reset --hard`. `--commit` (requires `--staged`) creates a real `git commit` of the
@@ -487,6 +509,54 @@ JSON top-level shapes:
 | `review task CODE --json` | `{"task_code": str, "iterations": [run_stats_record], "sessions": [dashboard_session_summary]}` |
 | `review task CODE --detail N --json` | `dashboard_session_detail` with `session_id`, `task_code`, `calls`, `errors`, `brainstorm`, and `roles` |
 | `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models": int, "passed": bool, "error"?: str}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). |
+
+---
+
+## `review stat` — per-harness/per-model usage + health report
+
+Detailed breakdown parsed from the real per-call logs under `log_dir()`: calls/ok/fail
+per harness (backend), a byte-size proxy for usage (the only cross-harness signal that
+exists — see below), **real** token counts where a backend actually emits them, the
+SKILL.md/MEMORY.md context-pollution rate for agentic seats, the Fable (priority-1 board
+seat) dispatch/failure pattern, and the largest individual calls recorded.
+
+```bash
+review stat                        # last 7 days (default), text report
+review stat --days 30              # last 30 days
+review stat --days 0               # all recorded history (can be slow on a long-lived install)
+review stat --since 2026-08-01T00:00:00+00:00
+review stat --harness codex        # narrow the per-harness TABLE to codex (other sections stay whole-window)
+review stat --top 20               # list the 20 largest calls instead of 10
+review stat --json                 # machine-readable
+```
+
+**Token/cost honesty, same posture as `review dashboard`'s Metrics panel:** review-cli has
+never recorded real token/cost numbers in its stats store (`reviewlib.stats`) — only a
+handful of REST backends (`z.ai`, `commandcode`, `gemini`, `openrouter`, and `claude` in
+API mode) ever had a token count to begin with, because they alone get a structured JSON
+response with a `usage` field; the four agentic CLI harnesses this command breaks out by
+name — `oc` (opencode), `omp` (Oh My Pi), `codex`, and `claude` in its default CLI mode —
+carry **no** token number in any call log review-cli writes today, because review-cli
+invokes each of them in its plain human-readable-stdout mode. This is not because the
+underlying tools have nothing to offer: verified live, `codex exec --json`, `opencode
+run --format json`, `omp --mode json`, and `claude -p --output-format json` each emit an
+exact usage object (the last two also emit a real cost in USD) — but that structured
+mode *replaces* the tool's readable stdout wholesale, and review-cli's live-log tailing
+plus its paywall/auth/context-pollution detection all currently scan that readable
+stdout as prose. Wiring it in is tracked separately (review-cli#186), not silently left
+unfixed. `cc` aliases to the
+single `commandcode` backend (`reviewlib.config.MODEL_ALIASES`), not a distinct harness.
+`--harness` accepts this and other common short aliases directly (`glm`/`zai`/`oc`/`cc`
+all normalize to the underlying backend name — see `--harness`'s own help text), so you
+don't need to know the exact internal spelling. `bytes` (the call log's file size) is
+reported for every harness as the best available proxy; `tokens_real` is `true` only for
+a harness/call where an exact count was actually parsed.
+
+JSON top-level shape:
+
+| Command | Shape |
+|---------|-------|
+| `review stat --json` | `{"log_dir": str, "since": str\|null, "call_count": int, "retry_event_count": int, "tokens_recorded_backends": [str], "harnesses": {name: {calls, ok, fail, running, bytes_total, bytes_avg, bytes_p50, bytes_p90, bytes_max, tokens_real: bool, tokens_prompt, tokens_output, calls_with_real_tokens, skill_md_calls, memory_md_calls}}, "models": {model_id: {calls, bytes_total, classes}}, "fable": {dispatch_attempts, cached_skips, paywall_sentinel_calls, failure_rate, retry_events, retry_event_reasons, cached_skip_retry_events_excluded}, "retry_events_by_kind": {kind: int}, "top_oversized_calls": [{backend, model, task_code, started, size_bytes, diff_git_files, binary_stub_files, skill_md, memory_md, path}]}` |
 
 ---
 
@@ -1163,6 +1233,20 @@ retry can fix it — so it falls straight to the reserve. The retry budget is co
 `--retry N` (or `$REVIEW_RETRY_COUNT`; default 2, `0` disables it). Every retry and every
 reserve promotion is recorded **durably** in the run-log dir (not just stderr), so a
 post-mortem or the dashboard can reconstruct exactly how a seat recovered or fell over.
+
+**Cross-invocation cooldown for a chronically-unavailable claude seat.** In-seat retry only
+sees one process's worth of history, so a Fable seat that is out of session quota still
+paid for one full `claude-p` dispatch on *every* review invocation before falling to the
+reserve — real evidence: 4,322 of 6,383 recorded runs dispatched Fable and it failed, most
+with an explicit session-limit notice. Once a dispatch comes back with that notice or the
+administrative "... is currently unavailable" sentinel, `reviewlib.seat_cooldown` records a
+short cooldown (default 10 minutes, `$REVIEW_SEAT_COOLDOWN_SECONDS`, `<= 0` disables it;
+store path overridable via `$REVIEW_SEAT_COOLDOWN_FILE`) so the *next* invocation within
+that window skips the real dispatch and returns the same sentinel shape immediately — every
+downstream consumer (failover, the dashboard's paywall classification) sees it exactly as it
+would a live paywall response. Deliberately narrow: only these two chronic signals start a
+cooldown, never a bare auth/bad-model seat-fatal (which can be a transient misconfiguration
+a human just fixed).
 
 **Memory-aware concurrency cap.** Each heavy seat (codex / claude / opencode) spawns a fat
 model-runner subprocess, and a `review` runs its whole pool in parallel — so a high `--pool`

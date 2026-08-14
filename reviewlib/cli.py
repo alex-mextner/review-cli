@@ -15,7 +15,7 @@ import io
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -889,6 +889,312 @@ def _task_subcommand(rest: list[str]) -> int:
             )
     print(f"\nDetail: review task {code} --detail <iteration|session_id>")
     return 0
+
+
+def _resolve_stat_since(since_arg: str | None, days: int) -> datetime | None | bool:
+    """Resolve `--since`/`--days` into a UTC datetime floor (None = all history).
+    Returns `False` as a sentinel for an unparseable `--since` — the caller reports it
+    as a usage error rather than silently falling back to "all history".
+
+    Opus/kimi review finding: `datetime.fromisoformat` only accepts a trailing `Z`
+    (Zulu/UTC) shorthand from Python 3.11 onward, but this project declares
+    `requires-python = ">=3.9"` — and every call-log filename this command's own output
+    is built from uses exactly that `...Z` stamp format. A user copying a timestamp
+    straight out of `review stat`'s own report (or a filename) got a real usage error
+    on 3.9/3.10 while the identical value worked on 3.11+. Normalize the shorthand
+    ourselves before parsing so the accepted syntax doesn't depend on the interpreter."""
+    if since_arg:
+        normalized = since_arg[:-1] + "+00:00" if since_arg.endswith("Z") else since_arg
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return False
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    if days <= 0:
+        return None
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+# glm review finding, round 2: `--harness` filtered on an EXACT match against
+# `report["harnesses"]`'s keys, which are the raw `CallLog.backend` string every OTHER
+# call-log writer uses (`opencode`, `z.ai`, `commandcode`, ...) — not the short aliases
+# `-m`/config actually teach (`-m glm`, `-m cc`, board ids `zai:...`/`oc:...`). So
+# `--harness glm`/`zai`/`oc`/`cc` all printed "no calls recorded" while the data sat in
+# the report under a different spelling. Sourced ONLY from aliases genuinely resolved
+# elsewhere in this codebase — `resolve_backend`'s own alt-spelling matching
+# (`zai`/`zhipu`/`glm` -> the z.ai backend, `oc` -> opencode) and `config.MODEL_ALIASES`
+# (the `glm*` family, `cc`/`commoncode` -> commandcode) — NOT invented here. `cmd` is
+# deliberately absent: despite a stale comment elsewhere once claiming it as a
+# commandcode alias, it resolves NOWHERE in `_match_named_backend` or `MODEL_ALIASES` —
+# it is not a real alias, so it is not silently accepted here either.
+_HARNESS_ARG_ALIASES = {
+    "zai": "z.ai",
+    "zhipu": "z.ai",
+    "glm": "z.ai",
+    "glm52": "z.ai",
+    "glm51": "z.ai",
+    "glm47": "z.ai",
+    "glm46": "z.ai",
+    "glm45": "z.ai",
+    "oc": "opencode",
+    "cc": "commandcode",
+    "commoncode": "commandcode",
+    "command-code": "commandcode",
+    "command_code": "commandcode",
+    "common-code": "commandcode",
+    "common_code": "commandcode",
+}
+
+
+def _normalize_harness_arg(raw: str) -> str:
+    """The `--harness` value, normalized to the exact `CallLog.backend` spelling the
+    report's `harnesses` dict is keyed by — see `_HARNESS_ARG_ALIASES` above.
+
+    Opus review finding, round 4: the fallback for a token NOT in the alias dict used
+    to return `raw` completely UNCHANGED — but every real backend key is lowercase with
+    no surrounding whitespace, so `--harness Codex` (different casing) or `--harness
+    "codex "` (trailing space) fell through as literally `"Codex"`/`"codex "`, which
+    then never equals the report's `"codex"` key — a false "no calls recorded" for data
+    that genuinely exists. The fallback now returns the SAME normalized (stripped,
+    lowercased) key the alias lookup itself used, so an exact name matches regardless
+    of input casing/whitespace, while a genuinely unrecognized token still produces the
+    honest "no calls recorded for harness ..." message, not a silent misroute."""
+    key = raw.strip().lower()
+    return _HARNESS_ARG_ALIASES.get(key, key)
+
+
+def _stat_subcommand(rest: list[str]) -> int:
+    """`review stat [--days N] [--since ISO] [--top N] [--harness NAME] [--json]` —
+    detailed per-harness/per-model usage + health report parsed from the real per-call
+    logs (see `reviewlib.dashboard.tokenstats` for the data model and the 2026-08
+    token-burn investigation this answers). Default window is the last 7 days — a full
+    scan of a long-lived install's log dir (tens of thousands of files) is slow, and
+    most token-burn questions are about recent behaviour; `--days 0` scans everything."""
+    parser = argparse.ArgumentParser(
+        prog="review stat",
+        description="Per-harness/per-model usage + health report from the real call logs.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="only calls from the last N days (default 7; <= 0 = all recorded history)",
+    )
+    parser.add_argument(
+        "--since",
+        metavar="ISO",
+        default=None,
+        help="only calls at/after this ISO-8601 timestamp (overrides --days)",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help="how many largest calls to list (default 10; clamped to >= 1)",
+    )
+    parser.add_argument(
+        "--harness",
+        default=None,
+        help="narrow the per-harness BREAKDOWN TABLE to this backend (e.g. codex, "
+        "opencode, commandcode, omp, claude, z.ai — also accepts common aliases: "
+        "glm/zai/oc/cc) — every other DATA section (models, Fable, retry events, "
+        "call count, top oversized calls) stays whole-window in --json; the text "
+        "report's Fable/retry/oversized sections show it too, but per-model detail is "
+        "--json-only (see `review stat --json`)",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    ns = parser.parse_args(rest)
+    # A non-positive --top has no sensible "top N" meaning, and a negative value would
+    # silently slice as "all but the last |N|" (sorted(...)[:-3]) — a confusing result
+    # under the "Top N oversized calls" heading (kimi review finding). Clamp instead of
+    # erroring: a typo'd --top still gets a useful (if minimal) report.
+    if ns.top < 1:
+        ns.top = 1
+
+    since = _resolve_stat_since(ns.since, ns.days)
+    if since is False:
+        print(
+            f"[review stat] invalid --since value: {ns.since!r} "
+            "(expected ISO-8601, e.g. 2026-08-01T00:00:00+00:00)",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .dashboard.tokenstats import compute_stat_report
+
+    report = compute_stat_report(since=since, top=ns.top)
+    # glm review finding, round 2: normalize BEFORE filtering — see
+    # `_normalize_harness_arg` for why a raw alias (`glm`, `zai`, `oc`, `cc`) used to
+    # always miss even though the report's own footnote teaches it. Displaying the
+    # normalized name (not the raw one the user typed) in the empty-result message is
+    # deliberate: it shows exactly what was actually searched for, so a mistaken alias
+    # mapping is visible, not hidden.
+    harness = _normalize_harness_arg(ns.harness) if ns.harness else None
+    if harness:
+        # Table-only filter (codex review finding): this narrows ONLY the per-harness
+        # breakdown row set, not the whole report — models/fable/retry-events/
+        # call_count/top_oversized_calls are cross-harness context that stays
+        # whole-window on purpose (e.g. seeing where codex's calls rank among the
+        # largest overall). See the --harness help text above.
+        report["harnesses"] = {
+            name: hs for name, hs in report["harnesses"].items() if name == harness
+        }
+        # Opus review finding, round 3: this stderr note used to print UNCONDITIONALLY,
+        # so the text-report path showed the "no calls recorded for harness ..." message
+        # TWICE — once here, once again via `_render_stat_harness_table`'s own empty-
+        # table message in the printed report body. Harmless but redundant. The `--json`
+        # path has no equivalent in-payload message (an empty `harnesses` dict alone
+        # doesn't explain WHY), so it's the only path that still needs this stderr note.
+        if not report["harnesses"] and ns.json:
+            print(
+                f"[review stat] no calls recorded for harness {harness!r} in this window.",
+                file=sys.stderr,
+            )
+
+    if ns.json:
+        import json as _json
+
+        print(_json.dumps(report, indent=2))
+        return 0
+    print(_render_stat_report_text(report, requested_harness=harness))
+    return 0
+
+
+def _render_stat_report_text(
+    report: dict, *, requested_harness: str | None = None
+) -> str:
+    """Assemble the full human-readable `review stat` report from its sections.
+    `requested_harness` (the raw `--harness` value, if any) only affects the empty-table
+    message — see `_render_stat_harness_table`."""
+    sections = [
+        _render_stat_header(report),
+        _render_stat_harness_table(
+            report["harnesses"], requested_harness=requested_harness
+        ),
+        _render_stat_fable_section(report["fable"]),
+        _render_stat_retry_section(report["retry_events_by_kind"]),
+        _render_stat_oversized_section(report["top_oversized_calls"]),
+        "Note: real token counts exist ONLY for REST-backed calls "
+        f"({', '.join(report['tokens_recorded_backends'])}); the agentic CLI harnesses "
+        "(oc/opencode, omp, codex, claude in CLI mode) show tokens: not captured (see "
+        "below) — bytes are the best available cross-harness proxy today. Each of these "
+        "CLIs DOES expose exact usage/cost via its own --json/--format json mode "
+        "(verified live); review-cli doesn't invoke them that way yet because it would "
+        "replace their readable stdout wholesale, breaking the paywall/auth detection "
+        "this report itself relies on — tracked separately, see review-cli"
+        "#186. `cc` is not a separate harness — it resolves to `commandcode`, same as "
+        "`--harness cc` (see `--harness`'s help text for the full alias list).",
+    ]
+    return "\n\n".join(sections)
+
+
+def _render_stat_header(report: dict) -> str:
+    window = f"since {report['since']}" if report["since"] else "all recorded history"
+    return (
+        f"review stat — {report['log_dir']} ({window})\n"
+        f"calls: {report['call_count']}   retry/promotion events: {report['retry_event_count']}"
+    )
+
+
+def _render_stat_harness_table(
+    harnesses: dict, *, requested_harness: str | None = None
+) -> str:
+    """One row per backend: call/health counts, byte-proxy distribution, real tokens
+    (REST backends only), and the SKILL.md/MEMORY.md context-pollution rate.
+
+    `requested_harness` distinguishes "genuinely nothing in this window" from "calls
+    exist, just none for the requested --harness" (kimi review finding: the generic
+    message was false/misleading in the latter case — this table can be legitimately
+    empty here while `report['call_count']` in the header above is nonzero)."""
+    if not harnesses:
+        if requested_harness:
+            return (
+                f"No calls recorded for harness {requested_harness!r} in this window "
+                "(other harnesses may still have activity — see the header above)."
+            )
+        return "No calls recorded in this window."
+    from .dashboard.tokenstats import format_bytes
+
+    header = (
+        f"{'HARNESS':<14}{'CALLS':>7}{'OK':>6}{'FAIL':>6}{'RUN':>5}  "
+        f"{'BYTES':>9}{'AVG':>9}{'P90':>9}{'MAX':>9}  {'TOK(real)':>10}  SKILL.md  MEMORY.md"
+    )
+    rows = [header, "-" * len(header)]
+    for name, hs in harnesses.items():
+        tok = (
+            f"{hs['tokens_prompt']}/{hs['tokens_output']}" if hs["tokens_real"] else "-"
+        )
+        calls = hs["calls"] or 1
+        skill_pct = f"{100 * hs['skill_md_calls'] / calls:.0f}%"
+        mem_pct = f"{100 * hs['memory_md_calls'] / calls:.0f}%"
+        rows.append(
+            f"{name:<14}{hs['calls']:>7}{hs['ok']:>6}{hs['fail']:>6}{hs['running']:>5}  "
+            f"{format_bytes(hs['bytes_total']):>9}{format_bytes(hs['bytes_avg']):>9}"
+            f"{format_bytes(hs['bytes_p90']):>9}{format_bytes(hs['bytes_max']):>9}  "
+            f"{tok:>10}  {skill_pct:>8}  {mem_pct:>9}"
+        )
+    title = (
+        "Per-harness breakdown (bytes = call-log size, a token PROXY for every "
+        "harness; TOK(real) = exact prompt/output tokens, REST backends only):"
+    )
+    return title + "\n" + "\n".join(rows)
+
+
+def _render_stat_fable_section(fable: dict) -> str:
+    """Surfaces the investigation's headline finding: the priority-1 Fable seat's
+    dispatch/failure rate and WHY it failed (session-limit vs paywall vs auth vs other)."""
+    if not fable["dispatch_attempts"] and not fable["retry_events"]:
+        return "Fable (priority-1 board seat): no dispatch attempts recorded in this window."
+    rate = (
+        f"{fable['failure_rate']:.0%}" if fable["failure_rate"] is not None else "n/a"
+    )
+    reasons = fable["retry_event_reasons"]
+    return (
+        "Fable (priority-1 board seat) pattern:\n"
+        f"  dispatch attempts: {fable['dispatch_attempts']}   "
+        f"cached-skips: {fable['cached_skips']}   failure rate: {rate}\n"
+        f"  retry/promotion events: {fable['retry_events']} "
+        f"(session_limit={reasons['session_limit']} paywall={reasons['paywall']} "
+        f"auth={reasons['auth']} other={reasons['other']})\n"
+        "  note: dispatch_attempts/failure_rate are a LOWER BOUND — a claude CLI-mode "
+        "call is only attributable to Fable when its body carries the paywall sentinel; "
+        "a successful Fable dispatch or a session-limit-shaped failure is attributed to "
+        "Opus instead (see reviewlib.dashboard.tokenstats.compute_fable_report)."
+    )
+
+
+def _render_stat_retry_section(by_kind: dict) -> str:
+    if not by_kind:
+        return "Retry/promotion events: none recorded in this window."
+    parts = " ".join(f"{kind}={count}" for kind, count in sorted(by_kind.items()))
+    return f"Retry/promotion events by kind: {parts}"
+
+
+def _render_stat_oversized_section(top: list[dict]) -> str:
+    """The largest calls by log size — the investigation's own outlier-hunting method,
+    now a standing report instead of a one-off manual pass."""
+    if not top:
+        return "Top oversized calls: none recorded in this window."
+    from .dashboard.tokenstats import format_bytes
+
+    lines = [f"Top {len(top)} oversized calls:"]
+    for i, call in enumerate(top, start=1):
+        task = call["task_code"] or "-"
+        flags = []
+        if call["diff_git_files"]:
+            flags.append(f"diff_git_files={call['diff_git_files']}")
+        if call["binary_stub_files"]:
+            flags.append(f"binary_stub_files={call['binary_stub_files']}")
+        if call["skill_md"]:
+            flags.append("SKILL.md")
+        if call["memory_md"]:
+            flags.append("MEMORY.md")
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        lines.append(
+            f"  {i}. {call['backend']:<12} {format_bytes(call['size_bytes']):>9}  "
+            f"task={task}{flag_str}"
+        )
+    return "\n".join(lines)
 
 
 def _quorum_check_subcommand(
@@ -2544,6 +2850,7 @@ _BARE_SUBCOMMANDS: frozenset[str] = frozenset(
         "dashboard",
         "sessions",
         "task",
+        "stat",
         "trust-module",
         "register-module",
         "spec-web",
@@ -2677,6 +2984,14 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
       window. Values under 60s stay exact for tests/probes; otherwise the normal 20m floor
       applies unless REVIEW_IDLE_TIMEOUT_SECONDS is set. QA and vision calls keep wall-clock
       timeout caps.
+    REVIEW_DIFF_MAX_BYTES=N             — dispatch-time diff-size cap (default 300000);
+                                          <= 0 disables it. See `review stat`'s section
+                                          in README.md.
+    REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window (default 600)
+                                          for a chronically-unavailable claude seat
+                                          (Fable); <= 0 disables it.
+    REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
+                                          ~/.config/review-cli/seat-cooldown.json).
   codex / opencode / omp carry their own CLI auth (no key here).
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
@@ -2706,6 +3021,7 @@ def _subcommand_epilog() -> str:
             "\n  dashboard   managed web dashboard over review-cli runs (run/start/status/stop/enable/disable)"
             "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
             "\n  task        show review iterations and transcripts for one task code"
+            "\n  stat        per-harness/per-model usage + health report from the real call logs"
             "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
             "\n  install-skill / install-commit-hook / install-hook tg / register-module"
             "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
@@ -3113,6 +3429,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # `review task CODE` — task-scoped run-stat iterations + log transcripts.
     if argv and argv[0] == "task":
         return _task_subcommand(argv[1:])
+    # `review stat` — detailed per-harness/per-model token-burn + health report parsed
+    # from the real on-disk call logs. A bare MANAGEMENT subcommand (like task/dashboard/
+    # sessions), NOT a fan-out mode.
+    if argv and argv[0] == "stat":
+        return _stat_subcommand(argv[1:])
     # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
     # install-skill) so they don't clutter the main review argparse surface. Project
     # modules load by default (trust-by-default); trust-module only pins under the
@@ -3590,6 +3911,41 @@ def _dispatch(argv: list[str] | None = None) -> int:
             diff = ""
     diff = diff or ""
 
+    # Dispatch-time diff cap for the flat PANEL modes (brainstorm/quorum/just-ask) —
+    # see reviewlib.backends.cap_diff_for_dispatch's docstring for why this is NOT
+    # applied to `review`/`visual` (mode_review owns capping its own two dispatch
+    # paths itself, so it can keep the UNCAPPED canonical diff for the --commit
+    # checkpoint's integrity check; these three modes have no such requirement).
+    # brainstorm in particular auto-probes the diff by DEFAULT (no --diff needed), so
+    # without this an oversized diff is sent uncapped to every persona every round —
+    # the worst token-burn multiplier the 2026-08 investigation found (codex/kimi
+    # review finding on this feature's own PR). A piped diff (`diff_from_stdin`) is
+    # exempt, matching mode_review's identical exemption.
+    #
+    # codex review finding (round 2 on this feature's own PR): each of these three
+    # modes ALSO caps at its own dispatch boundary (`cap_diff_for_dispatch` is called
+    # again inside mode_brainstorm/mode_quorum/mode_just_ask, so a direct library
+    # caller bypassing this CLI layer is still protected). Capping HERE and there both
+    # is a genuine double-application: harmless at the DEFAULT cap (the first call's
+    # output is already <= cap, so the second is a true no-op), but NOT idempotent
+    # when `$REVIEW_DIFF_MAX_BYTES` is set below the truncation marker's own length —
+    # the second call then re-truncates the FIRST call's marker text and reports ITS
+    # byte count as "the full diff", not the real original diff's size. Rather than
+    # remove either capping point (the mode-level one is the ONLY guard for a direct
+    # caller; this CLI-level one is what `test_cli_brainstorm_oversized_worktree_diff_
+    # is_capped_for_dispatch` pins), thread whether THIS layer already capped it so the
+    # mode-level call becomes a genuine no-op for the CLI path instead of a second real
+    # application — see `diff_already_capped` in `ModeContext.extra` below.
+    diff_already_capped = False
+    if (
+        diff
+        and not diff_from_stdin
+        and mode.name in ("brainstorm", "quorum", "just-ask")
+    ):
+        capped_diff = backends.cap_diff_for_dispatch(diff)
+        diff_already_capped = capped_diff != diff
+        diff = capped_diff
+
     # --- --visual composition (§2.1). Build the visual context ONCE; thread it into
     # whichever consumer runs. cvGate fires here regardless of mode (a broken render
     # is flagged before any model call). -----------------------------------------
@@ -3713,7 +4069,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
         visual_ctx=visual_ctx,
         moderators=moderators,
         effort_override=effort_override,
-        extra={"diff_from_stdin": diff_from_stdin},
+        extra={
+            "diff_from_stdin": diff_from_stdin,
+            "diff_already_capped": diff_already_capped,
+        },
     )
 
     # The recorded mode is the EXACT mode (a brainstorm of 4 is nothing like a plain

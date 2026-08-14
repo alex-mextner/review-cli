@@ -16,6 +16,7 @@ offline (run_panel / run_moderator are stubbed — no model call, no network):
 Same harness style as tests/test_reviewer_board.py: plain test_* functions invoked
 by the __main__ block; backends/panel funcs are stubbed by reassigning module globals.
 """
+
 from __future__ import annotations
 
 import os
@@ -38,8 +39,8 @@ class _Capture:
     Forces a single round (moderator says STOP) so the test is fast and deterministic."""
 
     def __init__(self):
-        self.persona_jobs = []          # every PanelJob across rounds
-        self.moderator_calls = []       # list of (prompt, diff)
+        self.persona_jobs = []  # every PanelJob across rounds
+        self.moderator_calls = []  # list of (prompt, diff)
 
     def __enter__(self):
         self._old_panel = bs.run_panel
@@ -47,17 +48,29 @@ class _Capture:
 
         def _fake_run_panel(jobs, cwd, timeout):
             self.persona_jobs.extend(jobs)
-            return [ReviewResult(model=j.label or j.model, command="fake",
-                                 returncode=0, stdout="idea", stderr="") for j in jobs]
+            return [
+                ReviewResult(
+                    model=j.label or j.model,
+                    command="fake",
+                    returncode=0,
+                    stdout="idea",
+                    stderr="",
+                )
+                for j in jobs
+            ]
 
         def _fake_run_moderator(candidates, prompt, cwd, timeout, diff="", round_no=0):
             self.moderator_calls.append((prompt, diff))
             # End the loop immediately (min_rounds is clamped to 5, but the test sets
             # rounds low and we still emit STOP — the loop only breaks at >= min_rounds,
             # so keep output non-empty + rc0 and let min_rounds gate the count).
-            return ReviewResult(model=candidates[0] if candidates else "mod",
-                                command="fake", returncode=0,
-                                stdout="summary\nDECISION: STOP", stderr="")
+            return ReviewResult(
+                model=candidates[0] if candidates else "mod",
+                command="fake",
+                returncode=0,
+                stdout="summary\nDECISION: STOP",
+                stderr="",
+            )
 
         bs.run_panel = _fake_run_panel
         bs.run_moderator = _fake_run_moderator
@@ -75,8 +88,14 @@ def _run(diff: str) -> _Capture:
         # rounds=1/max_rounds=1 -> clamped to min 5 internally, but the persona-job
         # capture only needs >= 1 round; assertions look at the FIRST round's jobs.
         rc = bs.mode_brainstorm(
-            "How should we cache?", ["codex", "gemini"], REPO_ROOT, 5,
-            ["mod"], rounds=1, max_rounds=1, diff=diff,
+            "How should we cache?",
+            ["codex", "gemini"],
+            REPO_ROOT,
+            5,
+            ["mod"],
+            rounds=1,
+            max_rounds=1,
+            diff=diff,
         )
     assert rc == 0, rc
     return cap
@@ -89,7 +108,9 @@ def test_brainstorm_with_diff_feeds_every_persona_job():
     for job in cap.persona_jobs:
         assert job.diff == SAMPLE_DIFF, "persona job missing the grounding diff"
         assert "```diff```" in job.prompt or "diff``` block" in job.prompt, job.prompt
-        assert "ABOUT this change" in job.prompt, "diff-note not injected into persona prompt"
+        assert "ABOUT this change" in job.prompt, (
+            "diff-note not injected into persona prompt"
+        )
 
 
 def test_brainstorm_with_diff_feeds_moderator_and_synthesis():
@@ -126,7 +147,13 @@ def test_brainstorm_diff_default_is_empty_backward_compatible():
     cap = _Capture()
     with cap:
         rc = bs.mode_brainstorm(
-            "topic", ["codex"], REPO_ROOT, 5, ["mod"], rounds=1, max_rounds=1,
+            "topic",
+            ["codex"],
+            REPO_ROOT,
+            5,
+            ["mod"],
+            rounds=1,
+            max_rounds=1,
         )
     assert rc == 0, rc
     for job in cap.persona_jobs:
@@ -146,7 +173,13 @@ def test_brainstorm_discussion_log_records_task_code():
         try:
             with cap:
                 rc = bs.mode_brainstorm(
-                    "topic", ["codex"], REPO_ROOT, 5, ["mod"], rounds=1, max_rounds=1,
+                    "topic",
+                    ["codex"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=1,
+                    max_rounds=1,
                 )
             assert rc == 0, rc
             logs = list(Path(d).glob("*-brainstorm.md"))
@@ -189,12 +222,16 @@ def test_real_run_moderator_forwards_diff_to_backend():
 
     def _fake_run_single(model, prompt, cwd, timeout, diff="", round_no=0):
         seen["diff"] = diff
-        return ReviewResult(model=model, command="fake", returncode=0, stdout="ok", stderr="")
+        return ReviewResult(
+            model=model, command="fake", returncode=0, stdout="ok", stderr=""
+        )
 
     old = panel.run_single
     panel.run_single = _fake_run_single
     try:
-        panel.run_moderator(["mod"], "summarize", REPO_ROOT, 5, diff=SAMPLE_DIFF, round_no=1)
+        panel.run_moderator(
+            ["mod"], "summarize", REPO_ROOT, 5, diff=SAMPLE_DIFF, round_no=1
+        )
     finally:
         panel.run_single = old
     assert seen.get("diff") == SAMPLE_DIFF, repr(seen.get("diff"))
@@ -203,8 +240,9 @@ def test_real_run_moderator_forwards_diff_to_backend():
 # === CLI-level diff acquisition for --brainstorm ==================================
 # These monkeypatch cli._git_diff with a SENTINEL (instead of relying on the dev tree
 # being dirty) so the assertions hold regardless of checkout cleanliness (GLM finding 2).
-def _capture_cli_brainstorm_diff(argv: list[str], *, stdin_text: str | None,
-                                 git_diff) -> dict:
+def _capture_cli_brainstorm_diff(
+    argv: list[str], *, stdin_text: str | None, git_diff
+) -> dict:
     """Run `cli.main(argv)` with mode_brainstorm + cli._git_diff stubbed, returning
     {"diff": <passed to mode_brainstorm>, "git_called": bool}. `stdin_text=None` -> a
     TTY (no pipe, `_read_stdin_if_piped` returns None); a string ("" or non-empty) ->
@@ -217,7 +255,9 @@ def _capture_cli_brainstorm_diff(argv: list[str], *, stdin_text: str | None,
 
     captured: dict = {"git_called": False}
 
-    def _fake_brainstorm(topic, models, cwd, timeout, moderators, rounds, max_rounds, diff="", **_k):
+    def _fake_brainstorm(
+        topic, models, cwd, timeout, moderators, rounds, max_rounds, diff="", **_k
+    ):
         captured["diff"] = diff
         return 0
 
@@ -241,6 +281,7 @@ def _capture_cli_brainstorm_diff(argv: list[str], *, stdin_text: str | None,
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
         os.environ["REVIEW_TASK_CODE"] = "TEST-1"
         if stdin_text is None:
+
             class _Tty(io.StringIO):
                 def isatty(self):
                     return True
@@ -278,7 +319,9 @@ def test_cli_brainstorm_picks_up_working_tree_diff():
     """--brainstorm (no pipe) feeds the working-tree diff into mode_brainstorm — the
     happy path (GLM finding 3), proven via a sentinel _git_diff, not tree dirtiness."""
     cap = _capture_cli_brainstorm_diff(
-        ["brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text=None, git_diff=_git_ok,
+        ["brainstorm", "topic", "-C", str(REPO_ROOT)],
+        stdin_text=None,
+        git_diff=_git_ok,
     )
     assert cap["git_called"] is True
     assert cap["diff"] == _git_ok(None, None), repr(cap["diff"])
@@ -293,7 +336,9 @@ def test_cli_brainstorm_staged_picks_up_staged_diff():
         return "diff --git a/s b/s\n@@\n+staged\n"
 
     cap = _capture_cli_brainstorm_diff(
-        ["brainstorm", "topic", "--staged", "-C", str(REPO_ROOT)], stdin_text=None, git_diff=_git,
+        ["brainstorm", "topic", "--staged", "-C", str(REPO_ROOT)],
+        stdin_text=None,
+        git_diff=_git,
     )
     assert seen["staged"] is True, "staged flag not forwarded to git diff"
     assert cap["diff"] == "diff --git a/s b/s\n@@\n+staged\n", repr(cap["diff"])
@@ -303,7 +348,9 @@ def test_cli_brainstorm_staged_nonrepo_degrades_to_ideation():
     """--staged --brainstorm against a NON-repo (git diff raises) must degrade to pure
     ideation (diff == ""), NOT raise — the docs promise graceful degradation (codex P2)."""
     cap = _capture_cli_brainstorm_diff(
-        ["brainstorm", "topic", "--staged", "-C", str(REPO_ROOT)], stdin_text=None, git_diff=_git_raises,
+        ["brainstorm", "topic", "--staged", "-C", str(REPO_ROOT)],
+        stdin_text=None,
+        git_diff=_git_raises,
     )
     assert cap["git_called"] is True
     assert cap["diff"] == "", repr(cap["diff"])
@@ -313,10 +360,77 @@ def test_cli_brainstorm_nonempty_pipe_takes_precedence_over_worktree():
     """A non-empty piped diff is used as-is and git diff is NOT consulted (precedence)."""
     piped = "diff --git a/z b/z\n@@\n+zzz\n"
     cap = _capture_cli_brainstorm_diff(
-        ["brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text=piped, git_diff=_git_ok,
+        ["brainstorm", "topic", "-C", str(REPO_ROOT)],
+        stdin_text=piped,
+        git_diff=_git_ok,
     )
-    assert cap["git_called"] is False, "non-empty pipe must win without probing the tree"
+    assert cap["git_called"] is False, (
+        "non-empty pipe must win without probing the tree"
+    )
     assert cap["diff"] == piped, repr(cap["diff"])
+
+
+def _with_default_diff_cap(fn):
+    """Clear $REVIEW_DIFF_MAX_BYTES for the duration of `fn` — the two cap tests below
+    assume DIFF_MAX_BYTES_DEFAULT, so a host with this exported would otherwise flake
+    (the exact ambient-env class test_diff_cap.py's `_with_default_cap` was written to
+    fix; kimi review finding: these two tests were missed when that fix landed)."""
+    saved = os.environ.get("REVIEW_DIFF_MAX_BYTES")
+    try:
+        os.environ.pop("REVIEW_DIFF_MAX_BYTES", None)
+        return fn()
+    finally:
+        if saved is None:
+            os.environ.pop("REVIEW_DIFF_MAX_BYTES", None)
+        else:
+            os.environ["REVIEW_DIFF_MAX_BYTES"] = saved
+
+
+def test_cli_brainstorm_oversized_worktree_diff_is_capped_for_dispatch():
+    """codex/kimi P1 finding (2026-08 token-burn investigation): brainstorm auto-probes
+    the working-tree diff BY DEFAULT (no --diff needed) and, before this fix, sent it
+    UNCAPPED to every persona every round — the worst token-burn multiplier found (an
+    order of magnitude worse than the single review-diff panel the cap originally
+    covered). Pins that an oversized auto-detected diff reaching `mode_brainstorm` is
+    now capped, exactly like `review diff`'s own dispatch."""
+    from reviewlib import backends
+
+    big = "diff --git a/x b/x\n" + ("+line\n" * 100_000)
+    assert len(big.encode("utf-8")) > backends.DIFF_MAX_BYTES_DEFAULT
+
+    def _git_big(_cwd, _staged):
+        return big
+
+    cap = _with_default_diff_cap(
+        lambda: _capture_cli_brainstorm_diff(
+            ["brainstorm", "topic", "-C", str(REPO_ROOT)],
+            stdin_text=None,
+            git_diff=_git_big,
+        )
+    )
+    assert cap["git_called"] is True
+    assert "[review-cli] diff truncated at" in cap["diff"]
+    assert len(cap["diff"].encode("utf-8")) < len(big.encode("utf-8"))
+
+
+def test_cli_brainstorm_piped_diff_is_not_capped():
+    """The stdin exemption applies here too: an explicitly piped diff is the user's own
+    already-scoped choice (matching mode_review's identical exemption), so it must reach
+    mode_brainstorm byte-identical even when it exceeds the cap."""
+    from reviewlib import backends
+
+    big_piped = "diff --git a/x b/x\n" + ("+line\n" * 100_000)
+    assert len(big_piped.encode("utf-8")) > backends.DIFF_MAX_BYTES_DEFAULT
+
+    cap = _with_default_diff_cap(
+        lambda: _capture_cli_brainstorm_diff(
+            ["brainstorm", "topic", "-C", str(REPO_ROOT)],
+            stdin_text=big_piped,
+            git_diff=_git_ok,
+        )
+    )
+    assert cap["git_called"] is False
+    assert cap["diff"] == big_piped, "a piped diff must never be truncated"
 
 
 def test_cli_brainstorm_empty_pipe_falls_back_to_worktree():
@@ -326,9 +440,13 @@ def test_cli_brainstorm_empty_pipe_falls_back_to_worktree():
     grounding). The 2nd-pass board review (codex) flagged the opposite gating as a
     regression for non-interactive runners; this pins the chosen behaviour."""
     cap = _capture_cli_brainstorm_diff(
-        ["brainstorm", "topic", "-C", str(REPO_ROOT)], stdin_text="", git_diff=_git_ok,
+        ["brainstorm", "topic", "-C", str(REPO_ROOT)],
+        stdin_text="",
+        git_diff=_git_ok,
     )
-    assert cap["git_called"] is True, "empty pipe must fall back to the working-tree diff"
+    assert cap["git_called"] is True, (
+        "empty pipe must fall back to the working-tree diff"
+    )
     assert cap["diff"] == _git_ok(None, None), repr(cap["diff"])
 
 
@@ -359,7 +477,9 @@ def test_cli_default_review_staged_nonrepo_fails_gracefully():
     ran = {"review": False}
 
     def _fake_review(*_a, **_k):
-        ran["review"] = True  # must never be reached — the diff is REQUIRED, not degraded
+        ran["review"] = (
+            True  # must never be reached — the diff is REQUIRED, not degraded
+        )
         return 0
 
     review_mod.mode_review = _fake_review
@@ -375,12 +495,20 @@ def test_cli_default_review_staged_nonrepo_fails_gracefully():
         raised = False
         rc = None
         try:
-            rc = cli.main(["diff", "--task", "TEST-1", "--staged", "-C", str(REPO_ROOT)])
+            rc = cli.main(
+                ["diff", "--task", "TEST-1", "--staged", "-C", str(REPO_ROOT)]
+            )
         except RuntimeError:
             raised = True  # the OLD bug: a raw traceback. The graceful path must NOT do this.
-        assert not raised, "default --staged review must FAIL GRACEFULLY, not raise a traceback"
-        assert rc == EXIT_GIT_DIFF_FAILED, rc  # stable non-zero, distinct from not-a-repo
-        assert not ran["review"], "the review handler must NOT run on a failed/empty diff"
+        assert not raised, (
+            "default --staged review must FAIL GRACEFULLY, not raise a traceback"
+        )
+        assert rc == EXIT_GIT_DIFF_FAILED, (
+            rc
+        )  # stable non-zero, distinct from not-a-repo
+        assert not ran["review"], (
+            "the review handler must NOT run on a failed/empty diff"
+        )
     finally:
         cli._git_diff = old_git
         cli._is_git_repo = old_is_git_repo
