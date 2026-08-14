@@ -48,6 +48,7 @@ from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
     FailoverOutcome,
     _tally_ok,
+    _tally_tokens,
     format_result,
     result_is_usable,
     run_board_with_failover,
@@ -312,6 +313,11 @@ def mode_review(
             # cooling-down seat can no longer report differently to run-stats than it does
             # to the review's own pass/fail result.
             _tally_ok(result_is_usable(results[-1]))
+            # codex review finding: this flat path's own executor never called
+            # _tally_tokens, so `-m`/configured-model reviews (the most common
+            # invocation) always persisted 0/0 real token counts even when the
+            # dispatched REST backends carried real usage.
+            _tally_tokens(results[-1])
 
     by_model = {result.model: result for result in results}
     print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))

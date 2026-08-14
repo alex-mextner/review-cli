@@ -202,11 +202,27 @@ def test_record_run_writes_correct_shape():
         assert r["duration_seconds"] == 372.5
         assert r["ok_count"] == 9 and r["fail_count"] == 1
         assert "ts" in r
-        # NO secrets/keys/raw prompt text — model names + aggregate token COUNTS only.
-        # `"prompt":` would be a leaked prompt field; `"prompt_tokens":` (an int count,
-        # v4) is fine and must not trip this guard.
-        blob = json.dumps(r)
-        assert '"prompt":' not in blob and "api" not in blob.lower()
+        # NO secrets/keys/raw prompt text — an explicit key ALLOWLIST (not a substring
+        # ban) so a future leaked field (`prompt_text`, `user_prompt`, an API key…)
+        # fails this test by not being on the list, rather than needing its own new
+        # substring rule (Fable review finding: `"prompt" not in blob` was too broad —
+        # it also rejected the legitimate `prompt_tokens` int field this v4 adds).
+        allowed_keys = {
+            "v",
+            "ts",
+            "mode",
+            "pool_size",
+            "models",
+            "duration_seconds",
+            "ok_count",
+            "fail_count",
+            "prompt_tokens",
+            "output_tokens",
+            "task_code",
+            "passed",
+        }
+        assert set(r.keys()) <= allowed_keys, set(r.keys()) - allowed_keys
+        assert "api" not in json.dumps(r).lower()
         # No `passed=` kwarg given -> verdict UNKNOWN -> the key is omitted entirely
         # (not written as null), so a reader can tell "never told us" from "told us False".
         assert "passed" not in r
@@ -710,6 +726,47 @@ def test_cli_review_run_records_stat_and_announces_eta():
             # mocked run is sub-second but must be a real, non-negative number.
             assert isinstance(r["duration_seconds"], (int, float))
             assert r["duration_seconds"] >= 0.0
+        finally:
+            restore()
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            d.cleanup()
+
+
+def test_cli_flat_m_review_threads_real_tokens_end_to_end_into_record_run():
+    """Pins the FULL wiring the codex review flagged as untested: a real `-m` (flat)
+    CLI invocation -> panel._tally_tokens (via modes.review.mode_review's own
+    executor, NOT run_panel) -> cli.py's _run_mode_with_stats -> record_run ->
+    the persisted JSONL record. Uses the flat `-m` path specifically because that
+    is the path codex found bypassed token tallying entirely before the fix."""
+    with _TmpStore() as store:
+        d = _git_init_with_diff()
+
+        def resolver(model: str):
+            def backend(m, prompt, diff, cwd, timeout, round_no=0, effort=None):
+                tokens = {"codex": (100, 20), "gemini": (250, 60)}[m]
+                return ReviewResult(
+                    model=m,
+                    command=f"stub {m}",
+                    returncode=0,
+                    stdout=f"output from {m}",
+                    stderr="",
+                    prompt_tokens=tokens[0],
+                    output_tokens=tokens[1],
+                )
+
+            return backend
+
+        restore = _with_backend_stub(resolver)
+        log = tempfile.mkdtemp()
+        os.environ["REVIEW_LOG_DIR"] = log
+        try:
+            with redirect_stderr(io.StringIO()), _capture_stdout():
+                rc = _cli.main(["diff", *TASK_ARGS, "-C", d.name, "-m", "codex,gemini"])
+            assert rc == 0, rc
+            recs = store.records()
+            assert len(recs) == 1, recs
+            assert recs[0]["prompt_tokens"] == 350
+            assert recs[0]["output_tokens"] == 80
         finally:
             restore()
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -1430,7 +1487,12 @@ def test_run_panel_tally_sums_real_token_counts_across_calls():
     p.begin_call_tally()
     try:
         results = p.run_panel(
-            [p.PanelJob(model="gemini", prompt="p"), p.PanelJob(model="gemini", prompt="p")], Path("."), 5
+            [
+                p.PanelJob(model="gemini", prompt="p"),
+                p.PanelJob(model="gemini", prompt="p"),
+            ],
+            Path("."),
+            5,
         )
         assert len(results) == 2
         tally = p.end_call_tally()

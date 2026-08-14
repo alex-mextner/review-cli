@@ -66,6 +66,17 @@ from pathlib import Path
 # data for this run" — NOT necessarily "zero tokens spent" — and a record with no
 # "prompt_tokens"/"output_tokens" key at all predates v4; both cases must be read
 # the same way (unknown/absent), never treated as a confirmed zero-token run.
+#
+# Relationship to reviewlib.dashboard.tokenstats (#194): that module is a SEPARATE,
+# complementary source — it derives token counts by re-parsing the per-call `.log`
+# files on disk (`extract_usage_tokens`, scoped to `_REST_USAGE_BACKENDS` to avoid a
+# real cross-contamination bug it already fixed) for the DETAILED per-model/
+# per-harness `review stat` report. This module's `prompt_tokens`/`output_tokens`
+# instead come from the SAME run's in-memory `ReviewResult` fields, aggregated once
+# per run for the lighter-weight ETA/quorum-gate store. Both trace back to the same
+# underlying provider usage payload and should agree; they are not two independent
+# measurements to reconcile, just two different aggregation granularities over one
+# source of truth.
 STATS_VERSION = 4
 _TASK_CODE_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,120}$")
 

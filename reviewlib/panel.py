@@ -313,14 +313,9 @@ def _run_moderator_inner(
     if last.returncode == 0 and not last.stdout.strip():
         # Every candidate "succeeded" with empty output. Surface as a failure so
         # quorum/brainstorm don't report success for a synthesis that isn't there.
-        return ReviewResult(
-            model=last.model,
-            command=last.command,
-            returncode=1,
-            stdout=last.stdout,
-            stderr=last.stderr or "moderator produced no output",
-            prompt_tokens=last.prompt_tokens,
-            output_tokens=last.output_tokens,
+        # `replace()`, not hand reconstruction -- see the run_panel relabel site above.
+        return replace(
+            last, returncode=1, stderr=last.stderr or "moderator produced no output"
         )
     return last
 
@@ -549,15 +544,12 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
             model = jobs[index].label or jobs[index].model
             try:
                 base = future.result()
-                results[index] = ReviewResult(
-                    model=jobs[index].label or base.model,
-                    command=base.command,
-                    returncode=base.returncode,
-                    stdout=base.stdout,
-                    stderr=base.stderr,
-                    prompt_tokens=base.prompt_tokens,
-                    output_tokens=base.output_tokens,
-                )
+                # `replace()` (not field-by-field reconstruction) so any FUTURE field
+                # added to ReviewResult carries through this relabel automatically —
+                # a hand-copied field list is a landmine every new field must remember
+                # to update (Fable review finding: this is exactly how prompt_tokens/
+                # output_tokens almost got silently dropped here).
+                results[index] = replace(base, model=jobs[index].label or base.model)
             except Exception as exc:  # noqa: BLE001 - report, never crash the panel
                 results[index] = ReviewResult(
                     model=model,
