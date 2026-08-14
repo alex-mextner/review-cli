@@ -5,6 +5,7 @@ decomposition — zero behaviour change). `_run_streamed` is the workhorse for
 long backend calls: it streams stdout/stderr to a per-call log file in real time
 and preserves partial output on timeout. See the module docstrings below.
 """
+
 from __future__ import annotations
 
 import codecs
@@ -43,16 +44,18 @@ def _safe_log_header(value: object) -> str:
 # it reaches the verdict pipeline AND the `-o` output file. cli._ANSI_ESCAPE_RE
 # (output-file path) and the claude backend both delegate here so the rules never drift.
 _CSI_OSC_RE = re.compile(
-    r"\x1b\[[0-9;?]*[ -/]*[@-~]"          # CSI: ESC [ … final-byte (colours / cursor moves)
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI: ESC [ … final-byte (colours / cursor moves)
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: ESC ] … (BEL | ST) (hyperlinks / titles)
-    r"|\x1b[ -/]*[@-~]"                    # other 2+-byte ESC seqs incl. ESC c (RIS), ESC M
+    r"|\x1b[ -/]*[@-~]"  # other 2+-byte ESC seqs incl. ESC c (RIS), ESC M
 )
 # C0 control chars to drop after CSI/OSC removal — everything below 0x20 (plus DEL)
 # EXCEPT newline (\n) and tab (\t), the whitespace that carries real verdict structure.
 # Carriage return (\r) IS dropped: in a TUI-scraper transcript it is the line-OVERWRITE
 # byte, so a stray CR could splice an old redraw fragment into a verdict line — we never
 # want carriage-return overwrite semantics in parsed text, only the resulting characters.
-_C0_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # 0x00–0x1F minus \t (0x09) & \n (0x0A), plus 0x7F
+_C0_CONTROL_RE = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f]"
+)  # 0x00–0x1F minus \t (0x09) & \n (0x0A), plus 0x7F
 
 
 def strip_control_sequences(text: str) -> str:
@@ -63,6 +66,7 @@ def strip_control_sequences(text: str) -> str:
     survives; drops carriage returns (the TUI line-overwrite byte). Idempotent and safe
     on text that has no control bytes."""
     return _C0_CONTROL_RE.sub("", _CSI_OSC_RE.sub("", text))
+
 
 # ── memory-aware concurrency cap (board resilience under swarm load, review-cli#65) ───────
 # Each heavy backend (codex / claude / opencode) spawns a model-runner subprocess, and a
@@ -120,7 +124,9 @@ def max_concurrency() -> int:
     return min(value, _MAX_CONCURRENCY_CEILING)
 
 
-def idle_timeout_seconds(timeout: int, *, idle_floor: int | None = _DEFAULT_IDLE_TIMEOUT) -> int | None:
+def idle_timeout_seconds(
+    timeout: int, *, idle_floor: int | None = _DEFAULT_IDLE_TIMEOUT
+) -> int | None:
     """Seconds of backend silence allowed before reaping a subprocess.
 
     The historical `timeout` was a hard wall clock cap. Agent CLIs can legitimately run
@@ -191,7 +197,9 @@ _LIVE_CHILDREN_LOCK = threading.Lock()
 _LIVE_CHILDREN: set[tuple[subprocess.Popen, int | None]] = set()
 
 
-def _register_child(proc: subprocess.Popen, pgid: int | None) -> tuple[subprocess.Popen, int | None]:
+def _register_child(
+    proc: subprocess.Popen, pgid: int | None
+) -> tuple[subprocess.Popen, int | None]:
     """Track a live backend child so the backstop can reap it. Returns the handle to
     pass back to `_unregister_child` in a finally."""
     handle = (proc, pgid)
@@ -295,8 +303,12 @@ def _resolve_git_dir(cwd: Path) -> Path | None:
     try:
         proc = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--absolute-git-dir"],
-            cwd=str(cwd), env=stripped, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+            cwd=str(cwd),
+            env=stripped,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -371,7 +383,11 @@ def log_dir() -> Path:
     else:
         state = os.environ.get("XDG_STATE_HOME", "").strip()
         # XDG spec: a relative $XDG_STATE_HOME must be ignored.
-        root = Path(state) if state and os.path.isabs(state) else (Path.home() / ".local" / "state")
+        root = (
+            Path(state)
+            if state and os.path.isabs(state)
+            else (Path.home() / ".local" / "state")
+        )
         base = root / "review-cli" / "logs"
     base.mkdir(parents=True, exist_ok=True)
     try:
@@ -382,7 +398,9 @@ def log_dir() -> Path:
 
 
 def _safe_backend(backend: str) -> str:
-    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in backend) or "backend"
+    return (
+        "".join(c if (c.isalnum() or c in "-_.") else "_" for c in backend) or "backend"
+    )
 
 
 def current_task_code() -> str | None:
@@ -401,6 +419,26 @@ def _task_header_suffix() -> str:
 def _open_log(backend: str, round_no: int) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     return log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
+
+
+# The `timeout_marker_kind` value stamped (via the `timeout_kind` result attribute,
+# see `_run_streamed`'s return) when a call times out via the LIVENESS/stall path
+# specifically — review-cli#153/#159/#179. A named constant, not a literal re-typed at
+# each call site (Fable review finding): a caller like `backends._opencode_call_stalled`
+# compares against THIS, so rewording the human-readable marker text can never silently
+# desync detection from display.
+TIMEOUT_KIND_STALL = "waiting for first output"
+
+
+def _timeout_marker_text(secs: int, kind: str) -> str:
+    """The exact `[review-cli] TIMEOUT ...]` line `_run_streamed` appends to `stdout`
+    on a timeout, WITHOUT the leading/trailing newlines. Internal to this module —
+    callers that need to tell timeout KINDS apart should read the `timeout_kind`
+    attribute `_run_streamed` stamps on its result (see `TIMEOUT_KIND_STALL` above),
+    never text-scrape `stdout` for this marker (a backend's own untrusted output could
+    coincidentally contain the same words, and after idle/liveness clamping the exact
+    embedded seconds value here may not equal what a caller originally requested)."""
+    return f"[review-cli] TIMEOUT after {secs}s {kind} — partial output above]"
 
 
 # Explicit status footer the dashboard parser reads to decide success/failure. The
@@ -532,7 +570,9 @@ def write_retry_log(
     seq = _next_retry_log_seq()
     path = log_dir() / f"{stamp}-{_safe_backend(model)}-retry-{seq:04d}.log"
     rc = getattr(result, "returncode", "?")
-    detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+    detail = (
+        getattr(result, "stderr", "") or getattr(result, "stdout", "") or ""
+    ).strip()
     detail = detail[:_RETRY_LOG_DETAIL_MAX]
     # The attempt fraction is only meaningful for a `retry` event (the Nth of `budget`
     # retries). A `promote` / `seat-fatal` event has no retry index, so it omits the fraction
@@ -548,7 +588,11 @@ def write_retry_log(
             for line in detail.splitlines():
                 fh.write("[detail] " + line + "\n")
     except OSError as exc:  # noqa: BLE001 - a log we can't write must not break the review
-        print(f"[review-cli] could not write retry log ({exc})", file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] could not write retry log ({exc})",
+            file=sys.stderr,
+            flush=True,
+        )
     return path
 
 
@@ -563,6 +607,7 @@ def _kill_tree(proc: subprocess.Popen, pgid: int | None) -> None:
     same group can still be alive and holding the pipe. `pgid` is captured at Popen
     time precisely so it stays valid after the parent is reaped.
     """
+
     def _signal_group(sig: int) -> None:
         try:
             if pgid is not None:
@@ -597,6 +642,7 @@ def _run_streamed(
     header_argv0: str | None = None,
     idle_floor: int | None = _DEFAULT_IDLE_TIMEOUT,
     timeout_mode: str = "idle",
+    liveness_timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a long backend call, streaming its output in real time.
 
@@ -618,7 +664,11 @@ def _run_streamed(
     """
     path = _open_log(backend, round_no)
     if announce:
-        print(f"[review-cli] {backend} live log: {path} (tail -f to follow)", file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] {backend} live log: {path} (tail -f to follow)",
+            file=sys.stderr,
+            flush=True,
+        )
 
     out_buf: list[str] = []
     err_buf: list[str] = []
@@ -627,10 +677,16 @@ def _run_streamed(
     timed_out = False
     if timeout_mode not in {"idle", "wall"}:
         raise ValueError(f"unknown timeout_mode: {timeout_mode}")
-    idle_timeout = idle_timeout_seconds(timeout, idle_floor=idle_floor) if timeout_mode == "idle" else None
+    idle_timeout = (
+        idle_timeout_seconds(timeout, idle_floor=idle_floor)
+        if timeout_mode == "idle"
+        else None
+    )
     timeout_secs = max(int(timeout), 1)
     timeout_marker_secs = timeout_secs
-    timeout_marker_kind = "without output" if timeout_mode == "idle" else "total runtime"
+    timeout_marker_kind = (
+        "without output" if timeout_mode == "idle" else "total runtime"
+    )
     activity = {"last": time.monotonic()}
     proc: subprocess.Popen | None = None
     pgid: int | None = None
@@ -673,13 +729,17 @@ def _run_streamed(
             if concurrency_sem.acquire(blocking=False):
                 sem_acquired = True
             else:
-                log_fh.write(f"[review-cli] {backend}: waiting for a concurrency slot "
-                             f"(cap {max_concurrency()})\n")
+                log_fh.write(
+                    f"[review-cli] {backend}: waiting for a concurrency slot "
+                    f"(cap {max_concurrency()})\n"
+                )
                 log_fh.flush()
                 concurrency_sem.acquire()
                 sem_acquired = True
 
-        log_fh.write(f"[review-cli] {_safe_log_header(backend)}: {header} (args redacted){_task_header_suffix()}\n")
+        log_fh.write(
+            f"[review-cli] {_safe_log_header(backend)}: {header} (args redacted){_task_header_suffix()}\n"
+        )
         log_fh.flush()
 
         proc = subprocess.Popen(
@@ -791,8 +851,12 @@ def _run_streamed(
                     pass
 
         stdin_thread = threading.Thread(target=_feed_stdin, daemon=True)
-        stdout_thread = threading.Thread(target=_drain, args=(proc.stdout, out_buf, ""), daemon=True)
-        stderr_thread = threading.Thread(target=_drain, args=(proc.stderr, err_buf, "[stderr] "), daemon=True)
+        stdout_thread = threading.Thread(
+            target=_drain, args=(proc.stdout, out_buf, ""), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=_drain, args=(proc.stderr, err_buf, "[stderr] "), daemon=True
+        )
         stdin_thread.start()
         stdout_thread.start()
         stderr_thread.start()
@@ -800,7 +864,21 @@ def _run_streamed(
         # Enforce the configured timeout. Review seats use silence-from-backend so long
         # agent calls such as Fable can think for ~15 minutes; QA/vision use wall time
         # because their public `--timeout` flags are cost/latency caps.
-        if timeout_mode == "wall" or idle_timeout is None:
+        #
+        # A caller-supplied `liveness_timeout` must be honoured whenever it is set,
+        # REGARDLESS of whether idle reaping itself is enabled (codex review finding:
+        # the original version fell straight into the plain `proc.wait(timeout_secs)`
+        # branch whenever idle reaping was disabled — e.g. $REVIEW_IDLE_TIMEOUT_
+        # SECONDS=0 — silently ignoring `liveness_timeout` and waiting the FULL
+        # per-call timeout on a zero-output stall). So the polling loop (where
+        # `liveness_timeout` is actually checked) runs whenever EITHER idle reaping is
+        # on OR a liveness bound was requested; only `timeout_mode == "wall"` (bounded
+        # surfaces like QA/vision, which never pass `liveness_timeout`) or "neither is
+        # configured" falls back to the plain wall-clock wait.
+        use_polling = timeout_mode == "idle" and (
+            idle_timeout is not None or liveness_timeout is not None
+        )
+        if not use_polling:
             timeout_marker_kind = "total runtime"
             try:
                 proc.wait(timeout=timeout_secs)
@@ -813,6 +891,37 @@ def _run_streamed(
                 except subprocess.TimeoutExpired:
                     pass
         else:
+            # If idle reaping itself is disabled but a liveness bound was still
+            # requested, the idle DIMENSION falls back to the wall-clock timeout
+            # (matching the plain-disabled-idle behaviour above) rather than polling
+            # forever on that axis. Fable review finding: this fallback must measure
+            # elapsed time from a FIXED start (true wall-clock), never from
+            # `activity["last"]` (silence since the last byte) — a backend that emits
+            # output periodically keeps resetting `activity["last"]`, so measuring the
+            # fallback that way would let it run UNBOUNDED, contradicting the very
+            # "REVIEW_IDLE_TIMEOUT_SECONDS=0 must not be an unbounded wait" contract
+            # `test_disabled_idle_reap_falls_back_to_wall_timeout` already pins for the
+            # no-liveness case.
+            idle_uses_wall_clock = idle_timeout is None
+            loop_started = time.monotonic()
+            effective_idle_timeout = (
+                idle_timeout if idle_timeout is not None else timeout_secs
+            )
+            effective_idle_kind = (
+                timeout_marker_kind if idle_timeout is not None else "total runtime"
+            )
+            # codex review finding: a smaller EFFECTIVE idle bound than
+            # `liveness_timeout` would otherwise fire the ordinary idle branch first
+            # (misclassified as "without output"/"total runtime", not a stall) even
+            # though the call genuinely never produced a single byte — clamping here
+            # guarantees a true zero-output call is ALWAYS classified as a stall
+            # whenever it times out at all, regardless of which numeric bound happens
+            # to be smaller.
+            effective_liveness_timeout = (
+                min(liveness_timeout, effective_idle_timeout)
+                if liveness_timeout is not None
+                else None
+            )
             while True:
                 try:
                     proc.wait(timeout=0.5)
@@ -820,10 +929,40 @@ def _run_streamed(
                 except subprocess.TimeoutExpired:
                     # CPython's GIL makes this single-float read safe enough; stale reads are
                     # harmless because the next 0.5s poll sees any newer activity.
-                    if time.monotonic() - activity["last"] < idle_timeout:
+                    elapsed_idle = time.monotonic() - activity["last"]
+                    # A backend that has NEVER emitted a byte gets a separate, much
+                    # shorter bound when the caller opts in via `liveness_timeout`
+                    # (review-cli#153/#159/#179: opencode's zai/glm seat hangs at 0%
+                    # CPU with ZERO output on provider quota exhaustion). This does
+                    # NOT change default behaviour: a backend that has produced SOME
+                    # output still gets the full, generous idle window below — "no
+                    # output yet" and "went quiet after producing output" are
+                    # different signals, and only the former is fast-failed here.
+                    no_output_yet = not out_buf and not err_buf
+                    if (
+                        effective_liveness_timeout is not None
+                        and no_output_yet
+                        and elapsed_idle >= effective_liveness_timeout
+                    ):
+                        timed_out = True
+                        timeout_marker_secs = effective_liveness_timeout
+                        timeout_marker_kind = TIMEOUT_KIND_STALL
+                        _kill_tree(proc, pgid)
+                        try:
+                            proc.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        break
+                    idle_elapsed = (
+                        (time.monotonic() - loop_started)
+                        if idle_uses_wall_clock
+                        else elapsed_idle
+                    )
+                    if idle_elapsed < effective_idle_timeout:
                         continue
                     timed_out = True
-                    timeout_marker_secs = idle_timeout
+                    timeout_marker_secs = effective_idle_timeout
+                    timeout_marker_kind = effective_idle_kind
                     _kill_tree(proc, pgid)
                     try:
                         proc.wait(timeout=3)
@@ -848,17 +987,16 @@ def _run_streamed(
 
         returncode = proc.returncode if proc.returncode is not None else -1
         if timed_out:
-            returncode = 124  # conventional timeout exit code (overrides the kill signal)
+            returncode = (
+                124  # conventional timeout exit code (overrides the kill signal)
+            )
 
         with log_lock:
             stopping.set()  # freeze the buffers + stop late log writes
             stdout = "".join(out_buf)
             stderr = "".join(err_buf)
             if timed_out:
-                marker = (
-                    f"\n[review-cli] TIMEOUT after {timeout_marker_secs}s {timeout_marker_kind} "
-                    "— partial output above]\n"
-                )
+                marker = f"\n{_timeout_marker_text(timeout_marker_secs, timeout_marker_kind)}\n"
                 stdout += marker
                 try:
                     log_fh.write(marker)
@@ -877,7 +1015,18 @@ def _run_streamed(
                 log_fh.flush()
             except (ValueError, OSError):
                 pass
-        return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
+        result = subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout, stderr=stderr
+        )
+        # `subprocess.CompletedProcess` has no `__slots__`, so a dynamic attribute is a
+        # normal, safe way to carry WHICH timeout kind fired (if any) without a caller
+        # having to text-scrape `stdout` for a marker string (codex review finding:
+        # scraping for the "waiting for first output" substring is both forgeable by a
+        # backend's own output text AND, after the idle/liveness clamping above, may not
+        # even carry the exact seconds value a caller expected). `None` when the call
+        # did not time out at all.
+        result.timeout_kind = timeout_marker_kind if timed_out else None
+        return result
     finally:
         # The log handle ALWAYS closes, even if Popen or a write raised before the
         # normal return path (the docstring's partial-output promise depends on it).

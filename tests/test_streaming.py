@@ -14,6 +14,7 @@ package (the streaming runner in `reviewlib.process`, the backends in
 `reviewlib.backends`); `bin/review` is now a thin shim. These tests import the
 package directly — the RUNTIME behaviour is unchanged.
 """
+
 from __future__ import annotations
 
 import os
@@ -92,7 +93,9 @@ def test_log_file_grows_incrementally_before_exit():
     grew_while_running = False
     seen_path: Path | None = None
     while time.time() < deadline and t.is_alive():
-        candidates = sorted(log_dir.glob("*-faketest-*.log"), key=lambda p: p.stat().st_mtime)
+        candidates = sorted(
+            log_dir.glob("*-faketest-*.log"), key=lambda p: p.stat().st_mtime
+        )
         if candidates:
             seen_path = candidates[-1]
             text = seen_path.read_text(encoding="utf-8", errors="replace")
@@ -119,11 +122,7 @@ def test_log_file_grows_incrementally_before_exit():
 
 def test_timeout_preserves_partial_output():
     """(b) On idle timeout, return partial stdout + a TIMEOUT marker and rc 124."""
-    code = (
-        "import time\n"
-        "print('line-0', flush=True)\n"
-        "time.sleep(60)\n"
-    )
+    code = "import time\nprint('line-0', flush=True)\ntime.sleep(60)\n"
     argv = [sys.executable, "-c", code]
 
     result = review._run_streamed(
@@ -139,7 +138,9 @@ def test_timeout_preserves_partial_output():
     )
     assert result.stdout.strip(), "partial output was lost on timeout (stdout empty)"
     assert "line-0" in result.stdout, "early lines missing from the preserved buffer"
-    assert "TIMEOUT" in result.stdout, "TIMEOUT marker missing from the preserved buffer"
+    assert "TIMEOUT" in result.stdout, (
+        "TIMEOUT marker missing from the preserved buffer"
+    )
 
 
 def test_periodic_output_resets_idle_timeout():
@@ -202,7 +203,7 @@ def test_idle_timeout_seconds_contract():
 
 def test_silent_child_can_think_until_requested_timeout():
     """No output is not itself a hang signal; only the requested timeout can stop it."""
-    code = "import time\n" "time.sleep(1.2)\n" "print('done', flush=True)\n"
+    code = "import time\ntime.sleep(1.2)\nprint('done', flush=True)\n"
     argv = [sys.executable, "-c", code]
 
     started = time.monotonic()
@@ -219,6 +220,132 @@ def test_silent_child_can_think_until_requested_timeout():
     assert elapsed >= 1.0, f"silent thinking was cut short after {elapsed:.2f}s"
     assert "done" in result.stdout
     assert "TIMEOUT" not in result.stdout
+
+
+def test_liveness_timeout_kills_a_totally_silent_process_fast():
+    """review-cli#153/#159/#179: a backend that NEVER produces a single byte (opencode's
+    zai/glm seat hanging on quota exhaustion) must be reaped at `liveness_timeout`, well
+    before the generous default idle window."""
+    code = "import time\ntime.sleep(30)\n"
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=30,
+        backend="fake-silent-hang",
+        round_no=12,
+        liveness_timeout=1,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert elapsed < 10, f"liveness timeout did not fire promptly (took {elapsed:.2f}s)"
+    assert "waiting for first output" in result.stdout, result.stdout
+
+
+def test_liveness_timeout_does_not_fire_once_output_arrives():
+    """A backend that DOES emit something must not be killed by the liveness bound --
+    only total silence from spawn is a liveness failure; silence AFTER output is still
+    governed by the normal (generous) idle timeout."""
+    code = "import time\nprint('alive', flush=True)\ntime.sleep(2)\nprint('done', flush=True)\n"
+    argv = [sys.executable, "-c", code]
+
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=30,
+        backend="fake-emits-then-quiet",
+        round_no=13,
+        liveness_timeout=1,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "done" in result.stdout
+    assert "TIMEOUT" not in result.stdout
+    assert result.timeout_kind is None
+
+
+def test_liveness_timeout_still_fires_when_idle_reap_is_disabled():
+    """codex review finding: REVIEW_IDLE_TIMEOUT_SECONDS=0 (disabling generic idle
+    reaping) must NOT also disable a caller's explicit `liveness_timeout` -- a
+    zero-output backend must still be reaped at the liveness bound, not left to wait
+    out the full wall-clock `timeout`."""
+    code = "import time\ntime.sleep(30)\n"
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=30,
+            backend="fake-silent-idle-disabled",
+            round_no=14,
+            liveness_timeout=1,
+        )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert elapsed < 10, f"liveness timeout did not fire promptly (took {elapsed:.2f}s)"
+    assert "waiting for first output" in result.stdout, result.stdout
+    assert result.timeout_kind == "waiting for first output"
+
+
+def test_disabled_idle_reap_with_liveness_set_still_bounds_intermittent_output():
+    """Fable review finding: the disabled-idle-reap FALLBACK (when a caller also sets
+    `liveness_timeout`) must measure true wall-clock time, not silence-since-last-byte
+    -- a backend that keeps emitting output (so it never trips the liveness check)
+    must still be bounded by the requested `timeout`, exactly like the plain
+    disabled-idle case without `liveness_timeout` already is
+    (`test_disabled_idle_reap_falls_back_to_wall_timeout`). Measuring from
+    `activity["last"]` here would let a chatty backend run UNBOUNDED."""
+    argv = _slow_argv(lines=100, interval=0.3)  # keeps emitting for ~30s if unbounded
+
+    started = time.monotonic()
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=2,
+            backend="fake-chatty-idle-disabled",
+            round_no=16,
+            liveness_timeout=1,
+        )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert elapsed < 10, (
+        f"wall-clock fallback did not bound a chatty backend (took {elapsed:.2f}s)"
+    )
+    assert "total runtime" in result.stdout, result.stdout
+    assert "waiting for first output" not in result.stdout, result.stdout
+    assert result.timeout_kind == "total runtime"
+
+
+def test_liveness_timeout_is_clamped_to_a_smaller_idle_window():
+    """codex review finding: if the effective idle timeout is SMALLER than the
+    requested `liveness_timeout`, a totally-silent call must still be classified as a
+    stall (not an ordinary idle timeout) -- the idle bound firing first must not mask
+    the fact that the call never produced a single byte."""
+    code = "import time\ntime.sleep(30)\n"
+    argv = [sys.executable, "-c", code]
+
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="1"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=30,
+            backend="fake-silent-small-idle",
+            round_no=15,
+            liveness_timeout=300,  # deliberately LARGER than the 1s idle window
+        )
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert "waiting for first output" in result.stdout, result.stdout
+    assert "without output" not in result.stdout, result.stdout
+    assert result.timeout_kind == "waiting for first output"
 
 
 def test_disabled_idle_reap_falls_back_to_wall_timeout():
@@ -393,28 +520,36 @@ def test_no_daemon_traceback_when_escaped_writer_outlives_close():
     import tempfile
 
     driver = (
-        "import os, sys, time\n"
-        "os.environ.setdefault('REVIEW_LOG_DIR', %r)\n"
-        "sys.path.insert(0, %r)\n"  # repo root, so the in-repo reviewlib package imports
-        "import reviewlib as rv\n"
-        "code = (\n"
-        "  \"import sys, subprocess, time\\n\"\n"
-        "  \"print('p', flush=True)\\n\"\n"
-        "  \"subprocess.Popen([sys.executable,'-c','import sys,time\\\\n\"\n"
-        "  \"time.sleep(3)\\\\nwhile True:\\\\n \"\n"
-        "  \"sys.stdout.write(chr(120))\\\\n sys.stdout.flush()\\\\n time.sleep(0.2)'], \"\n"
-        "  \"start_new_session=True)\\n\"\n"
-        "  \"time.sleep(60)\\n\"\n"
-        ")\n"
-        "r = rv._run_streamed([sys.executable,'-c',code], cwd=rv.Path('.'), timeout=2, "
-        "backend='postclose', round_no=1)\n"
-        "assert r.returncode == 124 and 'p' in r.stdout\n"
-        "time.sleep(2)\n"  # let any post-close daemon write surface as a traceback
-        "print('DRIVER_OK')\n"
-    ) % (tempfile.mkdtemp(), str(REPO_ROOT))
+        (
+            "import os, sys, time\n"
+            "os.environ.setdefault('REVIEW_LOG_DIR', %r)\n"
+            "sys.path.insert(0, %r)\n"  # repo root, so the in-repo reviewlib package imports
+            "import reviewlib as rv\n"
+            "code = (\n"
+            '  "import sys, subprocess, time\\n"\n'
+            "  \"print('p', flush=True)\\n\"\n"
+            "  \"subprocess.Popen([sys.executable,'-c','import sys,time\\\\n\"\n"
+            '  "time.sleep(3)\\\\nwhile True:\\\\n "\n'
+            '  "sys.stdout.write(chr(120))\\\\n sys.stdout.flush()\\\\n time.sleep(0.2)\'], "\n'
+            '  "start_new_session=True)\\n"\n'
+            '  "time.sleep(60)\\n"\n'
+            ")\n"
+            "r = rv._run_streamed([sys.executable,'-c',code], cwd=rv.Path('.'), timeout=2, "
+            "backend='postclose', round_no=1)\n"
+            "assert r.returncode == 124 and 'p' in r.stdout\n"
+            "time.sleep(2)\n"  # let any post-close daemon write surface as a traceback
+            "print('DRIVER_OK')\n"
+        )
+        % (tempfile.mkdtemp(), str(REPO_ROOT))
+    )
 
-    proc = _sp.run([sys.executable, "-c", driver], cwd=str(REPO_ROOT),
-                   capture_output=True, text=True, timeout=40)
+    proc = _sp.run(
+        [sys.executable, "-c", driver],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
     # cleanup any survivors the driver spawned
     _sp.run(["pkill", "-f", "while True"], capture_output=True)
     assert "DRIVER_OK" in proc.stdout, f"driver failed: {proc.stdout}\n{proc.stderr}"
@@ -429,7 +564,9 @@ def test_log_file_is_private():
     import stat
 
     argv = [sys.executable, "-c", "print('x', flush=True)"]
-    review._run_streamed(argv, cwd=REPO_ROOT, timeout=10, backend="faketest", round_no=4)
+    review._run_streamed(
+        argv, cwd=REPO_ROOT, timeout=10, backend="faketest", round_no=4
+    )
     log_dir = review.log_dir()
     logs = sorted(log_dir.glob("*-faketest-*.log"), key=lambda p: p.stat().st_mtime)
     assert logs, "no log file produced"
@@ -438,8 +575,20 @@ def test_log_file_is_private():
 
 
 _CLAUDE_READONLY_TOOLS = (
-    "Edit", "MultiEdit", "Write", "Bash", "Read", "Grep", "Glob", "NotebookEdit",
-    "SlashCommand", "Task", "TodoWrite", "ExitPlanMode", "WebFetch", "WebSearch",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "Bash",
+    "Read",
+    "Grep",
+    "Glob",
+    "NotebookEdit",
+    "SlashCommand",
+    "Task",
+    "TodoWrite",
+    "ExitPlanMode",
+    "WebFetch",
+    "WebSearch",
 )
 
 
@@ -465,7 +614,9 @@ def _run_claude_cli_capture(which_fn):
         review_backends._ensure_workspace_trusted = lambda _cwd: None
         # Target the CLI variant directly: review_claude() is a dispatcher that routes
         # to the API backend when a key is configured, so calling it would be env-dependent.
-        result = review_backends.review_claude_cli("claude:opus", "prompt", "diff", REPO_ROOT, 10)
+        result = review_backends.review_claude_cli(
+            "claude:opus", "prompt", "diff", REPO_ROOT, 10
+        )
     finally:
         review_backends._which_optional = old_which
         review_backends._run_streamed = old_run_streamed
@@ -476,7 +627,9 @@ def _run_claude_cli_capture(which_fn):
 
 def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     # Default path: the real `claude` binary in genuine print mode (no PTY/TUI scrape).
-    cap = _run_claude_cli_capture(lambda name: "/bin/claude" if name == "claude" else None)
+    cap = _run_claude_cli_capture(
+        lambda name: "/bin/claude" if name == "claude" else None
+    )
     assert cap["result"].returncode == 0
     argv = cap["argv"]
     # Genuine headless print mode — no fullscreen TUI to bleed into the captured pipe.
@@ -486,7 +639,9 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     # Read-only via an EMPTY tool allowlist (all built-in tools off) — stronger and more
     # future-proof than a denylist, and it avoids real `claude` warning on claude-p tool names.
     assert argv[argv.index("--tools") + 1] == ""
-    assert "--disallowedTools" not in argv  # the empty allowlist already forbids everything
+    assert (
+        "--disallowedTools" not in argv
+    )  # the empty allowlist already forbids everything
     assert "--strict-mcp-config" in argv
     assert "--disable-slash-commands" in argv
     assert "--safe-mode" in argv
@@ -503,7 +658,9 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
 def test_claude_backend_falls_back_to_claude_p_when_claude_absent():
     # A host that ships only the legacy `claude-p` TUI-scraper still gets a working seat,
     # with its wrapper-specific surface (--cwd / --tools '' / --timeout-sec / -p) intact.
-    cap = _run_claude_cli_capture(lambda name: "/bin/claude-p" if name == "claude-p" else None)
+    cap = _run_claude_cli_capture(
+        lambda name: "/bin/claude-p" if name == "claude-p" else None
+    )
     assert cap["result"].returncode == 0
     argv = cap["argv"]
     assert "--print" not in argv  # claude-p has no --print
@@ -526,7 +683,9 @@ def test_run_streamed_feeds_large_input_over_stdin_without_deadlock():
     payload = "x" * 200_000 + "\nEND\n"  # > 64 KiB pipe buffer
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["REVIEW_LOG_DIR"] = tmp
-        proc = review._run_streamed(["cat"], cwd=Path(tmp), input_text=payload, timeout=30)
+        proc = review._run_streamed(
+            ["cat"], cwd=Path(tmp), input_text=payload, timeout=30
+        )
     assert proc.returncode == 0
     assert proc.stdout == payload
 
@@ -543,8 +702,10 @@ def test_run_streamed_forwards_env_to_the_child_process():
         os.environ["REVIEW_LOG_DIR"] = tmp
         child_env = {**os.environ, "TERM": "dumb", "REVIEW_ENV_PROBE": "probe-value-42"}
         proc = review._run_streamed(
-            ["sh", "-c", "printf '%s|%s' \"$TERM\" \"$REVIEW_ENV_PROBE\""],
-            cwd=Path(tmp), env=child_env, timeout=30,
+            ["sh", "-c", 'printf \'%s|%s\' "$TERM" "$REVIEW_ENV_PROBE"'],
+            cwd=Path(tmp),
+            env=child_env,
+            timeout=30,
         )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "dumb|probe-value-42", proc.stdout
@@ -564,11 +725,17 @@ def test_log_dir_uses_os_standard_locations():
             sys.platform = "darwin"
             assert review.log_dir() == Path(home) / "Library" / "Logs" / "review-cli"
             sys.platform = "linux"
-            assert review.log_dir() == Path(home) / ".local" / "state" / "review-cli" / "logs"
+            assert (
+                review.log_dir()
+                == Path(home) / ".local" / "state" / "review-cli" / "logs"
+            )
             os.environ["XDG_STATE_HOME"] = str(Path(home) / "xdg")
             assert review.log_dir() == Path(home) / "xdg" / "review-cli" / "logs"
             os.environ["XDG_STATE_HOME"] = "relative-ignored"  # XDG: relative → ignored
-            assert review.log_dir() == Path(home) / ".local" / "state" / "review-cli" / "logs"
+            assert (
+                review.log_dir()
+                == Path(home) / ".local" / "state" / "review-cli" / "logs"
+            )
     finally:
         sys.platform = saved_platform
         for key, val in saved.items():

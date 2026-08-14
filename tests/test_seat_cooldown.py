@@ -80,7 +80,7 @@ def _with_store(fn):
 # ---- the store itself -------------------------------------------------------------------
 def test_no_cooldown_recorded_returns_none():
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="test") is None
 
     _with_store(_run)
 
@@ -102,15 +102,19 @@ def test_active_cooldown_never_raises_when_cooldown_path_raises_runtimeerror():
 
     sc.cooldown_path = _boom
     try:
-        assert sc.active_cooldown(MODEL) is None  # must not raise
+        assert sc.active_cooldown(MODEL, access_method="test") is None  # must not raise
     finally:
         sc.cooldown_path = saved
 
 
 def test_record_then_active_within_window():
     def _run():
-        sc.record_cooldown(MODEL, "session limit", now=1000.0, ttl_seconds=600.0)
-        result = sc.active_cooldown(MODEL, now=1100.0)  # 100s later, still within 600s
+        sc.record_cooldown(
+            MODEL, "session limit", now=1000.0, ttl_seconds=600.0, access_method="test"
+        )
+        result = sc.active_cooldown(
+            MODEL, now=1100.0, access_method="test"
+        )  # 100s later, still within 600s
         assert result is not None
         assert result["reason"] == "session limit"
         assert abs(result["remaining_seconds"] - 500.0) < 0.01
@@ -120,9 +124,11 @@ def test_record_then_active_within_window():
 
 def test_cooldown_expires_after_ttl():
     def _run():
-        sc.record_cooldown(MODEL, "session limit", now=1000.0, ttl_seconds=600.0)
+        sc.record_cooldown(
+            MODEL, "session limit", now=1000.0, ttl_seconds=600.0, access_method="test"
+        )
         assert (
-            sc.active_cooldown(MODEL, now=1700.0) is None
+            sc.active_cooldown(MODEL, now=1700.0, access_method="test") is None
         )  # 700s later, past the window
 
     _with_store(_run)
@@ -130,25 +136,36 @@ def test_cooldown_expires_after_ttl():
 
 def test_cooldown_is_per_model():
     def _run():
-        sc.record_cooldown(MODEL, "session limit", now=1000.0, ttl_seconds=600.0)
-        assert sc.active_cooldown("claude:claude-opus-4-8", now=1100.0) is None
+        sc.record_cooldown(
+            MODEL, "session limit", now=1000.0, ttl_seconds=600.0, access_method="test"
+        )
+        assert (
+            sc.active_cooldown(
+                "claude:claude-opus-4-8", now=1100.0, access_method="test"
+            )
+            is None
+        )
 
     _with_store(_run)
 
 
 def test_clear_cooldown_removes_it():
     def _run():
-        sc.record_cooldown(MODEL, "session limit", now=1000.0, ttl_seconds=600.0)
-        sc.clear_cooldown(MODEL)
-        assert sc.active_cooldown(MODEL, now=1100.0) is None
+        sc.record_cooldown(
+            MODEL, "session limit", now=1000.0, ttl_seconds=600.0, access_method="test"
+        )
+        sc.clear_cooldown(MODEL, access_method="test")
+        assert sc.active_cooldown(MODEL, now=1100.0, access_method="test") is None
 
     _with_store(_run)
 
 
 def test_ttl_le_zero_disables_recording():
     def _run():
-        sc.record_cooldown(MODEL, "session limit", now=1000.0, ttl_seconds=0.0)
-        assert sc.active_cooldown(MODEL, now=1000.5) is None
+        sc.record_cooldown(
+            MODEL, "session limit", now=1000.0, ttl_seconds=0.0, access_method="test"
+        )
+        assert sc.active_cooldown(MODEL, now=1000.5, access_method="test") is None
 
     _with_store(_run)
 
@@ -193,10 +210,10 @@ def test_non_finite_until_in_store_reads_as_no_cooldown_not_crash():
             path = sc.cooldown_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
-                json.dumps({MODEL: {"until": bad, "reason": "corrupt"}}),
+                json.dumps({MODEL: {"test": {"until": bad, "reason": "corrupt"}}}),
                 encoding="utf-8",
             )
-            assert sc.active_cooldown(MODEL) is None, bad
+            assert sc.active_cooldown(MODEL, access_method="test") is None, bad
 
     _with_store(_run)
 
@@ -205,7 +222,7 @@ def test_corrupt_store_reads_as_no_cooldown():
     def _run():
         Path(sc.cooldown_path()).parent.mkdir(parents=True, exist_ok=True)
         Path(sc.cooldown_path()).write_text("{not valid json", encoding="utf-8")
-        assert sc.active_cooldown(MODEL) is None  # never raises
+        assert sc.active_cooldown(MODEL, access_method="test") is None  # never raises
 
     _with_store(_run)
 
@@ -220,7 +237,7 @@ def test_non_utf8_store_reads_as_no_cooldown_not_a_crash():
         path = sc.cooldown_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"\xff\xfe\x00\x01garbage-not-utf8")
-        assert sc.active_cooldown(MODEL) is None  # never raises
+        assert sc.active_cooldown(MODEL, access_method="test") is None  # never raises
 
     _with_store(_run)
 
@@ -228,8 +245,10 @@ def test_non_utf8_store_reads_as_no_cooldown_not_a_crash():
 def test_reason_is_truncated_and_persisted():
     def _run():
         long_reason = "x" * 5000
-        sc.record_cooldown(MODEL, long_reason, now=1000.0, ttl_seconds=600.0)
-        result = sc.active_cooldown(MODEL, now=1001.0)
+        sc.record_cooldown(
+            MODEL, long_reason, now=1000.0, ttl_seconds=600.0, access_method="test"
+        )
+        result = sc.active_cooldown(MODEL, now=1001.0, access_method="test")
         assert len(result["reason"]) <= sc._REASON_MAX_LEN
 
     _with_store(_run)
@@ -253,11 +272,15 @@ def test_record_and_clear_cooldown_never_raise_on_a_non_oserror_write_failure():
 
         sc._write = _boom
         try:
-            sc.record_cooldown(MODEL, "session limit")  # must not raise
-            sc.clear_cooldown(MODEL)  # must not raise either
+            sc.record_cooldown(
+                MODEL, "session limit", access_method="test"
+            )  # must not raise
+            sc.clear_cooldown(MODEL, access_method="test")  # must not raise either
         finally:
             sc._write = saved
-        assert sc.active_cooldown(MODEL) is None  # the write never actually landed
+        assert (
+            sc.active_cooldown(MODEL, access_method="test") is None
+        )  # the write never actually landed
 
     _with_store(_run)
 
@@ -289,7 +312,11 @@ def test_concurrent_writes_from_multiple_threads_never_corrupt_the_store():
     def _run():
         models = [f"claude:m{i}" for i in range(12)]
         threads = [
-            threading.Thread(target=sc.record_cooldown, args=(m, "session limit"))
+            threading.Thread(
+                target=sc.record_cooldown,
+                args=(m, "session limit"),
+                kwargs={"access_method": "test"},
+            )
             for m in models
         ]
         for t in threads:
@@ -302,7 +329,9 @@ def test_concurrent_writes_from_multiple_threads_never_corrupt_the_store():
         assert leftover_tmp == [], leftover_tmp
         raw = sc.cooldown_path().read_text(encoding="utf-8")
         data = json.loads(raw)  # never raises ValueError — proves no interleaved write
-        assert any(sc.active_cooldown(m) is not None for m in models), data
+        assert any(
+            sc.active_cooldown(m, access_method="test") is not None for m in models
+        ), data
 
     _with_store(_run)
 
@@ -331,8 +360,10 @@ def test_cooldown_skip_result_contract_with_panel_and_retry():
     from reviewlib.retry import FailureClass, classify_failure
 
     def _run():
-        sc.record_cooldown(MODEL, "session limit", now=None, ttl_seconds=600.0)
-        cooldown = sc.active_cooldown(MODEL)
+        sc.record_cooldown(
+            MODEL, "session limit", now=None, ttl_seconds=600.0, access_method="test"
+        )
+        cooldown = sc.active_cooldown(MODEL, access_method="test")
         result = backends._cooldown_skip_result(MODEL, 0, cooldown)
         assert result_is_usable(result) is False, result.stdout
         assert classify_failure(result) == FailureClass.SEAT_FATAL
@@ -360,8 +391,14 @@ def test_cooldown_skip_body_stays_usable_with_a_long_model_and_reason():
     )  # the store's own max persisted reason length
 
     def _run():
-        sc.record_cooldown(long_model, long_reason, now=None, ttl_seconds=600.0)
-        cooldown = sc.active_cooldown(long_model)
+        sc.record_cooldown(
+            long_model,
+            long_reason,
+            now=None,
+            ttl_seconds=600.0,
+            access_method="test",
+        )
+        cooldown = sc.active_cooldown(long_model, access_method="test")
         result = backends._cooldown_skip_result(long_model, 0, cooldown)
         assert len(result.stdout) <= backends._UNAVAILABLE_MAX_LEN, len(result.stdout)
         # The marker phrase itself must survive truncation — it's the one substring
@@ -404,9 +441,59 @@ def test_cooldown_skip_body_stays_usable_with_a_pathological_remaining_seconds()
     assert result_is_usable(fake_result) is False, body
 
 
+def test_review_claude_cli_cooldown_does_not_shadow_the_api_transport():
+    """review-cli#187, the headline claim: a cooldown recorded from the CLI transport
+    must NOT skip a dispatch that resolves to the (independently healthy) API
+    transport for the SAME model, and vice versa -- before this fix, the store was
+    keyed by model alone, so a CLI-recorded cooldown silently starved the API route
+    too even though switching transport is a legitimate immediate fix."""
+
+    def _run():
+        sc.record_cooldown(
+            MODEL, "session limit", now=None, ttl_seconds=600.0, access_method="cli"
+        )
+        api_calls = []
+        saved_api = _patched(
+            backends,
+            "review_claude_api",
+            lambda *a, **k: (
+                api_calls.append(1)
+                or ReviewResult(
+                    model=MODEL,
+                    command="api",
+                    returncode=0,
+                    stdout="real answer",
+                    stderr="",
+                )
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        saved_mode = os.environ.get("REVIEW_CLAUDE_MODE")
+        os.environ["REVIEW_CLAUDE_MODE"] = "api"
+        try:
+            result = backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_api = saved_api
+            backends.unpaid_provider_result = saved_unpaid
+            if saved_mode is None:
+                os.environ.pop("REVIEW_CLAUDE_MODE", None)
+            else:
+                os.environ["REVIEW_CLAUDE_MODE"] = saved_mode
+        # The API transport was actually dispatched -- the CLI cooldown did not skip it.
+        assert api_calls == [1], "API transport was wrongly skipped by a CLI cooldown"
+        assert result.returncode == 0
+        assert result.stdout == "real answer"
+
+    _with_store(_run)
+
+
 def test_review_claude_skips_real_dispatch_while_cooling_down():
     def _run():
-        sc.record_cooldown(MODEL, "session limit", now=None, ttl_seconds=600.0)
+        sc.record_cooldown(
+            MODEL, "session limit", now=None, ttl_seconds=600.0, access_method="cli"
+        )
         saved_cli = _patched(
             backends,
             "review_claude_cli",
@@ -431,7 +518,7 @@ def test_review_claude_skips_real_dispatch_while_cooling_down():
 
 def test_review_claude_records_cooldown_after_sentinel_response():
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
         saved_cli = _patched(
             backends,
             "review_claude_cli",
@@ -451,7 +538,7 @@ def test_review_claude_records_cooldown_after_sentinel_response():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 
@@ -470,7 +557,7 @@ def test_review_claude_records_cooldown_for_every_unavailable_marker_wording():
     for marker in backends._UNAVAILABLE_MARKERS:
 
         def _run(marker=marker):
-            assert sc.active_cooldown(MODEL) is None
+            assert sc.active_cooldown(MODEL, access_method="cli") is None
             saved_cli = _patched(
                 backends,
                 "review_claude_cli",
@@ -490,8 +577,8 @@ def test_review_claude_records_cooldown_for_every_unavailable_marker_wording():
             finally:
                 backends.review_claude_cli = saved_cli
                 backends.unpaid_provider_result = saved_unpaid
-            assert sc.active_cooldown(MODEL) is not None, marker
-            sc.clear_cooldown(MODEL)
+            assert sc.active_cooldown(MODEL, access_method="cli") is not None, marker
+            sc.clear_cooldown(MODEL, access_method="cli")
 
         _with_store(_run)
 
@@ -517,7 +604,7 @@ def test_review_claude_records_cooldown_after_session_limit_response():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 
@@ -547,7 +634,7 @@ def test_review_claude_does_not_cache_a_plain_auth_failure():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -580,7 +667,7 @@ def test_review_claude_does_not_cache_a_long_real_review():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -619,7 +706,7 @@ def test_review_claude_does_not_cache_a_successful_review_mentioning_session_lim
             backends.unpaid_provider_result = saved_unpaid
         assert result.returncode == 0
         assert result.stdout == long_body  # the real review is returned unmodified
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -648,7 +735,7 @@ def test_review_claude_does_not_cache_a_short_rc0_body_mentioning_session_limit(
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -659,7 +746,9 @@ def test_review_with_images_skips_real_dispatch_while_cooling_down():
     bypassing review_claude() entirely — it must consult seat_cooldown itself."""
 
     def _run():
-        sc.record_cooldown(MODEL, "session limit", now=None, ttl_seconds=600.0)
+        sc.record_cooldown(
+            MODEL, "session limit", now=None, ttl_seconds=600.0, access_method="cli"
+        )
         saved_images = _patched(
             backends,
             "review_claude_cli_with_images",
@@ -686,7 +775,7 @@ def test_review_with_images_skips_real_dispatch_while_cooling_down():
 
 def test_review_with_images_records_cooldown_after_sentinel_response():
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
         saved_images = _patched(
             backends,
             "review_claude_cli_with_images",
@@ -708,7 +797,7 @@ def test_review_with_images_records_cooldown_after_sentinel_response():
         finally:
             backends.review_claude_cli_with_images = saved_images
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 

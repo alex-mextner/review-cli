@@ -36,15 +36,21 @@ cooldown. An auth failure, a bad model, or any other seat-fatal class is NOT cac
 skipping a "real" retry after a key rotation would hide the fix. Chronic-only means a
 false-cache costs at most one cooldown window of extra skips, never a wrong-forever verdict.
 
-KNOWN LIMITATION (codex review finding, not fixed here): the store is keyed by ``model``
-only, checked BEFORE ``REVIEW_CLAUDE_MODE``/CLI-vs-API transport selection. A session-
-limit recorded from the CLI transport (subscription quota) therefore also skips that
-model's separate, key-billed API transport for the same window — even though switching
-transport is a legitimate, immediate fix a human could make (unlike the auth-failure case
-above, which this module already protects). Impact is bounded: the synthetic sentinel
-names the cached reason + expiry, and ``$REVIEW_SEAT_COOLDOWN_SECONDS=0`` un-sticks it
-immediately. A real fix would key the store by ``(model, transport)`` — tracked as
-review-cli#187, out of scope for this change.
+FIXED (was review-cli#187): the store used to be keyed by ``model`` alone, checked BEFORE
+``REVIEW_CLAUDE_MODE``/CLI-vs-API transport selection, so a session-limit cooldown
+recorded from the CLI transport (subscription quota) also skipped that model's separate,
+key-billed API transport for the same window — even though switching transport is a
+legitimate, immediate fix a human could make. The store is now keyed by ``(model,
+access_method)`` (``record_cooldown``/``active_cooldown``/``clear_cooldown`` all take a
+REQUIRED ``access_method`` keyword — no default, so a caller that forgets to pass the
+same one it recorded under gets an immediate ``TypeError`` rather than a silent
+cache-miss); ``review_claude`` resolves ``"cli"``/``"api"`` BEFORE checking
+the cooldown and records into that same bucket, so a CLI cooldown never shadows a
+healthy API route for the same model (or vice versa). The identical fix applies to
+review-cli#153/#159/#179's opencode-agentic seats (``review_opencode`` uses
+``access_method="opencode"``), which hang on the SAME z.ai quota exhaustion the direct
+keyed-HTTP zai/glm route can hit independently — the two access methods must cool down
+independently too.
 
 KNOWN LIMITATION (Fable review finding, deliberately not fixed here): ``record_cooldown``/
 ``clear_cooldown``'s read-modify-write (``_load`` then ``_write``) is NOT itself locked
@@ -169,12 +175,24 @@ def record_cooldown(
     model: str,
     reason: str,
     *,
+    access_method: str,
     now: float | None = None,
     ttl_seconds: float | None = None,
 ) -> None:
-    """Mark ``model`` as chronically unavailable until ``now + ttl``. Best-effort: never
-    raises — a cooldown we failed to persist just means the next run pays for one more
-    real dispatch, never a broken review.
+    """Mark ``(model, access_method)`` as chronically unavailable until ``now + ttl``.
+    Best-effort: never raises — a cooldown we failed to persist just means the next run
+    pays for one more real dispatch, never a broken review.
+
+    ``access_method`` distinguishes independently-failing routes to the SAME model
+    (review-cli#187: claude's ``cli`` vs ``api`` transport; review-cli#153/#159/#179:
+    opencode's agentic route vs a model's direct keyed-HTTP route) — a cooldown on one
+    access method must never shadow a different, independently-healthy one for the same
+    model. REQUIRED (no default): two independent reviewers flagged, across two review
+    rounds, that a default bucket turns a missed migration into a SILENT fail-open —
+    `active_cooldown` is fail-open by design, so a caller that forgot to pass the same
+    `access_method` it recorded under would just see "no cooldown", never an error.
+    Forcing every caller to pass it explicitly turns that class of bug into an
+    immediate `TypeError` at the call site instead.
 
     Opus review finding: `_write` re-raises ANY `BaseException` after its temp-file
     cleanup (not just `OSError`) — this call runs on the hot path immediately after a
@@ -190,21 +208,39 @@ def record_cooldown(
     try:
         path = cooldown_path()
         data = _load(path)
-        data[model] = {
+        model_entry = data.get(model)
+        # A pre-#187 flat entry (`{"until": ..., "reason": ..., "recorded_at": ...}`)
+        # IS a dict, so it would otherwise pass the isinstance check below and gain a
+        # new `access_method` key ALONGSIDE its stale flat keys — those never get
+        # cleaned up (they aren't a recognised access_method), so the model key could
+        # never fully empty out in `clear_cooldown`. Detect the old shape (a top-level
+        # "until" key — no valid access_method is ever literally named "until") and
+        # discard it wholesale rather than merge into it (codex review finding).
+        if not isinstance(model_entry, dict) or "until" in model_entry:
+            model_entry = {}
+        model_entry[access_method] = {
             "until": now + ttl,
             "reason": reason[:_REASON_MAX_LEN],
             "recorded_at": now,
         }
+        data[model] = model_entry
         _write(path, data)
     except Exception:  # noqa: BLE001 — best-effort cache, see docstring above
         pass
 
 
-def active_cooldown(model: str, *, now: float | None = None) -> dict | None:
-    """``{"reason", "until", "remaining_seconds"}`` if ``model`` is currently cooling
-    down, else ``None``. Never raises — a corrupt/missing store reads as "no cooldown",
-    fail-open toward dispatching (never fail-closed toward silently starving a seat that
-    would actually work).
+def active_cooldown(
+    model: str,
+    *,
+    access_method: str,
+    now: float | None = None,
+) -> dict | None:
+    """``{"reason", "until", "remaining_seconds"}`` if ``(model, access_method)`` is
+    currently cooling down, else ``None``. Never raises — a corrupt/missing store reads
+    as "no cooldown", fail-open toward dispatching (never fail-closed toward silently
+    starving a seat that would actually work). A store entry recorded under a DIFFERENT
+    access method (or the pre-#187 flat shape, from before this key existed) reads as
+    "no cooldown" here too — never a crash, worst case one extra real dispatch.
 
     Re-checks ``$REVIEW_SEAT_COOLDOWN_SECONDS <= 0`` here too (not just in
     ``record_cooldown``): a user who sets it to 0 to un-stick a seat RIGHT NOW must see
@@ -235,7 +271,10 @@ def active_cooldown(model: str, *, now: float | None = None) -> dict | None:
         # `record_cooldown`/`clear_cooldown` were already widened to `Exception` to
         # avoid; this call site was missed.
         return None
-    entry = data.get(model)
+    model_entry = data.get(model)
+    if not isinstance(model_entry, dict):
+        return None
+    entry = model_entry.get(access_method)
     if not isinstance(entry, dict):
         return None
     until = entry.get("until")
@@ -259,9 +298,9 @@ def active_cooldown(model: str, *, now: float | None = None) -> dict | None:
     }
 
 
-def clear_cooldown(model: str) -> None:
-    """Remove any recorded cooldown for ``model``. Best-effort; used by tests and
-    available for a future ``review`` maintenance command.
+def clear_cooldown(model: str, *, access_method: str) -> None:
+    """Remove any recorded cooldown for ``(model, access_method)``. Best-effort; used by
+    tests and available for a future ``review`` maintenance command.
 
     Opus review finding: widened from `except OSError` to `except Exception` for the
     same reason as `record_cooldown` above — `_write` can re-raise a non-`OSError`
@@ -270,8 +309,14 @@ def clear_cooldown(model: str) -> None:
     try:
         path = cooldown_path()
         data = _load(path)
-        if model in data:
+        model_entry = data.get(model)
+        if not isinstance(model_entry, dict) or access_method not in model_entry:
+            return
+        del model_entry[access_method]
+        if model_entry:
+            data[model] = model_entry
+        else:
             del data[model]
-            _write(path, data)
+        _write(path, data)
     except Exception:  # noqa: BLE001 — best-effort cache, see docstring above
         pass
