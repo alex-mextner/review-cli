@@ -14,6 +14,8 @@ from pathlib import Path
 
 from .backends import (
     ReviewResult,
+    _UNAVAILABLE_MARKERS,
+    _UNAVAILABLE_MAX_LEN,
     backend_available,
     call_backend,
     resolve_backend,
@@ -35,16 +37,17 @@ from .process import write_retry_log
 # review uses ("`X` is not available before py3.11"). The check fires only when the WHOLE
 # body is short (a one-liner notice, see `_UNAVAILABLE_MAX_LEN`). These shapes may need
 # updating if a provider changes its unavailability wording.
-_UNAVAILABLE_MARKERS = (
-    "is currently unavailable",
-    "is temporarily unavailable",
-    "model is unavailable",
-    "currently not available",
-)
-# Only treat an "unavailable" marker as a sentinel when the whole body is short — a real
-# review is long and may legitimately mention availability; the sentinel notice is a
-# one-liner. 400 chars comfortably covers the notice + its "Learn more" URL.
-_UNAVAILABLE_MAX_LEN = 400
+#
+# `_UNAVAILABLE_MARKERS` / `_UNAVAILABLE_MAX_LEN` are imported FROM `.backends` (above),
+# not defined here — backends.py is now the single canonical source (this module already
+# imports several other names from backends, so this direction has no circularity; the
+# reverse would). retry.py imports `_UNAVAILABLE_MAX_LEN` FROM THIS module unchanged —
+# re-exporting it here keeps that import working without touching retry.py. glm/Opus
+# review finding (2026-08 seat-cooldown feature, round 2): a prior version of
+# backends.py kept its OWN private copy of just one of these four markers, so a Fable
+# response shaped like one of the other three was classified paywall everywhere EXCEPT
+# the cooldown-recording check — silently defeating the cooldown for that wording. A
+# single shared source makes that class of drift impossible, not just commented-against.
 
 # Optional per-call success/fail tally for the run-stats record. The CLI installs a
 # collector (`begin_call_tally`) before a run and reads it after, so every mode that
@@ -199,11 +202,15 @@ def run_moderator(
 ) -> ReviewResult:
     """Run the moderator `prompt` against `candidates` in priority order.
 
-    Returns the first result that succeeds (exit 0 with non-empty output). On a
-    failure (non-zero exit OR empty output — the dead-moderator hang surfaces as
-    a timeout exit, and a silently-disabled model as empty output) it logs and
-    falls back to the next candidate. If every candidate fails, returns the last
-    result so the caller still surfaces an error rather than crashing.
+    Returns the first result that is USABLE (`result_is_usable`: exit 0, non-empty,
+    and not a short "is currently unavailable" sentinel body). On a failure
+    (non-zero exit, empty output, or the unavailable sentinel — a cooling-down
+    claude candidate returns exactly that rc=0 sentinel shape, codex review finding:
+    a bare "rc==0 and non-empty" check accepted it as a real moderator summary, so a
+    cooling-down FIRST candidate silently blocked fallback to a healthy one, and
+    `quorum`/`brainstorm` could report the cache-hit notice as the actual synthesis)
+    it logs and falls back to the next candidate. If every candidate fails, returns
+    the last result so the caller still surfaces an error rather than crashing.
 
     Each call retries from the top of the list: the common path (the first
     candidate works) costs one run, and a persistently dead top candidate only
@@ -227,7 +234,11 @@ def run_moderator(
     finally:
         with _TALLY_LOCK:
             _suppress_autotally = prev_suppress
-    _tally_ok(result.returncode == 0 and bool(result.stdout.strip()))
+    # codex review finding (2026-08 seat-cooldown feature): tallied by the SAME
+    # predicate `_run_moderator_inner` uses to accept/reject a candidate below
+    # (`result_is_usable`, not a bare `rc==0 and non-empty` check) — a cached-skip
+    # sentinel is rc=0 and non-empty, so the old check would have tallied it "ok".
+    _tally_ok(result_is_usable(result))
     return result
 
 
@@ -242,7 +253,7 @@ def _run_moderator_inner(
     last: ReviewResult | None = None
     for index, model in enumerate(candidates):
         result = run_single(model, prompt, cwd, timeout, diff=diff, round_no=round_no)
-        if result.returncode == 0 and result.stdout.strip():
+        if result_is_usable(result):
             if index > 0:
                 print(
                     f"[review-cli] moderator fell back to {model} "
@@ -251,9 +262,12 @@ def _run_moderator_inner(
                     flush=True,
                 )
             return result
-        reason = (
-            f"exit {result.returncode}" if result.returncode != 0 else "empty output"
-        )
+        if result.returncode != 0:
+            reason = f"exit {result.returncode}"
+        elif not result.stdout.strip():
+            reason = "empty output"
+        else:
+            reason = "unavailable sentinel"  # rc=0, non-empty, but result_is_usable rejected it
         nxt = "trying next" if index + 1 < len(candidates) else "no more candidates"
         print(
             f"[review-cli] moderator {model} failed ({reason}); {nxt}",

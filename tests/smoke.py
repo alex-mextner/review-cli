@@ -789,6 +789,27 @@ _UNIT_FILES = [
     # shared agenttools_rig_delegate helper). The two delegation cases SKIP when that in-ecosystem
     # helper isn't installed (bare CI); the rig-absent / helper-missing cases always run.
     ("test_install_commit_hook_rig_delegate.py", {}),
+    # The token-burn investigation's first two concrete fixes: the dispatch-time
+    # diff-size cap (backends.cap_diff_for_dispatch / $REVIEW_DIFF_MAX_BYTES, applied
+    # at the mode_review dispatch boundary — deliberately NEVER in _git_diff, which
+    # would break the --commit checkpoint's integrity check; a piped diff is exempt
+    # everywhere) and the cross-invocation Fable cooldown cache
+    # (reviewlib.seat_cooldown) and its wiring into review_claude/review_with_images.
+    # Both deterministic — no live backends, no network; the seat_cooldown wiring
+    # tests redirect $REVIEW_SEAT_COOLDOWN_FILE, $REVIEW_LOG_DIR, and
+    # $REVIEW_CLAUDE_MODE (the cooldown-skip path writes a real sidecar log via
+    # reviewlib.process.log_dir(), and REVIEW_CLAUDE_MODE=cli keeps the dispatch
+    # deterministic on any host).
+    ("test_diff_cap.py", {}),
+    ("test_seat_cooldown.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # `review stat`'s data model (reviewlib.dashboard.tokenstats): parsing per-call logs
+    # into the per-harness/per-model breakdown, the REST-backend token-text parser, the
+    # Fable dispatch/failure report, and byte-proxy stats. Deterministic — synthetic
+    # CallLog fixtures, no real log dir, no network, no backend.
+    ("test_tokenstats.py", {}),
+    # `review stat`'s CLI surface (argparse wiring, --since/--days resolution, --json vs
+    # text rendering, --harness table filtering). Deterministic, no network/backend.
+    ("test_stat_subcommand.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in

@@ -26,6 +26,7 @@ Nothing here writes; the only new persistence is in ``store.py``. Anything revie
 does not record yet (real token/cost numbers, an explicit run id) is reported as an
 empty/`null` field with a note rather than faked.
 """
+
 from __future__ import annotations
 
 import os
@@ -40,9 +41,13 @@ from pathlib import Path
 _CALL_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-(.+)-r(\d+)\.log$")
 # Brainstorm discussion md: 20260613T114552_999796Z-brainstorm.md
 _BRAINSTORM_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-brainstorm\.md$")
-_HEADER_RE = re.compile(r"^\[review-cli\] (?P<backend>.+?): (?P<argv0>.*?) \(args redacted\)(?: task=(?P<task>\S+))?\s*$")
+_HEADER_RE = re.compile(
+    r"^\[review-cli\] (?P<backend>.+?): (?P<argv0>.*?) \(args redacted\)(?: task=(?P<task>\S+))?\s*$"
+)
 _NO_TASK_RE = re.compile(r"^\[review-cli\] TASK\s*$")
-_WAITING_RE = re.compile(r"^\[review-cli\] .+?: waiting for a concurrency slot \(cap \d+\)\s*$")
+_WAITING_RE = re.compile(
+    r"^\[review-cli\] .+?: waiting for a concurrency slot \(cap \d+\)\s*$"
+)
 _TIMEOUT_RE = re.compile(r"^\[review-cli\] TIMEOUT after (?P<secs>\d+)s")
 # Explicit status footer written by every log writer (process._run_streamed and
 # backends' REST sidecar). This is the authoritative success/failure signal (finding 4).
@@ -67,11 +72,15 @@ _MAX_CALL_WALL = timedelta(seconds=1200)
 # content); the rest are hard failures. Order here is the tie-break for "dominant class"
 # when two classes are equally frequent (hard-unavailable beats soft).
 HEALTH_OK = "ok"
-HEALTH_PAYWALL = "paywall"  # body says "currently unavailable" (Fable). EXIT is often 0.
+HEALTH_PAYWALL = (
+    "paywall"  # body says "currently unavailable" (Fable). EXIT is often 0.
+)
 HEALTH_AUTH = "auth"  # EXIT 401 / stderr {"error":"bad key"} (z.ai / GLM bad key).
 HEALTH_BLOCKED = "blocked"  # EXIT 403 / "error code: 1010" (Cloudflare bot block).
 HEALTH_TIMEOUT = "timeout"  # EXIT 124 / "timed out".
-HEALTH_EMPTY = "empty"  # EXIT 0 but no real content (output_tokens=0 / framing-only body).
+HEALTH_EMPTY = (
+    "empty"  # EXIT 0 but no real content (output_tokens=0 / framing-only body).
+)
 HEALTH_ERROR = "error"  # any other non-zero exit not matched above.
 
 # The three "hard-unavailable" classes: a model currently in one of these is problematic
@@ -135,7 +144,11 @@ _CLAUDE_API_MODEL_RE = re.compile(r"^Anthropic API\s+(?P<model>\S+)")
 # openrouter's backend name AND board prefix are both `openrouter` (seat `openrouter:<slug>`);
 # its `openrouter API <slug>` argv0 carries the per-model slug, so mapping it here keeps each
 # openrouter model a distinct dashboard row instead of collapsing them into one `openrouter`.
-_BACKEND_BOARD_PREFIX = {"commandcode": "commandcode", "z.ai": "zai", "openrouter": "openrouter"}
+_BACKEND_BOARD_PREFIX = {
+    "commandcode": "commandcode",
+    "z.ai": "zai",
+    "openrouter": "openrouter",
+}
 
 
 def _parse_stamp(date_part: str, micros: str) -> datetime:
@@ -218,7 +231,12 @@ class CallLog:
         P2); it is `running`/unknown. (A truncated old log with a body error marker is still
         surfaced as an error by has_error — only the clean, footerless case is `running`.)
         """
-        return self.exit_code is not None or self.timed_out or bool(self.stderr_lines) or _looks_like_error(self.body)
+        return (
+            self.exit_code is not None
+            or self.timed_out
+            or bool(self.stderr_lines)
+            or _looks_like_error(self.body)
+        )
 
     @property
     def has_error(self) -> bool:
@@ -382,7 +400,9 @@ def parse_call_log(path: Path) -> CallLog | None:
     # footer (or file end for a legacy log), never an arbitrary quoted line earlier in the body.
     timeout_line_idx: int | None = None
     if exit_code == 124 or exit_code is None:
-        scan_start = (exit_line_idx - 1) if exit_line_idx is not None else (len(lines) - 1)
+        scan_start = (
+            (exit_line_idx - 1) if exit_line_idx is not None else (len(lines) - 1)
+        )
         for j in range(scan_start, -1, -1):
             if not lines[j].strip():
                 continue  # skip blank lines between body and footer
@@ -415,7 +435,7 @@ def parse_call_log(path: Path) -> CallLog | None:
             timeout_secs = int(tm.group("secs"))
             continue  # the authoritative timeout marker — kept out of the body
         if line.startswith(_STDERR_PREFIX):
-            stderr_lines.append(line[len(_STDERR_PREFIX):])
+            stderr_lines.append(line[len(_STDERR_PREFIX) :])
         body_lines.append(line)
     try:
         st = path.stat()
@@ -478,7 +498,7 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
     in_control = False
     for line in raw.splitlines():
         if line.startswith("# Brainstorm:"):
-            topic = line[len("# Brainstorm:"):].strip()
+            topic = line[len("# Brainstorm:") :].strip()
             continue
         hm = _BS_HEADER_RE.search(line)
         if hm and not panel:
@@ -512,8 +532,17 @@ def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
         # a heading whose parenthesized tail is a known panel model — otherwise it's body
         # text and belongs to the current persona's transcript. Inside a control section we
         # accept no personas at all.
-        if pm and cur_round is not None and not in_control and (not panel or pm.group("model") in panel):
-            cur_persona = {"name": pm.group("name"), "model": pm.group("model"), "text": ""}
+        if (
+            pm
+            and cur_round is not None
+            and not in_control
+            and (not panel or pm.group("model") in panel)
+        ):
+            cur_persona = {
+                "name": pm.group("name"),
+                "model": pm.group("model"),
+                "text": "",
+            }
             cur_round["personas"].append(cur_persona)
             continue
         if cur_persona is not None and not in_control:
@@ -616,9 +645,9 @@ class Session:
         e.g. ``z.ai API glm-5.2``) is the only durable "what was run" a non-brainstorm session
         has; surfacing it lets the Prompts panel / panel rows show the invocation instead of a
         bare "redacted" note. Order-preserving de-dup (one entry per distinct seat)."""
-        return list(dict.fromkeys(
-            inv for c in self.calls if (inv := (c.argv0 or "").strip())
-        ))
+        return list(
+            dict.fromkeys(inv for c in self.calls if (inv := (c.argv0 or "").strip()))
+        )
 
     @property
     def has_error(self) -> bool:
@@ -672,22 +701,24 @@ class Session:
                 and (other.round == c.round or other.started >= c.started)
                 for other in ordered
             )
-            out.append({
-                "backend": c.backend,
-                "round": c.round,
-                "summary": c.error_summary,
-                "filename": c.filename,
-                "model": model_id,
-                "started": c.started.isoformat(),
-                "health_class": cls,
-                # The next board seat by priority — what the failover pool promotes when this
-                # seat is down. None when this seat is off-board or already the lowest priority.
-                "fallback": _fallback_seat_for(model_id),
-                # Did the run still produce a usable verdict at/after this failure?
-                #   recovered   — a clean OK call ran concurrently-or-after this failed seat.
-                #   unrecovered — no clean OK call did; this run needs attention (manual control).
-                "recovery": "recovered" if recovered else "unrecovered",
-            })
+            out.append(
+                {
+                    "backend": c.backend,
+                    "round": c.round,
+                    "summary": c.error_summary,
+                    "filename": c.filename,
+                    "model": model_id,
+                    "started": c.started.isoformat(),
+                    "health_class": cls,
+                    # The next board seat by priority — what the failover pool promotes when this
+                    # seat is down. None when this seat is off-board or already the lowest priority.
+                    "fallback": _fallback_seat_for(model_id),
+                    # Did the run still produce a usable verdict at/after this failure?
+                    #   recovered   — a clean OK call ran concurrently-or-after this failed seat.
+                    #   unrecovered — no clean OK call did; this run needs attention (manual control).
+                    "recovery": "recovered" if recovered else "unrecovered",
+                }
+            )
         return out
 
     def to_summary(self) -> dict:
@@ -730,7 +761,9 @@ class Session:
         for rnd in self.brainstorm.rounds:
             for p in rnd["personas"]:
                 key = p["name"]
-                entry = seen.setdefault(key, {"role": p["name"], "models": [], "count": 0})
+                entry = seen.setdefault(
+                    key, {"role": p["name"], "models": [], "count": 0}
+                )
                 entry["count"] += 1
                 if p["model"] not in entry["models"]:
                     entry["models"].append(p["model"])
@@ -755,7 +788,11 @@ def cluster_sessions(
         # single invocation whose individual call runs longer than `gap` is not split
         # into multiple sessions. `cur.ended` therefore tracks the max call end-time.
         same_task = cur is not None and (cur.task_code or "") == (call.task_code or "")
-        if cur is None or not same_task or (call.started - cur.ended).total_seconds() > gap_seconds:
+        if (
+            cur is None
+            or not same_task
+            or (call.started - cur.ended).total_seconds() > gap_seconds
+        ):
             cur = Session(
                 session_id=_session_id_for(call.started),
                 started=call.started,
@@ -801,7 +838,9 @@ def cluster_sessions(
     return sessions
 
 
-def load_sessions(log_dir_path: Path, gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS) -> list[Session]:
+def load_sessions(
+    log_dir_path: Path, gap_seconds: float = DEFAULT_SESSION_GAP_SECONDS
+) -> list[Session]:
     """Read every artifact in ``log_dir_path`` and return clustered sessions, newest first."""
     calls: list[CallLog] = []
     brainstorms: list[BrainstormLog] = []
@@ -1034,7 +1073,9 @@ def compute_stats(sessions: list[Session]) -> dict:
     running_calls = 0
     for s in sessions:
         by_mode[s.mode] = by_mode.get(s.mode, 0) + 1
-        by_day[s.started.date().isoformat()] = by_day.get(s.started.date().isoformat(), 0) + 1
+        by_day[s.started.date().isoformat()] = (
+            by_day.get(s.started.date().isoformat(), 0) + 1
+        )
         if s.task_code:
             by_task[s.task_code] = by_task.get(s.task_code, 0) + 1
             group = task_groups.setdefault(
@@ -1050,7 +1091,10 @@ def compute_stats(sessions: list[Session]) -> dict:
             )
             group["iterations"] += 1
             group["session_ids"].append(s.session_id)
-            if group["last_started"] is None or s.started.isoformat() > group["last_started"]:
+            if (
+                group["last_started"] is None
+                or s.started.isoformat() > group["last_started"]
+            ):
                 group["last_started"] = s.started.isoformat()
             group["modes"].add(s.mode)
         for m in s.models:
@@ -1076,6 +1120,7 @@ def compute_stats(sessions: list[Session]) -> dict:
             else:
                 ok_calls += 1
     durations.sort()
+
     def _pct(p: float) -> float | None:
         if not durations:
             return None
@@ -1098,7 +1143,9 @@ def compute_stats(sessions: list[Session]) -> dict:
         "running_calls": running_calls,
         # success_rate is over COMPLETED calls only (ok + error) — an in-flight / aborted
         # footerless call has no known outcome and must not drag the rate either way.
-        "success_rate": round(ok_calls / (ok_calls + error_calls), 4) if (ok_calls + error_calls) else None,
+        "success_rate": round(ok_calls / (ok_calls + error_calls), 4)
+        if (ok_calls + error_calls)
+        else None,
         "by_mode": by_mode,
         "by_model": by_model,
         "by_role": by_role,
@@ -1132,6 +1179,76 @@ def _normalize_body(text: str) -> str:
     (interior spaces gone), so a spaced `currently unavailable` match would miss it; we
     compare against the fully de-spaced form instead."""
     return re.sub(r"\s+", "", text).lower()
+
+
+# `_has_paywall_sentinel`'s cheap first check: `currently`/`unavailable` as two adjacent
+# WORDS with only whitespace between them (0+, so the fully-collapsed `currentlyunavailable`
+# rendering still matches) — a `re.search` for this is a literal-text scan with NO new
+# string built, unlike `_normalize_body`'s `re.sub(r"\s+", "", text)`, which allocates and
+# rewrites the ENTIRE body. `review-cli#186`'s token-burn investigation profiled
+# `classify_call` against this project's own real log_dir() (~7,000 calls/~760MB of body
+# text for a 7-day window) and found that `re.sub` — run on the FULL body of every call,
+# unconditionally, as `classify_call`'s very first check — was 20+ of a ~50 second report.
+# A first attempt at this prefilter searched for the single word "current" (no `unavailable`
+# adjacency) and barely moved the needle: these ARE code-review logs, so ~37% of real calls'
+# bodies contain "current" somewhere as ordinary prose/code (`current_user`, "the current
+# implementation", ...) — worse, that ~37% skews toward the LARGEST bodies (a call quoting a
+# huge diff is more likely to contain the word than a short one), so the prefilter let
+# through almost exactly the expensive tail it existed to filter out. The two-word phrase
+# is far more specific: 33 of 6,981 real calls (0.5%) in the same window.
+_PAYWALL_PREFILTER_RE = re.compile(r"currently\s*unavailable", re.IGNORECASE)
+
+
+def _has_paywall_sentinel(text: str) -> bool:
+    """`_PAYWALL_SENTINEL in _normalize_body(text)`, byte-for-byte — this is a perf
+    fast path, NEVER a truncation. `text` is always scanned in full on the slow path; the
+    fast path only decides whether that scan needs to run at all.
+
+    review-cli#186: an earlier version of this fast path CAPPED the body (classified a
+    truncated copy) on the assumption that a paywall/blocked/auth sentinel is always an
+    early, short administrative rejection — plausible for `claude`/Fable's immediate
+    reject, but FALSE on this project's own real `codex` logs: a codex call can stream a
+    long transcript (a large quoted diff, real analysis) and only THEN hit a session
+    sentinel at the very end, past any reasonable byte cap. Verified: capping at 20,000
+    bytes silently reclassified 7 genuinely-paywalled codex calls out of a real 7-day
+    window as `error`/`ok` — a report that's supposed to be the honest source of truth
+    for exactly this kind of failure pattern would have quietly lied. A substring
+    PRE-FILTER has no such risk: `_PAYWALL_SENTINEL` ("currentlyunavailable") can only
+    survive whitespace-collapse from a raw body where "currently" and "unavailable"
+    already appear as adjacent words (0+ whitespace between them, per
+    `_PAYWALL_PREFILTER_RE`) — the collapsing this project's loggers perform is strictly
+    INTER-word (see `_normalize_body`'s docstring), never splitting a word's own letters
+    apart — so for any body a real model/logger produces, this pre-filter changes
+    NOTHING about which calls classify as paywall (see the HONEST LIMITATION note below
+    for the narrow, unrealistic case where that stops holding); it only skips the
+    `re.sub` allocation for the (vast majority) case where the phrase isn't present
+    anywhere in the body at all. Covered against the exact whitespace-
+    collapse fixtures (spaced + fully-collapsed) in
+    `tests/test_dashboard.py::test_paywall_sentinel_prefilter_matches_normalize_body`,
+    and separately verified equal to the pre-fix (unfiltered) classification on this
+    project's own real 7-day log_dir() window during development.
+
+    HONEST LIMITATION (Opus review finding, round 3 — confirmed by direct reproduction,
+    not merely theoretical as an earlier round assumed): the equivalence above holds
+    for any body a real model/logger actually produces, but is NOT a mathematical
+    guarantee of the code itself. `_normalize_body` strips ALL whitespace, including
+    INTRA-word (`re.sub(r"\s+", "", text)` makes no inter/intra distinction — "loggers
+    only collapse inter-word whitespace" is an assumption about the INPUT text, not
+    something this function enforces), while `_PAYWALL_PREFILTER_RE` requires
+    "currently"/"unavailable" as literal contiguous tokens. A body containing unusual
+    intra-word whitespace (e.g. "curre ntly unavailable" — not a shape any real
+    provider response or this project's own loggers produce, but not something this
+    code can rule out either) makes the two diverge: the reference check reads it as a
+    paywall sentinel, this fast path does not. Bounded impact, matching this module's
+    other accepted-limitation notes: at most one call misclassified as `error`/`ok`
+    instead of `HEALTH_PAYWALL`, never a crash or systemic drift — pinned explicitly
+    (not silently) by
+    `test_paywall_sentinel_prefilter_intra_word_split_diverges_from_reference` in
+    `tests/test_dashboard.py`, so a reader sees the real boundary instead of trusting
+    an unverified "changes nothing" claim."""
+    if not _PAYWALL_PREFILTER_RE.search(text):
+        return False
+    return _PAYWALL_SENTINEL in _normalize_body(text)
 
 
 def _body_has_real_content(call: "CallLog") -> bool:
@@ -1177,7 +1294,7 @@ def classify_call(call: "CallLog") -> str:
     # Paywall: the body sentinel is authoritative even when EXIT is 0 (Fable returns 0 with
     # an "unavailable" body — the EXIT code lies, the body tells the truth). This is the only
     # check that must run on the EXIT-0 happy path, so it leads.
-    if _PAYWALL_SENTINEL in _normalize_body(call.body):
+    if _has_paywall_sentinel(call.body):
         return HEALTH_PAYWALL
     if call.timed_out or call.exit_code == 124:
         return HEALTH_TIMEOUT
@@ -1224,7 +1341,7 @@ def model_id_for_call(call: "CallLog") -> str:
         m = _CLAUDE_API_MODEL_RE.match(call.argv0)
         if m:
             return f"claude:{m.group('model')}"
-        if _PAYWALL_SENTINEL in _normalize_body(call.body):
+        if _has_paywall_sentinel(call.body):
             return _CLAUDE_FABLE_MODEL
         return _CLAUDE_OPUS_MODEL
     if backend == "codex":
@@ -1308,7 +1425,12 @@ def _fallback_seat_for(model_id: str) -> dict | None:
             nxt = board[idx + 1] if idx + 1 < len(board) else None
             if nxt is None:
                 return None
-            return {"model": nxt["model"], "display": nxt["display"], "role": nxt["role"], "priority": nxt["priority"]}
+            return {
+                "model": nxt["model"],
+                "display": nxt["display"],
+                "role": nxt["role"],
+                "priority": nxt["priority"],
+            }
     return None
 
 
@@ -1323,16 +1445,23 @@ def _dominant_class(classes: list[str]) -> str | None:
             counts[c] = counts.get(c, 0) + 1
     if not counts:
         return None
+
     # Sort by frequency desc, then by hard-unavailable precedence, then name for stability.
     def _rank(item: tuple[str, int]) -> tuple[int, int, str]:
         cls, n = item
-        hard = HARD_UNAVAILABLE_CLASSES.index(cls) if cls in HARD_UNAVAILABLE_CLASSES else len(HARD_UNAVAILABLE_CLASSES)
+        hard = (
+            HARD_UNAVAILABLE_CLASSES.index(cls)
+            if cls in HARD_UNAVAILABLE_CLASSES
+            else len(HARD_UNAVAILABLE_CLASSES)
+        )
         return (-n, hard, cls)
 
     return sorted(counts.items(), key=_rank)[0][0]
 
 
-def _model_is_problematic(ok_rate: float | None, classes_newest_first: list[str], current_class: str | None) -> bool:
+def _model_is_problematic(
+    ok_rate: float | None, classes_newest_first: list[str], current_class: str | None
+) -> bool:
     """A model is problematic when ANY of:
       * it is currently in a hard-unavailable class (paywall/auth/blocked) — down NOW;
       * its fail-rate over the window meets/exceeds PROBLEMATIC_FAIL_RATE;
@@ -1344,7 +1473,9 @@ def _model_is_problematic(ok_rate: float | None, classes_newest_first: list[str]
     if ok_rate is not None and (1.0 - ok_rate) >= PROBLEMATIC_FAIL_RATE:
         return True
     recent = classes_newest_first[:PROBLEMATIC_RECENT_N]
-    if len(recent) >= PROBLEMATIC_RECENT_N and all(c in FAILURE_CLASSES for c in recent):
+    if len(recent) >= PROBLEMATIC_RECENT_N and all(
+        c in FAILURE_CLASSES for c in recent
+    ):
         return True
     return False
 
@@ -1401,18 +1532,20 @@ def compute_model_health(sessions: list[Session]) -> dict:
             status = (dominant or HEALTH_ERROR) if problematic else HEALTH_OK
         if problematic and on_board:
             problematic_count += 1
-        models_out.append({
-            "model": mid,
-            "display": meta["display"] if meta else mid,
-            "role": meta["role"] if meta else None,
-            "on_board": on_board,
-            "calls": total,
-            "ok": ok,
-            "fail": fail,
-            "ok_rate": ok_rate,
-            "current_class": current,
-            "dominant_class": dominant,
-            "status": status,
-            "problematic": problematic,
-        })
+        models_out.append(
+            {
+                "model": mid,
+                "display": meta["display"] if meta else mid,
+                "role": meta["role"] if meta else None,
+                "on_board": on_board,
+                "calls": total,
+                "ok": ok,
+                "fail": fail,
+                "ok_rate": ok_rate,
+                "current_class": current,
+                "dominant_class": dominant,
+                "status": status,
+                "problematic": problematic,
+            }
+        )
     return {"models": models_out, "problematic_count": problematic_count}

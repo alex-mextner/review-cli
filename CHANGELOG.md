@@ -5,6 +5,25 @@ semantic versioning.
 
 ## Unreleased
 
+- **`review stat` — per-harness/per-model usage + health report, and two concrete
+  token-burn fixes (2026-08 investigation).** `review stat` (`--days`, `--since`,
+  `--top`, `--harness`, `--json`) parses the real per-call logs into a per-backend
+  breakdown (calls/ok/fail, a byte-size proxy for every harness, **real** token counts
+  for the REST backends that emit them, SKILL.md/MEMORY.md context-pollution rate), the
+  Fable (priority-1 board seat) dispatch/failure pattern, retry/promotion totals, and
+  the largest individual calls recorded — see `reviewlib/dashboard/tokenstats.py` and
+  the README's `review stat` section. Two concrete causes the investigation evidenced
+  are now fixed at the source, not just measured: (1) a dispatch-time diff-size cap
+  (`reviewlib.backends.cap_diff_for_dispatch`, default 300,000 bytes,
+  `$REVIEW_DIFF_MAX_BYTES`) truncates an oversized diff before it reaches any backend —
+  a real 6.5MB/583-file diff was previously sent whole to every board seat every round;
+  the canonical diff used by `--commit`'s checkpoint integrity check stays uncapped, and
+  a piped diff is never capped. (2) A cross-invocation cooldown cache
+  (`reviewlib/seat_cooldown.py`) stops the chronically-unavailable Fable seat from
+  paying for one full real dispatch on every single invocation — 4,322 of 6,383
+  recorded runs dispatched Fable and it failed, most with an explicit session-limit
+  notice; a later invocation within the cooldown window now skips the real dispatch and
+  returns the same sentinel shape every downstream consumer already recognizes.
 - **New `omp:` backend — Oh My Pi agentic read-only seats (review-cli#174).** A board or
   `-m` seat spelled `omp:<provider>/<model>` (e.g. `omp:kimi-code/k3`) now routes to a
   first-class omp backend instead of falling through to the opencode catch-all. The seat
