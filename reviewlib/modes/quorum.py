@@ -77,6 +77,29 @@ def mode_quorum(
         "Do not edit files or run commands.\n\n"
         f"QUESTION:\n{question}" + _diff_context_block(dispatch_diff)
     )
+    # `models` can contain the SAME model more than once (reviewlib.config's
+    # reuse-aware panel padding, Alex 2026-08-18 — see cli.py's
+    # `expand_flat_models_with_reuse` wiring): when a distinct-model pool is
+    # scarce or some models are near their usage limit, one model fills
+    # several seats instead of shrinking the panel. Label each REPEATED
+    # occurrence "<model>#N" (via PanelJob.label, which `run_panel` uses to
+    # relabel the result) so the transcript and moderator can tell them apart
+    # — without this, two identical "### Expert: fable" blocks read as two
+    # INDEPENDENT opinions, silently double-weighting one account's answer in
+    # the moderator's own "majority of experts" judgement.
+    _seat_counts: dict[str, int] = {}
+    labels: list[str | None] = []
+    for model in models:
+        _seat_counts[model] = _seat_counts.get(model, 0) + 1
+        labels.append(None)
+    has_duplicates = any(n > 1 for n in _seat_counts.values())
+    if has_duplicates:
+        _seen: dict[str, int] = {}
+        for i, model in enumerate(models):
+            if _seat_counts[model] > 1:
+                _seen[model] = _seen.get(model, 0) + 1
+                labels[i] = f"{model}#{_seen[model]}"
+
     jobs = [
         PanelJob(
             model=model,
@@ -84,8 +107,9 @@ def mode_quorum(
             diff="",
             images=visual_images,
             effort=_run_effort(effort_override, model),
+            label=labels[i],
         )
-        for model in models
+        for i, model in enumerate(models)
     ]
     expert_results = run_panel(jobs, cwd, timeout)
     # glm-5.2 review finding (2026-08 seat-cooldown feature): `run_panel`'s own
@@ -100,6 +124,19 @@ def mode_quorum(
         f"{(r.stdout.strip() or r.stderr.strip() or '(no output)')}"
         for r in expert_results
     )
+    duplicate_note = (
+        # Deliberately silent on WHY the panel has duplicates (scarcity/usage-limit
+        # padding vs an explicit `-m fable,fable` request both reach this same
+        # code path) — asserting a specific cause here would be a claim this
+        # function can't verify (Fable review finding, review-cli#205 round 3).
+        "\n\nNOTE: this panel contains one or more models on multiple seats "
+        "(labelled `<model>#1`, `<model>#2`, ...). Treat ALL seats sharing one "
+        "model (e.g. `fable#1` and `fable#2` together) as a SINGLE opinion for "
+        "majority-counting purposes — do NOT count a repeated model's agreement "
+        "with itself as extra weight toward QUORUM."
+        if has_duplicates
+        else ""
+    )
     mod_prompt = (
         "You are the MODERATOR of an expert panel. Below are independent expert answers to "
         "one question. Produce a structured summary with exactly these sections:\n"
@@ -107,7 +144,8 @@ def mode_quorum(
         "(state the point, who agrees, and the evidence).\n"
         "2. DISAGREEMENT / NO QUORUM — points where experts conflict or no majority exists.\n"
         "3. ABSTAINED — experts who said INSUFFICIENT EVIDENCE, and on what.\n"
-        "Do not invent agreement. Do not edit files.\n\n"
+        "Do not invent agreement. Do not edit files."
+        f"{duplicate_note}\n\n"
         f"QUESTION:\n{question}\n\n=== EXPERT ANSWERS ===\n{transcript}"
     )
     # No `diff=` here — pre-existing (not something this diff-cap feature changed): the
