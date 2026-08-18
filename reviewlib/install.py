@@ -10,6 +10,7 @@ instruction file; and an idempotent SessionStart hook that surfaces every
 installed agent-CLI at the top of each session. `install-commit-hook` adds the
 optional hard review-before-commit gate.
 """
+
 from __future__ import annotations
 
 import json
@@ -227,9 +228,9 @@ SKILL_BLURB = (
     "`review` — multi-model read-only code review + AI panels "
     "(codex/claude/gemini/opencode). Modes are SUBCOMMANDS (the verb leads; -C follows): "
     "`review diff --task CODE -C <repo>` (diff review), "
-    "`review quorum \"Q\" --task CODE -C <repo>`, "
-    "`review brainstorm \"topic\" --task CODE -C <repo>`, "
-    "`review just-ask \"Q\" --task CODE -C <repo>`. "
+    '`review quorum "Q" --task CODE -C <repo>`, '
+    '`review brainstorm "topic" --task CODE -C <repo>`, '
+    '`review just-ask "Q" --task CODE -C <repo>`. '
     "A bare `review` prints HELP — the diff review is `review diff` (NOT a bare "
     "`review`); the old --quorum/--brainstorm/--just-ask flags were removed. "
     "Always pass -C <project-root>. Always pass --task CODE (or set REVIEW_TASK_CODE) for "
@@ -243,9 +244,9 @@ SKILL_BLURB = (
 
 _HOOK_MARKER = "# agent-tools-awareness"
 _HOOK_COMMAND = (
-    "sh -c 'd=\"$HOME/.agents/skills/.blurbs\"; ls \"$d\"/*.md >/dev/null 2>&1 && "
-    '{ printf \"Agent CLI tools installed on this machine (prefer them):\\n\"; '
-    "cat \"$d\"/*.md; }' " + _HOOK_MARKER
+    'sh -c \'d="$HOME/.agents/skills/.blurbs"; ls "$d"/*.md >/dev/null 2>&1 && '
+    '{ printf "Agent CLI tools installed on this machine (prefer them):\\n"; '
+    'cat "$d"/*.md; }\' ' + _HOOK_MARKER
 )
 
 
@@ -262,6 +263,7 @@ def _append_marked(path, tool: str, blurb: str) -> bool:
     CHANGED (newly added or the block content differs), False if it was already up to date —
     so the caller can report "already configured" vs "updated" (install-* INSTALLED state)."""
     import re
+
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     start, end = f"<!-- skill:{tool} -->", f"<!-- /skill:{tool} -->"
@@ -273,7 +275,9 @@ def _append_marked(path, tool: str, blurb: str) -> bool:
     # a crash (glm review). OUR-generated files go through `_write_if_changed`, which safely
     # rewrites an undecodable file because we own its content.
     before = p.read_text(encoding="utf-8") if p.exists() else ""
-    existing = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"\n?", "", before, flags=re.S)
+    existing = re.sub(
+        re.escape(start) + r".*?" + re.escape(end) + r"\n?", "", before, flags=re.S
+    )
     block = f"{start}\n{blurb}\n{end}\n"
     after = (existing.rstrip() + "\n\n" + block) if existing.strip() else block
     if after == before:
@@ -331,7 +335,11 @@ def _ensure_sessionstart_hook(home) -> bool:
     try:
         # (OSError, ValueError) also covers UnicodeDecodeError (a non-UTF-8 settings.json) and
         # JSONDecodeError — degrade to "could not write" rather than crash (glm review).
-        data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
+        data = (
+            json.loads(settings.read_text(encoding="utf-8"))
+            if settings.exists()
+            else {}
+        )
     except (OSError, ValueError):
         return False
     if not isinstance(data, dict):
@@ -348,7 +356,9 @@ def _ensure_sessionstart_hook(home) -> bool:
                 return False
     sessionstart.append({"hooks": [{"type": "command", "command": _HOOK_COMMAND}]})
     if settings.exists():
-        settings.with_suffix(".json.bak").write_text(settings.read_text(encoding="utf-8"), encoding="utf-8")
+        settings.with_suffix(".json.bak").write_text(
+            settings.read_text(encoding="utf-8"), encoding="utf-8"
+        )
     settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return True
 
@@ -380,7 +390,9 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
     home = Path.home()
     # (label, changed?) per target — `changed` False == already-configured.
     results: list[tuple[str, bool]] = []
-    conflicts: list[str] = []  # targets we could NOT configure (left as-is) — block "nothing to do"
+    conflicts: list[
+        str
+    ] = []  # targets we could NOT configure (left as-is) — block "nothing to do"
 
     def _write_target(path: Path, content: str) -> None:
         # A write that fails (read-only FS, ENOSPC, EPERM, immutable flag) must become a
@@ -390,7 +402,9 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
         try:
             results.append((str(path), _write_if_changed(path, content)))
         except (OSError, ValueError) as exc:
-            conflicts.append(f"{path} could not be written ({exc}) — fix permissions and re-run")
+            conflicts.append(
+                f"{path} could not be written ({exc}) — fix permissions and re-run"
+            )
 
     skill_dir = home / ".agents" / "skills" / name
     _write_target(skill_dir / "SKILL.md", skill_md)
@@ -420,8 +434,12 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
             ):
                 results.append((str(link), False))  # correct symlink already present
             else:
-                target_desc = "an unreadable target" if points_at is None else f"{points_at}"
-                conflicts.append(f"{link} is a symlink to {target_desc} (expected {want})")
+                target_desc = (
+                    "an unreadable target" if points_at is None else f"{points_at}"
+                )
+                conflicts.append(
+                    f"{link} is a symlink to {target_desc} (expected {want})"
+                )
         elif link.exists():
             # A regular file/dir occupies the path (is_symlink already handled all symlinks,
             # incl. dangling ones, above).
@@ -439,7 +457,11 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
     harness_files = [
         ("claude", home / ".claude" / "CLAUDE.md", ("~/.claude",)),
         ("codex", home / ".codex" / "AGENTS.md", ("~/.codex",)),
-        ("opencode", home / ".config" / "opencode" / "AGENTS.md", ("~/.config/opencode",)),
+        (
+            "opencode",
+            home / ".config" / "opencode" / "AGENTS.md",
+            ("~/.config/opencode",),
+        ),
         ("gemini", home / ".gemini" / "GEMINI.md", ("~/.gemini",)),
     ]
     for cmd, path, dirs in harness_files:
@@ -452,7 +474,9 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
                 # — never overwritten (data loss) and never a mid-loop crash that strands later
                 # targets. Record a conflict so the run exits non-zero and tells the user to
                 # fix the file (glm review: honor the `! conflict` contract for this case too).
-                conflicts.append(f"{path} is not readable as UTF-8 ({exc}) — left as-is, fix it manually")
+                conflicts.append(
+                    f"{path} is not readable as UTF-8 ({exc}) — left as-is, fix it manually"
+                )
 
     if (home / ".claude").is_dir():
         # _ensure_sessionstart_hook returns True if it ADDED the hook, False if already there
@@ -492,18 +516,24 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
     if conflicts:
         # A conflict means a target is NOT configured — never say "nothing to do" / done.
         # Return non-zero so a caller/script sees the install is incomplete (codex review).
-        print(f"{name}: install-skill — {changed} updated, "
-              f"{len(results) - changed} already configured, "
-              f"{len(conflicts)} CONFLICT(S) left unconfigured. Resolve the conflict(s) "
-              "above and re-run.")
+        print(
+            f"{name}: install-skill — {changed} updated, "
+            f"{len(results) - changed} already configured, "
+            f"{len(conflicts)} CONFLICT(S) left unconfigured. Resolve the conflict(s) "
+            "above and re-run."
+        )
         return 1
     if changed == 0:
-        print(f"{name}: install-skill — already configured, nothing to do "
-              f"({len(results)} target(s) ✓). Idempotent; re-run anytime.")
+        print(
+            f"{name}: install-skill — already configured, nothing to do "
+            f"({len(results)} target(s) ✓). Idempotent; re-run anytime."
+        )
     else:
-        print(f"{name}: install-skill done — {changed} updated, "
-              f"{len(results) - changed} already configured ({len(results)} target(s)). "
-              "Idempotent; re-run anytime.")
+        print(
+            f"{name}: install-skill done — {changed} updated, "
+            f"{len(results) - changed} already configured ({len(results)} target(s)). "
+            "Idempotent; re-run anytime."
+        )
     return 0
 
 
@@ -518,9 +548,165 @@ _PRECOMMIT_MARKER = "# review-before-commit-gate"
 # `command git` bypasses shell aliases/functions (e.g. an rtk-style wrapper that rewrites
 # `git diff` output) so the hash matches the one written by review-cli, which calls the
 # real git binary via subprocess directly.
-_PRECOMMIT = """\
+#
+# review-cli#208: the exact-hash check above has zero tolerance -- restaging after even a
+# one-line follow-up produces a different hash and used to force a brand-new full
+# multi-model review round every time. This block runs ONLY on an exact-hash MISS and
+# tolerates a SMALL trailing delta against the last diff that was actually reviewed,
+# instead of requiring a byte-for-byte match. `review diff --staged`
+# (`_write_review_stamp` below) writes that reviewed diff's raw TEXT to a companion
+# `review-stamp-diff` file alongside the hash stamp; this block re-diffs the CURRENT
+# staged diff against that stored text (`diff -U0`, symmetric add+remove line count) and
+# allows the commit without dispatching a fresh review when the count is within
+# `$REVIEW_TRIVIAL_DELTA_LINES` (default 10).
+#
+# The outer `diff -U0` always emits EXACTLY two header lines (`--- old` / `+++ new`)
+# before its first `@@` hunk, so those two lines are dropped positionally (`tail -n +3`),
+# NOT by matching their `+`/`-` prefix textually -- the diff TEXT being compared is itself
+# a unified diff whose every real content line already starts with `+`/`-`, so a
+# second-character content match (an earlier, broken version of this block used
+# `grep -c '^[+-][^+-]'`) would misfire: it happens to also exclude a genuinely-changed
+# outer line whenever the underlying reviewed line itself starts with `+`/`-` -- which is
+# effectively ALWAYS true for diff content, undercounting real drift to near zero
+# (caught by this feature's own `test_substantive_change_after_same_baseline_is_still_blocked`
+# test, which a naive second-character filter passed through as "trivial"). Skipping a
+# fixed line COUNT instead of pattern-matching content sidesteps that collision entirely.
+#
+# Two more counting pitfalls, both caught by genuine review of this feature's own PR
+# (review task REVIEW-208):
+#   * GLM-cc-last [Medium-High]: without excluding it, the `index <old>..<new>` metadata
+#     line changes for EVERY touched file (always +2 to the outer delta) and every
+#     `@@ -a,b +c,d @@` hunk header downstream of a length-changing edit shifts too (+2 per
+#     shifted hunk) -- so a genuine one-line insertion in a file that already has several
+#     hunks could exceed the threshold and force a full review anyway, defeating the whole
+#     point. `index `/`@@ ` lines are pure diff-generation artifacts, not real content
+#     drift, so they are excluded from the count (`grep -Ecv '^[+-](@@ |index )'`).
+#   * k3 [Security]: binary/gitlink content is invisible to a line-count ruler -- a swapped
+#     binary shows only a 2-line `index` change (or zero, if the reviewed diff already had
+#     an identical "Binary files ... differ" line) and a submodule bump shows 2
+#     `Subproject commit` lines, regardless of how large or opaque the real change is. This
+#     block fails CLOSED (skips the fast path entirely, falls through to the block message)
+#     whenever either the reviewed baseline or the current diff contains `Binary files ...
+#     differ` or a `[+-]Subproject commit <sha>` line -- an unmeasurable delta is never
+#     "trivial". (The sha is required in the pattern, not a bare `Subproject commit` prefix
+#     -- round-5, below -- so ordinary prose that happens to start with those two words
+#     can't force a spurious fail-closed on an unrelated file.)
+#   * round-2 finding: a MODIFIED line always appears in the outer diff-of-diffs as a
+#     `-oldcontent`/`+newcontent` PAIR (the old text is removed, the new text is added), so a
+#     raw `+`/`-` line count doubles every genuinely-edited line -- `REVIEW_TRIVIAL_DELTA_LINES`
+#     documented (README/CHANGELOG/--help) and was meant to mean "N edited lines" but the
+#     code actually measured "N raw diff lines", roughly 2x the edited-line count for the
+#     common in-place-edit case. Fixed by counting ADDED and REMOVED lines SEPARATELY and
+#     taking `changed = max(added, removed)`, not a naive `raw / 2`: for a balanced
+#     modification (a lines removed, a lines added) `max(a, a) == a`, correctly reporting `a`
+#     edited lines instead of `2a` raw ones -- but for a PURE insertion or deletion (only one
+#     side present, e.g. inserting k brand-new lines with nothing removed) `max(0, k) == k`
+#     stays exact, whereas `raw / 2 == k / 2` would silently DOUBLE the effective tolerance
+#     for pure insertions/deletions (a k-line unreviewed addition would only cost k/2 against
+#     the threshold) -- a real loosening a naive halving would introduce, verified empirically
+#     (a k-line pure insertion after a reviewed baseline raw-counts as exactly k, not 2k, so
+#     halving it would undercount). `max()` matches the documented "N edited lines" meaning
+#     in the common case and never undercounts the size of an unreviewed pure add/remove.
+#   * round-3 finding (Opus + Fable, independently, same PR): the `index `/`@@ ` exclusion
+#     covers a length-changing edit inside an ALREADY-TOUCHED file, but not a follow-up that
+#     adds, deletes, or renames a WHOLE file -- that introduces MORE pure diff-generation
+#     lines that were not excluded: `diff --git a/x b/x`, `--- `/`+++ ` (esp. `--- /dev/null`
+#     for a new file or `+++ /dev/null` for a deletion), `new file mode `/`deleted file mode
+#     `/`old mode `/`new mode `, and `rename from/to `/`copy from/to `/`similarity index
+#     `/`dissimilarity index ` for renames/copies. Left unexcluded, a small brand-new file
+#     (e.g. 3 real lines) could raw-count as ~7 (the metadata lines plus the content),
+#     tipping past the default threshold and forcing a full review for exactly the trivial
+#     case this feature exists to accept. Direction was always SAFE (over-counts, never
+#     under -- no unreviewed change could slip through undercounted), so this was a
+#     correctness-vs-intent gap, not a security hole; fixed by extending the exclusion list
+#     to cover all of the above, same treatment as `index `/`@@ `.
+#   * round-4 finding (Opus, next round, on the round-3 fix itself) [Security -- undercount]:
+#     a bare `--- `/`+++ ` exclusion (round-3's fix, above) is UNSAFE, unlike every other
+#     entry in this list. `index `, `diff --git `, `old mode `, etc. can only ever match a
+#     genuine header line, because a real CONTENT line's full outer-diff text is always
+#     <outer +/-><inner +/-/space><source text>, and the inner marker can never spell out
+#     those words' first letters. But `--- `/`+++ ` are each 3 repeats of a character that
+#     IS itself a valid inner marker (`-`/`+`) -- so a REMOVED source line whose own text
+#     starts with `-- ` (SQL/Lua/Haskell line-comment syntax, e.g. `-- explanation`) renders
+#     in git-diff as `--- explanation` (git's own `-` marker + the source's leading `-- `),
+#     and if that removal is new in the current diff, the OUTER diff-of-diffs shows it as
+#     `+--- explanation` -- which the bare `--- ` pattern wrongly excludes as "just a file
+#     header", undercounting a REAL unreviewed deletion. (Symmetrically for `++ `-prefixed
+#     added content colliding with `+++ `.) This is the one direction this whole mechanism
+#     must never take: a small enough series of such lines makes `changed` read 0 for a
+#     real, unreviewed change, and the gate `exit 0`s it through unreviewed. Fixed by
+#     anchoring both patterns to the ACTUAL header shapes git emits -- `--- a/`, `---
+#     /dev/null`, `+++ b/`, `+++ /dev/null` -- which a plain `-- `/`++ `-prefixed content
+#     line cannot spell (it would need to literally start with `a/` or `/dev/null` right
+#     after the two extra dashes/pluses, astronomically narrower than the bare-prefix
+#     collision, and in the same accepted-risk class as the pre-existing `index `/`@@ `
+#     collision risk this codebase already tolerates). A header that fails to match the
+#     tightened pattern (e.g. a git-quoted path with spaces) just falls through to being
+#     COUNTED -- safe/conservative, not a new bypass.
+#   * round-5 finding (Opus, on this feature's own PR, reviewing rounds 1-4 together)
+#     [Security -- unbounded undercount]: `old mode `/`new mode `/`rename from `/`rename
+#     to `/`copy from `/`copy to `/`similarity index ` are pure diff-generation metadata,
+#     same class as `index `/`@@ ` (round-1's own exclusion) -- but unlike a metadata line
+#     attached to a real content edit, a PURE mode change or a 100%-similarity rename has
+#     NO content hunk at all: `git diff` emits ONLY `diff --git `+ one or two of those
+#     excluded lines, nothing else. So `changed` reads exactly 0 no matter how many files
+#     are touched this way -- `chmod +x` on an arbitrary number of scripts, or renaming an
+#     arbitrary number of files, is UNBOUNDED by the threshold and sails through unreviewed
+#     every time, not just when small (verified empirically: 5 unreviewed `chmod +x`
+#     follow-ups on a reviewed baseline pass at `REVIEW_TRIVIAL_DELTA_LINES=2`). This breaks
+#     the block's own core premise (a SIZE heuristic bounded by `threshold`) for this one
+#     line-type family, the same "unmeasurable by line count" failure class the k3 binary/
+#     gitlink fail-closed pre-check (above) already exists to reject -- so fixed the same
+#     way, not by trying to count mode/rename lines (they have no natural size unit): the
+#     fail-closed pre-check now ALSO fires whenever either diff contains an `old mode `/`new
+#     mode `/`rename from `/`rename to `/`copy from `/`copy to ` line, forcing a full review
+#     instead of silently passing. A rename or mode change that also touches real content
+#     (an actual hunk) now costs one full review it might not strictly have needed --
+#     safe/conservative, same tradeoff already accepted for `Subproject commit`/binary.
+#
+# This is a SIZE heuristic, not a semantic one -- a small but security-critical one-line
+# edit gets the same pass as a typo fix. That trade-off is deliberate and matches
+# review-cli#208's own filed acceptance criteria (a configurable line-count threshold).
+# The baseline is NEVER advanced by this block itself (it only reads review-stamp-diff,
+# never writes it) -- only a real `review diff --staged` pass moves the baseline forward,
+# so drift is always measured from the last GENUINE review, not a sliding window where
+# many small unreviewed commits could add up to something large. Sizing the threshold to
+# 0 (`REVIEW_TRIVIAL_DELTA_LINES=0`) disables this block entirely and restores today's
+# exact-hash-only behavior -- the default for any stamp that predates this feature (no
+# review-stamp-diff file -> the `-f "$stamp_diff"` check below is false -> falls straight
+# through to the block message, unchanged from before this feature existed).
+_TRIVIAL_DELTA_BLOCK = """\
+threshold="${REVIEW_TRIVIAL_DELTA_LINES:-10}"
+case "$threshold" in ''|*[!0-9]*) threshold=10 ;; esac
+if [ "$threshold" -gt 0 ]; then
+  stamp_diff=$(command git rev-parse --git-path review-stamp-diff)
+  if [ -f "$stamp_diff" ]; then
+    cur_tmp=$(mktemp 2>/dev/null) && trap 'rm -f "$cur_tmp"' EXIT
+    if [ -n "$cur_tmp" ]; then
+      command git diff --no-ext-diff --cached > "$cur_tmp"
+      if ! grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$stamp_diff" "$cur_tmp" 2>/dev/null; then
+        diff_out=$(diff -U0 "$stamp_diff" "$cur_tmp" 2>/dev/null)
+        diff_rc=$?
+        if [ "$diff_rc" -le 1 ]; then
+          content=$(printf '%s\\n' "$diff_out" | tail -n +3 | grep -Ev '^[+-](@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
+          added=$(printf '%s\\n' "$content" | grep -c '^+')
+          removed=$(printf '%s\\n' "$content" | grep -c '^-')
+          changed=$added
+          [ "$removed" -gt "$changed" ] && changed=$removed
+          if [ "$changed" -le "$threshold" ] 2>/dev/null; then
+            exit 0
+          fi
+        fi
+      fi
+    fi
+  fi
+fi"""
+_PRECOMMIT = (
+    """\
 #!/bin/sh
-""" + _PRECOMMIT_MARKER + """ (installed by `review install-commit-hook`)
+"""
+    + _PRECOMMIT_MARKER
+    + """ (installed by `review install-commit-hook`)
 # Blocks a commit whose staged diff has not been reviewed. Bypass with
 # REVIEW_SKIP=1 git commit ...   or   git commit --no-verify
 root=$(command git rev-parse --show-toplevel 2>/dev/null) || exit 0
@@ -539,11 +725,16 @@ fi
 h=$(command git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
 stamp=$(command git rev-parse --git-path review-stamp)
 if [ -f "$stamp" ] && grep -q "$h" "$stamp"; then exit 0; fi
+
+"""
+    + _TRIVIAL_DELTA_BLOCK
+    + """
 echo "review-before-commit: staged changes have not been reviewed." >&2
 echo "  run:  review diff --staged --task TASK-CODE      (then commit)" >&2
 echo "  skip: REVIEW_SKIP=1 git commit ...   |   git commit --no-verify" >&2
 exit 1
 """
+)
 
 
 def _write_review_stamp(cwd: Path, diff: str) -> None:
@@ -555,14 +746,22 @@ def _write_review_stamp(cwd: Path, diff: str) -> None:
     stripped (`git_repo_env`), matching the diff probe in cli._git_diff: a leaked
     GIT_DIR/GIT_WORK_TREE must not write the stamp into an UNRELATED repo while the diff was
     read from `cwd`. The stamp and the diff it stamps stay anchored to the SAME `-C` repo
-    (the #18 stamp/tool alignment, kept under the #71 env-leak fix)."""
+    (the #18 stamp/tool alignment, kept under the #71 env-leak fix).
+
+    Also writes the `review-stamp-diff` companion (review-cli#208) so the pre-commit
+    gate's trivial-follow-up tolerance (`_TRIVIAL_DELTA_BLOCK`) has a reviewed-diff
+    baseline to measure drift against."""
     import hashlib
 
     from .process import git_repo_env
+
     try:
         p = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--git-path", "review-stamp"],
-            cwd=cwd, env=git_repo_env(cwd), capture_output=True, text=True,
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            capture_output=True,
+            text=True,
         )
         if p.returncode != 0:
             return
@@ -570,6 +769,34 @@ def _write_review_stamp(cwd: Path, diff: str) -> None:
         stamp = Path(rel) if os.path.isabs(rel) else Path(cwd) / rel
         digest = hashlib.sha256(diff.encode("utf-8")).hexdigest()
         stamp.write_text(f"{digest}\n", encoding="utf-8")
+    except Exception:
+        return
+    _write_review_stamp_diff(cwd, diff)
+
+
+def _write_review_stamp_diff(cwd: Path, diff: str) -> None:
+    """Companion to `_write_review_stamp` (review-cli#208): persist the RAW reviewed diff
+    TEXT (not just its hash) next to the hash stamp, so the pre-commit gate can tolerate a
+    small trailing follow-up instead of requiring an exact byte-for-byte restage match on
+    every commit. Best-effort, like `_write_review_stamp` itself -- a failure here must
+    never break a review or the exact-hash stamp it accompanies; it only means the gate's
+    delta-tolerance fast path stays unavailable (falls back to exact-hash-only, same as
+    before this feature existed)."""
+    from .process import git_repo_env
+
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--git-path", "review-stamp-diff"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            capture_output=True,
+            text=True,
+        )
+        if p.returncode != 0:
+            return
+        rel = p.stdout.strip()
+        stamp_diff = Path(rel) if os.path.isabs(rel) else Path(cwd) / rel
+        stamp_diff.write_text(diff, encoding="utf-8")
     except Exception:
         pass
 
@@ -650,7 +877,10 @@ def resolve_tg_cli_source(configured: str | None = None) -> Path:
     # (source label, raw value) — pairs so the error message attributes a bad path to
     # where it ACTUALLY came from (an explicit `configured` arg vs. the env var), not
     # always the env var name regardless of origin (review found).
-    for label, raw in (("configured", configured), ("REVIEW_TG_CLI_SOURCE", os.environ.get("REVIEW_TG_CLI_SOURCE"))):
+    for label, raw in (
+        ("configured", configured),
+        ("REVIEW_TG_CLI_SOURCE", os.environ.get("REVIEW_TG_CLI_SOURCE")),
+    ):
         if raw:
             p = Path(os.path.expanduser(raw)).resolve()
             if not _looks_like_tg_cli_checkout(p):
@@ -706,7 +936,10 @@ def _load_source_descriptor(src_descriptor: Path) -> tuple[dict | None, str | No
         )
     on_error = spec.get("on_error")
     if on_error is not None and on_error not in ("open", "closed"):
-        return None, f"descriptor at {src_descriptor} has on_error={on_error!r} (must be 'open' or 'closed')"
+        return (
+            None,
+            f"descriptor at {src_descriptor} has on_error={on_error!r} (must be 'open' or 'closed')",
+        )
     return spec, None
 
 
@@ -744,7 +977,9 @@ def _clear_stale_local_copy(target_dir: Path, script_name: str) -> tuple[bool, b
     non-idempotent paths, wrote_descriptor and warned_non_executable)."""
     local_copy = target_dir / script_name
     if local_copy.is_symlink():
-        if local_copy.exists():  # `exists()` follows the link — True here means it resolves
+        if (
+            local_copy.exists()
+        ):  # `exists()` follows the link — True here means it resolves
             return False, False  # a working symlink; leave it alone
         label, note = "broken symlink", "dangling; cmd points at the source checkout"
     elif local_copy.exists():
@@ -756,7 +991,9 @@ def _clear_stale_local_copy(target_dir: Path, script_name: str) -> tuple[bool, b
         print(f"  - removed {label}  {local_copy} ({note})")
         return True, False
     except OSError as exc:
-        print(f"      (warning: could not remove {label} {local_copy}: {exc} — harmless, the hook doesn't read it)")
+        print(
+            f"      (warning: could not remove {label} {local_copy}: {exc} — harmless, the hook doesn't read it)"
+        )
         return False, True
 
 
@@ -792,11 +1029,17 @@ def install_hook_tg() -> int:
     except OSError as exc:
         print(f"  ! conflict  {target_descriptor} could not be written ({exc})")
         return 1
-    print(f"  {'+ wrote/updated' if wrote_descriptor else '✓ already configured'}  {target_descriptor}")
+    print(
+        f"  {'+ wrote/updated' if wrote_descriptor else '✓ already configured'}  {target_descriptor}"
+    )
     print(f"      cmd -> {spec['cmd']}")
-    print(f"      (sourced live from {source}; `git pull` there resyncs the hook — no re-install needed)")
+    print(
+        f"      (sourced live from {source}; `git pull` there resyncs the hook — no re-install needed)"
+    )
 
-    removed_stale_copy, warned_stale_removal = _clear_stale_local_copy(target_dir, _TG_HOOK_SCRIPT_NAME)
+    removed_stale_copy, warned_stale_removal = _clear_stale_local_copy(
+        target_dir, _TG_HOOK_SCRIPT_NAME
+    )
 
     # "nothing to do" is only true when NOTHING changed and nothing needs attention — a
     # rewritten descriptor, a removed stale copy, a failed-but-harmless removal attempt, or a
@@ -804,11 +1047,17 @@ def install_hook_tg() -> int:
     # do" (review found: each of these could previously print a real action/warning right
     # above a contradicting "nothing to do" line).
     if wrote_descriptor or removed_stale_copy:
-        print(f"review: install-hook tg — done. Descriptor points at {source}. Idempotent; re-run anytime.")
+        print(
+            f"review: install-hook tg — done. Descriptor points at {source}. Idempotent; re-run anytime."
+        )
     elif warned_non_executable or warned_stale_removal:
-        print("review: install-hook tg — descriptor already configured, but see the warning above.")
+        print(
+            "review: install-hook tg — descriptor already configured, but see the warning above."
+        )
     else:
-        print("review: install-hook tg — already configured, nothing to do. Idempotent; re-run anytime.")
+        print(
+            "review: install-hook tg — already configured, nothing to do. Idempotent; re-run anytime."
+        )
     return 0
 
 
@@ -837,7 +1086,9 @@ def _commit_gate_active() -> bool:
     delegation would print "rig owns the hooks" and return 0, silently leaving the user
     without the review gate they explicitly asked for (codex review)."""
     cur = subprocess.run(
-        ["git", "config", "--global", "--get", "core.hooksPath"], capture_output=True, text=True
+        ["git", "config", "--global", "--get", "core.hooksPath"],
+        capture_output=True,
+        text=True,
     )
     raw = cur.stdout.strip()
     if not raw:
@@ -871,7 +1122,11 @@ def _commit_gate_active() -> bool:
     # neither (a contrived hook that both comments the token AND leaves a stray stage file is
     # not worth guarding beyond this).
     review_gate = hooks_dir / "review-gate"
-    return "review-gate" in body and review_gate.is_file() and os.access(review_gate, os.X_OK)
+    return (
+        "review-gate" in body
+        and review_gate.is_file()
+        and os.access(review_gate, os.X_OK)
+    )
 
 
 def install_commit_hook() -> int:
@@ -900,7 +1155,9 @@ def install_commit_hook() -> int:
     if result.returncode != 0:
         return result.returncode  # a real rig failure — surfaced, not swallowed
     if _commit_gate_active():
-        print("review: rig owns the global git hooks (delegated to `rig apply --only git_hooks`).")
+        print(
+            "review: rig owns the global git hooks (delegated to `rig apply --only git_hooks`)."
+        )
         return 0
     # rig succeeded but provisions no commit gate here (no git_hooks block) — honor the
     # explicit request via the direct installer rather than silently leaving no gate.
@@ -916,7 +1173,9 @@ def _install_commit_hook_direct() -> int:
     hooks_dir = home / ".config" / "git" / "hooks"
     # Respect an existing global hooksPath rather than hijacking it.
     cur = subprocess.run(
-        ["git", "config", "--global", "--get", "core.hooksPath"], capture_output=True, text=True
+        ["git", "config", "--global", "--get", "core.hooksPath"],
+        capture_output=True,
+        text=True,
     )
     existing_path = cur.stdout.strip()
     if existing_path:
@@ -925,19 +1184,29 @@ def _install_commit_hook_direct() -> int:
             # Git resolves a relative core.hooksPath per-repo, so a single global
             # gate can't live there. Refuse rather than silently misinstall.
             print(f"review: global core.hooksPath is relative ('{existing_path}').")
-            print("        Git resolves it per repository, so a global gate can't be placed")
-            print("        there. Set an absolute core.hooksPath (or unset it) and re-run.")
+            print(
+                "        Git resolves it per repository, so a global gate can't be placed"
+            )
+            print(
+                "        there. Set an absolute core.hooksPath (or unset it) and re-run."
+            )
             return 1
         hooks_dir = Path(expanded)
     hooks_dir.mkdir(parents=True, exist_ok=True)
     pre_commit = hooks_dir / "pre-commit"
 
-    already = False  # the gate is ALREADY installed with our exact content AND executable
+    already = (
+        False  # the gate is ALREADY installed with our exact content AND executable
+    )
     if pre_commit.exists():
         body = pre_commit.read_text(encoding="utf-8", errors="replace")
         if _PRECOMMIT_MARKER not in body:
-            print(f"review: a pre-commit hook already exists at {pre_commit} and is NOT ours.")
-            print("        Not overwriting. Merge the gate manually or remove that hook first.")
+            print(
+                f"review: a pre-commit hook already exists at {pre_commit} and is NOT ours."
+            )
+            print(
+                "        Not overwriting. Merge the gate manually or remove that hook first."
+            )
             return 1
         # "Already configured" requires the exec bit too: a 0644 hook with our exact content
         # is SKIPPED by git, so reporting "already active" would be a false claim (codex
@@ -956,9 +1225,11 @@ def _install_commit_hook_direct() -> int:
         # INSTALLED state") instead of silently rewriting identical content.
         print(f"  ✓ already configured  {pre_commit}")
         print(f"  ✓ already configured  core.hooksPath -> {hooks_dir}")
-        print("review: commit gate already active — nothing to do. "
-              "`review diff --staged --task TASK-CODE` before committing; "
-              "bypass with REVIEW_SKIP=1 or --no-verify.")
+        print(
+            "review: commit gate already active — nothing to do. "
+            "`review diff --staged --task TASK-CODE` before committing; "
+            "bypass with REVIEW_SKIP=1 or --no-verify."
+        )
         return 0
 
     if not already:
@@ -969,8 +1240,10 @@ def _install_commit_hook_direct() -> int:
             # A write/chmod that fails (read-only FS, EPERM, ENOSPC) must be a structured
             # conflict + non-zero exit, NOT a traceback — same contract as install-skill's
             # write paths (glm review). Don't print "gate active": it isn't.
-            print(f"  ! conflict  {pre_commit} could not be written ({exc}) — fix permissions "
-                  "and re-run.")
+            print(
+                f"  ! conflict  {pre_commit} could not be written ({exc}) — fix permissions "
+                "and re-run."
+            )
             return 1
         print(f"  + wrote {pre_commit}")
     else:
@@ -982,16 +1255,21 @@ def _install_commit_hook_direct() -> int:
         # (codex review).
         cfg = subprocess.run(
             ["git", "config", "--global", "core.hooksPath", str(hooks_dir)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if cfg.returncode != 0:
-            print(f"  ! conflict  could not set global core.hooksPath -> {hooks_dir} "
-                  f"({cfg.stderr.strip() or 'git config failed'}). The hook is written but git "
-                  "is not pointed at it; fix your global git config and re-run.")
+            print(
+                f"  ! conflict  could not set global core.hooksPath -> {hooks_dir} "
+                f"({cfg.stderr.strip() or 'git config failed'}). The hook is written but git "
+                "is not pointed at it; fix your global git config and re-run."
+            )
             return 1
         print(f"  + set global core.hooksPath -> {hooks_dir}")
     elif hookspath_ok:
         print(f"  ✓ already configured  core.hooksPath -> {hooks_dir}")
-    print("review: commit gate active. `review diff --staged --task TASK-CODE` before "
-          "committing; bypass with REVIEW_SKIP=1 or --no-verify.")
+    print(
+        "review: commit gate active. `review diff --staged --task TASK-CODE` before "
+        "committing; bypass with REVIEW_SKIP=1 or --no-verify."
+    )
     return 0

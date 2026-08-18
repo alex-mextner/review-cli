@@ -2995,6 +2995,10 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           (Fable); <= 0 disables it.
     REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
                                           ~/.config/review-cli/seat-cooldown.json).
+    REVIEW_TRIVIAL_DELTA_LINES=N        — pre-commit gate: max changed lines tolerated
+                                          against the last reviewed baseline before a
+                                          restage forces a fresh full review (default 10);
+                                          0 disables the tolerance (exact-hash match only).
   codex / opencode / omp carry their own CLI auth (no key here).
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.

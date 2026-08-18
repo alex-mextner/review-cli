@@ -950,7 +950,13 @@ delivers the structured review to the launching agent.)
 And before every commit, `review diff --staged --task HYP-742` is a multi-model gate —
 optionally *enforced* with `review install-commit-hook` (a global pre-commit hook that
 blocks unreviewed staged changes; bypass with `REVIEW_SKIP=1 git commit` or
-`git commit --no-verify`).
+`git commit --no-verify`). The gate tolerates a small trailing follow-up on top of an
+already-reviewed baseline — up to `$REVIEW_TRIVIAL_DELTA_LINES` changed lines (default
+10) since the last real review — without forcing a brand-new full multi-model round on
+every restage during an iterative fix loop; a genuinely larger change, or any binary /
+submodule-gitlink content (unmeasurable by a line count), still requires a fresh review.
+Set `REVIEW_TRIVIAL_DELTA_LINES=0` to disable the tolerance and require an exact-hash
+match on every commit, as before.
 
 ---
 
