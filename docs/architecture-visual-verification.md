@@ -737,8 +737,8 @@ reviewlib/
   modes/
     review.py       # plain diff review (the body now inline in main())             (~60)
     just_ask.py     # mode_just_ask                                                  (~30)
-    quorum.py       # mode_quorum                                                    (~60)
-    brainstorm.py   # mode_brainstorm, PERSONAS                                      (~140)
+    quorum.py       # mode_quorum, _seat_assignments (per-seat persona/label)       (~300)
+    brainstorm.py   # mode_brainstorm                                               (~607)
 features/
   visual/
     __init__.py

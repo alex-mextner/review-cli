@@ -21,11 +21,90 @@ from ..panel import (
     run_moderator,
     run_panel,
 )
-from . import _diff_context_block, _run_effort, _visual_images
+from . import PERSONAS, _diff_context_block, _run_effort, _visual_images
 from .contract import ModeContext, ModeSpec
 
 if TYPE_CHECKING:
     from ..config import EffortOverride
+
+
+def _expert_prompt(
+    persona_name: str, persona_bg: str, question: str, diff_block: str
+) -> str:
+    """One seat's prompt: brainstorm's persona framing grafted onto quorum's existing
+    evidence-citing / INSUFFICIENT-EVIDENCE contract (Alex, 2026-08-18 — quorum reuses
+    brainstorm's role set so a padded/reused seat gets a genuinely distinct lens, not
+    just a disclosure label)."""
+    return (
+        f"You are a '{persona_name}' ({persona_bg}) serving as one expert on a panel. "
+        "Give a clear RECOMMENDATION on the question below, reasoned from YOUR "
+        "perspective as this role. Cite concrete evidence for every claim (file path, "
+        "line number, command output, or a verifiable fact). If you do not have an "
+        "evidence base to answer, say exactly 'INSUFFICIENT EVIDENCE' and explain what "
+        "you would need — do NOT guess. Do not edit files or run commands.\n\n"
+        f"QUESTION:\n{question}" + diff_block
+    )
+
+
+def _seat_assignments(
+    models: list[str],
+) -> tuple[list[str], list[tuple[str, str]], bool]:
+    """One (label, persona) pair per seat, computed ONCE and shared by both the
+    transcript label and the seat's own prompt (Fable/k3 review finding: computing
+    `PERSONAS[i % len(PERSONAS)]` independently in two places can silently desync a
+    seat's disclosed lens from the lens it actually reasoned from).
+
+    Persona is chosen by PER-MODEL occurrence, offset by that model's OWN first seat
+    index — not by the raw global seat index — so two seats sharing one model always
+    land on DISTINCT personas up to `len(PERSONAS)` repeats of that one model. Raw
+    `PERSONAS[i % len(PERSONAS)]` collides once a model's repeats are spaced exactly
+    `len(PERSONAS)` seats apart (e.g. seats 0 and 6 of a 7-seat `[A,B,A,B,A,B,A]`
+    panel, which `expand_flat_models_with_reuse`'s cycling padding reaches for real
+    once a pool is down to 2 reachable models) — Fable AND k3 independently found
+    this exact collision, reintroducing the zero-diversity duplicate-seat failure
+    this feature exists to prevent. Distinct models MAY still land on the same
+    persona by position (harmless — the invariant that matters is same-model seats
+    never repeating a lens, not global uniqueness). The one case this can't fully
+    avoid is a SINGLE model occupying more than `len(PERSONAS)` seats by itself (a
+    >6x reuse of one model in one panel) — k3 review finding: this IS reachable
+    today, not just theoretical, via a config.yaml `models:` list of 7+ entries
+    (no length cap, cli.py's `expand_flat_models_with_reuse(reachable, ...)`) where
+    usage-limit exclusion (or its all-near-limit least-depleted fallback) leaves
+    only one survivor — the panel becomes `[A]*7+` and seat #1/#7 of A repeat a
+    lens. Deliberately NOT guarded against here (a large `models:` list collapsing
+    to one survivor is itself an unusual config), but a caller building much
+    larger or more usage-constrained panels should re-check this — tracked as a
+    follow-up (review-cli#206) rather than adding warn/fail-loud machinery now.
+
+    Labels are `<model> [<persona>]`, or `<model>#N [<persona>]` when a model
+    occupies more than one seat (reuse-aware panel padding, `expand_flat_models_
+    with_reuse` in cli.py) — the `#N` keeps repeated seats grep-able by model
+    identity even though their persona differs."""
+    first_index: dict[str, int] = {}
+    seat_counts: dict[str, int] = {}
+    for i, model in enumerate(models):
+        first_index.setdefault(model, i)
+        seat_counts[model] = seat_counts.get(model, 0) + 1
+    has_duplicates = any(n > 1 for n in seat_counts.values())
+
+    occurrence: dict[str, int] = {}
+    labels: list[str] = []
+    personas: list[tuple[str, str]] = []
+    for model in models:
+        # 0-indexed occurrence of THIS model so far -> occ+1 is its 1-indexed seat
+        # number, reused directly for both the persona offset and the `#N` label
+        # (Fable review finding, round 3: a separate `seen` counter that always
+        # equalled `occ + 1` was redundant bookkeeping in a function whose whole
+        # point is eliminating exactly this class of desync risk).
+        occ = occurrence.get(model, 0)
+        occurrence[model] = occ + 1
+        persona = PERSONAS[(first_index[model] + occ) % len(PERSONAS)]
+        personas.append(persona)
+        if seat_counts[model] > 1:
+            labels.append(f"{model}#{occ + 1} [{persona[0]}]")
+        else:
+            labels.append(f"{model} [{persona[0]}]")
+    return labels, personas, has_duplicates
 
 
 def mode_quorum(
@@ -69,41 +148,27 @@ def mode_quorum(
     dispatch_diff = (
         diff if diff_from_stdin or diff_already_capped else cap_diff_for_dispatch(diff)
     )
-    expert_prompt = (
-        "You are one expert on a panel. Give a clear RECOMMENDATION on the question below. "
-        "Cite concrete evidence for every claim (file path, line number, command output, "
-        "or a verifiable fact). If you do not have an evidence base to answer, say exactly "
-        "'INSUFFICIENT EVIDENCE' and explain what you would need — do NOT guess. "
-        "Do not edit files or run commands.\n\n"
-        f"QUESTION:\n{question}" + _diff_context_block(dispatch_diff)
-    )
-    # `models` can contain the SAME model more than once (reviewlib.config's
-    # reuse-aware panel padding, Alex 2026-08-18 — see cli.py's
-    # `expand_flat_models_with_reuse` wiring): when a distinct-model pool is
-    # scarce or some models are near their usage limit, one model fills
-    # several seats instead of shrinking the panel. Label each REPEATED
-    # occurrence "<model>#N" (via PanelJob.label, which `run_panel` uses to
-    # relabel the result) so the transcript and moderator can tell them apart
-    # — without this, two identical "### Expert: fable" blocks read as two
-    # INDEPENDENT opinions, silently double-weighting one account's answer in
-    # the moderator's own "majority of experts" judgement.
-    _seat_counts: dict[str, int] = {}
-    labels: list[str | None] = []
-    for model in models:
-        _seat_counts[model] = _seat_counts.get(model, 0) + 1
-        labels.append(None)
-    has_duplicates = any(n > 1 for n in _seat_counts.values())
-    if has_duplicates:
-        _seen: dict[str, int] = {}
-        for i, model in enumerate(models):
-            if _seat_counts[model] > 1:
-                _seen[model] = _seen.get(model, 0) + 1
-                labels[i] = f"{model}#{_seen[model]}"
+    diff_block = _diff_context_block(dispatch_diff)
+    # Every seat gets a persona/role from the SAME rotation brainstorm uses (Alex,
+    # 2026-08-18: quorum panels should run "под разными полями" — distinct fields/roles
+    # — not just distinct models). `models` can also contain the SAME model more than
+    # once (reviewlib.config's reuse-aware panel padding — see cli.py's
+    # `expand_flat_models_with_reuse` wiring): when a distinct-model pool is scarce or
+    # some models are near their usage limit, one model fills several seats instead of
+    # shrinking the panel. `_seat_assignments` picks ONE (label, persona) pair per
+    # seat and both the label and the prompt below consume that SAME value — see its
+    # docstring for why persona is keyed on per-model occurrence rather than raw seat
+    # index. Repeated occurrences stay grep-able via a "<model>#N" prefix (via
+    # PanelJob.label, which `run_panel` uses to relabel the result) — without the
+    # numbering, two identical "### Expert: fable" blocks would read as two
+    # INDEPENDENT opinions, silently double-weighting one account's answer in the
+    # moderator's own "majority of experts" judgement.
+    labels, personas, has_duplicates = _seat_assignments(models)
 
     jobs = [
         PanelJob(
             model=model,
-            prompt=expert_prompt,
+            prompt=_expert_prompt(*personas[i], question, diff_block),
             diff="",
             images=visual_images,
             effort=_run_effort(effort_override, model),
@@ -124,16 +189,47 @@ def mode_quorum(
         f"{(r.stdout.strip() or r.stderr.strip() or '(no output)')}"
         for r in expert_results
     )
+    # Unconditional (Fable/k3 review finding, round 1): every seat now carries a
+    # `[<lens>]` suffix, not just duplicates, so the moderator needs the notation
+    # explained regardless of whether any model repeats. NOT worded as "distinct"
+    # (Fable review finding, round 2): `_seat_assignments` only guarantees a
+    # repeated MODEL never repeats its own lens — two DIFFERENT models can land on
+    # the same lens by position, which is fine (two independent security reviews
+    # from two different vendors), but claiming blanket distinctness to the
+    # moderator would be false and could bias its de-dup judgement. Bounded to
+    # "up to its first len(PERSONAS) seats" (Fable/k3 review finding, round 3):
+    # beyond that, a single model CAN repeat a lens — see `_seat_assignments`'
+    # own docstring for the exact (reachable, not just theoretical) condition.
+    # The count is INTERPOLATED, not hardcoded (Fable/k3 review finding, round 4
+    # — both independently caught that a hardcoded "SIX" would silently go stale
+    # the moment someone resizes the PERSONAS tuple, since the only guard on the
+    # tuple's size was `>= 5`, not `== 6`; interpolating means the note can never
+    # be wrong regardless of pool size, closing the gap for good instead of just
+    # tightening one assertion). The worked example is ALSO interpolated, not a
+    # hardcoded persona name (Fable review finding, round 5): this very diff
+    # renamed one persona, and a future rename of whichever one happened to be
+    # hardcoded here would go stale the same way — pulling from `PERSONAS`
+    # directly means any future rename updates the example automatically.
+    lens_note = (
+        "\n\nNOTE: each expert below is assigned a role/lens (shown in brackets "
+        f"after the model, e.g. `glm [{PERSONAS[1][0]}]`; not necessarily unique "
+        "across different models, and a single model is only guaranteed a "
+        f"different lens across its first {len(PERSONAS)} seats) — each reasons "
+        "from that role, but the lens does not change how their answer should be "
+        "weighted."
+    )
     duplicate_note = (
         # Deliberately silent on WHY the panel has duplicates (scarcity/usage-limit
         # padding vs an explicit `-m fable,fable` request both reach this same
         # code path) — asserting a specific cause here would be a claim this
         # function can't verify (Fable review finding, review-cli#205 round 3).
-        "\n\nNOTE: this panel contains one or more models on multiple seats "
-        "(labelled `<model>#1`, `<model>#2`, ...). Treat ALL seats sharing one "
-        "model (e.g. `fable#1` and `fable#2` together) as a SINGLE opinion for "
-        "majority-counting purposes — do NOT count a repeated model's agreement "
-        "with itself as extra weight toward QUORUM."
+        "\n\nNOTE: this panel contains one or more models on multiple seats, each "
+        "assigned a role/lens (labelled `<model>#1 [<lens>]`, `<model>#2 [<lens>]`, "
+        f"...) that's distinct across a model's first {len(PERSONAS)} seats. Treat "
+        "ALL seats sharing one model (e.g. `fable#1` and `fable#2` together) as a "
+        "SINGLE opinion for majority-counting purposes — do NOT count a repeated "
+        "model's agreement with itself as extra weight toward QUORUM, even though "
+        "its seats usually reason from different roles."
         if has_duplicates
         else ""
     )
@@ -145,7 +241,7 @@ def mode_quorum(
         "2. DISAGREEMENT / NO QUORUM — points where experts conflict or no majority exists.\n"
         "3. ABSTAINED — experts who said INSUFFICIENT EVIDENCE, and on what.\n"
         "Do not invent agreement. Do not edit files."
-        f"{duplicate_note}\n\n"
+        f"{lens_note}{duplicate_note}\n\n"
         f"QUESTION:\n{question}\n\n=== EXPERT ANSWERS ===\n{transcript}"
     )
     # No `diff=` here — pre-existing (not something this diff-cap feature changed): the

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Unit tests for the operator-facing "panel/board padded" stderr notices and
-the quorum duplicate-seat disclosure (reviewlib.cli._warn_if_panel_padded,
+quorum's per-seat role/lens assignment (reviewlib.cli._warn_if_panel_padded,
 reviewlib.modes.review._warn_if_board_reused, reviewlib.modes.quorum's
-`<model>#N` labelling + moderator note).
+`<model>#N [<persona>]` labelling + moderator note).
 
 Covers, offline (no model call, no network):
   (a) the panel/board warnings fire iff a repeat is genuinely REUSE, not just
       "the output happens to contain a duplicate model" — a config board that
       legitimately lists the same model under two distinct roles must NOT
       false-positive (Fable/k3 review finding, review-cli#205 round 2);
-  (b) quorum labels repeated models `<model>#1`/`<model>#2` in the transcript
-      and adds a moderator disclosure note, so duplicate seats read as ONE
-      opinion, not two independent ones.
+  (b) every quorum seat gets a distinct persona from brainstorm's role
+      rotation (Alex, 2026-08-18); repeated models keep a `<model>#N` prefix
+      in their label and a moderator disclosure note so duplicate seats read
+      as ONE opinion, not two independent ones, despite reasoning from
+      different roles.
 
 Plain-script harness (mirrors tests/test_pool_reuse.py): each test_* is run
 by __main__, and also pytest-discoverable.
@@ -30,6 +32,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.cli import _warn_if_panel_padded  # noqa: E402
 from reviewlib.config import BoardReviewer  # noqa: E402
+from reviewlib.modes import PERSONAS  # noqa: E402
 from reviewlib.modes import quorum as q_mod  # noqa: E402
 from reviewlib.modes.review import _warn_if_board_reused  # noqa: E402
 
@@ -96,12 +99,16 @@ def test_board_reused_warning_silent_when_pool_equals_board():
 
 # --- quorum's <model>#N labelling + moderator disclosure --------------------------
 
+# Shared fakes for the `mode_quorum` tests below (Fable review finding, round 5:
+# 5 tests each copy-pasted an equivalent pair of fakes; a shared factory keeps a
+# 6th quorum test from forking yet another copy). `captured` is a fresh dict per
+# test, populated with `jobs` (the real PanelJob list dispatched, so a test can
+# inspect `.label`/`.prompt`/`.model`) and `mod_prompt` (the moderator's prompt).
 
-def test_quorum_labels_duplicate_seats_and_notes_them_to_the_moderator():
-    captured: dict = {}
 
+def _fake_quorum_panel(captured: dict):
     def _fake_run_panel(jobs, cwd, timeout):
-        captured["labels"] = [j.label for j in jobs]
+        captured["jobs"] = jobs
         return [
             ReviewResult(
                 model=j.label or j.model,
@@ -113,6 +120,10 @@ def test_quorum_labels_duplicate_seats_and_notes_them_to_the_moderator():
             for j in jobs
         ]
 
+    return _fake_run_panel
+
+
+def _fake_quorum_moderator(captured: dict):
     def _fake_run_moderator(candidates, prompt, cwd, timeout, diff="", round_no=0):
         captured["mod_prompt"] = prompt
         return ReviewResult(
@@ -123,65 +134,164 @@ def test_quorum_labels_duplicate_seats_and_notes_them_to_the_moderator():
             stderr="",
         )
 
+    return _fake_run_moderator
+
+
+def _run_quorum_with_fakes(models: list[str]) -> dict:
+    """Dispatch `mode_quorum(models)` through the shared fakes and return
+    `captured` (with `jobs`, `labels`, `mod_prompt`, `rc`)."""
+    captured: dict = {}
     saved_panel, saved_mod = q_mod.run_panel, q_mod.run_moderator
-    q_mod.run_panel = _fake_run_panel
-    q_mod.run_moderator = _fake_run_moderator
+    q_mod.run_panel = _fake_quorum_panel(captured)
+    q_mod.run_moderator = _fake_quorum_moderator(captured)
     try:
-        rc = q_mod.mode_quorum(
-            "question",
-            ["fable", "glm", "fable"],  # fable padded in twice
-            "",
-            REPO_DIR,
-            5,
-            ["mod"],
-        )
+        captured["rc"] = q_mod.mode_quorum("question", models, "", REPO_DIR, 5, ["mod"])
     finally:
         q_mod.run_panel = saved_panel
         q_mod.run_moderator = saved_mod
-    assert rc == 0, rc
-    # glm has no duplicate, so its PanelJob.label stays None (run_panel falls
-    # back to job.model for the transcript) -- only the repeated fable seats
-    # get an explicit "#N" label.
-    assert captured["labels"] == ["fable#1", None, "fable#2"]
-    assert "### Expert: fable#1" in captured["mod_prompt"]
-    assert "### Expert: fable#2" in captured["mod_prompt"]
+    captured["labels"] = [j.label for j in captured["jobs"]]
+    return captured
+
+
+def test_quorum_labels_duplicate_seats_and_notes_them_to_the_moderator():
+    captured = _run_quorum_with_fakes(
+        ["fable", "glm", "fable"]
+    )  # fable padded in twice
+    assert captured["rc"] == 0, captured["rc"]
+    # Every seat gets a persona (Alex, 2026-08-18: quorum panels run "под разными
+    # полями" -- distinct roles, not just distinct models). Persona is keyed on
+    # PER-MODEL occurrence (offset by that model's own first seat index), not raw
+    # seat index -- fable's 2nd seat lands on PERSONAS[(0+1)%6]=P1, which happens
+    # to match glm's own P1; that's fine, the invariant is same-model seats never
+    # repeat a lens, not global uniqueness across different models. The repeated
+    # fable seats keep a "#N" prefix so they stay grep-able by model identity.
+    assert captured["labels"] == [
+        "fable#1 [Pragmatic staff engineer]",
+        "glm [Security-paranoid reviewer]",
+        "fable#2 [Security-paranoid reviewer]",
+    ]
+    assert "### Expert: fable#1 [Pragmatic staff engineer]" in captured["mod_prompt"]
+    assert "### Expert: fable#2 [Security-paranoid reviewer]" in captured["mod_prompt"]
     assert "fable#1" in captured["mod_prompt"]
     assert "fable#2" in captured["mod_prompt"]
     assert "SINGLE opinion" in captured["mod_prompt"]
 
 
-def test_quorum_no_labels_or_note_when_models_are_distinct():
-    captured: dict = {}
+def test_quorum_labels_distinct_seats_with_roles_but_no_dedup_note():
+    captured = _run_quorum_with_fakes(["fable", "glm"])
+    # No duplicates -> no "#N" and no dedup note, but every seat still carries
+    # a persona (Alex, 2026-08-18) -- distinct-model panels get roles too.
+    assert captured["labels"] == [
+        "fable [Pragmatic staff engineer]",
+        "glm [Security-paranoid reviewer]",
+    ]
+    assert "SINGLE opinion" not in captured["mod_prompt"]
+    # The lens notation is explained UNCONDITIONALLY (k3 review finding, round 2:
+    # a distinct-model panel's moderator saw the `[<lens>]` bracket with no
+    # explanation of what it means).
+    assert "role/lens" in captured["mod_prompt"]
 
-    def _fake_run_panel(jobs, cwd, timeout):
-        captured["labels"] = [j.label for j in jobs]
-        return [
-            ReviewResult(
-                model=j.model, command="fake", returncode=0, stdout="ok", stderr=""
-            )
-            for j in jobs
-        ]
 
-    def _fake_run_moderator(candidates, prompt, cwd, timeout, diff="", round_no=0):
-        captured["mod_prompt"] = prompt
-        return ReviewResult(
-            model=candidates[0],
-            command="fake",
-            returncode=0,
-            stdout="summary",
-            stderr="",
+def test_quorum_reused_model_gets_a_different_persona_per_seat():
+    """A model reused across 3 seats (short pool, `expand_flat_models_with_reuse`)
+    must land on 3 DIFFERENT personas, not the same one repeated -- otherwise
+    reuse gives quorum zero added diversity, which is exactly what Alex asked
+    to fix ("под разными полями")."""
+    captured = _run_quorum_with_fakes(["fable", "fable", "fable"])
+    assert captured["labels"] == [
+        "fable#1 [Pragmatic staff engineer]",
+        "fable#2 [Security-paranoid reviewer]",
+        "fable#3 [Developer-experience designer]",
+    ]
+    # The prompts themselves differ by role too, not just the label.
+    prompts = [j.prompt for j in captured["jobs"]]
+    assert len(set(prompts)) == 3
+    assert "Pragmatic staff engineer" in prompts[0]
+    assert "Security-paranoid reviewer" in prompts[1]
+    assert "Developer-experience designer" in prompts[2]
+    # The evidence-citing / INSUFFICIENT-EVIDENCE contract must survive the
+    # persona rewrite (k3 review finding, round 3: `_expert_prompt` was written
+    # from scratch and nothing pinned this -- quorum's whole "cited quorum"
+    # value depends on it, and the moderator's ABSTAINED section reads it).
+    for prompt in prompts:
+        assert "INSUFFICIENT EVIDENCE" in prompt
+        assert "Cite concrete evidence" in prompt
+
+
+def test_quorum_persona_does_not_collide_past_six_seats():
+    """Fable/k3 review finding: raw `PERSONAS[i % len(PERSONAS)]` (len==6) collided
+    once a model's own repeats landed exactly 6 seats apart -- reachable via
+    `expand_flat_models_with_reuse`'s cycling pad once a pool is down to 2
+    reachable models (e.g. a 7-seat panel `[A,B,A,B,A,B,A]`). Assert every
+    occurrence of the SAME model gets a distinct persona across a 7-seat panel."""
+    captured = _run_quorum_with_fakes(
+        ["fable", "glm", "fable", "glm", "fable", "glm", "fable"]
+    )
+    jobs = captured["jobs"]
+    fable_personas = [j.prompt for i, j in enumerate(jobs) if jobs[i].model == "fable"]
+    glm_personas = [j.prompt for i, j in enumerate(jobs) if jobs[i].model == "glm"]
+    assert len(fable_personas) == 4
+    assert len(set(fable_personas)) == 4, "fable's 4 seats must not repeat a persona"
+    assert len(glm_personas) == 3
+    assert len(set(glm_personas)) == 3, "glm's 3 seats must not repeat a persona"
+
+
+def test_quorum_seat_label_persona_matches_the_seat_prompt_persona():
+    """Fable/k3 review finding, round 2: the original version of this test only
+    checked `_seat_assignments`' OWN return values against each other (label vs
+    personas from the SAME call) -- tautologically true by construction, and
+    blind to a real desync between `_seat_assignments` and the SEPARATE
+    `_expert_prompt` call site in `mode_quorum` that actually builds what gets
+    sent. This version routes every shape through the real `mode_quorum` (like
+    the neighboring reuse/collision tests) and checks each dispatched job's
+    label persona is the SAME persona that landed in that job's own prompt --
+    a fix that edits one call site but not the other would fail this."""
+    for models in (
+        ["fable", "glm", "fable"],
+        ["fable", "fable", "fable"],
+        ["fable", "glm", "fable", "glm", "fable", "glm", "fable"],
+        ["sol", "kimi", "glm", "codex"],
+    ):
+        captured = _run_quorum_with_fakes(models)
+        for job in captured["jobs"]:
+            # Extract the bracketed lens name from the label (e.g.
+            # "fable#2 [Security-paranoid reviewer]" -> "Security-paranoid reviewer").
+            persona_name = job.label.rsplit("[", 1)[1].rstrip("]")
+            assert persona_name in job.prompt, (models, job.label, job.prompt)
+
+
+def test_personas_pool_stays_large_enough_for_both_consumers():
+    """Enforce the CROSS-MODE CONTRACT documented in modes/__init__.py as a real
+    test, not just prose (Fable review finding, round 3) -- a future edit that
+    shrinks the pool below brainstorm's minimum, or reintroduces a character that
+    breaks quorum's label parsing, should fail loudly here instead of surfacing
+    as a confusing brainstorm/quorum bug later."""
+    assert len(PERSONAS) >= 5, "brainstorm's rotation needs a pool >= 5"
+    names = [name for name, _bg in PERSONAS]
+    assert len(set(names)) == len(names), "persona names must be unique"
+    for name in names:
+        # `[`/`]` are the LOAD-BEARING characters (Fable review finding, round 5:
+        # the round-2 rename avoided `/`, but quorum's label format is
+        # `<model> [<persona>]` and both `mode_quorum`'s tests and its own
+        # `label.rsplit("[", 1)` parsing depend on the bracket pair being
+        # unambiguous -- a persona name containing one would corrupt that, not
+        # a stray `/`, which was already confirmed harmless in round 3).
+        assert "[" not in name and "]" not in name, (
+            f"persona name {name!r} would break quorum's <model> [<persona>] "
+            "label parsing"
         )
 
-    saved_panel, saved_mod = q_mod.run_panel, q_mod.run_moderator
-    q_mod.run_panel = _fake_run_panel
-    q_mod.run_moderator = _fake_run_moderator
-    try:
-        q_mod.mode_quorum("question", ["fable", "glm"], "", REPO_DIR, 5, ["mod"])
-    finally:
-        q_mod.run_panel = saved_panel
-        q_mod.run_moderator = saved_mod
-    assert captured["labels"] == [None, None]
-    assert "SINGLE opinion" not in captured["mod_prompt"]
+
+def test_brainstorm_draws_from_the_shared_personas_pool():
+    """Fable review finding, round 4: the PERSONAS move was only test-covered from
+    the quorum side; nothing pinned that brainstorm still draws from the SAME
+    tuple rather than a re-forked local copy. Identity (not just equality) --
+    a future "brainstorm needs its own persona flavor" edit that re-forks the
+    tuple would still be equal-by-value the moment it's copy-pasted, but this
+    catches it immediately, before drift starts."""
+    from reviewlib.modes import brainstorm as b_mod
+
+    assert b_mod.PERSONAS is PERSONAS
 
 
 if __name__ == "__main__":

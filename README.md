@@ -208,9 +208,17 @@ git diff | review just-ask "Is this safe to merge?" --task HYP-742
 
 Two-phase structured panel. **Phase 1:** every expert answers in parallel and must cite
 concrete evidence (file/line/fact); if they lack an evidence base they must say
-`INSUFFICIENT EVIDENCE` rather than guess. **Phase 2:** a moderator runs sequentially,
-reads all expert answers, and emits a structured summary with three sections — QUORUM
-(points of majority agreement with evidence), DISAGREEMENT / NO QUORUM, and ABSTAINED.
+`INSUFFICIENT EVIDENCE` rather than guess. Each seat also reasons from an assigned
+role/lens (the same persona pool `brainstorm` rotates through — pragmatic staff
+engineer, security-paranoid reviewer, skeptical SRE, etc.), shown in the transcript as
+`glm [Security-paranoid reviewer]`; when a distinct-model pool is scarce or some
+models are near their usage limit, one model can fill several seats (`fable#1`,
+`fable#2`, ...) and each of ITS seats gets a different lens, up to the size of the
+persona pool (currently 6) — beyond that a model's lens can repeat. **Phase 2:** a
+moderator runs sequentially, reads all expert answers, and emits a structured summary
+with three sections — QUORUM (points of majority agreement with evidence),
+DISAGREEMENT / NO QUORUM, and ABSTAINED. The moderator is told to treat all seats
+sharing one model as a single opinion, regardless of lens, for majority-counting.
 
 Use when a question has real stakes and you want cited consensus, not vibes.
 
@@ -283,9 +291,9 @@ review quorum "Should we switch to a plugin architecture?" --task HYP-742 --mode
 ![brainstorm mode](docs/mode-brainstorm.svg)
 
 Iterative ideation loop. Each round assigns at least three distinct **rotating personas**
-(Pragmatic Staff Engineer, Security-Paranoid Reviewer, DX Designer, Skeptical SRE,
-Product-Minded Architect, Cost-Conscious Perf Engineer) to your panel backends in
-parallel. After each round a moderator summarizes and decides STOP/CONTINUE — but
+(Pragmatic Staff Engineer, Security-Paranoid Reviewer, Developer-Experience Designer,
+Skeptical SRE, Product-Minded Architect, Cost-Conscious Perf Engineer) to your panel
+backends in parallel. After each round a moderator summarizes and decides STOP/CONTINUE — but
 **cannot stop before `--rounds`** (minimum and default: 5). `--max-rounds` (default 8)
 is a hard cap. Ends with a full moderator synthesis: best ideas, tradeoffs, and a
 concrete recommendation.

@@ -4,8 +4,11 @@
 `--diff`/`--staged` (or a piped diff) so the personas can brainstorm ABOUT a specific
 change as optional grounding. Originally the `--brainstorm` flag (Stage 0
 decomposition); now a first-class SUBCOMMAND backed by the `MODE` descriptor at the
-bottom of this file (see `modes/contract.py`). PERSONAS lives here because it is only
-used by this mode.
+bottom of this file (see `modes/contract.py`). PERSONAS moved to `modes/__init__.py`
+so quorum can reuse the same role set (Alex, 2026-08-18) — one entry was also
+RENAMED in that move ("DX / ergonomics designer" -> "Developer-experience
+designer", Fable review finding, round 3), a user-visible change to any
+brainstorm transcript using that persona, not a behaviour-neutral extraction.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ from ..panel import (
     run_panel,
 )
 from ..process import current_task_code, log_dir
-from . import _run_effort, _visual_images
+from . import PERSONAS, _run_effort, _visual_images
 from .contract import ModeContext, ModeSpec
 
 if TYPE_CHECKING:
@@ -89,42 +92,6 @@ def _read_trusted_header_nonce(log: Path) -> str:
         if m:
             return m.group(1)
     return ""
-
-
-# Distinct expert personas for brainstorm rotation (pool >= 5). Each round assigns
-# >= 3 of these, rotating so backends see a fresh role each round.
-PERSONAS = (
-    (
-        "Pragmatic staff engineer",
-        "20 years shipping production systems; values simplicity, "
-        "incremental delivery, and proven tech over novelty.",
-    ),
-    (
-        "Security-paranoid reviewer",
-        "thinks adversarially about every input, trust boundary, secret, "
-        "and failure mode; assumes the worst actor and the worst case.",
-    ),
-    (
-        "DX / ergonomics designer",
-        "obsessed with developer and user experience: clear APIs, good "
-        "defaults, discoverability, error messages, and minimal friction.",
-    ),
-    (
-        "Skeptical SRE",
-        "cares about operability, observability, blast radius, rollback, "
-        "and what breaks at 3am; distrusts anything without a failure plan.",
-    ),
-    (
-        "Product-minded architect",
-        "connects technical choices to user value and roadmap; weighs "
-        "long-term flexibility against time-to-market.",
-    ),
-    (
-        "Cost-conscious performance engineer",
-        "watches latency, throughput, token/compute spend, and resource "
-        "footprint; allergic to waste and premature scale.",
-    ),
-)
 
 
 def _round_is_dead(round_results: list) -> bool:
