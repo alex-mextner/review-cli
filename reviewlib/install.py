@@ -546,7 +546,9 @@ exit 1
 """
 
 
-def _write_review_stamp(cwd: Path, diff: str) -> None:
+def _write_review_stamp(
+    cwd: Path, diff: str, *, stamp_diff_hash: str | None = None
+) -> None:
     """Record that this exact diff was reviewed, so the optional pre-commit gate
     can verify it. Uses `git rev-parse --git-path` so worktrees / pointer-file
     .git resolve correctly. Best-effort: never breaks a review on failure.
@@ -555,7 +557,36 @@ def _write_review_stamp(cwd: Path, diff: str) -> None:
     stripped (`git_repo_env`), matching the diff probe in cli._git_diff: a leaked
     GIT_DIR/GIT_WORK_TREE must not write the stamp into an UNRELATED repo while the diff was
     read from `cwd`. The stamp and the diff it stamps stay anchored to the SAME `-C` repo
-    (the #18 stamp/tool alignment, kept under the #71 env-leak fix)."""
+    (the #18 stamp/tool alignment, kept under the #71 env-leak fix).
+
+    IMPORTANT: the hash is NOT computed from the `diff` parameter. Both the local
+    `_PRECOMMIT` template below and the separate agent-tools global hook verify by
+    independently running `git diff --no-ext-diff --cached` with NO explicit
+    `--src-prefix`/`--dst-prefix` -- so their hash reflects whatever the invoking
+    machine's ambient `diff.noprefix`/prefix git config happens to produce.
+    `cli._git_diff` pins `--src-prefix=a/ --dst-prefix=b/` (reviewlib.stats
+    "Diff-identity binding" -- needed so `extract_diff_files` can parse the
+    header), so on a `diff.noprefix=true` machine the REVIEWED `diff` string and
+    the hook's own unprefixed recomputation are BYTE-DIFFERENT texts with
+    DIFFERENT hashes -- hashing `diff` directly would then never match the stamp,
+    permanently failing the pre-commit gate on any such machine (live-caught:
+    this repo's own dev machine has `diff.noprefix=true`, and this exact
+    divergence blocked committing this fix's own commit).
+
+    `stamp_diff_hash` (round-5 review finding, k3+Opus): PREFER this over any
+    fresh recompute -- it is the hook-compatible hash the CALLER captured at
+    DIFF-DISPATCH time (`cli._stamp_hash_for_staged_diff`, called immediately
+    adjacent to the `diff` this function receives), so the stamp certifies what
+    the models actually reviewed. A first cut of the noprefix fix instead
+    re-derived the hash HERE, independently, at stamp-WRITE time -- potentially
+    MINUTES after dispatch for a real multi-model panel -- reopening a TOCTOU
+    window where a concurrent index mutation during the review (a second
+    agent/session in a shared checkout; AGENTS.md documents this has happened
+    in production) would get silently certified as reviewed. When
+    `stamp_diff_hash` is None (any caller that doesn't thread it -- a
+    non-CLI/library caller of `mode_review`), falls back to that same
+    independent re-derive so the stamp still writes something hook-compatible,
+    just without the tightened timing guarantee."""
     import hashlib
 
     from .process import git_repo_env
@@ -568,7 +599,19 @@ def _write_review_stamp(cwd: Path, diff: str) -> None:
             return
         rel = p.stdout.strip()
         stamp = Path(rel) if os.path.isabs(rel) else Path(cwd) / rel
-        digest = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+        if stamp_diff_hash is not None:
+            digest = stamp_diff_hash
+        else:
+            hook_diff = subprocess.run(
+                ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--cached"],
+                cwd=cwd, env=git_repo_env(cwd), capture_output=True, text=True,
+                timeout=30,
+            )
+            # Fall back to the reviewed `diff` text if the independent recompute
+            # itself fails (best-effort: never break a review over the stamp) --
+            # matches the hook's own tolerance for a diff-less/non-repo state.
+            stamped_text = hook_diff.stdout if hook_diff.returncode == 0 else diff
+            digest = hashlib.sha256(stamped_text.encode("utf-8")).hexdigest()
         stamp.write_text(f"{digest}\n", encoding="utf-8")
     except Exception:
         pass
