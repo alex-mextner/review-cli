@@ -1532,13 +1532,6 @@ def _quorum_check_subcommand(
         print(_json.dumps(result, indent=2))
         return 0 if result["passed"] else 1
 
-    if "error" in result:
-        print(
-            f"review bar NOT met for {result['task_code']}: {result['error']}",
-            file=sys.stderr,
-        )
-        return 1
-
     passed_iter = result["passed_iterations"]
     distinct = result["distinct_models_passed"]
     if result["passed"]:
@@ -1551,11 +1544,43 @@ def _quorum_check_subcommand(
         )
         return 0
 
-    print(
-        f"review bar NOT met for {result['task_code']}: "
-        f"{passed_iter}/{min_iter} passed iterations, "
-        f"{distinct}/{min_models} distinct models"
-    )
+    # review-cli#221 round-4 review finding (k3/Fable): the header and the `stalled:`
+    # detail lines must land on the SAME stream — a caller capturing only one of
+    # stdout/stderr must never see a bare header with no detail, or bare detail lines
+    # with no task-code/NOT-met context. The ratio branch already prints both to
+    # stdout; mirror that choice for the error branch's stream too.
+    detail_stream = sys.stderr if "error" in result else None
+    if "error" in result:
+        print(
+            f"review bar NOT met for {result['task_code']}: {result['error']}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"review bar NOT met for {result['task_code']}: "
+            f"{passed_iter}/{min_iter} passed iterations, "
+            f"{distinct}/{min_models} distinct models"
+        )
+    # review-cli#221: a bare N/M count (or a bare mismatch-error line) leaves a human
+    # no better off than before — name the SPECIFIC attempted model(s) currently
+    # cooling down (an unavailable sentinel or a session-limit/usage-credits notice —
+    # a plain timeout doesn't record a cooldown, see seat_cooldown.py's docstring) and
+    # why, same signal --json already carries in `stalled_models`. Reached on EITHER
+    # not-met path (round-3 review
+    # finding: an earlier version of this diff returned early on the `error` branch,
+    # before ever reaching this loop, even though `stalled_models` can genuinely be
+    # populated alongside a mismatch error). Text-mode-only (the --json branch above
+    # already returned this data structured) so a plain `review task X --check` run
+    # directly by a developer sees it too, not just a `gh ship` caller parsing --json.
+    for stalled in result.get("stalled_models", []):
+        minutes = max(1, round(stalled["remaining_seconds"] / 60))
+        times = stalled["consecutive_failures"]
+        plural = "" if times == 1 else "s"
+        print(
+            f"  stalled: {stalled['model']} ({stalled['reason']}, "
+            f"{times} consecutive failure{plural}, ~{minutes}m until retry-eligible)",
+            file=detail_stream,
+        )
     return 1
 
 
@@ -3314,9 +3339,15 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     REVIEW_DIFF_MAX_BYTES=N             — dispatch-time diff-size cap (default 300000);
                                           <= 0 disables it. See `review stat`'s section
                                           in README.md.
-    REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window (default 600)
-                                          for a chronically-unavailable claude seat
-                                          (Fable); <= 0 disables it.
+    REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window for a
+                                          chronically-unavailable claude seat (Fable;
+                                          NOT wired into opencode/commandcode backends
+                                          yet — see review-cli#226). Unset:
+                                          the window ESCALATES per consecutive failure
+                                          (10min, 30min, 2h, then 8h cap), resetting to
+                                          10min after a success or a 24h quiet period.
+                                          Set: that fixed window every time, no
+                                          escalation; <= 0 disables cooldowns entirely.
     REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
                                           ~/.config/review-cli/seat-cooldown.json).
   codex / opencode / omp carry their own CLI auth (no key here).
