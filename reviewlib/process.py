@@ -5,6 +5,7 @@ decomposition — zero behaviour change). `_run_streamed` is the workhorse for
 long backend calls: it streams stdout/stderr to a per-call log file in real time
 and preserves partial output on timeout. See the module docstrings below.
 """
+
 from __future__ import annotations
 
 import codecs
@@ -43,16 +44,18 @@ def _safe_log_header(value: object) -> str:
 # it reaches the verdict pipeline AND the `-o` output file. cli._ANSI_ESCAPE_RE
 # (output-file path) and the claude backend both delegate here so the rules never drift.
 _CSI_OSC_RE = re.compile(
-    r"\x1b\[[0-9;?]*[ -/]*[@-~]"          # CSI: ESC [ … final-byte (colours / cursor moves)
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI: ESC [ … final-byte (colours / cursor moves)
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: ESC ] … (BEL | ST) (hyperlinks / titles)
-    r"|\x1b[ -/]*[@-~]"                    # other 2+-byte ESC seqs incl. ESC c (RIS), ESC M
+    r"|\x1b[ -/]*[@-~]"  # other 2+-byte ESC seqs incl. ESC c (RIS), ESC M
 )
 # C0 control chars to drop after CSI/OSC removal — everything below 0x20 (plus DEL)
 # EXCEPT newline (\n) and tab (\t), the whitespace that carries real verdict structure.
 # Carriage return (\r) IS dropped: in a TUI-scraper transcript it is the line-OVERWRITE
 # byte, so a stray CR could splice an old redraw fragment into a verdict line — we never
 # want carriage-return overwrite semantics in parsed text, only the resulting characters.
-_C0_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # 0x00–0x1F minus \t (0x09) & \n (0x0A), plus 0x7F
+_C0_CONTROL_RE = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f]"
+)  # 0x00–0x1F minus \t (0x09) & \n (0x0A), plus 0x7F
 
 
 def strip_control_sequences(text: str) -> str:
@@ -63,6 +66,7 @@ def strip_control_sequences(text: str) -> str:
     survives; drops carriage returns (the TUI line-overwrite byte). Idempotent and safe
     on text that has no control bytes."""
     return _C0_CONTROL_RE.sub("", _CSI_OSC_RE.sub("", text))
+
 
 # ── memory-aware concurrency cap (board resilience under swarm load, review-cli#65) ───────
 # Each heavy backend (codex / claude / opencode) spawns a model-runner subprocess, and a
@@ -93,6 +97,40 @@ _DEFAULT_IDLE_TIMEOUT = 20 * 60
 _SHORT_TIMEOUT_EXACT_THRESHOLD = 60
 _IDLE_TIMEOUT_ENV = "REVIEW_IDLE_TIMEOUT_SECONDS"
 
+# A reserve seat promoted late in a board run must still get a fair shot, even when
+# almost no wall-clock budget remains — otherwise a tight deadline would starve every
+# backfill attempt to zero and the board would degrade for no reason. 90s is enough
+# for a normal backend to at least attempt a call and fail fast if it's the one that's
+# actually stuck, without letting the deadline clamp become a no-op.
+_MIN_DEADLINE_CLAMPED_IDLE_FLOOR = 90
+
+# Process-wide wall-clock deadline (a time.monotonic() timestamp) that
+# idle_timeout_seconds() clamps its returned idle-silence budget against, so a board
+# run bounded by an external wrapper (e.g. `timeout 900 review diff ...`) degrades
+# gracefully instead of being SIGKILLed mid-reserve-promotion. Set/cleared once around
+# a single run_board_with_failover call (panel.py) — mirrors that function's existing
+# _suppress_autotally set/restore-in-finally shape: one board run owns this for the
+# process at a time, matching how the CLI actually invokes it (one `review` command =
+# one process = one board run). None (the default) preserves the pre-existing
+# unclamped behaviour exactly.
+_DEADLINE_LOCK = threading.Lock()
+_board_deadline: float | None = None
+
+
+def set_board_deadline(deadline: float | None) -> None:
+    """Set (or clear, with None) the active board-run wall-clock deadline that
+    idle_timeout_seconds() clamps against. See the module-level comment above
+    _board_deadline for the ownership contract."""
+    global _board_deadline
+    with _DEADLINE_LOCK:
+        _board_deadline = deadline
+
+
+def _active_board_deadline() -> float | None:
+    with _DEADLINE_LOCK:
+        return _board_deadline
+
+
 # Built lazily + cached: read $REVIEW_MAX_CONCURRENCY once on first spawn so a test can set
 # the env before importing/using the module, and so every seat in a run shares ONE semaphore
 # (a per-call build would never actually limit anything). Guarded by its own lock; None until
@@ -120,7 +158,9 @@ def max_concurrency() -> int:
     return min(value, _MAX_CONCURRENCY_CEILING)
 
 
-def idle_timeout_seconds(timeout: int, *, idle_floor: int | None = _DEFAULT_IDLE_TIMEOUT) -> int | None:
+def idle_timeout_seconds(
+    timeout: int, *, idle_floor: int | None = _DEFAULT_IDLE_TIMEOUT
+) -> int | None:
     """Seconds of backend silence allowed before reaping a subprocess.
 
     The historical `timeout` was a hard wall clock cap. Agent CLIs can legitimately run
@@ -133,6 +173,15 @@ def idle_timeout_seconds(timeout: int, *, idle_floor: int | None = _DEFAULT_IDLE
     Set REVIEW_IDLE_TIMEOUT_SECONDS=0 to disable idle reap and use the requested wall-clock
     timeout instead. Callers that pass ``idle_floor=0`` have a tight user-facing contract,
     so their requested value stays exact even when the ambient env var is present.
+
+    When a board-run wall-clock deadline is active (set_board_deadline — normally by
+    run_board_with_failover for a run wrapped in an external timeout), the returned floor
+    is additionally clamped to whatever time genuinely remains before that deadline, down
+    to a minimum of _MIN_DEADLINE_CLAMPED_IDLE_FLOOR seconds so a late reserve promotion
+    still gets a fair shot instead of being starved to ~0. This clamp is skipped for the
+    two EXPLICIT-DISABLE contracts above (idle_floor<=0, and $REVIEW_IDLE_TIMEOUT_SECONDS=0)
+    — those are a caller/operator opting OUT of idle reaping entirely, and a deadline clamp
+    silently reintroducing a bound would violate that contract.
     """
     requested = max(int(timeout), 1)
     if idle_floor is not None and idle_floor <= 0:
@@ -147,14 +196,34 @@ def idle_timeout_seconds(timeout: int, *, idle_floor: int | None = _DEFAULT_IDLE
             if value == 0:
                 return None
             if value > 0:
-                return value
+                return _clamp_to_board_deadline(value)
     if idle_floor is None:
-        return requested
+        computed = requested
     # Tiny timeouts are test/debug contracts. Preserve them exactly so unit tests and
     # one-off probes can still finish quickly; normal human review timeouts get the floor.
-    if requested < _SHORT_TIMEOUT_EXACT_THRESHOLD:
-        return requested
-    return max(requested, idle_floor)
+    elif requested < _SHORT_TIMEOUT_EXACT_THRESHOLD:
+        computed = requested
+    else:
+        computed = max(requested, idle_floor)
+    return _clamp_to_board_deadline(computed)
+
+
+def _clamp_to_board_deadline(computed: int) -> int:
+    """Clamp an already-computed idle-timeout value down to whatever wall-clock time
+    remains before the active board deadline (if any), never below
+    _MIN_DEADLINE_CLAMPED_IDLE_FLOOR — but NEVER above `computed` either: the floor
+    protects a late reserve promotion from being starved by the DEADLINE, it must never
+    override a caller's own smaller request (an explicit REVIEW_IDLE_TIMEOUT_SECONDS, or
+    the exact-preserve contract for tiny timeouts) by handing back something LARGER than
+    what was asked for. A elapsed/past deadline still returns the minimum floor (never
+    zero/negative, so the caller gets one last real attempt), but capped at `computed`."""
+    deadline = _active_board_deadline()
+    if deadline is None:
+        return computed
+    remaining = int(deadline - time.monotonic())
+    if remaining >= computed:
+        return computed
+    return min(computed, max(remaining, _MIN_DEADLINE_CLAMPED_IDLE_FLOOR))
 
 
 def _get_concurrency_sem() -> threading.BoundedSemaphore | None:
@@ -191,7 +260,9 @@ _LIVE_CHILDREN_LOCK = threading.Lock()
 _LIVE_CHILDREN: set[tuple[subprocess.Popen, int | None]] = set()
 
 
-def _register_child(proc: subprocess.Popen, pgid: int | None) -> tuple[subprocess.Popen, int | None]:
+def _register_child(
+    proc: subprocess.Popen, pgid: int | None
+) -> tuple[subprocess.Popen, int | None]:
     """Track a live backend child so the backstop can reap it. Returns the handle to
     pass back to `_unregister_child` in a finally."""
     handle = (proc, pgid)
@@ -295,8 +366,12 @@ def _resolve_git_dir(cwd: Path) -> Path | None:
     try:
         proc = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--absolute-git-dir"],
-            cwd=str(cwd), env=stripped, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+            cwd=str(cwd),
+            env=stripped,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -371,7 +446,11 @@ def log_dir() -> Path:
     else:
         state = os.environ.get("XDG_STATE_HOME", "").strip()
         # XDG spec: a relative $XDG_STATE_HOME must be ignored.
-        root = Path(state) if state and os.path.isabs(state) else (Path.home() / ".local" / "state")
+        root = (
+            Path(state)
+            if state and os.path.isabs(state)
+            else (Path.home() / ".local" / "state")
+        )
         base = root / "review-cli" / "logs"
     base.mkdir(parents=True, exist_ok=True)
     try:
@@ -382,7 +461,9 @@ def log_dir() -> Path:
 
 
 def _safe_backend(backend: str) -> str:
-    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in backend) or "backend"
+    return (
+        "".join(c if (c.isalnum() or c in "-_.") else "_" for c in backend) or "backend"
+    )
 
 
 def current_task_code() -> str | None:
@@ -532,7 +613,9 @@ def write_retry_log(
     seq = _next_retry_log_seq()
     path = log_dir() / f"{stamp}-{_safe_backend(model)}-retry-{seq:04d}.log"
     rc = getattr(result, "returncode", "?")
-    detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+    detail = (
+        getattr(result, "stderr", "") or getattr(result, "stdout", "") or ""
+    ).strip()
     detail = detail[:_RETRY_LOG_DETAIL_MAX]
     # The attempt fraction is only meaningful for a `retry` event (the Nth of `budget`
     # retries). A `promote` / `seat-fatal` event has no retry index, so it omits the fraction
@@ -548,7 +631,11 @@ def write_retry_log(
             for line in detail.splitlines():
                 fh.write("[detail] " + line + "\n")
     except OSError as exc:  # noqa: BLE001 - a log we can't write must not break the review
-        print(f"[review-cli] could not write retry log ({exc})", file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] could not write retry log ({exc})",
+            file=sys.stderr,
+            flush=True,
+        )
     return path
 
 
@@ -563,6 +650,7 @@ def _kill_tree(proc: subprocess.Popen, pgid: int | None) -> None:
     same group can still be alive and holding the pipe. `pgid` is captured at Popen
     time precisely so it stays valid after the parent is reaped.
     """
+
     def _signal_group(sig: int) -> None:
         try:
             if pgid is not None:
@@ -618,7 +706,11 @@ def _run_streamed(
     """
     path = _open_log(backend, round_no)
     if announce:
-        print(f"[review-cli] {backend} live log: {path} (tail -f to follow)", file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] {backend} live log: {path} (tail -f to follow)",
+            file=sys.stderr,
+            flush=True,
+        )
 
     out_buf: list[str] = []
     err_buf: list[str] = []
@@ -627,10 +719,16 @@ def _run_streamed(
     timed_out = False
     if timeout_mode not in {"idle", "wall"}:
         raise ValueError(f"unknown timeout_mode: {timeout_mode}")
-    idle_timeout = idle_timeout_seconds(timeout, idle_floor=idle_floor) if timeout_mode == "idle" else None
+    idle_timeout = (
+        idle_timeout_seconds(timeout, idle_floor=idle_floor)
+        if timeout_mode == "idle"
+        else None
+    )
     timeout_secs = max(int(timeout), 1)
     timeout_marker_secs = timeout_secs
-    timeout_marker_kind = "without output" if timeout_mode == "idle" else "total runtime"
+    timeout_marker_kind = (
+        "without output" if timeout_mode == "idle" else "total runtime"
+    )
     activity = {"last": time.monotonic()}
     proc: subprocess.Popen | None = None
     pgid: int | None = None
@@ -673,13 +771,17 @@ def _run_streamed(
             if concurrency_sem.acquire(blocking=False):
                 sem_acquired = True
             else:
-                log_fh.write(f"[review-cli] {backend}: waiting for a concurrency slot "
-                             f"(cap {max_concurrency()})\n")
+                log_fh.write(
+                    f"[review-cli] {backend}: waiting for a concurrency slot "
+                    f"(cap {max_concurrency()})\n"
+                )
                 log_fh.flush()
                 concurrency_sem.acquire()
                 sem_acquired = True
 
-        log_fh.write(f"[review-cli] {_safe_log_header(backend)}: {header} (args redacted){_task_header_suffix()}\n")
+        log_fh.write(
+            f"[review-cli] {_safe_log_header(backend)}: {header} (args redacted){_task_header_suffix()}\n"
+        )
         log_fh.flush()
 
         proc = subprocess.Popen(
@@ -791,8 +893,12 @@ def _run_streamed(
                     pass
 
         stdin_thread = threading.Thread(target=_feed_stdin, daemon=True)
-        stdout_thread = threading.Thread(target=_drain, args=(proc.stdout, out_buf, ""), daemon=True)
-        stderr_thread = threading.Thread(target=_drain, args=(proc.stderr, err_buf, "[stderr] "), daemon=True)
+        stdout_thread = threading.Thread(
+            target=_drain, args=(proc.stdout, out_buf, ""), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=_drain, args=(proc.stderr, err_buf, "[stderr] "), daemon=True
+        )
         stdin_thread.start()
         stdout_thread.start()
         stderr_thread.start()
@@ -848,7 +954,9 @@ def _run_streamed(
 
         returncode = proc.returncode if proc.returncode is not None else -1
         if timed_out:
-            returncode = 124  # conventional timeout exit code (overrides the kill signal)
+            returncode = (
+                124  # conventional timeout exit code (overrides the kill signal)
+            )
 
         with log_lock:
             stopping.set()  # freeze the buffers + stop late log writes
@@ -877,7 +985,9 @@ def _run_streamed(
                 log_fh.flush()
             except (ValueError, OSError):
                 pass
-        return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout, stderr=stderr
+        )
     finally:
         # The log handle ALWAYS closes, even if Popen or a write raised before the
         # normal return path (the docstring's partial-output promise depends on it).
