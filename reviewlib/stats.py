@@ -87,6 +87,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import seat_cooldown as _seat_cooldown
+from .config import REVIEW_ROLES
 
 # Schema version for the JSONL records. Bump if the record shape changes
 # incompatibly; readers tolerate unknown/missing fields and skip junk lines.
@@ -248,6 +249,7 @@ def record_run(
     repo_id: str | None = None,
     diff_files: list[str] | None = None,
     diff_sha256: str | None = None,
+    roles: list[str] | None = None,
 ) -> bool:
     """Append one run record to the JSONL store. Best-effort: never raises.
 
@@ -256,6 +258,32 @@ def record_run(
     wall-clock the caller timed with a monotonic clock. Returns True on a
     successful append, False if anything went wrong (unwritable dir, etc.) — the
     run must never fail because stats couldn't be persisted.
+
+    ``roles`` (review-cli#221) is the board ROLE each USABLE seat that produced a
+    verdict was reviewing under, for callers that carry per-seat role info
+    (currently: the review-diff/visual board dispatch, whose seats each carry a
+    ``REVIEW_ROLES`` key — see ``panel.FailoverOutcome.usable_roles``). It IS
+    index-aligned with ``models`` for every current producer (``usable_models``/
+    ``usable_roles`` are appended in the same loop iteration in
+    ``panel.run_board_with_failover``; the CLI's explicit-board branches build
+    both from the same seat list in the same order — see ``cli._ran_models``/
+    ``_ran_roles``), and ``quorum_check``'s monoculture guard
+    (``_models_behind_role_coverage``) relies on that alignment to credit only a
+    model whose OWN role is valid, not merely one sharing a record with a
+    valid-role seat. ``record_run`` itself DOES enforce this at write time (see
+    the ``len(roles) == len(models)`` check below — a mismatched-length ``roles``
+    is dropped, not partially written), so every record THIS module writes is
+    aligned; the ``zip``-truncates-gracefully fallback in
+    ``_models_behind_role_coverage`` matters only for pre-existing/externally-
+    written records this function's own guard predates, which can still supply a
+    mismatched pair (``zip`` truncates to the shorter list, under- never over-
+    crediting — the fail-closed direction) — it just won't get full role credit.
+    ``None``
+    (the default) means "this mode/caller has no role concept" and the key is
+    omitted entirely — same "unknown, not written as an empty list" convention as
+    ``passed``/``repo_id`` — so a ``--min-roles`` gate can tell "never recorded a
+    role" apart from "recorded zero roles". Modes with no board (quorum/just-ask/
+    brainstorm/qa) never pass this.
 
     ``passed`` is the run's VERDICT — the caller's own success/failure criterion
     (e.g. the mode handler's exit code), NOT ``ok_count``/``fail_count`` (those are
@@ -299,6 +327,25 @@ def record_run(
         record["diff_files"] = list(diff_files)
     if diff_sha256 is not None:
         record["diff_sha256"] = diff_sha256
+    if roles is not None:
+        # Round-7 review finding (Fable): `_distinct_roles` (the ENFORCING counter
+        # behind --min-roles) has no reference to `models` at all — it just iterates
+        # `roles` independently, unlike the advisory `_models_behind_role_coverage`,
+        # which zips the two and so fails closed (under- never over-credits) on a
+        # length mismatch. That makes the enforcement path fail OPEN if a future/
+        # buggy/adversarial producer ever wrote more roles than models (e.g.
+        # `models: ["codex"], roles: ["architect", "security"]`), inflating role
+        # coverage from a single seat — backwards for a self-merge-authority gate.
+        # No CURRENT producer can write mismatched lengths (`panel.
+        # FailoverOutcome.usable_models`/`usable_roles` are appended in lockstep;
+        # `_ran_models`/`_ran_roles` build both from the same seat list in the same
+        # order), so this is defense-in-depth at the one write chokepoint, not a
+        # fix for a reachable bug — best-effort/never-raise like every other
+        # validation in this function: silently omit `roles` (not partially write
+        # it) rather than persist a shape whose length lies about which seats it
+        # actually describes.
+        if len(roles) == len(models):
+            record["roles"] = list(roles)
     try:
         p = stats_path()  # may raise RuntimeError on an unexpandable ~user / no HOME
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -468,6 +515,78 @@ def _distinct_models(items: list[dict]) -> list[str]:
     return models
 
 
+def _distinct_roles(items: list[dict]) -> list[str]:
+    """Sorted, deduped board-role list across a set of run-stats iterations
+    (review-cli#221 --min-roles). Mirrors ``_distinct_models``, reading the
+    ``roles`` key instead of ``models`` — with one deliberate difference: only
+    roles that are a real ``REVIEW_ROLES`` key count.
+
+    An iteration with no recorded ``roles`` key (a mode with no role concept, or
+    history that predates this field) contributes nothing — it neither helps nor
+    hurts a ``--min-roles`` count, same as a pre-v4 record and ``repo_id`` in the
+    diff-identity check.
+
+    Codex review finding: a config ``board:`` entry may carry an UNKNOWN role
+    string (``config._normalize_board_reviewer`` keeps it but degrades the seat
+    to the generic prompt — no distinct lens — and logs a warning; see that
+    function's docstring). Counting an unknown/typo'd role string here would let
+    N seats that all reviewed under the SAME generic prompt satisfy a
+    ``--min-roles N`` self-merge-authority gate as if they were N genuinely
+    distinct facets — exactly the "distinct lenses" contract this gate exists to
+    enforce. Filtering to ``REVIEW_ROLES`` keeps the count honest: only a role
+    that actually carries its own lens text can ever count as covered."""
+    roles: list[str] = []
+    for item in items:
+        for role in item.get("roles") or []:
+            if isinstance(role, str) and role in REVIEW_ROLES and role not in roles:
+                roles.append(role)
+    roles.sort()
+    return roles
+
+
+def _models_behind_role_coverage(items: list[dict]) -> list[str]:
+    """Distinct models that actually EARNED a VALID (``REVIEW_ROLES``) role — the
+    population the ``--min-roles`` monoculture guard in ``quorum_check``'s
+    suggestion must check diversity against.
+
+    Round-3 review finding (Fable): the guard originally checked
+    ``len(models) >= 2`` across EVERY passed iteration, including role-LESS ones
+    (quorum/just-ask/brainstorm). That let a role-less iteration on a second model
+    satisfy "2 distinct models" while 100% of the counted ROLE coverage still came
+    from a single other model — exactly the monoculture shape the guard exists to
+    block, just laundered through an unrelated iteration.
+
+    Round-4 review finding (Codex), sharper still: scoping to "this ITERATION
+    contributed >=1 valid role" is not enough EITHER — a single multi-seat record
+    (e.g. one `review diff` call recording every board seat's ``models``/``roles``
+    together) can mix a valid-role seat with an unknown-role seat, and crediting
+    every model in that record (not just the one that earned the valid role) lets
+    the unknown-role seat's model launder in as "diverse" too. ``models``/``roles``
+    ARE index-aligned per seat for every current producer (`panel.
+    FailoverOutcome.usable_models`/`usable_roles`, and the CLI's `_ran_models`/
+    `_ran_roles` explicit-board branches both iterate the SAME seat list in the
+    SAME order — see their docstrings), so ``zip`` pairs each model with the SAME
+    seat's own role and credits ONLY a model whose OWN role is valid — never a
+    model that merely shares a record with a valid-role seat. A record from a
+    hypothetical future producer that doesn't honor this alignment just
+    under-credits (``zip`` stops at the shorter list) rather than over-crediting —
+    the fail-closed direction for a self-merge-authority gate."""
+    models: list[str] = []
+    for item in items:
+        item_models = item.get("models") or []
+        item_roles = item.get("roles") or []
+        for model, role in zip(item_models, item_roles):
+            if (
+                isinstance(model, str)
+                and isinstance(role, str)
+                and role in REVIEW_ROLES
+                and model not in models
+            ):
+                models.append(model)
+    models.sort()
+    return models
+
+
 def _finalize_quorum_result(
     result: dict,
     *,
@@ -502,11 +621,13 @@ def quorum_check(
     *,
     min_iter: int,
     min_models: int,
+    min_roles: int | None = None,
     repo_id: str | None = None,
     diff_files: list[str] | None = None,
 ) -> dict:
     """Compute the quorum verdict for one task: N PASSED iterations across M distinct
-    models (self-merge-authority gate; CTO decision tg#7306 #1).
+    models (self-merge-authority gate; CTO decision tg#7306 #1) — or, when ``min_roles``
+    is given, across M distinct BOARD ROLES instead (review-cli#221).
 
     Only iterations whose record has ``passed is True`` count toward ``min_iter``, and
     ``min_models`` is the distinct-model count among those SAME passed iterations — a
@@ -534,17 +655,46 @@ def quorum_check(
     is currently cooling down — this is the one exception to "identical to pre-v4
     shape when passing," since it doesn't depend on diff-identity at all.)
 
+    ``min_roles`` (optional, review-cli#221) switches the SECOND half of the gate from
+    counting distinct model-name strings to counting distinct board ROLES covered by
+    ``gate_iterations`` — a role filled by the board's shortage-resilience duplicate-
+    model pad (a model reused onto an otherwise-empty role slot, see
+    ``config.select_pool_with_reuse`` / PR #207) counts once per role there, exactly
+    like any other role, instead of collapsing into the model string ``_distinct_models``
+    already counted. ``--min-models`` and ``--min-roles`` are independent: passing
+    neither/only ``min_models`` reproduces the EXACT pre-#221 shape and behavior below
+    (``min_roles`` omitted -> no ``roles``/``distinct_roles_passed`` keys, the gate is
+    governed by ``min_models`` as always); passing ``min_roles`` governs the pass/fail
+    decision instead (``min_models`` is still validated/reported for visibility, but no
+    longer decides ``passed``). Iterations from a mode with no role concept (quorum /
+    just-ask / brainstorm / qa — only the review-diff/visual board dispatch records
+    per-seat roles today) contribute no roles, same fail-closed-by-omission treatment as
+    an unverdicted iteration.
+
+    KNOWN, DELIBERATE trade-off (Fable round-3 review finding): when a caller passes
+    BOTH floors explicitly, this function silently lets ``min_roles`` govern (per the
+    "whichever is passed" design above) with no signal in the returned dict that
+    ``min_models`` didn't decide the verdict — the visibility mitigation for that
+    (a printed stderr note) lives ONLY in the CLI wrapper (``reviewlib.cli``'s
+    ``--check`` handling), which can tell "explicitly passed" apart from "defaulted"
+    via its own argparse layer; this function's plain ``int`` parameters cannot. A
+    direct library caller passing ``min_models=5, min_roles=1`` gets role-mode's
+    verdict with no note. Tracked as a follow-up (either enforce both floors as an AND
+    when both are explicit, or thread an explicit-vs-default signal — e.g. a
+    ``min_models_explicit`` bool — into this function so the note can live here too),
+    not fixed in this change.
+
     Fail-closed (independent of the above): an invalid task code, an unreadable/missing
     store, or zero recorded iterations for the code all yield ``passed: False`` plus an
     ``"error"`` key explaining why — the caller must never treat "no data" as "quorum
-    met". A ``min_iter``/``min_models`` floor below 1 is also rejected the same way — 0
-    would trivially satisfy the bar via ``0 >= 0`` even for a task with zero passed
-    iterations, undermining the whole point of this gate. Validated HERE (not only in
-    the CLI wrapper) so a direct library caller can't bypass the floor either.
+    met". A ``min_iter``/``min_models``/``min_roles`` floor below 1 is also rejected the
+    same way — 0 would trivially satisfy the bar via ``0 >= 0`` even for a task with zero
+    passed iterations, undermining the whole point of this gate. Validated HERE (not only
+    in the CLI wrapper) so a direct library caller can't bypass the floor either.
     """
 
     def _rejected(error: str) -> dict:
-        return {
+        result = {
             "task_code": task_code,
             "passed_iterations": 0,
             "total_iterations": 0,
@@ -555,11 +705,22 @@ def quorum_check(
             "passed": False,
             "error": error,
         }
+        if min_roles is not None:
+            result["distinct_roles_passed"] = 0
+            result["roles"] = []
+            result["min_roles"] = min_roles
+        return result
 
-    if min_iter < 1 or min_models < 1:
+    if min_iter < 1 or min_models < 1 or (min_roles is not None and min_roles < 1):
+        # Opus round-3 review finding: only name min_roles in the message when it was
+        # actually part of the input — otherwise a bare min_iter/min_models violation
+        # prints a confusing "min_roles=None" (the same fix the CLI layer already
+        # applies to its own copy of this validation; mirrored here so a direct
+        # library caller sees the identical, non-confusing message).
+        roles_clause = f" min_roles={min_roles}" if min_roles is not None else ""
         return _rejected(
-            f"min_iter and min_models must both be >= 1 (got min_iter={min_iter} "
-            f"min_models={min_models})"
+            "min_iter, min_models, and min_roles (when given) must all be >= 1 "
+            f"(got min_iter={min_iter} min_models={min_models}{roles_clause})"
         )
     try:
         clean = normalize_task_code(task_code)
@@ -578,7 +739,12 @@ def quorum_check(
     # check, so unchanged from pre-v4 behavior) — mismatched iterations are excluded.
     gate_iterations = verified + unverifiable
     models = _distinct_models(gate_iterations)
+    roles = _distinct_roles(gate_iterations) if min_roles is not None else None
 
+    if roles is not None:
+        gate_met = len(gate_iterations) >= min_iter and len(roles) >= min_roles
+    else:
+        gate_met = len(gate_iterations) >= min_iter and len(models) >= min_models
     result = {
         "task_code": clean,
         "passed_iterations": len(gate_iterations),
@@ -587,8 +753,59 @@ def quorum_check(
         "models": models,
         "min_iter": min_iter,
         "min_models": min_models,
-        "passed": len(gate_iterations) >= min_iter and len(models) >= min_models,
+        "passed": gate_met,
     }
+    if roles is not None:
+        result["distinct_roles_passed"] = len(roles)
+        result["roles"] = roles
+        result["min_roles"] = min_roles
+    # review-cli#221: when --min-models governs the gate (min_roles not given) and the
+    # bar isn't met because model diversity itself is short, point at --min-roles as an
+    # alternative counting mode — a duplicated-model role-fill (PR #207) still counts
+    # toward it even though `_distinct_models` collapsed it to one string here.
+    #
+    # Round-1 review finding (Opus/Codex/Fable, independently): the ORIGINAL version of
+    # this block only checked "models fell short", which suggests a flag that CANNOT
+    # help in real cases — a task whose history has no recorded roles at all (predates
+    # this field, or every iteration came from quorum/just-ask/brainstorm/qa) is
+    # GUARANTEED to still fail under --min-roles too, just with less diagnostic detail;
+    # so is a task that's ALSO short on `min_iter` (switching counting mode doesn't add
+    # iterations). Compute the roles `--min-roles {min_models}` would actually see and
+    # only suggest it when it would truly flip the verdict to passed — never a hint that
+    # sends the caller straight into a second denial.
+    #
+    # Round-2 review finding (Fable): requiring at least 2 distinct models keeps the
+    # hint scoped to its own stated premise — genuine partial model diversity being
+    # under-credited by `_distinct_models` (the PR #207 "2 real models + 1 role-fill"
+    # shape this feature exists for) — instead of ALSO recommending --min-roles for a
+    # full monoculture (every passed iteration on the SAME single model, just under
+    # different roles), which would let one model self-authorize a merge that a
+    # self-merge-authority gate exists specifically to prevent. --min-roles ITSELF still
+    # allows that shape if a caller explicitly opts into it (that's the feature's own
+    # documented semantics — see this function's docstring); only the ADVISORY hint here
+    # is more conservative than the gate it points at.
+    #
+    # Round-3 review finding (Fable): the guard must count distinct models among the
+    # ROLE-BEARING iterations specifically (`_models_behind_role_coverage`), NOT every
+    # passed iteration — the original `len(models) >= 2` counted a role-LESS iteration
+    # on a second model as "diversity" even when 100% of the counted role coverage
+    # still traced back to a single other model, laundering the exact monoculture the
+    # guard exists to block through an unrelated iteration.
+    if min_roles is None and not gate_met and store_error is None and iterations:
+        potential_roles = _distinct_roles(gate_iterations)
+        role_bearing_models = _models_behind_role_coverage(gate_iterations)
+        if (
+            len(role_bearing_models) >= 2
+            and len(models) < min_models
+            and len(gate_iterations) >= min_iter
+            and len(potential_roles) >= min_models
+        ):
+            result["min_roles_suggestion"] = (
+                f"{min_models} distinct models required, only {len(models)} found. If "
+                "review passes duplicated a model onto multiple roles (see PR #207), "
+                f"try --min-roles {min_models} instead, which covers "
+                f"{len(potential_roles)} distinct roles rather than unique model names."
+            )
     # review-cli#221: when the bar isn't met, name the SPECIFIC model(s) that were
     # actually attempted for this task and are CURRENTLY cooling down (an unavailable
     # sentinel or a session-limit/usage-credits notice — the two chronic signals

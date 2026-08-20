@@ -17,6 +17,7 @@ keeps the hot review path free of a directory scan. A future "drop a Python file
 modes plugin dir" discovery step would mirror `features/visual/registry.discover_specs`
 — the contract (`ModeSpec` + a top-level `MODE`) is already discovery-ready.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -142,7 +143,7 @@ REMOVED_FLAGS: dict[str, RemovedFlag] = {
         "colliding with the unrelated `review quorum` multi-model consensus panel — same "
         "word, two different features.",
         fix="use `review task CODE --check` instead; `--min-iter`/`--min-models`/`--json` "
-        "are unchanged.",
+        "are unchanged (review-cli#221 also added `--min-roles` there).",
     ),
 }
 

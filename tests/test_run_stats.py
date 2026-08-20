@@ -769,6 +769,49 @@ def test_cli_default_board_run_records_pool_size_four():
     assert "[review] pool=4 (review)" in r["_stderr"]
 
 
+def test_cli_default_board_run_records_roles_review_cli_221():
+    """End-to-end coverage of `_ran_roles`'s `outcome_sink` branch -- the DEFAULT,
+    non-exact board dispatch path (Fable round-2 review finding: this closure,
+    reading `outcome_sink[0].usable_roles`, had no coverage distinct from the
+    `_run_mode_with_stats(roles_after=lambda: ...)` unit-level test)."""
+    r = _run_board_review_and_get_record([])  # default pool = 4, all seats succeed
+    assert len(r["roles"]) == 4, r
+    assert set(r["roles"]) == {
+        "correctness",
+        "performance",
+        "quality",
+        "consistency",
+    }, r
+
+
+def test_cli_default_board_roles_actually_satisfy_min_roles_review_cli_221():
+    """Round-7 review finding (Opus): closes the loop between the real board-
+    dispatch record shape (the test above) and `quorum_check`'s counting --
+    every OTHER `--min-roles` test hand-writes `record_run(roles=[...])`
+    directly, so nothing previously proved the ACTUAL role strings a real
+    default-board dispatch produces are valid `REVIEW_ROLES` keys that
+    `_distinct_roles` wouldn't silently filter out (a silent no-op on the most
+    common path, invisible to the rest of the suite)."""
+    dispatched = _run_board_review_and_get_record([])  # default pool = 4
+    real_roles = dispatched["roles"]
+    assert len(real_roles) == 4, dispatched
+
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=dispatched["models"],
+            roles=real_roles,
+            duration_seconds=1.0,
+            ok_count=4,
+            fail_count=0,
+            passed=True,
+        )
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=4)
+        assert result["passed"] is True, result
+        assert result["distinct_roles_passed"] == 4
+
+
 def test_cli_board_run_records_explicit_pool_size():
     """`--pool 2` must record pool_size == 2 (not 4, not 9): the slice feeds run-stats
     at arbitrary sizes, not just the default (GLM finding 23)."""
@@ -912,6 +955,126 @@ def test_cli_exact_board_records_all_explicit_attempted_models_on_partial_failur
             assert r["models"] == ["codex", "gemini"], r
             assert r["pool_size"] == 2, r
             assert r["ok_count"] == 1 and r["fail_count"] == 1, r
+        finally:
+            restore()
+            _cli.load_config = saved_cfg
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            d.cleanup()
+
+
+def test_cli_exact_board_failed_seat_roles_never_satisfy_min_roles_review_cli_221():
+    """The invariant `_ran_roles`'s `explicit_models` branch relies on (round-2
+    review finding, Opus/Fable, independently, both marked 'blocking' pending this
+    exact confirmation): an exact board with ANY failed seat can never record
+    `passed=True` (there is no reserve to backfill it — `run_board_with_failover`
+    degrades), so "return every planned seat's role regardless of pass/fail" (the
+    same pre-existing shortcut `_ran_models` already took) can never leak a FAILED
+    seat's role into a record that actually counts toward --min-roles."""
+    with _TmpStore() as store:
+        d = _git_init_with_diff()
+        restore = _with_backend_stub(_stub_resolve_backend({"codex": 0, "gemini": 1}))
+        saved_cfg = _cli.load_config
+        log = tempfile.mkdtemp()
+        os.environ["REVIEW_LOG_DIR"] = log
+        _cli.load_config = lambda: {
+            "models": ["codex", "gemini"],
+            "board": [
+                {"model": "codex", "role": "correctness", "name": "Codex"},
+                {"model": "gemini", "role": "contracts", "name": "Gemini"},
+            ],
+        }
+        try:
+            with redirect_stderr(io.StringIO()), _capture_stdout():
+                rc = _cli.main(
+                    ["diff", *TASK_ARGS, "-C", d.name, "-m", "codex", "-m", "gemini"]
+                )
+            assert rc == 1, rc  # gemini failed -> the whole exact-board run degrades
+            rec = store.records()[0]
+            assert rec.get("passed") is False
+            # `_ran_roles` DOES still record both roles onto the iteration (mirrors
+            # `_ran_models`'s identical, already-tested choice above) --
+            assert rec["roles"] == ["correctness", "contracts"]
+            # Round-10 review finding (Opus): pairwise, not just two independently-
+            # correct lists -- `_ran_models`/`_ran_roles` build both from the SAME
+            # `board` list in the SAME comprehension order, so each model lands
+            # with the role IT was actually configured under, not a neighbor's.
+            assert list(zip(rec["models"], rec["roles"])) == [
+                ("codex", "correctness"),
+                ("gemini", "contracts"),
+            ]
+            # -- but because `passed` is False, `quorum_check`'s `passed is True`
+            # filter excludes this iteration entirely: NEITHER role counts, including
+            # "correctness" from the seat that actually succeeded.
+            result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=1)
+            assert result["passed"] is False
+            assert result["roles"] == []
+        finally:
+            restore()
+            _cli.load_config = saved_cfg
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            d.cleanup()
+
+
+def test_cli_exact_board_unavailable_sentinel_seat_never_satisfies_min_roles_review_cli_221():
+    """Round-4 review finding (Opus, marked 'blocking pending one trace'): the
+    failed-seat invariant above must ALSO hold for a seat that returns exit 0
+    with an UNAVAILABLE-SENTINEL body (`result_is_usable`'s third failure shape —
+    the paywalled-but-keyed case a raw exit-code check can't see), not only a
+    plain non-zero exit. Traced: `run_board_with_failover` gates `usable` (hence
+    `outcome.degraded`, hence `ok = not degraded`, hence the CLI's exit code) on
+    `result_is_usable`, which classifies an rc=0 short body containing an
+    unavailable marker as UNUSABLE -- so an exact board (empty reserve) with a
+    sentinel-body seat degrades exactly like a plain failure, and `passed` is
+    False the same way."""
+    with _TmpStore() as store:
+        d = _git_init_with_diff()
+
+        def _resolver(_model: str):
+            def _backend(m, prompt, diff, cwd, timeout, round_no=0, effort=None):
+                if m == "gemini":
+                    # rc=0, but a short body matching an _UNAVAILABLE_MARKERS
+                    # entry -- result_is_usable's sentinel-body failure shape.
+                    return ReviewResult(
+                        model=m,
+                        command=f"stub {m}",
+                        returncode=0,
+                        stdout="Gemini is currently unavailable.",
+                        stderr="",
+                    )
+                return ReviewResult(
+                    model=m,
+                    command=f"stub {m}",
+                    returncode=0,
+                    stdout=f"output from {m}",
+                    stderr="",
+                )
+
+            return _backend
+
+        restore = _with_backend_stub(_resolver)
+        saved_cfg = _cli.load_config
+        log = tempfile.mkdtemp()
+        os.environ["REVIEW_LOG_DIR"] = log
+        _cli.load_config = lambda: {
+            "models": ["codex", "gemini"],
+            "board": [
+                {"model": "codex", "role": "correctness", "name": "Codex"},
+                {"model": "gemini", "role": "contracts", "name": "Gemini"},
+            ],
+        }
+        try:
+            with redirect_stderr(io.StringIO()), _capture_stdout():
+                rc = _cli.main(
+                    ["diff", *TASK_ARGS, "-C", d.name, "-m", "codex", "-m", "gemini"]
+                )
+            # gemini's sentinel body is unusable -> the exact board (no reserve)
+            # degrades -> exit 1, exactly like a plain backend failure.
+            assert rc == 1, rc
+            rec = store.records()[0]
+            assert rec.get("passed") is False
+            result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=1)
+            assert result["passed"] is False
+            assert result["roles"] == []
         finally:
             restore()
             _cli.load_config = saved_cfg
@@ -1536,6 +1699,100 @@ def test_quorum_check_met_has_no_stalled_models_key():
         assert "stalled_models" not in result
 
 
+def test_quorum_check_min_roles_met_has_no_stalled_models_key_review_cli_221():
+    """Round-10 review finding (Opus): `stalled_models` must key on the ACTUAL
+    role-mode verdict (`result["passed"]`), not a re-derived model-count
+    shortfall -- a run that PASSES via --min-roles (with a cooling-down model
+    that has nothing to do with the passed roles) must not carry
+    `stalled_models` at all."""
+    from reviewlib import seat_cooldown as _sc
+
+    with tempfile.TemporaryDirectory() as d, _TmpStore():
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(d) / "seat-cooldown.json")
+        try:
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                roles=["architect"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                roles=["security"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+            # An unrelated model is cooling down -- must not surface, since the
+            # gate PASSED via roles (2 >= min_roles=2) regardless of models.
+            _sc.record_cooldown("gemini", "timed out", now=time.time())
+            result = _stats.quorum_check(TASK, min_iter=2, min_models=5, min_roles=2)
+            assert result["passed"] is True, result  # 2 distinct roles >= 2
+            assert "stalled_models" not in result
+        finally:
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
+
+
+def test_quorum_check_min_roles_not_met_shows_stalled_models_review_cli_221():
+    """Round-10 review finding (Opus), the inverse case: a run that would
+    SATISFY a raw distinct-model-count floor but FAILS via --min-roles must
+    still surface `stalled_models` -- proving the guard doesn't independently
+    re-derive a model-count shortfall that disagrees with the actual role-mode
+    verdict."""
+    from reviewlib import seat_cooldown as _sc
+
+    with tempfile.TemporaryDirectory() as d, _TmpStore():
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(d) / "seat-cooldown.json")
+        try:
+            # 2 distinct models (would satisfy a --min-models=2 floor), but BOTH
+            # under the SAME role -- only 1 distinct role, short of min_roles=2.
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                roles=["architect"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["gemini"],
+                roles=["architect"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+            fixed_now = time.time()
+            _sc.record_cooldown("gemini", "timed out", now=fixed_now)
+            _sc.record_cooldown("gemini", "timed out", now=fixed_now)
+            result = _stats.quorum_check(TASK, min_iter=2, min_models=2, min_roles=2)
+            assert result["passed"] is False, result  # only 1 distinct role
+            assert "stalled_models" in result
+            stalled = {s["model"]: s for s in result["stalled_models"]}
+            assert "gemini" in stalled
+        finally:
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
+
+
 def test_quorum_check_only_counts_passed_iterations():
     """The bug being fixed: 3 DISPATCHED iterations (enough to satisfy the old
     count-everything gate) but only 1 of them PASSED -- must fail, not pass, and
@@ -1660,6 +1917,150 @@ def test_quorum_check_current_verdictless_mode_also_fails_closed():
         assert result["passed_iterations"] == 0
 
 
+def test_run_mode_with_stats_roles_after_wiring_review_cli_221():
+    """The `roles_after` -> `record_run(roles=)` glue, exercised directly through
+    `_run_mode_with_stats` (Fable round-1 review finding: distinct from both the
+    panel-level `usable_roles` tests and the stats-level `record_run` tests, this
+    exact wire had no coverage of its own). A successful `roles_after` lands its
+    list in the record -- alongside a `models_after`, since round-6 review
+    (Opus) tightened the contract to require BOTH present, so `recorded_roles`
+    is only ever paired against the ACTUAL roster, never the merely-planned one
+    (see `test_run_mode_with_stats_roles_omitted_when_no_models_after_given_review_cli_221`
+    for the "models_after absent" case this excludes)."""
+    with _TmpStore() as store:
+        from reviewlib import panel as _panel
+
+        def _dispatch() -> int:
+            _panel._tally_ok(True)
+            return 0
+
+        _cli._run_mode_with_stats(
+            "review",
+            ["codex", "gemini"],
+            _dispatch,
+            models_after=lambda: ["codex", "gemini"],
+            roles_after=lambda: ["architect", "security"],
+            task_code=TASK,
+        )
+        rec = store.records()[0]
+        assert rec["roles"] == ["architect", "security"]
+
+
+def test_run_mode_with_stats_roles_after_raising_omits_roles_key_review_cli_221():
+    """A `roles_after` that raises must never break the run -- stats are best-
+    effort -- and must omit the `roles` key (not write a misleading `[]`). Paired
+    with a succeeding `models_after` so the round-6 `models_after is not None`
+    guard doesn't short-circuit before `roles_after` is ever even called --
+    this test is specifically about `roles_after`'s OWN exception handling."""
+    with _TmpStore() as store:
+        from reviewlib import panel as _panel
+
+        def _dispatch() -> int:
+            _panel._tally_ok(True)
+            return 0
+
+        def _boom():
+            raise RuntimeError("boom")
+
+        rc = _cli._run_mode_with_stats(
+            "review",
+            ["codex"],
+            _dispatch,
+            models_after=lambda: ["codex"],
+            roles_after=_boom,
+            task_code=TASK,
+        )
+        assert rc == 0
+        rec = store.records()[0]
+        assert "roles" not in rec
+
+
+def test_run_mode_with_stats_roles_after_empty_omits_roles_key_review_cli_221():
+    """An empty `roles_after()` result (e.g. a degraded run with zero usable
+    seats) omits the `roles` key, same as `models_after` falling back to the
+    planned pool -- an empty role LIST is never persisted as `roles: []`. Paired
+    with a succeeding `models_after` for the same reason as the raising case
+    above -- this test is about `roles_after`'s empty-result handling
+    specifically, not the round-6 `models_after is not None` guard."""
+    with _TmpStore() as store:
+        from reviewlib import panel as _panel
+
+        def _dispatch() -> int:
+            _panel._tally_ok(True)
+            return 0
+
+        _cli._run_mode_with_stats(
+            "review",
+            ["codex"],
+            _dispatch,
+            models_after=lambda: ["codex"],
+            roles_after=lambda: [],
+            task_code=TASK,
+        )
+        rec = store.records()[0]
+        assert "roles" not in rec
+
+
+def test_run_mode_with_stats_roles_omitted_when_models_after_falls_back_review_cli_221():
+    """Round-5 review finding (Opus): `quorum_check`'s monoculture guard zips
+    `models`/`roles` BY INDEX, so the two must always describe the SAME seats in
+    the SAME order or omit `roles` entirely -- never a real `roles_after()` result
+    paired against the PLANNED `pool_models` fallback. When `models_after` falls
+    back (raises, or returns empty), `roles_after`'s result must be discarded too,
+    even if `roles_after` itself succeeded."""
+    with _TmpStore() as store:
+        from reviewlib import panel as _panel
+
+        def _dispatch() -> int:
+            _panel._tally_ok(True)
+            return 0
+
+        def _models_boom():
+            raise RuntimeError("boom")
+
+        _cli._run_mode_with_stats(
+            "review",
+            ["codex", "gemini"],
+            _dispatch,
+            models_after=_models_boom,
+            roles_after=lambda: ["architect", "security"],
+            task_code=TASK,
+        )
+        rec = store.records()[0]
+        # models fell back to the planned pool ...
+        assert rec["models"] == ["codex", "gemini"]
+        # ... so roles must be OMITTED, not paired against a roster that isn't the
+        # one those roles were actually observed on.
+        assert "roles" not in rec
+
+
+def test_run_mode_with_stats_roles_omitted_when_no_models_after_given_review_cli_221():
+    """Round-6 review finding (Opus): the round-5 guard only checked
+    `models_after_fell_back` (which stays False when `models_after` is None
+    entirely, since it's never set) -- a caller supplying `roles_after` WITHOUT
+    `models_after` would then pair real roles against the merely-PLANNED
+    `pool_models`, the exact drift the round-5 fix exists to prevent. No CURRENT
+    caller does this (the board dispatch always supplies both), but the guard
+    itself must not depend on that being true forever."""
+    with _TmpStore() as store:
+        from reviewlib import panel as _panel
+
+        def _dispatch() -> int:
+            _panel._tally_ok(True)
+            return 0
+
+        _cli._run_mode_with_stats(
+            "review",
+            ["codex", "gemini"],
+            _dispatch,
+            roles_after=lambda: ["architect", "security"],
+            task_code=TASK,
+        )
+        rec = store.records()[0]
+        assert rec["models"] == ["codex", "gemini"]  # the planned pool, unchanged
+        assert "roles" not in rec  # no ACTUAL-roster callable -> no roles either
+
+
 def test_quorum_check_zero_records_fails_closed():
     with _TmpStore():
         # Write a record for a DIFFERENT task first so the store exists and is
@@ -1739,6 +2140,587 @@ def test_quorum_check_rejects_zero_or_negative_thresholds_directly():
             result = _stats.quorum_check(TASK, min_iter=min_iter, min_models=min_models)
             assert result["passed"] is False, (min_iter, min_models, result)
             assert "error" in result, (min_iter, min_models, result)
+
+
+# ---------------------------------------------------------------------------
+# --min-roles quorum-counting mode (review-cli#221)
+# ---------------------------------------------------------------------------
+def test_record_run_roles_omitted_when_not_given():
+    """A mode with no per-seat role concept (quorum/just-ask/brainstorm/qa) never
+    passes `roles=` -- the key must be OMITTED from the persisted record, not
+    written as an empty list (same 'unknown, not written as null' convention as
+    `passed`/`repo_id`), so `_distinct_roles` can tell "never recorded" apart from
+    "recorded zero roles"."""
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+        )
+        rec = store.records()[0]
+        assert "roles" not in rec
+
+
+def test_record_run_roles_persisted_when_given():
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex", "codex"],
+            roles=["architect", "security"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+        )
+        rec = store.records()[0]
+        assert rec["roles"] == ["architect", "security"]
+
+
+def test_record_run_roles_omitted_on_length_mismatch_review_cli_221():
+    """Round-7 review finding (Fable): `_distinct_roles` (the ENFORCING counter
+    behind --min-roles) has no reference to `models` -- unlike the advisory
+    `_models_behind_role_coverage`, which zips and fails closed, a record with
+    MORE roles than models would inflate role coverage from fewer real seats
+    than it claims. No current producer can write mismatched lengths, but
+    `record_run` (the one write chokepoint) defends against it anyway: a
+    length mismatch omits `roles` entirely rather than persisting a shape that
+    lies about which seats it describes."""
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect", "security"],  # more roles than models
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        rec = store.records()[0]
+        assert "roles" not in rec
+
+
+def test_quorum_check_min_roles_counts_distinct_roles_not_models_review_cli_221():
+    """The core review-cli#221 scenario: 2 passed iterations each on a genuinely
+    distinct model, plus a 3rd whose model REPEATS the first one but was reviewing
+    under a DIFFERENT board role (the board's #207 shortage-resilience duplicate-
+    model role-fill). `--min-roles 3` must count that 3rd pass (3 distinct roles
+    covered); `--min-models 3` must NOT (only 2 distinct model-name strings)."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        # Duplicated-model role-fill: same model ("codex") as the first iteration,
+        # but a DIFFERENT role.
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["performance"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+
+        by_models = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert by_models["passed"] is False
+        assert by_models["distinct_models_passed"] == 2
+
+        by_roles = _stats.quorum_check(TASK, min_iter=3, min_models=3, min_roles=3)
+        assert by_roles["passed"] is True, by_roles
+        assert by_roles["distinct_roles_passed"] == 3
+        assert by_roles["roles"] == ["architect", "performance", "security"]
+        assert by_roles["min_roles"] == 3
+        # --min-models is still reported for visibility, but does not govern here.
+        assert by_roles["distinct_models_passed"] == 2
+
+
+def test_quorum_check_min_models_regression_unchanged_review_cli_221():
+    """Regression guard: omitting --min-roles must reproduce the EXACT pre-#221
+    result shape (no roles/distinct_roles_passed/min_roles keys) -- --min-models
+    keeps strictly counting distinct model-name strings."""
+    with _TmpStore():
+        for model in ("codex", "gemini"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=2, min_models=3)
+        assert result["passed"] is False
+        assert result["distinct_models_passed"] == 2
+        assert "roles" not in result
+        assert "distinct_roles_passed" not in result
+        assert "min_roles" not in result
+
+
+def test_quorum_check_min_roles_suggestion_when_switching_would_actually_pass_review_cli_221():
+    """The suggestion must fire ONLY when re-running with --min-roles at the SAME
+    number would actually satisfy the gate -- round-1 review finding (Opus/Codex/
+    Fable, independently): a bare 'models fell short' check suggests a flag that
+    is guaranteed to fail worse when the history has no recorded roles at all.
+    This scenario is the genuine PR #207 shape: 2 real distinct models plus a
+    role-fill pass that reused one of them under a third role."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],  # duplicated model, distinct role
+            roles=["performance"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is False
+        assert result["distinct_models_passed"] == 2
+        assert "min_roles_suggestion" in result
+        msg = result["min_roles_suggestion"]
+        assert "3 distinct models required, only 2 found" in msg
+        assert "--min-roles 3" in msg
+        assert "PR #207" in msg
+        # And the suggestion is honest: literally re-running with --min-roles 3
+        # (the number the message names) passes.
+        by_roles = _stats.quorum_check(TASK, min_iter=3, min_models=3, min_roles=3)
+        assert by_roles["passed"] is True, by_roles
+
+
+def test_quorum_check_no_min_roles_suggestion_when_no_roles_recorded_at_all_review_cli_221():
+    """The exact bug all three reviewers flagged: a task whose history has NO
+    recorded roles (predates the field, or every iteration came from a mode with
+    no role concept) must never be told to try --min-roles -- it is guaranteed to
+    fail there too, just with less diagnostic detail."""
+    with _TmpStore():
+        for _ in range(3):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is False
+        assert result["distinct_models_passed"] == 1
+        assert "min_roles_suggestion" not in result
+        # Confirms the premise: --min-roles 3 on this exact history really does fail.
+        by_roles = _stats.quorum_check(TASK, min_iter=3, min_models=3, min_roles=3)
+        assert by_roles["passed"] is False
+
+
+def test_quorum_check_no_min_roles_suggestion_when_iterations_also_short_review_cli_221():
+    """Even with 3 distinct roles recorded, the suggestion must not fire if the
+    ITERATION floor is also unmet -- switching counting mode can't add iterations,
+    so --min-roles would fail on the iteration check too."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        # Only 2 passed iterations, but min_iter=3 -- the roles ARE distinct (2)
+        # yet still short of min_models=3 too, so this also covers the "models
+        # short" precondition; min_iter is the binding constraint under test.
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is False
+        assert result["passed_iterations"] == 2
+        assert "min_roles_suggestion" not in result
+
+
+def test_quorum_check_no_min_roles_suggestion_when_min_roles_already_used():
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=5)
+        assert result["passed"] is False  # only 1 distinct role, need 5
+        assert "min_roles_suggestion" not in result
+
+
+def test_quorum_check_no_min_roles_suggestion_when_never_reviewed():
+    """The suggestion must not fire for the unrelated 'no history at all' fail-
+    closed case -- switching counting mode wouldn't help there either."""
+    with _TmpStore():
+        result = _stats.quorum_check("HYP-999-review-cli-221", min_iter=1, min_models=1)
+        assert result["passed"] is False
+        assert "error" in result
+        assert "min_roles_suggestion" not in result
+
+
+def test_quorum_check_min_roles_rejects_zero_or_negative():
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+        )
+        for min_roles in (0, -1):
+            result = _stats.quorum_check(
+                TASK, min_iter=1, min_models=1, min_roles=min_roles
+            )
+            assert result["passed"] is False, (min_roles, result)
+            assert "error" in result, (min_roles, result)
+
+
+def test_quorum_check_unknown_role_strings_never_satisfy_min_roles_review_cli_221():
+    """Codex round-2 review finding: a config `board:` entry may carry an UNKNOWN
+    role string (kept by `config._normalize_board_reviewer`, but degraded to the
+    generic prompt -- no distinct lens -- with a warning logged). N seats that all
+    reviewed under that SAME generic prompt must not satisfy --min-roles N as if
+    they were N genuinely distinct facets -- only a real REVIEW_ROLES key counts."""
+    with _TmpStore():
+        for typo_role in ("architeckt", "Correctness", "made-up-role"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                roles=[typo_role],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=1, min_roles=3)
+        assert result["passed"] is False
+        assert result["roles"] == []
+        assert result["distinct_roles_passed"] == 0
+
+
+def test_quorum_check_min_roles_ignores_roles_on_failed_iterations_review_cli_221():
+    """Fable round-2 review finding: a role recorded on a `passed=False` iteration
+    must never count toward --min-roles -- the fail-closed core of the gate
+    (mirrors the pre-existing `_distinct_models`/passed-only contract exactly)."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,  # this seat's role must NOT count
+        )
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=2)
+        assert result["passed"] is False
+        assert result["roles"] == ["architect"]
+        assert result["distinct_roles_passed"] == 1
+
+
+def test_quorum_check_min_roles_mixed_role_less_and_role_bearing_history_review_cli_221():
+    """README's documented mixed-history contract: quorum/just-ask/brainstorm
+    iterations (no role concept) count toward --min-iter but never toward
+    --min-roles -- a task whose passed iterations combine both kinds meets the
+    iteration floor from all of them, but the role floor only from the ones that
+    actually carry roles."""
+    with _TmpStore():
+        # A role-less iteration (e.g. a `quorum` run) -- counts toward min_iter.
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+        )
+        # Two role-bearing `review` iterations.
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        # min_iter=3 is met by all three passed iterations combined.
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=1, min_roles=3)
+        assert result["passed_iterations"] == 3
+        # min_roles=3 is NOT met: only the 2 role-bearing iterations contribute.
+        assert result["distinct_roles_passed"] == 2
+        assert result["passed"] is False
+        # A lower --min-roles that only the role-bearing iterations need to clear
+        # DOES pass, proving the role-less iteration didn't silently help OR hurt.
+        result2 = _stats.quorum_check(TASK, min_iter=3, min_models=1, min_roles=2)
+        assert result2["passed"] is True, result2
+
+
+def test_quorum_check_min_roles_excludes_diff_mismatched_iterations_review_cli_221():
+    """Fable round-2 review finding: a passed iteration EXCLUDED by diff-identity
+    verification (recorded repo/diff doesn't match the current check context) must
+    not contribute its role either -- role counting sits downstream of the SAME
+    verified/mismatched/unverifiable split `--min-models` already respects."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-a",
+            diff_files=["a.py"],
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-b",  # a DIFFERENT repo -- excluded as mismatched
+            diff_files=["b.py"],
+        )
+        result = _stats.quorum_check(
+            TASK,
+            min_iter=1,
+            min_models=1,
+            min_roles=2,
+            repo_id="repo-a",
+            diff_files=["a.py"],
+        )
+        assert result["passed"] is False
+        assert result["roles"] == ["architect"]
+        assert result["excluded_mismatched_iterations"] == 1
+
+
+def test_quorum_check_no_min_roles_suggestion_for_single_model_under_distinct_roles_review_cli_221():
+    """Opus round-3 review finding: the `len(models) >= 2`-style monoculture guard
+    is load-bearing -- prove it directly. 3 passed iterations, all on the SAME
+    single model, each under a genuinely distinct role: `--min-roles 3` on this
+    history would pass with ZERO real model diversity (one model self-authorizing
+    under different lenses) -- the suggestion must never steer a caller there."""
+    with _TmpStore():
+        for role in ("architect", "security", "performance"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                roles=[role],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is False
+        assert result["distinct_models_passed"] == 1
+        assert "min_roles_suggestion" not in result
+        # Confirms the premise: --min-roles 3 on this exact history WOULD pass --
+        # which is exactly why the hint must never point there.
+        by_roles = _stats.quorum_check(TASK, min_iter=3, min_models=3, min_roles=3)
+        assert by_roles["passed"] is True, by_roles
+
+
+def test_quorum_check_no_min_roles_suggestion_when_role_coverage_traces_one_model_review_cli_221():
+    """Fable round-3 review finding: the ORIGINAL `len(models) >= 2` guard checked
+    model diversity across ALL passed iterations, not just the role-BEARING ones --
+    a role-less iteration on a SECOND model let the guard pass even though 100% of
+    the counted role coverage still traced back to a single other model. Exact
+    scenario: one board run where codex alone covers 3 distinct roles, plus two
+    role-less quorum runs on gemini (a different model, but contributing ZERO
+    roles). `models` = {codex, gemini} (2, passes the OLD guard); the roles that
+    would satisfy --min-roles all come from codex alone."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex", "codex", "codex"],
+            roles=["architect", "security", "performance"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+        )
+        for _ in range(2):
+            _stats.record_run(
+                task_code=TASK,
+                mode="quorum",
+                models=["gemini"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is False
+        assert result["distinct_models_passed"] == 2  # codex, gemini
+        assert "min_roles_suggestion" not in result
+        # Confirms the premise: --min-roles 3 on this history passes with 100% of
+        # the role coverage traced to codex ALONE -- exactly what the guard must
+        # never recommend.
+        by_roles = _stats.quorum_check(TASK, min_iter=3, min_models=3, min_roles=3)
+        assert by_roles["passed"] is True, by_roles
+
+
+def test_quorum_check_no_min_roles_suggestion_when_unknown_role_shares_record_review_cli_221():
+    """Round-4 review finding (Codex), a sharper version of the round-3 fix above:
+    scoping the monoculture guard to "this ITERATION contributed >=1 valid role"
+    is not enough either — a SINGLE multi-seat record can mix a valid-role seat
+    with an unknown-role seat, and crediting every model in that record (not just
+    the one that earned the valid role) lets the unknown-role seat's model launder
+    in as "diverse". `models`/`roles` are index-aligned per seat, so the guard must
+    pair them and credit only a model whose OWN role is valid.
+
+    Record 1: codex earns "architect" (valid); gemini gets a typo'd/unknown role in
+    the SAME record — gemini must NOT be credited as a role-earning model here.
+    Records 2-3: codex alone earns "security"/"performance". `models` overall =
+    {codex, gemini} (2, would pass a record-level-only guard); every valid role
+    traces to codex alone."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex", "gemini"],
+            roles=["architect", "not-a-real-role"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["performance"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is False
+        assert result["distinct_models_passed"] == 2  # codex, gemini
+        assert "min_roles_suggestion" not in result
+        # Confirms the premise: --min-roles 3 on this history passes with every
+        # valid role traced back to codex alone -- gemini earned nothing.
+        by_roles = _stats.quorum_check(TASK, min_iter=3, min_models=3, min_roles=3)
+        assert by_roles["passed"] is True, by_roles
+
+
+def test_quorum_check_rejected_json_shape_includes_role_keys_when_min_roles_set_review_cli_221():
+    """Fable round-3 review finding: `_rejected()` (the fail-closed early-return
+    for an invalid task code / unreadable store / zero-iterations) was extended to
+    carry `roles`/`distinct_roles_passed`/`min_roles` when `min_roles` is given --
+    but nothing asserted that shape directly."""
+    result = _stats.quorum_check("bad code", min_iter=1, min_models=1, min_roles=2)
+    assert result["passed"] is False
+    assert "error" in result
+    assert result["roles"] == []
+    assert result["distinct_roles_passed"] == 0
+    assert result["min_roles"] == 2
 
 
 def test_cli_check_met_prints_verdict_and_exits_0():
@@ -2020,6 +3002,423 @@ def test_cli_check_rejects_zero_min_models():
             rc = _cli.main(["task", TASK, "--check", "--min-models", "0"])
         assert rc == 2, rc
         assert "--min-models" in err.getvalue() and ">= 1" in err.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# `review task CODE --check --min-roles N` (review-cli#221)
+# ---------------------------------------------------------------------------
+def test_cli_check_min_roles_governs_gate_when_given_review_cli_221():
+    """The core review-cli#221 scenario, driven through the real CLI: 2 real
+    distinct models plus one duplicated-model role-fill pass (the board's #207
+    shortage-resilience behavior) -- --min-roles 3 passes even though the default
+    --min-models 3 does not, reading the SAME recorded history."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        # Duplicated-model role-fill: repeats "codex" from iteration 1, under a
+        # DIFFERENT role -- exactly what config.select_pool_with_reuse (PR #207)
+        # produces when too few distinct models are available.
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["performance"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check", "--min-roles", "3"])
+        assert rc == 0, out.getvalue()
+        text = out.getvalue()
+        assert "review bar met" in text
+        assert "3 distinct role" in text
+        # Fable review finding: role mode's headline drops model names -- a
+        # secondary audit line must still name which models actually reviewed.
+        assert "models: 2 distinct model" in text
+        assert "codex" in text and "gemini" in text
+
+        # Same history, default --min-models 3: only 2 distinct model strings.
+        out2 = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out2):
+            rc2 = _cli.main(["task", TASK, "--check", "--min-models", "3"])
+        assert rc2 != 0, out2.getvalue()
+        assert "2/3 distinct models" in out2.getvalue()
+
+
+def test_cli_check_min_roles_not_met_shows_model_audit_line_review_cli_221():
+    """The model-audit line (Fable review finding) must also appear on the
+    NOT-met path, not just the met path -- an operator debugging a --min-roles
+    denial still needs to see which models actually ran."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(
+                ["task", TASK, "--check", "--min-iter", "2", "--min-roles", "3"]
+            )
+        assert rc != 0, out.getvalue()
+        text = out.getvalue()
+        assert "review bar NOT met" in text
+        assert "2/3 distinct roles" in text
+        assert "models: 2 distinct model" in text
+        assert "codex" in text and "gemini" in text
+
+
+def test_cli_check_min_models_default_behavior_unchanged_review_cli_221():
+    """Regression guard: review-cli#221 must not change --min-models' own
+    text-mode output/exit code when --min-roles is not passed."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check"])
+        assert rc == 0, rc
+        text = out.getvalue()
+        assert "review bar met" in text
+        assert "3 distinct model" in text
+        assert "role" not in text
+
+
+def test_cli_check_min_models_short_shows_min_roles_suggestion_review_cli_221():
+    """When --min-models fails because model diversity is short AND switching to
+    --min-roles at the same number would actually pass, the text-mode denial must
+    suggest it, with concrete counts."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],  # duplicated model, distinct role
+            roles=["performance"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check"])
+        assert rc != 0, rc
+        text = out.getvalue()
+        assert "review bar NOT met" in text
+        assert "hint:" in text
+        assert "3 distinct models required, only 2 found" in text
+        assert "--min-roles 3" in text
+        assert "PR #207" in text
+
+
+def test_cli_check_min_models_short_no_suggestion_when_roles_wouldnt_help_review_cli_221():
+    """Regression for the round-1 review finding: a role-less history must NOT
+    get the --min-roles hint -- it would only fail again with less detail."""
+    with _TmpStore():
+        for _ in range(3):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check"])
+        assert rc != 0, rc
+        text = out.getvalue()
+        assert "review bar NOT met" in text
+        assert "hint:" not in text
+        assert "--min-roles" not in text
+
+
+def test_cli_check_rejects_zero_min_roles():
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        err = io.StringIO()
+        with redirect_stderr(err), _capture_stdout():
+            rc = _cli.main(["task", TASK, "--check", "--min-roles", "0"])
+        assert rc == 2, rc
+        assert "--min-roles" in err.getvalue() and ">= 1" in err.getvalue()
+
+
+def test_cli_check_min_roles_json_shape_review_cli_221():
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(
+                [
+                    "task",
+                    TASK,
+                    "--check",
+                    "--json",
+                    "--min-iter",
+                    "1",
+                    "--min-roles",
+                    "1",
+                ]
+            )
+        assert rc == 0, out.getvalue()
+        payload = json.loads(out.getvalue())
+        assert payload["passed"] is True
+        assert payload["roles"] == ["architect"]
+        assert payload["distinct_roles_passed"] == 1
+        assert payload["min_roles"] == 1
+
+
+def test_cli_check_min_roles_error_path_does_not_crash_review_cli_221():
+    """--min-roles against a fail-closed ERROR path (invalid task code) must not
+    crash and must route to stderr, exactly like the --min-models error path --
+    `_print_quorum_bar_not_met`'s error branch never touches the role-only result
+    keys (`roles`/`distinct_roles_passed`/`min_roles`), which the `_rejected()`
+    shape omits entirely when they're absent from a `KeyError` risk (Fable/Opus
+    review finding: this combination had no coverage)."""
+    with _TmpStore():
+        err = io.StringIO()
+        with redirect_stderr(err), _capture_stdout():
+            rc = _cli.main(["task", "bad code", "--check", "--min-roles", "2"])
+        assert rc != 0, rc
+        assert "review bar NOT met" in err.getvalue()
+        assert "invalid task code" in err.getvalue()
+
+
+def test_print_quorum_bar_not_met_mismatch_error_shows_model_audit_line_review_cli_221():
+    """Fable round-6 review finding: the `distinct_models_passed > 0` gating in
+    `_print_quorum_bar_not_met` (added for the Codex round-5 finding) exists
+    precisely so a diff-identity MISMATCH denial -- which still carries real
+    counts from the non-mismatched iterations -- keeps its audit line. The only
+    prior error-path test used an invalid task code (`distinct_models_passed`
+    == 0 there, where the line IS correctly suppressed), so a regression back to
+    gating on bare `"error" in result` would still pass the rest of the suite."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-a",
+            diff_files=["a.py"],
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["gemini"],
+            roles=["security"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-b",  # a DIFFERENT repo -- excluded as mismatched
+            diff_files=["b.py"],
+        )
+        result = _stats.quorum_check(
+            TASK,
+            min_iter=1,
+            min_models=1,
+            min_roles=2,  # only "architect" survives verification -- not met
+            repo_id="repo-a",
+            diff_files=["a.py"],
+        )
+        assert result["passed"] is False
+        assert "error" in result
+        assert result["distinct_models_passed"] == 1  # real data survives exclusion
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            _cli._print_quorum_bar_not_met(result, True, 1, 1)
+        text = err.getvalue()
+        assert "review bar NOT met" in text
+        assert "models: 1 distinct model (codex)" in text
+
+
+def test_cli_check_min_roles_json_shape_not_met_review_cli_221():
+    """Opus round-2 review finding: the existing JSON-shape test only covers the
+    PASSING role-mode path -- `roles`/`distinct_roles_passed`/`min_roles` must
+    also be present (and correct) alongside `passed: false`."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(
+                [
+                    "task",
+                    TASK,
+                    "--check",
+                    "--json",
+                    "--min-iter",
+                    "1",
+                    "--min-roles",
+                    "3",
+                ]
+            )
+        assert rc != 0, out.getvalue()
+        payload = json.loads(out.getvalue())
+        assert payload["passed"] is False
+        assert payload["roles"] == ["architect"]
+        assert payload["distinct_roles_passed"] == 1
+        assert payload["min_roles"] == 3
+
+
+def test_cli_check_both_min_models_and_min_roles_explicit_warns_and_roles_governs_review_cli_221():
+    """Round-2 review finding (Opus/Fable, independently): when BOTH floors are
+    given explicitly, --min-roles still governs the verdict (per the feature's own
+    'whichever is passed' design), but the CLI must print a visible note that
+    --min-models isn't the decisive floor here -- not silently drop it."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        err = io.StringIO()
+        out = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            rc = _cli.main(
+                [
+                    "task",
+                    TASK,
+                    "--check",
+                    "--min-iter",
+                    "1",
+                    "--min-models",
+                    "5",  # would fail on its own (only 1 distinct model)
+                    "--min-roles",
+                    "1",  # satisfied -- and this is what governs
+                ]
+            )
+        assert rc == 0, (out.getvalue(), err.getvalue())
+        assert "review bar met" in out.getvalue()
+        note = err.getvalue()
+        assert "both --min-models 5 and --min-roles 1 were given" in note
+        assert "--min-roles governs" in note
+
+
+def test_cli_check_min_models_default_no_warning_when_only_min_roles_given_review_cli_221():
+    """The 'both explicit' note must NOT fire when --min-models was left at its
+    default (not typed) -- only an explicit + explicit combination is a footgun
+    worth flagging."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        err = io.StringIO()
+        with redirect_stderr(err), _capture_stdout():
+            rc = _cli.main(
+                ["task", TASK, "--check", "--min-iter", "1", "--min-roles", "1"]
+            )
+        assert rc == 0, err.getvalue()
+        assert "were given" not in err.getvalue()
 
 
 # ---------------------------------------------------------------------------
