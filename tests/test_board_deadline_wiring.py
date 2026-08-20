@@ -35,9 +35,9 @@ def _deadline_guard():
     — smoke.py's entry inherits the parent environment — must not leak into
     test_no_env_var_means_no_deadline_armed's assumption that the var is unset), but
     RESTORES whatever value was actually there on exit rather than deleting it outright
-    — under real pytest collection this fixture wraps every test in the session, so a
-    bare unconditional pop would permanently erase a caller-provided value for the rest
-    of the session, not just for this module's tests."""
+    — the autouse fixture wraps every test in THIS MODULE, so a bare unconditional pop
+    would still permanently erase a caller-provided value for the rest of the pytest
+    session once this module's tests are done, not just hide it during them."""
     process.set_board_deadline(None)
     saved = os.environ.pop("REVIEW_BOARD_DEADLINE_SECONDS", None)
     try:
