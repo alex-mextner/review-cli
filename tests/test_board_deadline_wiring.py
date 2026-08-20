@@ -9,6 +9,7 @@ actually arm and clear the deadline at the right moments.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import time
@@ -16,13 +17,55 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pytest  # noqa: E402
-
 import reviewlib.panel as panel  # noqa: E402
 import reviewlib.process as process  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.config import BoardReviewer  # noqa: E402
 from reviewlib.panel import run_board_with_failover  # noqa: E402
+
+
+@contextlib.contextmanager
+def _deadline_guard():
+    """The single definition of 'clean' for board-deadline state — both the pytest
+    fixture and the plain-script __main__ harness use this, so the two execution paths
+    can never disagree about what setup/teardown means.
+
+    Clears the in-process armed deadline AND hides $REVIEW_BOARD_DEADLINE_SECONDS for
+    the duration of one test (an invoking environment that happens to already export it
+    — smoke.py's entry inherits the parent environment — must not leak into
+    test_no_env_var_means_no_deadline_armed's assumption that the var is unset), but
+    RESTORES whatever value was actually there on exit rather than deleting it outright
+    — under real pytest collection this fixture wraps every test in the session, so a
+    bare unconditional pop would permanently erase a caller-provided value for the rest
+    of the session, not just for this module's tests."""
+    process.set_board_deadline(None)
+    saved = os.environ.pop("REVIEW_BOARD_DEADLINE_SECONDS", None)
+    try:
+        yield
+    finally:
+        process.set_board_deadline(None)
+        if saved is None:
+            os.environ.pop("REVIEW_BOARD_DEADLINE_SECONDS", None)
+        else:
+            os.environ["REVIEW_BOARD_DEADLINE_SECONDS"] = saved
+
+
+# pytest is optional here — this file also runs standalone (`python tests/test_*.py`,
+# how tests/smoke.py's run_unit invokes it). Under real pytest collection the fixture
+# below wraps every test in _deadline_guard automatically; the plain-script harness in
+# __main__ does the exact same wrapping manually instead (matching the established
+# pattern in tests/test_inseat_retry.py).
+try:
+    import pytest  # noqa: E402
+
+    @pytest.fixture(autouse=True)
+    def _clean_deadline():
+        """Every test starts and ends with no deadline armed — a leaked deadline from one
+        test (or a bug in the finally-clearing under test) must never bleed into another."""
+        with _deadline_guard():
+            yield
+except ImportError:  # pytest absent: the plain __main__ harness applies it itself
+    pass
 
 PROMPT = "Review this diff."
 
@@ -80,15 +123,6 @@ class _DeadlineSpyBackends:
         return False
 
 
-@pytest.fixture(autouse=True)
-def _clean_deadline():
-    """Every test starts and ends with no deadline armed — a leaked deadline from one
-    test (or a bug in the finally-clearing under test) must never bleed into another."""
-    process.set_board_deadline(None)
-    yield
-    process.set_board_deadline(None)
-
-
 def test_no_env_var_means_no_deadline_armed():
     """Backward compatibility: a caller that never sets $REVIEW_BOARD_DEADLINE_SECONDS
     (every caller before review-cli#221, and most callers after it) sees the deadline
@@ -141,3 +175,24 @@ def test_zero_or_negative_budget_is_treated_as_unset():
             with _DeadlineSpyBackends() as backends:
                 run_board_with_failover(pool, [], PROMPT, "diff", Path("."), 900)
         assert backends.deadline_seen == [None], bad
+
+
+if __name__ == "__main__":
+    # Plain-script harness (tests/smoke.py's run_unit): pytest fixtures don't apply here,
+    # so wrap each test in _deadline_guard manually — matching the established pattern
+    # in tests/test_inseat_retry.py.
+    failures = 0
+    for name, fn in list(globals().items()):
+        if not (name.startswith("test_") and callable(fn)):
+            continue
+        try:
+            with _deadline_guard():
+                fn()
+            print(f"PASS {name}")
+        except AssertionError as exc:
+            failures += 1
+            print(f"FAIL {name}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print(f"ERROR {name}: {type(exc).__name__}: {exc}")
+    sys.exit(1 if failures else 0)
