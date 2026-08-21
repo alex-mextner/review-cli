@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import re
 import sys
 import threading
 import time
@@ -175,13 +176,100 @@ def result_is_usable(result: ReviewResult) -> bool:
     return True
 
 
-def format_result(result: ReviewResult) -> str:
+# A clean/no-issues verdict without evidence (audit finding: "no forced structured
+# verdict / no evidence requirement for a clean pass"). DEFAULT_PROMPT now asks every
+# reviewer to back a clean verdict with an explicit "checked: <mode>, ruled out because
+# <reason>" statement, the same way a finding must cite file:line. This is a HEURISTIC
+# surfacing of a body that ignores that ask — not an enforcement gate (flipping the
+# reviewer's exit code on free-text content is the larger effort tracked separately,
+# review-cli#137) — so a body shaped like a bare "looks good" gets a visible warning
+# instead of being silently trusted.
+_FINDING_EVIDENCE_RE = re.compile(
+    r"[\w./-]+\.[a-zA-Z0-9]+:\d+"
+)  # e.g. reviewlib/foo.py:42
+_CHECKED_EVIDENCE_RE = re.compile(r"(?i)\bchecked\s*:")
+# No 'approved' alternative (k3 review finding, round 8): a bare `\bapproved\b` also
+# matches inside a REJECTING verdict — "Not approved — the checkpoint races the
+# stamp write." — attaching the missing-evidence WARNING to a verdict that already
+# blocked the change, actively misdescribing it rather than merely under- or
+# over-warning. DEFAULT_PROMPT never asks a reviewer to say "approved" in the first
+# place (this heuristic exists to catch DEFAULT_PROMPT's own "checked: ..." contract
+# being skipped, not to recognize every possible clean-sounding word), and the
+# remaining alternatives below already catch the common bare rubber-stamp shapes
+# ("Approved, no issues." still matches via "no issues") — so the safer fix is to
+# drop the ambiguous word entirely rather than chase every negation ("not approved",
+# "never approved", "can't be approved") with more lookbehinds.
+_CLEAN_VERDICT_RE = re.compile(
+    r"(?i)\b(no issues|looks good|lgtm|nothing (?:blocking|to flag)|no (?:blocking )?"
+    r"findings|no problems(?: found)?)\b"
+)
+# Above this length the finding-evidence scan is skipped outright (glm-cc review
+# finding, round 1): `_FINDING_EVIDENCE_RE` backtracks per start position across an
+# unbroken `[\w./-]` run with no match inside it (a model echoing a long hex blob,
+# dotted identifier chain, or minified line from the diff), which is O(L^2) on that
+# run's length — and this heuristic only ever targets a SHORT rubber-stamp verdict
+# in the first place, so a long body gets nothing from running it. The cap is well
+# above any plausible "looks good" one-liner and comfortably below where the
+# quadratic cost would be felt.
+_EVIDENCE_SCAN_MAX_LEN = 4000
+
+
+def clean_verdict_missing_evidence(body: str) -> bool:
+    """True when `body` reads like an unsupported clean verdict: it claims something in
+    the "no issues" family but shows neither a file:line citation nor a "checked: ..."
+    ruled-out statement to back that claim. A body that already cites a file:line
+    (findings, or a clean verdict that names what it inspected) or uses the "checked:"
+    phrasing DEFAULT_PROMPT now asks for is never flagged, regardless of wording — this
+    only targets the specific unsupported "looks good" rubber-stamp shape.
+
+    ACCEPTED RESIDUAL (Opus review finding, round 11, in-family with the "approved"
+    fix above): `_CLEAN_VERDICT_RE`'s remaining alternatives ("no issues", "no
+    problems", "nothing blocking", ...) can also fire on a SCOPED clause inside a
+    body that DOES report a real finding elsewhere — e.g. "Missing test: nothing
+    exercises the board render path with a custom --prompt override. No issues
+    found in the flat path." — attaching the WARNING to a response that already did
+    the work, the same class of misdescription round 8 fixed for "approved". Unlike
+    "approved" (a word DEFAULT_PROMPT never asks for at all, so dropping it cost
+    nothing), these ARE the exact words DEFAULT_PROMPT's own "checked: ..." contract
+    expects a genuinely clean SECTION to use — removing them would defeat this
+    heuristic's whole purpose, and telling a "whole verdict is clean" claim apart
+    from a "this one part is clean" clause needs the same real-conclusion-location
+    reasoning already accepted as out of reach for `refutation_verdict`'s own
+    residuals. Left as a documented, low-cost warning-only heuristic gap rather than
+    chased further: worst case is an unnecessary WARNING next to a real finding that
+    already cited its own evidence, never a silently-dropped finding."""
+    if not body.strip() or len(body) > _EVIDENCE_SCAN_MAX_LEN:
+        return False
+    if _FINDING_EVIDENCE_RE.search(body) or _CHECKED_EVIDENCE_RE.search(body):
+        return False
+    return bool(_CLEAN_VERDICT_RE.search(body))
+
+
+def format_result(result: ReviewResult, *, check_evidence: bool = False) -> str:
+    """Render one `ReviewResult` for terminal/transcript output.
+
+    `check_evidence` (default False — glm-cc review finding, round 1) opts a caller
+    into the missing-evidence WARNING: the "checked: ... / file:line" contract
+    `clean_verdict_missing_evidence` looks for is asked for ONLY by
+    `config.DEFAULT_PROMPT` (the diff-review board's base instruction) — quorum's
+    expert/moderator prompts, just-ask's prompt, and brainstorm's persona prompts
+    never ask a model for that phrasing, so applying the check there flagged a
+    perfectly normal "nothing blocking, all experts agree" synthesis as a suspicious
+    skim it was never asked to avoid being. Only `mode_review`'s two render call
+    sites (the flat and board diff-review paths) pass `check_evidence=True`."""
     status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
     body = result.stdout.strip()
     err = result.stderr.strip()
     parts = [f"## {result.model} [{status}]", f"`{result.command}`"]
     if body:
         parts.append(body)
+        if check_evidence and clean_verdict_missing_evidence(body):
+            parts.append(
+                "> [review-cli] WARNING: this reads as a clean verdict with no "
+                "evidence of what was checked (no file:line finding, no 'checked: "
+                "...' statement) — treat with skepticism; it may be a skim rather "
+                "than a real adversarial pass."
+            )
     if err:
         parts.append("stderr:\n" + err)
     return "\n\n".join(parts)
