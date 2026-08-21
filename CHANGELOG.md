@@ -5,6 +5,37 @@ semantic versioning.
 
 ## Unreleased
 
+- **`review task CODE --check` bare default — fall back to model-counting when
+  a task has zero recorded role data (follow-up to #246).** The role-based
+  default #246 introduced (below) has a real gap: a task whose ENTIRE review
+  history predates role-tracking, or comes only from `review quorum`/
+  `review just-ask`/`review brainstorm`/`review qa` (modes that never record
+  per-seat roles at all), has ZERO role-tagged iterations — and the bare-check
+  default was treating that identically to "recorded some roles, just short of
+  the floor," a guaranteed hard fail even when the task genuinely has 3+
+  distinct MODELS in its history that would have satisfied the pre-#246
+  model-counting default. Now: in the bare-check path only (neither
+  `--min-models` nor `--min-roles` given), once real history is loaded and
+  found to carry NO role data whatsoever — checked across every recorded
+  iteration REGARDLESS OF VERDICT (a role-tagged review that failed still
+  counts as role data), excluding only iterations diff-identity-mismatched
+  against a genuinely different repo/diff — the default silently swaps to the
+  old model-counting check at the same numeric floor, and the JSON payload
+  gains a `quorum_mode_fallback` key (plus a text-mode `note:` line) explaining
+  why, PLUS a `min_models_source: "fallback" | "explicit"` key — so a caller can
+  tell this apart from a genuine explicit `--min-models` request, which
+  behaves exactly as before (`"min_models" in payload` alone is no longer
+  sufficient to detect an explicit request; `min_models_source` is the direct,
+  positive discriminator). A task whose ENTIRE history is diff-identity-
+  mismatched against the current repo/diff (e.g. a task-code collision with an
+  unrelated project) is treated the same as "no effective history for this
+  check" and does NOT trigger the fallback either — it keeps the pre-existing
+  role-based fail-closed shape, rather than a misleadingly-worded
+  model-counting shape. A task with even ONE role-tagged iteration of any
+  verdict, for the current repo/diff, is unaffected: it stays role-based and
+  must pass or fail on that basis alone, never falling back just because the
+  role floor isn't met.
+
 - **`review task CODE --check --min-roles N` — count covered board roles instead
   of distinct model names, and default to role-based counting (#221, #246).**
   The board's shortage-resilience behavior (`select_pool_with_reuse`, #207)

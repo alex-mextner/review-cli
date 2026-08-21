@@ -990,10 +990,14 @@ def _task_subcommand(rest: list[str]) -> int:
         help="exit 0 iff the task has enough PASSED recorded iterations across enough "
         "distinct board roles (self-merge-authority gate, default) or distinct "
         "models (when --min-models is explicitly given); see --min-iter/"
-        "--min-models/--min-roles. Counts only iterations whose run came back "
-        "clean — a review that ran but failed/degraded does not count toward "
-        "the bar, and pre-verdict-field history never satisfies it either "
-        "(fail-closed)",
+        "--min-models/--min-roles. If the task has ZERO recorded role data at "
+        "all (its history predates role-tracking, or comes only from quorum/"
+        "just-ask/brainstorm/qa), the default falls back to the old "
+        "distinct-model count instead of a guaranteed fail — the result's "
+        "quorum_mode_fallback field/note explains when this happened. Counts "
+        "only iterations whose run came back clean — a review that ran but "
+        "failed/degraded does not count toward the bar, and pre-verdict-field "
+        "history never satisfies it either (fail-closed)",
     )
     parser.add_argument(
         "--min-iter",
@@ -1565,6 +1569,13 @@ def _print_quorum_bar_met(result: dict, role_mode: bool, model_mode: bool) -> No
         _print_quorum_model_audit_line(result)
     if advisory := result.get("min_models_advisory"):
         print(f"  note: {advisory}")
+    # Alex's review-cli#246 follow-up: a bare `--check` that fell back to
+    # model-counting because the task has zero role-tagged history looks
+    # IDENTICAL to an explicit `--min-models` pass otherwise (same result
+    # shape, same printed line above) -- this note is the one visible signal
+    # that the bar-met floor came from the fallback, not from a real flag.
+    if fallback := result.get("quorum_mode_fallback"):
+        print(f"  note: {fallback}")
 
 
 def _print_quorum_bar_not_met(result: dict, role_mode: bool, model_mode: bool) -> None:
@@ -1621,6 +1632,12 @@ def _print_quorum_bar_not_met(result: dict, role_mode: bool, model_mode: bool) -
         _print_quorum_model_audit_line(result, detail_stream)
     if advisory := result.get("min_models_advisory"):
         print(f"  note: {advisory}", file=detail_stream)
+    if fallback := result.get("quorum_mode_fallback"):
+        # Alex's review-cli#246 follow-up: same rationale as the met-path note --
+        # this is the one visible signal that the ratio above (`N/M distinct
+        # models`) came from the zero-role-data fallback, not an explicit
+        # `--min-models` flag.
+        print(f"  note: {fallback}", file=detail_stream)
     if suggestion := result.get("min_roles_suggestion"):
         print(f"  hint: {suggestion}", file=detail_stream)
     # review-cli#221: a bare N/M count (or a bare mismatch-error line) leaves a human

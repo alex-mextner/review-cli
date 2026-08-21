@@ -433,12 +433,20 @@ def _store_unreadable_error() -> str | None:
 def _classify_iteration_identity(
     item: dict, repo_id: str, current_files: frozenset[str]
 ) -> tuple[str, str | None]:
-    """Classify one PASSED iteration against the CURRENT check context.
+    """Classify one iteration against the CURRENT check context.
 
-    ``current_files`` is a pre-built ``frozenset`` (hoisted ONCE by the caller,
-    not rebuilt per iteration — this loop runs once per PASSED iteration, which
-    for the exact "years of history" pollution shape this feature targets can be
-    thousands; review finding on this feature's own PR).
+    Despite the name of its main caller (``_sort_passed_iterations_into_buckets``),
+    this function itself never reads ``item.get("passed")`` — it purely compares
+    recorded repo/diff identity, so it is safe to reuse on iterations of ANY
+    verdict (see ``_iterations_excluding_mismatched``, which does exactly that for
+    the bare-check zero-role fallback's "has any role data" check).
+
+    ``current_files`` is a pre-built ``frozenset`` (hoisted ONCE by each caller
+    via ``_current_files_frozenset``, not rebuilt per iteration — a caller's loop
+    can run once per PASSED iteration (``_sort_passed_iterations_into_buckets``)
+    or once per iteration of ANY verdict (``_iterations_excluding_mismatched``),
+    either of which, for the exact "years of history" pollution shape this
+    feature targets, can be thousands; review finding on this feature's own PR).
 
     Returns ``(bucket, reason)``:
       * ``"verified"`` — the iteration's recorded repo matches ``repo_id``, and
@@ -465,6 +473,16 @@ def _classify_iteration_identity(
     return "verified", None
 
 
+def _current_files_frozenset(diff_files: list[str] | None) -> frozenset[str]:
+    """Shared ``diff_files -> frozenset`` construction for diff-identity
+    classification (``frozenset(diff_files or ())``) — used by every caller of
+    `_classify_iteration_identity` so independent call sites can never diverge on
+    how a ``None``/absent ``diff_files`` is treated (Fable review finding: two
+    call sites each inlining this expression separately risked silent drift if
+    one were ever edited without the other)."""
+    return frozenset(diff_files or ())
+
+
 def _sort_passed_iterations_into_buckets(
     passed_iterations: list[dict], repo_id: str | None, diff_files: list[str] | None
 ) -> tuple[list[dict], list[dict], list[dict]]:
@@ -477,7 +495,7 @@ def _sort_passed_iterations_into_buckets(
     """
     if repo_id is None:
         return list(passed_iterations), [], []
-    current_files = frozenset(diff_files or ())
+    current_files = _current_files_frozenset(diff_files)
     verified: list[dict] = []
     mismatched: list[dict] = []
     unverifiable: list[dict] = []
@@ -542,6 +560,83 @@ def _distinct_roles(items: list[dict]) -> list[str]:
                 roles.append(role)
     roles.sort()
     return roles
+
+
+def _has_any_role_data(items: list[dict]) -> bool:
+    """True iff at least one item recorded ANY role data (a non-empty ``roles``
+    list) -- used by `quorum_check`'s bare-check zero-role fallback (Alex's
+    review-cli#246 follow-up, see the module-level constant `_DEFAULT_QUORUM_FLOOR`
+    usage below) to tell "genuinely never recorded a role" apart from "recorded
+    some roles, just not enough to meet the floor". Only the former falls back to
+    the old model-counting default -- the latter must fail on its own merits via
+    role-counting, exactly like PR #246 left it.
+
+    Deliberately checks for a non-empty ``roles`` LIST, not whether it contains a
+    valid ``REVIEW_ROLES`` name (unlike `_distinct_roles`, which is stricter
+    because it decides what counts TOWARD the floor). An unrecognized/typo'd role
+    string is still evidence the task WAS reviewed through a role-recording mode
+    (the normal ``review diff`` board), which is the only fact this check needs --
+    whether that role earns credit is a separate question `_distinct_roles`
+    already answers correctly. Truthiness (not merely ``is not None``) is
+    deliberate too (round-review finding, Opus/Fable): `record_run` can in
+    principle persist ``"roles": []`` for a caller that supplies matching empty
+    ``models``/``roles`` lists (its own length-match guard permits ``0 == 0``) --
+    though no CURRENT producer's own truthy-result guard (see cli.py's
+    `_run_mode_with_stats`) ever exercises that path in practice, an empty list
+    carries no actual role information and must not count as "role data present"
+    either way; treating it as sufficient would re-create the exact
+    guaranteed-fail-with-no-escape this feature exists to close."""
+    return any(item.get("roles") for item in items)
+
+
+def _iterations_excluding_mismatched(
+    iterations: list[dict], repo_id: str | None, diff_files: list[str] | None
+) -> list[dict]:
+    """All ``iterations`` (of ANY verdict -- passed, failed, or unverdicted) except
+    those diff-identity-MISMATCHED against the current check context.
+
+    Used ONLY by the bare-check zero-role fallback's "has this task ever recorded
+    role data" check (`_has_any_role_data`) -- deliberately a DIFFERENT population
+    than `gate_iterations` (which is PASSED-only). A role-tagged iteration that
+    FAILED, or was never verdicted, is still real evidence the task went through a
+    role-recording review mode; excluding it from the "any role data" check (round-
+    review finding, Opus/Fable, independently) would let the fallback fire for a
+    task that genuinely has role-recording history, just none of it happened to
+    pass -- contradicting this feature's own documented "even ONE role-tagged
+    iteration is unaffected" guarantee and, in the worst case, silently letting
+    model-counting decide a self-merge-authority gate that role coverage was
+    supposed to govern.
+
+    Mismatched iterations ARE still excluded, though (unlike the "include every
+    verdict" relaxation above) -- for the OPPOSITE reason `gate_iterations`
+    excludes them: a role-tagged iteration recorded against a genuinely DIFFERENT
+    repo/diff (the exact task-code-reuse/collision pollution
+    `_sort_passed_iterations_into_buckets` exists to guard against) has nothing to
+    do with THIS check's task, and letting it force the CURRENT, unrelated check
+    into role-mode (where it would then see zero roles and fail) would silently
+    reopen that same cross-repo pollution bug class through a new angle -- the
+    counting MODE, not the iteration count itself.
+
+    When ``repo_id`` is None (no check context given -- a direct library call that
+    omits it, exactly as elsewhere in this module), no filtering is applied: every
+    iteration is returned as-is, matching the "verification is opt-in" convention
+    used throughout diff-identity binding.
+
+    Its caller passes only the NON-passed remainder of a task's iterations, not
+    the full list -- the PASSED-and-non-mismatched subset is exactly
+    ``gate_iterations`` (already computed by `_sort_passed_iterations_into_buckets`
+    moments earlier with identical inputs), so re-classifying it here would be
+    pure duplicate work on the exact "thousands of iterations" history shape this
+    module's docstrings call out as performance-relevant (GLM/Fable review
+    finding, raised across two rounds)."""
+    if repo_id is None:
+        return list(iterations)
+    current_files = _current_files_frozenset(diff_files)
+    return [
+        item
+        for item in iterations
+        if _classify_iteration_identity(item, repo_id, current_files)[0] != "mismatched"
+    ]
 
 
 def _models_behind_role_coverage(items: list[dict]) -> list[str]:
@@ -702,7 +797,58 @@ def quorum_check(
         ``--min-models`` used to default to), not a model-count check — Alex's
         direction that role-based counting is the new default everywhere, with no
         default model-count floor; an explicit model-count request is still always
-        honored per the bullet above.
+        honored per the bullet above. FALLBACK (Alex's review-cli#246 follow-up,
+        see "Bare-check zero-role fallback" below): this role-based default only
+        applies when the task has AT LEAST ONE role-tagged iteration ANYWHERE in
+        its non-mismatched history (any verdict — passed, failed, or unverdicted);
+        a task with genuinely ZERO role-tagged iterations falls back to the OLD
+        model-counting default instead of a guaranteed hard fail.
+
+    Bare-check zero-role fallback (review-cli#246 follow-up; Alex's explicit
+    request after shipping the role-based default above): a task whose ENTIRE
+    review history predates role-tracking (pre-#246), or whose history comes only
+    from ``review quorum``/``review just-ask``/``review brainstorm``/``review qa``
+    (modes that never record roles at all — see `record_run`'s ``roles`` param
+    docstring), has ZERO role-tagged iterations. Treating that identically to
+    "recorded some roles, just short of the floor" is a hard, undeserved fail even
+    when the task genuinely has 3+ distinct MODELS in its history that would have
+    satisfied the pre-#246 model-counting default. So: in the bare-check default
+    path ONLY (neither ``min_models`` nor ``min_roles`` explicitly given), whenever
+    the store is readable AND the task has at least one recorded iteration of ANY
+    kind (same ``store_error is None and iterations`` guard the sibling
+    ``min_models_advisory``/``min_roles_suggestion`` already use — a task with NO
+    history at all keeps the pre-existing role-based fail-closed shape; "never
+    reviewed" and "reviewed, but never through a role-recording mode" are
+    different problems), the task's history is checked for role data — every
+    recorded iteration REGARDLESS OF VERDICT (passed, failed, or unverdicted), but
+    EXCLUDING any diff-identity-MISMATCHED iteration (a role-tagged review of a
+    genuinely different repo/diff under a reused task code must not force THIS
+    check into role-mode — see ``_iterations_excluding_mismatched``). This is
+    deliberately a WIDER population than ``gate_iterations`` (PASSED-only): a
+    role-tagged iteration that FAILED is still real evidence the task went through
+    a role-recording review mode, and must not be invisible to this check just
+    because it didn't pass. The fallback fires ONLY when this non-mismatched
+    population is itself non-empty AND carries no role data — a task whose
+    ENTIRE history is diff-identity-mismatched (e.g. a task-code collision with a
+    genuinely different repo) is treated the same as "no effective history for
+    this check" and keeps the pre-existing role-based fail-closed shape, rather
+    than swapping to a model-counting shape with a message that would falsely
+    claim no role data exists at all. When it DOES fire, the default silently
+    swaps from role-counting to the old model-counting check at the same numeric
+    floor — ``result`` ends up with a ``min_models``/``distinct_models_passed``
+    shape (no ``min_roles``/``roles`` keys) exactly as if ``--min-models`` had been
+    given explicitly, PLUS a ``quorum_mode_fallback`` key explaining why AND a
+    ``min_models_source`` key set to ``"fallback"`` (vs. ``"explicit"`` for a
+    genuine ``--min-models`` request) — ``"min_models" in result`` alone is NOT a
+    reliable "was this explicit" signal anymore; ``min_models_source`` is the
+    positive discriminator (``quorum_mode_fallback``'s presence/absence works too,
+    but is a secondary/derived signal).
+    A task with even ONE role-tagged iteration of ANY verdict in its
+    non-mismatched history — regardless of whether the role floor is actually
+    met — never falls back: it stays role-based and must pass or fail on that
+    basis alone, same as PR #246 left it. This fallback decision is INDEPENDENT
+    of ``min_models_explicit``/``min_roles_explicit`` (both stay False in the
+    result) and never fires when either floor is explicitly given.
 
     FIXED (review-cli#246; was a KNOWN, DELIBERATE trade-off per a Fable round-3 review
     finding on review-cli#221): a caller passing BOTH floors explicitly — e.g.
@@ -731,16 +877,24 @@ def quorum_check(
     whole point of this gate. Validated HERE (not only in the CLI wrapper) so a direct
     library caller can't bypass the floor either.
     """
-    # Captured BEFORE any default substitution below -- `min_models is not None` stays
-    # a valid "was this explicit" check for the rest of the function (min_models itself
-    # is never reassigned), but min_roles IS reassigned by the default substitution, so
-    # its "was this explicit" flag must be captured now, not re-derived later.
+    # Captured BEFORE any default substitution below. Historically `min_models is
+    # not None` alone was a safe "was this explicit" check for the rest of the
+    # function, because min_models was NEVER reassigned -- only min_roles was. The
+    # bare-check zero-role fallback (below) now CAN reassign min_models too (once
+    # real history is loaded, a genuinely role-data-free task swaps it in), so both
+    # flags must be captured here, before either variable is ever touched.
+    min_models_explicit = min_models is not None
     min_roles_explicit = min_roles is not None
-    if min_models is None and not min_roles_explicit:
+    bare_check_default = not min_models_explicit and not min_roles_explicit
+    if bare_check_default:
         # The new default (Alex, review-cli#246): role-based coverage, not a distinct-
         # model-name count -- switches counting MODE while preserving the original "at
         # least 3 distinct opinions" intent via the SAME numeric floor --min-models
-        # used to default to.
+        # used to default to. TENTATIVE: this is swapped back to the old model-
+        # counting default below, once real history is loaded, if the task turns out
+        # to have zero role-tagged iterations (Alex's review-cli#246 follow-up -- see
+        # this function's docstring "Bare-check zero-role fallback" section, and the
+        # `_has_any_role_data` check right after `gate_iterations` is computed).
         min_roles = _DEFAULT_QUORUM_FLOOR
 
     def _rejected(error: str) -> dict:
@@ -756,6 +910,17 @@ def quorum_check(
         }
         if min_models is not None:
             result["min_models"] = min_models
+            # Round-review finding (Opus/Fable, independently): `min_models_source`
+            # must accompany `min_models` on EVERY shape that carries it, including
+            # this early-reject path. Derived from `min_models_explicit` (Fable
+            # review finding on an earlier revision) rather than hardcoded
+            # `"explicit"` -- both `_rejected()` call sites DO currently run before
+            # the fallback logic below, so hardcoding would be correct today, but
+            # deriving it makes that an enforced structural fact instead of an
+            # assumption a future edit to this function could silently invalidate.
+            result["min_models_source"] = (
+                "explicit" if min_models_explicit else "fallback"
+            )
         if min_roles is not None:
             result["distinct_roles_passed"] = 0
             result["roles"] = []
@@ -803,6 +968,111 @@ def quorum_check(
     # Gate-worthy = verified (identity checked out) + unverifiable (no identity to
     # check, so unchanged from pre-v4 behavior) -- mismatched iterations are excluded.
     gate_iterations = verified + unverifiable
+
+    # Bare-check zero-role fallback (Alex's review-cli#246 follow-up -- see this
+    # function's docstring "Bare-check zero-role fallback" section). Only the true
+    # bare-default path is eligible (an explicit --min-models/--min-roles is never
+    # second-guessed here).
+    #
+    # `role_data_population` (ALL verdicts, not just passed -- only diff-identity-
+    # MISMATCHED iterations are dropped) is deliberately NOT `gate_iterations`
+    # (PASSED-only): a task with even one role-tagged iteration of ANY verdict --
+    # passed, failed, or unverdicted -- in that population must stay role-based
+    # and fail on its own merits (not fall back just because the role floor isn't
+    # met). Round-review finding (Opus/Fable, independently): checking
+    # `gate_iterations` alone missed a role-tagged iteration that FAILED (or a
+    # role-less current-repo run alongside an unrelated-repo role-tagged one) --
+    # letting the fallback fire even though the task genuinely went through
+    # role-recording review, just not successfully. See
+    # `_iterations_excluding_mismatched`'s own docstring for why mismatched
+    # iterations are still excluded (the opposite concern: a role-tagged
+    # iteration for a genuinely DIFFERENT repo/diff must not force THIS check into
+    # role-mode -- that would reopen the exact cross-repo pollution bug class
+    # diff-identity binding exists to close, just via the counting mode instead of
+    # the iteration count).
+    #
+    # `store_error is None and role_data_population` deliberately EXCLUDES two
+    # denials from the swap, keeping BOTH at the PRE-existing role-based shape
+    # (`min_roles`=3, `roles=[]`) exactly as before this fix:
+    #   1. "No history at all" (unreadable store, or a readable store with zero
+    #      records for this task code) -- `role_data_population` is trivially
+    #      empty whenever `iterations` is. "Never reviewed" and "reviewed, but
+    #      never through a role-recording mode" are different problems with
+    #      different fixes; blurring them would muddy `_finalize_quorum_result`'s
+    #      already-clear "no recorded review iterations for X" error with an
+    #      unrelated role/model mode note that has nothing real to explain.
+    #   2. "Every recorded iteration is diff-identity-MISMATCHED" (round-review
+    #      finding, Opus/Fable, independently -- a SECOND, sharper round after the
+    #      first fix above): checking `_has_any_role_data` against a population
+    #      that RAW `iterations` is non-empty but is filtered down to nothing
+    #      would fire the fallback -- and its message would falsely claim "no
+    #      role-tagged review history recorded" for a task whose ENTIRE history is
+    #      genuinely role-tagged, just for an unrelated repo/diff (a task-code
+    #      reuse/collision, exactly the shape diff-identity binding exists to
+    #      catch). Checking `role_data_population` (POST-filter) directly for
+    #      non-emptiness, instead of raw `iterations`, closes this: an
+    #      all-mismatched task is treated the same as "no effective history for
+    #      this check" and keeps the role-based fail-closed shape, rather than
+    #      silently swapping to a misleadingly-worded model-counting shape.
+    #
+    # `role_data_population` is only ever computed when `bare_check_default and
+    # store_error is None` -- an explicit `--min-models`/`--min-roles` caller (or
+    # any denial with an unreadable store) pays ZERO extra work for a fallback
+    # that could never apply to them: `role_data_population` was previously
+    # computed OUTSIDE any conditional at all (an earlier revision's mistake, not
+    # a Python `and`-short-circuit issue -- `and` already short-circuits fine),
+    # so moving the computation inside this branch is what makes the skip real.
+    #
+    # `gate_iterations` (PASSED, non-mismatched -- already computed above by
+    # `_sort_passed_iterations_into_buckets`) is reused directly here rather than
+    # re-classifying those same items via `_iterations_excluding_mismatched`
+    # again (GLM/Fable review finding, raised across two rounds: on the exact
+    # "thousands of iterations" history shape this module's docstrings call out,
+    # re-running `_classify_iteration_identity` -- itself an O(files) set
+    # comparison per item -- over the ENTIRE history a second time roughly
+    # doubles the dominant per-iteration cost of a bare `--check`). Only the
+    # NON-passed remainder (failed/unverdicted -- never seen by the bucket sort,
+    # which is passed-only) is freshly classified.
+    #
+    # `_has_any_role_data(gate_iterations)` is checked FIRST, before touching the
+    # non-passed remainder at all (GLM/Fable review finding, a THIRD round,
+    # independently converging on the identical fix): if the task's PASSED,
+    # non-mismatched history already carries a role, the fallback can never fire
+    # regardless of what the non-passed remainder holds -- role_data_population
+    # would be non-empty AND have role data either way. This lets the single most
+    # common bare-check shape (a task with real, PASSING role-tagged history --
+    # exactly the steady state once review-cli#246 is adopted) skip classifying
+    # the non-passed remainder entirely, rather than always paying for it only to
+    # discover the answer was already decided.
+    quorum_mode_fallback: str | None = None
+    if (
+        bare_check_default
+        and store_error is None
+        and not _has_any_role_data(gate_iterations)
+    ):
+        non_passed = [item for item in iterations if item.get("passed") is not True]
+        role_data_population = gate_iterations + _iterations_excluding_mismatched(
+            non_passed, repo_id, diff_files
+        )
+    elif bare_check_default and store_error is None:
+        role_data_population = gate_iterations
+    else:
+        role_data_population = []
+    if role_data_population and not _has_any_role_data(role_data_population):
+        min_roles = None
+        min_models = _DEFAULT_QUORUM_FLOOR
+        # "against the current repo/diff" only makes sense when a check context
+        # was actually given (Opus review finding: a direct library caller that
+        # omits repo_id has no such context, and the unqualified message reads
+        # oddly claiming a comparison that never happened).
+        scope = " against the current repo/diff" if repo_id is not None else ""
+        quorum_mode_fallback = (
+            f"no role-tagged review history recorded for {clean}{scope}; fell "
+            "back to the pre-review-cli#246 model-counting default "
+            f"(min_models={_DEFAULT_QUORUM_FLOOR}) since there is no role data "
+            "to count against the new role-based default"
+        )
+
     models = _distinct_models(gate_iterations)
     roles = _distinct_roles(gate_iterations) if min_roles is not None else None
 
@@ -825,11 +1095,31 @@ def quorum_check(
     }
     if min_models is not None:
         result["min_models"] = min_models
+        # Round-review finding (Fable, two independent rounds): `"min_models" in
+        # result` used to be a reliable "was --min-models explicit" signal, but the
+        # fallback above breaks that -- both an explicit request and a fallback now
+        # produce the identical `min_models`/`distinct_models_passed` shape, and
+        # telling them apart required a caller to check the ABSENCE of
+        # `quorum_mode_fallback` (a negative/derived signal, easy to get wrong).
+        # This key is a direct, POSITIVE discriminator instead -- always present
+        # whenever `min_models` is, naming exactly which of the two put it there.
+        result["min_models_source"] = (
+            "fallback" if quorum_mode_fallback is not None else "explicit"
+        )
+    if quorum_mode_fallback is not None:
+        # Alex's review-cli#246 follow-up: distinguishes THIS silent bare-check
+        # swap-to-model-counting from a genuine explicit `--min-models` request --
+        # both end up with the identical `min_models`/`distinct_models_passed`
+        # result shape, so without this key a caller can't tell "you asked for
+        # model-counting" apart from "you asked for nothing and there was no role
+        # data to give you the new default". Present ONLY when the fallback
+        # actually fired (never on an explicit-flag path).
+        result["quorum_mode_fallback"] = quorum_mode_fallback
     if roles is not None:
         result["distinct_roles_passed"] = len(roles)
         result["roles"] = roles
         result["min_roles"] = min_roles
-    if min_models is not None and store_error is None and iterations:
+    if min_models_explicit and store_error is None and iterations:
         # review-cli#246: non-blocking advisory -- Alex's policy explicitly enforces
         # a caller-requested model floor (models_ok above), but role-based coverage is
         # generally sufficient on its own, so surface the option without failing the
@@ -843,6 +1133,13 @@ def quorum_check(
         # AFTER this point runs, so neither is itself a short-circuit; a nudge
         # saying "this floor may not be needed" on a task with NO review history
         # at all (of any kind) would contradict its own fail-closed error.
+        #
+        # Gated on `min_models_explicit` (the PRE-substitution flag), NOT on
+        # `min_models is not None` -- the latter is also true for the bare-check
+        # zero-role fallback above, and this advisory's own text ("an explicit
+        # min_models floor is set... role-based coverage is generally sufficient")
+        # would be actively WRONG there: nothing was explicit, and role-based
+        # coverage is exactly what's UNAVAILABLE (that's why the fallback fired).
         result["min_models_advisory"] = (
             "an explicit min_models floor is set; role-based coverage (min_roles) is "
             "generally sufficient and this explicit floor may not be needed unless "
@@ -880,15 +1177,19 @@ def quorum_check(
     # on a second model as "diversity" even when 100% of the counted role coverage
     # still traced back to a single other model, laundering the exact monoculture the
     # guard exists to block through an unrelated iteration.
-    # `min_models is not None` is provably always true whenever `min_roles is None`
-    # here (the default-substitution above sets min_roles whenever min_models is
-    # None) -- but it's checked explicitly (not via `assert`) so this stays correct
-    # even under `python -O` (which strips asserts), and so mypy narrows `min_models`
-    # from a plain conditional rather than a strippable statement (Opus review
-    # finding on this change).
+    # Gated on `min_models_explicit` (the PRE-substitution flag), NOT on
+    # `min_models is not None` -- the bare-check zero-role fallback (above) can
+    # ALSO leave `min_roles is None and min_models is not None` true (it swaps
+    # min_roles back to None and sets min_models itself), and suggesting "switch
+    # to --min-roles" would be nonsensical there: the fallback fired BECAUSE
+    # `gate_iterations` has zero role-tagged items, so `potential_roles` below is
+    # guaranteed empty and the inner `len(potential_roles) >= min_models` check
+    # would never fire anyway -- but gating explicitly here keeps that a
+    # documented invariant this block relies on by DESIGN, not a coincidence of
+    # `_has_any_role_data`/`_distinct_roles` happening to agree today.
     if (
         min_roles is None
-        and min_models is not None
+        and min_models_explicit
         and not gate_met
         and store_error is None
         and iterations

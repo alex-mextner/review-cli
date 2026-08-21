@@ -1528,6 +1528,10 @@ def test_quorum_check_met():
         # review-cli#246: `min_models_advisory` is now always present alongside an
         # explicit `min_models` (see test_quorum_check_min_models_advisory_only_when_
         # explicit_review_cli_246 for the full explicit-vs-default matrix).
+        # review-cli#246 follow-up: `min_models_source` is now always present
+        # alongside `min_models` too (explicit here, since --min-models was given
+        # directly -- see test_quorum_check_bare_default_falls_back_to_models_when_
+        # zero_role_data_review_cli_246_followup for the "fallback" counterpart).
         assert set(result) == {
             "task_code",
             "passed_iterations",
@@ -1536,6 +1540,7 @@ def test_quorum_check_met():
             "models",
             "min_iter",
             "min_models",
+            "min_models_source",
             "passed",
             "min_models_advisory",
         }
@@ -1547,6 +1552,7 @@ def test_quorum_check_met():
         assert all(isinstance(m, str) for m in result["models"])
         assert isinstance(result["min_iter"], int)
         assert isinstance(result["min_models"], int)
+        assert result["min_models_source"] == "explicit"
         assert isinstance(result["passed"], bool)
         assert isinstance(result["min_models_advisory"], str)
 
@@ -1895,6 +1901,698 @@ def test_quorum_check_neither_explicit_defaults_to_role_based_review_cli_246():
         assert result["distinct_roles_passed"] == 3
         assert "min_models" not in result
         assert result["distinct_models_passed"] == 2  # reported, just not enforced
+        # Real role data was recorded -- this must be the plain role-based default,
+        # never the zero-role fallback (regression guard, review-cli#246 follow-up).
+        assert "quorum_mode_fallback" not in result
+        assert "min_models_source" not in result
+
+
+# ---------------------------------------------------------------------------
+# Bare-check zero-role fallback (Alex's review-cli#246 follow-up)
+#
+# A task whose ENTIRE review history predates role-tracking, or comes only from
+# quorum/just-ask/brainstorm/qa (modes that never record roles), has ZERO
+# role-tagged iterations. The bare-check default (neither --min-models nor
+# --min-roles given) must fall back to the OLD model-counting check for such a
+# task instead of a guaranteed hard fail -- but ONLY when there is genuinely no
+# role data at all; a task with even one role-tagged iteration stays role-based
+# and must pass/fail on that basis alone, never falling back just because the
+# role floor isn't met.
+# ---------------------------------------------------------------------------
+def test_quorum_check_bare_default_falls_back_to_models_when_zero_role_data_review_cli_246_followup():
+    """The exact bug being fixed: 3 distinct models, ZERO recorded roles at all --
+    the bare default must fall back to model-counting and PASS, not fail with
+    '0/3 distinct roles' the way the pre-follow-up default did."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3)
+        assert result["passed"] is True, result
+        assert result["min_models"] == 3
+        assert result["distinct_models_passed"] == 3
+        assert sorted(result["models"]) == ["codex", "fable5", "gemini"]
+        assert "min_roles" not in result
+        assert "roles" not in result
+        assert "distinct_roles_passed" not in result
+        # The fallback note is present and distinguishes this from an explicit
+        # --min-models request -- see test_quorum_check_explicit_min_models_no_
+        # fallback_note_even_with_zero_role_data below for the contrast.
+        assert "quorum_mode_fallback" in result
+        assert TASK in result["quorum_mode_fallback"]
+        assert "model-counting default" in result["quorum_mode_fallback"]
+        # No check context was given (repo_id defaults to None here) -- the
+        # message must not claim a repo/diff comparison that never happened
+        # (Fable review finding: this scope variant was untested).
+        assert "against the current repo/diff" not in result["quorum_mode_fallback"]
+        # The positive discriminator: distinguishes this fallback-produced
+        # min_models from a genuine explicit request without relying on
+        # quorum_mode_fallback's absence as the signal.
+        assert result["min_models_source"] == "fallback"
+        # The advisory/suggestion keys are explicit-min-models-only features --
+        # neither must leak onto the fallback path (it never asked for either).
+        assert "min_models_advisory" not in result
+        assert "min_roles_suggestion" not in result
+
+
+def test_quorum_check_bare_default_falls_back_for_realistic_quorum_just_ask_history_review_cli_246_followup():
+    """Opus review finding: every other "fallback fires" test records
+    `mode="review"` with no roles -- an atypical shape, since `review` IS the
+    role-recording board mode post-#246. The DOCUMENTED real-world trigger this
+    feature targets is a task reviewed only through `quorum`/`just-ask`/
+    `brainstorm`/`qa` -- modes that never record roles at all, by design, not
+    by omission. Exercise that actual production shape directly."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="just-ask",
+            models=["k3"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        result = _stats.quorum_check(TASK, min_iter=2)
+        assert result["passed"] is True, result
+        assert result["min_models"] == 3
+        assert result["min_models_source"] == "fallback"
+        assert sorted(result["models"]) == ["codex", "fable5", "gemini", "k3"]
+        assert "min_roles" not in result
+        assert "quorum_mode_fallback" in result
+
+
+def test_quorum_check_bare_default_fallback_still_enforces_floor_review_cli_246_followup():
+    """The fallback isn't a free pass: zero role data + only 2 distinct models
+    (short of the same numeric floor the role-based default would have used)
+    must still fail."""
+    with _TmpStore():
+        for model in ("codex", "gemini"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=2)
+        assert result["passed"] is False, result
+        assert result["min_models"] == 3
+        assert result["distinct_models_passed"] == 2
+        assert "min_roles" not in result
+        assert "quorum_mode_fallback" in result
+
+
+def test_quorum_check_bare_default_any_role_data_blocks_fallback_review_cli_246_followup():
+    """The critical distinction: even ONE role-tagged passed iteration means the
+    task is NOT eligible for the fallback, regardless of how much OTHER model
+    diversity exists in its history. Here 3 distinct models are genuinely
+    present (codex, gemini, fable5 -- enough to satisfy the old model floor),
+    but only 1 distinct ROLE is covered -- the bare default must stay
+    role-based, fail on the role shortfall, and must NOT silently switch to
+    model-counting just because that would have passed."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        for model in ("gemini", "fable5"):
+            # Role-LESS iterations (e.g. quorum/just-ask on the same task code) --
+            # these add real model diversity but carry no role data at all.
+            _stats.record_run(
+                task_code=TASK,
+                mode="quorum",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert result["distinct_roles_passed"] == 1
+        assert result["roles"] == ["architect"]
+        # Model diversity really is there -- proving the failure is genuinely
+        # about roles, not a side effect of insufficient models.
+        assert result["distinct_models_passed"] == 3
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+
+
+def test_quorum_check_explicit_min_models_no_fallback_note_even_with_zero_role_data_review_cli_246_followup():
+    """The fallback is a BARE-CHECK-ONLY behavior: a caller who explicitly asks
+    for --min-models on a task with zero role data gets the exact pre-existing
+    explicit-min-models behavior (and its own min_models_advisory), never the
+    fallback note -- the two must not be conflated even though the numbers can
+    look identical."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is True, result
+        assert result["min_models"] == 3
+        assert result["min_models_source"] == "explicit"
+        assert "quorum_mode_fallback" not in result
+        assert "min_models_advisory" in result
+
+        explicit_roles = _stats.quorum_check(TASK, min_iter=3, min_roles=1)
+        # Explicit --min-roles on a zero-role-data task must ALSO behave exactly
+        # as before this follow-up: a genuine role-count failure, no fallback.
+        assert explicit_roles["passed"] is False, explicit_roles
+        assert explicit_roles["distinct_roles_passed"] == 0
+        assert "quorum_mode_fallback" not in explicit_roles
+
+
+def test_quorum_check_bare_default_failed_role_tagged_iteration_blocks_fallback_review_cli_246_followup():
+    """Round-review finding (Opus/Fable, independently): a role-tagged iteration
+    that FAILED is still real evidence the task went through a role-recording
+    review mode -- it must block the fallback exactly like a passed role-tagged
+    iteration does, even though it contributes nothing to `gate_iterations`
+    (PASSED-only). Without this, the fallback could fire for a task that
+    genuinely has role-recording history, just none of it happened to pass --
+    silently letting model-counting decide a gate role coverage was supposed to
+    govern. Here: 1 FAILED role-tagged board review, plus 3 PASSED role-less
+    quorum runs on 3 distinct models (which WOULD satisfy the model-counting
+    fallback if it fired) -- the bare default must stay role-based and fail on
+    0 covered roles, never silently switching to model-counting."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,  # the review ran but did NOT pass
+        )
+        for model in ("gemini", "fable5", "k3"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="quorum",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert result["distinct_roles_passed"] == 0
+        assert result["roles"] == []
+        # Real model diversity IS present (proving this isn't accidentally
+        # failing for lack of models too, and that the fallback genuinely did
+        # NOT fire despite it being available).
+        assert result["distinct_models_passed"] == 3
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+
+
+def test_quorum_check_bare_default_failed_role_tagged_same_repo_blocks_fallback_review_cli_246_followup():
+    """Fable review finding (test-coverage gap): every existing "failed
+    role-tagged iteration blocks the fallback" test passes `repo_id=None`, so
+    `_iterations_excluding_mismatched`'s ACTUAL classification loop (the branch
+    that calls `_classify_iteration_identity`, not its `repo_id is None`
+    early-return) never actually ran in any test -- despite the amount of
+    docstring/comment mass defending its exact semantics. This test gives a
+    REAL `repo_id`/`diff_files` check context, with the failed role-tagged
+    iteration recorded for the SAME repo -- it must be classified "verified"
+    (not mismatched) and block the fallback exactly as the repo_id=None
+    sibling test proves."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+            repo_id="repo-a",
+            diff_files=["a.py"],
+        )
+        for model in ("gemini", "fable5", "k3"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="quorum",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+                repo_id="repo-a",
+                diff_files=["a.py"],
+            )
+        result = _stats.quorum_check(
+            TASK, min_iter=3, repo_id="repo-a", diff_files=["a.py"]
+        )
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert result["distinct_roles_passed"] == 0
+        assert result["distinct_models_passed"] == 3
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        assert result["excluded_mismatched_iterations"] == 0
+
+
+def test_quorum_check_bare_default_failed_role_tagged_different_repo_still_falls_back_review_cli_246_followup():
+    """The mismatched counterpart to the test above: the failed role-tagged
+    iteration is recorded for a DIFFERENT repo -- `_iterations_excluding_
+    mismatched`'s classification loop must exclude it as "mismatched" (not
+    "verified"), so it does NOT block the fallback, which fires normally on
+    the current repo's real model diversity."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+            repo_id="repo-b",  # unrelated repo -- must not count toward THIS check
+            diff_files=["b.py"],
+        )
+        for model in ("gemini", "fable5", "k3"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="quorum",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+                repo_id="repo-a",
+                diff_files=["a.py"],
+            )
+        result = _stats.quorum_check(
+            TASK, min_iter=3, repo_id="repo-a", diff_files=["a.py"]
+        )
+        assert result["passed"] is True, result
+        assert result["min_models"] == 3
+        assert result["distinct_models_passed"] == 3
+        assert "min_roles" not in result
+        assert "quorum_mode_fallback" in result
+        assert result["excluded_mismatched_iterations"] == 0  # role-tagged one FAILED
+
+
+def test_quorum_check_bare_default_mismatched_repo_role_data_does_not_block_fallback_review_cli_246_followup():
+    """The inverse of the failed-iteration case above: a role-tagged iteration
+    recorded against a genuinely DIFFERENT repo/diff (a reused task code across
+    unrelated projects -- the exact cross-repo pollution diff-identity binding
+    exists to guard against) must NOT count as "this task has role data" for the
+    CURRENT check -- otherwise a task-code collision in an unrelated repo would
+    force THIS check into role-mode (where it then sees zero roles and fails),
+    reopening the same pollution bug class through the counting-mode angle
+    instead of the iteration-count angle. Here: 1 role-tagged PASSED iteration
+    for repo-b (unrelated), plus 3 role-less PASSED iterations for the CURRENT
+    repo-a with real model diversity -- the fallback must fire and pass on
+    model-counting, exactly as if the repo-b record didn't exist at all."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-b",  # unrelated repo -- must not count toward THIS check
+            diff_files=["b.py"],
+        )
+        for model in ("gemini", "fable5", "k3"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+                repo_id="repo-a",
+                diff_files=["a.py"],
+            )
+        result = _stats.quorum_check(
+            TASK, min_iter=3, repo_id="repo-a", diff_files=["a.py"]
+        )
+        assert result["passed"] is True, result
+        assert result["min_models"] == 3
+        assert result["distinct_models_passed"] == 3
+        assert "min_roles" not in result
+        assert "quorum_mode_fallback" in result
+        # A real check context WAS given here (repo_id="repo-a") -- the message
+        # must include the scope qualifier (Fable review finding: only the
+        # ABSENCE variant, for repo_id=None, had a pinning test; this is the
+        # PRESENCE counterpart).
+        assert "against the current repo/diff" in result["quorum_mode_fallback"]
+        assert result["excluded_mismatched_iterations"] == 1
+
+
+def test_quorum_check_bare_default_all_history_mismatched_keeps_role_shape_no_fallback_review_cli_246_followup():
+    """Round-review finding (Opus/Fable, independently, a SECOND sharper round):
+    a task whose ENTIRE recorded history is diff-identity-mismatched (every
+    iteration is role-tagged, but for a genuinely different repo -- e.g. a
+    task-code collision/reuse) must NOT trigger the fallback. The raw
+    `iterations` list is non-empty, but the non-mismatched population is
+    EMPTY -- this must be treated the same as "no effective history for this
+    check", keeping the pre-existing role-based fail-closed shape, rather than
+    silently swapping to a model-counting shape with a message that falsely
+    claims no role data exists at all (when in fact the task's entire history
+    IS role-tagged, just for an unrelated repo/diff)."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                roles=["architect"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+                repo_id="repo-b",  # every iteration is for an UNRELATED repo
+                diff_files=["b.py"],
+            )
+        result = _stats.quorum_check(
+            TASK, min_iter=3, repo_id="repo-a", diff_files=["a.py"]
+        )
+        assert result["passed"] is False, result
+        # Kept the PRE-existing role-based shape -- no silent swap to models.
+        assert result["min_roles"] == 3
+        assert result["roles"] == []
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        assert result["excluded_mismatched_iterations"] == 3
+
+
+def test_quorum_check_bare_default_repo_id_given_diff_files_none_matches_gate_semantics_review_cli_246_followup():
+    """Fable review finding: `_iterations_excluding_mismatched` and
+    `_sort_passed_iterations_into_buckets` must build their comparison
+    `current_files` under IDENTICAL rules (both now via the shared
+    `_current_files_frozenset` helper) -- verify directly with `repo_id` given
+    but `diff_files=None` (a real, if unusual, direct-library-call shape;
+    unreachable from the CLI, which always pairs a repo_id with a real, if
+    possibly empty, diff_files list). A role-tagged iteration for the SAME repo
+    with no comparable diff_files must be treated as verified (not mismatched),
+    matching the main gate's own treatment of this exact combination -- so it
+    correctly BLOCKS the fallback here."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-a",
+            diff_files=["a.py"],
+        )
+        result = _stats.quorum_check(
+            TASK, min_iter=1, repo_id="repo-a", diff_files=None
+        )
+        assert result["min_roles"] == 3
+        assert result["distinct_roles_passed"] == 1
+        assert "quorum_mode_fallback" not in result
+        assert result["excluded_mismatched_iterations"] == 0
+
+
+def test_quorum_check_bare_default_unverifiable_role_tagged_iteration_blocks_fallback_review_cli_246_followup():
+    """Fable review finding (missing test): a role-tagged iteration with NO
+    recorded identity at all (pre-v4 history -- predates `repo_id`/`diff_files`
+    tracking) is "unverifiable", not "mismatched" -- `_iterations_excluding_
+    mismatched` includes it (same as `_sort_passed_iterations_into_buckets`
+    already does for the main gate), so it must block the fallback exactly like
+    a same-repo role-tagged iteration does, even though THIS check supplies a
+    real `repo_id`."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            # No repo_id/diff_files -- pre-v4 history, identity UNVERIFIABLE.
+        )
+        result = _stats.quorum_check(
+            TASK, min_iter=1, repo_id="repo-a", diff_files=["a.py"]
+        )
+        assert result["min_roles"] == 3
+        assert result["distinct_roles_passed"] == 1
+        assert result["unverifiable_iterations"] == 1
+        assert "quorum_mode_fallback" not in result
+        assert "min_models" not in result
+
+
+def test_quorum_check_bare_default_unverdicted_role_tagged_iteration_blocks_fallback_review_cli_246_followup():
+    """Docstring claim: an UNVERDICTED role-tagged iteration (no `passed` key at
+    all -- pre-STATS_VERSION-3 history, or a current record from a mode with no
+    verdict to thread) blocks the fallback exactly like a passed or failed one
+    does. Directly exercises this third verdict state (only passed/failed were
+    covered by the sibling tests above)."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            roles=["architect"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            # `passed` omitted entirely -- verdict UNKNOWN, not True or False.
+        )
+        for model in ("gemini", "fable5", "k3"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="quorum",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert result["distinct_roles_passed"] == 0  # unverdicted -> not gate-worthy
+        assert result["distinct_models_passed"] == 3  # but real model diversity
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+
+
+def test_quorum_check_bare_default_empty_roles_list_does_not_count_as_role_data_review_cli_246_followup():
+    """Round-review finding (Opus/Fable, independently): `record_run` can in
+    principle persist `"roles": []` for a caller supplying matching empty
+    `models`/`roles` lists (its own length-match guard permits `0 == 0`) -- an
+    empty list carries no actual role information and must not block the
+    fallback, or a task could get pinned at a permanent, escape-hatch-less
+    `0/N distinct roles` fail (the exact bug this whole feature exists to
+    close). Directly exercises `record_run` with `roles=[]` (bypassing the
+    CLI's own truthy-result guard that never actually writes this shape in
+    practice) to pin the module-level contract regardless."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=[],
+            roles=[],  # explicitly empty -- must not count as "role data present"
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=0,
+            passed=True,
+        )
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3)
+        assert result["passed"] is True, result
+        assert result["min_models"] == 3
+        assert result["distinct_models_passed"] == 3
+        assert "min_roles" not in result
+        assert "quorum_mode_fallback" in result
+
+
+def test_quorum_check_bare_default_zero_history_keeps_role_shape_no_fallback_review_cli_246_followup():
+    """Pin the deliberate exclusion: a task with genuinely ZERO recorded
+    iterations (not just zero role data) keeps the PRE-existing role-based
+    fail-closed shape (`min_roles=3, roles=[]`) -- the fallback must NOT fire
+    just because there's no role data, when there's no ANY data either.
+    "Never reviewed" and "reviewed, but never through a role-recording mode"
+    are different problems with different fixes."""
+    with _TmpStore():
+        result = _stats.quorum_check(TASK, min_iter=3)
+        assert result["passed"] is False, result
+        assert "error" in result
+        assert result["min_roles"] == 3
+        assert result["roles"] == []
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+
+
+def test_quorum_check_bare_default_unreadable_store_keeps_role_shape_no_fallback_review_cli_246_followup():
+    """Fable review finding (missing test): the `store_error is None` half of
+    the fallback's guard -- an unreadable store on a BARE check (no explicit
+    flags at all) must also keep the pre-existing role-based fail-closed shape,
+    same as the zero-history exemption above, rather than gaining fallback
+    keys. Every existing unreadable-store test uses an explicit --min-models,
+    which never exercises this branch of the guard."""
+    saved = os.environ.get("REVIEW_STATS_FILE")
+    os.environ["REVIEW_STATS_FILE"] = "/nonexistent-xyz/deeper/run-stats.jsonl"
+    try:
+        result = _stats.quorum_check(TASK, min_iter=3)
+        assert result["passed"] is False
+        assert "error" in result
+        assert result["min_roles"] == 3
+        assert result["roles"] == []
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+    finally:
+        if saved is None:
+            os.environ.pop("REVIEW_STATS_FILE", None)
+        else:
+            os.environ["REVIEW_STATS_FILE"] = saved
+
+
+def test_quorum_check_bare_default_fallback_fires_with_zero_passed_iterations_review_cli_246_followup():
+    """Fable review finding (missing test): a bare check whose ENTIRE current-
+    repo history is non-passed (failed/unverdicted) and role-free -- so
+    `gate_iterations` is genuinely EMPTY, and the fallback fires purely off the
+    non-passed remainder, not off any passed history at all. No prior test hit
+    this specific combination (every other fallback-fires test has at least
+    some PASSED role-less history)."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=0,
+                fail_count=1,
+                passed=False,  # every iteration ran but did NOT pass
+            )
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result  # 0 passed iterations -> iter_ok fails
+        assert result["passed_iterations"] == 0
+        assert result["min_models"] == 3
+        assert result["min_models_source"] == "fallback"
+        assert result["distinct_models_passed"] == 0  # no PASSED models to count
+        assert "min_roles" not in result
+        assert "quorum_mode_fallback" in result
+
+
+def test_cli_check_json_shape_bare_default_fallback_review_cli_246_followup():
+    """JSON-shape pin for the fallback path: carries the model-counting keys
+    (identical shape to an explicit --min-models call) PLUS quorum_mode_fallback,
+    and none of the role or explicit-min-models-only keys."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check", "--json"])
+        assert rc == 0, rc
+        payload = json.loads(out.getvalue())
+        assert payload["min_iter"] == 3
+        assert payload["min_models"] == 3
+        assert payload["min_models_source"] == "fallback"
+        assert payload["distinct_models_passed"] == 3
+        assert payload["passed"] is True
+        assert "quorum_mode_fallback" in payload
+        assert "min_roles" not in payload
+        assert "roles" not in payload
+        assert "min_models_advisory" not in payload
+        assert "min_roles_suggestion" not in payload
+
+
+def test_cli_check_json_shape_bare_default_fallback_not_met_review_cli_246_followup():
+    """Opus review finding: the fallback's --json shape was only pinned on the
+    MET path -- the NOT-met path exercises the changed `min_roles_suggestion`
+    gating (`min_models_explicit` instead of `min_models is not None`) through
+    the CLI's JSON serializer too, and is the one combination where that
+    gating change could leak a `min_roles_suggestion` onto a fallback payload."""
+    with _TmpStore():
+        for model in ("codex", "gemini"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check", "--json"])
+        assert rc != 0, rc
+        payload = json.loads(out.getvalue())
+        assert payload["passed"] is False
+        assert payload["min_models"] == 3
+        assert payload["min_models_source"] == "fallback"
+        assert payload["distinct_models_passed"] == 2
+        assert "quorum_mode_fallback" in payload
+        assert "min_roles" not in payload
+        assert "roles" not in payload
+        # The changed min_roles_suggestion gating (min_models_explicit) must not
+        # leak a suggestion onto a fallback payload -- nothing was explicit here.
+        assert "min_roles_suggestion" not in payload
+        assert "min_models_advisory" not in payload
 
 
 def test_quorum_check_min_models_advisory_only_when_explicit_review_cli_246():
@@ -2395,6 +3093,59 @@ def test_quorum_check_invalid_task_code_fails_closed():
     assert result["passed"] is False
     assert "error" in result
     assert result["passed_iterations"] == 0 and result["distinct_models_passed"] == 0
+
+
+def test_quorum_check_rejected_shapes_carry_min_models_source_review_cli_246_followup():
+    """Round-review finding (Opus/Fable, independently, on an EARLIER revision of
+    this follow-up): `min_models_source` was only ever attached in the main
+    result-building path -- the `_rejected()` early-return shapes (invalid task
+    code, floor-validation failure) also emit `min_models` when it was given
+    explicitly, but were missing `min_models_source`, contradicting the
+    documented "accompanies min_models EVERY time" contract and risking a
+    KeyError for any caller following that contract literally. Both `_rejected()`
+    call sites run before the fallback logic exists, so `min_models` there is
+    ALWAYS explicit -- pin `min_models_source == "explicit"` on both."""
+    invalid_code = _stats.quorum_check("bad code", min_iter=1, min_models=3)
+    assert invalid_code["passed"] is False
+    assert "error" in invalid_code
+    assert invalid_code["min_models"] == 3
+    assert invalid_code["min_models_source"] == "explicit"
+
+    with _TmpStore():
+        floor_violation = _stats.quorum_check(TASK, min_iter=0, min_models=3)
+        assert floor_violation["passed"] is False
+        assert "error" in floor_violation
+        assert floor_violation["min_models"] == 3
+        assert floor_violation["min_models_source"] == "explicit"
+
+
+def test_quorum_check_zero_iterations_explicit_min_models_carries_min_models_source_review_cli_246_followup():
+    """Opus review finding: a THIRD fail-closed shape also emits `min_models` --
+    a readable store with ZERO recorded iterations for this task code, given an
+    explicit `--min-models`. Unlike the two `_rejected()` shapes above, this one
+    reaches its "error" key via `_finalize_quorum_result`'s "no recorded review
+    iterations" branch at the very END of `quorum_check`, not via an early
+    `_rejected()` return -- so it goes through the MAIN result-building code
+    (where `min_models_source` is set unconditionally whenever `min_models` is),
+    not the `_rejected()` closure. Pin it as its own shape rather than assuming
+    the two `_rejected()` tests cover it."""
+    with _TmpStore():
+        # A record for a DIFFERENT task keeps the store readable/non-empty
+        # overall, isolating "zero records for THIS code" from "store missing".
+        _stats.record_run(
+            task_code="HYP-000",
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        result = _stats.quorum_check("HYP-999-followup", min_iter=1, min_models=3)
+        assert result["passed"] is False
+        assert "error" in result
+        assert result["min_models"] == 3
+        assert result["min_models_source"] == "explicit"
 
 
 def test_quorum_check_rejects_zero_or_negative_thresholds_directly():
@@ -3075,13 +3826,45 @@ def test_cli_check_met_prints_verdict_and_exits_0():
         assert "3 passed iteration" in text and "3 distinct model" in text
 
 
-def test_cli_check_bare_default_is_role_based_review_cli_246():
-    """review-cli#246: with NO flags at all, --check now defaults to a ROLE-based
-    check at the same floor (3) --min-models used to default to -- 3 distinct
-    models with NO recorded roles must still fail, since role coverage (not
-    model diversity) now governs by default."""
+def test_cli_check_bare_default_falls_back_to_models_when_no_role_data_review_cli_246_followup():
+    """Alex's review-cli#246 follow-up (the bug this fix closes): 3 distinct
+    models with ZERO recorded roles at all (this task's entire history predates
+    role-tracking, or came only from quorum/just-ask/brainstorm/qa) must NOT be a
+    guaranteed hard fail under the bare-check default just because it has no role
+    data -- it falls back to the OLD model-counting default and PASSES here,
+    since 3 distinct models meets the same numeric floor. Before this follow-up,
+    this exact scenario used to fail (see git history/PR #246: "0/3 distinct
+    roles" for a task with real 3-model diversity)."""
     with _TmpStore():
         for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check"])
+        assert rc == 0, rc
+        text = out.getvalue()
+        assert "review bar met" in text
+        assert "3 distinct model" in text
+        # The fallback note explains WHY model-counting governed here, distinct
+        # from a genuine explicit --min-models request.
+        assert "no role-tagged review history recorded" in text
+        assert "fell back to the pre-review-cli#246 model-counting default" in text
+
+
+def test_cli_check_bare_default_short_on_models_still_fails_via_fallback_review_cli_246_followup():
+    """The inverse: zero role data, but only 2 distinct models -- the fallback
+    still enforces the SAME numeric floor (3) the role-based default would have
+    used, it just counts a different thing. Not a free pass."""
+    with _TmpStore():
+        for model in ("codex", "gemini"):
             _stats.record_run(
                 task_code=TASK,
                 mode="review",
@@ -3097,9 +3880,8 @@ def test_cli_check_bare_default_is_role_based_review_cli_246():
         assert rc != 0, rc
         text = out.getvalue()
         assert "review bar NOT met" in text
-        assert "0/3 distinct roles" in text
-        # The model audit line still names which models actually reviewed.
-        assert "models: 3 distinct model" in text
+        assert "2/3 distinct models" in text
+        assert "fell back to the pre-review-cli#246 model-counting default" in text
 
 
 def test_cli_check_bare_default_passes_on_distinct_roles_review_cli_246():
