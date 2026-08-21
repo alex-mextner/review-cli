@@ -11,7 +11,7 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .backends import (
@@ -405,6 +405,18 @@ class FailoverOutcome:
     # honest run-stats pool: a backfilled reserve appears here under its real model id,
     # so record_run keys the ETA/history on what actually ran, never a display label.
     usable_models: list[str]
+    # The board ROLE (a REVIEW_ROLES key, e.g. "architect"/"security") each usable seat
+    # was reviewing under, index-aligned with `usable_models` (same seat, same position —
+    # both lists are appended to in the same loop iteration, so they can never drift).
+    # review-cli#221: a role-filling seat created by the shortage-resilience duplicate-
+    # model pad (select_pool_with_reuse / config.py) carries its OWN distinct role even
+    # when its `model` repeats one already in the pool — this is what lets a --min-roles
+    # gate count that pass as covering a genuinely different facet of the review, instead
+    # of `_distinct_models` collapsing it into the same already-counted model string.
+    # Defaulted to `[]` (unlike the required `usable_models`) so existing direct
+    # `FailoverOutcome(...)` test fakes that predate this field keep constructing
+    # without passing it.
+    usable_roles: list[str] = field(default_factory=list)
 
 
 def run_board_with_failover(
@@ -435,6 +447,7 @@ def run_board_with_failover(
     all_results: list[ReviewResult] = []
     usable: list[ReviewResult] = []
     usable_models: list[str] = []
+    usable_roles: list[str] = []
     reserve_queue = list(reserve)
 
     # If REVIEW_BOARD_DEADLINE_SECONDS names an overall wall-clock budget, arm the
@@ -474,6 +487,7 @@ def run_board_with_failover(
                 if result_is_usable(result):
                     usable.append(result)
                     usable_models.append(reviewer.model)
+                    usable_roles.append(reviewer.role)
                     _tally_ok(True)
                 else:
                     # This seat failed — count it as a fail and try to backfill it from
@@ -513,6 +527,7 @@ def run_board_with_failover(
         target=target,
         degraded=degraded,
         usable_models=usable_models,
+        usable_roles=usable_roles,
     )
 
 

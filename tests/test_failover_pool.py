@@ -404,6 +404,69 @@ def test_promoted_reserve_brings_its_own_role_lens():
     assert REVIEW_ROLES["security"] in prompts["m-reserve"]  # reserve's own lens
 
 
+# === usable_roles (review-cli#221 --min-roles) ==================================
+def test_usable_roles_index_aligned_with_usable_models_review_cli_221():
+    """FailoverOutcome.usable_roles is index-aligned with usable_models, one board
+    ROLE per USABLE seat -- including a shortage-resilience duplicate-model role-
+    fill seat (PR #207: `config.select_pool_with_reuse` reuses an already-picked
+    model onto an otherwise-empty role slot), which repeats a `.model` string but
+    still carries its OWN distinct `.role`."""
+    pool = [
+        BoardReviewer("fable", "architect", "Fable"),
+        BoardReviewer("opus", "correctness", "Opus"),
+        # Duplicated-model role-fill: same model as pool[0] ("fable"), a DIFFERENT
+        # role -- exactly what select_pool_with_reuse produces under scarcity.
+        BoardReviewer("fable", "security", "Fable"),
+    ]
+    with _FakeBackends():
+        outcome = run_board_with_failover(pool, [], PROMPT, "+x", REPO_ROOT, 5)
+    assert not outcome.degraded
+    assert outcome.usable_models == ["fable", "opus", "fable"]
+    assert outcome.usable_roles == ["architect", "correctness", "security"]
+
+
+def test_usable_roles_only_covers_seats_that_produced_a_verdict():
+    """A FAILED seat contributes nothing to `usable_roles`, matching `usable_models`
+    -- only the seat that actually backfills it (with its own role) counts."""
+    board = [
+        BoardReviewer("m-pool", "architect", "P"),
+        BoardReviewer("m-reserve", "security", "R"),
+    ]
+    pool, reserve = split_pool_reserve(board, 1, _avail({"m-pool", "m-reserve"}))
+    with _FakeBackends({"m-pool": (1, "boom")}):
+        outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
+    assert outcome.usable_models == ["m-reserve"]
+    assert outcome.usable_roles == ["security"]
+
+
+def test_usable_roles_stay_aligned_with_usable_models_when_a_middle_seat_backfills_review_cli_221():
+    """Round-2/6/7 review finding (Opus, raised repeatedly): confirm — with a
+    DISCRIMINATING multi-seat case, not the single-element pool the earlier test
+    used — that a backfilled seat can never desync `usable_models`/`usable_roles`
+    from each other. A single-usable-seat list is trivially 'aligned' under any
+    ordering; this needs >=2 REAL successes plus one failure+backfill, with the
+    failure in the MIDDLE of the pool (not first or last), so a mispaired append
+    would produce a visibly wrong pairing, not just a wrong length."""
+    pool = [
+        BoardReviewer("m-a", "architect", "A"),
+        BoardReviewer("m-b", "correctness", "B"),  # this one fails and backfills
+        BoardReviewer("m-c", "consistency", "C"),
+    ]
+    reserve = [BoardReviewer("m-r", "security", "R")]
+    with _FakeBackends({"m-b": (1, "boom")}):
+        outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
+    assert not outcome.degraded
+    assert outcome.usable_models == ["m-a", "m-c", "m-r"]
+    assert outcome.usable_roles == ["architect", "consistency", "security"]
+    # Pairwise, not just as two independently-correct lists: each model landed
+    # with the role it ACTUALLY reviewed under, not a neighbor's.
+    assert list(zip(outcome.usable_models, outcome.usable_roles)) == [
+        ("m-a", "architect"),
+        ("m-c", "consistency"),
+        ("m-r", "security"),
+    ]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

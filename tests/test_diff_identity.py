@@ -192,8 +192,12 @@ def _record_passed(*, models, repo_id=None, diff_files=None):
 def test_quorum_check_without_context_preserves_pre_v4_shape_and_behavior():
     """The regression guard for backward compat: a caller that never passes
     repo_id/diff_files (every direct library caller before this feature existed)
-    gets the EXACT pre-v4 return shape -- no new keys, no filtering -- even when
-    the stored iterations are, in fact, from totally different repos."""
+    gets the pre-v4 return shape and filtering behavior -- no verification keys,
+    no exclusion -- even when the stored iterations are, in fact, from totally
+    different repos. "Pre-v4" here means the diff-identity-verification feature
+    (v4) specifically; it does NOT mean "no keys added by any later feature" --
+    review-cli#246's `min_models_advisory` is a genuinely NEW key (present
+    whenever `min_models` is given explicitly, as it is here), unrelated to v4."""
     with _TmpStore():
         _record_passed(models=["codex"], repo_id="github.com/org/repo-a")
         _record_passed(models=["gemini"], repo_id="github.com/org/repo-b")
@@ -210,6 +214,7 @@ def test_quorum_check_without_context_preserves_pre_v4_shape_and_behavior():
             "min_iter",
             "min_models",
             "passed",
+            "min_models_advisory",
         }
 
 
@@ -350,6 +355,25 @@ def test_quorum_check_all_mismatched_fails_bar_despite_raw_count_meeting_floor()
         assert result["passed"] is False
         assert result["passed_iterations"] == 0
         assert result["excluded_mismatched_iterations"] == 4
+
+
+def test_quorum_check_min_models_advisory_present_on_mismatch_denial_review_cli_246():
+    """k3/Opus review finding: the documented `min_models_advisory` contract
+    ("met, not-met, or a diff-identity-mismatch denial all qualify") must hold
+    on the mismatch-denial shape specifically -- a diff-identity mismatch is
+    NOT one of the early-return `_rejected()` shapes (invalid code/unreadable
+    store/floor-validation), it runs the FULL result-building path and only
+    gets its `"error"` key from `_finalize_quorum_result` afterward, so the
+    advisory (added earlier in that same path) must survive onto it."""
+    with _TmpStore():
+        this_repo = "github.com/hyperide/agent-tools"
+        _record_passed(models=["codex"], repo_id="github.com/other-org/repo-0")
+        result = _stats.quorum_check(
+            TASK, min_iter=1, min_models=3, repo_id=this_repo, diff_files=None
+        )
+        assert result["passed"] is False
+        assert "error" in result
+        assert "min_models_advisory" in result
 
 
 def test_quorum_check_stalled_models_coexists_with_mismatch_error():
