@@ -516,18 +516,39 @@ JSON top-level shapes:
 | `review task --json` | `{"tasks": [{"task_code": str, "iterations": int, "models": [str], "modes": [str], "first_ts": str, "last_ts": str, "duration_seconds": number, "ok_count": int, "fail_count": int}]}` |
 | `review task CODE --json` | `{"task_code": str, "iterations": [run_stats_record], "sessions": [dashboard_session_summary]}` |
 | `review task CODE --detail N --json` | `dashboard_session_detail` with `session_id`, `task_code`, `calls`, `errors`, `brainstorm`, and `roles` |
-| `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models": int, "passed": bool, "error"?: str, "identity_verification": "ran" \| "disabled" \| "skipped_unresolvable", "verified_iterations"?: int, "unverifiable_iterations"?: int, "excluded_mismatched_iterations"?: int, "mismatch_details"?: [{"iteration": int, "reason": str, "recorded_repo_id": str, "recorded_diff_files": [str] | null, "ts": str}], "mismatch_details_truncated"?: true, "stalled_models"?: [{"model": str, "reason": str, "remaining_seconds": int, "consecutive_failures": int}], "min_roles_suggestion"?: str, "roles"?: [str], "distinct_roles_passed"?: int, "min_roles"?: int}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). `mismatch_details` is capped at 50 entries — `excluded_mismatched_iterations` is always the uncapped true count. `stalled_models` (review-cli#221) is present only when the bar ISN'T met and names any ATTEMPTED model that's currently cooling down (an unavailable-sentinel response or a session-limit/usage-credits notice — the two chronic signals `seat_cooldown` records; a plain timeout does NOT currently start a cooldown, see the "Deliberately narrow" note above) — the same signal `stalled: <model> (...)` lines print in text mode. `roles`/`distinct_roles_passed`/`min_roles` (review-cli#221, `--min-roles`) appear only when `--min-roles` was passed — see below. `min_roles_suggestion` appears only when `--min-roles` was NOT passed and the gate failed because `distinct_models_passed` fell short of `--min-models`. |
+| `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models"?: int, "passed": bool, "error"?: str, "identity_verification": "ran" \| "disabled" \| "skipped_unresolvable", "verified_iterations"?: int, "unverifiable_iterations"?: int, "excluded_mismatched_iterations"?: int, "mismatch_details"?: [{"iteration": int, "reason": str, "recorded_repo_id": str, "recorded_diff_files": [str] | null, "ts": str}], "mismatch_details_truncated"?: true, "stalled_models"?: [{"model": str, "reason": str, "remaining_seconds": int, "consecutive_failures": int}], "min_roles_suggestion"?: str, "roles"?: [str], "distinct_roles_passed"?: int, "min_roles"?: int, "min_models_advisory"?: str}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). `mismatch_details` is capped at 50 entries — `excluded_mismatched_iterations` is always the uncapped true count. `stalled_models` (review-cli#221) is present only when the bar ISN'T met and names any ATTEMPTED model that's currently cooling down (an unavailable-sentinel response or a session-limit/usage-credits notice — the two chronic signals `seat_cooldown` records; a plain timeout does NOT currently start a cooldown, see the "Deliberately narrow" note above) — the same signal `stalled: <model> (...)` lines print in text mode. `min_models` (review-cli#246: now optional) appears only when `--min-models` was explicitly given. `roles`/`distinct_roles_passed`/`min_roles` (review-cli#221, `--min-roles`) appear whenever a role-based floor is ACTIVE — either `--min-roles` was explicitly given, or NEITHER flag was given (review-cli#246's new default, see below). `min_roles_suggestion` appears only when `--min-roles` was NOT passed and the gate failed because `distinct_models_passed` fell short of an explicit `--min-models`. `min_models_advisory` (review-cli#246) appears whenever `--min-models` was explicitly given AND at least one iteration is recorded for the task AND the store was readable (met, not-met, or a diff-identity-mismatch denial all qualify) — a non-blocking nudge, never affecting `passed`; it is NOT added to any of the fail-closed shapes that carry NO real history to evaluate (invalid task code, unreadable store, zero recorded iterations, a floor-validation failure). |
 
-**`--min-roles N`** (review-cli#221) switches the SECOND half of the gate — normally "N
-distinct MODEL NAMES among the passed iterations" (`--min-models`) — to "N distinct BOARD
-ROLES (architect/correctness/security/…) covered by the passed iterations" instead. The
-two flags are independent: `--min-models` alone (left at its default, `--min-roles`
-omitted) behaves exactly as it always has, a strict count of distinct model-name strings;
-passing `--min-roles` governs the pass/fail decision in its place — `--min-models` is
-still validated and reported, but not enforced. Passing BOTH explicitly (e.g.
-`--min-models 5 --min-roles 3`) prints a `[review task] note: ...` on stderr saying
-`--min-roles` is the one that actually governs, so the weaker floor is never silently
-invisible. This exists because the board's shortage-resilience behavior (PR #207:
+**`--min-roles N`** (review-cli#221, defaults changed in review-cli#246) switches the
+SECOND half of the gate — normally "N distinct MODEL NAMES among the passed iterations"
+(`--min-models`) — to "N distinct BOARD ROLES (architect/correctness/security/…) covered
+by the passed iterations" instead.
+
+**Explicit-vs-default semantics (review-cli#246):** both `--min-models` and `--min-roles`
+are optional; the gate reacts differently depending on which were actually TYPED:
+
+- **Neither flag given** (the true default): the bar is role-based, at the SAME numeric
+  floor `--min-models` used to default to (3) — "at least 3 distinct board roles", not "at
+  least 3 distinct models". This is the new default everywhere (Alex's direction: role-based
+  counting by default, no default model-count floor).
+- **Only `--min-models` given**: reproduces the exact pre-#221 PASS/FAIL decision — a
+  strict count of distinct model-name strings decides the gate. The `--json` payload
+  itself gains one new key here (the `min_models_advisory` described below), so a
+  strict-key-set consumer of the OLD shape still needs updating even though the gate's
+  logic hasn't changed.
+- **Only `--min-roles` given**: reproduces the exact pre-#246 `--min-roles` behavior — a
+  count of distinct board roles decides the gate; `--min-models`/`distinct_models_passed`
+  are still computed and reported for visibility, but never gate.
+- **BOTH given explicitly**: an explicitly requested floor is now ALWAYS enforced — the gate
+  requires `--min-iter` AND the model floor AND the role floor to all be met (an AND, not
+  "whichever is passed governs"). This fixes a review-cli#221 round-3 review finding: a
+  caller explicitly passing `--min-models 5 --min-roles 1` used to get `passed: true` from a
+  single-model review, because `--min-roles` silently outvoted the explicit model floor —
+  Alex's policy is "if a model limit is explicitly set, it must work". Whenever `--min-models`
+  is explicit, the response also carries a non-blocking `min_models_advisory` note (both in
+  `--json` and as a `  note: ...` stderr/stdout line in text mode) suggesting that role-based
+  coverage is usually sufficient on its own — it never affects `passed`.
+
+This exists because the board's shortage-resilience behavior (PR #207:
 `select_pool_with_reuse`, review-cli#207) fills an otherwise-empty role by reusing an
 already-picked model instead of shrinking the panel — each duplicated pass reviews under
 its OWN distinct role, but `--min-models` still only counts it as the SAME model string it
@@ -537,20 +558,26 @@ though 3 genuinely distinct facets of the diff were reviewed — `--min-roles 3`
 correctly. Only a role that is an actual `REVIEW_ROLES` key counts (an unknown/typo'd role
 string on a custom config `board:` entry is kept for its own diagnostics but never a
 distinct FACET — the seat degrades to the generic prompt, so it earns no lens credit here).
-When `--min-models` fails, the text/`--json` denial includes a `min_roles_suggestion`
-pointing at `--min-roles` — but ONLY when re-running with `--min-roles` set to the SAME
-number would actually pass: the iteration floor is already met, the recorded history
-covers enough distinct roles, AND at least 2 distinct models actually EARNED one of those
-roles (a model sharing a multi-seat record with a valid-role seat, but whose own role was
-unknown/typo'd, doesn't count toward that "2 distinct models" check — only a model whose
-own recorded role is a real `REVIEW_ROLES` key does). A task with no recorded roles at
-all, one that's ALSO short on `--min-iter`, or one whose qualifying role coverage traces
-back to a single model (a monoculture — technically `--min-roles`-passable, but not what
-the hint should ever steer a caller toward), never gets the hint. Role-mode text output
-also prints a secondary `models: N distinct model (...)` line — including on a diff-
-identity-mismatch denial, which still carries real model/role counts alongside its error
-message — so a self-merge-authority audit trail never loses which models actually
-reviewed just because roles (not models) governed the verdict. Only iterations from a mode
+When an EXPLICIT `--min-models` (with no `--min-roles`) fails, the text/`--json` denial
+includes a `min_roles_suggestion` pointing at `--min-roles` — but ONLY when re-running with
+`--min-roles` set to the SAME number, IN PLACE of `--min-models`, would actually pass: the
+iteration floor is already met, the recorded history covers enough distinct roles, AND at
+least 2 distinct models actually EARNED one of those roles (a model sharing a multi-seat
+record with a valid-role seat, but whose own role was unknown/typo'd, doesn't count toward
+that "2 distinct models" check — only a model whose own recorded role is a real
+`REVIEW_ROLES` key does). A task with no recorded roles at all, one that's ALSO short on
+`--min-iter`, or one whose qualifying role coverage traces back to a single model (a
+monoculture — technically `--min-roles`-passable, but not what the hint should ever steer a
+caller toward), never gets the hint. Role-mode text output also prints a secondary
+`models: N distinct model (...)` line naming which models actually reviewed. On the MET
+path this is skipped when `--min-models` was ALSO explicitly given, since that floor's own
+count clause already lists the names inline; on the NOT-met path the count clause is always
+bare numbers (no names, matching the pre-#246 convention), so the secondary line prints
+whenever a role floor is active, REGARDLESS of whether `--min-models` was also explicit —
+including on a diff-identity-mismatch denial, which still carries real model/role counts
+alongside its error message — so a self-merge-authority audit trail never loses which
+models actually reviewed just because roles (not models) governed the verdict. Only
+iterations from a mode
 that records per-seat roles (currently: the `review diff`/`review visual` board dispatch)
 contribute a role — `quorum`/`just-ask`/`brainstorm`/`qa` iterations count toward
 `--min-iter` as always, but never toward `--min-roles` — and a role only ever counts from

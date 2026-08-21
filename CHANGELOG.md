@@ -6,35 +6,62 @@ semantic versioning.
 ## Unreleased
 
 - **`review task CODE --check --min-roles N` — count covered board roles instead
-  of distinct model names (#221).** The board's shortage-resilience behavior
-  (`select_pool_with_reuse`, #207) fills an otherwise-empty role by reusing an
-  already-picked model rather than shrinking the panel — each duplicated pass
-  reviews under its OWN distinct role, but the self-merge-authority quorum gate's
-  `--min-models` still counted it as the same model string it already counted
-  once, so that pass could never help satisfy model diversity even though it
-  genuinely covered a different facet of the review. `--min-roles` switches the
-  gate's second half from "N distinct model-name strings" to "N distinct board
-  roles (architect/correctness/security/…) covered by the passed iterations" —
-  a role-fill pass counts once per role, same as any other. `--min-models` and
-  `--min-roles` are independent (whichever is passed governs the gate; omitting
-  `--min-roles` reproduces `--min-models`' exact prior behavior), and a
-  `--min-models` denial now suggests `--min-roles` as an alternative when model
-  diversity itself is the shortfall — but ONLY when switching would actually
-  pass (the iteration floor is met, at least 2 distinct models each actually
-  EARNED a valid role — not merely shared a record with one, and the recorded
-  history covers enough real roles); a role-less history or a same-model
-  monoculture never gets steered toward the hint. Only
-  a genuine `REVIEW_ROLES` key ever counts as covered — a typo'd/unknown role
-  string on a custom config board (which the board itself already degrades to
-  the generic, non-distinct prompt) cannot inflate the count. Passing BOTH
-  `--min-models` and `--min-roles` explicitly prints a visible stderr note
-  naming which one actually governs, instead of silently reporting the unused
-  floor as if it were enforced. Per-seat role tracking is new to the run-stats
-  record (`roles`, optional, currently populated only by the `review diff`/
-  `review visual` board dispatch — `panel.FailoverOutcome.usable_roles`); a task
-  whose history predates this field, or comes from a mode with no role concept
-  (quorum/just-ask/brainstorm/qa), simply contributes no roles to a
-  `--min-roles` count.
+  of distinct model names, and default to role-based counting (#221, #246).**
+  The board's shortage-resilience behavior (`select_pool_with_reuse`, #207)
+  fills an otherwise-empty role by reusing an already-picked model rather than
+  shrinking the panel — each duplicated pass reviews under its OWN distinct
+  role, but the self-merge-authority quorum gate's `--min-models` still counted
+  it as the same model string it already counted once, so that pass could never
+  help satisfy model diversity even though it genuinely covered a different
+  facet of the review. `--min-roles` switches the gate's second half from "N
+  distinct model-name strings" to "N distinct board roles (architect/
+  correctness/security/…) covered by the passed iterations" — a role-fill pass
+  counts once per role, same as any other. Only a genuine `REVIEW_ROLES` key
+  ever counts as covered — a typo'd/unknown role string on a custom config board
+  (which the board itself already degrades to the generic, non-distinct prompt)
+  cannot inflate the count.
+
+  `--min-models` and `--min-roles` are both optional, and their semantics now
+  depend on which were actually typed (#246): passing NEITHER (the true
+  default) switches to a role-based check at the SAME numeric floor
+  `--min-models` used to default to (3) — role-based coverage is now the
+  default everywhere, with no default model-count floor. **Breaking for any
+  machine consumer of `--check --json` that reads `payload["min_models"]`
+  unconditionally**: that key is now OMITTED (not `null`) whenever
+  `--min-models` wasn't explicitly passed — including the bare-default
+  invocation, which previously always carried a resolved `min_models: 3` — and
+  `roles`/`distinct_roles_passed`/`min_roles` now appear by default instead.
+  Passing only `--min-models` reproduces the exact pre-#221 pass/fail decision
+  (the payload still gains the new `min_models_advisory` key described below).
+  Passing only `--min-roles` reproduces the pre-#246 `--min-roles` behavior
+  unchanged.
+  Passing BOTH explicitly now enforces BOTH as an AND — an explicitly requested
+  floor can no longer be silently outvoted by the other (fixes a #221 round-3
+  review finding: `quorum_check(..., min_models=5, min_roles=1)` used to return
+  `passed: true` from a single-model review because `--min-roles` governed
+  alone). Whenever `--min-models` is explicit and there's real history to
+  evaluate (not a fail-closed denial with zero recorded iterations or an
+  unreadable store), the response carries a non-blocking `min_models_advisory`
+  note (both in `--json` and as a text-mode `note:` line) suggesting role-based
+  coverage is usually sufficient on its own — it never affects `passed`.
+
+  A `--min-models`-only denial still suggests replacing it with `--min-roles`
+  at the same number when model diversity itself is the shortfall — but ONLY
+  when switching would actually pass (the iteration floor is met, at least 2
+  distinct models each actually EARNED a valid role — not merely shared a
+  record with one, and the recorded history covers enough real roles); a
+  role-less history or a same-model monoculture never gets steered toward the
+  hint. Role-mode text output also prints a secondary `models: N distinct
+  model (...)` audit line naming which models actually reviewed — on the MET
+  path only when `--min-models` wasn't ALSO explicit (whose own count clause
+  already lists names inline); on the NOT-met path the count clause is always
+  bare numbers, so the audit line prints whenever a role floor is active,
+  regardless of `--min-models`. Per-seat role tracking is new to the run-stats
+  record (`roles`, optional,
+  currently populated only by the `review diff`/`review visual` board dispatch
+  — `panel.FailoverOutcome.usable_roles`); a task whose history predates this
+  field, or comes from a mode with no role concept (quorum/just-ask/brainstorm/
+  qa), simply contributes no roles to a `--min-roles` count.
 
 - **Cross-process/cross-thread locking for the seat-cooldown store (#188).** A board
   dispatches its seats in parallel, so two concurrent `record_cooldown`/`clear_cooldown`

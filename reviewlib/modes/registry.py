@@ -142,8 +142,12 @@ REMOVED_FLAGS: dict[str, RemovedFlag] = {
         reason="`review task CODE --quorum-check` was renamed to `--check` to avoid "
         "colliding with the unrelated `review quorum` multi-model consensus panel — same "
         "word, two different features.",
-        fix="use `review task CODE --check` instead; `--min-iter`/`--min-models`/`--json` "
-        "are unchanged (review-cli#221 also added `--min-roles` there).",
+        fix="use `review task CODE --check` instead; `--min-iter`/`--json` are unchanged. "
+        "Note (review-cli#246): bare `--check` with NEITHER `--min-models` nor "
+        "`--min-roles` now defaults to a 3-distinct-BOARD-ROLE gate, not the old "
+        "3-distinct-MODEL gate — pass `--min-models 3` explicitly to keep the prior "
+        "default behavior (review-cli#221 added `--min-roles` as an opt-in alternative "
+        "counting mode; #246 made it the default).",
     ),
 }
 

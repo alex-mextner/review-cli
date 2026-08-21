@@ -988,11 +988,12 @@ def _task_subcommand(rest: list[str]) -> int:
         "--check",
         action="store_true",
         help="exit 0 iff the task has enough PASSED recorded iterations across enough "
-        "distinct models (self-merge-authority gate); see --min-iter/--min-models, "
-        "or --min-roles to count distinct board roles instead of model names. "
-        "Counts only iterations whose run came back clean — a review that ran but "
-        "failed/degraded does not count toward the bar, and pre-verdict-field "
-        "history never satisfies it either (fail-closed)",
+        "distinct board roles (self-merge-authority gate, default) or distinct "
+        "models (when --min-models is explicitly given); see --min-iter/"
+        "--min-models/--min-roles. Counts only iterations whose run came back "
+        "clean — a review that ran but failed/degraded does not count toward "
+        "the bar, and pre-verdict-field history never satisfies it either "
+        "(fail-closed)",
     )
     parser.add_argument(
         "--min-iter",
@@ -1004,13 +1005,14 @@ def _task_subcommand(rest: list[str]) -> int:
         "--min-models",
         type=int,
         default=None,
-        help="review-bar floor: distinct models among the PASSED iterations "
-        "(default 3). When --min-roles is ALSO given, it governs the gate "
-        "instead — regardless of whether --min-models was explicit or left at "
-        "its default; explicitly passing both additionally prints a visible "
-        "stderr note saying so, so it's never silently unclear which floor "
-        "decided the verdict (review-cli#221 round-2 review finding — see "
-        "--min-roles' own help).",
+        help="review-bar floor: distinct models among the PASSED iterations. Not "
+        "enforced by default (review-cli#246: role-based coverage is the "
+        "default instead — see --min-roles). When explicitly given, this floor "
+        "is ALWAYS enforced — including alongside --min-roles, where BOTH "
+        "floors must then be met (an explicit request is never silently "
+        "dropped) — and, when there's real review history to check it against, "
+        "a non-blocking advisory is printed noting that role-based coverage is "
+        "usually sufficient on its own.",
     )
     parser.add_argument(
         "--min-roles",
@@ -1018,13 +1020,16 @@ def _task_subcommand(rest: list[str]) -> int:
         default=None,
         help="review-cli#221: review-bar floor: distinct BOARD ROLES (architect/"
         "correctness/security/…) covered among the PASSED iterations, instead of "
-        "distinct model NAMES. When given, this governs the gate instead of "
-        "--min-models — a role filled by the board's shortage-resilience "
-        "duplicate-model pad (PR #207: one model reused onto an otherwise-empty "
-        "role when too few distinct models are available) counts once per role, "
-        "same as any other role, even though it repeats a model --min-models "
-        "already counted. Only iterations from a mode that records per-seat "
-        "roles (currently: the review-diff/visual board dispatch) contribute.",
+        "distinct model NAMES. This is the DEFAULT check (review-cli#246) when "
+        "neither --min-models nor --min-roles is given, at the same numeric "
+        "floor --min-models used to default to (3) — pass this flag explicitly "
+        "only to override that number. A role filled by the board's "
+        "shortage-resilience duplicate-model pad (PR #207: one model reused "
+        "onto an otherwise-empty role when too few distinct models are "
+        "available) counts once per role, same as any other role, even though "
+        "it repeats a model --min-models already counted. Only iterations from "
+        "a mode that records per-seat roles (currently: the review-diff/visual "
+        "board dispatch) contribute.",
     )
     parser.add_argument(
         "-C",
@@ -1047,55 +1052,41 @@ def _task_subcommand(rest: list[str]) -> int:
         if not ns.code:
             print("[review task] --check requires a task CODE", file=sys.stderr)
             return 2
-        # `--min-models` defaults to None (not the resolved value 3) SOLELY so this
-        # command can tell "the user explicitly typed --min-models" apart from "left
-        # at the default" — see the visibility note below (review-cli#221 round-2
-        # review finding: silently dropping an EXPLICITLY-passed model floor on a
-        # self-merge-authority gate is a footgun). The resolved value is otherwise
-        # identical to the pre-#221 default in every other respect.
-        min_models_explicit = ns.min_models is not None
-        effective_min_models = ns.min_models if min_models_explicit else 3
+        # Both `--min-models` and `--min-roles` default to None (not a resolved int)
+        # so the CLI can tell "the user explicitly typed this flag" apart from "left
+        # at the default" — and now (review-cli#246) that raw None-or-value is passed
+        # straight through to quorum_check(), which owns ALL default-resolution and
+        # AND-logic itself (see its docstring): an explicitly given floor is always
+        # enforced, and the "neither given" default switches to a role-based check.
         # A floor of 0 would trivially satisfy the bar for a task with ZERO passed
         # iterations (0 >= 0), even one whose every recorded run failed or predates
         # the verdict field -- defeating the fail-closed contract this gate exists
-        # for. Every given floor must be at least 1 (--min-roles is optional --
-        # only checked when the flag was actually passed). The message only names
-        # --min-roles when it was actually part of the input, so a plain --min-iter 0
-        # never prints a confusing "--min-roles None" (Opus round-2 review finding).
+        # for. Only an EXPLICITLY given floor is validated here (mirrors
+        # quorum_check's own validation) — the message only names a flag that was
+        # actually part of the input, so a plain --min-iter 0 never prints a
+        # confusing "--min-models None --min-roles None" (Opus round-2 review
+        # finding, still honored under the new sentinel-based design).
         if (
             ns.min_iter < 1
-            or effective_min_models < 1
+            or (ns.min_models is not None and ns.min_models < 1)
             or (ns.min_roles is not None and ns.min_roles < 1)
         ):
-            roles_clause = (
-                f" --min-roles {ns.min_roles}" if ns.min_roles is not None else ""
-            )
+            clauses = [f"--min-iter {ns.min_iter}"]
+            if ns.min_models is not None:
+                clauses.append(f"--min-models {ns.min_models}")
+            if ns.min_roles is not None:
+                clauses.append(f"--min-roles {ns.min_roles}")
             print(
-                "[review task] --min-iter, --min-models, and --min-roles (when given) "
-                f"must all be >= 1 (got --min-iter {ns.min_iter} --min-models "
-                f"{effective_min_models}{roles_clause})",
+                "[review task] --min-iter must be >= 1, and any explicitly given "
+                "--min-models/--min-roles must also be >= 1 "
+                f"(got {' '.join(clauses)})",
                 file=sys.stderr,
             )
             return 2
-        # review-cli#221 round-2 review finding (Opus/Fable, independently): when
-        # BOTH floors are given explicitly, --min-roles governs the pass/fail
-        # decision (see quorum_check's docstring) but --min-models is still
-        # VALIDATED and reported — silently, with no signal that it isn't the
-        # decisive floor. This note doesn't change which one governs (that stays
-        # "whichever is passed" per the feature's own design — see quorum_check's
-        # docstring), it only makes the choice visible instead of silent.
-        if min_models_explicit and ns.min_roles is not None:
-            print(
-                f"[review task] note: both --min-models {effective_min_models} and "
-                f"--min-roles {ns.min_roles} were given — --min-roles governs the "
-                "gate here; --min-models is reported for visibility only, not "
-                "enforced",
-                file=sys.stderr,
-            )
         return _quorum_check_subcommand(
             ns.code,
             ns.min_iter,
-            effective_min_models,
+            ns.min_models,
             min_roles=ns.min_roles,
             as_json=ns.json,
             cwd_raw=ns.cwd,
@@ -1541,40 +1532,49 @@ def _print_quorum_model_audit_line(result: dict, stream=None) -> None:
     )
 
 
-def _print_quorum_bar_met(result: dict, role_mode: bool) -> None:
-    """Text-mode 'review bar met' line. `role_mode` (review-cli#221, `--min-roles`)
-    selects whether the covered-unit count/list is distinct BOARD ROLES or distinct
-    MODEL names (the default, `--min-models`) — see `_quorum_check_subcommand`."""
+def _print_quorum_bar_met(result: dict, role_mode: bool, model_mode: bool) -> None:
+    """Text-mode 'review bar met' line. `role_mode`/`model_mode` (review-cli#221,
+    extended in review-cli#246) select which floor(s) actually governed the
+    verdict — the caller derives both from which keys `quorum_check` put in
+    `result` (see `_quorum_check_subcommand`), since that reflects the function's
+    OWN default-resolution/AND-logic, not the raw CLI flags. Either, or both, can
+    be true (review-cli#246: an explicit --min-models alongside --min-roles now
+    means BOTH govern)."""
     passed_iter = result["passed_iterations"]
+    plural_i = "" if passed_iter == 1 else "s"
+    parts = []
     if role_mode:
         distinct = result["distinct_roles_passed"]
-        covered = result["roles"]
-        unit = "role"
-    else:
+        covered_str = ", ".join(result["roles"]) or "-"
+        plural_u = "" if distinct == 1 else "s"
+        parts.append(f"{distinct} distinct role{plural_u} ({covered_str})")
+    if model_mode:
         distinct = result["distinct_models_passed"]
-        covered = result["models"]
-        unit = "model"
-    covered_str = ", ".join(covered) or "-"
-    plural_i = "" if passed_iter == 1 else "s"
-    plural_u = "" if distinct == 1 else "s"
+        covered_str = ", ".join(result["models"]) or "-"
+        plural_u = "" if distinct == 1 else "s"
+        parts.append(f"{distinct} distinct model{plural_u} ({covered_str})")
     print(
         f"review bar met for {result['task_code']}: {passed_iter} passed "
-        f"iteration{plural_i} across {distinct} distinct {unit}{plural_u} ({covered_str})"
+        f"iteration{plural_i} across {' and '.join(parts)}"
     )
     # Fable review finding: role mode's line above drops WHICH MODELS reviewed
     # entirely — for a self-merge-authority audit trail that's the fact worth
-    # keeping in the log even when roles (not models) govern the verdict.
-    if role_mode:
+    # keeping in the log even when roles (not models) governed the verdict. Only
+    # needed when models weren't ALREADY shown in the headline above.
+    if role_mode and not model_mode:
         _print_quorum_model_audit_line(result)
+    if advisory := result.get("min_models_advisory"):
+        print(f"  note: {advisory}")
 
 
-def _print_quorum_bar_not_met(
-    result: dict, role_mode: bool, min_iter: int, min_models: int
-) -> None:
+def _print_quorum_bar_not_met(result: dict, role_mode: bool, model_mode: bool) -> None:
     """Text-mode 'review bar NOT met' report: the ratio/error header, the
-    `--min-roles` suggestion hint (review-cli#221, `--min-models` mode only — see
+    `--min-roles` suggestion hint (review-cli#221, `--min-models`-only mode — see
     `quorum_check`'s `min_roles_suggestion`), and any currently-stalled attempted
-    model(s).
+    model(s). Everything is read from `result` (populated by `quorum_check`, whose
+    own default-resolution/AND-logic decided which floor(s) actually govern — see
+    `_print_quorum_bar_met`) rather than from separately-passed CLI values, so this
+    never drifts from what actually gated the verdict.
 
     review-cli#221 round-4 review finding (k3/Fable): the header and every detail
     line below it must land on the SAME stream — a caller capturing only one of
@@ -1590,18 +1590,19 @@ def _print_quorum_bar_not_met(
         )
     else:
         passed_iter = result["passed_iterations"]
+        clauses = [f"{passed_iter}/{result['min_iter']} passed iterations"]
         if role_mode:
-            distinct = result["distinct_roles_passed"]
-            floor = result["min_roles"]
-            unit = "roles"
-        else:
-            distinct = result["distinct_models_passed"]
-            floor = min_models
-            unit = "models"
+            clauses.append(
+                f"{result['distinct_roles_passed']}/{result['min_roles']} "
+                "distinct roles"
+            )
+        if model_mode:
+            clauses.append(
+                f"{result['distinct_models_passed']}/{result['min_models']} "
+                "distinct models"
+            )
         print(
-            f"review bar NOT met for {result['task_code']}: "
-            f"{passed_iter}/{min_iter} passed iterations, "
-            f"{distinct}/{floor} distinct {unit}",
+            f"review bar NOT met for {result['task_code']}: {', '.join(clauses)}",
             file=detail_stream,
         )
     # Codex round-5 review finding: this line must not be suppressed on every
@@ -1611,9 +1612,15 @@ def _print_quorum_bar_not_met(
     # store, zero iterations — have nothing to show), so the audit trail must
     # not go dark there. Gate on there being real data instead of on "error"
     # presence: `distinct_models_passed > 0` is false for every `_rejected()`
-    # shape and true whenever there's a meaningful roster to report.
+    # shape and true whenever there's a meaningful roster to report. UNLIKE the
+    # met-path printer, the NOT-met header's model clause above is COUNTS ONLY
+    # (no names, matching the pre-#246 convention) even when `model_mode` is
+    # True — so this line is the only place model NAMES ever appear here, and
+    # must print whenever role_mode is on regardless of model_mode.
     if role_mode and result["distinct_models_passed"] > 0:
         _print_quorum_model_audit_line(result, detail_stream)
+    if advisory := result.get("min_models_advisory"):
+        print(f"  note: {advisory}", file=detail_stream)
     if suggestion := result.get("min_roles_suggestion"):
         print(f"  hint: {suggestion}", file=detail_stream)
     # review-cli#221: a bare N/M count (or a bare mismatch-error line) leaves a human
@@ -1641,7 +1648,7 @@ def _print_quorum_bar_not_met(
 def _quorum_check_subcommand(
     code: str,
     min_iter: int,
-    min_models: int,
+    min_models: int | None,
     *,
     min_roles: int | None = None,
     as_json: bool,
@@ -1650,16 +1657,16 @@ def _quorum_check_subcommand(
 ) -> int:
     """`review task CODE --check [--min-iter N] [--min-models M] [--min-roles R] [-C DIR]`.
 
-    Exit 0 iff CODE has >= min_iter PASSED recorded iterations, across either
-    >= min_models distinct models (the default) or — when `min_roles` is given
-    (review-cli#221) — >= min_roles distinct BOARD ROLES among those passed
-    iterations; exit 1 otherwise, including the fail-closed cases (invalid code,
-    unreadable/missing stats store, zero records, or a task whose only history
-    predates the verdict field) where reviewlib.stats.quorum_check sets an "error"
-    key or simply comes up short. See quorum_check's docstring for the "passed, not
-    just dispatched" semantics this check enforces, and for exactly how `min_roles`
-    changes the counting mode (it does not change `--min-models`'s own behavior when
-    `min_roles` is omitted — that stays a strict distinct-model-name count).
+    Exit 0 iff CODE has >= min_iter PASSED recorded iterations AND every EXPLICITLY
+    given floor among {min_models, min_roles} is met (review-cli#246: an explicit
+    floor is never silently outvoted by the other) — or, when NEITHER is given, >=
+    the default distinct BOARD ROLES floor (review-cli#246's new default; see
+    quorum_check's docstring for the full default-resolution/AND-logic table). Exit 1
+    otherwise, including the fail-closed cases (invalid code, unreadable/missing
+    stats store, zero records, or a task whose only history predates the verdict
+    field) where reviewlib.stats.quorum_check sets an "error" key or simply comes up
+    short. See quorum_check's docstring for the "passed, not just dispatched"
+    semantics this check enforces.
 
     `verify_identity` (default True) resolves `cwd_raw` (`-C`) to a repo id + the
     current diff's touched-file set and hands both to `quorum_check`, so a PASSED
@@ -1706,11 +1713,16 @@ def _quorum_check_subcommand(
         print(_json.dumps(result, indent=2))
         return 0 if result["passed"] else 1
 
-    role_mode = min_roles is not None
+    # review-cli#246: derived from the RESULT (which floor(s) quorum_check actually
+    # applied, after its own default-resolution), not from the raw min_models/
+    # min_roles arguments here — those can be None even when quorum_check ends up
+    # enforcing a floor anyway (the "neither given" default substitutes min_roles).
+    role_mode = "min_roles" in result
+    model_mode = "min_models" in result
     if result["passed"]:
-        _print_quorum_bar_met(result, role_mode)
+        _print_quorum_bar_met(result, role_mode, model_mode)
         return 0
-    _print_quorum_bar_not_met(result, role_mode, min_iter, min_models)
+    _print_quorum_bar_not_met(result, role_mode, model_mode)
     return 1
 
 

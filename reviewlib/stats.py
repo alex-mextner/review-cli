@@ -616,18 +616,24 @@ def _finalize_quorum_result(
         )
 
 
+_DEFAULT_QUORUM_FLOOR = 3  # the "at least 3 distinct opinions" floor -- shared by
+# --min-models' historical default AND --min-roles' new default below (review-cli#246).
+
+
 def quorum_check(
     task_code: str,
     *,
     min_iter: int,
-    min_models: int,
+    min_models: int | None = None,
     min_roles: int | None = None,
     repo_id: str | None = None,
     diff_files: list[str] | None = None,
 ) -> dict:
     """Compute the quorum verdict for one task: N PASSED iterations across M distinct
-    models (self-merge-authority gate; CTO decision tg#7306 #1) — or, when ``min_roles``
-    is given, across M distinct BOARD ROLES instead (review-cli#221).
+    models (self-merge-authority gate; CTO decision tg#7306 #1) and/or across M distinct
+    BOARD ROLES (review-cli#221) — the role floor governs whenever ``min_roles`` is
+    either explicitly given OR defaulted-in (review-cli#246, see below); see the
+    explicit-vs-default semantics below for exactly when each floor governs.
 
     Only iterations whose record has ``passed is True`` count toward ``min_iter``, and
     ``min_models`` is the distinct-model count among those SAME passed iterations — a
@@ -661,37 +667,81 @@ def quorum_check(
     model pad (a model reused onto an otherwise-empty role slot, see
     ``config.select_pool_with_reuse`` / PR #207) counts once per role there, exactly
     like any other role, instead of collapsing into the model string ``_distinct_models``
-    already counted. ``--min-models`` and ``--min-roles`` are independent: passing
-    neither/only ``min_models`` reproduces the EXACT pre-#221 shape and behavior below
-    (``min_roles`` omitted -> no ``roles``/``distinct_roles_passed`` keys, the gate is
-    governed by ``min_models`` as always); passing ``min_roles`` governs the pass/fail
-    decision instead (``min_models`` is still validated/reported for visibility, but no
-    longer decides ``passed``). Iterations from a mode with no role concept (quorum /
-    just-ask / brainstorm / qa — only the review-diff/visual board dispatch records
-    per-seat roles today) contribute no roles, same fail-closed-by-omission treatment as
-    an unverdicted iteration.
+    already counted. Only a role that is an actual ``REVIEW_ROLES`` key counts (an
+    unknown/typo'd role string is kept for its own diagnostics but earns no lens
+    credit). Iterations from a mode with no role concept (quorum / just-ask /
+    brainstorm / qa — only the review-diff/visual board dispatch records per-seat
+    roles today) contribute no roles, same fail-closed-by-omission treatment as an
+    unverdicted iteration.
 
-    KNOWN, DELIBERATE trade-off (Fable round-3 review finding): when a caller passes
-    BOTH floors explicitly, this function silently lets ``min_roles`` govern (per the
-    "whichever is passed" design above) with no signal in the returned dict that
-    ``min_models`` didn't decide the verdict — the visibility mitigation for that
-    (a printed stderr note) lives ONLY in the CLI wrapper (``reviewlib.cli``'s
-    ``--check`` handling), which can tell "explicitly passed" apart from "defaulted"
-    via its own argparse layer; this function's plain ``int`` parameters cannot. A
-    direct library caller passing ``min_models=5, min_roles=1`` gets role-mode's
-    verdict with no note. Tracked as a follow-up (either enforce both floors as an AND
-    when both are explicit, or thread an explicit-vs-default signal — e.g. a
-    ``min_models_explicit`` bool — into this function so the note can live here too),
-    not fixed in this change.
+    ``min_models`` and ``min_roles`` semantics (review-cli#246, fixing a review-cli#221
+    round-3 finding — see below): both parameters default to ``None``, which means
+    "the caller did not ask for this floor" — NOT "the caller asked for a 0/low value".
+    This distinction is what lets the function tell an explicit request apart from a
+    default, the same way the CLI's own argparse layer already could (see
+    ``reviewlib.cli``'s ``--check`` handling) but couldn't PASS DOWN before this fix,
+    since a plain ``int`` default here was indistinguishable from an explicit int of
+    the same value.
+
+      * Only ``min_models`` explicitly given (``min_roles`` omitted): reproduces the
+        exact pre-#221 PASS/FAIL semantics — a strict distinct-model-name count
+        decides ``passed`` (no ``roles``/``distinct_roles_passed``/``min_roles`` keys
+        in the result). The result SHAPE gains one new key here (review-cli#246's
+        ``min_models_advisory``, see below) — the gate's decision logic is unchanged,
+        the payload is not byte-identical.
+      * Only ``min_roles`` explicitly given (``min_models`` omitted): reproduces the
+        pre-#246 ``--min-roles`` pass/fail behavior — distinct BOARD ROLES decide
+        ``passed``. ``distinct_models_passed``/``models`` are still computed/reported
+        for visibility (no ``min_models`` key itself, since no floor was requested).
+      * BOTH explicitly given: an explicitly requested floor is now ALWAYS enforced —
+        ``passed`` requires ``min_iter`` AND the model floor AND the role floor to all
+        be met (Alex's policy: "if a model limit is explicitly set, it must work").
+        This closes the round-3 finding below.
+      * NEITHER given (the true default — no flags at all): the default switches to a
+        ROLE-based check at ``_DEFAULT_QUORUM_FLOOR`` (the SAME numeric value
+        ``--min-models`` used to default to), not a model-count check — Alex's
+        direction that role-based counting is the new default everywhere, with no
+        default model-count floor; an explicit model-count request is still always
+        honored per the bullet above.
+
+    FIXED (review-cli#246; was a KNOWN, DELIBERATE trade-off per a Fable round-3 review
+    finding on review-cli#221): a caller passing BOTH floors explicitly — e.g.
+    ``min_models=5, min_roles=1`` — used to silently let ``min_roles`` govern alone,
+    so a task with only 1 distinct model could get ``passed: True`` even though the
+    caller explicitly asked for 5. The AND logic above closes that: an explicit
+    ``min_models`` can no longer be silently outvoted by ``min_roles`` (or the reverse).
+
+    Whenever ``min_models`` is explicitly given AND there is real history to evaluate
+    it against (the store is readable AND at least one iteration is recorded for the
+    task — met, not-met, and a diff-identity-mismatch denial all qualify), the result
+    also carries a non-blocking ``min_models_advisory`` key (review-cli#246) — Alex's
+    policy allows enforcing an explicit model floor while still nudging the caller
+    that role-based coverage is usually enough on its own; the advisory never affects
+    ``passed``. It is NOT added to any of the fail-closed shapes below that carry NO
+    real history (invalid task code, unreadable store, zero recorded iterations, or a
+    floor-validation failure) — matching the pre-existing ``min_roles_suggestion``
+    convention exactly (same ``store_error is None and iterations`` guard).
 
     Fail-closed (independent of the above): an invalid task code, an unreadable/missing
     store, or zero recorded iterations for the code all yield ``passed: False`` plus an
     ``"error"`` key explaining why — the caller must never treat "no data" as "quorum
-    met". A ``min_iter``/``min_models``/``min_roles`` floor below 1 is also rejected the
-    same way — 0 would trivially satisfy the bar via ``0 >= 0`` even for a task with zero
-    passed iterations, undermining the whole point of this gate. Validated HERE (not only
-    in the CLI wrapper) so a direct library caller can't bypass the floor either.
+    met". A ``min_iter`` floor below 1, or an explicitly given ``min_models``/
+    ``min_roles`` below 1, is also rejected the same way — 0 would trivially satisfy a
+    floor via ``0 >= 0`` even for a task with zero passed iterations, undermining the
+    whole point of this gate. Validated HERE (not only in the CLI wrapper) so a direct
+    library caller can't bypass the floor either.
     """
+    # Captured BEFORE any default substitution below -- `min_models is not None` stays
+    # a valid "was this explicit" check for the rest of the function (min_models itself
+    # is never reassigned), but min_roles IS reassigned by the default substitution, so
+    # its "was this explicit" flag must be captured now, not re-derived later.
+    min_roles_explicit = min_roles is not None
+    if min_models is None and not min_roles_explicit:
+        # The new default (Alex, review-cli#246): role-based coverage, not a distinct-
+        # model-name count -- switches counting MODE while preserving the original "at
+        # least 3 distinct opinions" intent via the SAME numeric floor --min-models
+        # used to default to.
+        min_roles = _DEFAULT_QUORUM_FLOOR
 
     def _rejected(error: str) -> dict:
         result = {
@@ -701,26 +751,41 @@ def quorum_check(
             "distinct_models_passed": 0,
             "models": [],
             "min_iter": min_iter,
-            "min_models": min_models,
             "passed": False,
             "error": error,
         }
+        if min_models is not None:
+            result["min_models"] = min_models
         if min_roles is not None:
             result["distinct_roles_passed"] = 0
             result["roles"] = []
             result["min_roles"] = min_roles
         return result
 
-    if min_iter < 1 or min_models < 1 or (min_roles is not None and min_roles < 1):
-        # Opus round-3 review finding: only name min_roles in the message when it was
-        # actually part of the input — otherwise a bare min_iter/min_models violation
-        # prints a confusing "min_roles=None" (the same fix the CLI layer already
-        # applies to its own copy of this validation; mirrored here so a direct
-        # library caller sees the identical, non-confusing message).
-        roles_clause = f" min_roles={min_roles}" if min_roles is not None else ""
+    if (
+        min_iter < 1
+        or (min_models is not None and min_models < 1)
+        or (min_roles is not None and min_roles < 1)
+    ):
+        # Opus round-3 review finding: only name a floor in the message when it was
+        # actually part of the input -- otherwise a bare min_iter violation prints a
+        # confusing "min_models=None min_roles=None" (the same fix the CLI layer
+        # already applies to its own copy of this validation; mirrored here so a
+        # direct library caller sees the identical, non-confusing message).
+        clauses = [f"min_iter={min_iter}"]
+        if min_models is not None:
+            clauses.append(f"min_models={min_models}")
+        if min_roles_explicit:
+            # Opus review finding: must check the PRE-substitution flag, not
+            # `min_roles is not None` -- by this point the "neither given"
+            # default substitution above may already have set min_roles=3, and
+            # naming it here would falsely claim the caller typed --min-roles
+            # when they didn't (defeating the whole point of this "only name
+            # what was actually part of the input" guard).
+            clauses.append(f"min_roles={min_roles}")
         return _rejected(
-            "min_iter, min_models, and min_roles (when given) must all be >= 1 "
-            f"(got min_iter={min_iter} min_models={min_models}{roles_clause})"
+            "min_iter must be >= 1, and min_models/min_roles (when explicitly given) "
+            f"must also be >= 1 (got {' '.join(clauses)})"
         )
     try:
         clean = normalize_task_code(task_code)
@@ -730,21 +795,25 @@ def quorum_check(
     store_error = _store_unreadable_error()
     iterations = iterations_for_task(clean) if clean else []
     # Fail-closed: a record with no "passed" key (pre-v3, verdict unknown) is NOT
-    # passed — `is True` (not truthy) so it never accidentally matches None/missing.
+    # passed -- `is True` (not truthy) so it never accidentally matches None/missing.
     passed_iterations = [item for item in iterations if item.get("passed") is True]
     verified, mismatched, unverifiable = _sort_passed_iterations_into_buckets(
         passed_iterations, repo_id, diff_files
     )
     # Gate-worthy = verified (identity checked out) + unverifiable (no identity to
-    # check, so unchanged from pre-v4 behavior) — mismatched iterations are excluded.
+    # check, so unchanged from pre-v4 behavior) -- mismatched iterations are excluded.
     gate_iterations = verified + unverifiable
     models = _distinct_models(gate_iterations)
     roles = _distinct_roles(gate_iterations) if min_roles is not None else None
 
-    if roles is not None:
-        gate_met = len(gate_iterations) >= min_iter and len(roles) >= min_roles
-    else:
-        gate_met = len(gate_iterations) >= min_iter and len(models) >= min_models
+    # review-cli#246: each floor gates independently when given, vacuously satisfied
+    # when not -- an explicitly requested floor can never be silently outvoted by the
+    # other one anymore (this is the fix for the round-3 finding in the docstring).
+    iter_ok = len(gate_iterations) >= min_iter
+    models_ok = min_models is None or len(models) >= min_models
+    roles_ok = min_roles is None or (roles is not None and len(roles) >= min_roles)
+    gate_met = iter_ok and models_ok and roles_ok
+
     result = {
         "task_code": clean,
         "passed_iterations": len(gate_iterations),
@@ -752,13 +821,33 @@ def quorum_check(
         "distinct_models_passed": len(models),
         "models": models,
         "min_iter": min_iter,
-        "min_models": min_models,
         "passed": gate_met,
     }
+    if min_models is not None:
+        result["min_models"] = min_models
     if roles is not None:
         result["distinct_roles_passed"] = len(roles)
         result["roles"] = roles
         result["min_roles"] = min_roles
+    if min_models is not None and store_error is None and iterations:
+        # review-cli#246: non-blocking advisory -- Alex's policy explicitly enforces
+        # a caller-requested model floor (models_ok above), but role-based coverage is
+        # generally sufficient on its own, so surface the option without failing the
+        # gate over it. Fires whenever min_models was EXPLICITLY given AND the gate
+        # was actually evaluated against real history, regardless of whether it
+        # happened to govern/pass/fail. `store_error is None` (k3/Opus round-1
+        # finding) excludes the unreadable-store denial; `iterations` (k3/Opus
+        # round-2 finding, same shape as the sibling `min_roles_suggestion` guard
+        # immediately below) additionally excludes the zero-recorded-iterations
+        # denial -- both `_finalize_quorum_result` turns into an "error" result
+        # AFTER this point runs, so neither is itself a short-circuit; a nudge
+        # saying "this floor may not be needed" on a task with NO review history
+        # at all (of any kind) would contradict its own fail-closed error.
+        result["min_models_advisory"] = (
+            "an explicit min_models floor is set; role-based coverage (min_roles) is "
+            "generally sufficient and this explicit floor may not be needed unless "
+            "you have a specific reason to require distinct models"
+        )
     # review-cli#221: when --min-models governs the gate (min_roles not given) and the
     # bar isn't met because model diversity itself is short, point at --min-roles as an
     # alternative counting mode — a duplicated-model role-fill (PR #207) still counts
@@ -791,7 +880,19 @@ def quorum_check(
     # on a second model as "diversity" even when 100% of the counted role coverage
     # still traced back to a single other model, laundering the exact monoculture the
     # guard exists to block through an unrelated iteration.
-    if min_roles is None and not gate_met and store_error is None and iterations:
+    # `min_models is not None` is provably always true whenever `min_roles is None`
+    # here (the default-substitution above sets min_roles whenever min_models is
+    # None) -- but it's checked explicitly (not via `assert`) so this stays correct
+    # even under `python -O` (which strips asserts), and so mypy narrows `min_models`
+    # from a plain conditional rather than a strippable statement (Opus review
+    # finding on this change).
+    if (
+        min_roles is None
+        and min_models is not None
+        and not gate_met
+        and store_error is None
+        and iterations
+    ):
         potential_roles = _distinct_roles(gate_iterations)
         role_bearing_models = _models_behind_role_coverage(gate_iterations)
         if (
@@ -803,8 +904,10 @@ def quorum_check(
             result["min_roles_suggestion"] = (
                 f"{min_models} distinct models required, only {len(models)} found. If "
                 "review passes duplicated a model onto multiple roles (see PR #207), "
-                f"try --min-roles {min_models} instead, which covers "
-                f"{len(potential_roles)} distinct roles rather than unique model names."
+                f"replace --min-models {min_models} with --min-roles {min_models} "
+                "(review-cli#246: keeping both now requires BOTH to pass), which "
+                f"covers {len(potential_roles)} distinct roles rather than unique "
+                "model names."
             )
     # review-cli#221: when the bar isn't met, name the SPECIFIC model(s) that were
     # actually attempted for this task and are CURRENTLY cooling down (an unavailable
