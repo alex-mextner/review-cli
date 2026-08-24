@@ -5,6 +5,39 @@ semantic versioning.
 
 ## Unreleased
 
+- **`review task CODE --check` zero-role fallback — only for GENUINELY old
+  history, never a permanent way to dodge the role-based gate (#252
+  follow-up).** The zero-role-data fallback below (#252) didn't distinguish
+  two different situations: (a) a task whose entire history genuinely predates
+  role-tracking (PR #246's merge) — nothing more can be done, the fallback is
+  correct; vs. (b) a task with at least one iteration recorded AFTER
+  role-tracking became possible, that simply never happened to use a
+  role-tracking `review diff` board (reviewed only via `quorum`/`just-ask`/
+  `brainstorm`/`qa` instead). Silently granting case (a)'s free pass to case
+  (b) too would let ANY task dodge the role-based gate forever, permanently,
+  just by never choosing a role-tracking review mode — not the one-time
+  migration accommodation for old history the fallback was meant to be. Now:
+  the fallback only fires when EVERY recorded iteration provably predates
+  role-tracking (compared against PR #246's merge commit/timestamp). A task
+  with at least one post-cutoff, role-less iteration stays role-based (fails on
+  its own merits, same as an ordinary short-of-floor denial) and gains a
+  `role_tracking_gap` key (plus a text-mode `hint:` line) naming exactly what's
+  missing and what to run instead (`review diff --task CODE` through a
+  role-tracking board) — distinct from `quorum_mode_fallback`, which is now
+  reserved for case (a) only. **Non-monotonic gate, by design:** a task
+  currently passing via the model-counting fallback can flip to failing the
+  moment one more role-less `quorum`/`just-ask`/`brainstorm`/`qa` review is
+  recorded against it — doing additional review work can move the gate from
+  pass to fail. That's the intended incentive (stop taking the role-blind
+  shortcut once role-tracking is available), but it's the concrete form of the
+  breaking change here, and the shape an automated `gh ship` pipeline could
+  trip on if it re-checks a task after recording a fresh, role-less review.
+  This is any-VERDICT, same as case (a)'s population — a role-less quorum/
+  just-ask attempt that FAILED (produced no usable review at all) still trips
+  it, not only a passing one, which is the sharper shape a retry loop is most
+  likely to hit (record a failed attempt → re-check → now blocked for a new
+  reason).
+
 - **`review task CODE --check` bare default — fall back to model-counting when
   a task has zero recorded role data (follow-up to #246).** The role-based
   default #246 introduced (below) has a real gap: a task whose ENTIRE review

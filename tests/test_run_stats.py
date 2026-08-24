@@ -46,6 +46,15 @@ from reviewlib.install import SKILL_BLURB, SKILL_MD  # noqa: E402
 
 TASK = "HYP-742"
 TASK_ARGS = ["--task", TASK]
+# Any instant strictly before reviewlib.stats._ROLE_TRACKING_CUTOFF (PR #246's merge,
+# 2026-08-21T10:52:25Z) -- passed as `record_run(..., started=LEGACY_TS)` to make a
+# test iteration provably predate role-tracking (review-cli#252 follow-up's case (a),
+# "genuinely old"). A record_run call with NO `started=` gets `datetime.now(utc)`,
+# which is always AFTER the cutoff on any machine running these tests today -- so
+# every "the fallback fires" test below MUST pass an explicit LEGACY_TS, or it
+# silently becomes a case-(b) ("not genuinely old") scenario instead and the
+# fallback correctly refuses to fire, breaking the assertion for the wrong reason.
+LEGACY_TS = datetime(2026, 8, 1, tzinfo=timezone.utc)
 
 try:
     import pytest  # noqa: E402
@@ -1918,11 +1927,21 @@ def test_quorum_check_neither_explicit_defaults_to_role_based_review_cli_246():
 # role data at all; a task with even one role-tagged iteration stays role-based
 # and must pass/fail on that basis alone, never falling back just because the
 # role floor isn't met.
+#
+# review-cli#252 follow-up (Alex's explicit request): "zero role-tagged
+# iterations" actually covers two different situations, and every test below
+# that exercises "the fallback FIRES" is exercising case (a) specifically --
+# GENUINELY old history, every iteration backdated via `started=LEGACY_TS` to
+# provably predate role-tracking. The dedicated case (b) tests further below
+# ("NOT genuinely old" -- a post-cutoff iteration reviewed via a role-blind mode)
+# pin the opposite outcome: the fallback must NOT fire, and a specific
+# `role_tracking_gap` note/hint explains why and what to run instead.
 # ---------------------------------------------------------------------------
 def test_quorum_check_bare_default_falls_back_to_models_when_zero_role_data_review_cli_246_followup():
     """The exact bug being fixed: 3 distinct models, ZERO recorded roles at all --
     the bare default must fall back to model-counting and PASS, not fail with
-    '0/3 distinct roles' the way the pre-follow-up default did."""
+    '0/3 distinct roles' the way the pre-follow-up default did. Backdated
+    (review-cli#252 follow-up): this is case (a), genuinely old history."""
     with _TmpStore():
         for model in ("codex", "gemini", "fable5"):
             _stats.record_run(
@@ -1933,6 +1952,7 @@ def test_quorum_check_bare_default_falls_back_to_models_when_zero_role_data_revi
                 ok_count=1,
                 fail_count=0,
                 passed=True,
+                started=LEGACY_TS,
             )
         result = _stats.quorum_check(TASK, min_iter=3)
         assert result["passed"] is True, result
@@ -1952,6 +1972,13 @@ def test_quorum_check_bare_default_falls_back_to_models_when_zero_role_data_revi
         # message must not claim a repo/diff comparison that never happened
         # (Fable review finding: this scope variant was untested).
         assert "against the current repo/diff" not in result["quorum_mode_fallback"]
+        # Same rationale for the "excluding mismatched" qualifier (review-cli#252
+        # follow-up, Fable round-review finding: this one was unpinned too) --
+        # mismatch exclusion never ran without a check context either.
+        assert (
+            "excluding any recorded for a different repo/diff"
+            not in result["quorum_mode_fallback"]
+        )
         # The positive discriminator: distinguishes this fallback-produced
         # min_models from a genuine explicit request without relying on
         # quorum_mode_fallback's absence as the signal.
@@ -1968,7 +1995,8 @@ def test_quorum_check_bare_default_falls_back_for_realistic_quorum_just_ask_hist
     role-recording board mode post-#246. The DOCUMENTED real-world trigger this
     feature targets is a task reviewed only through `quorum`/`just-ask`/
     `brainstorm`/`qa` -- modes that never record roles at all, by design, not
-    by omission. Exercise that actual production shape directly."""
+    by omission. Exercise that actual production shape directly. Backdated
+    (review-cli#252 follow-up): this is case (a), genuinely old history."""
     with _TmpStore():
         _stats.record_run(
             task_code=TASK,
@@ -1978,6 +2006,7 @@ def test_quorum_check_bare_default_falls_back_for_realistic_quorum_just_ask_hist
             ok_count=3,
             fail_count=0,
             passed=True,
+            started=LEGACY_TS,
         )
         _stats.record_run(
             task_code=TASK,
@@ -1987,6 +2016,7 @@ def test_quorum_check_bare_default_falls_back_for_realistic_quorum_just_ask_hist
             ok_count=1,
             fail_count=0,
             passed=True,
+            started=LEGACY_TS,
         )
         result = _stats.quorum_check(TASK, min_iter=2)
         assert result["passed"] is True, result
@@ -2000,7 +2030,8 @@ def test_quorum_check_bare_default_falls_back_for_realistic_quorum_just_ask_hist
 def test_quorum_check_bare_default_fallback_still_enforces_floor_review_cli_246_followup():
     """The fallback isn't a free pass: zero role data + only 2 distinct models
     (short of the same numeric floor the role-based default would have used)
-    must still fail."""
+    must still fail. Backdated (review-cli#252 follow-up): this is case (a),
+    genuinely old history."""
     with _TmpStore():
         for model in ("codex", "gemini"):
             _stats.record_run(
@@ -2011,6 +2042,7 @@ def test_quorum_check_bare_default_fallback_still_enforces_floor_review_cli_246_
                 ok_count=1,
                 fail_count=0,
                 passed=True,
+                started=LEGACY_TS,
             )
         result = _stats.quorum_check(TASK, min_iter=2)
         assert result["passed"] is False, result
@@ -2018,6 +2050,719 @@ def test_quorum_check_bare_default_fallback_still_enforces_floor_review_cli_246_
         assert result["distinct_models_passed"] == 2
         assert "min_roles" not in result
         assert "quorum_mode_fallback" in result
+
+
+# ---------------------------------------------------------------------------
+# Genuinely-old vs. merely-mode-avoiding (Alex's review-cli#252 follow-up)
+#
+# "Zero role-tagged iterations" isn't one situation -- it's two, and only one of
+# them may reuse the old model-counting default:
+#   (a) genuinely old -- every iteration provably predates role-tracking
+#       (_ROLE_TRACKING_CUTOFF, PR #246's merge). Covered above: every "the
+#       fallback fires" test backdates its iterations via `started=LEGACY_TS`.
+#   (b) NOT genuinely old -- at least one iteration ran AFTER role-tracking
+#       became possible, yet recorded no role data (reviewed via quorum/
+#       just-ask/brainstorm/qa instead of a role-tracking `review diff` board).
+#       This must NOT get case (a)'s free pass -- silently granting it would let
+#       any task dodge the role-based gate forever by simply never choosing a
+#       role-tracking review mode. The tests below pin case (b): the fallback
+#       does NOT fire, the task stays role-based (and fails, since roles=[]),
+#       and a `role_tracking_gap` note/hint names the specific gap and the fix.
+# ---------------------------------------------------------------------------
+def test_quorum_check_bare_default_post_cutoff_quorum_mode_blocks_fallback_review_cli_252_followup():
+    """The core case (b) scenario: one genuinely old, role-less iteration PLUS
+    one post-cutoff `quorum` iteration (no `started=` -- defaults to "now",
+    which is always after the cutoff) with no role data anywhere. The task is
+    NOT eligible for the model-counting fallback just because part of its
+    history happens to be old -- ANY post-cutoff, role-blind iteration blocks
+    it. Stays role-based and fails on its own merits (0/3 roles), with a
+    role_tracking_gap explaining exactly what to run instead.
+
+    Independent round-review finding (Opus/Codex/Fable, all three, on this
+    feature's own PR): the message must be built from ONLY the non-legacy
+    iteration(s), not the whole population -- this exact mixed shape (1 legacy
+    + 1 post-cutoff) is what caught an earlier cut computing the count/mode
+    list from `role_data_population` as a whole, which said "2 review
+    iteration(s)... recorded after role-tracking became available" and named
+    the LEGACY `review` iteration as part of the gap, both false. Pinned below
+    with an exact count and an explicit absence check."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            started=LEGACY_TS,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- this iteration is POST-cutoff (recorded "now").
+        )
+        result = _stats.quorum_check(TASK, min_iter=2)
+        assert result["passed"] is False, result
+        # NOT swapped to model-counting -- stays role-based.
+        assert "min_roles" in result
+        assert result["min_roles"] == 3
+        assert result["roles"] == []
+        assert result["distinct_roles_passed"] == 0
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        # The positive, machine-readable discriminator for case (b).
+        assert "role_tracking_gap" in result
+        gap = result["role_tracking_gap"]
+        assert TASK in gap
+        assert "review-cli#246" in gap
+        # EXACT count -- only the 1 post-cutoff iteration, never the 2 total.
+        assert f"{TASK} has 1 review iteration(s)" in gap
+        assert "`review quorum`" in gap
+        # The legacy `review` (diff-mode) iteration must NOT be blamed -- it
+        # genuinely predates the cutoff and had nothing to do with the gap
+        # (the fix-it instruction's OWN "run `review diff --task CODE`" advice
+        # legitimately mentions diff mode -- only the malformed double-stutter
+        # form, from rendering the raw `mode="review"` string naively, must
+        # never appear).
+        assert "`review review`" not in gap
+        assert f"review diff --task {TASK}" in gap
+        assert "3 distinct role" in gap
+        # The "configure a board" fix-it only applies when a role-less `review
+        # diff` run is part of the gap (see the dedicated diff-mode test) --
+        # here the only non-legacy iteration is `quorum`, so it must NOT appear.
+        assert "configure a reviewer board" not in gap
+        # Diagnostics still show the real, if role-less, model diversity.
+        assert sorted(result["models"]) == ["codex", "fable5", "gemini"]
+
+
+def test_quorum_check_bare_default_all_post_cutoff_role_blind_blocks_fallback_review_cli_252_followup():
+    """No legacy history at all -- every iteration is post-cutoff and role-blind
+    (just-ask + quorum). Same case (b) outcome: no free pass, specific gap
+    message naming both modes actually used."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="just-ask",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+        )
+        result = _stats.quorum_check(TASK, min_iter=2)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert result["roles"] == []
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        gap = result["role_tracking_gap"]
+        assert "`review just-ask`" in gap
+        assert "`review quorum`" in gap
+
+
+def test_quorum_check_bare_default_malformed_timestamp_not_treated_as_old_review_cli_252_followup():
+    """Fail-closed on an unverifiable date: a directly-written record with a
+    missing/malformed `ts` must NOT count as "provably old" -- an unparseable
+    timestamp proves nothing, so it can't help grant case (a)'s free pass. Here
+    every iteration has either no `ts` at all or a naive (no UTC offset) one;
+    none can be verified as predating the cutoff, so this is case (b)."""
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            started=LEGACY_TS,
+        )
+        # Directly corrupt the just-written record's `ts` to a naive (no
+        # timezone) string -- record_run always writes a real, tz-aware ISO
+        # timestamp, so this simulates an externally-written/corrupted record
+        # rather than exercising a reachable record_run path.
+        lines = store.path.read_text().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        record["ts"] = "2020-01-01T00:00:00"  # naive -- no UTC offset
+        store.path.write_text(json.dumps(record) + "\n")
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        assert "role_tracking_gap" in result
+
+
+def test_quorum_check_bare_default_missing_ts_key_not_treated_as_old_review_cli_252_followup():
+    """The other unverifiable-timestamp shape Fable's round-review flagged as
+    untested: a record with NO `ts` key at all (not merely a naive one). Same
+    fail-closed outcome as the naive-timestamp test above -- absence of a
+    timestamp proves nothing about age, so it cannot grant case (a)'s free
+    pass either."""
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="just-ask",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            started=LEGACY_TS,
+        )
+        lines = store.path.read_text().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        del record["ts"]
+        store.path.write_text(json.dumps(record) + "\n")
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        assert "role_tracking_gap" in result
+
+
+def test_quorum_check_bare_default_non_iso_ts_not_treated_as_old_review_cli_252_followup():
+    """Fable's round-review flagged this as untested too: a `ts` that isn't
+    even a valid ISO-8601 string (garbage, not merely naive/timezone-less).
+    `datetime.fromisoformat` raises `ValueError` for this -- must be caught
+    and treated the same fail-closed way, not propagate."""
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="brainstorm",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            started=LEGACY_TS,
+        )
+        lines = store.path.read_text().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        record["ts"] = "not-a-timestamp"
+        store.path.write_text(json.dumps(record) + "\n")
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        assert "role_tracking_gap" in result
+
+
+def test_quorum_check_bare_default_ts_equal_to_cutoff_is_not_old_review_cli_252_followup():
+    """Boundary: a `ts` exactly EQUAL to `_ROLE_TRACKING_CUTOFF` is case (b), not
+    case (a) -- the comparison is a strict `<`, so role-tracking becoming
+    "possible" at the cutoff instant itself means a record from that exact
+    instant could, in principle, have carried role data. Fail-closed in the
+    conservative direction (denies the free pass at the boundary rather than
+    granting it)."""
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            started=LEGACY_TS,
+        )
+        lines = store.path.read_text().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        record["ts"] = _stats._ROLE_TRACKING_CUTOFF.isoformat()
+        store.path.write_text(json.dumps(record) + "\n")
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        assert "role_tracking_gap" in result
+
+
+def test_quorum_check_bare_default_z_suffix_timestamp_recognized_as_old_review_cli_252_followup():
+    """Codex/kimi-class round-review finding on this feature's own PR:
+    `datetime.fromisoformat` only accepts a trailing `Z` (Zulu/UTC shorthand)
+    from Python 3.11 onward, but this project declares
+    `requires-python = ">=3.9"` -- the exact cross-version gap
+    `_resolve_stat_since` (reviewlib/cli.py) already had to fix for `--since`.
+    A genuinely pre-cutoff record using `Z` (unambiguous UTC, not the
+    offsetless-naive case that stays fail-closed) must still be recognized as
+    case (a), not wrongly denied the fallback on unsupported interpreters."""
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            started=LEGACY_TS,
+        )
+        lines = store.path.read_text().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        record["ts"] = "2026-08-01T00:00:00Z"  # Z-suffixed, genuinely pre-cutoff
+        store.path.write_text(json.dumps(record) + "\n")
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is True, result
+        assert result["min_models"] == 3
+        assert "min_roles" not in result
+        assert "quorum_mode_fallback" in result
+        assert "role_tracking_gap" not in result
+
+
+def test_quorum_check_bare_default_failed_post_cutoff_iteration_still_blocks_fallback_review_cli_252_followup():
+    """Fable round-review finding: case (b)'s population is any-verdict (same
+    convention case (a) already uses), so a post-cutoff role-less iteration
+    that FAILED still blocks the fallback -- a legacy task that would otherwise
+    pass via model-counting flips to failing the moment a single failed
+    quorum/just-ask attempt is recorded against it, not only a passing one.
+    This is the intended any-verdict convention, not a free pass for a run
+    that produced no usable review; pin it explicitly since the sharper
+    "even a failed attempt trips this" shape wasn't previously tested."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+                started=LEGACY_TS,
+            )
+        # Legacy-only history passes via the fallback up to this point.
+        legacy_only = _stats.quorum_check(TASK, min_iter=3)
+        assert legacy_only["passed"] is True, legacy_only
+        assert "quorum_mode_fallback" in legacy_only
+
+        # A single FAILED post-cutoff quorum attempt is recorded...
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["k3"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=1,
+            passed=False,
+            # No `started=` -- post-cutoff.
+        )
+        # ...and the SAME task now flips to failing: the fallback no longer
+        # applies at all, even though the new attempt itself never passed.
+        result = _stats.quorum_check(TASK, min_iter=3)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        gap = result["role_tracking_gap"]
+        assert "`review quorum`" in gap
+
+
+def test_quorum_check_explicit_min_roles_no_role_tracking_gap_review_cli_252_followup():
+    """Fable round-review finding (missing test): `role_tracking_gap` is a
+    bare-check-default-only diagnostic, same scoping as `quorum_mode_fallback`
+    -- an explicit `--min-roles` request against the identical zero-role,
+    post-cutoff history must NOT gain it, even though the same remediation
+    would apply. Pinned so a future refactor can't leak it onto the explicit
+    path by accident."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff.
+        )
+        result = _stats.quorum_check(TASK, min_iter=1, min_roles=3)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert result["roles"] == []
+        assert "role_tracking_gap" not in result
+        assert "quorum_mode_fallback" not in result
+
+
+def test_quorum_check_explicit_min_models_no_role_tracking_gap_review_cli_252_followup():
+    """Symmetric counterpart (Fable round-review finding) to the explicit
+    `--min-roles` pin above: an explicit `--min-models` request against the
+    identical zero-role, post-cutoff history must ALSO not gain
+    `role_tracking_gap` -- the diagnostic is bare-check-default-only
+    regardless of WHICH floor was explicitly requested."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff.
+        )
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=3)
+        assert result["passed"] is True, result
+        assert result["min_models"] == 3
+        assert "min_roles" not in result
+        assert "role_tracking_gap" not in result
+        assert "quorum_mode_fallback" not in result
+        assert result["min_models_source"] == "explicit"
+
+
+def test_quorum_check_bare_default_missing_mode_field_uses_unverified_mode_label_review_cli_252_followup():
+    """Minor coverage gap Fable flagged: a non-legacy item with no `mode` string
+    at all must still produce a sensible `role_tracking_gap` message (the
+    `"an unverified mode"` fallback label), not crash or render an empty
+    backtick pair.
+
+    Opus round-review finding: when NO mode can be identified at all, the
+    fix-it text must not assert a confident claim about which modes were
+    involved (e.g. naming "quorum/just-ask/brainstorm/qa" as the culprits) --
+    that would be an unverified guess dressed up as fact for a record whose
+    mode is genuinely unknown."""
+    with _TmpStore() as store:
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff.
+        )
+        lines = store.path.read_text().splitlines()
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        del record["mode"]
+        store.path.write_text(json.dumps(record) + "\n")
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        gap = result["role_tracking_gap"]
+        assert "an unverified mode" in gap
+        # No confident claim about a mode that was never actually identified.
+        assert "quorum/just-ask/brainstorm/qa never record roles" not in gap
+
+
+def test_quorum_check_bare_default_mismatched_post_cutoff_iteration_does_not_block_legacy_fallback_review_cli_252_followup():
+    """Codex/Fable round-review finding, independently converged: a post-cutoff,
+    role-less iteration recorded for a DIFFERENT repo/diff (diff-identity
+    MISMATCHED against the current check) must NOT count toward case (b) --
+    `role_data_population` already excludes mismatched iterations entirely
+    (built via `_iterations_excluding_mismatched`/the passed-iteration bucket
+    sort, both upstream of the case (a)/(b) split), so an otherwise-genuinely-
+    legacy task must still get case (a)'s fallback even though a post-cutoff,
+    role-less record for an UNRELATED repo exists in the raw store under the
+    same task code. This interaction (new cutoff check x pre-existing mismatch
+    exclusion) was untested."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+                repo_id="repo-a",
+                diff_files=["a.py"],
+                started=LEGACY_TS,
+            )
+        # Post-cutoff, role-less, but for a genuinely DIFFERENT repo/diff --
+        # must be excluded from consideration entirely, not force case (b).
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["k3"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-b",
+            diff_files=["b.py"],
+            # No `started=` -- post-cutoff.
+        )
+        result = _stats.quorum_check(
+            TASK, min_iter=3, repo_id="repo-a", diff_files=["a.py"]
+        )
+        assert result["passed"] is True, result
+        assert result["min_models"] == 3
+        assert "min_roles" not in result
+        assert "quorum_mode_fallback" in result
+        assert "role_tracking_gap" not in result
+        assert result["excluded_mismatched_iterations"] == 1
+
+
+def test_quorum_check_case_b_coexists_with_mismatch_error_review_cli_252_followup():
+    """Fable round-review finding: when case (b) fires AND the bar isn't met
+    AND some OTHER history was excluded as mismatched, `_finalize_quorum_result`
+    fills `result["error"]` with the mismatch-detail message while
+    `role_tracking_gap` is ALSO set (role_tracking_gap is deliberately never
+    promoted into `error` -- see that function's docstring) -- both must
+    coexist sensibly: the JSON payload carries both keys, and the printed
+    text still carries the `hint:` line even though the primary line is the
+    mismatch error."""
+    with _TmpStore():
+        # A role-less, MISMATCHED iteration (different repo) -- excluded from
+        # role_data_population, but still populates `mismatched` for
+        # `_finalize_quorum_result`'s error-message branch.
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["k3"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-b",
+            diff_files=["b.py"],
+        )
+        # A post-cutoff, role-less iteration for the CURRENT repo -- this is
+        # what actually triggers case (b) for THIS check.
+        _stats.record_run(
+            task_code=TASK,
+            mode="just-ask",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            repo_id="repo-a",
+            diff_files=["a.py"],
+        )
+        result = _stats.quorum_check(
+            TASK, min_iter=3, repo_id="repo-a", diff_files=["a.py"]
+        )
+        assert result["passed"] is False, result
+        # The mismatch-detail message wins the "error" slot (unaffected by
+        # case (b) -- role_tracking_gap is never promoted there).
+        assert "error" in result
+        assert "excluded" in result["error"]
+        assert result["excluded_mismatched_iterations"] == 1
+        # role_tracking_gap is STILL present as its own key alongside it.
+        assert "role_tracking_gap" in result
+        assert "quorum_mode_fallback" not in result
+
+        # Text-mode print (same direct-call pattern other mismatch-interaction
+        # tests use -- the CLI's own git-based repo/diff resolution can't be
+        # steered to "repo-a"/"repo-b" from a unit test, so print the ALREADY-
+        # COMPUTED `result` directly rather than round-tripping through
+        # `_cli.main`'s real resolution).
+        # role_mode=True/model_mode=False matches what the real CLI derives
+        # for this result shape ("min_roles" in result, "min_models" not).
+        err = io.StringIO()
+        with redirect_stderr(err):
+            _cli._print_quorum_bar_not_met(result, True, False)
+        text = err.getvalue()
+        assert "review bar NOT met" in text
+        assert "excluded" in text
+        assert "hint:" in text
+
+
+def test_quorum_check_bare_default_post_cutoff_role_less_diff_mode_review_cli_252_followup():
+    """Fable's round-review finding: case (b) explicitly covers a role-less
+    `review diff` run (mode="review") with no board/role config in play, not
+    just the role-blind panel modes -- but no prior test exercised that
+    specific sub-case, and the naive `` `review {mode}` `` render would have
+    produced the nonsensical, removed `` `review review` `` stutter for it.
+    Pin both the outcome and the corrected display text.
+
+    Opus round-review finding: telling a caller who already ran `review diff`
+    to "run `review diff`" reads as self-referential -- their actual fix is
+    configuring a board. The fix-it sentence must lead with that instead."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex", "gemini"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff, and no `roles=` -- a flat/no-board
+            # `review diff` call, which records no per-seat role data.
+        )
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        assert result["min_roles"] == 3
+        assert "min_models" not in result
+        assert "quorum_mode_fallback" not in result
+        gap = result["role_tracking_gap"]
+        assert "`review diff`" in gap
+        assert "`review review`" not in gap
+        assert "configure a reviewer board" in gap
+        assert "`review --show-board`" in gap
+
+
+def test_quorum_check_bare_default_post_cutoff_mixed_diff_and_panel_modes_review_cli_252_followup():
+    """Second-round Opus round-review finding: when `not_legacy` mixes a
+    role-less `review diff` iteration WITH a role-blind panel iteration (e.g.
+    quorum), the fix-it text must mention BOTH remediations -- a board-config
+    fix alone would silently ignore the quorum iteration, which needs a
+    role-tracking `review diff` run regardless of board config."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff, no `roles=` -- flat/no-board diff.
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff.
+        )
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        gap = result["role_tracking_gap"]
+        assert "configure a reviewer board" in gap
+        assert "the other iteration(s) need a role-tracking" in gap
+        assert "`review review`" not in gap
+
+
+def test_quorum_check_bare_default_post_cutoff_role_less_visual_mode_review_cli_252_followup():
+    """Codex round-review finding, a further round: `visual` (reviewlib/modes/
+    visual.py's `ModeSpec`) has the EXACT SAME board-vs-flat duality as
+    `review` -- `cli.py`'s dispatch gates the board path (which records roles)
+    on `mode.name not in ("review", "visual")`, so a role-less `review visual`
+    run is a real, reachable shape, not just a role-less diff run. It must get
+    the "configure a board" remediation, not be misclassified as a role-blind
+    PANEL mode (quorum/just-ask/brainstorm/qa) -- those can NEVER record roles
+    regardless of board config, a materially different situation.
+
+    Second-round Codex finding: the remediation must NOT print `` `review
+    visual --task CODE` `` as a copy-pasteable "run this again" command --
+    `review visual` REQUIRES an IMAGE positional argument (cli.py rejects a
+    bare `review visual --task CODE` with "the following arguments are
+    required: IMAGE"), so that would hand the caller a broken command."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="visual",
+            models=["codex", "gemini"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff, no `roles=` -- flat/no-board visual.
+        )
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        gap = result["role_tracking_gap"]
+        assert "`review visual`" in gap
+        assert "configure a reviewer board" in gap
+        # Must NOT get the panel-mode-only remediation -- visual is
+        # board-capable, unlike quorum/just-ask/brainstorm/qa.
+        assert "the other iteration(s) need a role-tracking" not in gap
+        # The re-run instruction must NOT be a broken, missing-IMAGE command.
+        assert "`review visual --task" not in gap
+        assert "IMAGE" in gap
+
+
+def test_quorum_check_bare_default_post_cutoff_unknown_mode_uses_diff_fix_review_cli_252_followup():
+    """Opus round-review finding: a non-legacy item whose `mode` is neither a
+    known board-capable mode (`review`/`visual`) nor blank falls through to
+    the generic `diff_fix` branch (`board_capable_used` empty, `has_panel`
+    True) -- reachable for a future/unrecognized mode string, untested
+    before. Pin that it still produces sensible, non-crashing advice."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="some-future-mode",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff.
+        )
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        gap = result["role_tracking_gap"]
+        assert "`review some-future-mode`" in gap
+        assert f"review diff --task {TASK}" in gap
+        assert "configure a reviewer board" not in gap
+
+
+def test_quorum_check_bare_default_post_cutoff_mixed_diff_and_visual_modes_review_cli_252_followup():
+    """Codex round-review finding: when `not_legacy` mixes a role-less
+    `review diff` iteration WITH a role-less `review visual` iteration (both
+    board-capable), the naive `" / ".join(...)` of exact CLI invocations would
+    have produced a two-command string like `` `review diff --task CODE` /
+    `review visual --task CODE` `` -- neither individually wrong, but joined
+    with `/` it isn't a single executable command, and the visual half is
+    STILL missing its required IMAGE argument. The re-run instruction must
+    stay a single, sensible piece of advice covering both."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff, no `roles=` -- flat/no-board diff.
+        )
+        _stats.record_run(
+            task_code=TASK,
+            mode="visual",
+            models=["gemini"],
+            duration_seconds=1.0,
+            ok_count=1,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff, no `roles=` -- flat/no-board visual.
+        )
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        gap = result["role_tracking_gap"]
+        assert "configure a reviewer board" in gap
+        assert "`review visual --task" not in gap
+        assert f"review diff --task {TASK}" in gap
+        assert "IMAGE" in gap
+
+
+def test_all_iterations_predate_role_tracking_empty_list_is_false_review_cli_252_followup():
+    """Direct pin of the documented contract (Opus round-review finding: only
+    implicitly covered via the caller guard before): an empty population is
+    NOT "all old" -- `_all_iterations_predate_role_tracking` must return
+    False, not vacuously True, so a caller can't misuse it as a "no history"
+    check."""
+    assert _stats._all_iterations_predate_role_tracking([]) is False
 
 
 def test_quorum_check_bare_default_any_role_data_blocks_fallback_review_cli_246_followup():
@@ -2061,6 +2806,11 @@ def test_quorum_check_bare_default_any_role_data_blocks_fallback_review_cli_246_
         assert result["distinct_models_passed"] == 3
         assert "min_models" not in result
         assert "quorum_mode_fallback" not in result
+        # Fable round-review finding (review-cli#252 follow-up): real role data
+        # anywhere in scope must suppress BOTH diagnostics, not just the
+        # legacy fallback -- this task has real role-tagged history, so it's
+        # neither case (a) nor case (b), and must carry neither key.
+        assert "role_tracking_gap" not in result
 
 
 def test_quorum_check_explicit_min_models_no_fallback_note_even_with_zero_role_data_review_cli_246_followup():
@@ -2194,7 +2944,10 @@ def test_quorum_check_bare_default_failed_role_tagged_different_repo_still_falls
     iteration is recorded for a DIFFERENT repo -- `_iterations_excluding_
     mismatched`'s classification loop must exclude it as "mismatched" (not
     "verified"), so it does NOT block the fallback, which fires normally on
-    the current repo's real model diversity."""
+    the current repo's real model diversity. Backdated (review-cli#252
+    follow-up): the counted repo-a iterations are case (a), genuinely old
+    history (the excluded repo-b iteration's own timestamp is irrelevant --
+    it never enters role_data_population either way)."""
     with _TmpStore():
         _stats.record_run(
             task_code=TASK,
@@ -2219,6 +2972,7 @@ def test_quorum_check_bare_default_failed_role_tagged_different_repo_still_falls
                 passed=True,
                 repo_id="repo-a",
                 diff_files=["a.py"],
+                started=LEGACY_TS,
             )
         result = _stats.quorum_check(
             TASK, min_iter=3, repo_id="repo-a", diff_files=["a.py"]
@@ -2242,7 +2996,9 @@ def test_quorum_check_bare_default_mismatched_repo_role_data_does_not_block_fall
     instead of the iteration-count angle. Here: 1 role-tagged PASSED iteration
     for repo-b (unrelated), plus 3 role-less PASSED iterations for the CURRENT
     repo-a with real model diversity -- the fallback must fire and pass on
-    model-counting, exactly as if the repo-b record didn't exist at all."""
+    model-counting, exactly as if the repo-b record didn't exist at all.
+    Backdated (review-cli#252 follow-up): the counted repo-a iterations are
+    case (a), genuinely old history."""
     with _TmpStore():
         _stats.record_run(
             task_code=TASK,
@@ -2267,6 +3023,7 @@ def test_quorum_check_bare_default_mismatched_repo_role_data_does_not_block_fall
                 passed=True,
                 repo_id="repo-a",
                 diff_files=["a.py"],
+                started=LEGACY_TS,
             )
         result = _stats.quorum_check(
             TASK, min_iter=3, repo_id="repo-a", diff_files=["a.py"]
@@ -2281,6 +3038,12 @@ def test_quorum_check_bare_default_mismatched_repo_role_data_does_not_block_fall
         # ABSENCE variant, for repo_id=None, had a pinning test; this is the
         # PRESENCE counterpart).
         assert "against the current repo/diff" in result["quorum_mode_fallback"]
+        # Same PRESENCE counterpart for the "excluding mismatched" qualifier
+        # (review-cli#252 follow-up, Fable round-review finding).
+        assert (
+            "excluding any recorded for a different repo/diff"
+            in result["quorum_mode_fallback"]
+        )
         assert result["excluded_mismatched_iterations"] == 1
 
 
@@ -2429,7 +3192,8 @@ def test_quorum_check_bare_default_empty_roles_list_does_not_count_as_role_data_
     `0/N distinct roles` fail (the exact bug this whole feature exists to
     close). Directly exercises `record_run` with `roles=[]` (bypassing the
     CLI's own truthy-result guard that never actually writes this shape in
-    practice) to pin the module-level contract regardless."""
+    practice) to pin the module-level contract regardless. Backdated
+    (review-cli#252 follow-up): this is case (a), genuinely old history."""
     with _TmpStore():
         _stats.record_run(
             task_code=TASK,
@@ -2440,6 +3204,7 @@ def test_quorum_check_bare_default_empty_roles_list_does_not_count_as_role_data_
             ok_count=0,
             fail_count=0,
             passed=True,
+            started=LEGACY_TS,
         )
         for model in ("codex", "gemini", "fable5"):
             _stats.record_run(
@@ -2450,6 +3215,7 @@ def test_quorum_check_bare_default_empty_roles_list_does_not_count_as_role_data_
                 ok_count=1,
                 fail_count=0,
                 passed=True,
+                started=LEGACY_TS,
             )
         result = _stats.quorum_check(TASK, min_iter=3)
         assert result["passed"] is True, result
@@ -2506,7 +3272,8 @@ def test_quorum_check_bare_default_fallback_fires_with_zero_passed_iterations_re
     `gate_iterations` is genuinely EMPTY, and the fallback fires purely off the
     non-passed remainder, not off any passed history at all. No prior test hit
     this specific combination (every other fallback-fires test has at least
-    some PASSED role-less history)."""
+    some PASSED role-less history). Backdated (review-cli#252 follow-up): this
+    is case (a), genuinely old history."""
     with _TmpStore():
         for model in ("codex", "gemini", "fable5"):
             _stats.record_run(
@@ -2517,6 +3284,7 @@ def test_quorum_check_bare_default_fallback_fires_with_zero_passed_iterations_re
                 ok_count=0,
                 fail_count=1,
                 passed=False,  # every iteration ran but did NOT pass
+                started=LEGACY_TS,
             )
         result = _stats.quorum_check(TASK, min_iter=1)
         assert result["passed"] is False, result  # 0 passed iterations -> iter_ok fails
@@ -2531,7 +3299,8 @@ def test_quorum_check_bare_default_fallback_fires_with_zero_passed_iterations_re
 def test_cli_check_json_shape_bare_default_fallback_review_cli_246_followup():
     """JSON-shape pin for the fallback path: carries the model-counting keys
     (identical shape to an explicit --min-models call) PLUS quorum_mode_fallback,
-    and none of the role or explicit-min-models-only keys."""
+    and none of the role or explicit-min-models-only keys. Backdated
+    (review-cli#252 follow-up): this is case (a), genuinely old history."""
     with _TmpStore():
         for model in ("codex", "gemini", "fable5"):
             _stats.record_run(
@@ -2542,6 +3311,7 @@ def test_cli_check_json_shape_bare_default_fallback_review_cli_246_followup():
                 ok_count=1,
                 fail_count=0,
                 passed=True,
+                started=LEGACY_TS,
             )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
@@ -2565,7 +3335,9 @@ def test_cli_check_json_shape_bare_default_fallback_not_met_review_cli_246_follo
     MET path -- the NOT-met path exercises the changed `min_roles_suggestion`
     gating (`min_models_explicit` instead of `min_models is not None`) through
     the CLI's JSON serializer too, and is the one combination where that
-    gating change could leak a `min_roles_suggestion` onto a fallback payload."""
+    gating change could leak a `min_roles_suggestion` onto a fallback payload.
+    Backdated (review-cli#252 follow-up): this is case (a), genuinely old
+    history."""
     with _TmpStore():
         for model in ("codex", "gemini"):
             _stats.record_run(
@@ -2576,6 +3348,7 @@ def test_cli_check_json_shape_bare_default_fallback_not_met_review_cli_246_follo
                 ok_count=1,
                 fail_count=0,
                 passed=True,
+                started=LEGACY_TS,
             )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
@@ -2593,6 +3366,73 @@ def test_cli_check_json_shape_bare_default_fallback_not_met_review_cli_246_follo
         # leak a suggestion onto a fallback payload -- nothing was explicit here.
         assert "min_roles_suggestion" not in payload
         assert "min_models_advisory" not in payload
+
+
+def test_cli_check_json_shape_case_b_role_tracking_gap_review_cli_252_followup():
+    """CLI --json pin for case (b) (review-cli#252 follow-up): a post-cutoff
+    quorum-mode iteration with no role data must NOT produce the
+    quorum_mode_fallback/min_models shape -- it stays role-based, not met, and
+    carries the role_tracking_gap discriminator a caller like `gh ship` can key
+    on directly."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="quorum",
+            models=["codex", "gemini", "fable5"],
+            duration_seconds=1.0,
+            ok_count=3,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff.
+        )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check", "--json"])
+        assert rc != 0, rc
+        payload = json.loads(out.getvalue())
+        assert payload["passed"] is False
+        assert payload["min_roles"] == 3
+        assert payload["roles"] == []
+        assert payload["distinct_roles_passed"] == 0
+        assert "min_models" not in payload
+        assert "min_models_source" not in payload
+        assert "quorum_mode_fallback" not in payload
+        assert "role_tracking_gap" in payload
+        assert TASK in payload["role_tracking_gap"]
+
+
+def test_cli_check_text_mode_case_b_prints_role_tracking_gap_hint_review_cli_252_followup():
+    """CLI text-mode pin for case (b): the ordinary "review bar NOT met" ratio
+    line still prints (unlike an unreadable-store/invalid-code denial, this is
+    NOT promoted to a bare error line -- see _finalize_quorum_result's
+    docstring), PLUS a `hint:` line naming the specific gap and the fix.
+
+    Opus round-review finding: also pin the ABSENCE of the `note:` fallback
+    line -- `quorum_mode_fallback` and `role_tracking_gap` are mutually
+    exclusive by construction, so a future refactor that accidentally sets
+    both must be caught at the printed-output layer too, not just the dict."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="brainstorm",
+            models=["codex", "gemini"],
+            duration_seconds=1.0,
+            ok_count=2,
+            fail_count=0,
+            passed=True,
+            # No `started=` -- post-cutoff.
+        )
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), redirect_stdout(out):
+            rc = _cli.main(["task", TASK, "--check"])
+        assert rc != 0, rc
+        text = out.getvalue()
+        assert "review bar NOT met" in text
+        assert "0/3 distinct roles" in text
+        assert "hint:" in text
+        assert "`review brainstorm`" in text
+        assert "note:" not in text
+        assert f"review diff --task {TASK}" in text
 
 
 def test_quorum_check_min_models_advisory_only_when_explicit_review_cli_246():
@@ -3834,7 +4674,8 @@ def test_cli_check_bare_default_falls_back_to_models_when_no_role_data_review_cl
     data -- it falls back to the OLD model-counting default and PASSES here,
     since 3 distinct models meets the same numeric floor. Before this follow-up,
     this exact scenario used to fail (see git history/PR #246: "0/3 distinct
-    roles" for a task with real 3-model diversity)."""
+    roles" for a task with real 3-model diversity). Backdated (review-cli#252
+    follow-up): this is case (a), genuinely old history."""
     with _TmpStore():
         for model in ("codex", "gemini", "fable5"):
             _stats.record_run(
@@ -3845,6 +4686,7 @@ def test_cli_check_bare_default_falls_back_to_models_when_no_role_data_review_cl
                 ok_count=1,
                 fail_count=0,
                 passed=True,
+                started=LEGACY_TS,
             )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):
@@ -3862,7 +4704,8 @@ def test_cli_check_bare_default_falls_back_to_models_when_no_role_data_review_cl
 def test_cli_check_bare_default_short_on_models_still_fails_via_fallback_review_cli_246_followup():
     """The inverse: zero role data, but only 2 distinct models -- the fallback
     still enforces the SAME numeric floor (3) the role-based default would have
-    used, it just counts a different thing. Not a free pass."""
+    used, it just counts a different thing. Not a free pass. Backdated
+    (review-cli#252 follow-up): this is case (a), genuinely old history."""
     with _TmpStore():
         for model in ("codex", "gemini"):
             _stats.record_run(
@@ -3873,6 +4716,7 @@ def test_cli_check_bare_default_short_on_models_still_fails_via_fallback_review_
                 ok_count=1,
                 fail_count=0,
                 passed=True,
+                started=LEGACY_TS,
             )
         out = io.StringIO()
         with redirect_stderr(io.StringIO()), redirect_stdout(out):

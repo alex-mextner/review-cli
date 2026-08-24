@@ -991,13 +991,18 @@ def _task_subcommand(rest: list[str]) -> int:
         "distinct board roles (self-merge-authority gate, default) or distinct "
         "models (when --min-models is explicitly given); see --min-iter/"
         "--min-models/--min-roles. If the task has ZERO recorded role data at "
-        "all (its history predates role-tracking, or comes only from quorum/"
-        "just-ask/brainstorm/qa), the default falls back to the old "
+        "all AND every in-scope (non-mismatched) iteration predates "
+        "role-tracking (PR #246), the default falls back to the old "
         "distinct-model count instead of a guaranteed fail — the result's "
-        "quorum_mode_fallback field/note explains when this happened. Counts "
-        "only iterations whose run came back clean — a review that ran but "
-        "failed/degraded does not count toward the bar, and pre-verdict-field "
-        "history never satisfies it either (fail-closed)",
+        "quorum_mode_fallback field/note explains when this happened. A task "
+        "with at least one iteration recorded AFTER role-tracking became "
+        "possible but reviewed only via quorum/just-ask/brainstorm/qa does NOT "
+        "get that fallback (review-cli#252) — it stays role-based and fails, "
+        "with a role_tracking_gap field/hint naming the fix (run `review diff "
+        "--task CODE` through a role-tracking board). Counts only iterations "
+        "whose run came back clean — a review that ran but failed/degraded "
+        "does not count toward the bar, and pre-verdict-field history never "
+        "satisfies it either (fail-closed)",
     )
     parser.add_argument(
         "--min-iter",
@@ -1638,6 +1643,14 @@ def _print_quorum_bar_not_met(result: dict, role_mode: bool, model_mode: bool) -
         # models`) came from the zero-role-data fallback, not an explicit
         # `--min-models` flag.
         print(f"  note: {fallback}", file=detail_stream)
+    if gap := result.get("role_tracking_gap"):
+        # review-cli#252 follow-up: case (b) ("not genuinely old" -- see
+        # quorum_check's docstring) never fires alongside quorum_mode_fallback
+        # (they're mutually exclusive branches of the same fallback decision),
+        # so this is never a duplicate of the note above -- it explains exactly
+        # WHY the ordinary "N/M distinct roles" ratio above can't be satisfied by
+        # the old model-counting escape hatch, and what to run instead.
+        print(f"  hint: {gap}", file=detail_stream)
     if suggestion := result.get("min_roles_suggestion"):
         print(f"  hint: {suggestion}", file=detail_stream)
     # review-cli#221: a bare N/M count (or a bare mismatch-error line) leaves a human
