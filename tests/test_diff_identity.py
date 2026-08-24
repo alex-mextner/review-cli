@@ -197,7 +197,11 @@ def test_quorum_check_without_context_preserves_pre_v4_shape_and_behavior():
     different repos. "Pre-v4" here means the diff-identity-verification feature
     (v4) specifically; it does NOT mean "no keys added by any later feature" --
     review-cli#246's `min_models_advisory` is a genuinely NEW key (present
-    whenever `min_models` is given explicitly, as it is here), unrelated to v4."""
+    whenever `min_models` is given explicitly, as it is here), unrelated to v4.
+    review-cli#252 follow-up: `min_models_source` is likewise a genuinely NEW key
+    (review-cli#246 follow-up, present whenever `min_models` is, pinned to
+    ``"explicit"`` here since this call passes `min_models` directly with no
+    fallback in play) -- unrelated to v4, same as `min_models_advisory` above."""
     with _TmpStore():
         _record_passed(models=["codex"], repo_id="github.com/org/repo-a")
         _record_passed(models=["gemini"], repo_id="github.com/org/repo-b")
@@ -205,6 +209,7 @@ def test_quorum_check_without_context_preserves_pre_v4_shape_and_behavior():
         result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
         assert result["passed"] is True
         assert result["passed_iterations"] == 3
+        assert result["min_models_source"] == "explicit"
         assert set(result) == {
             "task_code",
             "passed_iterations",
@@ -215,6 +220,7 @@ def test_quorum_check_without_context_preserves_pre_v4_shape_and_behavior():
             "min_models",
             "passed",
             "min_models_advisory",
+            "min_models_source",
         }
 
 
