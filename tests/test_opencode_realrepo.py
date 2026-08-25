@@ -16,6 +16,7 @@ PATH, which is the whole point of mocking).
 
 Mock harness style mirrors tests/test_streaming.py.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -40,8 +41,20 @@ class _Captured:
         self.cwd: Path | None = None
         self.timeout: int | None = None
         self.header_argv0: str | None = None
+        self.true_silence_timeout: int | None = None
 
-    def __call__(self, argv, cwd, timeout, backend, round_no=0, announce=False, header_argv0=None):
+    def __call__(
+        self,
+        argv,
+        cwd,
+        timeout,
+        backend,
+        round_no=0,
+        announce=False,
+        header_argv0=None,
+        true_silence_timeout=None,
+    ):
+        self.true_silence_timeout = true_silence_timeout
         self.argv = list(argv)
         self.cwd = Path(cwd)
         self.timeout = timeout
@@ -61,7 +74,17 @@ def _capture_opencode():
     needed) AND `_ensure_opencode_readonly_agent` (so the unit tests do NOT touch the
     developer's / CI's global ~/.config/opencode) for the duration of one test,
     restoring all three afterward. A single restore point means a typo can't leak the
-    mock into sibling tests (board feedback)."""
+    mock into sibling tests (board feedback).
+
+    codex review finding, review-cli#243 round 13: `review_opencode` now consults
+    `active_cooldown(model)` before dispatching (review-cli#235) -- without isolating
+    `REVIEW_SEAT_COOLDOWN_FILE`, every test through this fixture read the developer's
+    REAL cooldown store, and `oc:zai/glm-5.2` (the model this file's tests exercise) is
+    literally the seat this feature benches for up to 8h under escalation. A real
+    active cooldown would silently flip these tests onto the skip path (never reaching
+    `_run_streamed` at all), making them depend on ambient machine state instead of
+    being hermetic. Isolated here, once, for every test using this fixture -- not just
+    the ones caught failing today."""
     cap = _Captured()
     orig_run = review_backends._run_streamed
     orig_which = review_backends._which
@@ -69,12 +92,21 @@ def _capture_opencode():
     review_backends._run_streamed = cap  # type: ignore[assignment]
     review_backends._which = lambda name: f"/fake/bin/{name}"  # type: ignore[assignment]
     review_backends._ensure_opencode_readonly_agent = lambda *_a, **_k: None  # type: ignore[assignment]
-    try:
-        yield cap
-    finally:
-        review_backends._run_streamed = orig_run
-        review_backends._which = orig_which
-        review_backends._ensure_opencode_readonly_agent = orig_ensure
+    saved_cooldown_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+    with tempfile.TemporaryDirectory() as cooldown_dir:
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(
+            Path(cooldown_dir) / "seat-cooldown.json"
+        )
+        try:
+            yield cap
+        finally:
+            review_backends._run_streamed = orig_run
+            review_backends._which = orig_which
+            review_backends._ensure_opencode_readonly_agent = orig_ensure
+            if saved_cooldown_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cooldown_file
 
 
 def _git_init(path: Path) -> None:
@@ -88,7 +120,11 @@ def test_runs_in_real_repo_with_dir_flag():
             repo.mkdir()
             _git_init(repo)
             res = review_backends.review_opencode(
-                "oc:opencode/deepseek-v4-flash-free", "Review.", "some diff", repo, 60,
+                "oc:opencode/deepseek-v4-flash-free",
+                "Review.",
+                "some diff",
+                repo,
+                60,
             )
         assert res.returncode == 0, res
         argv = cap.argv or []
@@ -103,7 +139,9 @@ def test_runs_in_real_repo_with_dir_flag():
         # The sidecar log header carries the model SELECTOR (not the bare binary path), so
         # the dashboard attributes the call to its `oc:` board seat (review-cli#24). It is
         # the `oc_model` (everything after `oc:`), and must NOT carry the prompt/diff.
-        assert cap.header_argv0 == "opencode -m opencode/deepseek-v4-flash-free", cap.header_argv0
+        assert cap.header_argv0 == "opencode -m opencode/deepseek-v4-flash-free", (
+            cap.header_argv0
+        )
         assert "some diff" not in (cap.header_argv0 or ""), cap.header_argv0
 
 
@@ -126,7 +164,9 @@ def test_glm52_opencode_keeps_requested_timeout_like_other_models():
             repo = Path(d) / "repo"
             repo.mkdir()
             _git_init(repo)
-            review_backends.review_opencode("oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200)
+            review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
         assert cap.timeout == 1200, cap.timeout
 
 
@@ -136,7 +176,9 @@ def test_other_opencode_models_keep_requested_timeout():
             repo = Path(d) / "repo"
             repo.mkdir()
             _git_init(repo)
-            review_backends.review_opencode("oc:commandcode/deepseek/deepseek-v4-pro", "Review.", "DIFF", repo, 1200)
+            review_backends.review_opencode(
+                "oc:commandcode/deepseek/deepseek-v4-pro", "Review.", "DIFF", repo, 1200
+            )
         assert cap.timeout == 1200, cap.timeout
 
 
@@ -235,7 +277,9 @@ def test_show_board_scope_label_tracks_direct_claude_cli():
 
     saved_which = review_backends._which_optional
     saved_mode = os.environ.get("REVIEW_CLAUDE_MODE")
-    review_backends._which_optional = lambda name: "/bin/claude" if name == "claude" else None
+    review_backends._which_optional = lambda name: (
+        "/bin/claude" if name == "claude" else None
+    )
     os.environ.pop("REVIEW_CLAUDE_MODE", None)
     try:
         assert _seat_reads_repo("claude:claude-opus-4-8", True) is True
@@ -258,8 +302,15 @@ class _CapturedCodex:
         self.header_argv0: str | None = None
 
     def __call__(
-        self, argv, cwd, timeout, backend, round_no=0, announce=False,
-        input_text="", header_argv0=None,
+        self,
+        argv,
+        cwd,
+        timeout,
+        backend,
+        round_no=0,
+        announce=False,
+        input_text="",
+        header_argv0=None,
     ):
         self.argv = list(argv)
         self.cwd = Path(cwd)
@@ -300,7 +351,9 @@ def test_codex_bare_seat_runs_agentic_read_only_in_repo_no_model_flag():
             repo = Path(d) / "repo"
             repo.mkdir()
             _git_init(repo)
-            res = review_backends.review_codex("codex", "Review.", "some diff", repo, 60)
+            res = review_backends.review_codex(
+                "codex", "Review.", "some diff", repo, 60
+            )
         assert res.returncode == 0, res
         argv = cap.argv or []
         assert argv[0].endswith("/codex"), argv

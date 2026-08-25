@@ -685,6 +685,7 @@ def _run_streamed(
     header_argv0: str | None = None,
     idle_floor: int | None = _DEFAULT_IDLE_TIMEOUT,
     timeout_mode: str = "idle",
+    true_silence_timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a long backend call, streaming its output in real time.
 
@@ -700,6 +701,27 @@ def _run_streamed(
         the buffer away. Idle mode treats stdout/stderr as progress, including output from
         descendants that inherited the pipe; if idle reap is disabled, the runner falls back
         to the requested wall-clock timeout rather than waiting forever.
+      * (idle mode only) optionally enforces a SEPARATE, tighter TRUE-SILENCE timeout via
+        ``true_silence_timeout``: if the child has produced literally ZERO bytes of output
+        by that many seconds after spawn, it is reaped early with a distinct
+        "true-silence" marker and the returned result's ``.true_silenced`` attribute set
+        to True (returncode is ALSO set to 125 purely for on-screen/log visibility,
+        mirroring the existing 124 idle-timeout convention — but ``.true_silenced`` is
+        the only signal a caller should branch control flow on; 125 is a real exit code
+        some CLIs/wrappers legitimately use on their own, so a caller must never infer
+        true-silence from the bare returncode alone, round-2 review finding). This lets
+        a caller distinguish "never said anything at all" (a much stronger stuck signal,
+        see reviewlib.model_behavior) from "produced some output, then went idle" (the
+        existing 124/idle path). Once ANY output arrives this check stops applying for
+        the rest of the call; the normal idle timeout governs from then on, unchanged.
+        None (the default) disables this check entirely — existing callers that don't
+        pass it see no behavior change, and always get ``.true_silenced is False``.
+        This check only runs in IDLE mode with idle reap enabled (``idle_timeout is
+        not None``) — it is not a substitute for the idle floor, so disabling idle reap
+        (``REVIEW_IDLE_TIMEOUT_SECONDS=0``) also disables true-silence detection, even
+        with ``true_silence_timeout`` set; a never-talking child then runs to the full
+        wall-clock ``timeout`` like any other idle-reap-disabled call (Opus review
+        finding: worth knowing before relying on true-silence as an independent guard).
 
     Returns a CompletedProcess-compatible object (.returncode/.stdout/.stderr) so
     callers like review_codex need no structural change.
@@ -717,6 +739,7 @@ def _run_streamed(
     log_lock = threading.Lock()
     stopping = threading.Event()
     timed_out = False
+    true_silenced = False
     if timeout_mode not in {"idle", "wall"}:
         raise ValueError(f"unknown timeout_mode: {timeout_mode}")
     idle_timeout = (
@@ -724,12 +747,41 @@ def _run_streamed(
         if timeout_mode == "idle"
         else None
     )
+    # codex review finding, review-cli#243 round 5 (P1): true_silence_timeout must
+    # respect the same active board deadline idle_timeout already does via
+    # idle_timeout_seconds' own _clamp_to_board_deadline call — without this, a
+    # nearly-expired REVIEW_BOARD_DEADLINE_SECONDS clamps idle_timeout down to as
+    # little as _MIN_DEADLINE_CLAMPED_IDLE_FLOOR seconds, but a silent opencode seat
+    # pre-first-byte still waited the FULL true_silence_timeout (default 300s)
+    # regardless, overrunning the very deadline #228 exists to enforce. This is
+    # orthogonal to the round-4 "sole authority before idle_timeout" fix above (that
+    # governs true_silence_timeout vs idle_timeout; this governs true_silence_timeout
+    # vs the board's own wall-clock budget) — the clamp never makes true_silence
+    # unreachable, only ever pulls a too-generous value down to what time actually
+    # remains, mirroring idle_timeout's own contract exactly.
+    #
+    # Verified (round 9): _MIN_DEADLINE_CLAMPED_IDLE_FLOOR lives INSIDE
+    # _clamp_to_board_deadline itself, so this clamp's worst case is bounded to that
+    # floor (~90s), never a near-zero instant reap. A narrower fairness question
+    # remains OPEN and deliberately unresolved here: when the clamp shrinks
+    # true_silence_timeout below what a seat would have needed under normal
+    # (unclamped) conditions, the caller (_record_true_silence_if_needed) has no way
+    # to distinguish "genuinely silent for the full budget" from "silent only because
+    # THIS run was deadline-pressured" — and records the same escalating cooldown
+    # either way. Tracked as review-cli#256; not a mechanical fix, a product decision
+    # about whether/how a deadline-driven reap should participate in seat-health
+    # escalation.
+    effective_true_silence_timeout = (
+        _clamp_to_board_deadline(true_silence_timeout)
+        if true_silence_timeout is not None
+        else None
+    )
     timeout_secs = max(int(timeout), 1)
     timeout_marker_secs = timeout_secs
     timeout_marker_kind = (
         "without output" if timeout_mode == "idle" else "total runtime"
     )
-    activity = {"last": time.monotonic()}
+    activity = {"last": time.monotonic(), "got_output": False}
     proc: subprocess.Popen | None = None
     pgid: int | None = None
     child_handle: tuple[subprocess.Popen, int | None] | None = None
@@ -816,8 +868,9 @@ def _run_streamed(
         if pgid is not None:
             child_handle = _reregister_child(child_handle, proc, pgid)
 
-        # Queueing on the concurrency cap is not backend runtime. Start the idle clock only
-        # once the child exists, so a queued seat is never falsely timed out before spawn.
+        # Queueing on the concurrency cap is not backend runtime. Start the idle clock (and
+        # the true-silence clock, if enabled) only once the child exists, so a queued seat
+        # is never falsely timed out before spawn.
         activity["last"] = time.monotonic()
 
         def _feed_stdin() -> None:
@@ -868,11 +921,26 @@ def _run_streamed(
                         text = decoder.decode(b"", final=True)
                     else:
                         text = decoder.decode(chunk)
+                    # codex review finding, review-cli#243 round 15 (P1): activity must
+                    # be marked on RAW byte receipt, not on decoded TEXT — the
+                    # incremental UTF-8 decoder buffers an incomplete multibyte
+                    # sequence internally and returns "" until it completes, so a
+                    # genuinely-alive child whose next chunk happens to end mid-
+                    # character (rare, but not impossible: e.g. a CJK/Cyrillic
+                    # character split across a 64KB read boundary) would otherwise
+                    # look like zero bytes were ever received — wrongly reaped as
+                    # true-silent and cooldown-benched despite having produced real
+                    # output. `chunk` (raw bytes) is the correct liveness signal;
+                    # `text` (decoded) is only ever used for what gets buffered/logged.
+                    if chunk:
+                        with log_lock:
+                            if not stopping.is_set():
+                                activity["last"] = time.monotonic()
+                                activity["got_output"] = True
                     if text:
                         with log_lock:
                             if stopping.is_set():
                                 break
-                            activity["last"] = time.monotonic()
                             buf.append(text)
                             if tag:
                                 line_rem += text
@@ -924,8 +992,61 @@ def _run_streamed(
                     proc.wait(timeout=0.5)
                     break
                 except subprocess.TimeoutExpired:
-                    # CPython's GIL makes this single-float read safe enough; stale reads are
-                    # harmless because the next 0.5s poll sees any newer activity.
+                    # CPython's GIL makes these single-value reads safe enough; stale
+                    # reads are harmless because the next 0.5s poll sees any newer state.
+                    #
+                    # `timeout_mode == "idle"` is ALREADY structurally guaranteed here
+                    # (this whole poll loop is the `else` of `if timeout_mode == "wall"
+                    # or idle_timeout is None:` above, which wall mode always takes) —
+                    # but two independent review rounds (codex, Fable) both misread
+                    # that distant control flow as NOT enforcing it, so the condition
+                    # is repeated explicitly below: cheap, always true today, and it
+                    # makes the "(idle mode only)" contract locally self-evident
+                    # instead of relying on a reader tracing 20+ lines upward — the
+                    # exact class of thing a future refactor of the wait paths could
+                    # silently break (Fable review finding, round 3).
+                    if (
+                        timeout_mode == "idle"
+                        and effective_true_silence_timeout is not None
+                        and not activity["got_output"]
+                    ):
+                        # Pre-first-byte with true-silence armed: true_silence_timeout
+                        # is the SOLE authority until output arrives, regardless of how
+                        # it compares to idle_timeout (Fable review finding, round 4:
+                        # a true_silence_timeout configured >= idle_timeout — e.g. a
+                        # deliberately generous per-model registry entry for a known
+                        # slow starter — was silently unreachable, because the ordinary
+                        # idle check below fired first once ITS smaller threshold
+                        # elapsed, and this branch's own elapsed check hadn't yet
+                        # crossed its larger one). Once output arrives, `got_output`
+                        # flips True and this whole branch is skipped from then on —
+                        # idle_timeout alone governs the rest of the call, unchanged.
+                        # Uses the board-deadline-CLAMPED value (round 5), not the raw
+                        # true_silence_timeout, so a nearly-expired board deadline still
+                        # bounds this branch the same way it already bounds idle_timeout.
+                        # codex review finding, review-cli#243 round 8: compares against
+                        # activity["last"], NOT the separately-tracked spawn_time —
+                        # `_drain` writes activity["last"] BEFORE activity["got_output"],
+                        # so a first byte landing in this poll's final ~0.5s window moves
+                        # `last` to "now" even if this thread still observes a stale
+                        # got_output=False, closing the race that would otherwise reap a
+                        # genuinely-alive child (and wrongly cooldown-bench the seat).
+                        # Pre-first-byte, activity["last"] == the spawn timestamp exactly
+                        # (nothing else updates it while got_output is False), so the
+                        # genuinely-silent case is byte-for-byte unchanged.
+                        if (
+                            time.monotonic() - activity["last"]
+                            >= effective_true_silence_timeout
+                        ):
+                            true_silenced = True
+                            timeout_marker_secs = effective_true_silence_timeout
+                            _kill_tree(proc, pgid)
+                            try:
+                                proc.wait(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                pass
+                            break
+                        continue  # still within the true-silence budget
                     if time.monotonic() - activity["last"] < idle_timeout:
                         continue
                     timed_out = True
@@ -953,7 +1074,14 @@ def _run_streamed(
         stdin_thread.join(timeout=1)
 
         returncode = proc.returncode if proc.returncode is not None else -1
-        if timed_out:
+        if true_silenced:
+            # A distinct code from the ordinary idle-timeout 124: true-silence means the
+            # backend never produced a single byte, a much stronger "this looks dead"
+            # signal than "went idle after producing something" — callers (backends.py)
+            # branch on this to record a cooldown via reviewlib.model_behavior instead of
+            # just treating it as one more ordinary seat failure.
+            returncode = 125
+        elif timed_out:
             returncode = (
                 124  # conventional timeout exit code (overrides the kill signal)
             )
@@ -962,7 +1090,19 @@ def _run_streamed(
             stopping.set()  # freeze the buffers + stop late log writes
             stdout = "".join(out_buf)
             stderr = "".join(err_buf)
-            if timed_out:
+            if true_silenced:
+                marker = (
+                    f"\n[review-cli] TRUE-SILENCE TIMEOUT after {timeout_marker_secs}s "
+                    "with zero output — treated as stuck, not thinking]\n"
+                )
+                stdout += marker
+                try:
+                    log_fh.write(marker)
+                    log_fh.flush()
+                    log_tail["nl"] = True
+                except (ValueError, OSError):
+                    pass
+            elif timed_out:
                 marker = (
                     f"\n[review-cli] TIMEOUT after {timeout_marker_secs}s {timeout_marker_kind} "
                     "— partial output above]\n"
@@ -985,9 +1125,20 @@ def _run_streamed(
                 log_fh.flush()
             except (ValueError, OSError):
                 pass
-        return subprocess.CompletedProcess(
+        result = subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=stderr
         )
+        # Explicit, OUT-OF-BAND signal (round-2 review finding, codex + Fable): 125 is
+        # a real exit code some CLIs/wrappers use on their own (`timeout(1)`'s "the
+        # wrapper itself failed", docker run, git-bisect skip) — a child that happens
+        # to genuinely exit 125 on its own, even after producing full real output,
+        # must NEVER be mistaken for a true-silence reap by a caller pattern-matching
+        # on `returncode == 125`. `result.true_silenced` is the only authoritative
+        # signal; the returncode is kept at 125 purely for on-screen/log visibility
+        # (mirroring the existing 124 idle-timeout convention), never for a caller's
+        # control-flow decision.
+        result.true_silenced = true_silenced
+        return result
     finally:
         # The log handle ALWAYS closes, even if Popen or a write raised before the
         # normal return path (the docstring's partial-output promise depends on it).
