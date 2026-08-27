@@ -17,6 +17,7 @@ Run from the repo root::
 
     python3 tests/test_review_marker.py
 """
+
 from __future__ import annotations
 
 import os
@@ -100,7 +101,9 @@ def test_touch_helper_advances_mtime():
         os.utime(marker, (old - 100, old - 100))
         backdated = marker.stat().st_mtime
         install._touch_review_marker()
-        assert marker.stat().st_mtime > backdated, "re-touch must refresh the marker mtime"
+        assert marker.stat().st_mtime > backdated, (
+            "re-touch must refresh the marker mtime"
+        )
 
 
 def test_touch_helper_expands_default_home_path_when_env_unset():
@@ -116,6 +119,23 @@ def test_touch_helper_expands_default_home_path_when_env_unset():
         assert expected.exists(), f"default marker should expand to {expected}"
         # And NOT a literal '~' path under the cwd.
         assert not (Path("~") / ".cache").exists()
+
+
+def test_touch_helper_uses_default_when_review_marker_is_empty_string():
+    """REVIEW_MARKER="" (explicitly set to empty, not unset) must resolve to the SAME
+    default path as unset — not Path(""), which is the review's own cwd. This is the
+    producer-side half of a contract with agent-tools' require-review-before-commit hook,
+    whose marker_path() normalizes empty-string the same way (`os.environ.get(...) or
+    DEFAULT`, not `.get(..., DEFAULT)` — the latter's default only applies when the key is
+    ABSENT, and an explicitly-empty value IS present). If the two sides disagree here, a
+    successful staged review touches the wrong path and the commit gate keeps blocking
+    despite review-cli reporting success — this test pins that they agree."""
+    with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
+        os.environ["REVIEW_MARKER"] = ""
+        os.environ["HOME"] = d
+        install._touch_review_marker()
+        expected = Path(d) / ".cache" / "agent-tools" / "last-review"
+        assert expected.exists(), f"empty REVIEW_MARKER should fall back to {expected}"
 
 
 def test_touch_helper_never_raises_on_bad_path():
@@ -135,9 +155,13 @@ def test_staged_review_touches_marker():
         marker = tmp / "cache" / "agent-tools" / "last-review"
         os.environ["REVIEW_MARKER"] = str(marker)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"  # deterministic in-process backend
-        rc = mode_review(["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True)
+        rc = mode_review(
+            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True
+        )
         assert rc == 0, rc
-        assert marker.exists(), "a successful staged review must touch the session marker"
+        assert marker.exists(), (
+            "a successful staged review must touch the session marker"
+        )
 
 
 def test_unstaged_review_does_not_touch_marker():
@@ -147,16 +171,23 @@ def test_unstaged_review_does_not_touch_marker():
         marker = tmp / "cache" / "agent-tools" / "last-review"
         os.environ["REVIEW_MARKER"] = str(marker)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
-        rc = mode_review(["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=False)
+        rc = mode_review(
+            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=False
+        )
         assert rc == 0, rc
-        assert not marker.exists(), "an unstaged/piped review must NOT touch the gate marker"
+        assert not marker.exists(), (
+            "an unstaged/piped review must NOT touch the gate marker"
+        )
 
 
 def test_failed_staged_review_does_not_touch_marker():
     """A staged review whose backend FAILS (rc != 0) must NOT satisfy the gate. The
     marker touch is gated on `ok and staged`, so a failed review leaves it absent."""
+
     def _failing_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
-        return ReviewResult(model=model, command="fake-fail", returncode=1, stdout="", stderr="boom")
+        return ReviewResult(
+            model=model, command="fake-fail", returncode=1, stdout="", stderr="boom"
+        )
 
     with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -168,11 +199,15 @@ def test_failed_staged_review_does_not_touch_marker():
         original = review_mode.resolve_backend
         review_mode.resolve_backend = lambda model: _failing_backend
         try:
-            rc = mode_review(["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True)
+            rc = mode_review(
+                ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True
+            )
         finally:
             review_mode.resolve_backend = original
         assert rc == 1, rc
-        assert not marker.exists(), "a FAILED staged review must NOT touch the gate marker"
+        assert not marker.exists(), (
+            "a FAILED staged review must NOT touch the gate marker"
+        )
 
 
 def test_piped_staged_review_does_not_touch_marker():
@@ -187,11 +222,18 @@ def test_piped_staged_review_does_not_touch_marker():
         os.environ["REVIEW_MARKER"] = str(marker)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
         rc = mode_review(
-            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True,
+            ["codex"],
+            prompt="p",
+            diff=_DIFF,
+            cwd=repo,
+            timeout=30,
+            staged=True,
             diff_from_stdin=True,
         )
         assert rc == 0, rc
-        assert not marker.exists(), "a piped --staged review must NOT touch the gate marker"
+        assert not marker.exists(), (
+            "a piped --staged review must NOT touch the gate marker"
+        )
 
 
 def test_staged_review_returns_zero_even_if_marker_unwritable():
@@ -205,8 +247,12 @@ def test_staged_review_returns_zero_even_if_marker_unwritable():
         blocker.write_text("x", encoding="utf-8")
         os.environ["REVIEW_MARKER"] = str(blocker / "child" / "last-review")
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
-        rc = mode_review(["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True)
-        assert rc == 0, "an unwritable marker must never fail an otherwise-successful review"
+        rc = mode_review(
+            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True
+        )
+        assert rc == 0, (
+            "an unwritable marker must never fail an otherwise-successful review"
+        )
 
 
 def test_staged_board_review_touches_marker():
@@ -224,11 +270,19 @@ def test_staged_board_review_touches_marker():
             BoardReviewer(model="claude", role="security", display="claude"),
         ]
         rc = mode_review(
-            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True,
-            board=board, pool_size=2,
+            ["codex"],
+            prompt="p",
+            diff=_DIFF,
+            cwd=repo,
+            timeout=30,
+            staged=True,
+            board=board,
+            pool_size=2,
         )
         assert rc == 0, rc
-        assert marker.exists(), "a successful staged board review must touch the session marker"
+        assert marker.exists(), (
+            "a successful staged board review must touch the session marker"
+        )
 
 
 if __name__ == "__main__":
