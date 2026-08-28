@@ -886,20 +886,26 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
 def test_cli_failover_backfill_records_actual_models_not_planned():
     """When a startup-pool seat FAILS mid-run, the CLI must record the models that
     ACTUALLY produced verdicts (a backfilled reserve under its real id), not the planned
-    pool. Heavy pool 4 is [Fable, Sol, Opus, GLM-cc]; the top seat (Fable) fails,
-    Kimi backfills, and the record excludes Fable while keeping pool_size 4."""
-    # Fable (priority #1, in the heavy pool of 4) fails; everything else succeeds.
-    resolver = _stub_resolve_backend({"claude:claude-fable-5": 1})
+    pool. review-cli#280: claude:claude-fable-5 is paywalled and excluded from
+    HEAVY_PRESET_BOARD entirely now, so heavy pool 4 is [Sol, Opus, GLM-cc, Kimi]; the
+    top seat (Sol) fails, Codex backfills, and the record excludes Sol while keeping
+    pool_size 4."""
+    # Sol (priority #1 in the heavy pool of 4 post-Fable-exclusion) fails; the rest succeed.
+    resolver = _stub_resolve_backend({"codex:gpt-5.6-sol": 1})
     r = _run_board_review_with_resolver(["--preset", "heavy"], resolver)
     assert r["_rc"] == 0, r
     assert r["mode"] == "review"
     assert r["pool_size"] == 4, r  # backfilled back up to 4
-    assert "claude:claude-fable-5" not in r["models"], r
-    assert "codex:gpt-5.6-sol" in r["models"], r
-    # The promoted reserve is the first reserve seat (Kimi, #5), recorded by its real id.
-    assert "oc:commandcode/moonshotai/Kimi-K2.7-Code" in r["models"], r
-    # GLM-cc is in the planned pool itself (it didn't fail), so it is recorded directly.
-    assert "commandcode:zai-org/GLM-5.2" in r["models"], r
+    # Full set, not individual `in` checks (glm/GLM-cc-last review finding): the old
+    # per-model asserts never pinned Kimi, which is now a PLANNED pool seat (heavy pool 4
+    # post-exclusion = Sol/Opus/GLM-cc/Kimi) -- a regression where Kimi also silently
+    # failed and Qwen backfilled instead would have passed every prior assertion here.
+    assert set(r["models"]) == {
+        "claude:claude-opus-4-8",
+        "commandcode:zai-org/GLM-5.2",
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "codex",  # the promoted reserve (#5 post-exclusion), recorded by its real id
+    }, r
     assert "[review] pool=4 (review)" in r["_stderr"]  # ETA still keys on the planned 4
     assert "promoting reserve" in r["_stderr"]  # failover actually fired
 

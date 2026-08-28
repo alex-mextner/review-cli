@@ -3181,7 +3181,8 @@ def _add_global_options(
             help=(
                 "diff-review preset: light = quick/cheap preflight (pool 2, medium effort); "
                 "default = routine change review (pool 4, high effort, excludes Fable/Sol); "
-                "heavy = release/risky-change review (pool 4, highest effort, includes Fable/Sol). "
+                "heavy = release/risky-change review (pool 4, highest effort, excludes "
+                "Fable — paywalled, review-cli#280 — includes Sol). "
                 f"If no config board/models are set, review diff uses {DEFAULT_PRESET!r}."
             ),
         )
@@ -3504,7 +3505,8 @@ REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints 
   A priority-ordered panel of seats, each model carrying its own
   role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool 4, high effort,
   without Fable/Sol. Use `--preset light` for quick preflight (pool 2, medium effort) and
-  `--preset heavy` for release/risky changes (Fable/Sol/Opus/GLM-cc at highest effort).
+  `--preset heavy` for release/risky changes (Sol/Opus/GLM-cc/Kimi at highest effort;
+  Fable is excluded there too — paywalled, review-cli#280).
   `--pool N` sizes the selected board (`--pool 0` = all available). Explicit -m never lets config add extra seats; it narrows
   configured metadata when present, else uses the flat exact panel. To set the priority
   roster, configure `models:`. To add role/name/effort metadata (or a full board when

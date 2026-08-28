@@ -398,12 +398,14 @@ def test_board_flags_and_listing():
     heavy = review_out("--show-board", "--preset", "heavy")
     for needle in (
         "source: preset:heavy",
-        "architect",
-        "claude:claude-fable-5",
+        "consistency",
         "codex:gpt-5.6-sol",
-        "10 seats",
+        "9 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
+    # review-cli#280: claude:claude-fable-5 is paywalled and excluded from the heavy
+    # preset board entirely now, so it must never appear in --show-board output.
+    assert_not_in("claude:claude-fable-5", heavy)
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())

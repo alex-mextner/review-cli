@@ -1382,7 +1382,8 @@ def _board_models() -> list[dict]:
     lazily so the parser stays import-light and free of a config dependency at module load.
 
     Carries the 1-based raw-board PRIORITY so the Models tab and the Errors-tab fallback hint
-    cover optional heavy-preset seats (Fable/Sol) as well as the default preset. This
+    cover optional heavy-preset seats (Sol/Kimi) as well as the default preset -- Fable is
+    excluded from every preset (paywalled, review-cli#280) but stays in the raw board. This
     returns FRESH dict copies so a caller can never mutate the shared cache (glm review
     finding 7 — the lookup runs once per failed call on the runs-list endpoint, so rebuilding
     the config objects each time was the wasteful part; copying small dicts is cheap)."""
@@ -1488,7 +1489,8 @@ def compute_model_health(sessions: list[Session]) -> dict:
     rolls up per model: total/ok/fail counts, ok-rate, the dominant failure class, the most
     recent class, and a `problematic` flag. Built-in raw-board models with NO calls in the
     window are still listed (status `no_data`) so the view covers optional heavy-preset
-    seats (Fable/Sol) as well as the default preset; any non-board model that appears in
+    seats (Sol/Kimi) as well as the default preset and the excluded-but-still-raw-board
+    Fable seat (paywalled, review-cli#280); any non-board model that appears in
     the logs is appended too. Returns `{"models": [...], "problematic_count": N}`;
     `problematic_count` is over built-in board models (the tab badge)."""
     # Gather calls per model, newest-first (sessions arrive newest-first; within a session

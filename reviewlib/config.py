@@ -45,6 +45,15 @@ DEFAULT_PROMPT = (
 # the board was kept current (the flat panel rotted on the dead Fireworks route).
 KIMI_SEAT = "commandcode:moonshotai/Kimi-K2.7-Code"
 SOL_SEAT = "codex:gpt-5.6-sol"
+# review-cli#280: paywalled on the accounts this project dispatches through (100%
+# failure_rate confirmed via `review stat`, matching seat_cooldown.py's historical
+# 4,322/6,383 finding). One constant, same reason KIMI_SEAT above exists: it is kept
+# (deliberately included) in DEFAULT_BOARD's own entry below, then excluded in exactly
+# TWO filters (DEFAULT_PRESET_BOARD's and HEAVY_PRESET_BOARD's) plus referenced by the
+# test suite — a raw literal repeated that many times is exactly the drift class
+# KIMI_SEAT's docstring warns about. Re-enabling Fable (once it's no longer paywalled)
+# means removing it from BOTH filters, not just one.
+FABLE_SEAT = "claude:claude-fable-5"
 
 # Canonical GLM-5.2-via-commandcode seat — the SINGLE source of truth for "GLM 5.2 routed
 # through the Command Code gateway" (as opposed to the z.ai-subscription route used by the
@@ -115,8 +124,8 @@ MODEL_ALIASES = {
     # FAILOVER alternate, not the default.)
     "opus": "claude:claude-opus-4-8",
     "opus48": "claude:claude-opus-4-8",
-    "fable": "claude:claude-fable-5",
-    "fable5": "claude:claude-fable-5",
+    "fable": FABLE_SEAT,
+    "fable5": FABLE_SEAT,
     "sol": SOL_SEAT,
     "gpt56sol": SOL_SEAT,
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
@@ -299,7 +308,7 @@ DEFAULT_BOARD = (
     # priority 1 — Fable 5 (Anthropic flagship). Currently paywalled/"unavailable", so
     # the failover skips it at startup (the cheap probe can't see the paywall, but its
     # run-time "currently unavailable" body is treated as a failure and backfilled).
-    BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+    BoardReviewer(FABLE_SEAT, "architect", "Fable"),
     # priority 2 — Sol through Codex CLI, immediately after Fable.
     BoardReviewer(SOL_SEAT, "consistency", "Sol"),
     # priority 3 — Opus 4.8. Also the moderator (MODERATOR_CANDIDATES[0]).
@@ -345,11 +354,26 @@ DEFAULT_BOARD = (
 DEFAULT_PRESET_BOARD = tuple(
     BoardReviewer(r.model, r.role, r.display, "high")
     for r in DEFAULT_BOARD
-    if r.model not in {"claude:claude-fable-5", SOL_SEAT}
+    if r.model not in {FABLE_SEAT, SOL_SEAT}
 )
+# review-cli#280/seat_cooldown.py: FABLE_SEAT is currently paywalled on the accounts
+# this project dispatches through (confirmed 100% failure_rate over the last 14 days via
+# `review stat`, matching the 4,322/6,383 historical rate seat_cooldown.py's own docstring
+# already documents). DEFAULT_PRESET_BOARD above already excludes it; HEAVY was the one
+# preset board still paying for a guaranteed-doomed dispatch on every ship-gate run.
+# Filtered from the already-enumerated DEFAULT_BOARD (not re-enumerated after filtering)
+# so the xhigh/max effort-tier boundary stays anchored to each seat's ORIGINAL board
+# position — dropping Fable's own entry must not shift every other seat's effort tier.
+#
+# Accepted consequence, not a bug: Fable was the board's only `architect`-role seat, so
+# the heavy pool of 4 (Sol/Opus/GLM-cc/Kimi) now has no architect lens at all — and if
+# Sol fails and Codex backfills, the pool ends up with two `consistency` seats instead.
+# Not re-roling another seat to cover it here — that's a separate design call. See
+# review-cli#280.
 HEAVY_PRESET_BOARD = tuple(
     BoardReviewer(r.model, r.role, r.display, "xhigh" if i < 4 else "max")
     for i, r in enumerate(DEFAULT_BOARD)
+    if r.model != FABLE_SEAT
 )
 LIGHT_PRESET_BOARD = tuple(
     BoardReviewer(r.model, r.role, r.display, "medium") for r in DEFAULT_PRESET_BOARD

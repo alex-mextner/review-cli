@@ -37,6 +37,7 @@ from reviewlib.config import (  # noqa: E402
     DEFAULT_POOL_SIZE,
     DEFAULT_PRESET,
     DEFAULT_PRESET_BOARD,
+    FABLE_SEAT,
     GLM_COMMANDCODE_SEAT,
     HEAVY_PRESET_BOARD,
     KIMI_SEAT,
@@ -250,13 +251,18 @@ def test_preset_boards_pin_model_order_pool_and_effort():
         r.model for r in DEFAULT_PRESET_BOARD
     ]
 
-    assert [(r.model, r.effort) for r in HEAVY_PRESET_BOARD[:4]] == [
-        ("claude:claude-fable-5", "xhigh"),
+    # review-cli#280: claude:claude-fable-5 is paywalled (100% failure_rate confirmed via
+    # `review stat`) and is excluded from HEAVY_PRESET_BOARD, same as it already is from
+    # DEFAULT_PRESET_BOARD above. The xhigh/max boundary stays anchored to each seat's
+    # ORIGINAL DEFAULT_BOARD position (Sol/Opus/GLM-cc were priorities 2-4, i.e. indices
+    # 1-3 < 4 -> xhigh), so dropping Fable's own entry doesn't shift anyone else's tier.
+    assert FABLE_SEAT not in [r.model for r in HEAVY_PRESET_BOARD]
+    assert [(r.model, r.effort) for r in HEAVY_PRESET_BOARD[:3]] == [
         (SOL_SEAT, "xhigh"),
         ("claude:claude-opus-4-8", "xhigh"),
         (GLM_COMMANDCODE_SEAT, "xhigh"),
     ]
-    assert all(r.effort == "max" for r in HEAVY_PRESET_BOARD[4:])
+    assert all(r.effort == "max" for r in HEAVY_PRESET_BOARD[3:])
 
 
 def test_package_facade_exports_preset_surface():
@@ -282,14 +288,16 @@ def test_package_facade_exports_preset_surface():
 def test_explicit_preset_board_overrides_config_board():
     cfg = {"board": [{"model": "gemini", "role": "tests", "effort": "medium"}]}
     board = load_board(cfg, preset="heavy")
-    assert [r.model for r in board[:4]] == [
-        "claude:claude-fable-5",
+    # review-cli#280: claude:claude-fable-5 is paywalled and excluded from the heavy
+    # preset board (same exclusion DEFAULT_PRESET_BOARD already applies).
+    assert FABLE_SEAT not in [r.model for r in board]
+    assert [r.model for r in board[:3]] == [
         SOL_SEAT,
         "claude:claude-opus-4-8",
         GLM_COMMANDCODE_SEAT,
     ]
-    assert all(r.effort == "xhigh" for r in board[:4])
-    assert all(r.effort == "max" for r in board[4:])
+    assert all(r.effort == "xhigh" for r in board[:3])
+    assert all(r.effort == "max" for r in board[3:])
 
 
 def test_explicit_models_with_preset_preserve_config_metadata_and_use_preset_effort():
@@ -322,6 +330,22 @@ def test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat()
     assert board[0].effort == "medium"
     assert board[1].role == ""
     assert board[1].effort == "medium"
+
+
+def test_explicit_fable_still_dispatches_under_preset_heavy():
+    """review-cli#280 excludes FABLE_SEAT from HEAVY_PRESET_BOARD's board COMPOSITION,
+    not from dispatch entirely -- an explicit `-m fable`/`-m fable5` (or a config
+    `board:` entry naming it) must still reach it, same as the CHANGELOG/README promise.
+    Fable is absent from the heavy PRESET board itself, so its role/effort come from the
+    out-of-preset-seat fallback path (DEFAULT_BOARD metadata + preset_default_effort),
+    the same path test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat
+    above exercises for `light` -- this pins the SAME guarantee for `heavy` specifically,
+    since that's the preset this diff actually changed."""
+    board = board_from_models([FABLE_SEAT], {}, preset="heavy")
+
+    assert [r.model for r in board] == [FABLE_SEAT]
+    assert board[0].role == "architect"  # from DEFAULT_BOARD's own entry, config.py
+    assert board[0].effort == "xhigh"  # preset_default_effort fallback (Sol's tier)
 
 
 def test_explicit_models_with_preset_prevent_config_effort_downgrade_for_out_of_preset_seat():
@@ -1238,7 +1262,9 @@ def test_install_skill_text_documents_agentic_default_board():
     assert "diff-only" in low and "default board" in low
     assert "selected preset/board" in low
     assert "--preset heavy --pool 0" in SKILL_MD
-    assert "covers all 10 built-ins" in SKILL_MD
+    # review-cli#280: Fable is paywalled and excluded from every preset (including heavy),
+    # so the skill text must say 9, not the raw 10-seat DEFAULT_BOARD count.
+    assert "covers all 9 heavy-preset built-ins" in SKILL_MD
     """review-cli#24 contract (codex review): the agentic `oc:` board seats authenticate via
     opencode's OWN provider config — NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
     So their availability gates on the `opencode` BINARY plus opencode's OWN provider
@@ -2530,14 +2556,16 @@ def test_cli_light_and_heavy_presets_set_board_and_default_pool():
             str(REPO_ROOT),
         ]
     )
-    assert [r.model for r in heavy["board"][:4]] == [
-        "claude:claude-fable-5",
+    # review-cli#280: claude:claude-fable-5 is paywalled and excluded from the heavy
+    # preset board (same exclusion DEFAULT_PRESET_BOARD already applies).
+    assert FABLE_SEAT not in [r.model for r in heavy["board"]]
+    assert [r.model for r in heavy["board"][:3]] == [
         SOL_SEAT,
         "claude:claude-opus-4-8",
         GLM_COMMANDCODE_SEAT,
     ]
-    assert all(r.effort == "xhigh" for r in heavy["board"][:4])
-    assert all(r.effort == "max" for r in heavy["board"][4:])
+    assert all(r.effort == "xhigh" for r in heavy["board"][:3])
+    assert all(r.effort == "max" for r in heavy["board"][3:])
     assert heavy["pool_size"] == 4
 
 
@@ -2666,8 +2694,10 @@ def test_cli_explicit_preset_overrides_config_board():
         cli.main(
             ["diff", "--task", "TEST-1", "--preset", "heavy", "-C", str(REPO_ROOT)]
         )
-        assert [r.model for r in captured["board"][:4]] == [
-            "claude:claude-fable-5",
+        # review-cli#280: claude:claude-fable-5 is paywalled and excluded from the heavy
+        # preset board (same exclusion DEFAULT_PRESET_BOARD already applies).
+        assert FABLE_SEAT not in [r.model for r in captured["board"]], captured
+        assert [r.model for r in captured["board"][:3]] == [
             SOL_SEAT,
             "claude:claude-opus-4-8",
             GLM_COMMANDCODE_SEAT,
@@ -2856,8 +2886,11 @@ def test_show_board_explicit_models_are_all_live_and_pool_is_ignored():
 def test_show_board_startup_failover_skips_unavailable_top_seat():
     """The live pool is the top-N AVAILABLE seats by priority: an unavailable higher
     priority seat is tagged `unavail` and the next available seat fills the pool."""
-    # Fable (#1) unavailable -> the pool of 2 is Sol (#2) + Opus (#3); Fable is unavail.
-    avail = {r.model for r in DEFAULT_BOARD if r.model != "claude:claude-fable-5"}
+    # review-cli#280: claude:claude-fable-5 is paywalled and excluded from
+    # HEAVY_PRESET_BOARD entirely now, so it can no longer stand in as the "unavailable
+    # top seat" example here -- Sol (#1 in the heavy board post-exclusion) unavailable ->
+    # the pool of 2 is Opus (#2) + GLM-cc (#3); Sol is unavail.
+    avail = {r.model for r in DEFAULT_BOARD if r.model != SOL_SEAT}
     seat_lines = [
         ln
         for ln in _show_board_lines(2, available=avail, preset="heavy")
@@ -2870,9 +2903,9 @@ def test_show_board_startup_failover_skips_unavailable_top_seat():
                 by_tier[tier].append(ln)
                 break
     assert len(by_tier["pool"]) == 2, by_tier["pool"]
-    assert "Fable" in by_tier["unavail"][0], by_tier["unavail"]
-    assert "Sol" in by_tier["pool"][0]
-    assert "Opus" in by_tier["pool"][1]
+    assert "Sol" in by_tier["unavail"][0], by_tier["unavail"]
+    assert "Opus" in by_tier["pool"][0]
+    assert "GLM-cc" in by_tier["pool"][1]
 
 
 def test_show_board_marks_claude_commandcode_api_gateway_unpaid():
@@ -2927,9 +2960,12 @@ def test_show_board_pool_zero_marks_all_seats_pool():
 
 def test_show_board_heavy_preset_displays_effort_values():
     lines = _show_board_lines(4, preset="heavy")
-    fable = next(ln for ln in lines if "claude:claude-fable-5" in ln)
+    # review-cli#280: claude:claude-fable-5 is paywalled and excluded from the heavy
+    # preset board entirely now, so it never appears in --show-board output.
+    assert not any(FABLE_SEAT in ln for ln in lines), lines
+    sol = next(ln for ln in lines if SOL_SEAT in ln)
     kimi = next(ln for ln in lines if "oc:commandcode/moonshotai/Kimi-K2.7-Code" in ln)
-    assert "effort=xhigh" in fable, fable
+    assert "effort=xhigh" in sol, sol
     assert "effort=max" in kimi, kimi
 
 

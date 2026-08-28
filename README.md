@@ -1188,7 +1188,8 @@ TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what a
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
 --preset NAME       Diff-review and --show-board preset: light for quick preflight,
                     default for routine review, heavy for release/risky changes with
-                    Fable/Sol. Other subcommands reject it.
+                    Sol (Fable is excluded from every preset -- paywalled, review-cli#280).
+                    Other subcommands reject it.
 --pool N            How many of the selected preset/board's seats to run (default
                     preset-dependent: 4 for default/heavy, 2 for light); the first N seats run,
                     the rest are kept in reserve. The board is never off — --pool only sizes
@@ -1278,16 +1279,20 @@ out of the box — no config file required.
 The raw built-in board is a **priority-ordered** list of 10 models — strongest first — and
 a plain `review diff` runs the `default` preset: a **pool of 4** without Fable/Sol, at high effort.
 Use `--preset light` for a quick/cheap pool of 2 at medium effort, and `--preset heavy` for
-release/risky changes: Fable, Sol, Opus, and GLM-cc at `xhigh` effort, with the remaining
-board seats as `max`-effort reserve. The pool is chosen by **priority + availability**,
-with two layers of failover so the run keeps the requested number of working reviewers even
-when models drop:
+release/risky changes: Sol, Opus, GLM-cc, and Kimi at `xhigh`/`max` effort, with the
+remaining board seats as `max`-effort reserve. **Fable is excluded from every preset**
+(light/default/heavy) — it's paywalled on the accounts this project dispatches through
+(confirmed 100% failure_rate; review-cli#280) — but its entry stays in the raw 10-seat
+`DEFAULT_BOARD` so re-enabling it (once the account has Fable-tier access) only needs the
+two preset-board exclusion filters removed (`DEFAULT_PRESET_BOARD`'s and
+`HEAVY_PRESET_BOARD`'s in `reviewlib/config.py`), not a rewrite of the board itself. The
+pool is chosen by **priority + availability**, with two layers of failover so
+the run keeps the requested number of working reviewers even when models drop:
 
 - **Startup failover** — the active pool is the **top N AVAILABLE** seats by priority.
   A higher-priority seat whose backend isn't reachable (no key / not on PATH) is
   **skipped** and the next-priority seat is pulled up, so you still start with the
-  requested number of working models. (E.g. if Fable 5 is paywalled/unavailable in the
-  heavy preset, the pool starts at Sol.)
+  requested number of working models.
 - **Mid-run failover** — if an active seat **fails during the review** (backend error,
   timeout, empty output, or an "unavailable" reply such as a paywalled model returning
   *"… is currently unavailable"*), the next-priority **reserve** model is promoted and
@@ -1300,19 +1305,20 @@ the panel still covers a broad set of facets.
 
 `--pool N` overrides the preset default (the top-N available, with the same failover);
 `--pool 0` runs **all available** seats in the selected preset/board. Use
-`--preset heavy --pool 0` for all 10 built-in seats. The board is **never disabled** —
-`--pool` only sizes the pool.
+`--preset heavy --pool 0` for all 9 heavy-preset built-ins (Fable is excluded from every
+preset, so it's never among them). The board is **never disabled** — `--pool` only sizes
+the pool.
 
 The built-in board, in **priority order** (the `tier` column shows the `heavy` preset split
-on a fully-keyed environment):
+on a fully-keyed environment; Fable is `excluded` from every preset, not `pool`/`reserve`):
 
 | # | Tier | Reviewer | Backend | Role | Lens focus |
 |---|---|---|---|---|---|
-| 1 | pool | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries |
+| 1 | excluded | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (paywalled — review-cli#280 — kept in `DEFAULT_BOARD` so re-enabling only means removing it from the two preset filters, dispatched by no preset) |
 | 2 | pool | Sol | `codex:gpt-5.6-sol` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
 | 3 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
 | 4 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
-| 5 | reserve | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
+| 5 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
 | 6 | reserve | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
 | 7 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
 | 8 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
@@ -1420,11 +1426,11 @@ commandcode gateway the same way. opencode must be installed for the agentic sea
 it they fall back to the reserve.
 
 ```bash
-review --show-board        # active default preset board; add --preset heavy to show Fable/Sol/full board
+review --show-board        # active default preset board; add --preset heavy to show the Sol/Opus/GLM-cc/Kimi+reserve board
 export REVIEW_TASK_CODE=HYP-742
 review diff                # default failover pool: the top 4 AVAILABLE seats by priority
 review diff --pool 0       # run all available default-preset seats
-review diff --preset heavy --pool 0  # run all 10 built-in seats, including Fable/Sol
+review diff --preset heavy --pool 0  # run all 9 heavy-preset seats (Fable excluded, review-cli#280)
 review diff --pool 2       # run the top 2 available seats (with failover)
 review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
 review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
@@ -1450,7 +1456,8 @@ configured `board:`   >   default preset
   the configured board metadata to only the requested models. The board can otherwise
   never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
   pool (default 4 for the default preset; `--pool 0` runs all available seats in the
-  selected preset/board; `--preset heavy --pool 0` currently covers all 10 built-ins).
+  selected preset/board; `--preset heavy --pool 0` currently covers all 9 heavy-preset
+  built-ins — Fable is excluded from every preset, review-cli#280).
   `--pool` does not reduce an explicit `-m` list:
   every requested `-m` seat is attempted.
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
@@ -1467,7 +1474,8 @@ When `models:` is present,
 An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
 warning); a single malformed entry is skipped (the valid ones are kept). With **no**
 `models:` or `board:` configured, the CLI uses the default preset; the raw 10-seat board
-above is used by `--preset heavy` or as the source for explicit configured boards. A `board:` that is
+above is the source for explicit configured boards (no preset, including `--preset heavy`,
+dispatches it as-is — Fable is filtered out of every preset board, review-cli#280). A `board:` that is
 **present but has no usable entry at all** is a hard error (non-zero exit) — it never
 silently falls back to the paid default board.
 

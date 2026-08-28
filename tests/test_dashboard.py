@@ -2285,8 +2285,9 @@ def test_compute_model_health_covers_board_and_flags_problematic():
                 argv0="opencode -m zai/glm-5.2",
                 exit_code=401,
             )
-        # Fable (claude) is a heavy-preset seat; the dashboard covers the full built-in
-        # raw board so heavy runs still get priority/fallback/health treatment.
+        # Fable (claude) is on the raw board but excluded from every preset now
+        # (review-cli#280); the dashboard still covers the full built-in raw board, so
+        # historical Fable calls keep getting priority/fallback/health treatment.
         _fable_paywall_log(ld, "20260601T120000_000000")
         # Codex — 4 healthy calls => NOT problematic (ok-rate 100%).
         for i in range(4):

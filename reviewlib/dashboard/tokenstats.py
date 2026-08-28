@@ -448,13 +448,13 @@ def compute_model_stats(calls: list[CallLog]) -> dict[str, dict]:
 
 # ---- Fable-specific report ---------------------------------------------------------------
 # The investigation's headline finding: the priority-1 board seat (claude:claude-fable-5,
-# display "Fable") is dispatched on most default reviews and fails on a majority of them —
-# 1,836/4,322 sampled failures an explicit session/usage-limit notice, 714 the rc=0
-# administrative "... is currently unavailable" sentinel. Surfaced as its own section
-# (not buried in the per-harness table) because it is a distinct, actionable pattern:
-# review-cli's own default panel burns real Claude-account session quota before ever
-# reaching a working seat (reviewlib.seat_cooldown is the fix for the dispatch side; this
-# report is how you'd SEE the pattern without another manual log-archaeology pass).
+# display "Fable") used to be dispatched on most default reviews and fail on a majority of
+# them — 1,836/4,322 sampled failures an explicit session/usage-limit notice, 714 the rc=0
+# administrative "... is currently unavailable" sentinel. review-cli#280 excluded Fable from
+# every preset board (light/default/heavy), so this class of live burn is now closed off on
+# the preset paths; it still fires for an explicit `-m fable`/config `board:` dispatch, and
+# this report (kept as its own section, not buried in the per-harness table) is how you'd
+# SEE that pattern without another manual log-archaeology pass.
 _SESSION_LIMIT_MARKERS = ("session limit", "usage-credits", "usage credits")
 # kimi review finding: a bare `"auth" in low` substring match mis-buckets an unrelated
 # retry detail into "auth" whenever it happens to contain "author"/"authoritative" —

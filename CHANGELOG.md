@@ -5,6 +5,20 @@ semantic versioning.
 
 ## Unreleased
 
+- **`--preset heavy` no longer dispatches Fable — it's paywalled, and it was burning
+  real tokens on a guaranteed-doomed dispatch every ship-gate run (#280).** Live
+  `review stat` data showed Fable's failure_rate at 1.0 (100%) over the last two
+  weeks, matching the 4,322/6,383 historical rate `seat_cooldown.py` already
+  documented. `DEFAULT_PRESET_BOARD` (the `light`/`default` presets) already
+  excluded Fable; `HEAVY_PRESET_BOARD` was the one preset board still including it.
+  The heavy pool of 4 is now Sol/Opus/GLM-cc/Kimi (was Fable/Sol/Opus/GLM-cc) — 9
+  seats total instead of 10, and no `architect`-role seat in the pool (Fable was
+  the board's only one; accepted, not worked around here). Fable's raw
+  `DEFAULT_BOARD` entry is untouched, and `-m fable`/`-m fable5`/an explicit
+  config `board:` entry still dispatch it — only the built-in presets exclude it.
+  New `FABLE_SEAT` constant (`reviewlib.config`, exported from the package
+  facade) mirrors `SOL_SEAT`.
+
 - **`review task CODE --check --min-roles N` — count covered board roles instead
   of distinct model names, and default to role-based counting (#221, #246).**
   The board's shortage-resilience behavior (`select_pool_with_reuse`, #207)
