@@ -996,6 +996,157 @@ def test_true_silence_timeout_is_clamped_to_a_near_board_deadline():
     )
 
 
+def test_true_silence_clamp_reflects_state_after_the_concurrency_wait_not_before():
+    """The sibling test above calls `_run_streamed` with an immediately-available
+    concurrency slot, so it passes identically whether the clamp is computed at
+    function entry (stale for a queued seat) or after the concurrency-slot wait --
+    it can't distinguish the two. This test forces real contention: it holds the
+    sole slot (`REVIEW_MAX_CONCURRENCY=1`) itself, starts `_run_streamed` in a
+    background thread (which must block waiting for the slot), and synchronizes on
+    real proof that the worker has reached ITS OWN acquire call -- not a fixed
+    `sleep()` -- before flipping the (monkeypatched) board-deadline clamp and
+    releasing. A regressed (entry-time) implementation reads the clamp as the very
+    first thing in `_run_streamed`, strictly earlier in the worker's program order
+    than the acquire call this test waits on, so by the time that signal fires a
+    regression has already committed to the PRE-flip value with certainty. Only the
+    fixed (post-acquire) implementation can observe the POST-flip value, since it
+    cannot compute the clamp until the real semaphore unblocks it -- no earlier
+    than our release()."""
+    code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+    argv = [sys.executable, "-c", code]
+
+    clamp_return = {"value": 999}  # the "pre-flip" (stale) value
+
+    def _fake_clamp(computed: int) -> int:
+        return clamp_return["value"]
+
+    # (GLM review finding, round 2 correction) This fake also intercepts the worker's
+    # entry-time `idle_timeout_seconds()` call, not just the post-acquire true-silence
+    # one -- so `idle_timeout` is ALSO 999 pre-flip. Harmless, not load-bearing: the
+    # child never emits a byte, so the round-4 "sole authority" branch is the only one
+    # that can ever fire here regardless of idle_timeout's value -- but noted so nobody
+    # is surprised the idle budget reads 999 mid-test.
+
+    result_box: dict[str, object] = {}
+    t = None
+
+    with _with_env(REVIEW_MAX_CONCURRENCY="1"):
+        # Unlike test_concurrency_cap.py's own `_with_env`, this file's version (above)
+        # only saves/restores env vars -- it does NOT rebuild the cached concurrency
+        # semaphore, so a stale cap from an earlier test would otherwise silently leave
+        # extra free slots and this test would never actually contend.
+        process._reset_concurrency_sem_for_tests()
+        # Patched/restored entirely from the MAIN thread around the whole lifecycle
+        # (GLM review finding): the previous version patched inside the worker thread
+        # and only restored in the worker's own `finally`, which never ran if the
+        # worker hung past `t.join(timeout=...)` -- leaking a flipped global clamp
+        # into every later test in this process.
+        orig_clamp = process._clamp_to_board_deadline
+        process._clamp_to_board_deadline = _fake_clamp
+        sem = None
+        orig_acquire = None
+        held_by_test = False
+        acquire_wrapped = False
+        try:
+            sem = process._get_concurrency_sem()
+            assert sem is not None, "cap=1 must build a real semaphore"
+            orig_acquire = sem.acquire
+            held_by_test = sem.acquire(blocking=False)
+            assert held_by_test, (
+                "test must hold the sole slot itself before starting the call"
+            )
+            # Prove cap==1 behaviorally (GLM finding: avoid the CPython-private
+            # `_value` attribute) -- a second non-blocking acquire must fail while the
+            # first slot is still held.
+            contended = sem.acquire(blocking=False)
+            assert not contended, (
+                "expected a cap=1 semaphore -- a second non-blocking acquire "
+                "succeeded while the first slot was still held"
+            )
+
+            # Fires the instant the worker thread reaches ITS OWN acquire call --
+            # production tries a non-blocking probe first (which will fail, since we
+            # hold the only slot) and then falls back to a real blocking acquire();
+            # both go through this wrapper, so the event fires no later than the
+            # worker reaching the concurrency-slot section, which is well after any
+            # entry-time computation a regression would already have done.
+            reached_acquire = threading.Event()
+
+            def _acquire_and_signal(*a, **kw):
+                reached_acquire.set()
+                return orig_acquire(*a, **kw)
+
+            sem.acquire = _acquire_and_signal
+            acquire_wrapped = True
+
+            def _run():
+                try:
+                    result_box["result"] = review._run_streamed(
+                        argv,
+                        cwd=REPO_ROOT,
+                        timeout=120,
+                        backend="fake-truesilence-queue-clamp",
+                        round_no=1,
+                        true_silence_timeout=60,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- surfaced below, not swallowed
+                    result_box["error"] = exc
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            assert reached_acquire.wait(timeout=10), (
+                "worker never reached the concurrency-slot acquire call -- "
+                "this test isn't proving anything"
+            )
+            assert t.is_alive(), (
+                "the call returned before the slot was released -- "
+                "it never actually contended for the concurrency cap"
+            )
+
+            # Flip the clamp's return value only now that the worker is proven to
+            # have reached its own acquire call, then release the slot it's blocked
+            # on (or about to block on).
+            clamp_return["value"] = 1
+            sem.release()
+            held_by_test = False
+            # Generous margin over the ~1s true-silence reap: kill_tree/registration/
+            # thread teardown under real concurrent machine load (this repo's own
+            # CI/local runs share the machine with other heavy processes) can add
+            # real seconds.
+            t.join(timeout=30)
+        finally:
+            # codex review finding: an early assertion failure (e.g. `reached_acquire`
+            # never fires) used to skip `sem.release()` entirely, leaving the worker's
+            # thread permanently blocked on a slot only the test itself was holding.
+            # Release it here so a failing test doesn't also orphan a hung thread.
+            if held_by_test and sem is not None:
+                sem.release()
+            if acquire_wrapped and sem is not None:
+                del sem.acquire  # drop the instance wrapper, restore the class method
+            process._clamp_to_board_deadline = orig_clamp
+            process._reset_concurrency_sem_for_tests()
+
+    # (GLM review finding, round 3) `t is not None` would be dead code here -- every
+    # path that reaches this line has already passed through `t = threading.Thread(...)`
+    # above; an earlier failure raises inside the `try` and never reaches this assert.
+    # `t = None` above stays only as the type-checker's initializer.
+    assert not t.is_alive(), (
+        "the call never completed after the slot was released -- if the clamp were "
+        "computed before the concurrency wait it would have read the pre-flip 999s "
+        "value and nothing would reap within the 30s join"
+    )
+    if "error" in result_box:
+        raise result_box["error"]  # noqa: TRY201 -- re-raised, not swallowed as KeyError
+    result = result_box["result"]
+    assert result.returncode == 125, result.stdout + result.stderr
+    assert result.true_silenced is True
+    assert "TRUE-SILENCE TIMEOUT after 1s" in result.stdout, (
+        "the reap used the PRE-flip clamp value computed before the concurrency wait, "
+        "instead of the POST-flip value the fix requires the clamp to be recomputed "
+        f"against after acquiring the slot; stdout={result.stdout!r}"
+    )
+
+
 def test_true_silence_is_also_disabled_when_idle_reap_is_disabled():
     """(Opus review finding, review-cli#243 round 4) The true-silence branch lives in
     the `else` of `if timeout_mode == "wall" or idle_timeout is None:` -- so disabling

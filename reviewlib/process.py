@@ -747,35 +747,6 @@ def _run_streamed(
         if timeout_mode == "idle"
         else None
     )
-    # codex review finding, review-cli#243 round 5 (P1): true_silence_timeout must
-    # respect the same active board deadline idle_timeout already does via
-    # idle_timeout_seconds' own _clamp_to_board_deadline call — without this, a
-    # nearly-expired REVIEW_BOARD_DEADLINE_SECONDS clamps idle_timeout down to as
-    # little as _MIN_DEADLINE_CLAMPED_IDLE_FLOOR seconds, but a silent opencode seat
-    # pre-first-byte still waited the FULL true_silence_timeout (default 300s)
-    # regardless, overrunning the very deadline #228 exists to enforce. This is
-    # orthogonal to the round-4 "sole authority before idle_timeout" fix above (that
-    # governs true_silence_timeout vs idle_timeout; this governs true_silence_timeout
-    # vs the board's own wall-clock budget) — the clamp never makes true_silence
-    # unreachable, only ever pulls a too-generous value down to what time actually
-    # remains, mirroring idle_timeout's own contract exactly.
-    #
-    # Verified (round 9): _MIN_DEADLINE_CLAMPED_IDLE_FLOOR lives INSIDE
-    # _clamp_to_board_deadline itself, so this clamp's worst case is bounded to that
-    # floor (~90s), never a near-zero instant reap. A narrower fairness question
-    # remains OPEN and deliberately unresolved here: when the clamp shrinks
-    # true_silence_timeout below what a seat would have needed under normal
-    # (unclamped) conditions, the caller (_record_true_silence_if_needed) has no way
-    # to distinguish "genuinely silent for the full budget" from "silent only because
-    # THIS run was deadline-pressured" — and records the same escalating cooldown
-    # either way. Tracked as review-cli#256; not a mechanical fix, a product decision
-    # about whether/how a deadline-driven reap should participate in seat-health
-    # escalation.
-    effective_true_silence_timeout = (
-        _clamp_to_board_deadline(true_silence_timeout)
-        if true_silence_timeout is not None
-        else None
-    )
     timeout_secs = max(int(timeout), 1)
     timeout_marker_secs = timeout_secs
     timeout_marker_kind = (
@@ -835,6 +806,27 @@ def _run_streamed(
             f"[review-cli] {_safe_log_header(backend)}: {header} (args redacted){_task_header_suffix()}\n"
         )
         log_fh.flush()
+
+        # Deadline-dependent: computed HERE (post concurrency-slot wait, pre-spawn),
+        # not at entry — the true-silence clock starts at Popen, so the board-deadline
+        # clamp (review-cli#243/#228) must see time remaining AT spawn. idle_timeout is
+        # still entry-computed and stale for a queued seat (review-cli#272, separately
+        # tracked). Floor-bounded by _MIN_DEADLINE_CLAMPED_IDLE_FLOOR — never a
+        # near-zero instant reap. Orthogonal to the round-4 "sole authority before
+        # idle_timeout" branch in the poll loop below (that governs true_silence_timeout
+        # vs idle_timeout; this governs true_silence_timeout vs the board's own
+        # wall-clock budget).
+        #
+        # Open fairness gap (review-cli#256): when this clamp shrinks
+        # true_silence_timeout below what a seat would've needed unclamped,
+        # _record_true_silence_if_needed can't distinguish "genuinely silent" from
+        # "silent only because this run was deadline-pressured" — both record the same
+        # escalating cooldown. Product decision, not a mechanical fix.
+        effective_true_silence_timeout = (
+            _clamp_to_board_deadline(true_silence_timeout)
+            if true_silence_timeout is not None
+            else None
+        )
 
         proc = subprocess.Popen(
             argv,
