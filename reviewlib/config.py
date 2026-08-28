@@ -49,10 +49,16 @@ SOL_SEAT = "codex:gpt-5.6-sol"
 # failure_rate confirmed via `review stat`, matching seat_cooldown.py's historical
 # 4,322/6,383 finding). One constant, same reason KIMI_SEAT above exists: it is kept
 # (deliberately included) in DEFAULT_BOARD's own entry below, then excluded in exactly
-# TWO filters (DEFAULT_PRESET_BOARD's and HEAVY_PRESET_BOARD's) plus referenced by the
-# test suite — a raw literal repeated that many times is exactly the drift class
-# KIMI_SEAT's docstring warns about. Re-enabling Fable (once it's no longer paywalled)
-# means removing it from BOTH filters, not just one.
+# TWO preset filters here (DEFAULT_PRESET_BOARD's and HEAVY_PRESET_BOARD's) plus
+# referenced by the test suite — a raw literal repeated that many times is exactly the
+# drift class KIMI_SEAT's docstring warns about. Re-enabling Fable (once it's no longer
+# paywalled) means removing it from BOTH filters, not just one. NOTE (glm review
+# finding, round 2): `reviewlib.dashboard.parser` keeps its OWN `_CLAUDE_FABLE_MODEL`
+# constant with the same value for response-attribution (parser.py's `model_id_for_call`)
+# — a THIRD copy this constant doesn't cover. parser.py already has a lazy
+# `from ..config import ...` precedent for exactly this (`_board_models_cached`), so a
+# top-level-import concern does NOT block consolidating it — not done here to keep this
+# stopgap fix scoped to the preset exclusion; tracked as review-cli#281.
 FABLE_SEAT = "claude:claude-fable-5"
 
 # Canonical GLM-5.2-via-commandcode seat — the SINGLE source of truth for "GLM 5.2 routed

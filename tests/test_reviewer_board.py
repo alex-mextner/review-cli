@@ -348,6 +348,32 @@ def test_explicit_fable_still_dispatches_under_preset_heavy():
     assert board[0].effort == "xhigh"  # preset_default_effort fallback (Sol's tier)
 
 
+def test_configured_board_fable_entry_survives_with_no_preset_flag():
+    """codex review finding: the `-m fable` test above only covers `board_from_models`'s
+    out-of-preset fallback path -- a SEPARATE code path (`load_board`'s raw `board:`
+    branch, config.py) is what a user's config.yaml `board:` entry naming Fable actually
+    goes through, and it was never exercised by this diff's new tests. `load_board`
+    only substitutes a preset board via its `if preset: return preset_board(preset)`
+    guard; with no `--preset` flag, a configured `board:` is parsed as-is and is NOT
+    filtered by either preset-exclusion comprehension -- Fable stays. (Passing
+    `--preset heavy` together with a configured `board:` is a distinct, pre-existing
+    precedence case already covered by test_explicit_preset_board_overrides_config_board
+    above, where the preset DOES win and Fable is correctly absent -- not retested here.)
+    """
+    board = load_board({"board": [{"model": FABLE_SEAT, "role": "architect"}]})
+
+    assert [r.model for r in board] == [FABLE_SEAT]
+    # glm review finding (round 2): the model+role check above already fails loudly if
+    # `load_board` ever took a different branch here (the empty-board fallback returns
+    # DEFAULT_PRESET_BOARD, which excludes Fable; an unparseable entry raises
+    # BoardConfigError) -- so this isn't guarding against a real silent-fallback path.
+    # It's belt-and-suspenders: `display` additionally pins that the entry was actually
+    # PARSED from config (falls back to `_display_name(model)` = "claude-fable-5" with
+    # no `name:` key) rather than some future change threading DEFAULT_BOARD's own
+    # entry (display="Fable") through this branch by coincidence of matching model/role.
+    assert board[0].display == "claude-fable-5", board[0]
+
+
 def test_explicit_models_with_preset_prevent_config_effort_downgrade_for_out_of_preset_seat():
     cfg = {
         "board": [
