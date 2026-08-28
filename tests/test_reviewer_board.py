@@ -1475,6 +1475,19 @@ class _AvailabilityPatch:
 
         self._old_review_mod = review_mod.backend_available
         review_mod.backend_available = _fake
+
+        # `_report_pool_shortfall` (review-cli#276) also does
+        # `from ..backends import backend_unavailable_reason` -- a seat this patch marks
+        # unavailable now gets a SECOND real probe from that function whenever the pool
+        # comes up short, undoing the exact hermeticity this class exists to guarantee
+        # (k3 review finding, round 4: real `_which()`/PATH/auth-db reads leak through a
+        # test that has no real CLI/key configured). Keep it deterministic and consistent
+        # with `_fake` above: available -> no reason, unavailable -> a fixed fake reason.
+        def _fake_reason(model: str) -> str | None:
+            return None if model in self._available else "patched unavailable (test)"
+
+        self._old_review_mod_reason = review_mod.backend_unavailable_reason
+        review_mod.backend_unavailable_reason = _fake_reason
         return self
 
     def __exit__(self, *exc):
@@ -1485,6 +1498,7 @@ class _AvailabilityPatch:
         import reviewlib.modes.review as review_mod
 
         review_mod.backend_available = self._old_review_mod
+        review_mod.backend_unavailable_reason = self._old_review_mod_reason
         return False
 
 
