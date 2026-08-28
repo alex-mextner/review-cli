@@ -1138,7 +1138,7 @@ def test_true_silence_clamp_reflects_state_after_the_concurrency_wait_not_before
     # (GLM review finding, round 3) `t is not None` would be dead code here -- every
     # path that reaches this line has already passed through `t = threading.Thread(...)`
     # above; an earlier failure raises inside the `try` and never reaches this assert.
-    # `t = None` above stays only as the type-checker's initializer.
+    # The `| None` in `t`'s annotation above exists only for the type checker.
     assert not t.is_alive(), (
         "the call never completed after the slot was released -- if the clamp were "
         "computed before the concurrency wait it would have read the pre-flip 999s "
