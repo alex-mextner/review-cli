@@ -2972,7 +2972,14 @@ def _reject_if_reentrant(_argv: list[str]) -> int | None:
     child then looks identical to a genuinely fresh top-level invocation. That
     residual gap is why this is layered with, not a substitute for, the codex
     execpolicy guard (`install.install_codex_recursion_guard`) and the existing
-    process-group timeout/backstop."""
+    process-group timeout/backstop.
+
+    This exact `env -u REVIEW_CLI_ACTIVE` technique is also used DELIBERATELY, not just as an
+    attacker's residual gap: `dashboard.service._env_clear_prefix()` (reused by
+    `specweb.service._serve_argv`) prepends it to the managed `__serve` child's argv, because
+    `run`/`start` are themselves active `review` invocations and the spawned server must NOT
+    inherit that activity marker (review-cli#180 review finding, chatgpt-codex-connector, PR
+    #279) — a sanctioned use of the same bypass this paragraph documents as unstoppable."""
     if os.environ.get(REVIEW_CLI_ACTIVE_ENV) is not None:
         print(
             "[review-cli] refusing to run: $REVIEW_CLI_ACTIVE is already set, meaning "
