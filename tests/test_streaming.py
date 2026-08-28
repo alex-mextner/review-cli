@@ -1028,7 +1028,7 @@ def test_true_silence_clamp_reflects_state_after_the_concurrency_wait_not_before
     # is surprised the idle budget reads 999 mid-test.
 
     result_box: dict[str, object] = {}
-    t = None
+    t: threading.Thread | None = None
 
     with _with_env(REVIEW_MAX_CONCURRENCY="1"):
         # Unlike test_concurrency_cap.py's own `_with_env`, this file's version (above)
@@ -1094,7 +1094,16 @@ def test_true_silence_clamp_reflects_state_after_the_concurrency_wait_not_before
 
             t = threading.Thread(target=_run, daemon=True)
             t.start()
-            assert reached_acquire.wait(timeout=10), (
+            reached = reached_acquire.wait(timeout=10)
+            # (GLM + k3 review findings, round 4) Check for a worker exception BEFORE
+            # the synchronization asserts below: a worker that raises before ever
+            # reaching its own acquire call (e.g. `_open_log` hits an OSError) leaves
+            # `reached_acquire` unset, and the asserts below would previously fire
+            # first with a misleading "never reached acquire"/"never contended"
+            # message -- burying the real exception, unread, in `result_box`.
+            if "error" in result_box:
+                raise result_box["error"]  # noqa: TRY201 -- the worker's real exception
+            assert reached, (
                 "worker never reached the concurrency-slot acquire call -- "
                 "this test isn't proving anything"
             )
