@@ -49,6 +49,9 @@ _WAITING_RE = re.compile(
     r"^\[review-cli\] .+?: waiting for a concurrency slot \(cap \d+\)\s*$"
 )
 _TIMEOUT_RE = re.compile(r"^\[review-cli\] TIMEOUT after (?P<secs>\d+)s")
+_TRUE_SILENCE_RE = re.compile(
+    r"^\[review-cli\] TRUE-SILENCE TIMEOUT after (?P<secs>\d+)s"
+)
 # Explicit status footer written by every log writer (process._run_streamed and
 # backends' REST sidecar). This is the authoritative success/failure signal (finding 4).
 _EXIT_RE = re.compile(r"^\[review-cli\] EXIT (?P<code>-?\d+)\s*$")
@@ -78,6 +81,11 @@ HEALTH_PAYWALL = (
 HEALTH_AUTH = "auth"  # EXIT 401 / stderr {"error":"bad key"} (z.ai / GLM bad key).
 HEALTH_BLOCKED = "blocked"  # EXIT 403 / "error code: 1010" (Cloudflare bot block).
 HEALTH_TIMEOUT = "timeout"  # EXIT 124 / "timed out".
+# A true-silence reap (EXIT 125): process._run_streamed's tighter pre-first-byte cutoff
+# for a model that never produced a single byte (reviewlib#238) — kept as its own bucket,
+# separate from the ordinary idle timeout, so the two failure modes stay distinguishable
+# on the dashboard instead of true-silence vanishing into the generic ERROR class.
+HEALTH_TRUE_SILENCE = "true_silence"
 HEALTH_EMPTY = (
     "empty"  # EXIT 0 but no real content (output_tokens=0 / framing-only body).
 )
@@ -96,6 +104,7 @@ FAILURE_CLASSES = (
     HEALTH_AUTH,
     HEALTH_BLOCKED,
     HEALTH_TIMEOUT,
+    HEALTH_TRUE_SILENCE,
     HEALTH_EMPTY,
     HEALTH_ERROR,
 )
@@ -171,6 +180,11 @@ class CallLog:
     stderr_lines: list[str] = field(default_factory=list)
     timed_out: bool = False
     timeout_secs: int | None = None
+    # A true-silence reap (process._run_streamed's tighter pre-first-byte cutoff,
+    # reviewlib#238) is exit 125 + its own marker line — distinct from an ordinary
+    # idle timeout (exit 124) so the dashboard doesn't bucket it as a generic error.
+    true_silenced: bool = False
+    true_silence_secs: int | None = None
     size_bytes: int = 0
     mtime: datetime | None = None
     # The explicit return code recorded by the writer as a trailing
@@ -230,10 +244,14 @@ class CallLog:
         (e.g. a Popen / E2BIG failure). Such a log must NOT be counted as a success (codex
         P2); it is `running`/unknown. (A truncated old log with a body error marker is still
         surfaced as an error by has_error — only the clean, footerless case is `running`.)
+        A true-silence marker (codex review finding, review-cli#243 round 2) is the same
+        class as a timeout marker here: a log truncated right after the marker but before
+        its EXIT footer is still a finished, failed call, not a still-running one.
         """
         return (
             self.exit_code is not None
             or self.timed_out
+            or self.true_silenced
             or bool(self.stderr_lines)
             or _looks_like_error(self.body)
         )
@@ -254,7 +272,7 @@ class CallLog:
         A clean footerless log is neither an error NOR a success — it is `running` (see
         `completed`); has_error stays False there but stats must not bucket it as OK.
         """
-        if self.timed_out:
+        if self.timed_out or self.true_silenced:
             return True
         if self.exit_code is not None:
             return self.exit_code != 0
@@ -267,6 +285,8 @@ class CallLog:
             return None
         if self.timed_out:
             return f"TIMEOUT after {self.timeout_secs}s"
+        if self.true_silenced:
+            return f"TRUE-SILENCE TIMEOUT after {self.true_silence_secs}s"
         if self.exit_code is not None and self.exit_code != 0:
             # Prefer a concrete stderr line; fall back to the explicit exit code so the
             # Errors panel always has a reason even when stderr is empty.
@@ -294,6 +314,8 @@ class CallLog:
             "duration_seconds": self.duration_seconds,
             "timed_out": self.timed_out,
             "timeout_secs": self.timeout_secs,
+            "true_silenced": self.true_silenced,
+            "true_silence_secs": self.true_silence_secs,
             "exit_code": self.exit_code,
             "task_code": self.task_code,
             "completed": self.completed,
@@ -370,6 +392,8 @@ def parse_call_log(path: Path) -> CallLog | None:
     stderr_lines: list[str] = []
     timed_out = False
     timeout_secs: int | None = None
+    true_silenced = False
+    true_silence_secs: int | None = None
     exit_code: int | None = None
     task_code: str | None = None
     header_seen = False
@@ -409,6 +433,20 @@ def parse_call_log(path: Path) -> CallLog | None:
             if _TIMEOUT_RE.match(lines[j]):
                 timeout_line_idx = j
             break  # only the trailing-most non-body line is decisive
+    # A true-silence reap (reviewlib#238) is the same shape as the ordinary timeout
+    # marker above, tied to its own return code (125, process._run_streamed) instead
+    # of 124 — same trailing-position discipline, same EXIT-0-quotes-the-marker guard.
+    true_silence_line_idx: int | None = None
+    if exit_code == 125 or exit_code is None:
+        scan_start = (
+            (exit_line_idx - 1) if exit_line_idx is not None else (len(lines) - 1)
+        )
+        for j in range(scan_start, -1, -1):
+            if not lines[j].strip():
+                continue  # skip blank lines between body and footer
+            if _TRUE_SILENCE_RE.match(lines[j]):
+                true_silence_line_idx = j
+            break  # only the trailing-most non-body line is decisive
     for i, line in enumerate(lines):
         if i == exit_line_idx:
             continue  # the authoritative trailing status footer — kept out of the body
@@ -434,6 +472,11 @@ def parse_call_log(path: Path) -> CallLog | None:
             timed_out = True
             timeout_secs = int(tm.group("secs"))
             continue  # the authoritative timeout marker — kept out of the body
+        if i == true_silence_line_idx:
+            tsm = _TRUE_SILENCE_RE.match(line)
+            true_silenced = True
+            true_silence_secs = int(tsm.group("secs"))
+            continue  # the authoritative true-silence marker — kept out of the body
         if line.startswith(_STDERR_PREFIX):
             stderr_lines.append(line[len(_STDERR_PREFIX) :])
         body_lines.append(line)
@@ -455,6 +498,8 @@ def parse_call_log(path: Path) -> CallLog | None:
         stderr_lines=stderr_lines,
         timed_out=timed_out,
         timeout_secs=timeout_secs,
+        true_silenced=true_silenced,
+        true_silence_secs=true_silence_secs,
         exit_code=exit_code,
         task_code=task_code,
         size_bytes=size,
@@ -1069,6 +1114,7 @@ def compute_stats(sessions: list[Session]) -> dict:
     call_total = 0
     error_calls = 0
     timeout_calls = 0
+    true_silence_calls = 0
     ok_calls = 0
     running_calls = 0
     for s in sessions:
@@ -1110,6 +1156,8 @@ def compute_stats(sessions: list[Session]) -> dict:
                 durations.append(d)
             if c.timed_out:
                 timeout_calls += 1
+            if c.true_silenced:
+                true_silence_calls += 1
             if not c.completed:
                 # A footerless, error-free log = a call still streaming or whose writer died
                 # before the footer. It is neither success nor failure — don't inflate the
@@ -1140,6 +1188,7 @@ def compute_stats(sessions: list[Session]) -> dict:
         "ok_calls": ok_calls,
         "error_calls": error_calls,
         "timeout_calls": timeout_calls,
+        "true_silence_calls": true_silence_calls,
         "running_calls": running_calls,
         # success_rate is over COMPLETED calls only (ok + error) — an in-flight / aborted
         # footerless call has no known outcome and must not drag the rate either way.
@@ -1197,6 +1246,19 @@ def _normalize_body(text: str) -> str:
 # through almost exactly the expensive tail it existed to filter out. The two-word phrase
 # is far more specific: 33 of 6,981 real calls (0.5%) in the same window.
 _PAYWALL_PREFILTER_RE = re.compile(r"currently\s*unavailable", re.IGNORECASE)
+
+# `_cooldown_skip_result`'s true-silence branch (backends.py `_bounded_cooldown_skip_body`)
+# always emits this exact trailing clause verbatim, including the digit-only remaining-
+# seconds field and the literal module name — anchoring on the FULL shape (not just the
+# "true-silence timeout" reason fragment) keeps this from firing on a normal review body
+# that merely quotes or discusses that reason string, e.g. this diff's own source or tests.
+_TRUE_SILENCE_SKIP_RE = re.compile(
+    r"\(cached: true-silence timeout; skip expires in \d+s — reviewlib\.seat_cooldown\)\."
+)
+# Mirrors `backends._UNAVAILABLE_MAX_LEN` (400) — `_bounded_cooldown_skip_body` guarantees
+# every skip body it returns is <= this length, so a longer body can never match the
+# pattern above and the regex scan can be skipped entirely (see `classify_call`).
+_TRUE_SILENCE_SKIP_MAX_LEN = 400
 
 
 def _has_paywall_sentinel(text: str) -> bool:
@@ -1286,11 +1348,42 @@ def _body_has_real_content(call: "CallLog") -> bool:
 def classify_call(call: "CallLog") -> str:
     """Bucket one finished call into a health class (see HEALTH_* constants).
 
-    Precedence is by how hard/actionable the failure is: timeout and the three
-    hard-unavailable classes (paywall/auth/blocked) are recognised first, because their
-    sentinels are unambiguous and they explain a model being down NOW. EMPTY vs OK is the
-    EXIT-0 split (no content vs a real verdict). A non-zero exit with no recognised sentinel
-    falls through to the generic ERROR class so it still counts against the ok-rate."""
+    Precedence is by how hard/actionable the failure is: timeout, true-silence, and the
+    three hard-unavailable classes (paywall/auth/blocked) are recognised first, because
+    their sentinels are unambiguous and they explain a model being down NOW. EMPTY vs OK
+    is the EXIT-0 split (no content vs a real verdict). A non-zero exit with no recognised
+    sentinel falls through to the generic ERROR class so it still counts against the
+    ok-rate."""
+    # A true-silence cooldown-SKIP (`_cooldown_skip_result` in backends.py) deliberately
+    # reuses the paywall-shaped sentinel body so the skipped call isn't invisible on the
+    # dashboard — but that means a seat benched for going silent, not for a real quota/
+    # paywall rejection, would otherwise show a HEALTH_PAYWALL badge for its entire
+    # escalated cooldown window (10min-8h), misleading an operator into checking billing
+    # for a seat that never hit one.
+    #
+    # codex review finding: an earlier version of this check matched the bare substring
+    # "(cached: true-silence timeout;", which a normal EXIT-0 review whose body happens
+    # to quote or discuss that exact code/string (this diff's own source, for instance)
+    # would also match, misclassifying a real successful review as true-silence. The
+    # anchored pattern below requires the SKIP body's full, distinctive trailing clause
+    # (`_bounded_cooldown_skip_body`'s fixed suffix, including the em dash and the
+    # module name) to appear, not just the reason fragment — this is the same residual
+    # "a reviewed body could theoretically quote our own sentinel text" risk the paywall
+    # check below already accepts for its own marker, not a new class of exposure.
+    #
+    # GLM review finding (performance): `classify_call` is a documented hot path
+    # (review-cli#186 profiled a single unconditional full-body regex scan here at 20+
+    # of a ~50s report over ~7,000 calls) -- an earlier version of this check ran
+    # unconditionally, adding a second such scan ahead of the paywall prefilter. But a
+    # true-silence SKIP body is provably bounded (`_bounded_cooldown_skip_body` in
+    # backends.py guarantees <= `_UNAVAILABLE_MAX_LEN` (400) chars on every return
+    # path), so a body longer than that can never be a skip body -- gating on length
+    # first makes this O(1) for every real (non-skip) review body, semantically
+    # identical to running the regex unconditionally.
+    if len(call.body) <= _TRUE_SILENCE_SKIP_MAX_LEN and _TRUE_SILENCE_SKIP_RE.search(
+        call.body
+    ):
+        return HEALTH_TRUE_SILENCE
     # Paywall: the body sentinel is authoritative even when EXIT is 0 (Fable returns 0 with
     # an "unavailable" body — the EXIT code lies, the body tells the truth). This is the only
     # check that must run on the EXIT-0 happy path, so it leads.
@@ -1298,6 +1391,14 @@ def classify_call(call: "CallLog") -> str:
         return HEALTH_PAYWALL
     if call.timed_out or call.exit_code == 124:
         return HEALTH_TIMEOUT
+    # Unlike the 124/timeout check above, exit 125 is NOT unambiguous on its own (codex +
+    # Opus review finding): some backends/wrappers legitimately exit 125 for their own
+    # unrelated reason, even with full real output and no reap. `call.true_silenced` —
+    # set only when parse_call_log found the authoritative TRUE-SILENCE marker in the
+    # writer's trailing position — is the sole signal; a bare exit-125 falls through to
+    # the ordinary error/empty/ok classification below, same as before this feature.
+    if call.true_silenced:
+        return HEALTH_TRUE_SILENCE
     # The CF bot-block / bad-key markers can land in stderr OR the body; build the haystack
     # once, only for the error-bearing calls that need it (the healthy majority skips this).
     blob = ("\n".join(call.stderr_lines) + "\n" + call.body).lower()
@@ -1382,8 +1483,10 @@ def _board_models() -> list[dict]:
     lazily so the parser stays import-light and free of a config dependency at module load.
 
     Carries the 1-based raw-board PRIORITY so the Models tab and the Errors-tab fallback hint
-    cover optional heavy-preset seats (Fable/Sol) as well as the default preset. This
-    returns FRESH dict copies so a caller can never mutate the shared cache (glm review
+    cover seats outside the default preset too — Sol (heavy-preset only) and Fable
+    (review-cli#fable-seat-reliability: no preset at all, a raw-board last-resort
+    reserve seat). This returns FRESH dict copies so a caller can never mutate the
+    shared cache (glm review
     finding 7 — the lookup runs once per failed call on the runs-list endpoint, so rebuilding
     the config objects each time was the wasteful part; copying small dicts is cheap)."""
     return [dict(b) for b in _board_models_cached()]
@@ -1487,9 +1590,11 @@ def compute_model_health(sessions: list[Session]) -> dict:
     MODEL id (commandcode/z.ai gateway model, Fable-vs-Opus split, etc.), classifies it, and
     rolls up per model: total/ok/fail counts, ok-rate, the dominant failure class, the most
     recent class, and a `problematic` flag. Built-in raw-board models with NO calls in the
-    window are still listed (status `no_data`) so the view covers optional heavy-preset
-    seats (Fable/Sol) as well as the default preset; any non-board model that appears in
-    the logs is appended too. Returns `{"models": [...], "problematic_count": N}`;
+    window are still listed (status `no_data`) so the view covers seats outside the default
+    preset too — Sol (heavy-preset only) and Fable (review-cli#fable-seat-reliability: no
+    preset at all, a raw-board last-resort reserve seat) — as well as the default preset;
+    any non-board model that appears in the logs is appended too. Returns
+    `{"models": [...], "problematic_count": N}`;
     `problematic_count` is over built-in board models (the tab badge)."""
     # Gather calls per model, newest-first (sessions arrive newest-first; within a session
     # we keep call order then reverse so the most-recent call leads).

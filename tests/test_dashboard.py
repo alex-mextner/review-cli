@@ -242,6 +242,369 @@ def test_parse_call_log_timeout_and_stderr():
         assert "TIMEOUT" in (c.error_summary or "")
 
 
+def test_parse_call_log_true_silence_marker():
+    """A genuine true-silence reap (process._run_streamed, exit 125) is parsed the same
+    way as the ordinary TIMEOUT marker: `true_silenced`/`true_silence_secs` set, the
+    marker line kept out of the displayed body, has_error True, error_summary names it."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+            exit_code=125,
+        )
+        c = p.parse_call_log(path)
+        assert c.true_silenced is True
+        assert c.true_silence_secs == 300
+        assert c.timed_out is False, (
+            "true-silence is its own class, not the 124 timeout"
+        )
+        assert c.has_error is True
+        assert "TRUE-SILENCE" in (c.error_summary or "")
+        assert "TRUE-SILENCE TIMEOUT after 300s" not in c.body, (
+            "the authoritative marker is consumed, not left in the displayed body"
+        )
+
+
+def test_parse_call_log_true_silence_marker_without_footer_still_completed():
+    """(codex review finding, review-cli#243 round 2) A log truncated right after the
+    TRUE-SILENCE marker but before its trailing EXIT footer (mirrors the pre-existing
+    timeout case) is still a FINISHED, FAILED call -- not `running` -- so compute_stats
+    must count it as an error, not silently drop it into running_calls."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+            # no exit_code -> _write_call_log omits the trailing EXIT footer entirely,
+            # mirroring a log truncated right after the marker was written.
+        )
+        c = p.parse_call_log(path)
+        assert c.true_silenced is True
+        assert c.completed is True, "a true-silence marker alone finishes the call"
+        assert c.has_error is True
+
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["error_calls"] == 1
+        assert stats["running_calls"] == 0
+
+
+def test_quoted_true_silence_marker_in_body_is_not_treated_as_true_silence():
+    """(mirrors the TIMEOUT quoted-marker regression) A successful `EXIT 0` review that
+    QUOTES `[review-cli] TRUE-SILENCE TIMEOUT after Ns` — even as the last body line —
+    must NOT be flagged as true-silenced, and the quote must stay visible."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body_last = (
+            "Reviewing the true-silence handling; the log ends with:\n"
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n"
+        )
+        c = p.parse_call_log(
+            _write_call_log(
+                ld, "20260601T100000_000000", "opencode", 0, body_last, exit_code=0
+            )
+        )
+        assert c.exit_code == 0
+        assert c.true_silenced is False, (
+            "EXIT 0 means no true-silence reap even if the last line quotes the marker"
+        )
+        assert c.has_error is False
+        assert "TRUE-SILENCE TIMEOUT after 300s" in c.body, (
+            "the quoted marker stays in the body"
+        )
+
+
+def test_footerless_quoted_true_silence_marker_is_misparsed_as_a_real_reap():
+    """(Opus review finding, review-cli#243 round 3 — documents a KNOWN, pre-existing
+    exposure, NOT a regression introduced by this diff) The genuine-marker scan runs
+    whenever `exit_code == 125 OR exit_code is None` (the same "legacy footerless log"
+    fallback the pre-existing TIMEOUT/124 scan already uses). A footerless log — still
+    streaming, or whose writer died before the EXIT footer — that happens to end with a
+    QUOTED true-silence marker line is therefore misparsed as a genuine reap, flipping
+    a `running` call into a failed true-silence one. This mirrors the identical,
+    already-accepted exposure on the TIMEOUT/124 path (same `exit_code is None` fallback,
+    same trailing-position quoting risk) — low probability, not tightened here; this
+    test exists so a future change to either scan's fallback is deliberate, not silent."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body_no_footer = (
+            "Reviewing the true-silence handling; the log ends with:\n"
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n"
+        )
+        # No exit_code -> _write_call_log omits the EXIT footer, mirroring a still-
+        # streaming or writer-died-before-footer log.
+        c = p.parse_call_log(
+            _write_call_log(ld, "20260601T100000_000000", "opencode", 0, body_no_footer)
+        )
+        assert c.exit_code is None
+        assert c.true_silenced is True, (
+            "documents the known footerless-quoted-marker exposure, symmetric with "
+            "the pre-existing TIMEOUT/124 path — not a new regression"
+        )
+
+
+def test_genuine_exit_125_with_a_quoted_trailing_marker_is_misparsed_as_a_real_reap():
+    """(codex review finding, review-cli#243 round 21 — documents a KNOWN, pre-existing
+    exposure, NOT a regression introduced by this diff) A child that genuinely exits
+    125 for its own unrelated reason (see process.py's own extensive commentary on
+    this: timeout(1)'s wrapper-failed code, docker run, git-bisect skip) AND whose
+    real review output happens to end with a line that's an EXACT quote of the
+    TRUE-SILENCE marker text is misparsed as a genuine reap -- the parser's marker
+    scan is gated on `exit_code == 125 OR exit_code is None`, the SAME trailing-
+    position-only discipline the pre-existing TIMEOUT/124 scan uses, which has this
+    identical exposure for a genuine exit-124 child quoting the TIMEOUT marker as its
+    last line. This is a PARSER limitation only -- the in-process `.true_silenced`
+    attribute (process._run_streamed's own authoritative signal, never bare rc==125)
+    is completely unaffected; this only affects reading LOGS after the fact, where no
+    equivalent out-of-band signal survives to disk. Documented, not fixed, matching
+    the sibling footerless-marker test above."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body_quotes_marker_last = (
+            "Reviewing the true-silence handling; the log ends with:\n"
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n"
+        )
+        c = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                body_quotes_marker_last,
+                exit_code=125,
+            )
+        )
+        assert c.exit_code == 125
+        assert c.true_silenced is True, (
+            "documents the known genuine-exit-125-plus-quoted-marker exposure, "
+            "symmetric with the pre-existing TIMEOUT/124 path — not a new regression"
+        )
+
+
+def test_classify_call_true_silence_vs_bare_exit_125():
+    """(codex + Opus review finding) exit 125 alone is NOT authoritative -- some backends
+    legitimately exit 125 for their own unrelated reason. Only the parsed TRUE-SILENCE
+    marker (`call.true_silenced`) may bucket a call as HEALTH_TRUE_SILENCE; a genuine
+    EXIT 125 with real output and no marker must fall through to the ordinary classes,
+    same as before this feature existed."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        genuine = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+                exit_code=125,
+            )
+        )
+        bare_125 = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100010_000000",
+                "opencode",
+                0,
+                "some unrelated wrapper exit -- full real review output here\n",
+                exit_code=125,
+            )
+        )
+        assert p.classify_call(genuine) == p.HEALTH_TRUE_SILENCE
+        assert p.classify_call(bare_125) != p.HEALTH_TRUE_SILENCE, (
+            "a bare exit 125 with no marker must not be misclassified as true-silence"
+        )
+        assert p.classify_call(bare_125) == p.HEALTH_ERROR
+
+
+def test_classify_call_true_silence_cooldown_skip_is_not_paywall():
+    """(Fable review finding) `_cooldown_skip_result` (reviewlib/backends.py) deliberately
+    reuses the paywall-shaped `is currently unavailable` sentinel for EVERY cached-cooldown
+    skip, including a true-silence-caused one, so the skipped call isn't invisible on the
+    dashboard. Without a distinct check, that means a seat benched for going silent -- not
+    for a real quota/paywall rejection -- would show a HEALTH_PAYWALL badge for its entire
+    escalated cooldown window (10min-8h), misleading an operator into checking billing for
+    a seat that never hit a quota. A genuine quota-cooldown skip (a real paywall/session-
+    limit reason cached earlier) must still classify as HEALTH_PAYWALL."""
+    from reviewlib.backends import _bounded_cooldown_skip_body
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        true_silence_skip_body = _bounded_cooldown_skip_body(
+            "oc:zai/glm-5.2", "true-silence timeout", 1800
+        )
+        quota_skip_body = _bounded_cooldown_skip_body(
+            "claude:claude-fable-5", "session limit / usage credits", 1800
+        )
+        true_silence_skip = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                true_silence_skip_body,
+                argv0="opencode -m zai/glm-5.2 (seat-cooldown skip)",
+                exit_code=0,
+            )
+        )
+        quota_skip = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100010_000000",
+                "claude",
+                0,
+                quota_skip_body,
+                argv0="seat-cooldown skip (claude)",
+                exit_code=0,
+            )
+        )
+        assert p.classify_call(true_silence_skip) == p.HEALTH_TRUE_SILENCE, (
+            "a true-silence cooldown skip must not be bucketed as a paywall event"
+        )
+        assert p.classify_call(quota_skip) == p.HEALTH_PAYWALL, (
+            "a genuine quota/paywall cooldown skip must still classify as paywall"
+        )
+
+
+def test_true_silence_skip_max_len_matches_the_bound_it_mirrors():
+    """(Fable review finding) `parser._TRUE_SILENCE_SKIP_MAX_LEN` hand-mirrors
+    `backends._UNAVAILABLE_MAX_LEN` rather than importing it, so the two constants can
+    silently drift apart -- if backends' bound ever grows, a skip body for a longer
+    model id would contain the full anchored true-silence clause but still get
+    length-gated out by parser's stale copy, landing back on HEALTH_PAYWALL for the
+    whole cooldown window (the exact misclassification this feature exists to prevent).
+    This pins the two constants equal so a future change to either fails loudly."""
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    assert p._TRUE_SILENCE_SKIP_MAX_LEN == backends._UNAVAILABLE_MAX_LEN
+
+
+def test_classify_call_body_merely_quoting_the_skip_reason_is_not_true_silence():
+    """(codex review finding) an earlier version of the true-silence-skip check matched
+    the bare substring "(cached: true-silence timeout;", which a normal EXIT-0 review
+    whose body happens to quote or discuss that exact reason string (this diff's own
+    source or tests, for instance) would also match -- misclassifying a real successful
+    review as a true-silence reap. Only the SKIP body's full, distinctive trailing
+    clause (the exact digits-and-module-name suffix `_bounded_cooldown_skip_body`
+    always emits) must trigger the true-silence class."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        quoting_call = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "codex",
+                0,
+                'The fix adds record_cooldown(model, "true-silence timeout") at line 694, '
+                "building on `(cached: true-silence timeout; ...)` from backends.py.\n"
+                "Looks correct, no further findings.\n",
+                exit_code=0,
+            )
+        )
+        assert p.classify_call(quoting_call) != p.HEALTH_TRUE_SILENCE, (
+            "a review body merely quoting the reason string must not be misclassified "
+            "as a true-silence reap"
+        )
+
+
+def test_compute_stats_true_silence_calls():
+    """compute_stats populates `true_silence_calls` as its own counter, distinct from
+    `timeout_calls` -- the dashboard metric this feature was built to stop losing."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+            exit_code=125,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100010_000000",
+            "codex",
+            0,
+            "partial\n[review-cli] TIMEOUT after 10s — partial output above]\n",
+            exit_code=124,
+        )
+        _write_call_log(ld, "20260601T100020_000000", "gemini", 0, "ok\n", exit_code=0)
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["true_silence_calls"] == 1
+        assert stats["timeout_calls"] == 1
+        assert stats["call_count"] == 3
+
+
+def test_real_true_silence_reap_round_trips_through_the_real_parser():
+    """(Opus review finding, review-cli#243 round 6) Every other true-silence parser
+    test hand-writes the marker string via `_write_call_log` -- the marker literal is
+    duplicated between `reviewlib.process` (the writer) and the tests (the fixtures),
+    so a future change to the writer's exact wording could drift silently: the parser
+    tests would stay green (testing the OLD wording) while the dashboard quietly loses
+    the true-silence class on real logs. This drives a REAL `_run_streamed` reap and
+    parses the REAL sidecar log it writes, closing that gap -- mirrors the shape
+    tests/test_true_silence_cooldown_wiring.py's sidecar-log test already uses for the
+    cooldown-skip path."""
+    import sys as _sys
+
+    from reviewlib import process as review_process
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        saved = os.environ.get("REVIEW_LOG_DIR")
+        os.environ["REVIEW_LOG_DIR"] = log_dir
+        try:
+            code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+            result = review_process._run_streamed(
+                [_sys.executable, "-c", code],
+                cwd=REPO_ROOT,
+                timeout=30,
+                backend="opencode",
+                round_no=0,
+                true_silence_timeout=1,
+            )
+            assert result.true_silenced is True
+
+            from reviewlib.dashboard import parser as p
+
+            logs = sorted(Path(log_dir).glob("*-opencode-r0.log"))
+            assert logs, "no sidecar log written for the real true-silence reap"
+            call = p.parse_call_log(logs[-1])
+            assert call is not None
+            assert call.true_silenced is True
+            assert call.true_silence_secs == 1
+            assert p.classify_call(call) == p.HEALTH_TRUE_SILENCE
+        finally:
+            if saved is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = saved
+
+
 def test_parse_call_log_rejects_bad_name():
     from reviewlib.dashboard import parser as p
 
@@ -1301,12 +1664,17 @@ def test_fallback_resolves_for_real_call_resolved_gateway_ids():
     # form today) resolves a real fallback, not None — the production failing-seat case.
     kimi_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Kimi")
     assert p._fallback_seat_for(kimi_seat) is not None
-    # The z.ai GLM seat is now the LAST-RESORT reserve (deprioritized, review-cli#65), so by
-    # construction it has no next-priority fallback — None is the correct hint for the lowest
-    # seat (the general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
+    # The z.ai GLM seat is deprioritized (review-cli#65) but no longer the very last
+    # seat: Fable is (review-cli#fable-seat-reliability, a confirmed ~100% dispatch
+    # failure rate demoted it below even GLM). GLM still resolves a real fallback (to
+    # Fable); Fable itself has none — None is the correct hint for the lowest seat (the
+    # general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
     glm_seat = next(b.model for b in DEFAULT_BOARD if b.display == "GLM")
-    assert glm_seat == DEFAULT_BOARD[-1].model, glm_seat  # pin: GLM is the last seat
-    assert p._fallback_seat_for(glm_seat) is None
+    fable_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Fable")
+    assert fable_seat == DEFAULT_BOARD[-1].model, fable_seat  # pin: Fable is last
+    fb = p._fallback_seat_for(glm_seat)
+    assert fb is not None and fb["model"] == fable_seat, fb
+    assert p._fallback_seat_for(fable_seat) is None
 
 
 def test_to_summary_exposes_enriched_errors_for_the_errors_tab():
@@ -2285,8 +2653,10 @@ def test_compute_model_health_covers_board_and_flags_problematic():
                 argv0="opencode -m zai/glm-5.2",
                 exit_code=401,
             )
-        # Fable (claude) is a heavy-preset seat; the dashboard covers the full built-in
-        # raw board so heavy runs still get priority/fallback/health treatment.
+        # k3 review finding (review-cli#286, round 3): Fable is now in NO preset
+        # (raw-board last-resort only, post-demotion) — the dashboard still covers
+        # the full built-in raw board (not just the active preset), so priority/
+        # fallback/health treatment for a raw-board-only seat is exercised here.
         _fable_paywall_log(ld, "20260601T120000_000000")
         # Codex — 4 healthy calls => NOT problematic (ok-rate 100%).
         for i in range(4):

@@ -185,6 +185,66 @@ def test_shortfall_warning_clamps_requested_to_board_size():
     assert "requested 8" not in out
 
 
+def test_shortfall_warning_distinguishes_unavailable_from_role_shrunk_reserve():
+    """Codex review finding, PR #278: a hand-built pool that's short for a role/usage
+    reason (NOT availability) while ALSO carrying a genuinely unavailable seat must not
+    have its healthy `reserve` seats silently folded into the unavailable-seat blame —
+    "1 selected + 3 healthy reserve + 1 unavailable" must not print as if the 1
+    unavailable seat explains the whole 3-seat gap."""
+    board = [
+        BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
+        BoardReviewer("codex:gpt-5.6-terra", "consistency", "Codex"),
+        BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
+        BoardReviewer("omp:kimi-code/k3", "general", "k3"),
+        BoardReviewer("commandcode:model", "tests", "CC"),
+    ]
+    pool = [board[0]]  # only Opus selected (role/usage-limited)
+    reserve = [board[2], board[3], board[4]]  # 3 healthy seats held back
+    saved = _patched_reason({"codex:gpt-5.6-terra": "codex: unpaid provider"})
+    try:
+        out = _captured_stdout(
+            review_mod._report_pool_shortfall,
+            board,
+            pool,
+            reserve=reserve,
+            pool_size=4,
+        )
+    finally:
+        review_mod.backend_unavailable_reason = saved
+    assert "only 1 live -- 1 board seat(s) unavailable" in out, out
+    assert "Codex (codex:gpt-5.6-terra): codex: unpaid provider" in out, out
+    # The 3 healthy reserve seats must be surfaced as their own fact, not silently
+    # dropped (which would falsely imply the 1 unavailable seat explains the whole gap).
+    assert "3 more board seat(s) are reachable but sitting in reserve" in out, out
+    assert "role/usage-based selection, not availability" in out, out
+
+
+def test_shortfall_warning_fires_for_pure_role_shrunk_pool_with_no_unavailable_seat():
+    """Codex review finding, PR #278 (the more severe half): when NOTHING on the board
+    is actually unavailable but the pool is still short because a role-less/too-few-role
+    board couldn't pad up to the requested size, the old code's `if not missing: return`
+    guard fired and stayed COMPLETELY SILENT — reproducing this notice's own reason for
+    existing, just via a role-limit cause instead of an availability one."""
+    board = [
+        BoardReviewer("claude:claude-opus-4-8", "", "Opus"),
+        BoardReviewer("codex:gpt-5.6-terra", "", "Codex"),
+        BoardReviewer("claude:claude-fable-5", "", "Fable"),
+    ]
+    pool = [board[0]]  # role-less board: no padding, primary stays at size 1
+    reserve = [board[1], board[2]]  # both fully healthy, just unused
+    out = _captured_stdout(
+        review_mod._report_pool_shortfall,
+        board,
+        pool,
+        reserve=reserve,
+        pool_size=3,
+    )
+    assert out != "", "must not be silent when the pool is short with a healthy board"
+    assert "only 1 live" in out, out
+    assert "unavailable" not in out, out  # nothing IS unavailable here
+    assert "2 more board seat(s) are reachable but sitting in reserve" in out, out
+
+
 def test_shortfall_warning_wired_to_real_selector_output():
     """End-to-end through the REAL `select_pool_and_reserve_with_reuse` (config.py),
     not a hand-built pool/reserve — the gap all three reviewers flagged: nothing proved
@@ -291,6 +351,8 @@ TESTS = [
     test_shortfall_warning_fires_in_all_seats_mode_when_a_seat_is_missing,
     test_shortfall_warning_does_not_list_a_healthy_reserve_seat,
     test_shortfall_warning_clamps_requested_to_board_size,
+    test_shortfall_warning_distinguishes_unavailable_from_role_shrunk_reserve,
+    test_shortfall_warning_fires_for_pure_role_shrunk_pool_with_no_unavailable_seat,
     test_shortfall_warning_wired_to_real_selector_output,
     test_shortfall_notice_fires_through_the_real_mode_review_board_call_site,
 ]

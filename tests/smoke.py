@@ -396,14 +396,17 @@ def test_board_flags_and_listing():
     ):
         assert_in(needle, board, "in --show-board")
     heavy = review_out("--show-board", "--preset", "heavy")
+    # review-cli#fable-seat-reliability: claude:claude-fable-5 is EXCLUDED from the
+    # heavy preset (a confirmed ~100% dispatch failure rate) — 9 seats, not 10, and no
+    # "architect" lens (Fable was the only seat carrying it).
     for needle in (
         "source: preset:heavy",
-        "architect",
-        "claude:claude-fable-5",
         "codex:gpt-5.6-sol",
-        "10 seats",
+        "9 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
+    assert_not_in("claude:claude-fable-5", heavy)
+    assert_not_in("architect", heavy)
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())
@@ -661,6 +664,14 @@ _UNIT_FILES = [
     ("test_staged_diff_honors_c_repo.py", {}),
     ("test_output_flag.py", {}),
     ("test_opencode_realrepo.py", {}),
+    # Versioned per-model true-silence behavior registry (review-cli#235). Pure data
+    # lookups + env-override precedence — no I/O, no git.
+    ("test_model_behavior.py", {}),
+    # review_opencode's true-silence cooldown wiring (review-cli#235): recording AND
+    # consulting a cooldown, escalation on repeat trips, dashboard attribution, and the
+    # no-cooldown-on-a-genuine-child-exit-125 safeguard (codex/Fable review findings).
+    # Isolates its own $REVIEW_SEAT_COOLDOWN_FILE per test — no shared env needed here.
+    ("test_true_silence_cooldown_wiring.py", {}),
     # The omp (Oh My Pi) agentic read-only backend (review-cli#174): routing, the
     # `@payloadfile` launch contract, the offline sqlite auth probe, unpaid gating,
     # board scope label + dashboard attribution. Hermetic — fake _which/_run_streamed

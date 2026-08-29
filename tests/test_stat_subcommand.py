@@ -80,7 +80,9 @@ def test_stat_days_zero_text_report():
         assert "calls: 3" in proc.stdout
         assert "codex" in proc.stdout
         assert "z.ai" in proc.stdout
-        assert "Fable (priority-1 board seat) pattern" in proc.stdout
+        # review-cli#fable-seat-reliability: the "priority-1" label was dropped along
+        # with the demotion itself (DEFAULT_BOARD priority 1 -> last-resort reserve).
+        assert "Fable (board seat) pattern" in proc.stdout
         assert "session_limit=1" in proc.stdout
 
 

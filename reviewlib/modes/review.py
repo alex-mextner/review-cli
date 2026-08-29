@@ -538,10 +538,14 @@ def _report_pool_shortfall(
     config.py) is technically reachable, so the selector pads the pool back up with a
     duplicate seat instead of leaving a gap -- `len(pool) >= requested` then true, and
     this function returns before ever inspecting that seat, so the near-limit exclusion
-    is invisible here, not merely mislabeled (Fable review finding, round 2). (3) This
-    notice prints at pre-dispatch time, before whatever produces a "reviewed via X + Y"
-    summary runs -- an agent that only pastes the final summary (not the full terminal
-    output) still misses it."""
+    is invisible here, not merely mislabeled (Fable review finding, round 2). This is
+    strictly the PADDING-SUCCEEDS case (the function never reaches the code below); the
+    padding-FAILS case (a role-less or too-few-role board can't pad at all, so `pool`
+    stays short with the near-limit/role-excluded seats sitting healthy in `reserve`) IS
+    handled below -- see the `reserve` line in the printed notice (Codex review finding,
+    PR #278). (3) This notice prints at pre-dispatch time, before whatever produces a
+    "reviewed via X + Y" summary runs -- an agent that only pastes the final summary (not
+    the full terminal output) still misses it."""
     # `_effective_pool_size` (config.py) is the single source of truth for this clamp
     # (its own docstring: "so the two [select_pool + split_pool_reserve] can never
     # drift") -- re-deriving the rule inline here would let a future change to that
@@ -552,17 +556,38 @@ def _report_pool_shortfall(
         return
     live_ids = {id(r) for r in pool} | {id(r) for r in reserve}
     missing = [r for r in board if id(r) not in live_ids]
-    if not missing:
-        return
+    # No early `if not missing: return` here (Codex review finding, PR #278): `board`
+    # is exactly `pool | reserve | missing` (disjoint), and `requested <= len(board)`
+    # by construction of `_effective_pool_size` above -- so having reached this line
+    # (`len(pool) < requested`), `missing` and `reserve` can never BOTH be empty. A
+    # role-less (or too-few-distinct-roles) board can shrink `pool` below `requested`
+    # via `select_pool_with_reuse`'s role-padding cutoff with EVERY seat reachable --
+    # `missing` empty, `reserve` holding the unused-but-healthy seats -- and the old
+    # guard silently returned here, reproducing the exact "zero signal" bug this
+    # notice exists to kill, just via a role-limit cause instead of an availability one.
     lines = [
         f"[review-cli] pool came up short: requested {requested} seats "
-        f"(board has {len(board)}), only {len(pool)} live -- "
-        f"{len(missing)} board seat(s) unavailable:"
+        f"(board has {len(board)}), only {len(pool)} live"
+        + (f" -- {len(missing)} board seat(s) unavailable:" if missing else ":")
     ]
     for r in missing:
         reason = backend_unavailable_reason(r.model) or "unavailable (reason unknown)"
         label = r.display or r.model
         lines.append(f"  - {label} ({r.model}): {reason}")
+    if reserve:
+        # Codex review finding, PR #278: printing ONLY `missing` here made a role/usage
+        # -driven shrink (healthy seats sitting unused in `reserve` because the board
+        # had too few distinct roles to pad into, or because they're near their usage
+        # limit) look like it was fully explained by whatever unavailable seat happened
+        # to also be on the board -- e.g. "1 selected + 3 healthy reserve + 1 unavailable"
+        # printed as "only 1 live -- 1 unavailable", falsely pinning a 3-seat gap on one
+        # seat. State the reserve count as its own fact instead of folding it into the
+        # unavailable-seat blame.
+        lines.append(
+            f"  ({len(reserve)} more board seat(s) are reachable but sitting in "
+            "reserve -- excluded from the pool by role/usage-based selection, not "
+            "availability)"
+        )
     # flush=True (GLM review finding, round 5): every sibling operator notice in this
     # file flushes (_warn_if_board_reused, the degraded warning, the provider-switch
     # notice) -- without it, a piped/teed run (`review diff | tee report.md`) block-
