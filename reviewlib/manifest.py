@@ -27,6 +27,7 @@ runs on), `gemini` -> `gemini`, `commandcode` -> `commandcode:`, `zai` -> `zai:`
 manifest id is turned into a runnable review-cli seat string via `_seat_for()` so the
 resolved value drops straight into the same backend dispatch the board already uses.
 """
+
 from __future__ import annotations
 
 import os
@@ -44,7 +45,7 @@ MANIFEST_ENV = "REVIEW_MODELS_MANIFEST"
 # Manifest provider token (models.yaml `provider:`) -> the review-cli SEAT prefix builder.
 # A `None` value means "the provider IS the bare seat name" (gemini -> `gemini`, no id tail).
 # `openai` maps to the agentic `codex` route (GPT-5.5 runs there), matching DEFAULT_BOARD's
-# priority-4 Codex seat — NOT the diff-only `commandcode:gpt-5.5` HTTP route.
+# priority-5 Codex seat — NOT the diff-only `commandcode:gpt-5.5` HTTP route.
 _PROVIDER_SEAT = {
     "anthropic": "claude:{id}",
     "openai": "codex",
@@ -80,7 +81,9 @@ def _candidate_manifest_paths() -> list[Path]:
         candidates.append(Path(env_file).expanduser())
     agent_tools = os.environ.get("AGENT_TOOLS_DIR")
     if agent_tools:
-        candidates.append(Path(agent_tools).expanduser() / "lib" / "contracts" / "models.yaml")
+        candidates.append(
+            Path(agent_tools).expanduser() / "lib" / "contracts" / "models.yaml"
+        )
     # `Path.home()` raises (RuntimeError, or KeyError via pwd.getpwuid) when no home is
     # resolvable — a real case in containers run under an arbitrary uid with no $HOME. Guard it
     # so the conventional-path probe degrades to "no candidates" instead of crashing a review;

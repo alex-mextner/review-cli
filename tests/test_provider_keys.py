@@ -394,7 +394,7 @@ def test_commandcode_base_url_and_model_override():
 
 
 def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
-    """The priority-4 GLM-5.2 board seat (`commandcode:zai-org/GLM-5.2`) must POST the
+    """The priority-3 GLM-5.2 board seat (`commandcode:zai-org/GLM-5.2`) must POST the
     byte-exact gateway model id `zai-org/GLM-5.2` — INCLUDING the embedded slash. The id has
     TWO `/`-free segments around a single `/` plus the `commandcode:` provider prefix, so a
     naive split could truncate it; this pins that `review_commandcode` strips ONLY the
@@ -423,7 +423,7 @@ def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
 
 
 def test_commandcode_glm_seat_id_beats_commandcode_model_env():
-    """The priority-4 GLM-cc seat id WINS over a `COMMANDCODE_MODEL` env override — so a host
+    """The priority-3 GLM-cc seat id WINS over a `COMMANDCODE_MODEL` env override — so a host
     that exports `COMMANDCODE_MODEL` (a legitimate override for the bare `-m cc` path) can NOT
     silently hijack the default-board seat into POSTing a different model. `review_commandcode`
     only consults `COMMANDCODE_MODEL` for a BARE `commandcode` id (no suffix); a suffixed seat
