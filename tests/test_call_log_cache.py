@@ -310,6 +310,56 @@ def test_save_prunes_entries_for_files_no_longer_present():
         assert names == {"keep.log"}
 
 
+def test_save_prunes_a_preexisting_db_even_when_this_process_never_opened_it():
+    """GitHub PR #324 review (chatgpt-codex-connector, P1): if every `.log` in a
+    directory is deleted, a fresh scan calls `get_or_parse` zero times (nothing left
+    to look up), so this process never opens a connection for that directory. Without
+    this fix, `save()`'s early-return-on-no-connection would leave a PRE-EXISTING db
+    (written by an earlier process) holding every deleted call's full body forever --
+    exactly the privacy leak `save()` exists to close."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        gone = d / "gone.log"
+        gone.write_text("g", encoding="utf-8")
+        clc.get_or_parse(d, gone, lambda p: _call(filename="gone.log"))
+        clc.save(d)
+        assert (d / clc._CACHE_FILENAME).exists()
+
+        gone.unlink()
+        _reset(d)  # simulate a FRESH process: no in-memory connection for this dir
+
+        clc.save(d)  # must open the EXISTING on-disk db and prune it, not no-op
+
+        entry = clc._conn_for(d)
+        names = {row[0] for row in entry.conn.execute("SELECT filename FROM entries")}
+        assert names == set(), "the deleted call's cached body must not survive"
+
+
+def test_save_does_not_retry_or_crash_after_a_memoized_connect_failure():
+    """GitHub PR #324 review (GLM finding 1): `_connections.get()` returns `None`
+    both when a directory was never opened AND when a prior connect for it already
+    failed and was memoized as `None` (`_conn_for`'s documented failure-memoization).
+    In the memoized-failure case, `save()`'s new "open the pre-existing db" branch
+    must not re-attempt the connect (that would defeat the whole point of
+    memoizing) and must not crash -- it should just return, identically to before
+    this fix."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / clc._CACHE_FILENAME).write_bytes(b"not a valid sqlite database at all")
+        f = d / "a.log"
+        f.write_text("x", encoding="utf-8")
+
+        # Prime the memoized failure the normal way -- a real cache-miss lookup.
+        clc.get_or_parse(d, f, lambda p: _call())
+        assert clc._connections[str(d)] is None
+
+        f.unlink()
+        clc.save(d)  # must not raise, and must not re-attempt the doomed connect
+        assert clc._connections[str(d)] is None, (
+            "the memoized failure must be untouched"
+        )
+
+
 def test_save_does_not_wipe_the_cache_when_the_directory_listing_fails():
     """review-cli#317 round 4, k3 finding 2: if listing the directory raises (a
     permission flip, a network-FS hiccup) mid-`save()`, that must NOT be read as

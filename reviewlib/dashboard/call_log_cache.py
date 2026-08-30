@@ -310,11 +310,35 @@ def save(directory: Path) -> None:
     """Prune rows for files no longer present in ``directory`` -- a deleted `.log`
     must not leave its parsed body (which can hold reviewed prompts/diffs) sitting in
     the cache forever. Writes are already committed as they happen (autocommit), so
-    this is pruning only, not a required flush."""
+    this is pruning only, not a required flush. May open (never create) a
+    pre-existing db even if THIS process never cached anything for ``directory`` --
+    see the comment below."""
     with _registry_lock:
         entry = _connections.get(str(directory))
     if entry is None:
-        return
+        # `_connections.get()` returns None in TWO distinct cases -- distinguish them:
+        # (a) this directory was never touched this process, or (b) a prior connect
+        # for it already failed and was memoized as None (`_conn_for`'s documented
+        # failure-memoization). Case (b) is handled below by simply calling
+        # `_conn_for` again: it returns the SAME memoized None without retrying the
+        # doomed connect, so this degrades to the pre-fix no-op for that case.
+        #
+        # Case (a) is why this branch exists at all: an existing db from a PRIOR
+        # process may still be sitting on disk holding now-stale rows. Concrete
+        # case: every `.log` in `directory` gets deleted, so a fresh scan calls
+        # `get_or_parse` zero times (nothing to look up) and `_conn_for` never
+        # runs -- returning early here would leave every deleted call's full
+        # prompt/diff body cached forever, exactly the privacy leak `save()`
+        # exists to close (GitHub PR #324 review, chatgpt-codex-connector P1).
+        # The `exists()` check is a fast-path optimization, not a hard CREATE
+        # guarantee: an unlikely delete-in-between-the-two-calls race can still let
+        # `_conn_for` create an empty db (harmless -- no rows, nothing to prune,
+        # nothing to leak) rather than genuinely guaranteeing no file materializes.
+        if not (directory / _CACHE_FILENAME).exists():
+            return
+        entry = _conn_for(directory)
+        if entry is None:
+            return
     try:
         # A directory listing that fails or lies (a permission flip, a network-FS
         # hiccup, an OSError mid-scandir) must NOT be read as "every file is gone" --
