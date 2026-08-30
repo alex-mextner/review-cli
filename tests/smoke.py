@@ -854,6 +854,10 @@ _UNIT_FILES = [
     # `review stat`'s CLI surface (argparse wiring, --since/--days resolution, --json vs
     # text rendering, --harness table filtering). Deterministic, no network/backend.
     ("test_stat_subcommand.py", {}),
+    # The persistent call-log cache (reviewlib.dashboard.call_log_cache) that lets a
+    # repeat `review stat`/dashboard scan skip re-parsing unchanged log files.
+    # Deterministic — synthetic tmpdirs, no real log dir, no network.
+    ("test_call_log_cache.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in
