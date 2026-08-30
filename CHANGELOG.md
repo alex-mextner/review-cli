@@ -14,12 +14,11 @@ semantic versioning.
   prewarm held the cache lock for its entire parse (a real request racing it
   blocked on the same lock), and fixing that naively let the cold-placeholder
   path and the prewarm both kick a background parse at once. Also fixed an
-  O(n^2) session-clustering cost at this scale. Hardened across 8 rounds of
-  adversarial review — see the commit and PR #329 for the full list of
-  concurrency-correctness fixes closed in the same change. Follow-up work
-  (a per-lineage in-flight-parse redesign, cold-window write/detail 404s,
-  and a client-side self-recovery nudge) is tracked separately as
-  review-cli#327 and review-cli#328.
+  O(n^2) session-clustering cost at this scale. See review-cli#329 for the
+  full list of concurrency-correctness fixes closed in the same change.
+  Follow-up work (a per-lineage in-flight-parse redesign, cold-window
+  write/detail 404s, and a client-side self-recovery nudge) is tracked
+  separately as review-cli#327 and review-cli#328.
 
 - **True-silence detection + partial-result preservation for opencode seats
   (#243, closes review-cli#243).** A per-model, versioned registry
