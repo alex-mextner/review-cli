@@ -95,7 +95,28 @@ _CACHE_ERRORS = (sqlite3.Error, ValueError)
 # the exit-code/timeout/task-code detection. `(mtime_ns, size)` alone can't catch
 # this: a finished log's file never changes again, so a pre-fix cached row would
 # otherwise be served forever (review-cli#317 review, round 3, k3 finding 1).
-_PARSER_VERSION = 1
+# review-cli#326: bumped 1 -> 2 because `parse_call_log` now caps retained body/stderr
+# text via `_cap_body`/`_cap_stderr_lines`, and computes `completed`/`has_error`/
+# `error_summary`/`is_paywall`/`is_cf_blocked`/`is_bad_key` once from the FULL
+# untruncated text (see `_classify_from_full_text` in parser.py). Without this bump a
+# pre-existing cache row (keyed only on filename/mtime/size) would satisfy the
+# cache-hit check and deserialize its OLD, uncapped body -- or a row missing the six
+# newer fields entirely -- straight back into memory on exactly the long-lived install
+# this fix targets, since finished `.log` files never change again and that row would
+# otherwise never be re-parsed through the new code path (codex review finding, round
+# 1; behavior proven end-to-end by
+# `test_bumping_parser_version_invalidates_an_otherwise_unchanged_row` below, Fable
+# review round 4 finding 4).
+#
+# THIS BUMP DISCIPLINE COVERS MORE THAN THE FOUR MARKER CONSTANTS documented next to
+# `_PAYWALL_SENTINEL` in parser.py -- `CALL_BODY_STORE_CAP`/`_CAP_CHARS`/
+# `CALL_STDERR_LINE_CAP` (also in parser.py) are baked into every persisted row's
+# `body`/`stderr_lines` too. Bump `_PARSER_VERSION` alongside ANY edit to: the four
+# marker constants, the two cap constants, or `_classify_from_full_text`'s own logic
+# (Fable review round 4 finding 3: lowering a cap without bumping this would leave
+# every cached row's retained-memory size unchanged on a warm 132k-log install, so the
+# fix would silently appear not to work).
+_PARSER_VERSION = 2
 _CALLLOG_FIELDS: set[str] | None = None  # lazily computed -- see `_calllog_fields()`
 _CALLLOG_DATETIME_FIELDS: frozenset[str] | None = (
     None  # see `_calllog_datetime_fields()`
