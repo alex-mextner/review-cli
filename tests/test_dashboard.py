@@ -147,6 +147,383 @@ def test_parse_call_log_basic():
         assert c.has_error is False
 
 
+def test_parse_call_log_body_is_capped_for_a_huge_output():
+    """review-cli#326: CallLog kept the FULL streamed body for every one of ~132k calls
+    on a real install, ballooning the dashboard process to 32.8GB RSS. `has_error`/
+    `completed` are already documented as EXIT-code-authoritative (body-grepping is only
+    a legacy fallback for exit-code-less logs), so bounding what's RETAINED in `.body`
+    caps per-call memory without touching that classification logic. A call whose exit
+    code is present must classify correctly regardless of body size."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        huge_body = "line of real review output\n" * 200_000  # ~5.4MB on disk
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, huge_body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(huge_body), (
+            "the stored body must be bounded, not the full multi-MB text"
+        )
+        assert (
+            len(c.body) <= p.CALL_BODY_STORE_CAP + 200
+        )  # + slack for markers stripped
+        assert c.completed is True
+        assert c.has_error is False, (
+            "exit_code=0 is authoritative regardless of body size/truncation"
+        )
+
+
+def test_parse_call_log_body_cap_bounds_real_retained_memory_for_a_single_astral_char():
+    """review-cli#326 round 4 (codex P1): an encoded-UTF-8-byte-length check (an
+    earlier version of this test) is NOT the same guarantee as bounding the actual
+    retained Python object's memory. CPython's PEP 393 string representation stores
+    the WHOLE string at up to 4 bytes/char once even ONE astral-plane character (an
+    emoji) is present anywhere in it, regardless of how many bytes that string encodes
+    to -- codex concretely reproduced ~262KB retained (4x the 64KB byte cap) from a
+    single retained astral character with an otherwise-ASCII body. `_cap_body` now
+    caps CHARACTER count at a quarter of the byte budget (`_CAP_CHARS`), which bounds
+    `sys.getsizeof()` -- the metric that actually matters -- regardless of script mix."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # codex's own repro shape: one astral character (forces 4-byte/char storage
+        # for the WHOLE string) plus a large ASCII body.
+        huge_body = "😀" + ("a" * 200_000)
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, huge_body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        retained_bytes = sys.getsizeof(c.body)
+        assert retained_bytes <= p.CALL_BODY_STORE_CAP + 512, (
+            f"retained body object is {retained_bytes} bytes -- a single astral "
+            "character anywhere in the body must not blow the memory cap"
+        )
+
+
+def test_parse_call_log_oversized_empty_call_stays_empty_after_capping():
+    """review-cli#326 round 5 (codex P1): `_cap_body` inserts a human-readable
+    truncation marker line into the retained `body`. `_body_has_real_content` (which
+    decides HEALTH_EMPTY vs HEALTH_OK for an EXIT-0 call) must not mistake that marker
+    for real review prose -- a genuinely empty call (all `[review-cli]` framing plus a
+    zero usage line, no real content) that happens to be huge enough to get capped
+    must still classify as HEALTH_EMPTY, not flip to HEALTH_OK just because it was
+    long enough to trigger the cap."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # All framing/usage lines, no real prose -- well past the cap, so capping
+        # definitely fires and the marker line lands in the retained body.
+        body = ("[review-cli] framing line\n" * 2000) + "output_tokens=0\n"
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(body), "sanity check: capping actually fired"
+        assert p.classify_call(c) == p.HEALTH_EMPTY, (
+            "the cap marker line must not be counted as real content"
+        )
+
+
+def test_parse_call_log_oversized_single_line_framing_body_stays_empty():
+    """review-cli#326 round 6 (codex P1 reproduction, two rounds): a body that is ONE
+    giant `[review-cli] ...` framing line, far past the cap, has no newline for
+    `_cap_body`'s slices to anchor on -- an intermediate version of this fix had
+    `_cap_body` drop the un-anchored fragment to avoid it being misread as content,
+    which fixed THIS case but broke the mirror case (see the sibling test below).
+    The real fix: `has_real_content` is computed ONCE from the FULL, uncapped body in
+    `_classify_from_full_text` (same as the other six classification fields), so
+    `_cap_body`'s exact boundary behavior no longer matters for correctness at all --
+    only for what gets shown for display."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = "[review-cli] " + ("x" * 40_000)  # one line, no newlines anywhere
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(body), "sanity check: capping actually fired"
+        assert p.classify_call(c) == p.HEALTH_EMPTY, (
+            "an oversized single-line framing body must not misclassify as HEALTH_OK"
+        )
+
+
+def test_parse_call_log_oversized_single_line_real_verdict_stays_ok():
+    """review-cli#326 round 6 (codex P1, second reproduction): the MIRROR of the test
+    above. A body that is ONE giant line of REAL review prose (no `[review-cli]`
+    framing prefix, no newlines anywhere) must still classify as HEALTH_OK even though
+    `_cap_body` retains almost none of it for display -- `has_real_content` is computed
+    from the FULL body before any capping, so it is unaffected by how little (or how
+    ragged) the displayed `body` ends up being."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = "Looks correct, no further findings. " + ("x" * 40_000)
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(body), "sanity check: capping actually fired"
+        assert p.classify_call(c) == p.HEALTH_OK, (
+            "an oversized single-line real verdict must not misclassify as "
+            "HEALTH_EMPTY just because capping left little/no recognizable content "
+            "in the DISPLAYED body"
+        )
+
+
+def test_parse_call_log_legacy_error_marker_near_start_survives_truncation():
+    """The legacy (no exit-code footer) error-detection fallback still finds a marker
+    that appears early in a huge body -- the common real-world shape (an error message
+    up front, followed by verbose tool output) -- even after the size cap is applied."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = "error: not available\n" + ("filler output line\n" * 200_000)
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) <= p.CALL_BODY_STORE_CAP + 200
+        assert c.has_error is True
+        assert c.error_summary and "error: not available" in c.error_summary
+
+
+def test_parse_call_log_legacy_error_marker_near_end_survives_truncation():
+    """Mirrors the near-start test for the other headline motivation in `_cap_body`'s
+    comment: 'crash at the tail of a long run'. The marker sits in the final ~32KB
+    (`text[-half:]`), which the head+tail split must retain."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = ("filler output line\n" * 200_000) + "error: not available\n"
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) <= p.CALL_BODY_STORE_CAP + 200
+        assert "error: not available" in c.body, (
+            "the tail half must retain the marker, not just detect it blindly"
+        )
+        assert c.has_error is True, (
+            "_looks_like_error scans the whole (capped) body, so a tail marker "
+            "is still detected -- error_summary's own first-non-blank-line pick "
+            "is a separate, pre-existing display heuristic not covered here"
+        )
+
+
+def test_parse_call_log_legacy_error_marker_in_middle_is_still_detected():
+    """review-cli#326 round 2 (codex reproduction): a legacy log with no EXIT footer
+    whose ONLY error marker falls strictly between the retained head and tail halves
+    used to flip `has_error` True->False after capping -- classification is now
+    computed ONCE from the FULL untruncated text in `parse_call_log`, before
+    `_cap_body` ever runs, so a middle-only marker is still correctly detected even
+    though it does not survive into the (capped) `body` kept for display."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + "error: not available\n" + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert "error: not available" not in c.body, (
+            "sanity check: the marker really did land in the truncated-away middle"
+        )
+        assert c.completed is True
+        assert c.has_error is True, (
+            "classification runs on the full body before capping, so a middle-only "
+            "marker in a footerless legacy log is still caught"
+        )
+
+
+def test_parse_call_log_paywall_sentinel_in_middle_is_still_detected():
+    """Sibling of the error-marker case above, for the paywall sentinel: a codex call
+    can stream a long transcript and only hit the sentinel deep in the body (see
+    `_has_paywall_sentinel`'s own docstring) -- past the retained head+tail, that must
+    still classify as HEALTH_PAYWALL, not silently fall back to ok/error."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + "currently unavailable\n" + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert "currently unavailable" not in c.body, (
+            "sanity check: the sentinel really did land in the truncated-away middle"
+        )
+        assert c.is_paywall is True
+        assert p.classify_call(c) == p.HEALTH_PAYWALL
+
+
+def test_parse_call_log_cf_block_marker_in_middle_is_still_detected():
+    """review-cli#326 round 4 (Opus missing-test finding): same middle-truncation
+    class as the error-marker/paywall tests above, but for `_CF_BLOCK_MARKER` --
+    `is_cf_blocked` is computed from the FULL body/stderr in `_classify_from_full_text`,
+    so a marker that only survives in the omitted middle must still be caught."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + "error code: 1010\n" + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert "error code: 1010" not in c.body, (
+            "sanity check: the marker really did land in the truncated-away middle"
+        )
+        assert c.is_cf_blocked is True
+        assert p.classify_call(c) == p.HEALTH_BLOCKED
+
+
+def test_parse_call_log_bad_key_marker_in_middle_is_still_detected():
+    """Sibling of the CF-block test above, for `_BAD_KEY_MARKER`."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + '{"error":"bad key"}\n' + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert '{"error":"bad key"}' not in c.body, (
+            "sanity check: the marker really did land in the truncated-away middle"
+        )
+        assert c.is_bad_key is True
+        assert p.classify_call(c) == p.HEALTH_AUTH
+
+
+def test_parse_call_log_huge_stderr_is_capped_too():
+    """review-cli#326 review finding (Opus + Codex, round 1): stderr_lines was the same
+    unbounded-retention bug as body, just through a different field -- a chatty backend
+    dumping megabytes to stderr must not reproduce the RSS blowup this fix exists for."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        stderr_block = "".join(
+            f"[stderr] boom {i}\n" for i in range(200_000)
+        )  # several MB
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, stderr_block + "ok\n"
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        total_stderr = "\n".join(c.stderr_lines)
+        assert len(total_stderr) <= p.CALL_BODY_STORE_CAP + 200
+        assert c.stderr_lines[0] == "boom 0", (
+            "first line still usable for error_summary"
+        )
+        assert c.has_error is True
+
+
+def test_parse_call_log_many_near_empty_stderr_lines_caps_line_count_too():
+    """review-cli#326 round 3 (codex P1): byte-capping alone isn't enough -- a backend
+    emitting tens of thousands of SHORT `[stderr]` lines produces a byte-capped ~64KiB
+    string that still explodes into tens of thousands of separate `str` objects once
+    split back into a list, each one costing real interpreter overhead well beyond its
+    own bytes. `_cap_stderr_lines` must bound the LINE COUNT independently of bytes."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # 300,000 near-empty stderr lines: byte-cheap (~2.4MB raw) but line-count-huge.
+        stderr_block = "".join(f"[stderr] {i}\n" for i in range(300_000))
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, stderr_block + "ok\n"
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.stderr_lines) <= p.CALL_STDERR_LINE_CAP + 1, (
+            "line count must be bounded independently of the byte cap"
+        )
+        assert c.stderr_lines[0] == "0"
+        assert c.has_error is True
+
+
+def test_direct_construction_auto_classifies_from_body():
+    """review-cli#326 round 3 (Fable finding 3 / codex P2): a `CallLog` built directly
+    (a test fixture, any future non-`parse_call_log` constructor) with a paywall/
+    error-shaped body and no explicit classification kwargs must still classify
+    correctly -- matching what the removed `@property`s used to do. `None` is the
+    sentinel `__post_init__` uses to detect "caller left this unset" and auto-derive
+    from `self.body`/`self.stderr_lines`/etc.; passing an explicit value (as
+    `parse_call_log` always does, from the FULL untruncated text) skips it."""
+    from reviewlib.dashboard import parser as p
+
+    call = p.CallLog(
+        path="",
+        filename="x.log",
+        started=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="claude-p",
+        body="currently unavailable",
+        exit_code=0,
+    )
+    assert call.is_paywall is True
+    assert call.completed is True
+    assert call.is_cf_blocked is False, (
+        "auto-derivation fills in EVERY classification field, not just the ones "
+        "that happen to be truthy for this body"
+    )
+    assert p.classify_call(call) == p.HEALTH_PAYWALL
+
+    # ALL SEVEN explicit values are honored as-is, not overridden by auto-classification
+    # -- this is an all-or-nothing contract (round 4, Opus finding; extended to a
+    # seventh field in round 6): passing only SOME of the seven leaves the rest at the
+    # `None` sentinel, which re-triggers auto-derivation and overwrites the partial
+    # values too (see `__post_init__`).
+    healthy = p.CallLog(
+        path="",
+        filename="y.log",
+        started=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="claude-p",
+        body="currently unavailable",
+        exit_code=0,
+        is_paywall=False,
+        completed=True,
+        has_error=False,
+        is_cf_blocked=False,
+        is_bad_key=False,
+        has_real_content=True,
+    )
+    assert healthy.is_paywall is False
+
+    # A PARTIAL override (some but not all seven) is not honored -- it's treated as
+    # fully unset and re-derived from the body, overwriting the partial values too.
+    partial = p.CallLog(
+        path="",
+        filename="z.log",
+        started=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="claude-p",
+        body="currently unavailable",
+        exit_code=0,
+        is_paywall=False,  # would be overwritten -- the other five/six are unset
+    )
+    assert partial.is_paywall is True
+    assert p.classify_call(healthy) != p.HEALTH_PAYWALL
+
+
 def test_parse_call_log_task_code_and_dashboard_task_stats():
     from reviewlib.dashboard import parser as p
 
@@ -240,6 +617,369 @@ def test_parse_call_log_timeout_and_stderr():
         assert c.has_error is True
         assert c.stderr_lines and "boom" in c.stderr_lines[0]
         assert "TIMEOUT" in (c.error_summary or "")
+
+
+def test_parse_call_log_true_silence_marker():
+    """A genuine true-silence reap (process._run_streamed, exit 125) is parsed the same
+    way as the ordinary TIMEOUT marker: `true_silenced`/`true_silence_secs` set, the
+    marker line kept out of the displayed body, has_error True, error_summary names it."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+            exit_code=125,
+        )
+        c = p.parse_call_log(path)
+        assert c.true_silenced is True
+        assert c.true_silence_secs == 300
+        assert c.timed_out is False, (
+            "true-silence is its own class, not the 124 timeout"
+        )
+        assert c.has_error is True
+        assert "TRUE-SILENCE" in (c.error_summary or "")
+        assert "TRUE-SILENCE TIMEOUT after 300s" not in c.body, (
+            "the authoritative marker is consumed, not left in the displayed body"
+        )
+
+
+def test_parse_call_log_true_silence_marker_without_footer_still_completed():
+    """(codex review finding, review-cli#243 round 2) A log truncated right after the
+    TRUE-SILENCE marker but before its trailing EXIT footer (mirrors the pre-existing
+    timeout case) is still a FINISHED, FAILED call -- not `running` -- so compute_stats
+    must count it as an error, not silently drop it into running_calls."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+            # no exit_code -> _write_call_log omits the trailing EXIT footer entirely,
+            # mirroring a log truncated right after the marker was written.
+        )
+        c = p.parse_call_log(path)
+        assert c.true_silenced is True
+        assert c.completed is True, "a true-silence marker alone finishes the call"
+        assert c.has_error is True
+
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["error_calls"] == 1
+        assert stats["running_calls"] == 0
+
+
+def test_quoted_true_silence_marker_in_body_is_not_treated_as_true_silence():
+    """(mirrors the TIMEOUT quoted-marker regression) A successful `EXIT 0` review that
+    QUOTES `[review-cli] TRUE-SILENCE TIMEOUT after Ns` — even as the last body line —
+    must NOT be flagged as true-silenced, and the quote must stay visible."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body_last = (
+            "Reviewing the true-silence handling; the log ends with:\n"
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n"
+        )
+        c = p.parse_call_log(
+            _write_call_log(
+                ld, "20260601T100000_000000", "opencode", 0, body_last, exit_code=0
+            )
+        )
+        assert c.exit_code == 0
+        assert c.true_silenced is False, (
+            "EXIT 0 means no true-silence reap even if the last line quotes the marker"
+        )
+        assert c.has_error is False
+        assert "TRUE-SILENCE TIMEOUT after 300s" in c.body, (
+            "the quoted marker stays in the body"
+        )
+
+
+def test_footerless_quoted_true_silence_marker_is_misparsed_as_a_real_reap():
+    """(Opus review finding, review-cli#243 round 3 — documents a KNOWN, pre-existing
+    exposure, NOT a regression introduced by this diff) The genuine-marker scan runs
+    whenever `exit_code == 125 OR exit_code is None` (the same "legacy footerless log"
+    fallback the pre-existing TIMEOUT/124 scan already uses). A footerless log — still
+    streaming, or whose writer died before the EXIT footer — that happens to end with a
+    QUOTED true-silence marker line is therefore misparsed as a genuine reap, flipping
+    a `running` call into a failed true-silence one. This mirrors the identical,
+    already-accepted exposure on the TIMEOUT/124 path (same `exit_code is None` fallback,
+    same trailing-position quoting risk) — low probability, not tightened here; this
+    test exists so a future change to either scan's fallback is deliberate, not silent."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body_no_footer = (
+            "Reviewing the true-silence handling; the log ends with:\n"
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n"
+        )
+        # No exit_code -> _write_call_log omits the EXIT footer, mirroring a still-
+        # streaming or writer-died-before-footer log.
+        c = p.parse_call_log(
+            _write_call_log(ld, "20260601T100000_000000", "opencode", 0, body_no_footer)
+        )
+        assert c.exit_code is None
+        assert c.true_silenced is True, (
+            "documents the known footerless-quoted-marker exposure, symmetric with "
+            "the pre-existing TIMEOUT/124 path — not a new regression"
+        )
+
+
+def test_genuine_exit_125_with_a_quoted_trailing_marker_is_misparsed_as_a_real_reap():
+    """(codex review finding, review-cli#243 round 21 — documents a KNOWN, pre-existing
+    exposure, NOT a regression introduced by this diff) A child that genuinely exits
+    125 for its own unrelated reason (see process.py's own extensive commentary on
+    this: timeout(1)'s wrapper-failed code, docker run, git-bisect skip) AND whose
+    real review output happens to end with a line that's an EXACT quote of the
+    TRUE-SILENCE marker text is misparsed as a genuine reap -- the parser's marker
+    scan is gated on `exit_code == 125 OR exit_code is None`, the SAME trailing-
+    position-only discipline the pre-existing TIMEOUT/124 scan uses, which has this
+    identical exposure for a genuine exit-124 child quoting the TIMEOUT marker as its
+    last line. This is a PARSER limitation only -- the in-process `.true_silenced`
+    attribute (process._run_streamed's own authoritative signal, never bare rc==125)
+    is completely unaffected; this only affects reading LOGS after the fact, where no
+    equivalent out-of-band signal survives to disk. Documented, not fixed, matching
+    the sibling footerless-marker test above."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body_quotes_marker_last = (
+            "Reviewing the true-silence handling; the log ends with:\n"
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n"
+        )
+        c = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                body_quotes_marker_last,
+                exit_code=125,
+            )
+        )
+        assert c.exit_code == 125
+        assert c.true_silenced is True, (
+            "documents the known genuine-exit-125-plus-quoted-marker exposure, "
+            "symmetric with the pre-existing TIMEOUT/124 path — not a new regression"
+        )
+
+
+def test_classify_call_true_silence_vs_bare_exit_125():
+    """(codex + Opus review finding) exit 125 alone is NOT authoritative -- some backends
+    legitimately exit 125 for their own unrelated reason. Only the parsed TRUE-SILENCE
+    marker (`call.true_silenced`) may bucket a call as HEALTH_TRUE_SILENCE; a genuine
+    EXIT 125 with real output and no marker must fall through to the ordinary classes,
+    same as before this feature existed."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        genuine = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+                exit_code=125,
+            )
+        )
+        bare_125 = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100010_000000",
+                "opencode",
+                0,
+                "some unrelated wrapper exit -- full real review output here\n",
+                exit_code=125,
+            )
+        )
+        assert p.classify_call(genuine) == p.HEALTH_TRUE_SILENCE
+        assert p.classify_call(bare_125) != p.HEALTH_TRUE_SILENCE, (
+            "a bare exit 125 with no marker must not be misclassified as true-silence"
+        )
+        assert p.classify_call(bare_125) == p.HEALTH_ERROR
+
+
+def test_classify_call_true_silence_cooldown_skip_is_not_paywall():
+    """(Fable review finding) `_cooldown_skip_result` (reviewlib/backends.py) deliberately
+    reuses the paywall-shaped `is currently unavailable` sentinel for EVERY cached-cooldown
+    skip, including a true-silence-caused one, so the skipped call isn't invisible on the
+    dashboard. Without a distinct check, that means a seat benched for going silent -- not
+    for a real quota/paywall rejection -- would show a HEALTH_PAYWALL badge for its entire
+    escalated cooldown window (10min-8h), misleading an operator into checking billing for
+    a seat that never hit a quota. A genuine quota-cooldown skip (a real paywall/session-
+    limit reason cached earlier) must still classify as HEALTH_PAYWALL."""
+    from reviewlib.backends import _bounded_cooldown_skip_body
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        true_silence_skip_body = _bounded_cooldown_skip_body(
+            "oc:zai/glm-5.2", "true-silence timeout", 1800
+        )
+        quota_skip_body = _bounded_cooldown_skip_body(
+            "claude:claude-fable-5", "session limit / usage credits", 1800
+        )
+        true_silence_skip = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                true_silence_skip_body,
+                argv0="opencode -m zai/glm-5.2 (seat-cooldown skip)",
+                exit_code=0,
+            )
+        )
+        quota_skip = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100010_000000",
+                "claude",
+                0,
+                quota_skip_body,
+                argv0="seat-cooldown skip (claude)",
+                exit_code=0,
+            )
+        )
+        assert p.classify_call(true_silence_skip) == p.HEALTH_TRUE_SILENCE, (
+            "a true-silence cooldown skip must not be bucketed as a paywall event"
+        )
+        assert p.classify_call(quota_skip) == p.HEALTH_PAYWALL, (
+            "a genuine quota/paywall cooldown skip must still classify as paywall"
+        )
+
+
+def test_true_silence_skip_max_len_matches_the_bound_it_mirrors():
+    """(Fable review finding) `parser._TRUE_SILENCE_SKIP_MAX_LEN` hand-mirrors
+    `backends._UNAVAILABLE_MAX_LEN` rather than importing it, so the two constants can
+    silently drift apart -- if backends' bound ever grows, a skip body for a longer
+    model id would contain the full anchored true-silence clause but still get
+    length-gated out by parser's stale copy, landing back on HEALTH_PAYWALL for the
+    whole cooldown window (the exact misclassification this feature exists to prevent).
+    This pins the two constants equal so a future change to either fails loudly."""
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    assert p._TRUE_SILENCE_SKIP_MAX_LEN == backends._UNAVAILABLE_MAX_LEN
+
+
+def test_classify_call_body_merely_quoting_the_skip_reason_is_not_true_silence():
+    """(codex review finding) an earlier version of the true-silence-skip check matched
+    the bare substring "(cached: true-silence timeout;", which a normal EXIT-0 review
+    whose body happens to quote or discuss that exact reason string (this diff's own
+    source or tests, for instance) would also match -- misclassifying a real successful
+    review as a true-silence reap. Only the SKIP body's full, distinctive trailing
+    clause (the exact digits-and-module-name suffix `_bounded_cooldown_skip_body`
+    always emits) must trigger the true-silence class."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        quoting_call = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "codex",
+                0,
+                'The fix adds record_cooldown(model, "true-silence timeout") at line 694, '
+                "building on `(cached: true-silence timeout; ...)` from backends.py.\n"
+                "Looks correct, no further findings.\n",
+                exit_code=0,
+            )
+        )
+        assert p.classify_call(quoting_call) != p.HEALTH_TRUE_SILENCE, (
+            "a review body merely quoting the reason string must not be misclassified "
+            "as a true-silence reap"
+        )
+
+
+def test_compute_stats_true_silence_calls():
+    """compute_stats populates `true_silence_calls` as its own counter, distinct from
+    `timeout_calls` -- the dashboard metric this feature was built to stop losing."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+            exit_code=125,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100010_000000",
+            "codex",
+            0,
+            "partial\n[review-cli] TIMEOUT after 10s — partial output above]\n",
+            exit_code=124,
+        )
+        _write_call_log(ld, "20260601T100020_000000", "gemini", 0, "ok\n", exit_code=0)
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["true_silence_calls"] == 1
+        assert stats["timeout_calls"] == 1
+        assert stats["call_count"] == 3
+
+
+def test_real_true_silence_reap_round_trips_through_the_real_parser():
+    """(Opus review finding, review-cli#243 round 6) Every other true-silence parser
+    test hand-writes the marker string via `_write_call_log` -- the marker literal is
+    duplicated between `reviewlib.process` (the writer) and the tests (the fixtures),
+    so a future change to the writer's exact wording could drift silently: the parser
+    tests would stay green (testing the OLD wording) while the dashboard quietly loses
+    the true-silence class on real logs. This drives a REAL `_run_streamed` reap and
+    parses the REAL sidecar log it writes, closing that gap -- mirrors the shape
+    tests/test_true_silence_cooldown_wiring.py's sidecar-log test already uses for the
+    cooldown-skip path."""
+    import sys as _sys
+
+    from reviewlib import process as review_process
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        saved = os.environ.get("REVIEW_LOG_DIR")
+        os.environ["REVIEW_LOG_DIR"] = log_dir
+        try:
+            code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+            result = review_process._run_streamed(
+                [_sys.executable, "-c", code],
+                cwd=REPO_ROOT,
+                timeout=30,
+                backend="opencode",
+                round_no=0,
+                true_silence_timeout=1,
+            )
+            assert result.true_silenced is True
+
+            from reviewlib.dashboard import parser as p
+
+            logs = sorted(Path(log_dir).glob("*-opencode-r0.log"))
+            assert logs, "no sidecar log written for the real true-silence reap"
+            call = p.parse_call_log(logs[-1])
+            assert call is not None
+            assert call.true_silenced is True
+            assert call.true_silence_secs == 1
+            assert p.classify_call(call) == p.HEALTH_TRUE_SILENCE
+        finally:
+            if saved is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = saved
 
 
 def test_parse_call_log_rejects_bad_name():
@@ -708,6 +1448,58 @@ def test_load_sessions_cached_parses_once_then_invalidates_on_change():
             )  # the >90s-later call clusters as a new session
         finally:
             p.parse_call_log = real_parse_call_log
+            p.invalidate_sessions_cache()
+
+
+def test_writing_the_call_log_cache_does_not_itself_invalidate_the_session_memo():
+    """review-cli#317 review, GLM MEDIUM finding: `load_sessions` now writes its own
+    persistent cache file INTO the scanned log dir (`call_log_cache.save`). If
+    `_dir_signature` counted that file too, every `load_sessions_cached` call would
+    invalidate itself on its own very next read (the producer's write moves the
+    signature it's about to be memoised under), forcing a full re-parse after every
+    single request -- exactly the thrash class `load_sessions_cached` exists to
+    prevent. Spies on `load_sessions` ITSELF (not `parse_call_log`, which a per-file
+    cache can mask) to prove the OUTER memo genuinely isn't re-invoked, not just that
+    per-file work happens to be cheap the second time."""
+    from reviewlib.dashboard import parser as p
+
+    load_calls = {"n": 0}
+    real_load_sessions = p.load_sessions
+
+    def _counting_load_sessions(*args, **kwargs):
+        load_calls["n"] += 1
+        return real_load_sessions(*args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.load_sessions = _counting_load_sessions
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0
+            )
+
+            first_sig = p._dir_signature(ld)
+            p.load_sessions_cached(ld, gap_seconds=90)
+            assert load_calls["n"] == 1
+
+            # `load_sessions` just wrote its own cache file(s) into `ld` as a side
+            # effect. The signature must be UNCHANGED by that write -- it only tracks
+            # the source `.log`/`.md` artifacts, never derived cache data.
+            assert p._dir_signature(ld) == first_sig, (
+                "the call-log cache's own files must not move `_dir_signature` -- "
+                "otherwise every load_sessions call invalidates its own memo entry"
+            )
+
+            # A second call on the (truly) unchanged dir must hit the OUTER memo and
+            # never re-enter `load_sessions` at all.
+            p.load_sessions_cached(ld, gap_seconds=90)
+            assert load_calls["n"] == 1, (
+                f"load_sessions re-ran ({load_calls['n']} calls) even though nothing "
+                "but the cache's own bookkeeping changed on disk"
+            )
+        finally:
+            p.load_sessions = real_load_sessions
             p.invalidate_sessions_cache()
 
 
@@ -1301,12 +2093,17 @@ def test_fallback_resolves_for_real_call_resolved_gateway_ids():
     # form today) resolves a real fallback, not None — the production failing-seat case.
     kimi_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Kimi")
     assert p._fallback_seat_for(kimi_seat) is not None
-    # The z.ai GLM seat is now the LAST-RESORT reserve (deprioritized, review-cli#65), so by
-    # construction it has no next-priority fallback — None is the correct hint for the lowest
-    # seat (the general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
+    # The z.ai GLM seat is deprioritized (review-cli#65) but no longer the very last
+    # seat: Fable is (review-cli#fable-seat-reliability, a confirmed ~100% dispatch
+    # failure rate demoted it below even GLM). GLM still resolves a real fallback (to
+    # Fable); Fable itself has none — None is the correct hint for the lowest seat (the
+    # general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
     glm_seat = next(b.model for b in DEFAULT_BOARD if b.display == "GLM")
-    assert glm_seat == DEFAULT_BOARD[-1].model, glm_seat  # pin: GLM is the last seat
-    assert p._fallback_seat_for(glm_seat) is None
+    fable_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Fable")
+    assert fable_seat == DEFAULT_BOARD[-1].model, fable_seat  # pin: Fable is last
+    fb = p._fallback_seat_for(glm_seat)
+    assert fb is not None and fb["model"] == fable_seat, fb
+    assert p._fallback_seat_for(fable_seat) is None
 
 
 def test_to_summary_exposes_enriched_errors_for_the_errors_tab():
@@ -1387,11 +2184,18 @@ def test_invocations_endpoint_returns_populated_prompt_for_panel():
             )
             from reviewlib.dashboard import server
 
+            orig_cache = server._session_cache
+            server._session_cache = server._SessionCache()
             httpd = server.make_server(0)
             base = f"http://127.0.0.1:{httpd.server_address[1]}"
             t = threading.Thread(target=httpd.serve_forever, daemon=True)
             t.start()
             try:
+                # A genuinely cold first hit serves an empty placeholder immediately and
+                # populates in the background (review-cli#323) — wait for it, then re-request.
+                with urllib.request.urlopen(base + "/api/runs", timeout=10) as r:
+                    json.loads(r.read().decode("utf-8"))
+                _wait_for_cache_refresh(server._session_cache, timeout=10.0)
                 with urllib.request.urlopen(base + "/api/runs", timeout=10) as r:
                     runs = json.loads(r.read().decode("utf-8"))
                 assert len(runs) == 1, runs
@@ -1403,6 +2207,7 @@ def test_invocations_endpoint_returns_populated_prompt_for_panel():
             finally:
                 httpd.shutdown()
                 httpd.server_close()
+                server._session_cache = orig_cache
         finally:
             os.environ.pop("REVIEW_LOG_DIR", None)
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
@@ -1456,11 +2261,17 @@ def test_session_cache_is_single_flight_and_invalidates_on_new_run():
             for w in workers:
                 w.join()
 
-            # Single-flight: eight concurrent cold callers => exactly ONE computation.
+            # A genuinely cold cache never blocks a caller (review-cli#323): every one of the
+            # 8 concurrent callers gets the empty placeholder immediately, and — single-flight —
+            # exactly ONE background computation was kicked to populate it (not 8 stampeding).
+            assert set(results) == {0}, results
             assert calls["n"] == 1, (
                 f"expected single-flight (1 compute), got {calls['n']}"
             )
-            assert set(results) == {1}, results  # all saw the same one run
+            _wait_for_cache_refresh(server._session_cache)
+            assert len(server._summaries_for_gap(90.0)) == 1, (
+                "the single background compute must have landed the real (1-row) result"
+            )
 
             # Unchanged log dir => served from cache, no recompute. /api/stats shares the SAME
             # cached parse, so requesting it must not trigger a second load_sessions.
@@ -1526,8 +2337,10 @@ def test_session_cache_window_suppresses_thrash_under_active_writes():
         orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
         server._SUMMARY_MIN_RECOMPUTE_SECONDS = 3600.0
         try:
-            # First call computes once and caches.
-            assert len(server._summaries_for_gap(90.0)) == 1
+            # Warm the cache explicitly (this test is about window-thrash suppression on an
+            # already-warm cache, not the cold-start path — force=True still blocks
+            # synchronously, see test_explicit_prewarm_still_blocks_synchronously).
+            assert len(server._session_cache.get(90.0, force=True)) == 1
             assert calls["n"] == 1
 
             # Simulate the active writer: several new logs land, each bumping the fingerprint.
@@ -1576,6 +2389,13 @@ def test_stats_are_memoized_until_session_list_reparses():
         orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
         server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
         try:
+            # Warm the cache explicitly first (force=True still blocks synchronously — this
+            # test is about the derived-stats memo on an established baseline, not the
+            # cold-start path itself, see test_cold_first_request_never_blocks_on_full_parse).
+            server._session_cache.get(90.0, force=True)
+            stat_calls["n"] = (
+                0  # the force=True warm-up above doesn't build derived stats
+            )
             server._cached_stats(90.0)
             server._cached_stats(90.0)
             server._cached_stats(90.0)
@@ -1634,8 +2454,11 @@ def test_stale_read_returns_immediately_and_refreshes_in_background():
         orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
         server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
         try:
-            # Warm the cache (this first call IS synchronous — nothing to serve yet).
-            assert len(server._summaries_for_gap(90.0)) == 1
+            # Warm the cache explicitly (force=True still blocks synchronously — see
+            # test_explicit_prewarm_still_blocks_synchronously; an ordinary cold call no
+            # longer blocks here, see test_cold_first_request_never_blocks_on_full_parse,
+            # so this test forces the warm-up itself to isolate the STALE behavior below).
+            assert len(server._session_cache.get(90.0, force=True)) == 1
             # Now make the reparse slow and add a new run; the stale read must come back fast.
             slow["on"] = True
             _write_call_log(
@@ -1658,6 +2481,356 @@ def test_stale_read_returns_immediately_and_refreshes_in_background():
         finally:
             server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
             p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_cold_first_request_never_blocks_on_full_parse():
+    """review-cli#323: on a real 130k-file/10GB install, the FIRST parse ever (nothing
+    cached yet — a fresh server start racing a request before `prewarm_summary_cache`
+    finishes) took ~130s, and a request landing in that window blocked on the SAME lock
+    the prewarm held — `curl -m 150 /api/stats` came back with ZERO bytes after 150s+.
+    The cold case must behave like the already-warm STALE case above: serve an empty
+    placeholder immediately and populate it via a background parse, never block a real
+    request on the full scan — this is the fix, verified WITHOUT ever having warmed the
+    cache first (unlike the sibling stale-read test, which warms it before making it slow)."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        import time as _time
+
+        orig_load = p.load_sessions
+
+        def _slow_load(*a, **k):
+            _time.sleep(1.0)  # stand in for the ~130s real-scale cold parse
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()  # genuinely cold, never warmed
+        p.load_sessions = _slow_load
+        try:
+            t0 = _time.monotonic()
+            cold = server._summaries_for_gap(90.0)
+            elapsed = _time.monotonic() - t0
+            assert elapsed < 0.5, (
+                f"cold first request must not block on the slow parse, took {elapsed:.2f}s"
+            )
+            assert cold == [], (
+                "a genuinely cold cache must serve an empty placeholder, not fabricate data"
+            )
+            stats = server._cached_stats(90.0)
+            assert stats.get("session_count") == 0, stats
+
+            # The background parse lands shortly after and the real run then appears.
+            _wait_for_cache_refresh(server._session_cache, timeout=5.0)
+            assert len(server._summaries_for_gap(90.0)) == 1, (
+                "the background parse must populate the real session once it lands"
+            )
+        finally:
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_cold_cache_retries_after_a_failed_background_parse():
+    """review-cli#323 review finding: the cold placeholder used to set `_fingerprint` to
+    the CURRENT (real) fingerprint at install time, before the background parse had even
+    run. If that parse then failed, `_should_refresh` saw `_fingerprint == fingerprint`
+    (nothing "changed") and never retried -- the dashboard stayed permanently empty. This
+    must instead retry (bounded by `_SUMMARY_MIN_RECOMPUTE_SECONDS`) once the parse starts
+    succeeding again."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        orig_load = p.load_sessions
+        should_fail = {"on": True}
+
+        def _maybe_fail(*a, **k):
+            if should_fail["on"]:
+                raise ValueError("simulated cold-parse failure")
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()  # genuinely cold
+        p.load_sessions = _maybe_fail
+        orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
+        server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
+        try:
+            cold = server._summaries_for_gap(90.0)
+            assert cold == [], "cold placeholder must still serve empty, not raise"
+            import time as _time
+
+            _time.sleep(0.2)  # let the doomed background parse fail and settle
+            assert server._session_cache._fingerprint is None, (
+                "a failed background parse must not mark the cache as caught-up"
+            )
+
+            # Parsing now succeeds; a later request must actually retry, not stay stuck.
+            should_fail["on"] = False
+            for _ in range(20):
+                server._summaries_for_gap(90.0)
+                if len(server._summaries_for_gap(90.0)) == 1:
+                    break
+                _time.sleep(0.1)
+            assert len(server._summaries_for_gap(90.0)) == 1, (
+                "cache must recover once the parse starts succeeding, not stay "
+                "permanently empty after one failed background parse"
+            )
+        finally:
+            server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_malformed_call_log_filename_does_not_crash_the_whole_scan():
+    """review-cli#323 review finding: `load_sessions` reached `parse_call_log` (and its
+    unguarded `_parse_stamp`) directly with no pre-check, unlike `tokenstats.list_call_logs`
+    which already guards this with `_safe_parse_stamp`. A single malformed-date filename
+    used to raise ValueError and abort the ENTIRE directory scan -- combined with the cold-
+    cache fingerprint bug above, this could leave the dashboard permanently blank the first
+    time such a file appeared. One bad file must be skipped, not fatal to the others."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+        # A filename that matches _CALL_RE's shape but has an invalid date component --
+        # _parse_stamp raises ValueError for this (month 99 is not a real month).
+        (ld / "20269999T999999_000000Z-codex-r0.log").write_text("ok\n")
+
+        sessions = p.load_sessions(ld, gap_seconds=90.0)
+        assert len(sessions) == 1, (
+            "the one well-formed call log must still be parsed and clustered despite "
+            "the malformed sibling"
+        )
+
+
+def test_parse_call_log_returns_none_not_raise_for_malformed_date():
+    """Unit-level guard for the fix's actual contract (review-cli#323 review finding):
+    `parse_call_log`'s own docstring says 'Returns None if the name doesn't match' --
+    a shape-matching-but-invalid date must honor that contract too, not raise."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        bad = Path(logd) / "20269999T999999_000000Z-codex-r0.log"
+        bad.write_text("ok\n")
+        assert p.parse_call_log(bad) is None
+
+
+def test_parse_brainstorm_log_returns_none_not_raise_for_malformed_date():
+    """Same contract, same fix, for the brainstorm `.md` sibling (review-cli#323 review
+    finding: a `.log`-only guard left this path still fatal to `load_sessions`)."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        bad = Path(logd) / "20269999T999999_000000Z-brainstorm.md"
+        bad.write_text("# Round 1\n")
+        assert p.parse_brainstorm_log(bad) is None
+
+
+def test_malformed_brainstorm_filename_does_not_crash_the_whole_scan():
+    """Directory-scan-level companion to the two unit tests above -- a malformed `.md`
+    sibling must not abort `load_sessions` any more than a malformed `.log` does."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+        (ld / "20269999T999999_000000Z-brainstorm.md").write_text("# Round 1\n")
+
+        sessions = p.load_sessions(ld, gap_seconds=90.0)
+        assert len(sessions) == 1, (
+            "the one well-formed call log must still be parsed despite the malformed "
+            "brainstorm sibling"
+        )
+
+
+def test_fresh_sessions_for_never_returns_another_lineages_data_after_retry_bound():
+    """review-cli#323 review finding (HIGH): the bounded lineage-retry loop must NOT
+    silently fall through to whatever is cached once its retry bound is exhausted --
+    that can be a DIFFERENT gap's clustered sessions, served to the caller as if they
+    were its own. Simulates sustained cross-lineage contention (every _ensure_fresh call
+    installs a DIFFERENT gap than the one asked for) and asserts the caller still gets
+    its OWN gap's real data, not someone else's."""
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        cache = server._SessionCache()
+        orig_ensure_fresh = cache._ensure_fresh
+
+        def _always_install_wrong_lineage(gap, *, force):
+            # Simulate another concurrent caller winning the race every single time.
+            with cache._lock:
+                cache._sessions = ["wrong-lineage-placeholder"]
+                cache._lineage = (gap + 999.0, str(ld))
+                cache._generation += 1
+
+        cache._ensure_fresh = _always_install_wrong_lineage
+        try:
+            sessions, _gen = cache._fresh_sessions_for(30.0, force=False)
+            assert sessions != ["wrong-lineage-placeholder"], (
+                "must never return another lineage's cached data after exhausting "
+                "the retry bound"
+            )
+            assert len(sessions) == 1, (
+                "the retry-bound fallback must do a real, correctly-lineaged parse"
+            )
+            assert _gen == -1, (
+                "the fallback's generation must be a sentinel (-1), never the "
+                "currently-cached FOREIGN lineage's real generation -- reusing that "
+                "real generation let get_derived() memoize this gap's derived value "
+                "under a tag a later request for the OTHER gap would also match"
+            )
+        finally:
+            cache._ensure_fresh = orig_ensure_fresh
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_get_derived_never_caches_a_retry_fallback_result_under_a_foreign_generation():
+    """review-cli#323 review finding (HIGH, found independently by two reviewers):
+    get_derived() must not store a derivation computed during the retry-bound fallback
+    (review-cli#323) under the real cache's (foreign-lineage) generation -- a later
+    request for that OTHER gap, at that same generation, would then incorrectly receive
+    THIS gap's derived value from the memo. Verifies the memo is empty after a
+    fallback-path get_derived() call, and that the "poisoned" generation still misses
+    on a normal same-generation lookup."""
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        cache = server._SessionCache()
+        # Seed a real cached lineage/generation, as if gap=90 already won the race.
+        cache._sessions = ["gap90-sessions"]
+        cache._lineage = (90.0, str(ld))
+        cache._fingerprint = (1, 1.0, 1)
+        cache._generation = 3
+        orig_ensure_fresh = cache._ensure_fresh
+        cache._ensure_fresh = lambda gap, *, force: None  # never installs gap=30
+        try:
+            value = cache.get_derived(
+                30.0, "stats", lambda sessions: f"stats-for-{len(sessions)}-sessions"
+            )
+            assert value == "stats-for-1-sessions", (
+                "sanity: the factory really did run over the fallback's real, "
+                "correctly-lineaged parse (one call log written at setup)"
+            )
+            assert "stats" not in cache._derived, (
+                "the fallback-path derived value must NOT be memoized at all -- it "
+                "was never tagged with a real generation, so a later same-generation "
+                "request for gap=90 must NOT receive it"
+            )
+        finally:
+            cache._ensure_fresh = orig_ensure_fresh
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_concurrent_same_lineage_sync_calls_both_complete_without_deadlock():
+    """review-cli#323 review: two concurrent sync callers for the exact same lineage
+    (e.g. two force=True calls, or a request racing the startup prewarm for the same
+    gap) each currently run their OWN full parse rather than sharing one -- a known,
+    deliberately-NOT-fixed-here gap tracked as review-cli#327 (an earlier attempt at a
+    wait-based single-flight fix was reverted after review found it introduced a worse,
+    narrower race). This test only guards the property that matters most: both callers
+    still complete with correct data and never deadlock, regardless of the redundant
+    work."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        import threading as _threading
+        import time as _time
+
+        orig_load = p.load_sessions
+        started = _threading.Event()
+
+        def _slow_load(*a, **k):
+            started.set()
+            _time.sleep(0.3)
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        p.load_sessions = _slow_load
+        try:
+            results: list[list] = []
+
+            def _call_force():
+                results.append(server._session_cache.get(90.0, force=True))
+
+            t1 = _threading.Thread(target=_call_force)
+            t1.start()
+            assert started.wait(timeout=2.0), "first parse must have started"
+            t2 = _threading.Thread(target=_call_force)
+            t2.start()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+            assert not t1.is_alive() and not t2.is_alive(), (
+                "both concurrent force=True callers must complete, not deadlock"
+            )
+            assert len(results) == 2
+            assert all(len(r) == 1 for r in results), (
+                "both callers must receive the real (non-empty) parsed result"
+            )
+        finally:
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_explicit_prewarm_still_blocks_synchronously():
+    """The startup prewarm (`force=True`) is deliberately the ONE caller that still blocks —
+    it runs on its own background thread already (never a real request's thread), and it
+    needs the actual parsed data to warm the derived-stats cache too, not an empty
+    placeholder it would just have to immediately redo."""
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        try:
+            sessions = server._session_cache.get(90.0, force=True)
+            assert len(sessions) == 1, (
+                "an explicit force=True prewarm must synchronously return real data"
+            )
+        finally:
             server._session_cache = orig_cache
             os.environ.pop("REVIEW_LOG_DIR", None)
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
@@ -1694,6 +2867,9 @@ def test_served_summary_does_not_share_mutable_state_with_cache():
         orig_cache = server._session_cache
         server._session_cache = server._SessionCache()
         try:
+            server._session_cache.get(
+                90.0, force=True
+            )  # warm; not testing cold-start here
             a = server._summaries_for_gap(90.0)
             b = server._summaries_for_gap(90.0)
             assert a and b
@@ -2285,8 +3461,10 @@ def test_compute_model_health_covers_board_and_flags_problematic():
                 argv0="opencode -m zai/glm-5.2",
                 exit_code=401,
             )
-        # Fable (claude) is a heavy-preset seat; the dashboard covers the full built-in
-        # raw board so heavy runs still get priority/fallback/health treatment.
+        # k3 review finding (review-cli#286, round 3): Fable is now in NO preset
+        # (raw-board last-resort only, post-demotion) — the dashboard still covers
+        # the full built-in raw board (not just the active preset), so priority/
+        # fallback/health treatment for a raw-board-only seat is exercised here.
         _fable_paywall_log(ld, "20260601T120000_000000")
         # Codex — 4 healthy calls => NOT problematic (ok-rate 100%).
         for i in range(4):

@@ -397,6 +397,7 @@ PANELS.overview = () => {
     ['success', s.success_rate != null ? Math.round(s.success_rate * 100) + '%' : '—', 'calls returning clean'],
     ['errors', s.error_calls, 'failed calls'],
     ['timeouts', s.timeout_calls, 'calls that aged out'],
+    ['true-silence', s.true_silence_calls != null ? s.true_silence_calls : 0, 'calls reaped for producing zero output'],
     ['conscious', s.conscious_count, 'reviewed by overseer'],
   ];
   let html = `<div class="panel-head"><h2>Overview</h2><p class="sub">Sessions are time-clustered bursts of backend calls (review-cli emits no run id; gap = ${state.gap}s).</p></div>`;
@@ -500,6 +501,7 @@ const HEALTH_LABEL = {
   auth: 'auth (bad key)',
   blocked: 'blocked (bot)',
   timeout: 'timeout',
+  true_silence: 'true-silence (no output)',
   empty: 'empty output',
   error: 'error',
   no_data: 'no data',
@@ -573,6 +575,7 @@ PANELS.metrics = () => {
     <tr><td>OK calls</td><td>${esc(s.ok_calls)}</td></tr>
     <tr><td>Error calls</td><td>${esc(s.error_calls)}</td></tr>
     <tr><td>Timeout calls</td><td>${esc(s.timeout_calls)}</td></tr>
+    <tr><td>True-silence calls</td><td>${esc(s.true_silence_calls != null ? s.true_silence_calls : 0)}</td></tr>
     <tr><td>Running / unknown</td><td>${esc(s.running_calls != null ? s.running_calls : 0)}</td></tr>
     <tr><td>Success rate</td><td>${s.success_rate != null ? Math.round(s.success_rate * 100) + '%' : '—'}</td></tr>
     <tr><td>Duration min</td><td>${fmtDur(d.min)}</td></tr>
@@ -646,9 +649,16 @@ function errorCard(sid, mode, started, e) {
   const cls = e.health_class || 'error';
   const rec = e.recovery || 'unrecovered';
   const recBadge = `<span class="badge ${RECOVERY_CLASS[rec] || 'err'}" title="recovery status">${esc(RECOVERY_LABEL[rec] || rec)}</span>`;
-  // A timeout is amber (transient/retryable); every other failure class — hard-unavailable
-  // (paywall/auth/blocked) and the generic error — is red.
-  const classBadge = `<span class="badge ${cls === 'timeout' ? 'degraded' : 'err'}">${esc(HEALTH_LABEL[cls] || cls)}</span>`;
+  // A timeout (ordinary or true-silence) is amber -- neither is a hard admin-level
+  // block (paywall/auth/bot-block), which is what red is reserved for below. codex
+  // review finding (review-cli#243 round 15): the two are NOT both "retryable" in the
+  // sense retry.classify_failure actually uses -- rc=124 (ordinary timeout) IS
+  // FailureClass.RETRYABLE (retried in-seat up to a cap before falling to reserve),
+  // but rc=125 (true-silence) is FailureClass.SEAT_FATAL (straight to reserve, no
+  // same-seat retry -- a seat that produced NOTHING at all is a stronger "broken"
+  // signal, matching the escalating cooldown this reap also records). The color here
+  // reflects "not a hard block", not "will be retried the same way".
+  const classBadge = `<span class="badge ${cls === 'timeout' || cls === 'true_silence' ? 'degraded' : 'err'}">${esc(HEALTH_LABEL[cls] || cls)}</span>`;
   const summary = e.summary ? `<div class="err-summary"><code>${esc(e.summary)}</code></div>` : '';
   // Recovery action row: a recovered/partial error needs no action; an unrecovered one offers
   // the next fallback seat (retry path) and a manual-control button (give up on auto-failover).
@@ -929,13 +939,22 @@ function renderDetail(d) {
   if (!(d.calls || []).length && !d.brainstorm)
     html += emptyState('calls', "This session's per-call logs aged out of the log dir.");
   (d.calls || []).forEach((c, i) => {
+    // codex review finding, review-cli#243 round 6: a timeout (ordinary OR true-
+    // silence) is not a hard admin-level block, same distinction the Errors panel's
+    // classBadge already draws (degraded/amber) vs. a hard error (err/red) -- see that
+    // badge's own comment for why "retryable" is the wrong word for true-silence
+    // specifically (it's SEAT_FATAL in retry.py, not retried the same way rc=124 is).
+    // The per-call view was still showing both as "err" (pre-existing for timed_out; true_silenced
+    // faithfully mirrored it in round 3), inconsistent with that declared semantics.
     const status = c.timed_out
-      ? `<span class="badge err">timeout ${c.timeout_secs}s</span>`
-      : c.has_error
-        ? `<span class="badge err">error</span>`
-        : c.completed === false
-          ? `<span class="badge running">running</span>`
-          : `<span class="badge ok">ok</span>`;
+      ? `<span class="badge degraded">timeout ${c.timeout_secs}s</span>`
+      : c.true_silenced
+        ? `<span class="badge degraded">true-silence ${c.true_silence_secs}s</span>`
+        : c.has_error
+          ? `<span class="badge err">error</span>`
+          : c.completed === false
+            ? `<span class="badge running">running</span>`
+            : `<span class="badge ok">ok</span>`;
     html += `<div class="call">
       <div class="call-head" data-call="${i}">
         <span class="call-ix">▸</span>

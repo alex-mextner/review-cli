@@ -44,6 +44,7 @@ from .config import (
     load_board,
     load_config,
     parse_effort_flag,
+    preset_board,
     preset_names,
     preset_pool_size,
     split_pool_reserve,
@@ -1422,16 +1423,21 @@ def _render_stat_harness_table(
 
 
 def _render_stat_fable_section(fable: dict) -> str:
-    """Surfaces the investigation's headline finding: the priority-1 Fable seat's
-    dispatch/failure rate and WHY it failed (session-limit vs paywall vs auth vs other)."""
+    """Surfaces the investigation's headline finding: the Fable seat's dispatch/failure
+    rate and WHY it failed (session-limit vs paywall vs auth vs other).
+
+    review-cli#fable-seat-reliability: the label dropped "priority-1" — that demotion
+    (DEFAULT_BOARD priority 1 -> last-resort reserve) is the whole point of that
+    change, so a report still claiming Fable sits at priority 1 would be actively
+    wrong about its own subject."""
     if not fable["dispatch_attempts"] and not fable["retry_events"]:
-        return "Fable (priority-1 board seat): no dispatch attempts recorded in this window."
+        return "Fable (board seat): no dispatch attempts recorded in this window."
     rate = (
         f"{fable['failure_rate']:.0%}" if fable["failure_rate"] is not None else "n/a"
     )
     reasons = fable["retry_event_reasons"]
     return (
-        "Fable (priority-1 board seat) pattern:\n"
+        "Fable (board seat) pattern:\n"
         f"  dispatch attempts: {fable['dispatch_attempts']}   "
         f"cached-skips: {fable['cached_skips']}   failure rate: {rate}\n"
         f"  retry/promotion events: {fable['retry_events']} "
@@ -3181,7 +3187,8 @@ def _add_global_options(
             help=(
                 "diff-review preset: light = quick/cheap preflight (pool 2, medium effort); "
                 "default = routine change review (pool 4, high effort, excludes Fable/Sol); "
-                "heavy = release/risky-change review (pool 4, highest effort, includes Fable/Sol). "
+                "heavy = release/risky-change review (pool 4, highest effort, excludes "
+                "Fable — a confirmed near-total dispatch failure rate — but includes Sol). "
                 f"If no config board/models are set, review diff uses {DEFAULT_PRESET!r}."
             ),
         )
@@ -3193,7 +3200,9 @@ def _add_global_options(
         help=(
             "how many of the board's seats to run (default "
             f"{preset_pool_size('default')} for default/heavy, {preset_pool_size('light')} "
-            f"for light; {DEFAULT_POOL_SIZE} with no preset); the "
+            f"for light — a bare `review diff` uses {preset_pool_size(DEFAULT_PRESET)}, the "
+            f"{DEFAULT_PRESET!r} preset's pool; {DEFAULT_POOL_SIZE} is only the fallback for a "
+            "custom config `models:`/`board:` roster with no `pool:` key set); the "
             "first N seats participate, the rest are kept in reserve. The board is "
             "never off — --pool only sizes it. N<=0 means all seats. Ignored for explicit -m."
         ),
@@ -3448,7 +3457,13 @@ def _help_topic_config() -> str:
     """The `review help config` deep reference (ROADMAP "Topic-based help across the
     ecosystem"): config file path + cascade, the keys, key/auth env vars, and how the
     reviewer board + model selection resolve. Kept in sync with config.py / backends.py
-    behavior (help-docs-sync); a flag/behavior change updates this topic in the same commit."""
+    behavior (help-docs-sync); a flag/behavior change updates this topic in the same commit.
+
+    NOTE: the "REVIEWER BOARD + PRESETS" section below derives its stated effort from
+    `preset_board(DEFAULT_PRESET)[0].effort` — correct only because DEFAULT_PRESET's board
+    has UNIFORM effort across all seats (true for "light"/"default", not for "heavy",
+    which mixes xhigh/max). If DEFAULT_PRESET ever becomes "heavy", that line needs a
+    real fix, not just re-pointing the same expression."""
     return f"""\
 review — configuration reference
 ================================
@@ -3502,9 +3517,12 @@ SELECTION CASCADE, by mode:
 
 REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints it live)
   A priority-ordered panel of seats, each model carrying its own
-  role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool 4, high effort,
-  without Fable/Sol. Use `--preset light` for quick preflight (pool 2, medium effort) and
-  `--preset heavy` for release/risky changes (Fable/Sol/Opus/GLM-cc at highest effort).
+  role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool
+  {preset_pool_size(DEFAULT_PRESET)}, {preset_board(DEFAULT_PRESET)[0].effort} effort, without
+  Fable/Sol. Use `--preset default` for a routine change review (pool 4, high effort)
+  or `--preset heavy` for release/risky changes (Sol/Opus/GLM-cc/Kimi at highest effort;
+  Fable is excluded from every preset — a confirmed ~100% dispatch failure rate, see
+  DEFAULT_BOARD's own comment — and sits last-resort in the raw board instead).
   `--pool N` sizes the selected board (`--pool 0` = all available). Explicit -m never lets config add extra seats; it narrows
   configured metadata when present, else uses the flat exact panel. To set the priority
   roster, configure `models:`. To add role/name/effort metadata (or a full board when
@@ -3533,16 +3551,67 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           <= 0 disables it. See `review stat`'s section
                                           in README.md.
     REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window for a
-                                          chronically-unavailable claude seat (Fable;
-                                          NOT wired into opencode/commandcode backends
-                                          yet — see review-cli#226). Unset:
-                                          the window ESCALATES per consecutive failure
-                                          (10min, 30min, 2h, then 8h cap), resetting to
-                                          10min after a success or a 24h quiet period.
-                                          Set: that fixed window every time, no
-                                          escalation; <= 0 disables cooldowns entirely.
+                                          chronically-unavailable claude seat (Fable).
+                                          opencode also consults + records + clears
+                                          this store for a TRUE-SILENCE trip
+                                          (review-cli#235, see
+                                          REVIEW_TRUE_SILENCE_SECONDS below), AND for
+                                          the SAME shared administrative-sentinel/
+                                          quota-marker phrases claude's own detection
+                                          uses (codex review finding, round 18: an
+                                          earlier version of this text wrongly said
+                                          that detection "remains claude-only" — it
+                                          does not, as of #243's round-12 fix).
+                                          opencode-SPECIFIC quota wording that matches
+                                          none of the shared phrases is still not
+                                          recognised (falls through as a genuine
+                                          success) — see review-cli#226.
+                                          commandcode/zai HTTP backends have no
+                                          cooldown consult/record/clear at all yet.
+                                          Unset: the window
+                                          ESCALATES per consecutive failure (10min,
+                                          30min, 2h, then 8h cap), resetting to 10min
+                                          after a success or a 24h quiet period. Set:
+                                          that fixed window every time, no escalation;
+                                          <= 0 disables cooldowns entirely.
     REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
                                           ~/.config/review-cli/seat-cooldown.json).
+    REVIEW_TRUE_SILENCE_SECONDS=N       — how many seconds of ZERO output an opencode
+                                          seat gets before it is reaped as stuck rather
+                                          than silently thinking (default 5min, per-model
+                                          overridable in reviewlib/model_behavior.py's
+                                          registry; review-cli#235). A trip records a
+                                          REVIEW_SEAT_COOLDOWN_SECONDS-governed cooldown
+                                          for that model. <= 0 disables the check
+                                          entirely (mirrors REVIEW_IDLE_TIMEOUT_SECONDS=0).
+                                          Only applies before the call's FIRST byte of
+                                          output ever arrives — see review-cli#239 for
+                                          the currently-uncovered mid-call-silence case.
+                                          Before the first byte, this REPLACES
+                                          REVIEW_IDLE_TIMEOUT_SECONDS as the sole reap
+                                          authority (not a min() of the two) — an
+                                          operator who tightens the idle timeout below
+                                          this value does NOT get an earlier pre-output
+                                          reap. There is no way to COMBINE the two for
+                                          an earlier pre-first-byte cutoff: for any
+                                          positive REVIEW_IDLE_TIMEOUT_SECONDS value,
+                                          it has NO effect before the first byte, no
+                                          matter what it is set to — the only lever
+                                          pre-first-byte is lowering
+                                          REVIEW_TRUE_SILENCE_SECONDS itself (codex
+                                          review finding, review-cli#243 round 15: an
+                                          earlier version of this text wrongly implied
+                                          setting both env vars together could make a
+                                          short idle floor also apply pre-output; it
+                                          cannot — see review-cli#254 for the related
+                                          deadline-clamp discussion). One EXCEPTION
+                                          (codex review finding, round 18):
+                                          REVIEW_IDLE_TIMEOUT_SECONDS=0 (the explicit
+                                          "disable idle reap entirely" value) also
+                                          disables true-silence — it is not just "no
+                                          effect", it turns the check OFF, since the
+                                          true-silence poll branch only runs at all
+                                          when idle reap is enabled.
   codex / opencode / omp carry their own CLI auth (no key here).
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
@@ -4413,7 +4482,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # configured seats. A configured `models:` list is the full priority-ordered roster from
     # which the active pool + reserve are selected; optional `board:` entries can still
     # provide role/name metadata for those models. The board is NEVER disabled — `--pool N`
-    # only sizes how many of its seats run (default 4; the rest are reserve). `use_board` is
+    # only sizes how many of its seats run (default 2, the light preset; the rest are
+    # reserve). `use_board` is
     # a cheap boolean gate computed now; the actual board resolution + cost-safety validation
     # (and the --pool slice) runs LATER
     # (validate_board, below) — after the standalone-visual path has had its chance to
@@ -4830,6 +4900,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         #     not preempt that no-op with an EXIT_UNSATISFIED. Inert on the happy path + fake
         #     backend.
         if mode.name == "review" and diff.strip():
+            # `preset_pool_size(active_preset)`, NOT `preset_pool_size(DEFAULT_PRESET)`
+            # (2 review-round finding, all 3 reviewers, after the light-default change):
+            # `active_preset` is `None` for a custom config `models:`/`board:` roster —
+            # in that case a no-override run ACTUALLY resolves pool via
+            # `preset_pool_size(None) == DEFAULT_POOL_SIZE` (4, cli.py ~4218), not the
+            # preset system's own default (2). Passing the literal `DEFAULT_PRESET` here
+            # would silently halve the guard's promised pool for every config-roster user,
+            # contradicting the very comment/help text this same change added elsewhere.
             guard_rc = _evaluate_pool_or_bail(
                 config,
                 config_models,
@@ -4837,7 +4915,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 _seats_of(board),
                 explicit_models,
                 args.pool,
-                _config_default_pool(config) or DEFAULT_POOL_SIZE,
+                _config_default_pool(config) or preset_pool_size(active_preset),
             )
             if guard_rc is not None:
                 return guard_rc
@@ -4907,6 +4985,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # whose panels keep their own behaviour and never see review-specific proposal text) AND
     # to a non-empty diff (an empty diff runs no panel — see the board-path note above).
     if mode.name == "review" and diff.strip():
+        # See the matching `preset_pool_size(active_preset)` comment above — same
+        # config-roster-vs-preset-system distinction applies here.
         guard_rc = _evaluate_pool_or_bail(
             config,
             config_models,
@@ -4914,7 +4994,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             tuple((m, m) for m in models),
             explicit_models,
             args.pool,
-            _config_default_pool(config) or DEFAULT_POOL_SIZE,
+            _config_default_pool(config) or preset_pool_size(active_preset),
         )
         if guard_rc is not None:
             return guard_rc
@@ -5031,7 +5111,19 @@ def _show_board(
     pool_filled = (
         len(board) if exact_board else _effective_pool_size(available_count, pool_size)
     )
-    sized = " (sized by preset/--pool)" if pool_size != DEFAULT_POOL_SIZE else ""
+    # The "sized" marker fires iff the RESOLVED pool differs from the selected preset's
+    # (or the config-roster fallback's) own default pool — typically an explicit
+    # --pool N that isn't equal to that default. It does NOT fire just because a
+    # non-bare --preset was passed (a preset's own resolved pool always equals
+    # preset_pool_size(that preset), so that clause alone can never trip it) — review
+    # finding, comment corrected to match actual behavior, not aspiration. Comparing
+    # against the bare constant DEFAULT_POOL_SIZE (4) unconditionally was wrong once a
+    # bare `review --show-board` started resolving the light preset's pool of 2 (Alex,
+    # 2026-08-28): every unadorned invocation would misleadingly claim to be "sized".
+    # `preset_pool_size(None)` already returns DEFAULT_POOL_SIZE (review finding: a
+    # prior `if preset else DEFAULT_POOL_SIZE` ternary duplicated that same fallback).
+    bare_default_pool = preset_pool_size(preset)
+    sized = " (sized by preset/--pool)" if pool_size != bare_default_pool else ""
     if exact_board:
         print(
             f"Reviewer board ({len(board)} explicit seats, source: {source}; "

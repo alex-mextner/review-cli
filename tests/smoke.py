@@ -383,27 +383,32 @@ def test_board_flags_and_listing():
     assert_not_in("--no-board", top)
     board = review_out("--show-board")
     for needle in (
-        "source: preset:default",
+        # Bare `--show-board` now resolves to the "light" preset (Alex, 2026-08-28:
+        # cheap/quick preflight is the default; "default"/"heavy" are opt-in).
+        "source: preset:light",
         "claude:claude-opus-4-8",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "oc:zai/glm-5.2",
         "contracts",
         "8 seats",
         "#1",
-        # The CTO-directed GLM-5.2-via-commandcode seat (default preset, diff-only keyed HTTP).
+        # The CTO-directed GLM-5.2-via-commandcode seat (light preset, diff-only keyed HTTP).
         "commandcode:zai-org/GLM-5.2",
         "GLM-cc",
     ):
         assert_in(needle, board, "in --show-board")
     heavy = review_out("--show-board", "--preset", "heavy")
+    # review-cli#fable-seat-reliability: claude:claude-fable-5 is EXCLUDED from the
+    # heavy preset (a confirmed ~100% dispatch failure rate) — 9 seats, not 10, and no
+    # "architect" lens (Fable was the only seat carrying it).
     for needle in (
         "source: preset:heavy",
-        "architect",
-        "claude:claude-fable-5",
         "codex:gpt-5.6-sol",
-        "10 seats",
+        "9 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
+    assert_not_in("claude:claude-fable-5", heavy)
+    assert_not_in("architect", heavy)
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())
@@ -421,7 +426,14 @@ def test_failover_pool_listing():
     board = review_out("--show-board")
     assert_in("live pool", board.lower())
     assert_in("reserve", board)
-    assert_in("pool 4", board.lower())
+    # Bare --show-board resolves the light preset (Alex, 2026-08-28): pool 2.
+    assert_in("pool 2", board.lower())
+    # Review finding: the bare invocation must NOT claim to be "sized" (it wasn't —
+    # this is the exact bug the light-default change fixed), but an explicit --pool
+    # override must.
+    assert_not_in("sized by preset", board)
+    sized_pool3 = review_out("--show-board", "--pool", "3")
+    assert_in("sized by preset", sized_pool3)
     pool2 = review_out("--show-board", "--pool", "2")
     if pool2.count("[pool") > 2:
         raise SmokeError(f"--pool 2 tagged more than 2 seats:\n{pool2}")
@@ -661,6 +673,14 @@ _UNIT_FILES = [
     ("test_staged_diff_honors_c_repo.py", {}),
     ("test_output_flag.py", {}),
     ("test_opencode_realrepo.py", {}),
+    # Versioned per-model true-silence behavior registry (review-cli#235). Pure data
+    # lookups + env-override precedence — no I/O, no git.
+    ("test_model_behavior.py", {}),
+    # review_opencode's true-silence cooldown wiring (review-cli#235): recording AND
+    # consulting a cooldown, escalation on repeat trips, dashboard attribution, and the
+    # no-cooldown-on-a-genuine-child-exit-125 safeguard (codex/Fable review findings).
+    # Isolates its own $REVIEW_SEAT_COOLDOWN_FILE per test — no shared env needed here.
+    ("test_true_silence_cooldown_wiring.py", {}),
     # The omp (Oh My Pi) agentic read-only backend (review-cli#174): routing, the
     # `@payloadfile` launch contract, the offline sqlite auth probe, unpaid gating,
     # board scope label + dashboard attribution. Hermetic — fake _which/_run_streamed
@@ -834,6 +854,10 @@ _UNIT_FILES = [
     # `review stat`'s CLI surface (argparse wiring, --since/--days resolution, --json vs
     # text rendering, --harness table filtering). Deterministic, no network/backend.
     ("test_stat_subcommand.py", {}),
+    # The persistent call-log cache (reviewlib.dashboard.call_log_cache) that lets a
+    # repeat `review stat`/dashboard scan skip re-parsing unchanged log files.
+    # Deterministic — synthetic tmpdirs, no real log dir, no network.
+    ("test_call_log_cache.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in

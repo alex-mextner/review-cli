@@ -737,6 +737,13 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
         _cli.load_board = _load_board
         log = tempfile.mkdtemp()
         os.environ["REVIEW_LOG_DIR"] = log
+        # Isolate the cross-invocation seat-cooldown store from this machine's REAL
+        # cooldown state -- without this, a seat that's genuinely cooling down from
+        # actual concurrent `review` usage elsewhere on the box silently changes which
+        # seats this "hermetic" test picks, especially now that the default pool is 2
+        # (light preset, Alex 2026-08-28) and there's no reserve slack to absorb it.
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(log) / "seat-cooldown.json")
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
@@ -755,33 +762,43 @@ def _run_board_review_and_get_record(extra_argv: list[str]) -> dict:
             _cli.load_config = saved_cfg
             _cli.load_board = saved_lb
             os.environ.pop("REVIEW_LOG_DIR", None)
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
             d.cleanup()
 
 
-def test_cli_default_board_run_records_pool_size_four():
+def test_cli_default_board_run_records_preset_pool_size():
     """A default `review` (no -m, no config models) runs the board sized to the default
-    pool (4 seats); the run-stats record must report pool_size == 4, NOT the full board
-    (the slice must feed run-stats, not the pre-slice board)."""
-    r = _run_board_review_and_get_record([])  # default pool = 4
+    (light, Alex 2026-08-28) preset's pool (2 seats); the run-stats record must report
+    pool_size == 2, NOT the full board (the slice must feed run-stats, not the pre-slice
+    board)."""
+    r = _run_board_review_and_get_record([])  # default preset (light) pool = 2
     assert r["mode"] == "review"
-    assert r["pool_size"] == 4, r  # the sliced board, not the full preset
-    assert len(r["models"]) == 4, r
-    assert "[review] pool=4 (review)" in r["_stderr"]
+    assert r["pool_size"] == 2, r  # the sliced board, not the full preset
+    assert len(r["models"]) == 2, r
+    assert "[review] pool=2 (review)" in r["_stderr"]
 
 
 def test_cli_default_board_run_records_roles_review_cli_221():
     """End-to-end coverage of `_ran_roles`'s `outcome_sink` branch -- the DEFAULT,
     non-exact board dispatch path (Fable round-2 review finding: this closure,
     reading `outcome_sink[0].usable_roles`, had no coverage distinct from the
-    `_run_mode_with_stats(roles_after=lambda: ...)` unit-level test)."""
-    r = _run_board_review_and_get_record([])  # default pool = 4, all seats succeed
-    assert len(r["roles"]) == 4, r
-    assert set(r["roles"]) == {
-        "correctness",
-        "performance",
-        "quality",
-        "consistency",
-    }, r
+    `_run_mode_with_stats(roles_after=lambda: ...)` unit-level test).
+
+    Checks role COUNT and VALIDITY, not which specific 2 seats answered: with the
+    light preset's zero-slack pool of 2 (Alex, 2026-08-28), a real seat-selection
+    signal beyond this test's own stubbing (e.g. live usage-limit-aware reuse) can
+    legitimately pick a different pair of seats than raw board order -- see
+    tests/test_run_stats.py::test_cli_failover_backfill_records_actual_models_not_planned
+    and rig-cli TaskList #80 for the same pre-existing, already-tracked sensitivity."""
+    from reviewlib.config import REVIEW_ROLES
+
+    r = _run_board_review_and_get_record([])  # default preset (light) pool = 2
+    assert len(r["roles"]) == 2, r
+    assert set(r["roles"]) <= set(REVIEW_ROLES), r
+    assert len(set(r["roles"])) == 2, r  # 2 DISTINCT roles, not the same role twice
 
 
 def test_cli_default_board_roles_actually_satisfy_min_roles_review_cli_221():
@@ -792,9 +809,9 @@ def test_cli_default_board_roles_actually_satisfy_min_roles_review_cli_221():
     default-board dispatch produces are valid `REVIEW_ROLES` keys that
     `_distinct_roles` wouldn't silently filter out (a silent no-op on the most
     common path, invisible to the rest of the suite)."""
-    dispatched = _run_board_review_and_get_record([])  # default pool = 4
+    dispatched = _run_board_review_and_get_record([])  # default preset (light) pool = 2
     real_roles = dispatched["roles"]
-    assert len(real_roles) == 4, dispatched
+    assert len(real_roles) == 2, dispatched
 
     with _TmpStore():
         _stats.record_run(
@@ -803,13 +820,13 @@ def test_cli_default_board_roles_actually_satisfy_min_roles_review_cli_221():
             models=dispatched["models"],
             roles=real_roles,
             duration_seconds=1.0,
-            ok_count=4,
+            ok_count=2,
             fail_count=0,
             passed=True,
         )
-        result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=4)
+        result = _stats.quorum_check(TASK, min_iter=1, min_models=1, min_roles=2)
         assert result["passed"] is True, result
-        assert result["distinct_roles_passed"] == 4
+        assert result["distinct_roles_passed"] == 2
 
 
 def test_cli_board_run_records_explicit_pool_size():
@@ -861,7 +878,12 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
             return list(DEFAULT_BOARD)
 
         _cli.load_board = _load_board
-        os.environ["REVIEW_LOG_DIR"] = tempfile.mkdtemp()
+        log = tempfile.mkdtemp()
+        os.environ["REVIEW_LOG_DIR"] = log
+        # Isolate the cross-invocation seat-cooldown store from this machine's REAL
+        # cooldown state -- see the matching comment in _run_board_review_and_get_record.
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(log) / "seat-cooldown.json")
         try:
             err = io.StringIO()
             with redirect_stderr(err), _capture_stdout():
@@ -880,38 +902,51 @@ def _run_board_review_with_resolver(extra_argv: list[str], resolver) -> dict:
             _cli.load_config = saved_cfg
             _cli.load_board = saved_lb
             os.environ.pop("REVIEW_LOG_DIR", None)
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
             d.cleanup()
 
 
 def test_cli_failover_backfill_records_actual_models_not_planned():
     """When a startup-pool seat FAILS mid-run, the CLI must record the models that
     ACTUALLY produced verdicts (a backfilled reserve under its real id), not the planned
-    pool. Heavy pool 4 is [Fable, Sol, Opus, GLM-cc]; the top seat (Fable) fails,
-    Kimi backfills, and the record excludes Fable while keeping pool_size 4."""
-    # Fable (priority #1, in the heavy pool of 4) fails; everything else succeeds.
-    resolver = _stub_resolve_backend({"claude:claude-fable-5": 1})
+    pool. review-cli#286: Fable is demoted to last-resort in DEFAULT_BOARD and excluded
+    from HEAVY_PRESET_BOARD entirely, so heavy pool 4 is now [Sol, Opus, GLM-cc, Kimi];
+    the top seat (Sol) fails, Codex (the next reserve seat) backfills, and the record
+    excludes Sol while keeping pool_size 4."""
+    # Sol (priority #1 in the heavy pool of 4, now that Fable is excluded) fails;
+    # everything else succeeds.
+    resolver = _stub_resolve_backend({"codex:gpt-5.6-sol": 1})
     r = _run_board_review_with_resolver(["--preset", "heavy"], resolver)
     assert r["_rc"] == 0, r
     assert r["mode"] == "review"
     assert r["pool_size"] == 4, r  # backfilled back up to 4
+    # Full set, not individual `in` checks: Kimi is now a PLANNED pool seat (heavy pool 4
+    # is Sol/Opus/GLM-cc/Kimi post-exclusion), so a regression where Kimi also silently
+    # failed and the NEXT reserve backfilled instead would pass a partial `in`-only check.
+    assert set(r["models"]) == {
+        "claude:claude-opus-4-8",
+        "commandcode:zai-org/GLM-5.2",
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "codex",  # the promoted reserve (#5, post-exclusion), recorded by its real id
+    }, r
     assert "claude:claude-fable-5" not in r["models"], r
-    assert "codex:gpt-5.6-sol" in r["models"], r
-    # The promoted reserve is the first reserve seat (Kimi, #5), recorded by its real id.
-    assert "oc:commandcode/moonshotai/Kimi-K2.7-Code" in r["models"], r
-    # GLM-cc is in the planned pool itself (it didn't fail), so it is recorded directly.
-    assert "commandcode:zai-org/GLM-5.2" in r["models"], r
+    assert "codex:gpt-5.6-sol" not in r["models"], r  # the failed seat, not backfilled
     assert "[review] pool=4 (review)" in r["_stderr"]  # ETA still keys on the planned 4
     assert "promoting reserve" in r["_stderr"]  # failover actually fired
 
 
 def test_cli_failover_exhausted_reserve_degrades_exit_1():
-    """When the reserve can't refill the pool (every commandcode + everything but a few
+    """When the reserve can't refill the pool (every commandcode + everything but one
     fail), the run degrades: exit 1, a degraded message on stderr, and the record holds
-    only the seats that produced verdicts."""
-    # Fail everything EXCEPT opus + gemini -> only 2 usable, reserve can't reach 4.
+    only the seats that produced verdicts. Bare invocation targets the light preset's
+    pool of 2 (Alex, 2026-08-28), so only ONE usable seat is needed to fall short."""
+    # Fail everything EXCEPT opus -> only 1 usable, reserve can't reach the pool of 2.
     from reviewlib.config import DEFAULT_BOARD
 
-    ok = {"claude:claude-opus-4-8", "gemini"}
+    ok = {"claude:claude-opus-4-8"}
     resolver = _stub_resolve_backend(
         {r.model: (0 if r.model in ok else 1) for r in DEFAULT_BOARD}
     )
@@ -919,7 +954,7 @@ def test_cli_failover_exhausted_reserve_degrades_exit_1():
     assert r["_rc"] == 1, r
     assert "degraded" in r["_stderr"], r["_stderr"]
     assert set(r["models"]) == ok, r  # only the seats that produced verdicts
-    assert r["pool_size"] == 2, r
+    assert r["pool_size"] == 1, r
 
 
 def test_cli_exact_board_records_all_explicit_attempted_models_on_partial_failure():
