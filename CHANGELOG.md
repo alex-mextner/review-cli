@@ -113,6 +113,22 @@ semantic versioning.
   recomputation. Falls back to the write-time re-derive for any non-CLI caller
   of `mode_review` that doesn't thread the new `stamp_diff_hash` parameter.
 
+- **`quorum` — every seat gets a per-seat role/lens, reusing brainstorm's persona
+  pool (review-cli#206).** Each expert answer is now reasoned from an assigned role
+  (Pragmatic Staff Engineer, Security-Paranoid Reviewer, Developer-Experience
+  Designer, Skeptical SRE, Product-Minded Architect, Cost-Conscious Performance
+  Engineer — the same pool `brainstorm` rotates through), shown in the transcript as
+  `glm [Security-paranoid reviewer]`. When a distinct-model pool is scarce or some
+  models are near their usage limit and `expand_flat_models_with_reuse` fills
+  multiple seats with one model, each of that model's seats gets a DIFFERENT lens
+  (keyed by per-model occurrence, not raw seat index) instead of a bare `<model>#N`
+  disclosure label with an otherwise-identical prompt — up to the size of the
+  persona pool (currently 6) per model; the moderator is told to still treat all
+  seats sharing one model as a single opinion regardless of lens. One persona was
+  also renamed in the shared pool: `"DX / ergonomics designer"` →
+  `"Developer-experience designer"` (a user-visible change to any brainstorm
+  transcript/log referencing the old name).
+
 - **`review stat` — per-harness/per-model usage + health report, and two concrete
   token-burn fixes (2026-08 investigation).** `review stat` (`--days`, `--since`,
   `--top`, `--harness`, `--json`) parses the real per-call logs into a per-backend
