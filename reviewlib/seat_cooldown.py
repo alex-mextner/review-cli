@@ -84,6 +84,25 @@ from pathlib import Path
 DEFAULT_COOLDOWN_SECONDS = 600.0  # 10 minutes
 _ENV_TTL = "REVIEW_SEAT_COOLDOWN_SECONDS"
 
+# review-cli#221: a seat that keeps failing across MANY separate `review` invocations
+# (each its own process) was only ever getting the flat 10-minute cooldown above — real
+# review runs are minutes apart, so by the time the next invocation checked, the window
+# had already lapsed and the same known-bad seat got re-dispatched, wasting another full
+# round (confirmed live: HYP-1295 re-selected `oc:zai/glm-5.2` at 09:22/09:55/10:07/10:25,
+# each gap > 10 minutes). This escalates the TTL with each consecutive failure so a
+# seat that is CHRONICALLY bad (not just unlucky once) gets pushed out of the active
+# pool for long enough that `run_board_with_failover`'s existing reserve-promotion
+# naturally substitutes a different model instead of re-trying the same one.
+# fail_count -> TTL seconds: 1st failure keeps the original 10-minute default, then
+# climbs (3x, then 4x, then 4x) to 30min, 2h, 8h(cap) — round human values, not a
+# constant multiplier; a maintainer changing this should edit the tuple, not infer a
+# formula from it.
+_ESCALATION_SCHEDULE = (600.0, 1800.0, 7200.0, 28800.0)  # 10min, 30min, 2h, 8h (cap)
+# A failure this long after the previous one is treated as a FRESH problem (seat looked
+# recovered in between), not a continuation — fail_count resets to 1 rather than keep
+# climbing forever for an occasionally-flaky-but-mostly-fine seat.
+_ESCALATION_RESET_SECONDS = 24 * 3600.0  # 24 hours
+
 # How much of the triggering reason text to persist. Enough to show a human "why", short
 # enough that the cooldown file never carries a meaningful fragment of a reviewed diff.
 _REASON_MAX_LEN = 200
@@ -99,23 +118,31 @@ def cooldown_path() -> Path:
     return Path.home() / ".config" / "review-cli" / "seat-cooldown.json"
 
 
-def _ttl_seconds() -> float:
-    """The configured cooldown window, read at CALL time so an env override applies. A
-    missing/blank/non-numeric value falls back to the default — and so does a
-    non-finite one (`nan`/`inf`/`-inf`): `float("nan") <= 0` and `float("inf") <= 0`
-    are BOTH False, so those values silently pass every `<= 0` "disabled" check, persist
-    into the stored `until`, and later crash `int(cooldown["remaining_seconds"])` in
-    backends._cooldown_skip_result (`nan` -> ValueError, `inf` -> OverflowError); `inf`
-    also creates an effectively permanent cooldown. Reject them explicitly rather than
-    let a malformed env var wedge a seat or crash a review (codex review finding)."""
+def _env_ttl_override() -> float | None:
+    """`$REVIEW_SEAT_COOLDOWN_SECONDS`'s value if the var is actually SET (whitespace-only
+    counts as unset), else `None`. An override that's present but non-numeric/non-finite
+    still counts as "set" (to the safe `DEFAULT_COOLDOWN_SECONDS`) rather than falling
+    through to escalation — a user who exported a malformed value gets the same flat
+    default they'd have gotten pre-escalation, not a surprise multiplier. See the
+    non-finite handling note on the caller side (this used to live here; unchanged
+    logic, just split out so callers can tell "explicitly overridden" apart from "use
+    the normal default/escalation path")."""
     raw = os.environ.get(_ENV_TTL)
     if raw is None or not raw.strip():
-        return DEFAULT_COOLDOWN_SECONDS
+        return None
     try:
         value = float(raw)
     except ValueError:
         return DEFAULT_COOLDOWN_SECONDS
     return value if math.isfinite(value) else DEFAULT_COOLDOWN_SECONDS
+
+
+def _ttl_seconds() -> float:
+    """The configured cooldown window, read at CALL time so an env override applies.
+    See `_env_ttl_override` for the non-finite/malformed handling; this just supplies
+    `DEFAULT_COOLDOWN_SECONDS` when nothing is set."""
+    override = _env_ttl_override()
+    return override if override is not None else DEFAULT_COOLDOWN_SECONDS
 
 
 def _load(path: Path) -> dict:
@@ -200,14 +227,89 @@ def record_cooldown(
     propagate up and take down the review, contradicting the "never raises" contract
     this docstring (and the module's) promises. `Exception` (not `BaseException`) is
     deliberate: a real fatal signal (`KeyboardInterrupt`, `SystemExit`) must still
-    propagate — only a genuinely unexpected serialization/IO failure is swallowed."""
-    ttl = ttl_seconds if ttl_seconds is not None else _ttl_seconds()
-    if ttl <= 0:
-        return
+    propagate — only a genuinely unexpected serialization/IO failure is swallowed.
+
+    review-cli#221: when the caller does NOT pass an explicit `ttl_seconds` (the normal
+    dispatch-time path — tests that force a tiny window still get exactly what they
+    ask for, unaffected), the TTL escalates with consecutive failures per
+    `_ESCALATION_SCHEDULE` instead of always using the flat default — see that
+    constant's comment for why. `fail_count` is read from any still-persisted PRIOR
+    entry for this model (even one whose cooldown has since expired — expiry only
+    means dispatch is allowed again, not that the failure history is forgotten) as
+    long as it isn't stale past `_ESCALATION_RESET_SECONDS`."""
     now = now if now is not None else time.time()
     try:
+        # Cheap disable checks FIRST, before touching the store at all — restores the
+        # pre-escalation fast path (codex/GLM review finding): a caller/operator who
+        # disabled cooldowns (`ttl_seconds=0` or `$REVIEW_SEAT_COOLDOWN_SECONDS<=0`)
+        # must pay zero I/O per failed dispatch, not a full store read+parse that's
+        # immediately discarded. `_load`/`_write` only run once we know a write is
+        # actually going to happen.
         path = cooldown_path()
-        data = _load(path)
+        data = None  # loaded lazily — only the escalation branch needs it up front
+        if ttl_seconds is not None:
+            if ttl_seconds <= 0:
+                return
+            ttl = ttl_seconds
+            fail_count = 1  # explicit ttl: no escalation, see docstring
+        else:
+            env_override = _env_ttl_override()
+            if env_override is not None:
+                if env_override <= 0:
+                    return
+                ttl = env_override
+                fail_count = 1  # explicit env override: no escalation, see docstring
+            else:
+                # Escalation: only reached when NEITHER the caller's explicit
+                # `ttl_seconds` NOR an explicit `$REVIEW_SEAT_COOLDOWN_SECONDS` is
+                # present — both are a human (or a test) asking for a SPECIFIC
+                # window, honored exactly, same as pre-escalation behavior. `data` is
+                # loaded ONCE here and reused for the write below (round-2 review
+                # finding: an earlier version of this diff loaded the store twice per
+                # failure on this exact path).
+                data = _load(path)
+                prior = data.get(model)
+                # A pre-#187 flat entry (`{"until": ..., "reason": ..., "recorded_at": ...}`)
+                # IS a dict, so it would otherwise be read as this ACCESS METHOD's own
+                # prior history — discard it wholesale (same detection as the write below)
+                # rather than let a stale flat shape masquerade as this access method's
+                # fail_count (review-cli#153/#159/#179 merge of #221's escalation with
+                # #187's access-method nesting).
+                if not isinstance(prior, dict) or "until" in prior:
+                    prior_for_access_method = None
+                else:
+                    prior_for_access_method = prior.get(access_method)
+                fail_count = 1
+                if isinstance(prior_for_access_method, dict):
+                    prior_recorded_at = prior_for_access_method.get("recorded_at")
+                    prior_count = prior_for_access_method.get("fail_count")
+                    if (
+                        # `type(x) in (int, float)`, not `isinstance(x, (int, float))`
+                        # — round-6 review finding (Opus): the sibling `prior_count`
+                        # guard below already rejects a bare JSON bool via `type(x) is
+                        # int` (isinstance(True, int) is True in Python); this guard
+                        # used isinstance and so silently accepted a corrupt
+                        # `"recorded_at": true`. In practice `now - True` almost always
+                        # exceeds the reset window anyway, but the two guards in the
+                        # same hardening block should reject the same corrupt shapes
+                        # for the same reason, not by accident of magnitude.
+                        type(prior_recorded_at) in (int, float)
+                        and math.isfinite(prior_recorded_at)
+                        and 0 <= (now - prior_recorded_at) <= _ESCALATION_RESET_SECONDS
+                        # `type(x) is int`, not `isinstance` — a corrupt store's bare
+                        # JSON `true`/`false` is a `bool`, and `isinstance(True, int)`
+                        # is True in Python (round-3 review finding), which would
+                        # silently escalate off a boolean instead of treating it as
+                        # the invalid value it is.
+                        and type(prior_count) is int
+                        and prior_count >= 1
+                    ):
+                        fail_count = prior_count + 1
+                ttl = _ESCALATION_SCHEDULE[
+                    min(fail_count - 1, len(_ESCALATION_SCHEDULE) - 1)
+                ]
+        if data is None:
+            data = _load(path)
         model_entry = data.get(model)
         # A pre-#187 flat entry (`{"until": ..., "reason": ..., "recorded_at": ...}`)
         # IS a dict, so it would otherwise pass the isinstance check below and gain a
@@ -222,6 +324,7 @@ def record_cooldown(
             "until": now + ttl,
             "reason": reason[:_REASON_MAX_LEN],
             "recorded_at": now,
+            "fail_count": fail_count,
         }
         data[model] = model_entry
         _write(path, data)
@@ -235,12 +338,13 @@ def active_cooldown(
     access_method: str,
     now: float | None = None,
 ) -> dict | None:
-    """``{"reason", "until", "remaining_seconds"}`` if ``(model, access_method)`` is
-    currently cooling down, else ``None``. Never raises — a corrupt/missing store reads
-    as "no cooldown", fail-open toward dispatching (never fail-closed toward silently
-    starving a seat that would actually work). A store entry recorded under a DIFFERENT
-    access method (or the pre-#187 flat shape, from before this key existed) reads as
-    "no cooldown" here too — never a crash, worst case one extra real dispatch.
+    """``{"reason", "until", "remaining_seconds", "fail_count"}`` if
+    ``(model, access_method)`` is currently cooling down, else ``None``. Never raises —
+    a corrupt/missing store reads as "no cooldown", fail-open toward dispatching (never
+    fail-closed toward silently starving a seat that would actually work). A store
+    entry recorded under a DIFFERENT access method (or the pre-#187 flat shape, from
+    before this key existed) reads as "no cooldown" here too — never a crash, worst
+    case one extra real dispatch.
 
     Re-checks ``$REVIEW_SEAT_COOLDOWN_SECONDS <= 0`` here too (not just in
     ``record_cooldown``): a user who sets it to 0 to un-stick a seat RIGHT NOW must see
@@ -291,21 +395,71 @@ def active_cooldown(
     reason = entry.get("reason")
     if not isinstance(reason, str) or not reason:
         reason = "unknown"
+    fail_count = entry.get("fail_count")
+    # `type(x) is int`, not `isinstance` — see the identical round-3 review finding
+    # noted on record_cooldown's matching guard: `isinstance(True, int)` is True in
+    # Python, so a corrupt store's bare JSON `true` would otherwise read as fail_count
+    # 1 (harmless here) but `false` would read as fail_count 0 -> clamped to 1 anyway,
+    # EXCEPT the display value itself must never render as a bare `True`/`False`.
+    if type(fail_count) is not int or fail_count < 1:
+        fail_count = 1
     return {
         "reason": reason,
         "until": until,
         "remaining_seconds": until - now,
+        "fail_count": fail_count,
     }
 
 
 def clear_cooldown(model: str, *, access_method: str) -> None:
-    """Remove any recorded cooldown for ``(model, access_method)``. Best-effort; used by
-    tests and available for a future ``review`` maintenance command.
+    """Remove any recorded cooldown (and its `fail_count` escalation history) for
+    ``(model, access_method)``. Best-effort; used by tests and available for a future
+    ``review`` maintenance command. Also called on the real success path (`backends.py`'s
+    `record_cooldown` call sites, on a genuine `returncode == 0` result) so a seat that
+    recovers doesn't stay escalated by the 24h failure-only reset window alone
+    (review-cli#221 round-2 review finding: without this, a seat failing more often
+    than once per 24h — even with many successes in between — ratchets to the 8h cap
+    and stays there, since only FAILURES ever touched the store). A seat's cooldown for
+    one access method must never be cleared by a success on a DIFFERENT access method
+    for the same model (review-cli#187) — see the body below.
 
     Opus review finding: widened from `except OSError` to `except Exception` for the
     same reason as `record_cooldown` above — `_write` can re-raise a non-`OSError`
     `BaseException`, and only a genuine fatal signal should propagate through a
-    best-effort cache write."""
+    best-effort cache write.
+
+    Round-3 review finding (Opus): a write here can still race an unrelated concurrent
+    `record_cooldown` for a DIFFERENT model (unlocked read-modify-write on one file) —
+    this is the SAME pre-existing, already-accepted, already-tracked class of race this
+    module's top-level docstring documents for `record_cooldown`/`clear_cooldown`
+    (review-cli#188): "a lost cooldown record costs at most one extra real dispatch on
+    the next run for THAT model, never a crash or a wrong-forever verdict." This success
+    path makes that race somewhat MORE frequent (more writers), not a new class of
+    failure — real locking is #188's fix, not re-solved here. Round-4 review finding
+    (Opus): with escalation, a lost/racy WRITE (not just a lost clear) can also change
+    the window's MAGNITUDE, not just its presence — two concurrent failures each
+    reading the same stale `fail_count` before either writes can leave the schedule
+    stuck at 10 minutes instead of climbing toward 30min/2h/8h, or (less likely) jump
+    unexpectedly. The #188 bound above ("one extra dispatch") is about whether a
+    cooldown record survives at all, not what TTL it ends up with — still within the
+    same accepted race class (a lost/wrong window costs extra dispatches, never a
+    crash), just slightly more than the original one-dispatch estimate under
+    escalation specifically.
+
+    Round-4 review finding (k3): deliberately does NOT mirror `record_cooldown`'s
+    disable-fast-path (`_ttl_seconds() <= 0` early return) despite an earlier round-3
+    version of this docstring proposing exactly that — a real incident shape it would
+    have broken: an operator escalated to the 8h cap sets
+    `REVIEW_SEAT_COOLDOWN_SECONDS=0` specifically to un-stick the seat RIGHT NOW (the
+    documented hatch on `active_cooldown`'s own docstring), the real dispatch runs and
+    succeeds, but a disable-gated `clear_cooldown` would bail before ever deleting the
+    stale escalated entry — so unsetting the var afterward would leave the seat
+    "cooling down" for up to 8 more hours despite the just-observed success. Disabling
+    *recording* must not also disable *clearing an observed recovery*. The `if model in
+    data` guard right below already skips the WRITE in the overwhelmingly common case
+    where there's nothing to clear — the extra cost of NOT fast-pathing is one file
+    read per genuine success, negligible next to the dispatch's own subprocess/LLM
+    round-trip cost."""
     try:
         path = cooldown_path()
         data = _load(path)

@@ -37,7 +37,7 @@ from .process import (
     strip_control_sequences,
     write_sidecar_log,
 )
-from .seat_cooldown import active_cooldown, record_cooldown
+from .seat_cooldown import active_cooldown, clear_cooldown, record_cooldown
 
 GEMINI_ENV_FALLBACKS = (
     Path.home() / ".config" / "review-cli" / ".env",
@@ -288,6 +288,19 @@ def review_with_images(
         reason = _chronic_unavailable_reason(result)
         if reason is not None:
             record_cooldown(model, reason, access_method="cli")
+        elif result.returncode == 0 and result.stdout.strip():
+            # review-cli#221: a genuine success clears any escalated cooldown history
+            # (see clear_cooldown's docstring) — `reason is None` alone isn't enough
+            # here, since it also covers a non-chronic FAILURE (returncode != 0) that
+            # must NOT be treated as recovery evidence. Round-4 review finding (k3):
+            # `returncode == 0` alone isn't "genuine success" either — panel.py's own
+            # `result_is_usable` treats rc=0 with an EMPTY body as a failure shape too
+            # ("a silently-disabled model often returns rc=0 with nothing"). Without
+            # this check, a seat oscillating between chronic-quota failures (escalates)
+            # and empty-rc0 responses (clears) would never actually escalate — pinned
+            # at the 10-minute window forever, the exact chronically-broken shape this
+            # feature exists to push out of the pool.
+            clear_cooldown(model, access_method="cli")
         return result
     return call_backend(
         backend, model, prompt, diff, cwd, timeout, round_no, effort=effort
@@ -2239,6 +2252,10 @@ def review_claude(
     reason = _chronic_unavailable_reason(result)
     if reason is not None:
         record_cooldown(model, reason, access_method=access_method)
+    elif result.returncode == 0 and result.stdout.strip():
+        # review-cli#221: see the identical comment (incl. the round-4 empty-body
+        # finding) on the --visual call site above.
+        clear_cooldown(model, access_method=access_method)
     return result
 
 

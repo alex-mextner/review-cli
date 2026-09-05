@@ -86,6 +86,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import seat_cooldown as _seat_cooldown
+
 # Schema version for the JSONL records. Bump if the record shape changes
 # incompatibly; readers tolerate unknown/missing fields and skip junk lines.
 #
@@ -525,9 +527,12 @@ def quorum_check(
     or a run with no resolvable repo) are "unverifiable" and still count, preserving
     the old behavior for history that predates this field. When ``repo_id`` is None
     (the caller has no check context to give — direct library callers that omit it,
-    exactly as before this parameter existed), NO verification is attempted and the
-    return shape is IDENTICAL to the pre-v4 function: no mismatch/unverifiable keys,
-    every passed iteration counts. Passing a check context is what turns the gate on.
+    exactly as before this parameter existed), NO verification is attempted: no
+    mismatch/unverifiable keys, every passed iteration counts. Passing a check context
+    is what turns the gate on. (review-cli#221: independently of ``repo_id``, a
+    ``stalled_models`` key is added whenever the bar ISN'T met and an attempted model
+    is currently cooling down — this is the one exception to "identical to pre-v4
+    shape when passing," since it doesn't depend on diff-identity at all.)
 
     Fail-closed (independent of the above): an invalid task code, an unreadable/missing
     store, or zero recorded iterations for the code all yield ``passed: False`` plus an
@@ -584,6 +589,38 @@ def quorum_check(
         "min_models": min_models,
         "passed": len(gate_iterations) >= min_iter and len(models) >= min_models,
     }
+    # review-cli#221: when the bar isn't met, name the SPECIFIC model(s) that were
+    # actually attempted for this task and are CURRENTLY cooling down (an unavailable
+    # sentinel or a session-limit/usage-credits notice — the two chronic signals
+    # seat_cooldown records; a plain timeout does NOT currently start a cooldown, see
+    # seat_cooldown.py's own docstring) — a bare "2/3 models" count leaves an operator
+    # guessing which seat is the problem. Sourced from `seat_cooldown` (the same live signal dispatch
+    # itself checks), scoped to models this task code actually tried (attempted_models,
+    # from ALL recorded iterations, not just passed ones) so this never lists an
+    # unrelated seat that simply isn't part of this task's history. Always computed
+    # when the bar isn't met (not gated behind `repo_id is not None` like the
+    # verification keys above) since it doesn't depend on diff-identity at all.
+    if not result["passed"]:
+        attempted_models = _distinct_models(iterations)
+        stalled = []
+        # GLM round-4 review finding: N reads of the same cooldown-store file for N
+        # attempted models — negligible today (CLI check command, M is small), but a
+        # real N+1 shape. Deferred: low value here per the finding's own assessment;
+        # worth a batch `active_cooldowns(models)` API in seat_cooldown if this ever
+        # gets called in a loop over many task codes.
+        for m in attempted_models:
+            cd = _seat_cooldown.active_cooldown(m)
+            if cd is not None:
+                stalled.append(
+                    {
+                        "model": m,
+                        "reason": cd["reason"],
+                        "remaining_seconds": round(cd["remaining_seconds"]),
+                        "consecutive_failures": cd["fail_count"],
+                    }
+                )
+        if stalled:
+            result["stalled_models"] = stalled
     # Verification-diagnostic keys are added ONLY when a check context was actually
     # supplied — omitted entirely otherwise, so a caller that never opts in sees the
     # exact pre-v4 shape (no new keys) — see this function's own docstring.

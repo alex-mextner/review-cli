@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1432,6 +1433,109 @@ def test_quorum_check_short_on_models():
         assert "error" not in result
 
 
+def test_quorum_check_names_currently_stalled_models_review_cli_221():
+    """review-cli#221: a bare '2/3 distinct models' short count leaves an operator
+    guessing which seat is the problem. When the bar isn't met, quorum_check must name
+    any ATTEMPTED model that's currently cooling down (unavailable/timing out), sourced
+    from seat_cooldown — the same live signal dispatch itself already checks."""
+    from reviewlib import seat_cooldown as _sc
+
+    with tempfile.TemporaryDirectory() as d, _TmpStore():
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        # Also scrub $REVIEW_SEAT_COOLDOWN_SECONDS (the module's own documented un-stick
+        # hatch): a developer with it exported would otherwise see this test fail two
+        # ways — =0 disables cooldown entirely (no stalled_models key at all), any other
+        # value suppresses escalation (consecutive_failures stays 1, not 2). Mirrors
+        # test_seat_cooldown.py's `_with_store` fixture, which scrubs it for the exact
+        # same reason (codex review finding cited in its own docstring).
+        saved_cd_ttl = os.environ.get("REVIEW_SEAT_COOLDOWN_SECONDS")
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(d) / "seat-cooldown.json")
+        os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+        try:
+            # codex passed once; oc:zai/glm-5.2 was ATTEMPTED (recorded, even though the
+            # overall run failed) and is separately in an active cooldown right now —
+            # exactly the HYP-1295 shape (a failed model still shows up in the run's
+            # `models` list even though it didn't itself pass).
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex", "oc:zai/glm-5.2"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=1,
+                passed=False,
+            )
+            fixed_now = time.time()
+            # No explicit ttl_seconds: two consecutive failures escalate fail_count
+            # to 2 (see test_seat_cooldown.py for the escalation schedule itself).
+            # "timed out" here is illustrative fixture data for the `reason` field, not
+            # a real production value — `record_cooldown`'s `reason` param accepts any
+            # string, but `_chronic_unavailable_reason` (the only real caller) only
+            # ever produces "unavailable sentinel" or "session limit / usage credits";
+            # a plain timeout does not currently start a cooldown (round-4 review
+            # finding, k3 — see seat_cooldown.py's own docstring).
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=fixed_now)
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=fixed_now)
+            # Round-4 review finding (k3): a model that's genuinely cooling down but was
+            # NEVER attempted for THIS task code must still be excluded — the scoping
+            # claim ("never lists an unrelated seat that simply isn't part of this
+            # task's history") had no regression coverage; a change that dropped the
+            # attempted_models filter and listed every cooling seat machine-wide would
+            # otherwise pass the suite unnoticed.
+            _sc.record_cooldown("claude:claude-fable-5", "session limit", now=fixed_now)
+
+            result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+            assert result["passed"] is False
+            assert "stalled_models" in result
+            stalled = {s["model"]: s for s in result["stalled_models"]}
+            assert "oc:zai/glm-5.2" in stalled
+            assert stalled["oc:zai/glm-5.2"]["reason"] == "timed out"
+            assert stalled["oc:zai/glm-5.2"]["consecutive_failures"] == 2
+            assert stalled["oc:zai/glm-5.2"]["remaining_seconds"] > 0
+            # codex isn't cooling down at all — must not be listed as stalled.
+            assert "codex" not in stalled
+            # claude:claude-fable-5 IS cooling down but was never part of this task's
+            # history — must not leak into this task's stalled_models either.
+            assert "claude:claude-fable-5" not in stalled
+        finally:
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
+            if saved_cd_ttl is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = saved_cd_ttl
+
+
+def test_quorum_check_met_has_no_stalled_models_key():
+    """A satisfied gate never needs the diagnostic key — keeps the passing-path JSON
+    shape exactly as documented (test_quorum_check_met's exact-shape assertion)."""
+    with _TmpStore():
+        for model in ("codex", "gemini", "fable5"):
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=[model],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=0,
+                passed=True,
+            )
+        result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
+        assert result["passed"] is True
+        assert "stalled_models" not in result
+
+
 def test_quorum_check_only_counts_passed_iterations():
     """The bug being fixed: 3 DISPATCHED iterations (enough to satisfy the old
     count-everything gate) but only 1 of them PASSED -- must fail, not pass, and
@@ -1680,6 +1784,50 @@ def test_cli_check_short_prints_ratio_and_exits_nonzero():
         assert "2/3 distinct models" in text
 
 
+def test_cli_check_short_prints_stalled_model_line_review_cli_221():
+    """review-cli#221: the TEXT-mode `--check` output (not just --json) must name the
+    specific attempted model that's currently cooling down — this is the path a human
+    running `review task X --check` directly actually sees, distinct from ship.sh's
+    own --json-driven refusal message (covered separately in agent-tools' test_ship.py)."""
+    from reviewlib import seat_cooldown as _sc
+
+    with tempfile.TemporaryDirectory() as d, _TmpStore():
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        saved_cd_ttl = os.environ.get("REVIEW_SEAT_COOLDOWN_SECONDS")
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(d) / "seat-cooldown.json")
+        os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+        try:
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["codex", "oc:zai/glm-5.2"],
+                duration_seconds=1.0,
+                ok_count=1,
+                fail_count=1,
+                passed=False,
+            )
+            _sc.record_cooldown(
+                "oc:zai/glm-5.2", "timed out", now=time.time(), ttl_seconds=1800.0
+            )
+            out = io.StringIO()
+            with redirect_stderr(io.StringIO()), redirect_stdout(out):
+                rc = _cli.main(["task", TASK, "--check"])
+            assert rc != 0, rc
+            text = out.getvalue()
+            assert "review bar NOT met" in text
+            assert "stalled: oc:zai/glm-5.2" in text
+            assert "timed out" in text
+        finally:
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
+            if saved_cd_ttl is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = saved_cd_ttl
+
+
 def test_cli_check_ran_but_not_passed_does_not_satisfy_bar():
     """The exact scenario the fix targets: enough iterations RAN, none of them
     PASSED -- the old gate would have said "met", the new one must say "NOT met"."""
@@ -1746,6 +1894,28 @@ def test_cli_check_zero_records_fails_closed_nonzero():
             rc = _cli.main(["task", "HYP-999", "--check"])
         assert rc != 0, rc
         assert "review bar NOT met" in err.getvalue()
+
+
+def test_cli_check_invalid_task_code_text_mode_does_not_crash_review_cli_221():
+    """review-cli#221 round-6 review finding (Opus AND Fable, independently, both
+    flagging the same concern a 3rd/4th time despite it already being verified false
+    by direct code reading and by test_quorum_check_invalid_task_code_fails_closed's
+    own assertion that passed_iterations/distinct_models_passed are BOTH present on
+    this exact _rejected() shape): drives the invalid-task-code early-return through
+    the REAL CLI in TEXT mode specifically (not --json, which returns before the
+    reordered count-key access; not quorum_check() directly, which the stats-level
+    test above already covers) -- the one remaining `_rejected()` branch (alongside
+    missing-store and zero-records, both already covered by the two sibling tests
+    above) that hadn't been driven through _quorum_check_subcommand's actual
+    print-then-return-1 path. If the reorder ever DID crash on a minimal error dict,
+    this is the test that would catch it -- a KeyError, not an AssertionError."""
+    with _TmpStore():
+        err = io.StringIO()
+        with redirect_stderr(err), _capture_stdout():
+            rc = _cli.main(["task", "bad code", "--check"])
+        assert rc != 0, rc
+        assert "review bar NOT met" in err.getvalue()
+        assert "invalid task code" in err.getvalue()
 
 
 def test_cli_check_json_shape():
