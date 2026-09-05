@@ -662,6 +662,14 @@ _UNIT_FILES = [
     ("test_staged_diff_honors_c_repo.py", {}),
     ("test_output_flag.py", {}),
     ("test_opencode_realrepo.py", {}),
+    # Versioned per-model true-silence behavior registry (review-cli#235). Pure data
+    # lookups + env-override precedence — no I/O, no git.
+    ("test_model_behavior.py", {}),
+    # review_opencode's true-silence cooldown wiring (review-cli#235): recording AND
+    # consulting a cooldown, escalation on repeat trips, dashboard attribution, and the
+    # no-cooldown-on-a-genuine-child-exit-125 safeguard (codex/Fable review findings).
+    # Isolates its own $REVIEW_SEAT_COOLDOWN_FILE per test — no shared env needed here.
+    ("test_true_silence_cooldown_wiring.py", {}),
     # The omp (Oh My Pi) agentic read-only backend (review-cli#174): routing, the
     # `@payloadfile` launch contract, the offline sqlite auth probe, unpaid gating,
     # board scope label + dashboard attribution. Hermetic — fake _which/_run_streamed
