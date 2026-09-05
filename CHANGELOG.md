@@ -69,6 +69,21 @@ semantic versioning.
   must pass or fail on that basis alone, never falling back just because the
   role floor isn't met.
 
+## 0.35.1 — 2026-08-30
+
+- **Dashboard: fix `/api/stats`/`/api/runs` hanging or returning nothing on a
+  large install (review-cli#323).** Three compounding bugs in the session
+  cache: no cold-start handling (a fully cold cache blocked the request
+  thread on a full parse, ~130s on a ~10GB/132k-file install), the startup
+  prewarm held the cache lock for its entire parse (a real request racing it
+  blocked on the same lock), and fixing that naively let the cold-placeholder
+  path and the prewarm both kick a background parse at once. Also fixed an
+  O(n^2) session-clustering cost at this scale. See review-cli#329 for the
+  full list of concurrency-correctness fixes closed in the same change.
+  Follow-up work (a per-lineage in-flight-parse redesign, cold-window
+  write/detail 404s, and a client-side self-recovery nudge) is tracked
+  separately as review-cli#327 and review-cli#328.
+
 - **True-silence detection + partial-result preservation for opencode seats
   (#243, closes review-cli#243).** A per-model, versioned registry
   (`reviewlib/model_behavior.py`) governs how long an opencode seat is given to
