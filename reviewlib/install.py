@@ -974,8 +974,10 @@ def _write_review_stamp(
             stamped_text = hook_diff.stdout if hook_diff.returncode == 0 else diff
             digest = hashlib.sha256(stamped_text.encode("utf-8")).hexdigest()
         stamp.write_text(f"{digest}\n", encoding="utf-8")
-    except Exception:
-        return
+    except Exception as exc:
+        # Deliberately broad, as before — the stamp is never worth breaking a review
+        # over — but no longer INVISIBLE: the caller turns this into one stderr line.
+        return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     _write_review_stamp_diff(cwd, diff)
     return None
 
