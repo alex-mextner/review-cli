@@ -77,6 +77,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..process import log_dir as _dashboard_log_dir
+from . import call_log_cache
 from .parser import (
     HEALTH_OK,
     HEALTH_PAYWALL,
@@ -246,9 +247,14 @@ def list_call_logs(directory: Path, *, since: datetime | None = None) -> list[Ca
             continue
         if since is not None and stamp < since:
             continue
-        call = parse_call_log(path)
+        # Call-log files are write-once, so a repeat scan of the same directory can
+        # reuse a prior parse keyed on (filename, mtime, size) instead of re-reading
+        # and re-parsing potentially tens of thousands of files every invocation (the
+        # documented cause of `review stat --days 0` timing out on a long-lived install).
+        call = call_log_cache.get_or_parse(directory, path, parse_call_log)
         if call is not None:
             calls.append(call)
+    call_log_cache.save(directory)
     return calls
 
 

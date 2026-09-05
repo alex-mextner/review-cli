@@ -73,6 +73,7 @@ INVARIANTS
     listable/resumable, only with the weaker legacy guard; a legacy log RESUMED by the new
     writer stays fully legacy (the writer mints no mid-file nonce).
 """
+
 from __future__ import annotations
 
 import os
@@ -136,7 +137,9 @@ class Session:
         if not self.rounds:
             return False
         min_floor = max(self.min_rounds, 1)
-        return bool(self.rounds[-1].moderator_stop) and self.completed_rounds >= min_floor
+        return (
+            bool(self.rounds[-1].moderator_stop) and self.completed_rounds >= min_floor
+        )
 
     def transcript_blocks(self) -> list[str]:
         """The prior rounds in the EXACT shape the brainstorm loop keeps in memory
@@ -155,7 +158,9 @@ def _derive_id(path: Path) -> str:
     in the same second (their micros differ) are still individually addressable by a
     longer prefix. A filename that does not match the stamp pattern falls back to the
     whole stem so it is still listable/resumable (never silently dropped)."""
-    stem = path.name[: -len(_LOG_SUFFIX)] if path.name.endswith(_LOG_SUFFIX) else path.stem
+    stem = (
+        path.name[: -len(_LOG_SUFFIX)] if path.name.endswith(_LOG_SUFFIX) else path.stem
+    )
     m = _STAMP_RE.match(stem)
     if not m:
         return stem
@@ -163,12 +168,16 @@ def _derive_id(path: Path) -> str:
 
 
 def _parse_timestamp(path: Path) -> datetime | None:
-    stem = path.name[: -len(_LOG_SUFFIX)] if path.name.endswith(_LOG_SUFFIX) else path.stem
+    stem = (
+        path.name[: -len(_LOG_SUFFIX)] if path.name.endswith(_LOG_SUFFIX) else path.stem
+    )
     m = _STAMP_RE.match(stem)
     if not m:
         return None
     try:
-        return datetime.strptime(m.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        return datetime.strptime(m.group(1), "%Y%m%dT%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
     except ValueError:
         return None
 
@@ -186,7 +195,9 @@ _META_RE = re.compile(
 # reproducing the fixed marker text or quoting this diff. SYNC: formats mirror
 # `brainstorm._SESSION_SENTINEL` / `_ROUND_SENTINEL` / `_FINAL_SENTINEL` (change together).
 _SESSION_SENTINEL_RE = re.compile(r"^<!-- review:session ([0-9a-fA-F]+) -->\s*$")
-_ROUND_SENTINEL_RE = re.compile(r"^<!-- review:round (\d+) nonce=([0-9a-fA-F]+) -->\s*$")
+_ROUND_SENTINEL_RE = re.compile(
+    r"^<!-- review:round (\d+) nonce=([0-9a-fA-F]+) -->\s*$"
+)
 _FINAL_SENTINEL_RE = re.compile(r"^<!-- review:final nonce=([0-9a-fA-F]+) -->\s*$")
 
 
@@ -212,7 +223,7 @@ def parse_log(path: Path) -> Session:
     # Header: `# Brainstorm: <topic>` then a `panel=… moderator=… rounds>=N max=M` line.
     for line in lines[:8]:
         if line.startswith("# Brainstorm:"):
-            topic = line[len("# Brainstorm:"):].strip()
+            topic = line[len("# Brainstorm:") :].strip()
         else:
             mm = _META_RE.search(line)
             if mm:
@@ -239,7 +250,9 @@ def parse_log(path: Path) -> Session:
     # at all, staying legacy end-to-end — see modes/brainstorm.py. So one trusted header line
     # is the whole authority.)
     valid_nonces: set[str] = set()
-    trusted_session_lines: set[int] = set()  # the single trusted session-sentinel line index
+    trusted_session_lines: set[int] = (
+        set()
+    )  # the single trusted session-sentinel line index
     if len(lines) >= 2 and lines[0].startswith("# Brainstorm:"):
         sm = _SESSION_SENTINEL_RE.match(lines[1])
         if sm:
@@ -267,7 +280,9 @@ def parse_log(path: Path) -> Session:
 
     round_hdr = re.compile(r"^# Round (\d+)\s*$")
     mod_hdr = re.compile(r"^## Moderator \(round (\d+)\)\s*$")
-    expected_round = 1  # the next round number a sentinel-LESS (legacy) heading may start
+    expected_round = (
+        1  # the next round number a sentinel-LESS (legacy) heading may start
+    )
 
     # Structure is decided PER HEADING with a RUNNING "nonce regime" flag, not a whole-file
     # mode. `nonce_regime` flips True once the trusted line-1 session sentinel is crossed (it
@@ -290,7 +305,9 @@ def parse_log(path: Path) -> Session:
         if cur_round_no is None:
             return
         body = "\n".join(cur_body).strip("\n")
-        rounds.append(RoundBlock(number=cur_round_no, text=body, moderator_stop=cur_mod_stop))
+        rounds.append(
+            RoundBlock(number=cur_round_no, text=body, moderator_stop=cur_mod_stop)
+        )
         cur_round_no = None
         cur_body = []
         cur_mod_stop = None
@@ -315,7 +332,9 @@ def parse_log(path: Path) -> Session:
             elif not nonce_regime:
                 is_structural = num == expected_round
             else:
-                is_structural = False  # nonce regime, heading without its sentinel -> body
+                is_structural = (
+                    False  # nonce regime, heading without its sentinel -> body
+                )
             if is_structural:
                 _flush_round()
                 cur_round_no = num
@@ -350,7 +369,12 @@ def parse_log(path: Path) -> Session:
         # round and only for the CURRENT round number (a body echoing `## Moderator
         # (round 9)` won't match the active round). Capture its STOP/CONTINUE but do NOT
         # fold it into the persona transcript (the loop re-derives the moderator prompt).
-        if mh and cur_round_no is not None and int(mh.group(1)) == cur_round_no and not in_moderator:
+        if (
+            mh
+            and cur_round_no is not None
+            and int(mh.group(1)) == cur_round_no
+            and not in_moderator
+        ):
             in_moderator = True
             cur_mod_stop = False
             continue
@@ -419,7 +443,12 @@ def find_session(session_id: str) -> Session | None:
         stem = p.name[: -len(_LOG_SUFFIX)] if p.name.endswith(_LOG_SUFFIX) else p.stem
         # Match the short display id (exact or prefix) OR the full filename stem (so two
         # same-second sessions are still individually addressable by their full stamp).
-        if sid == session_id or sid.startswith(session_id) or stem == session_id or stem.startswith(session_id):
+        if (
+            sid == session_id
+            or sid.startswith(session_id)
+            or stem == session_id
+            or stem.startswith(session_id)
+        ):
             try:
                 matches.append(parse_log(p))
                 full_stems.append(stem)
@@ -472,7 +501,9 @@ def resume_session(
     # exact slot count `mode_brainstorm` fills). Reconstruct it from the SAVED panel so a
     # resume continues the rotation where it left off, even if the live `models` differ.
     saved_panel_size = len(sess.panel) or len(models)
-    slots_per_round = len(brainstorm_pool([""] * saved_panel_size)) if saved_panel_size else 3
+    slots_per_round = (
+        len(brainstorm_pool([""] * saved_panel_size)) if saved_panel_size else 3
+    )
     seed_persona_index = sess.completed_rounds * slots_per_round
 
     # SYNTHESIZE-ONLY (skip the round loop, go straight to a fresh synthesis over the
@@ -483,12 +514,12 @@ def resume_session(
     #     (`sess.stopped`) — the moderator decided to stop but the run crashed before the
     #     synthesis was written; running MORE rounds would contradict that decision.
     # `synthesize_only` is needed because a low saved-cap cannot be honoured by passing a
-    # low max (mode_brainstorm re-floors min_rounds to 5).
+    # low max (mode_brainstorm re-floors min_rounds to 3).
     synthesize_only = sess.completed or sess.stopped
     # Otherwise honour the saved caps EXACTLY — do NOT inflate max by start_round. An
     # interrupted session that already ran every round (crashed at the cap, just before
     # synthesis) has start_round > max_rounds, so the loop is empty and the run synthesizes
-    # straight away (no spurious extra round). mode_brainstorm re-clamps to its min>=5 /
+    # straight away (no spurious extra round). mode_brainstorm re-clamps to its min>=3 /
     # max>=min invariants.
     saved_max = max(sess.max_rounds, 1)
     saved_min = max(sess.min_rounds, 1)

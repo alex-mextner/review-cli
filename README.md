@@ -308,7 +308,7 @@ Iterative ideation loop. Each round assigns at least three distinct **rotating p
 (Pragmatic Staff Engineer, Security-Paranoid Reviewer, Developer-Experience Designer,
 Skeptical SRE, Product-Minded Architect, Cost-Conscious Perf Engineer) to your panel
 backends in parallel. After each round a moderator summarizes and decides STOP/CONTINUE — but
-**cannot stop before `--rounds`** (minimum and default: 5). `--max-rounds` (default 8)
+**cannot stop before `--rounds`** (minimum and default: 3). `--max-rounds` (default 8)
 is a hard cap. Ends with a full moderator synthesis: best ideas, tradeoffs, and a
 concrete recommendation.
 
@@ -317,8 +317,11 @@ rounds rather than converge in one shot.
 
 **Brainstorm about a specific change (`brainstorm` + a diff).** brainstorm is composable
 with the diff. When there IS a diff — an uncommitted working-tree diff in `-C` (pass
-`--diff`), a `--staged` diff, or a piped diff — every persona (and the moderator) sees it
-as constant **grounding context**, so you can brainstorm concretely ABOUT a change
+`--diff`), a `--staged` diff, or a piped diff — the moderator sees it as constant
+**grounding context** on every round, and personas see it on the first round of the
+invocation (Alex, 2026-08-28: later rounds rely on the shared transcript instead of
+re-reading the diff — cheaper, since personas rotate and the transcript already carries
+forward what earlier rounds found), so you can brainstorm concretely ABOUT a change
 instead of in the abstract. With **no** diff present it stays pure ideation, exactly as
 before. The diff is optional: an absent diff or a non-repo `-C` degrades silently to
 ideation.
@@ -1208,7 +1211,8 @@ install-skill | install-commit-hook | install-hook tg | register-module
 
 TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what applies)
 -m / --model        Backend to run; repeat or comma-separate. Default (no -m) is mode-aware:
-                    `review diff` runs the default preset board (or your config `models:`);
+                    `review diff` runs the active default preset board — "light" as of
+                    2026-08-28, see --preset — (or your config `models:`);
                     brainstorm uses `brainstorm_models:`, just-ask/quorum the defaults.
                     Each subcommand's `--help` shows its own effective default.
 -C / --cwd DIR      Run against a different repository directory.
@@ -1249,7 +1253,7 @@ SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
                     review the diff is required; optional grounding for brainstorm.
 --prompt TEXT       (review diff) Override the diff-review prompt.
 --moderator M       (quorum / brainstorm) Override the auto-picked moderator.
---rounds N          (brainstorm) Minimum rounds before STOP is allowed (default 5).
+--rounds N          (brainstorm) Minimum rounds before STOP is allowed (default 3).
 --max-rounds N      (brainstorm) Hard cap on rounds (default 8).
 --visual IMAGE …    Composable visual-verification group for text modes: attach/verify a
                     render; rides subcommands such as
@@ -1317,9 +1321,10 @@ out of the box — no config file required.
 ### Priority-ordered failover pool
 
 The raw built-in board is a **priority-ordered** list of 10 models — strongest WORKING
-model first — and a plain `review diff` runs the `default` preset: a **pool of 4** without
-Fable/Sol, at high effort. Use `--preset light` for a quick/cheap pool of 2 at medium
-effort, and `--preset heavy` for release/risky changes: Sol, Opus, GLM-cc, and Kimi at
+model first — and a plain `review diff` runs the `light` preset (Alex, 2026-08-28): a
+**pool of 2** without Fable/Sol, at medium effort — cheap by default for routine
+pre-commit checks. Use `--preset default` for a routine change review at a pool of 4,
+high effort, and `--preset heavy` for release/risky changes: Sol, Opus, GLM-cc, and Kimi at
 `xhigh` effort, with the remaining board seats as `max`-effort reserve. Fable is excluded
 from every preset — `review stat` telemetry showed a confirmed ~97.9-100% dispatch failure
 rate (chronic session/usage-limit exhaustion on the account it runs through), so it is
@@ -1465,7 +1470,7 @@ subprocesses run at once (default **4**, overridable via `$REVIEW_MAX_CONCURRENC
 disables it, and a value above **64** is clamped to that ceiling so a typo can't pin an
 absurd number of children). A seat over the cap simply **waits** for a slot — it is never dropped, and its
 per-call timeout starts only once it actually spawns, so queueing on the cap can't falsely
-time it out. The common single-seat gate (`--pool 1`) and the default pool of 4 are
+time it out. The common single-seat gate (`--pool 1`) and the default (light) pool of 2 are
 unaffected (both `<=` the cap). This is a *per-process* cap; a swarm of separate `review`
 processes also leans on the per-seat timeout (a stalled seat frees its slot fast) and on the
 slow `oc:zai/glm-5.2` seat being **deprioritized to last-resort reserve** (review-cli#65).
@@ -1481,10 +1486,11 @@ commandcode gateway the same way. opencode must be installed for the agentic sea
 it they fall back to the reserve.
 
 ```bash
-review --show-board        # active default preset board; add --preset heavy to show Sol (Fable excluded)
+review --show-board        # active default preset board (light); add --preset heavy to show Sol (Fable excluded)
 export REVIEW_TASK_CODE=HYP-742
-review diff                # default failover pool: the top 4 AVAILABLE seats by priority
-review diff --pool 0       # run all available default-preset seats
+review diff                # default (light) failover pool: the top 2 AVAILABLE seats by priority
+review diff --pool 0       # run all available light-preset seats
+review diff --preset default --pool 0  # run all 8 default-preset built-in seats (Fable/Sol excluded)
 review diff --preset heavy --pool 0  # run all 9 heavy-preset built-in seats (Fable excluded)
 review diff --pool 2       # run the top 2 available seats (with failover)
 review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
@@ -1500,7 +1506,7 @@ Precedence:
 
 ```
 explicit -m requested models   >   explicit --preset   >   `models:` priority roster   >
-configured `board:`   >   default preset
+configured `board:`   >   default preset (light)
 ```
 
 - A `models:` list in `config.yaml` is the **full priority roster** for `review diff`:
@@ -1510,7 +1516,8 @@ configured `board:`   >   default preset
   `models:`/`board:` it is the legacy flat exact panel; with config present it narrows
   the configured board metadata to only the requested models. The board can otherwise
   never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
-  pool (default 4 for the default preset; `--pool 0` runs all available seats in the
+  pool (default 2 for a bare `review diff` — the light preset, Alex 2026-08-28 — or 4 if
+  you pass `--preset default`; `--pool 0` runs all available seats in the
   selected preset/board; `--preset heavy --pool 0` currently covers all 9 heavy-preset
   built-ins — Fable is excluded from every preset, see "Reviewer board" above).
   `--pool` does not reduce an explicit `-m` list:
@@ -1528,12 +1535,14 @@ When `models:` is present,
 `models:`. When `models:` is absent, `board:` is the full priority-ordered board.
 An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
 warning); a single malformed entry is skipped (the valid ones are kept). With **no**
-`models:` or `board:` configured, the CLI uses the default preset; `--preset heavy` uses
-the 9-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable excluded, see
-"Reviewer board" above) — the raw 10-seat board (including last-resort Fable) is only
-reached by an EXPLICIT, non-empty `board:`/`models:` listing naming the seats you want;
-an absent or empty `board:`/`models:` falls back to the same 8-seat `DEFAULT_PRESET_BOARD`
-(no Fable, no Sol) the default preset uses. A
+`models:` or `board:` configured, the CLI uses the default preset (light as of
+2026-08-28); `--preset default` uses the same 8 seats at high effort, and `--preset
+heavy` uses the 9-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable
+excluded, see "Reviewer board" above) — the raw 10-seat board (including last-resort
+Fable) is only reached by an EXPLICIT, non-empty `board:`/`models:` listing naming the
+seats you want; an absent or empty `board:`/`models:` falls back to the same 8-seat
+`LIGHT_PRESET_BOARD` (no Fable, no Sol; same model order as `DEFAULT_PRESET_BOARD`, at
+medium instead of high effort) that the default preset now resolves to. A
 `board:` that is **present but has no usable entry at all** is a hard error (non-zero
 exit) — it never silently falls back to the paid default board.
 
