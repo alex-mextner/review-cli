@@ -53,6 +53,7 @@ from _failover_neutralise import identity_provider_chain  # noqa: E402
 import reviewlib.panel as panel  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.config import (  # noqa: E402
+    ASTRA_SEAT,
     DEFAULT_BOARD,
     DEFAULT_POOL_SIZE,
     GLM_COMMANDCODE_SEAT,
@@ -178,7 +179,7 @@ def test_startup_failover_skips_unavailable_top_seat():
     a no-op for the top-4 pool (Sol/Opus/GLM-cc/Kimi either way), so the "skip an
     unavailable TOP seat, pull the next one up" behavior this test exists to defend
     went unexercised. Sol (the new #1) unavailable -> the top-4 pool starts at Opus
-    and pulls Codex in from the reserve, so it is still 4 WORKING seats."""
+    and pulls Astra in from the reserve, so it is still 4 WORKING seats."""
     board = list(DEFAULT_BOARD)
     available = {r.model for r in board if r.model != SOL_SEAT}
     pool, reserve = split_pool_reserve(board, 4, _avail(available))
@@ -186,7 +187,7 @@ def test_startup_failover_skips_unavailable_top_seat():
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",
+        ASTRA_SEAT,
     ], [r.model for r in pool]
     # Sol is NOT in the pool nor the reserve — it's unavailable.
     assert SOL_SEAT not in {r.model for r in pool + reserve}
@@ -208,13 +209,13 @@ def test_fable_unavailability_is_noop_for_default_pool_roles():
     assert "architect" not in roles, roles  # Fable's lens is the one lost, as expected.
 
 
-def test_glm_cc_unavailable_backfills_from_codex_with_a_duplicate_lens():
-    """When GLM-cc itself is unavailable, Kimi and then Codex backfill. Before
+def test_glm_cc_unavailable_backfills_from_astra_with_a_duplicate_lens():
+    """When GLM-cc itself is unavailable, Kimi and then Astra backfill. Before
     review-cli#fable-seat-reliability, Fable's UNIQUE `architect` lens sat right behind
     GLM-cc in priority, so this exact combo still kept four distinct lenses. Now that
     Fable is demoted to the very last reserve seat (a confirmed ~100% dispatch failure
     rate made that trade worth it — see DEFAULT_BOARD's Fable comment), the next
-    backfill is Codex, whose `consistency` lens duplicates Sol's — a real, accepted,
+    backfill is Astra, whose `consistency` lens duplicates Sol's — a real, accepted,
     narrow trade-off: this combo (GLM-cc down AND a 4th seat needed) is far rarer than
     Fable's near-certain failure on literally every default review."""
     board = list(DEFAULT_BOARD)
@@ -226,10 +227,10 @@ def test_glm_cc_unavailable_backfills_from_codex_with_a_duplicate_lens():
         SOL_SEAT,
         "claude:claude-opus-4-8",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",
+        ASTRA_SEAT,
     ], models
     roles = [r.role for r in pool]
-    assert roles.count("consistency") == 2, roles  # Sol + Codex, the accepted trade-off
+    assert roles.count("consistency") == 2, roles  # Sol + Astra, the accepted trade-off
     assert set(roles) == {"consistency", "correctness", "quality"}, roles
 
 

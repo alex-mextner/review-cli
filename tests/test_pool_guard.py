@@ -29,7 +29,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from reviewlib.config import SOL_SEAT  # noqa: E402
+from reviewlib.config import ASTRA_SEAT, SOL_SEAT  # noqa: E402
 from reviewlib.pool_guard import (  # noqa: E402
     EXIT_UNSATISFIED,
     MIN_CONVERGE_MODELS,
@@ -343,6 +343,30 @@ def test_codex_and_sol_collapse_to_one_engine_for_viability():
     assert d.kind == PROPOSE, d.text
     assert "codexish" not in d.text  # the one-engine option is filtered out
     assert "default board" in d.text
+
+
+def test_astra_does_not_collapse_with_codex_or_sol():
+    """Opus review finding: the whole point of pinning ASTRA_SEAT onto the board (in
+    place of the bare `"codex"` seat that used to collapse with Sol) is that Astra is a
+    GENUINELY DISTINCT engine. Assert it directly against the distinct-engine counter
+    this module actually uses for viability, rather than trusting it transitively —
+    a future change to `_CODEX_SOL_EQUIVALENTS` (e.g. a prefix test instead of exact
+    membership) could silently re-collapse Astra into the same engine as Sol/bare codex
+    with nothing here to catch it."""
+    astra_key = default_distinct_key(ASTRA_SEAT)
+    assert astra_key != default_distinct_key(SOL_SEAT)
+    assert astra_key != default_distinct_key("codex")
+    # `-m codex,sol,astra` must therefore count as 2 distinct engines, not 1 or 3.
+    assert (
+        len(
+            {
+                default_distinct_key("codex"),
+                default_distinct_key(SOL_SEAT),
+                default_distinct_key(ASTRA_SEAT),
+            }
+        )
+        == 2
+    )
 
 
 def test_deliberate_fully_live_narrow_selection_proceeds():

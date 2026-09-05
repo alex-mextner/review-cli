@@ -413,10 +413,10 @@ def test_board_flags_and_listing():
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())
-    # The codex seat is agentic.
-    codex_line = next((ln for ln in board.splitlines() if "Codex" in ln), "")
-    assert_in("codex", codex_line)
-    assert_in("agentic", codex_line)
+    # The Astra seat (codex:gpt-6-astra, the agentic codex CLI route) is agentic.
+    astra_line = next((ln for ln in board.splitlines() if "Astra" in ln), "")
+    assert_in("codex:gpt-6-astra", astra_line)
+    assert_in("agentic", astra_line)
     # In the default preset, GLM-cc sits directly under Opus at #2 and is diff-only.
     glmcc_line = next((ln for ln in board.splitlines() if "GLM-cc" in ln), "")
     assert_in("#2", glmcc_line)

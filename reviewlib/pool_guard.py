@@ -50,11 +50,15 @@ PROCEED = "proceed"
 PROPOSE = "propose"
 UNSATISFIED = "unsatisfied"
 
-# codex and Sol (SOL_SEAT) currently run the SAME underlying model (gpt-5.6-sol): bare
-# `codex` uses the codex CLI default, which is that model today. For DISTINCT-engine
-# counting they must collapse to one — otherwise `-m codex,sol` looks like a 2-model panel
-# but is one engine reviewed twice. Only these two collapse; every other `codex:<model>`
-# stays its own key.
+# A bare `codex` model string uses the codex CLI's OWN default (`~/.codex/config.toml`'s
+# `model =`), which today happens to be gpt-5.6-sol — the SAME model SOL_SEAT pins
+# explicitly. That equivalence is a fact about the codex CLI's local default, not about
+# DEFAULT_BOARD (whose priority-5 seat is now pinned to ASTRA_SEAT, gpt-6-astra, a
+# genuinely distinct model — see config.py). It still matters here because a user can
+# type `-m codex,sol` directly: without this collapse that would count as a 2-model
+# panel when it's one engine reviewed twice. For DISTINCT-engine counting the two must
+# collapse to one. Only these two collapse; every other `codex:<model>` (including
+# ASTRA_SEAT) stays its own key.
 _CODEX_ENGINE_KEY = "codex-engine"
 _CODEX_SOL_EQUIVALENTS = frozenset({"codex", SOL_SEAT.lower()})
 
