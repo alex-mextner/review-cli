@@ -6,7 +6,7 @@
 > caged — they cannot edit, run shell, or hit the network), with two explicit, narrow
 > exceptions. The **`qa`** mode runs an **un-caged write/exec tester** that drives a
 > System-Under-Test (see [QA — agent-as-tester](#qa--agent-as-tester-review-qa) for the
-> safety model). And **`review diff --staged --commit`** creates a checkpoint commit of
+> safety model). And **`review diff --staged --task CODE --commit`** creates a checkpoint commit of
 > the staged diff it just reviewed (opt-in via `--commit`; see
 > [Diff review](#diff-review-review-diff) below). Don't assume every subcommand is
 > read-only.
@@ -143,8 +143,8 @@ git show --format= --no-ext-diff HEAD | review diff --task HYP-742 -m gemini,cod
 > **Never use `git reset --hard` to discard a bad attempt mid-review** — a review→fix→
 > re-review loop that resets hard can destroy unrelated uncommitted work from other
 > sessions/agents sharing the same checkout (it has happened). Use `git checkout --
-> <file>` to discard specific files, or `review diff --staged --commit` (below) to
-> checkpoint progress instead — undo a bad checkpoint safely with `git reset --soft
+> <file>` to discard specific files, or `review diff --staged --task CODE --commit` (below)
+> to checkpoint progress instead — undo a bad checkpoint safely with `git reset --soft
 > HEAD~1`, which does not touch untracked/foreign files.
 
 **Diff size cap.** The auto-detected diff is capped at 300,000 bytes by default

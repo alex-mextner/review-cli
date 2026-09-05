@@ -203,7 +203,7 @@ def mode_review(
         print(
             "[review-cli] --commit requires --staged: a checkpoint commits the reviewed "
             "STAGED diff, and there is no such thing as checkpointing an unstaged/piped "
-            "diff.\n  fix: add --staged (`review diff --staged --commit`), or drop --commit.",
+            f"diff.\n  fix: add --staged (`{_RERUN_STAGED_COMMIT}`), or drop --commit.",
             file=sys.stderr,
             flush=True,
         )
@@ -399,17 +399,28 @@ def _warn_if_dispatch_diff_truncated(
     diff: str, dispatch_diff: str, staged: bool
 ) -> bool:
     """Print a visible stderr warning whenever the dispatch cap actually truncated the
-    diff, and return whether it did ON A `--staged` RUN specifically (codex review
-    finding, round 5, then round 6): the stamp/checkpoint always certify against the
-    UNCAPPED canonical `diff` (by design — see cap_diff_for_dispatch's docstring), so
-    `review diff --staged` on an oversized staged diff used to still pass the
-    commit-hook gate ("the staged index was reviewed") even though every seat actually
-    saw only the first $REVIEW_DIFF_MAX_BYTES plus a truncation note. A stderr warning
-    alone does NOT protect automation (a non-interactive `review diff --staged --commit`
-    never sees it) — the return value here lets the caller REFUSE to stamp/checkpoint on
-    a truncated staged diff, not just warn about it (see EXIT_COMMIT_DIFF_TRUNCATED).
-    The return value stays STAGED-SCOPED on purpose (an unstaged run has no commit-gate
-    certification to refuse), but the WARNING itself now fires either way.
+    diff, and return WHETHER IT DID (codex review finding, round 5, then round 6): the
+    stamp/checkpoint always certify against the UNCAPPED canonical `diff` (by design —
+    see cap_diff_for_dispatch's docstring), so `review diff --staged` on an oversized
+    staged diff used to still pass the commit-hook gate ("the staged index was
+    reviewed") even though every seat actually saw only the first
+    $REVIEW_DIFF_MAX_BYTES plus a truncation note. A stderr warning alone does NOT
+    protect automation (a non-interactive `review diff --staged --commit` never sees it)
+    — the return value here lets the caller REFUSE to stamp/checkpoint on a truncated
+    staged diff, not just warn about it (see EXIT_COMMIT_DIFF_TRUNCATED).
+
+    This return used to be STAGED-SCOPED — `False` for an unstaged truncated run, on the
+    reasoning that such a run has no commit-gate certification to refuse. That became
+    wrong the moment `_commit_gate_skip_reason` started using the same value to pick
+    WHICH remediation to print (codex finding, iteration 4): an unstaged oversized run
+    arrived as `truncated=False`, fell through to the not-staged branch, and was told to
+    "stage and re-run `--staged`" — which truncates again, the exact looping advice that
+    branch ordering exists to prevent. The value is now the plain fact "the cap cut this
+    diff", and staged-scoping happens where it belongs, in the callers that act on it:
+    the stamp path refuses an unstaged run anyway (it is not `staged`), and the
+    checkpoint path is only ever reached under `--staged` (`--commit` without `--staged`
+    is rejected before dispatch, EXIT_COMMIT_REQUIRES_STAGED). Only the WORDING of the
+    warning below is still staged-specific.
 
     Opus review finding (this feature's own PR): an unstaged, over-cap `review diff`
     used to truncate completely SILENTLY to the user — the only signal was the marker
@@ -444,7 +455,7 @@ def _warn_if_dispatch_diff_truncated(
         file=sys.stderr,
         flush=True,
     )
-    return False
+    return True
 
 
 def _warn_if_board_reused(
@@ -596,6 +607,159 @@ def _report_pool_shortfall(
     print("\n".join(lines), flush=True)
 
 
+# The one pre-commit invocation every gate remediation points at. Spelled ONCE: every
+# recorded review mode requires `--task CODE`, so a rerun command without a task-code
+# placeholder fails at the first keystroke whenever $REVIEW_TASK_CODE is unset (Codex
+# finding on #359) — five copies drifting apart is how that regresses one string at a time.
+_RERUN_STAGED = "review diff --task <CODE> --staged -C <repo>"
+# Its `--commit` sibling, for the `--commit` usage and checkpoint refusals (all of which
+# already run inside the repo, so no `-C <repo>`).
+_RERUN_STAGED_COMMIT = "review diff --task <CODE> --staged --commit"
+
+
+# Why an OK review did not satisfy the commit gate — and what to do about it.
+#
+# This is the single source of truth for the DIFF-SHAPE half of the gate predicate:
+# `_stamp_if_staged_commit_review` does not re-spell those conditions, it asks here and stamps
+# iff the answer is None. An earlier draft carried the predicate twice (the `if` plus this
+# function) with a comment promising they would not drift; a review pointed out that a future
+# fourth clause added to the `if` alone would fall through to "no reason" and skip the warning
+# SILENTLY — which is the very bug this code exists to kill. One copy, no promise needed.
+#
+# Two conditions deliberately live in the CALLER instead, because neither is a property of the
+# diff's shape (iteration-2 accuracy finding — the earlier "SINGLE source of truth for the gate
+# predicate" claim was overstated by exactly these two):
+#   * `ok`   — a FAILED review is not this function's business; its own failure output is the
+#              louder reason, and a gate line on top of it points at the wrong problem.
+#   * the marker WRITE actually succeeding — only knowable after attempting it.
+# Both still route their user-visible outcome through `_warn_commit_gate_not_satisfied` (or, for
+# `ok=False`, through the review's own failure output), so no path stays silent.
+#
+# The gate is satisfied by exactly ONE shape of review, and every other shape used to leave the
+# marker alone SILENTLY — which reads, from the caller's side, as "my review passed, so why is
+# my commit still blocked?". A real detached agent burned ~40 minutes on that gap: it ran
+# `review diff` (unstaged), saw every seat pass, found the marker stale, followed the gate's own
+# README advice to `touch` the marker path by hand, and its headless permission policy
+# auto-rejected the write to that external directory and killed the run. Naming the reason on
+# stderr turns that into a one-line fix.
+#
+# The REMEDIATION is per-reason, not one shared suffix: "re-run it `--staged`" is right for an
+# unstaged or piped run and WRONG for a truncated one (re-running truncates again — advice that
+# loops is how an agent burns another 40 minutes).
+
+
+def _commit_gate_skip_reason(
+    staged: bool, diff_from_stdin: bool, truncated: bool
+) -> tuple[str, str] | None:
+    """`(reason, remediation)` for the first condition this review fails, or None when it
+    satisfies the gate. Callers must only consult it for an OK review — a FAILED review has
+    its own, louder reason (the failure itself) and is not this function's business."""
+    # ORDER MATTERS, and `truncated` deliberately comes FIRST (Fable review finding on
+    # iteration 2). Only ONE reason is reported — the first failing condition — so the
+    # order decides which remediation a compound failure gets. `staged`/`diff_from_stdin`
+    # are fixed by re-running differently; `truncated` is NOT: it persists across every
+    # re-run of the same oversized diff. Checking `staged` first would tell an unstaged,
+    # oversized run to "stage and re-run `--staged`", it would truncate again, and only
+    # THEN would it hear "split the change" — one wasted multi-minute review round, which
+    # is precisely the looping-advice failure this whole notice exists to prevent.
+    if truncated:
+        return (
+            "the diff was truncated for dispatch, so no seat saw all of it",
+            "split the change into smaller staged commits (or raise $REVIEW_DIFF_MAX_BYTES) "
+            f"and review each part with `{_RERUN_STAGED}` — re-running this "
+            "same diff truncates again, and piping a smaller one in still fails the "
+            "index-provenance check",
+        )
+    if not staged:
+        return (
+            "the review was not `--staged` (the gate certifies the staged index)",
+            f"stage what you are about to commit and re-run `{_RERUN_STAGED}`",
+        )
+    if diff_from_stdin:
+        return (
+            "the diff was piped on stdin, not read from `git diff --cached`",
+            f"re-run `{_RERUN_STAGED}` and let it read the index itself",
+        )
+    return None
+
+
+# The two artifacts a gate-eligible review writes, and the consequence of losing each.
+# They are NOT interchangeable: agent-tools' `require-review-before-commit` hook stats the
+# session MARKER, while the local git pre-commit hook verifies the diff-scoped REVIEW-STAMP
+# against the diff being committed. A first version of this warning hard-coded the marker
+# into its frame and let the stamp branch borrow it, which produced a line that opened
+# "commit-gate marker not written" for a run whose marker HAD been written and then sent
+# the reader to check $REVIEW_MARKER while the broken file was the stamp (Fable finding,
+# iteration 7). Naming the artifact is the whole point of this warning; getting it wrong is
+# worse than staying silent.
+# Each entry is (artifact, consequence, closing warning). The CLOSING warning differs too,
+# and not decoratively: the marker is mtime-stat'd, so a hand-made one is indistinguishable
+# from a real one and forging it is the whole hazard. The stamp carries the hash of the
+# reviewed diff, so hand-making a USEFUL one means computing the hash of the very diff you
+# are about to commit — the forgery advice does not transfer, and printing it there would
+# be one more sentence pointing at the wrong problem (Fable finding, iteration 8).
+_GATE_MARKER = (
+    "commit-gate marker",
+    "A pre-commit review gate keyed on that marker (e.g. agent-tools' "
+    "require-review-before-commit) will not count this run:",
+    "Never create it by hand — a completed staged review is what writes it, so a "
+    "hand-made one certifies a review that did not happen.",
+)
+# The SKIP path (unstaged / piped / truncated) writes NEITHER artifact, so naming only one
+# of them invites the reader with the other gate installed to conclude the line is not
+# about them (Fable finding, iteration 12).
+_GATE_BOTH = (
+    "commit-gate marker and diff-scoped review-stamp",
+    "Neither pre-commit review gate — agent-tools' require-review-before-commit, which "
+    "stats the marker, nor the git hook that verifies the stamp — will accept this run:",
+    "Never create either by hand — a completed staged review is what writes them, so a "
+    "hand-made one certifies a review that did not happen.",
+)
+_GATE_STAMP = (
+    "diff-scoped review-stamp",
+    "A pre-commit git hook that verifies the reviewed diff against that stamp (the one "
+    "`review install-commit-hook` places) will reject the commit:",
+    "Re-running the review is the fix — the stamp records the hash of the diff that was "
+    "actually reviewed, so there is nothing useful to write there by hand.",
+)
+
+
+def _warn_commit_gate_not_satisfied(
+    reason: str,
+    remediation: str,
+    *,
+    artifact_and_consequence: tuple[str, str, str] = _GATE_MARKER,
+) -> None:
+    """One stderr line: which artifact is missing, why, and the fix for THAT reason.
+
+    States only what review-cli can observe — that it did not write the marker. It does
+    not claim a commit "will be blocked": whether a gate is installed at all, whether a
+    commit is even pending, and whether an earlier staged run left a still-fresh marker
+    are all outside this process's knowledge. It does warn off the hand-`touch`
+    workaround, which is review-cli's own contract to state: the marker means "review-cli
+    ran and passed", so a hand-written one certifies a review that never happened.
+
+    UNCONDITIONAL, and that is a deliberate trade-off rather than an oversight — three
+    review seats raised it across two iterations, so the reasoning is recorded here. The
+    obvious alternative is to stay quiet unless a gate is plausibly installed, proxied by
+    "$REVIEW_MARKER is set" or "the marker path already exists". Rejected: both proxies
+    are wrong in the direction that costs the most. The marker exists only AFTER a first
+    passing staged run, so on a fresh machine — a new checkout, a fresh container, a
+    detached agent's first task, exactly where nobody has the context to diagnose a
+    blocked commit — the proxy says "no gate" and the line disappears at the one moment
+    it is worth the most. The cost of being wrong the other way is one hedged stderr line
+    on a review that passed. The accepted price is that plain `review diff` (the default,
+    most common shape) always ends with this line, so it must stay one line and stay
+    hedged; if it ever grows into a paragraph, revisit the trade-off, not the wording."""
+    artifact, consequence, closing = artifact_and_consequence
+    print(
+        f"[review-cli] {artifact} not written — {reason}. {consequence} "
+        f"{remediation}. {closing}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _stamp_if_staged_commit_review(
     ok: bool,
     staged: bool,
@@ -608,9 +772,10 @@ def _stamp_if_staged_commit_review(
 ) -> None:
     """Write the diff-scoped review-stamp and touch the session marker iff this review
     genuinely satisfies the staged commit gate. Shared by the flat and board paths so the
-    gate condition stays in ONE place.
+    gate condition stays in ONE place — and the condition itself lives in
+    `_commit_gate_skip_reason`, which this function only consults.
 
-    Conditions (all required):
+    Conditions (all required; `ok` is checked here, the rest in `_commit_gate_skip_reason`):
       * `ok`             — the review actually passed (every seat usable / not degraded).
       * `staged`         — `--staged`; an unstaged/working-tree review is not the gate.
       * NOT `diff_from_stdin` — the diff came from `git diff --cached`, not piped stdin.
@@ -620,10 +785,18 @@ def _stamp_if_staged_commit_review(
         forgeable this way — so both are gated on real-index provenance.
       * NOT `truncated` — codex review finding: the stamp certifies the UNCAPPED
         canonical `diff`, but every seat only saw the CAPPED, truncated copy when this
-        is True. Skipped silently here (matching the existing `ok=False` silent skip —
-        `_warn_if_dispatch_diff_truncated` already printed the loud stderr warning that
-        explains WHY, before this function is ever called), so a truncated staged
-        review no longer satisfies the pre-commit hook gate it would otherwise pass.
+        is True — so a truncated staged review no longer satisfies the pre-commit hook
+        gate it would otherwise pass. (`_warn_if_dispatch_diff_truncated` has already
+        printed the loud stderr warning explaining the truncation itself before this
+        function is ever called; the gate line below adds only the gate consequence.)
+
+    When the review is `ok` but one of the other conditions fails, this NAMES the failed
+    condition on stderr (`_warn_commit_gate_not_satisfied`) instead of skipping silently
+    — see `_commit_gate_skip_reason` for the incident that motivated it. The same holds
+    for the one branch that DOES attempt the write and loses: a gate-eligible run whose
+    marker write fails is reported too, so "the review passed but the marker is stale" is
+    never an unexplained state. A FAILED review (`ok=False`) still skips silently: its own
+    failure output is the reason, and a gate line on top of it would just be noise.
 
     `truncated` has NO default (Fable review finding): a defaulted `False` would be
     fail-OPEN — a future call site that simply forgets to pass it would silently
@@ -638,9 +811,42 @@ def _stamp_if_staged_commit_review(
     run could otherwise get silently certified as reviewed). None for any non-CLI caller
     of `mode_review` — `_write_review_stamp` falls back to its own independent re-derive.
     """
-    if ok and staged and not diff_from_stdin and not truncated:
-        _write_review_stamp(cwd, diff, stamp_diff_hash=stamp_diff_hash)
-        _touch_review_marker()
+    if not ok:
+        return  # the review's own failure output already says why; no gate line on top of it.
+    skipped = _commit_gate_skip_reason(staged, diff_from_stdin, truncated)
+    if skipped is not None:
+        _warn_commit_gate_not_satisfied(*skipped, artifact_and_consequence=_GATE_BOTH)
+        return
+    stamp_error = _write_review_stamp(cwd, diff, stamp_diff_hash=stamp_diff_hash)
+    marker_error = _touch_review_marker()
+    if stamp_error is None and marker_error is None:
+        return
+    # The gate-ELIGIBLE run whose own writes failed (iteration-2 review finding, raised
+    # independently by three seats; extended to the stamp on iteration 6). Both writes are
+    # best-effort by design — neither an unwritable REVIEW_MARKER nor an unwritable
+    # `.git/review-stamp` may fail a good review — but swallowing a failure silently
+    # rebuilds the original trap one level down: the review passes, every doc says a
+    # passing staged run satisfies the gate, it does not, and the caller concludes the
+    # gate is broken and forges the marker by hand.
+    #
+    # The two feed DIFFERENT gates and so are reported separately: agent-tools'
+    # `require-review-before-commit` stats the marker, while the local git pre-commit hook
+    # verifies the diff-scoped stamp. Losing either one blocks a commit on its own, and
+    # each has its own remediation, so a merged "something failed" line would send the
+    # caller to fix the wrong file half the time.
+    if marker_error is not None:
+        _warn_commit_gate_not_satisfied(
+            f"the marker file could not be written ({marker_error})",
+            "point $REVIEW_MARKER at a writable path (or fix the permissions on the "
+            f"default one) and re-run `{_RERUN_STAGED}`",
+        )
+    if stamp_error is not None:
+        _warn_commit_gate_not_satisfied(
+            f"the write failed ({stamp_error})",
+            "check that `.git/review-stamp` (`git rev-parse --git-path review-stamp`) is "
+            f"writable, then re-run `{_RERUN_STAGED}`",
+            artifact_and_consequence=_GATE_STAMP,
+        )
 
 
 _CHECKPOINT_COMMIT_MESSAGE = "chore: checkpoint via review diff --staged --commit"
@@ -1004,7 +1210,7 @@ def _checkpoint_if_requested(
             "was TRUNCATED for dispatch — no checkpoint created (a checkpoint must certify "
             "the FULL reviewed diff, and every seat here only saw a partial view). Scope "
             "the review (`git diff --cached -- <path>`) or raise $REVIEW_DIFF_MAX_BYTES, "
-            "then re-run `review diff --staged --commit`.",
+            f"then re-run `{_RERUN_STAGED_COMMIT}`.",
             file=sys.stderr,
             flush=True,
         )
@@ -1021,7 +1227,7 @@ def _checkpoint_if_requested(
         "[review-cli] --commit: the review succeeded but the checkpoint commit itself "
         f"FAILED — no checkpoint was created.\n  git commit failed: {detail}\n"
         "  fix: check the repo's commit-msg/pre-commit hooks (lint/typecheck/tests may be "
-        "blocking it), then re-run `review diff --staged --commit`.",
+        f"blocking it), then re-run `{_RERUN_STAGED_COMMIT}`.",
         file=sys.stderr,
         flush=True,
     )

@@ -3,7 +3,45 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
-## Unreleased
+## 0.35.3 — 2026-09-05
+
+- **`review diff` now says WHY a passing review did not satisfy the commit gate
+  (review-cli#350).** The gate marker that agent-tools'
+  `require-review-before-commit` hook stats is written by exactly one shape of
+  run — a PASSING `review diff --staged` whose diff came from the real index.
+  Every other shape (unstaged, a diff piped on stdin, a diff truncated for
+  dispatch) used to skip writing it SILENTLY, so a caller saw a green review, a
+  stale marker and a blocked commit with no explanation. Such a run now prints
+  one stderr line naming the failed condition and the remediation for THAT
+  condition (the truncated case is told to split the change, not to re-run
+  `--staged`, which would truncate again), and warns off hand-creating the
+  marker. The same now holds for the one run that DOES try to write the marker
+  and loses it (an unwritable `$REVIEW_MARKER`): the write stays best-effort and
+  never fails the review, but it is no longer swallowed in silence, because
+  "green review, stale marker, no reason anywhere" is exactly the state that
+  sends a caller reaching for the forged marker. The diff-shape half of the gate
+  predicate now lives in exactly one place (`_commit_gate_skip_reason`), so a
+  future condition added to it cannot skip the warning by drift, and its reasons
+  are ordered so a truncated diff is told to be split rather than sent around a
+  re-run loop that truncates again. For that ordering to fire at all, the
+  dispatch-cap helper now reports the plain fact "the cap cut this diff" instead
+  of a `--staged`-only version of it: an unstaged oversized run used to arrive as
+  "not truncated", take the not-staged branch, and get sent around exactly that
+  loop. Nothing about WHEN the marker is written changed — an unstaged run was
+  refused before and is refused now, only the reason it gives is right. The
+  same silence is gone from the two writes themselves: an unwritable session
+  marker, a marker path that is not a regular file (pointing it at a directory
+  used to "succeed" — `touch` just bumps the directory's mtime), and a
+  `.git/review-stamp` that could not be written are each reported with the file
+  and the fix that belongs to them. The marker and the stamp feed DIFFERENT
+  gates — agent-tools' hook stats the marker, the local git pre-commit hook
+  verifies the stamp — so losing either one blocks a commit on its own, and each
+  gets its own line rather than a merged one that would send the caller to fix
+  the wrong file. The `review` skill blurb and SKILL.md now
+  name `review diff --staged --task CODE` as the pre-commit invocation.
+  Every rerun command the notice (and the `--commit` refusals) print carries a
+  `--task <CODE>` placeholder — a recorded review mode requires a task code, so a
+  remediation without one failed at the first keystroke (Codex finding on #359).
 
 - **`review diff` board mode: print a visible STDOUT notice when the pool comes up
   short of the requested size, naming every excluded seat + its unavailability
