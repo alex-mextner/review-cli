@@ -52,6 +52,8 @@ const MODEL_LOGO = {
   gpt: 'codex',
   'gpt-5.6-sol': 'codex',
   sol: 'codex',
+  'gpt-6-astra': 'codex',
+  astra: 'codex',
   // Google
   gemini: 'gemini',
   google: 'gemini',
@@ -107,6 +109,8 @@ const MODEL_LABEL = {
   codex: 'Codex',
   'gpt-5.6-sol': 'Sol',
   sol: 'Sol',
+  'gpt-6-astra': 'Astra',
+  astra: 'Astra',
   openai: 'OpenAI',
   gpt: 'GPT',
   gemini: 'Gemini',

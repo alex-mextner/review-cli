@@ -17,6 +17,19 @@ semantic versioning.
   that Opus/GLM were configured but missing. `_report_pool_shortfall` in
   `reviewlib/modes/review.py`.
 
+## 0.35.3 — 2026-09-05
+
+- **`DEFAULT_BOARD` (the `review diff` reviewer board): replace the redundant
+  bare-`"codex"` #5 seat with GPT-6-Astra ("Astra"), pinned explicitly.** The
+  bare seat tracked `~/.codex/config.toml`'s own default model, which today is
+  `gpt-5.6-sol` — the SAME model the #1 Sol seat (`SOL_SEAT`) already pins, so
+  the board's #5 slot was silently reviewing with Sol twice instead of adding
+  real model coverage. `ASTRA_SEAT = "codex:gpt-6-astra"` (OpenAI's new
+  flagship codex model) is now the #5 `DEFAULT_BOARD` seat, keeping the same
+  `consistency` role/lens. Scoped to the board only — the separate flat
+  `DEFAULT_MODELS` panel (used by `--quorum`/`--brainstorm`) still keeps its
+  own bare `codex` entry unchanged, by design.
+
 ## 0.35.2 — 2026-09-01
 
 - **Dashboard: fix the review-cli#326 memory balloon — every streamed call

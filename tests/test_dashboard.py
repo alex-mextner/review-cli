@@ -3206,6 +3206,21 @@ def test_model_attribution_splits_shared_backends_and_claude():
                 exit_code=0,
             )
         )
+        # Opus review finding: a real `-m gpt-6-astra` call must attribute to the
+        # ASTRA_SEAT board id, not fall off-board — the argv reconstruction is generic
+        # (any `-m <model>`), not a Sol-only special case, and this is the only test
+        # that exercises it against a real dispatched call rather than a stub.
+        astra = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100320_000000",
+                "codex",
+                0,
+                "x\n",
+                argv0="codex -m gpt-6-astra",
+                exit_code=0,
+            )
+        )
         fable = p.parse_call_log(_fable_paywall_log(ld, "20260601T100400_000000"))
         opus = p.parse_call_log(_opus_ok_log(ld, "20260601T100500_000000"))
 
@@ -3225,6 +3240,7 @@ def test_model_attribution_splits_shared_backends_and_claude():
         assert p.model_id_for_call(or_gpt) == "openrouter:openai/gpt-4o:beta"
         assert p.model_id_for_call(codex) == "codex"
         assert p.model_id_for_call(sol) == "codex:gpt-5.6-sol"
+        assert p.model_id_for_call(astra) == "codex:gpt-6-astra"
         # claude wrapper is identical on disk; the body splits Fable (paywall) from Opus.
         assert p.model_id_for_call(fable) == "claude:claude-fable-5"
         assert p.model_id_for_call(opus) == "claude:claude-opus-4-8"
@@ -3433,6 +3449,7 @@ def test_paywall_sentinel_prefilter_intra_word_split_diverges_from_reference():
 
 
 def test_compute_model_health_covers_board_and_flags_problematic():
+    from reviewlib.config import ASTRA_SEAT
     from reviewlib.dashboard import parser as p
 
     with tempfile.TemporaryDirectory() as d:
@@ -3466,7 +3483,11 @@ def test_compute_model_health_covers_board_and_flags_problematic():
         # the full built-in raw board (not just the active preset), so priority/
         # fallback/health treatment for a raw-board-only seat is exercised here.
         _fable_paywall_log(ld, "20260601T120000_000000")
-        # Codex — 4 healthy calls => NOT problematic (ok-rate 100%).
+        # GLM review finding: these are bare `codex` CLI-default calls (argv0 has no
+        # `-m`), which is no longer a DEFAULT_BOARD seat (ASTRA_SEAT replaced it) —
+        # compute_model_health surfaces them as an OFF-BOARD observed row, not the
+        # board's #5 seat. 4 healthy calls => that off-board row is NOT problematic
+        # (ok-rate 100%).
         for i in range(4):
             _write_call_log(
                 ld,
@@ -3484,13 +3505,17 @@ def test_compute_model_health_covers_board_and_flags_problematic():
         # Every built-in board model is represented, even no-data seats.
         for board_id in (
             "claude:claude-opus-4-8",
-            "codex",
+            ASTRA_SEAT,
             "claude:claude-fable-5",
             "codex:gpt-5.6-sol",
             "oc:commandcode/moonshotai/Kimi-K2.7-Code",
             "oc:zai/glm-5.2",
         ):
             assert board_id in health, board_id
+        # Astra had no calls (only bare `codex` calls were logged above) => no_data,
+        # same as Opus below, NOT the off-board bare-`codex` row's 100% ok-rate.
+        assert health[ASTRA_SEAT]["status"] == "no_data"
+        assert health[ASTRA_SEAT]["problematic"] is False
 
         assert health["oc:commandcode/moonshotai/Kimi-K2.7-Code"]["problematic"] is True
         assert (
@@ -3502,6 +3527,10 @@ def test_compute_model_health_covers_board_and_flags_problematic():
         assert health["claude:claude-fable-5"]["problematic"] is True
         assert health["claude:claude-fable-5"]["dominant_class"] == p.HEALTH_PAYWALL
         assert health["claude:claude-fable-5"]["on_board"] is True
+        # Bare `codex` is an OFF-BOARD observed row now (union of board + observed
+        # models, parser.py) -- pin that explicitly so a future regression that drops
+        # this union can't hide behind an unrelated key.
+        assert health["codex"]["on_board"] is False
         assert health["codex"]["problematic"] is False
         assert health["codex"]["ok_rate"] == 1.0
         # Opus had no calls => no_data, not problematic.
@@ -3551,6 +3580,7 @@ def test_recent_streak_makes_a_model_problematic_even_below_rate_threshold():
 
 
 def test_model_health_empty_log_dir_is_graceful():
+    from reviewlib.config import ASTRA_SEAT
     from reviewlib.dashboard import parser as p
 
     with tempfile.TemporaryDirectory() as d:
@@ -3559,7 +3589,7 @@ def test_model_health_empty_log_dir_is_graceful():
         # The board is still listed (all no_data), so the view never shows a blank tab.
         assert all(m["status"] == "no_data" for m in stats["model_health"])
         assert {m["model"] for m in stats["model_health"]} >= {
-            "codex",
+            ASTRA_SEAT,
             "oc:zai/glm-5.2",
         }
 
