@@ -52,29 +52,54 @@ review-cli#153/#159/#179's opencode-agentic seats (``review_opencode`` uses
 keyed-HTTP zai/glm route can hit independently — the two access methods must cool down
 independently too.
 
-KNOWN LIMITATION (Fable review finding, deliberately not fixed here): ``record_cooldown``/
-``clear_cooldown``'s read-modify-write (``_load`` then ``_write``) is NOT itself locked
-across the two calls, only each individual ``_write`` is atomic. Two threads (a board
-dispatches its seats in parallel) recording a cooldown for TWO DIFFERENT models in the
-same round can race: both read the store before either writes, so the second write's
-snapshot doesn't include the first thread's new entry, and that first entry is lost
-("last-writer-wins", not corruption — ``_write``'s ``tempfile.mkstemp`` fix above already
-closes the SEPARATE same-tmp-path collision that could corrupt the file or raise). Bounded
-impact, matching this module's "best-effort" contract throughout: a lost cooldown record
-costs at most one extra real dispatch on the next run for THAT model, never a crash or a
-wrong-forever verdict. A real fix needs a file lock (e.g. ``fcntl.flock``) around the whole
-read-modify-write — tracked as review-cli#188, out of scope here as a lower-severity,
-already-bounded race.
+FIXED (review-cli#188), CONDITIONALLY: ``record_cooldown``/``clear_cooldown``'s
+read-modify-write (``_load`` then ``_write``) used to be unlocked across the two calls,
+only each individual ``_write`` was atomic. Two threads (a board dispatches its seats in
+parallel) recording a cooldown for TWO DIFFERENT models in the same round could race: both
+read the store before either wrote, so the second write's snapshot didn't include the
+first thread's new entry, silently losing it ("last-writer-wins", not corruption —
+``_write``'s ``tempfile.mkstemp`` fix above already closes the SEPARATE same-tmp-path
+collision that could corrupt the file or raise). ``_locked()`` now wraps the whole
+read-modify-write in an in-process ``threading.Lock`` PLUS (where available) an
+``fcntl.flock`` exclusive lock: same-process threads are serialized by the
+``threading.Lock`` alone (the flock is only ever attempted while already holding it, so
+same-process threads never actually contend the flock against each other — see the
+``_locked()`` docstring below); the flock is what extends that serialization ACROSS
+separate processes, which the in-process lock alone cannot do (Fable review finding,
+round 7: an earlier version of this paragraph overstated the flock as itself
+thread-contended, which the implementation makes unreachable — corrected here).
+
+Fable review finding, round 5: the guarantee above is real but bounded, not absolute — say
+so plainly rather than implying "never" like the paragraph above reads in isolation. If
+EITHER lock (the in-process ``threading.Lock`` OR the flock) is still held by a peer past
+``_LOCK_TOTAL_DEADLINE_SECONDS`` (a stalled thread, a paused process, a hung network
+filesystem — the module's own motivating scenario), the caller degrades to progressively
+weaker locking and, in the worst case, proceeds FULLY UNLOCKED — the original lost-update
+race returns for that one call. This is a deliberate trade (never block the caller
+indefinitely; see the ``_locked()`` docstring below) inherited from, and mirroring,
+``reviewlib.specweb.store.SpecStore._guard``'s established pattern: fcntl import is guarded
+(Windows has none — degrades to the in-process lock only), and any lock-acquisition
+``OSError`` (an odd filesystem without working advisory locks) degrades the SAME way rather
+than aborting the write entirely — this cache must never regress from "best-effort,
+occasionally racy" to "silently stops recording cooldowns", and "occasionally racy under
+sustained contention or a stuck filesystem" is exactly the residual risk this trade keeps.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
+
+try:
+    import fcntl  # POSIX advisory file locking (cross-process)
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None  # type: ignore[assignment]
 
 # Default cooldown window once a chronic-unavailable signal is seen. Conservative: long
 # enough to skip several would-be-wasted dispatches in a normal burst of review runs, short
@@ -143,6 +168,165 @@ def _ttl_seconds() -> float:
     `DEFAULT_COOLDOWN_SECONDS` when nothing is set."""
     override = _env_ttl_override()
     return override if override is not None else DEFAULT_COOLDOWN_SECONDS
+
+
+# Serializes same-process threads unconditionally (works even where fcntl is unavailable,
+# e.g. Windows) — the flock below adds the cross-process guarantee on top where possible.
+_LOCK = threading.Lock()
+
+# Total bounded budget for acquiring the in-process `_LOCK` (and, via the flock's own
+# smaller sub-budget below, an upper bound on the combined wait) — Opus/GLM review
+# findings, round 2. Round 1 bounded only the flock retry and left `with _LOCK:` a plain
+# unbounded acquire — but the exact hang this module exists to avoid (a peer stalled
+# *inside* the critical section, e.g. a hung `os.replace` on a stuck network filesystem)
+# blocks on `_LOCK`, not the flock, so that left the identical bug one layer up. A thread
+# that can't get `_LOCK` in time degrades to fully unlocked (matching this module's
+# pre-fix, already-accepted best-effort contract) instead of blocking indefinitely.
+#
+# Fable review finding (final round): an earlier version of this comment claimed sharing
+# ONE deadline between `_LOCK` and the flock retry ALSO fixed an "N x deadline convoy"
+# for in-process threads queued behind a contended flock — it did not: the thread holding
+# `_LOCK` would still spin on the flock for up to the full deadline, so every OTHER
+# thread queued on `_LOCK.acquire(timeout=deadline)` timed out at roughly the SAME
+# moment and all degraded to fully unlocked SIMULTANEOUSLY, racing each other — the exact
+# in-process lost-update this module exists to prevent. See `_FLOCK_SUB_BUDGET_SECONDS`
+# below for the actual fix: the flock retry gets its own, much smaller budget, so it
+# releases `_LOCK` back to waiting threads quickly instead of holding it hostage for the
+# cross-process half's sake.
+_LOCK_TOTAL_DEADLINE_SECONDS = 2.0
+_FLOCK_RETRY_INTERVAL_SECONDS = 0.02
+
+# Fable review finding, final round: sharing ONE deadline between `_LOCK` acquisition
+# and the flock retry (the comment above) does NOT actually prevent the convoy it
+# claims to — a thread that wins `_LOCK` first still spins on the flock for up to the
+# FULL shared deadline while holding it, so every OTHER same-process thread queued on
+# `_LOCK.acquire(timeout=deadline)` times out at roughly the SAME moment and all
+# degrade to fully unlocked SIMULTANEOUSLY, racing each other — the exact in-process
+# lost-update this module exists to prevent, now triggered by ordinary brief
+# cross-process contention rather than a genuinely stalled peer. The flock retry gets
+# its OWN, much smaller sub-budget instead: give up on the CROSS-process half quickly
+# and degrade to `_LOCK`-only (still real, still serializes this process's threads)
+# rather than holding `_LOCK` hostage for the flock's sake. Deliberately much smaller
+# than `_LOCK_TOTAL_DEADLINE_SECONDS` — long enough to absorb a normal brief flock hold
+# (another process finishing its own write), short enough that `_LOCK` waiters are
+# never blocked more than this by someone else's cross-process contention.
+_FLOCK_SUB_BUDGET_SECONDS = 0.15
+
+
+@contextlib.contextmanager
+def _locked(path: Path):
+    """Exclusive advisory lock serializing the read-modify-write pair in
+    `record_cooldown`/`clear_cooldown` (review-cli#188). The flock is only ever attempted
+    AFTER acquiring the in-process `_LOCK` below, so within one process the flock itself is
+    never actually contended between threads — `_LOCK` alone already serializes them
+    (Fable review finding, round 7: an earlier version of this docstring claimed distinct
+    threads contend the flock "just like separate processes would," which this ordering
+    makes unreachable — corrected here). What the flock's per-open-file-description scoping
+    (not per-process) DOES buy is the cross-process half: a SEPARATE `review` invocation
+    (its own process, its own `_LOCK`) opens its own fd to the SAME sidecar file and
+    contends on that, which is the one case an in-process `threading.Lock` could never
+    cover on its own. Locks a dedicated `.<name>.lock` file rather than `path` itself,
+    since `path` may not exist yet on a first-ever cooldown and `_write`'s `os.replace`
+    swaps the underlying inode out from under any fd opened on `path` directly.
+
+    Mirrors `reviewlib.specweb.store.SpecStore._guard`, with a stronger bound: the WHOLE
+    operation (in-process `_LOCK` + cross-process flock, combined) is capped at
+    `_LOCK_TOTAL_DEADLINE_SECONDS`. On platforms without `fcntl` (Windows), when the file
+    lock fails for any `OSError` reason (an odd filesystem without working advisory locks),
+    when a peer holds the FLOCK past the shared deadline, or when a peer holds `_LOCK`
+    ITSELF past the shared deadline (a same-process thread stalled inside its own critical
+    section — Opus/GLM review finding, round 2: this case was still an unbounded wait after
+    round 1's fix, which only bounded the flock half), this degrades progressively — first
+    to `_LOCK`-only, then to fully unlocked — instead of blocking indefinitely. Lock
+    ACQUISITION (both `_LOCK` and the flock) is bounded by this deadline; the critical
+    section's own I/O (`_load`/`_write`, including `os.replace`) is not and cannot be —
+    Fable review finding, round 3: a genuinely hung filesystem still stalls the write
+    itself, the deadline only guarantees we don't ALSO wait indefinitely just to start.
+    A failure to lock must never abort the write, only narrow the guarantee back toward
+    this module's pre-fix, already-accepted best-effort contract.
+
+    Fable review finding, final round: the flock retry does NOT spin for the full
+    shared `deadline` — it has its own much smaller `_FLOCK_SUB_BUDGET_SECONDS`, so a
+    thread holding `_LOCK` while contending for the flock releases `_LOCK` back to
+    other same-process threads quickly on flock contention (degrading itself to
+    `_LOCK`-only) instead of holding `_LOCK` hostage for the cross-process half's sake.
+    Without this, EVERY same-process thread queued on `_LOCK.acquire(timeout=deadline)`
+    would time out at roughly the same moment as the first thread's flock spin and all
+    degrade to fully unlocked SIMULTANEOUSLY, racing each other — the exact in-process
+    lost-update this module exists to prevent, reappearing under ordinary brief
+    cross-process contention rather than only a genuinely stalled peer. A thread that
+    times out on `_LOCK` itself (waiting for ANOTHER same-process thread, not a
+    cross-process peer) still never attempts even a single non-blocking flock — by the
+    time `_LOCK` itself is contended for the full deadline, the holder is almost
+    certainly stalled deep in the critical section (a hung `_write`/`os.replace`), not
+    merely retrying its own flock, so a flock probe here would rarely help and isn't
+    worth the extra syscall on the already-slow path."""
+    deadline = time.monotonic() + _LOCK_TOTAL_DEADLINE_SECONDS
+    got_lock = _LOCK.acquire(timeout=max(0.0, deadline - time.monotonic()))
+    try:
+        if not got_lock or fcntl is None:
+            yield
+            return
+        lock_path = path.parent / f".{path.name}.lock"
+        fd = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            # Its OWN, smaller sub-budget (see `_FLOCK_SUB_BUDGET_SECONDS`'s comment) —
+            # NOT the full shared `deadline` — so a contended flock releases `_LOCK`
+            # back to other in-process threads quickly instead of holding it hostage.
+            flock_deadline = min(deadline, time.monotonic() + _FLOCK_SUB_BUDGET_SECONDS)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= flock_deadline:
+                        # Fable review finding, round 3 (comment corrected, round 6): null
+                        # out `fd` BEFORE attempting the close, not after. Without this
+                        # ordering, a raising `os.close` (an exotic deferred-error
+                        # filesystem) would propagate out of this `except BlockingIOError`
+                        # into the OUTER `except OSError` below with `fd` STILL non-None —
+                        # closing the SAME descriptor number again there, risking an EBADF
+                        # on an unrelated fd a concurrent thread has since reused. Nulling
+                        # `fd` first and swallowing the close error LOCALLY (immediately
+                        # below) is what actually prevents that — control never reaches the
+                        # outer handler for this branch at all.
+                        _fd_to_close, fd = fd, None
+                        try:
+                            os.close(_fd_to_close)
+                        except OSError:
+                            pass
+                        break
+                    time.sleep(_FLOCK_RETRY_INTERVAL_SECONDS)
+        except OSError:
+            # k3 review finding, round 4: this bare `os.close(fd)` was the same defect
+            # class the deadline-expiry branch above was already fixed for (round 3) — if
+            # THIS close itself raises (the same deferred-error-filesystem scenario), the
+            # exception would escape `_locked` before `yield`, get swallowed by
+            # `record_cooldown`'s own `except Exception`, and silently skip the write —
+            # contradicting the "a failure to lock must never abort the write" contract.
+            if fd is not None:
+                _fd_to_close, fd = fd, None
+                try:
+                    os.close(_fd_to_close)
+                except OSError:
+                    pass
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    finally:
+        if got_lock:
+            _LOCK.release()
 
 
 def _load(path: Path) -> dict:
@@ -239,14 +423,19 @@ def record_cooldown(
     long as it isn't stale past `_ESCALATION_RESET_SECONDS`."""
     now = now if now is not None else time.time()
     try:
-        # Cheap disable checks FIRST, before touching the store at all — restores the
-        # pre-escalation fast path (codex/GLM review finding): a caller/operator who
-        # disabled cooldowns (`ttl_seconds=0` or `$REVIEW_SEAT_COOLDOWN_SECONDS<=0`)
-        # must pay zero I/O per failed dispatch, not a full store read+parse that's
-        # immediately discarded. `_load`/`_write` only run once we know a write is
-        # actually going to happen.
-        path = cooldown_path()
-        data = None  # loaded lazily — only the escalation branch needs it up front
+        # Cheap disable checks FIRST, before touching the store OR EVEN ACQUIRING THE
+        # LOCK — restores the pre-escalation fast path (codex/GLM review finding),
+        # tightened by a later review round: the disable path must not enter
+        # `_locked()` either, since lock acquisition itself does unbounded
+        # `mkdir`/`os.open` on the sidecar file — a caller using `ttl_seconds=0` or
+        # `$REVIEW_SEAT_COOLDOWN_SECONDS<=0` specifically to un-stick a seat RIGHT NOW
+        # (the documented hatch on `active_cooldown`'s docstring) must not itself be
+        # blocked by the very filesystem hang this module exists to route around. An
+        # earlier version of this diff nested BOTH disable checks inside `with
+        # _locked(path):`, which regressed exactly this guarantee — every no-op call
+        # still paid for lock acquisition even though nothing was ever going to be
+        # written.
+        escalate = False
         if ttl_seconds is not None:
             if ttl_seconds <= 0:
                 return
@@ -262,11 +451,19 @@ def record_cooldown(
             else:
                 # Escalation: only reached when NEITHER the caller's explicit
                 # `ttl_seconds` NOR an explicit `$REVIEW_SEAT_COOLDOWN_SECONDS` is
-                # present — both are a human (or a test) asking for a SPECIFIC
-                # window, honored exactly, same as pre-escalation behavior. `data` is
-                # loaded ONCE here and reused for the write below (round-2 review
-                # finding: an earlier version of this diff loaded the store twice per
-                # failure on this exact path).
+                # present — both are a human (or a test) asking for a SPECIFIC window,
+                # honored exactly, same as pre-escalation behavior. `ttl`/`fail_count`
+                # are computed below, once the lock is held and the store is actually
+                # being loaded for the write (round-2 review finding: an earlier
+                # version of this diff loaded the store twice per failure on this
+                # exact path).
+                ttl = None
+                fail_count = None
+                escalate = True
+
+        path = cooldown_path()
+        with _locked(path):
+            if escalate:
                 data = _load(path)
                 prior = data.get(model)
                 # A pre-#187 flat entry (`{"until": ..., "reason": ..., "recorded_at": ...}`)
@@ -308,26 +505,27 @@ def record_cooldown(
                 ttl = _ESCALATION_SCHEDULE[
                     min(fail_count - 1, len(_ESCALATION_SCHEDULE) - 1)
                 ]
-        if data is None:
-            data = _load(path)
-        model_entry = data.get(model)
-        # A pre-#187 flat entry (`{"until": ..., "reason": ..., "recorded_at": ...}`)
-        # IS a dict, so it would otherwise pass the isinstance check below and gain a
-        # new `access_method` key ALONGSIDE its stale flat keys — those never get
-        # cleaned up (they aren't a recognised access_method), so the model key could
-        # never fully empty out in `clear_cooldown`. Detect the old shape (a top-level
-        # "until" key — no valid access_method is ever literally named "until") and
-        # discard it wholesale rather than merge into it (codex review finding).
-        if not isinstance(model_entry, dict) or "until" in model_entry:
-            model_entry = {}
-        model_entry[access_method] = {
-            "until": now + ttl,
-            "reason": reason[:_REASON_MAX_LEN],
-            "recorded_at": now,
-            "fail_count": fail_count,
-        }
-        data[model] = model_entry
-        _write(path, data)
+            else:
+                data = _load(path)
+            model_entry = data.get(model)
+            # A pre-#187 flat entry (`{"until": ..., "reason": ..., "recorded_at": ...}`)
+            # IS a dict, so it would otherwise pass the isinstance check below and gain
+            # a new `access_method` key ALONGSIDE its stale flat keys — those never get
+            # cleaned up (they aren't a recognised access_method), so the model key
+            # could never fully empty out in `clear_cooldown`. Detect the old shape (a
+            # top-level "until" key — no valid access_method is ever literally named
+            # "until") and discard it wholesale rather than merge into it (codex
+            # review finding).
+            if not isinstance(model_entry, dict) or "until" in model_entry:
+                model_entry = {}
+            model_entry[access_method] = {
+                "until": now + ttl,
+                "reason": reason[:_REASON_MAX_LEN],
+                "recorded_at": now,
+                "fail_count": fail_count,
+            }
+            data[model] = model_entry
+            _write(path, data)
     except Exception:  # noqa: BLE001 — best-effort cache, see docstring above
         pass
 
@@ -428,23 +626,20 @@ def clear_cooldown(model: str, *, access_method: str) -> None:
     `BaseException`, and only a genuine fatal signal should propagate through a
     best-effort cache write.
 
-    Round-3 review finding (Opus): a write here can still race an unrelated concurrent
-    `record_cooldown` for a DIFFERENT model (unlocked read-modify-write on one file) —
-    this is the SAME pre-existing, already-accepted, already-tracked class of race this
-    module's top-level docstring documents for `record_cooldown`/`clear_cooldown`
-    (review-cli#188): "a lost cooldown record costs at most one extra real dispatch on
-    the next run for THAT model, never a crash or a wrong-forever verdict." This success
-    path makes that race somewhat MORE frequent (more writers), not a new class of
-    failure — real locking is #188's fix, not re-solved here. Round-4 review finding
-    (Opus): with escalation, a lost/racy WRITE (not just a lost clear) can also change
-    the window's MAGNITUDE, not just its presence — two concurrent failures each
-    reading the same stale `fail_count` before either writes can leave the schedule
-    stuck at 10 minutes instead of climbing toward 30min/2h/8h, or (less likely) jump
-    unexpectedly. The #188 bound above ("one extra dispatch") is about whether a
-    cooldown record survives at all, not what TTL it ends up with — still within the
-    same accepted race class (a lost/wrong window costs extra dispatches, never a
-    crash), just slightly more than the original one-dispatch estimate under
-    escalation specifically.
+    Round-3 review finding (Opus), UPDATED post-#188: the write below is now wrapped
+    in `_locked()` (same as `record_cooldown`), so a concurrent write here and a
+    `record_cooldown` call (any model — they share one store file) are properly
+    serialized within `_locked()`'s bounded deadline, not merely "unlocked and
+    accepted." The residual risk is narrower than the pre-#188 note this paragraph
+    used to describe: only `_locked()`'s own documented degrade path (sustained
+    contention past the deadline; see its docstring) still admits a race, not every
+    concurrent call. Round-4 review finding (Opus): under that residual degrade, a
+    lost/racy WRITE (not just a lost clear) can still change the escalation window's
+    MAGNITUDE, not just its presence — two writes racing past the degrade point, each
+    reading the same stale `fail_count`, could leave the schedule stuck at 10 minutes
+    instead of climbing toward 30min/2h/8h, or (less likely) jump unexpectedly. Still
+    within the module's accepted best-effort contract (a lost/wrong window costs extra
+    dispatches, never a crash) — just a narrower window for it than pre-#188.
 
     Round-4 review finding (k3): deliberately does NOT mirror `record_cooldown`'s
     disable-fast-path (`_ttl_seconds() <= 0` early return) despite an earlier round-3
@@ -462,15 +657,31 @@ def clear_cooldown(model: str, *, access_method: str) -> None:
     round-trip cost."""
     try:
         path = cooldown_path()
-        data = _load(path)
-        model_entry = data.get(model)
-        if not isinstance(model_entry, dict) or access_method not in model_entry:
+        # Fast pre-check WITHOUT the lock — a DIFFERENT guarantee than record_cooldown's
+        # disable checks above. Unlike those (pure env/argument tests, genuinely zero
+        # I/O), this still calls `_load(path)` — an open/read/parse on the same
+        # filesystem, equally unbounded on a hung disk. It buys ONLY avoidance of lock
+        # ACQUISITION overhead in the overwhelmingly common no-op case (nothing to
+        # clear), not hung-filesystem protection — do not group this with the true
+        # zero-I/O disable hatches. This is a coarse, MODEL-level check (not access-
+        # method-aware) — a false "something to clear" when only a DIFFERENT access
+        # method has an entry just costs one extra lock acquisition below, where the
+        # access-method-aware re-check is the one that actually matters. Re-checked
+        # under the lock below since this read is racy by construction (TOCTOU) — a
+        # concurrent write landing in the gap is just an ordering the caller could have
+        # observed anyway, same best-effort contract as the rest of this module.
+        if model not in _load(path):
             return
-        del model_entry[access_method]
-        if model_entry:
-            data[model] = model_entry
-        else:
-            del data[model]
-        _write(path, data)
+        with _locked(path):
+            data = _load(path)
+            model_entry = data.get(model)
+            if not isinstance(model_entry, dict) or access_method not in model_entry:
+                return
+            del model_entry[access_method]
+            if model_entry:
+                data[model] = model_entry
+            else:
+                del data[model]
+            _write(path, data)
     except Exception:  # noqa: BLE001 — best-effort cache, see docstring above
         pass
