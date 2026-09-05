@@ -14,6 +14,8 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from pathlib import Path
 
+from .usage_limits import DEFAULT_LIMIT_THRESHOLD
+
 DEFAULT_PROMPT = (
     "Review this uncommitted git diff for bugs, regressions, security issues, "
     "and missing tests. Return only actionable findings. Do not edit files."
@@ -428,7 +430,15 @@ def _effort_provider_key(model_or_provider: str) -> str:
 
 # Known route keys a `--effort <provider>=<level>` token may target (for the error message
 # when a token is unrecognised). Derived once from the backend routes.
-_EFFORT_PROVIDER_KEYS = ("codex", "claude", "gemini", "opencode", "commandcode", "zai", "openrouter")
+_EFFORT_PROVIDER_KEYS = (
+    "codex",
+    "claude",
+    "gemini",
+    "opencode",
+    "commandcode",
+    "zai",
+    "openrouter",
+)
 
 
 def _require_provider_key(provider: str) -> str:
@@ -464,7 +474,9 @@ class EffortOverride:
         # this keeps programmatic callers coherent. The result is frozen behind a
         # MappingProxyType so `frozen=True` is not defeated by an in-place dict mutation.
         # Frozen dataclass → object.__setattr__.
-        canonical = {_require_provider_key(key): value for key, value in self.by_provider.items()}
+        canonical = {
+            _require_provider_key(key): value for key, value in self.by_provider.items()
+        }
         object.__setattr__(self, "by_provider", MappingProxyType(canonical))
 
     @property
@@ -504,7 +516,9 @@ def parse_effort_flag(values: list[str] | None) -> EffortOverride:
                 provider, _, level = token.partition("=")
                 provider = provider.strip()
                 if not provider:
-                    raise EffortValueError(f"malformed --effort token {token!r}; expected provider=level")
+                    raise EffortValueError(
+                        f"malformed --effort token {token!r}; expected provider=level"
+                    )
                 by_provider[_require_provider_key(provider)] = _require_effort(level)
             else:
                 default = _require_effort(token)
@@ -512,7 +526,8 @@ def parse_effort_flag(values: list[str] | None) -> EffortOverride:
 
 
 def apply_effort_override(
-    board: list[BoardReviewer], override: EffortOverride | None,
+    board: list[BoardReviewer],
+    override: EffortOverride | None,
 ) -> list[BoardReviewer]:
     """Return a board with each seat's effort resolved through the run-scoped override
     (`override.resolve(model, seat_effort)`). Identity-returns the board when the override
@@ -575,6 +590,208 @@ def split_pool_reserve(
     seats = [r for r in board if available(r)]
     n = _effective_pool_size(len(seats), pool)
     return list(seats[:n]), list(seats[n:])
+
+
+def _is_near_limit(
+    model: str,
+    usage_percent: Callable[[str], float | None],
+    threshold: float,
+) -> bool:
+    pct = usage_percent(model)
+    return pct is not None and pct >= threshold
+
+
+def _least_depleted_index(
+    models: list[str], usage_percent: Callable[[str], float | None]
+) -> int:
+    """Index of the model with the LOWEST usage percent (None reads as 0 — the
+    most-available case — but this is only ever called on a set where every
+    known percent is already >= a threshold, per its callers, so a None here
+    would mean "not really near-limit" and callers filter those out first)."""
+    return min(
+        range(len(models)),
+        key=lambda i: (usage_percent(models[i]) or 0.0, i),
+    )
+
+
+def select_pool_with_reuse(
+    board: list[BoardReviewer],
+    pool: int,
+    available: Callable[[BoardReviewer], bool] = _always_available,
+    usage_percent: Callable[[str], float | None] | None = None,
+    limit_threshold: float = DEFAULT_LIMIT_THRESHOLD,
+) -> list[BoardReviewer]:
+    """Like `select_pool`, but reuses already-available models across the
+    remaining role slots instead of shrinking the board when the usage-aware
+    candidate pool is smaller than the target size.
+
+    Selection, in order:
+      1. `reachable` = seats passing `available` (the same distinct-model
+         liveness check `select_pool` uses).
+      2. If `usage_percent` is given, split `reachable` into seats whose model
+         is BELOW `limit_threshold` percent used (`under_limit` — None counts
+         as "not excluded", fail-open when usage data is unavailable for a
+         model/provider) and seats at/above it.
+      3. `candidates` = `under_limit` if non-empty; otherwise (every reachable
+         seat is near its limit) the SINGLE seat with the lowest usage
+         percentage (ties broken by board priority) — so the board never goes
+         empty just because every seat is somewhat depleted.
+      4. Target size `n` = `_effective_pool_size(len(reachable), pool)` — the
+         same clamp `select_pool` uses, based on RAW reachability (the usage
+         threshold shrinks the MODEL pool, not the requested seat count).
+      5. The first `min(n, len(candidates))` slots each keep their OWN role, in
+         priority order — IDENTICAL to `select_pool`'s output whenever
+         `len(candidates) >= n` (this function is a drop-in when `usage_percent`
+         is None or nothing is excluded/reused: zero behaviour change).
+      6. Any remaining slots (`n - len(candidates)`) are filled by cycling back
+         through `candidates`' models, each one taking the NEXT board role not
+         yet used by an earlier slot (in board priority order) — so a shrunk
+         model pool still reviews the diff under `n` distinct lenses instead of
+         fewer."""
+    reachable = [r for r in board if available(r)]
+    if not reachable:
+        return []
+    n = _effective_pool_size(len(reachable), pool)
+
+    if usage_percent is None:
+        return list(reachable[:n])
+
+    under_limit = [
+        r
+        for r in reachable
+        if not _is_near_limit(r.model, usage_percent, limit_threshold)
+    ]
+    if under_limit:
+        candidates = under_limit
+    else:
+        idx = _least_depleted_index([r.model for r in reachable], usage_percent)
+        candidates = [reachable[idx]]
+
+    primary = candidates[: min(n, len(candidates))]
+    extra_needed = n - len(primary)
+    if extra_needed <= 0:
+        return primary
+
+    if not any(r.role for r in board):
+        # A role-less board (every seat has role="" — e.g. a config `models:`
+        # roster with no lens metadata) has no distinct lenses to gain from
+        # reuse: duplicating a model here is pure cost with zero added review
+        # diversity. Leave the pool at its (smaller) primary size instead.
+        return primary
+
+    used_roles = {r.role for r in primary}
+    # Every DISTINCT board role not yet used by `primary`, in board priority
+    # order, deduped order-preservingly. A real board can carry the SAME role
+    # twice (DEFAULT_BOARD has "consistency" and "quality" each on two seats)
+    # — without the dedup, two padded extras could land on that same role,
+    # dispatching two BYTE-IDENTICAL prompts (same model AND same lens) in
+    # parallel: pure duplicate cost, contradicting this function's own "N
+    # distinct lenses" guarantee (k3 review finding, review-cli#205 round 3).
+    role_pool: list[str] = []
+    for r in board:
+        if r.role not in used_roles and r.role not in role_pool:
+            role_pool.append(r.role)
+
+    extra: list[BoardReviewer] = []
+    for i in range(extra_needed):
+        if i >= len(role_pool):
+            # Every distinct board role is already spoken for — stop padding
+            # SHORT rather than emit a model+role pair already in the pool.
+            # A smaller-than-`n` pool (still all-distinct lenses) beats a
+            # full-size pool with a wasted duplicate dispatch.
+            break
+        extra.append(replace(candidates[i % len(candidates)], role=role_pool[i]))
+    return primary + extra
+
+
+def select_pool_and_reserve_with_reuse(
+    board: list[BoardReviewer],
+    pool: int,
+    available: Callable[[BoardReviewer], bool] = _always_available,
+    usage_percent: Callable[[str], float | None] | None = None,
+    limit_threshold: float = DEFAULT_LIMIT_THRESHOLD,
+) -> tuple[list[BoardReviewer], list[BoardReviewer]]:
+    """`(pool_seats, reserve_seats)` for the board dispatch path — the reuse-aware
+    counterpart to `split_pool_reserve`, extracted as its own testable function
+    (Fable/k3 review finding: this exact pool/reserve seat-identity construction
+    had zero coverage before).
+
+    `available` is probed EXACTLY ONCE (both `pool_seats` and `reserve_seats`
+    are derived from the same `reachable` snapshot) — calling `available`
+    separately for each risks it disagreeing with itself between calls when
+    it wraps something non-deterministic (e.g. a live chain-aware liveness
+    probe), and wastes a non-free probe.
+
+    `reserve_seats` = every reachable seat NOT one of `pool_seats`'s ORIGINAL
+    picks, matched by object IDENTITY (not `.model` string) so a config board
+    that legitimately lists the same model under two distinct roles never
+    loses one seat's reserve slot just because the OTHER seat with the same
+    model landed in the pool. A seat's reserve MEMBERSHIP does not depend on
+    its raw board position: a seat excluded from the pool for being near its
+    usage limit is just as eligible a last-resort backfill as one that simply
+    didn't fit under `pool`. Its reserve ORDER does, however, get demoted:
+    under-limit overflow seats are offered FIRST (each keeps its relative
+    board-priority order), near-limit seats LAST (same) — otherwise a
+    near-limit seat sitting at a higher board position than a perfectly
+    healthy overflow seat would be promoted to the pool FIRST on mid-run
+    failover, defeating the reason it was excluded to begin with (Fable
+    review finding, review-cli#205 round 5)."""
+    reachable = [r for r in board if available(r)]
+    reachable_ids = {id(r) for r in reachable}
+    pool_seats = select_pool_with_reuse(
+        board,
+        pool,
+        lambda r: id(r) in reachable_ids,
+        usage_percent=usage_percent,
+        limit_threshold=limit_threshold,
+    )
+    consumed_ids = {id(r) for r in pool_seats} & reachable_ids
+    unused = [r for r in reachable if id(r) not in consumed_ids]
+    if usage_percent is None:
+        reserve_seats = unused
+    else:
+        # Stable sort: seats keep their relative board-priority order WITHIN
+        # each group (under-limit first, near-limit last) — this is a
+        # DEMOTION of near-limit seats, not a full re-rank.
+        reserve_seats = sorted(
+            unused,
+            key=lambda r: _is_near_limit(r.model, usage_percent, limit_threshold),
+        )
+    return pool_seats, reserve_seats
+
+
+def expand_flat_models_with_reuse(
+    models: list[str],
+    target: int,
+    usage_percent: Callable[[str], float | None] | None = None,
+    limit_threshold: float = DEFAULT_LIMIT_THRESHOLD,
+) -> list[str]:
+    """Reuse-aware padding for a FLAT model list (quorum / just-ask / brainstorm
+    — no per-seat role/board concept). Excludes any model at/above
+    `limit_threshold` percent of its usage window; if that empties the list,
+    falls back to the SINGLE least-depleted model (repeated for every slot)
+    rather than running nothing. Returns exactly `target` entries (or
+    `len(models)` when `target <= 0`), cycling through the surviving models in
+    their given order.
+
+    A no-op (returns `models` unchanged) when `usage_percent` is None, `models`
+    is empty, or nothing is excluded and `target <= len(models)` — so existing
+    callers see zero behaviour change until a model actually IS near its
+    limit."""
+    if usage_percent is None or not models:
+        return list(models)
+
+    n = target if target > 0 else len(models)
+    under_limit = [
+        m for m in models if not _is_near_limit(m, usage_percent, limit_threshold)
+    ]
+    if under_limit:
+        pool_models = under_limit
+    else:
+        idx = _least_depleted_index(models, usage_percent)
+        pool_models = [models[idx]]
+
+    return [pool_models[i % len(pool_models)] for i in range(n)]
 
 
 def _display_name(model: str) -> str:

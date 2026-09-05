@@ -696,6 +696,17 @@ _UNIT_FILES = [
     # switchover (provider A fails on the call, the model completes via B, board not degraded).
     # Offline — availability/unpaid injected, cache is a throwaway temp file.
     ("test_provider_failover.py", {}),
+    # Reuse-aware board/panel composition (review-cli#205): scarce/near-limit models
+    # reuse across roles instead of shrinking the panel. Pure algorithm, no I/O.
+    ("test_pool_reuse.py", {}),
+    # The tg-ctl usage-percent bridge test_pool_reuse.py's consumer relies on — offline
+    # (every core assertion passes `samples=`); the few real-file tests manage their own
+    # $REVIEW_USAGE_LIMITS_FILE/_DIR save-restore internally, no shared env needed.
+    ("test_usage_limits.py", {}),
+    # The operator-facing "panel/board padded" warnings + quorum's <model>#N
+    # duplicate-seat labelling (review-cli#205 round 2). Pure functions +
+    # mocked run_panel/run_moderator, no real dispatch.
+    ("test_reuse_warnings.py", {}),
     # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
     # give it a FRESH temp log dir like the other log-touching tests (review-cli#65).
     ("test_concurrency_cap.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

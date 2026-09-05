@@ -42,7 +42,7 @@ from ..config import (
     DEFAULT_POOL_SIZE,
     BoardReviewer,
     apply_effort_override,
-    split_pool_reserve,
+    select_pool_and_reserve_with_reuse,
 )
 from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
@@ -190,6 +190,7 @@ def mode_review(
     exact_board: bool = False,
     effort_override: "EffortOverride | None" = None,
     commit: bool = False,
+    usage_percent: Callable[[str], float | None] | None = None,
 ) -> int:
     # --commit REQUIRES --staged (see the exit-code block above). Checked BEFORE the (paid)
     # panel dispatch, not after — a usage mistake should fail fast, not after burning a full
@@ -227,6 +228,7 @@ def mode_review(
             visual_images,
             exact_board,
             commit,
+            usage_percent,
         )
 
     # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets BOTH
@@ -404,6 +406,35 @@ def _warn_if_dispatch_diff_truncated(
         flush=True,
     )
     return False
+
+
+def _warn_if_board_reused(
+    board: list[BoardReviewer], pool: list[BoardReviewer]
+) -> None:
+    """Operator-facing stderr notice when `select_pool_with_reuse` actually
+    padded the pool with a repeated model -- NOT inferred from "does `pool`
+    contain a duplicate model" (a config board MAY legitimately list the same
+    model under two distinct roles as two separate seats, which would
+    false-positive that check — Fable/k3 review finding). The accurate
+    signal: `select_pool_with_reuse`'s padding entries are always fresh
+    `replace()` copies (see its docstring), so their `id()` is never one of
+    `board`'s own seat objects — an ORIGINAL board seat repeated verbatim in
+    `pool` is a legitimate duplicate-model board, not reuse.
+
+    Mirrors the existing failover promotion message (`run_board_with_failover`'s
+    stderr line) so the duplicated dispatch cost is attributable, not silent."""
+    board_ids = {id(r) for r in board}
+    reused_models = [r.model for r in pool if id(r) not in board_ids]
+    if not reused_models:
+        return
+    counts = {m: reused_models.count(m) for m in dict.fromkeys(reused_models)}
+    repeated = ", ".join(f"{m} x{n}" for m, n in counts.items())
+    print(
+        f"[review-cli] board padded — reusing {repeated} across extra roles "
+        "(too few distinct models were under their usage limit)",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _stamp_if_staged_commit_review(
@@ -841,6 +872,7 @@ def _mode_review_board(
     visual_images: tuple[Path, ...] = (),
     exact_board: bool = False,
     commit: bool = False,
+    usage_percent: Callable[[str], float | None] | None = None,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -860,7 +892,18 @@ def _mode_review_board(
     paywalled-Fable case would make every `review --staged` fail despite a full, healthy
     pool). Only a genuine shortfall (reserve exhausted before the pool refilled) is a
     failure. `outcome_sink`, when given, receives the FailoverOutcome so the CLI can
-    report the models that actually ran."""
+    report the models that actually ran.
+
+    `usage_percent`, when given, enables reuse-aware pool composition (Alex,
+    2026-08-18) — the CALLER (cli.py's `_dispatch`) builds ONE tg-ctl usage
+    snapshot per dispatch and passes the resulting closure down, rather than
+    this function loading it itself. Defaults to None: NO usage-limit
+    awareness, byte-identical to the pre-reuse `split_pool_reserve` selection
+    — this keeps every existing/direct caller of `_mode_review_board` (tests
+    included) hermetic by default; it never touches the real
+    ~/.config/tg-cli/ file unless the caller explicitly opts in (k3/Fable
+    review finding: an unconditional internal load broke test hermeticity for
+    board-path tests that assert exact dispatched model sets)."""
     if exact_board:
         pool, reserve = list(board), []
     else:
@@ -879,7 +922,20 @@ def _mode_review_board(
                 unpaid=runtime_provider_marked_unpaid,
             )
 
-        pool, reserve = split_pool_reserve(board, pool_size, _chain_aware_available)
+        # Reuse-aware pool + reserve, both derived from ONE `_chain_aware_available`
+        # pass (see select_pool_and_reserve_with_reuse's docstring): fills every
+        # role slot even when fewer than `pool_size` DISTINCT models are
+        # reachable/under their usage limit, by repeating an already-available
+        # model across the remaining roles instead of shrinking the board
+        # (Alex, 2026-08-18). `usage_percent` is None by default (see this
+        # function's docstring) -- the caller opts in explicitly.
+        pool, reserve = select_pool_and_reserve_with_reuse(
+            board,
+            pool_size,
+            _chain_aware_available,
+            usage_percent=usage_percent,
+        )
+        _warn_if_board_reused(board, pool)
     if not pool:
         print(
             "[review-cli] board: no reviewers are available — configure at least one "
@@ -1006,6 +1062,7 @@ def _handler(ctx: ModeContext) -> int:
         visual_images=_visual_images(ctx),
         exact_board=bool(ctx.extra.get("exact_board", False)),
         commit=commit,
+        usage_percent=ctx.extra.get("usage_percent"),
     )
 
 

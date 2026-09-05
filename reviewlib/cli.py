@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 from . import backends
+from . import usage_limits
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
 from .config import (
@@ -39,6 +40,7 @@ from .config import (
     _split_models,
     apply_effort_override,
     board_from_models,
+    expand_flat_models_with_reuse,
     load_board,
     load_config,
     parse_effort_flag,
@@ -46,6 +48,7 @@ from .config import (
     preset_pool_size,
     split_pool_reserve,
 )
+from .usage_limits import usage_percent_for_model
 from .pool_guard import (
     PROCEED,
     Candidate,
@@ -3298,6 +3301,27 @@ def _pool_guard_candidates(
     return candidates
 
 
+def _warn_if_panel_padded(models: list[str]) -> None:
+    """Operator-facing stderr notice for the flat quorum panel, fired iff
+    `models` contains a repeat -- the only way a repeat can appear here is
+    `expand_flat_models_with_reuse` reusing a model, since its input `src`
+    (DEFAULT_MODELS or config `models:`) is already distinct and `-m` never
+    reaches this call site (`explicit_models` is handled by an earlier,
+    separate branch that bypasses padding entirely). Mirrors the board path's
+    existing failover promotion message (reviewlib.panel.run_board_with_failover)
+    so the token spend is attributable instead of a silent surprise."""
+    if len(set(models)) == len(models):
+        return
+    counts = {m: models.count(m) for m in dict.fromkeys(models)}
+    repeated = ", ".join(f"{m} x{n}" for m, n in counts.items() if n > 1)
+    print(
+        f"[review-cli] panel padded — reusing {repeated} across multiple seats "
+        "(some models near their usage limit)",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _chain_aware_available(model: str) -> bool:
     """The failover-chain-aware liveness probe: True iff `model` OR any later provider in
     its `reviewlib.provider_failover` chain is reachable and paid.
@@ -3703,6 +3727,15 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # Precedence: explicit -m > config > code default. Brainstorm prefers
     # config.brainstorm_models and drops unreachable backends gracefully (so a
     # missing GEMINI_API_KEY never aborts the run). Explicit -m is honored as-is.
+    # One usage-limit SNAPSHOT for this whole dispatch (board mode takes the same
+    # approach in modes/review.py) — every seat/candidate checked below reads the
+    # SAME sample set instead of each re-globbing + re-parsing the tg-ctl usage
+    # file independently (and possibly disagreeing mid-selection if it changes).
+    _usage_snapshot = usage_limits.load_snapshot()
+
+    def _usage_percent(model: str) -> float | None:
+        return usage_percent_for_model(model, samples=_usage_snapshot)
+
     if explicit_models:
         models = explicit_models
     elif is_brainstorm:
@@ -3714,8 +3747,87 @@ def _dispatch(argv: list[str] | None = None) -> int:
         models = [m for m in src if backends.backend_available(m)]
         if not models:
             models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        else:
+            # Reuse-aware panel: pad back up to the AVAILABILITY-filtered count
+            # (not `len(src)`) when some of the reachable models are near their
+            # usage limit, instead of silently running a smaller panel (Alex,
+            # 2026-08-18). Target is `len(models)`, not `len(src)`, so this ONLY
+            # compensates usage-limit exclusions -- it must never fight brainstorm's
+            # existing "drop unreachable backends gracefully" shrink above.
+            models = expand_flat_models_with_reuse(
+                models, len(models), usage_percent=_usage_percent
+            )
+            _warn_if_panel_padded(models)
     else:
-        models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        src = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        if mode.name == "quorum":
+            # Scoped to quorum specifically: `review` builds its OWN board
+            # from `config_models`/`load_board` (never reads this `models`
+            # var) and `visual`/`qa` use their own model lists too — this
+            # `else` branch is also their fallthrough, so padding it
+            # unconditionally printed a spurious "panel padded" warning for a
+            # panel that was never actually dispatched (k3/Fable review
+            # finding). `just-ask` is EXCLUDED too, deliberately: it sends the
+            # identical prompt to every seat with no per-seat role/lens (see
+            # config's role-less-board carve-out for the same reasoning), so a
+            # duplicated seat there is pure cost with zero added diversity —
+            # unlike quorum, which labels + discloses duplicates to its
+            # moderator so a repeated model is at least an INFORMED tradeoff.
+            #
+            # Availability-filter BEFORE padding (k3 review finding, round 3):
+            # `_is_near_limit` fails OPEN on unknown usage data, so an
+            # UNREACHABLE model (missing API key/CLI — unknown to
+            # usage_percent, hence "not excluded") could otherwise survive
+            # padding while a REACHABLE-but-near-limit model gets excluded —
+            # e.g. src=[claude:opus@90%, gemini(keyless)] would pad to
+            # ["gemini","gemini"], a panel with ZERO live seats, worse than
+            # quorum's pre-reuse behavior of just dispatching both and letting
+            # the dead one fail per-call. Filtering first keeps padding
+            # scoped to seats that can actually answer; the all-unreachable
+            # case is handled below (dispatch `src` unfiltered, no exclusion
+            # — k3 review finding, round 5).
+            #
+            # Target `len(reachable)`, NOT `len(src)` (k3/Fable review finding,
+            # round 4): padding must compensate ONLY usage-limit exclusions,
+            # exactly like the brainstorm branch above — targeting `len(src)`
+            # would ALSO duplicate a live model to paper over a plain
+            # unreachable one (a real paid call replacing what used to be a
+            # free per-call failure), which is a different, unrequested
+            # feature and made `_warn_if_panel_padded`'s "near their usage
+            # limit" text false in that case.
+            #
+            # `_chain_aware_available`, NOT raw `backend_available` (k3/Fable
+            # review finding, round 6): the raw probe false-negatives on a
+            # seat whose HEAD provider is down but has a live failover
+            # alternate (e.g. no ZAI_API_KEY but an authenticated `oc:zai`) —
+            # exactly the case `_chain_aware_available`'s own docstring exists
+            # to cover for every OTHER pre-dispatch liveness decision (the
+            # pool guard, the board split, the ETA). Using the raw probe here
+            # would silently drop a chain-recoverable model from the quorum
+            # panel instead of just letting `run_panel`'s own provider
+            # failover (panel.py) route around the down head provider.
+            reachable = [m for m in src if _chain_aware_available(m)]
+            if reachable:
+                models = expand_flat_models_with_reuse(
+                    reachable, len(reachable), usage_percent=_usage_percent
+                )
+                _warn_if_panel_padded(models)
+            else:
+                # EVERYTHING reads unreachable -- dispatch `src` UNFILTERED
+                # and skip usage-limit exclusion entirely (k3 review finding,
+                # round 5): the comment above claimed this fallback matches
+                # brainstorm's "identical" one, but it didn't -- brainstorm's
+                # actual all-unreachable fallback (`config_models or
+                # [_expand_alias(x) for x in DEFAULT_MODELS]`, a few lines up)
+                # dispatches the raw list with NO exclusion, letting each dead
+                # seat fail per-call (and its provider-chain failover a real
+                # chance to recover a false-negative availability probe).
+                # Applying exclusion here too would silently drop a near-limit
+                # model in favor of duplicating another EQUALLY DEAD one --
+                # pure noise when nothing is going to answer regardless.
+                models = src
+        else:
+            models = src
 
     visual_mode = args.visual is not None
     if explicit_models:
@@ -4171,6 +4283,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
             pool_size=review_pool_size,
             outcome_sink=outcome_sink,
             exact_board=bool(explicit_models),
+            # None for an explicit -m board (exact_board — usage-limit awareness
+            # doesn't apply to a hand-picked, non-failover roster) or when a
+            # config/default board is priced out entirely — matches this
+            # function's own "explicit -m is honored as-is" precedent above.
+            usage_percent=None if explicit_models else _usage_percent,
         )
 
         def _ran_models() -> list[str]:
