@@ -1074,6 +1074,58 @@ def test_load_sessions_cached_parses_once_then_invalidates_on_change():
             p.invalidate_sessions_cache()
 
 
+def test_writing_the_call_log_cache_does_not_itself_invalidate_the_session_memo():
+    """review-cli#317 review, GLM MEDIUM finding: `load_sessions` now writes its own
+    persistent cache file INTO the scanned log dir (`call_log_cache.save`). If
+    `_dir_signature` counted that file too, every `load_sessions_cached` call would
+    invalidate itself on its own very next read (the producer's write moves the
+    signature it's about to be memoised under), forcing a full re-parse after every
+    single request -- exactly the thrash class `load_sessions_cached` exists to
+    prevent. Spies on `load_sessions` ITSELF (not `parse_call_log`, which a per-file
+    cache can mask) to prove the OUTER memo genuinely isn't re-invoked, not just that
+    per-file work happens to be cheap the second time."""
+    from reviewlib.dashboard import parser as p
+
+    load_calls = {"n": 0}
+    real_load_sessions = p.load_sessions
+
+    def _counting_load_sessions(*args, **kwargs):
+        load_calls["n"] += 1
+        return real_load_sessions(*args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.load_sessions = _counting_load_sessions
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0
+            )
+
+            first_sig = p._dir_signature(ld)
+            p.load_sessions_cached(ld, gap_seconds=90)
+            assert load_calls["n"] == 1
+
+            # `load_sessions` just wrote its own cache file(s) into `ld` as a side
+            # effect. The signature must be UNCHANGED by that write -- it only tracks
+            # the source `.log`/`.md` artifacts, never derived cache data.
+            assert p._dir_signature(ld) == first_sig, (
+                "the call-log cache's own files must not move `_dir_signature` -- "
+                "otherwise every load_sessions call invalidates its own memo entry"
+            )
+
+            # A second call on the (truly) unchanged dir must hit the OUTER memo and
+            # never re-enter `load_sessions` at all.
+            p.load_sessions_cached(ld, gap_seconds=90)
+            assert load_calls["n"] == 1, (
+                f"load_sessions re-ran ({load_calls['n']} calls) even though nothing "
+                "but the cache's own bookkeeping changed on disk"
+            )
+        finally:
+            p.load_sessions = real_load_sessions
+            p.invalidate_sessions_cache()
+
+
 def test_compute_stats_cached_aggregates_once_then_invalidates_on_change():
     """`/api/stats` was STILL ~8.5s on a warm session cache: the sessions came back fast, but the
     handler then re-ran the PURE ``compute_stats`` (re-aggregating ~590 sessions / ~30k calls,

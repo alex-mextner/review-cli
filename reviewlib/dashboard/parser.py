@@ -22,7 +22,9 @@ So this parser is a READER over those artifacts. It:
     surfaces models, roles (personas, parsed from the brainstorm md), durations,
     success/fail, errors, and the redacted prompt/argv per call.
 
-Nothing here writes; the only new persistence is in ``store.py``. Anything review-core
+The only writes here are `call_log_cache`'s own perf memo (derived data, keyed off
+the source logs' identity — never a source of truth); the actual overseer
+persistence (feedback/conscious/links) lives in ``store.py``. Anything review-core
 does not record yet (real token/cost numbers, an explicit run id) is reported as an
 empty/`null` field with a note rather than faked.
 """
@@ -36,6 +38,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import cached_property, lru_cache
 from pathlib import Path
+
+from . import call_log_cache
 
 # Per-call log filename: 20260613T040611_516399Z-claude-r0.log
 _CALL_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-(.+)-r(\d+)\.log$")
@@ -895,13 +899,19 @@ def load_sessions(
         if not entry.is_file():
             continue
         if entry.suffix == ".log":
-            c = parse_call_log(entry)
+            # Call-log files are write-once, so a repeat scan of the same directory can
+            # reuse a prior parse keyed on (filename, mtime, size) instead of re-reading
+            # and re-parsing potentially tens of thousands of files on every request —
+            # the documented cause of the dashboard's default view rendering blank
+            # before a cold parse of a long-lived install's log dir finishes.
+            c = call_log_cache.get_or_parse(log_dir_path, entry, parse_call_log)
             if c:
                 calls.append(c)
         elif entry.suffix == ".md":
             b = parse_brainstorm_log(entry)
             if b:
                 brainstorms.append(b)
+    call_log_cache.save(log_dir_path)
     return cluster_sessions(calls, brainstorms, gap_seconds)
 
 
@@ -914,7 +924,9 @@ def load_sessions(
 # past the browser/Tailscale-proxy timeout, never resolved, and the panel stayed stuck on
 # "Loading…" — i.e. an EMPTY dashboard. The fix is a short-lived memo of the parsed sessions,
 # invalidated by a CHEAP directory signature so live activity is never hidden behind a stale
-# cache. `load_sessions` itself stays PURE (no caching) so tests keep deterministic parses.
+# cache. `load_sessions` itself stays DETERMINISTIC given the same on-disk `.log`/`.md`
+# content (tests still get repeatable parses) — it does now persist its own per-file perf
+# memo (`call_log_cache`) as a side effect, but that memo never changes what it RETURNS.
 _CacheKey = tuple[str, float]  # (resolved dir str, gap)
 _Signature = tuple[int, float]  # (entry-count, max-mtime), from `_dir_signature`
 
@@ -936,7 +948,9 @@ class _SingleFlightCache:
     WAIT for that in-flight result instead of starting a duplicate producer. A waiter accepts
     whatever that one in-flight cycle produced even if the dir signature has since moved again —
     staleness of a single parse-cycle is fine, and it guarantees forward progress (no re-parse
-    loop while a writer hammers the dir). `load_sessions` / `compute_stats` themselves stay pure.
+    loop while a writer hammers the dir). `load_sessions` / `compute_stats` themselves stay
+    deterministic (same source logs in, same result out) — see the note above `_CacheKey`
+    on `load_sessions`'s own perf-memo side effect.
 
     Thread-safety / deadlock-freedom: one `threading.Condition` (and its single underlying lock)
     guards `_cache` and `_in_flight`. The lock is held ONLY for the cheap bookkeeping + the
@@ -1034,6 +1048,17 @@ def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
     try:
         with os.scandir(log_dir_path) as it:
             for entry in it:
+                # Only source artifacts move this signature -- derived data written into
+                # the SAME directory (the persistent call-log cache's db/wal/shm files,
+                # `call_log_cache.py`) must NOT count, or every `load_sessions` call that
+                # writes/updates its own cache invalidates this exact memo on its very next
+                # read, guaranteeing a full re-parse after every productive scan. Same
+                # `Path.suffix` idiom (not a bare `.endswith`) as `_log_dir_fingerprint`/
+                # `_snapshot_logs`, so a dotfile literally named `.log` (suffix `""` under
+                # `Path`) is treated identically by all three -- a prior `endswith` version
+                # of this filter disagreed with its siblings on exactly that edge case.
+                if Path(entry.name).suffix not in (".log", ".md"):
+                    continue
                 count += 1
                 try:
                     mtime = entry.stat().st_mtime

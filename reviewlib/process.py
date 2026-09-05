@@ -83,7 +83,7 @@ def strip_control_sequences(text: str) -> str:
 # only starts once the child is actually spawned (the wait is BEFORE Popen), so a queued
 # seat is never falsely timed out. The default cap is small enough that a single high-`--pool`
 # run can't exhaust memory, while the common single-seat gate (`--pool 1`) and the default
-# pool of 4 are unaffected (4 <= the cap). Overridable via $REVIEW_MAX_CONCURRENCY; <= 0
+# (light) pool of 2 are unaffected (2 <= the cap). Overridable via $REVIEW_MAX_CONCURRENCY; <= 0
 # disables the cap (unbounded, the legacy behaviour) for a box that can sustain it.
 #
 # NOTE: this is a PER-PROCESS cap. A swarm of N separate `review` processes is N independent
