@@ -390,6 +390,132 @@ def _write_if_changed(path: Path, content: str) -> bool:
     return True
 
 
+# review-cli#180: the codex backend's ONLY safety mechanism was `-s read-only`, a
+# filesystem/network sandbox that does NOT restrict codex's shell/exec tool (codex's
+# core capability IS running shell commands — there is no `--tools ""`-style built-in
+# tool-disable, unlike the claude/opencode backends). That let a codex reviewer
+# re-invoke `review diff` on the same worktree as a plain shell command, which spawns
+# another codex, forming an unbounded self-reinvocation loop (live-confirmed
+# 2026-08-11: 40+ live `codex exec` processes and 11 `review diff` processes across 4
+# worktrees, swap at 88.5%, load average 60+).
+#
+# codex DOES have a real command-level restriction: execpolicy `.rules` files
+# (Starlark `prefix_rule(pattern=[...], decision="forbidden")`), loaded by default
+# from `$CODEX_HOME/rules/` (user layer) for every `codex exec` unless
+# `--ignore-rules` is passed. A `forbidden` decision hard-blocks the command before it
+# runs (verified via `codex execpolicy check -r <file> review diff` ->
+# `"decision": "forbidden"`) — this is the closest available equivalent to the claude
+# backend's `--tools ""` / opencode's `bash: deny`. It is written to the USER-level
+# rules dir, not the reviewed repo's own `.codex/rules/`, because `review_codex()`
+# runs with `-C <cwd>` pointed at an arbitrary (often untrusted — project-local rules
+# require trust) target repo — writing config into someone else's working tree would
+# also violate the read-only-reviewer contract.
+#
+# LIMITATION (be honest about it, VERIFIED not assumed — review-cli#180 review
+# finding, glm-5.2): `prefix_rule` matches literal argv TOKENS, so it blocks the
+# demonstrated attack vector — codex invoking these binaries BY NAME as the direct
+# first token — but NOT every conceivable indirection. Confirmed live via
+# `codex execpolicy check` (each below resolves to `"matchedRules": []`, i.e. ALLOWED,
+# not forbidden):
+#   * a wrapped shell script:      bash -c "review diff"
+#   * an absolute path:            /usr/local/bin/review diff
+#   * the module entry point:      python3 -m reviewlib diff
+# codex's core capability is arbitrary shell exec, so no purely name-pattern-based
+# policy can be a complete proof — widening the pattern set to cover these (e.g. a
+# blanket rule on `bash`/`sh`/`python3`) would false-positive-block ordinary reviewer
+# shell usage, so it is not attempted here. The REVIEW_CLI_ACTIVE reentrancy guard
+# (`reviewlib.cli._reject_if_reentrant`) is the mechanism that still holds against ALL
+# three of these, because it checks $REVIEW_CLI_ACTIVE inside `review`'s own process at
+# startup — it does not matter HOW that process was invoked.
+#
+# DELIBERATE, PERMANENT, MACHINE-WIDE (not scoped to review-cli's own calls or cleaned
+# up after): this rules file lives in codex's USER-level `$CODEX_HOME/rules/`, so it
+# affects every `codex exec`/interactive codex session on the machine, not just ones
+# spawned by review-cli, and is never removed. That is intentional, not an oversight —
+# review-cli#180 was a real machine-hanging incident (see below), and "codex shells
+# out to bare `review`/`codex`/`claude`/`opencode`/`omp`" is not a legitimate pattern
+# for ordinary interactive codex usage either. There is deliberately NO opt-out flag:
+# an opt-out that a compromised/confused agent could set would reopen exactly this
+# hole (same class of gap as the REVIEW_CLI_ACTIVE `env -u` bypass documented in
+# `cli._reject_if_reentrant`). The file is plainly commented (see the generated
+# header below) and lives at a well-known, single path if a human wants to remove it.
+_CODEX_RECURSION_GUARD_FILENAME = "review-cli-recursion-guard.rules"
+_CODEX_RECURSION_GUARD_MARKER = "review-cli#180"
+# The exact binaries review-cli itself shells out to as a backend (reviewlib/backends.py).
+# A codex agent invoking any of these AS A COMMAND is, by definition, either the
+# review-cli#180 loop or an equally unwanted nested-agent spawn — never something a
+# read-only code review legitimately needs to do.
+CODEX_RECURSION_GUARD_FORBIDDEN_COMMANDS = ("review", "codex", "claude", "opencode", "omp")
+
+
+def _codex_recursion_guard_rules() -> str:
+    """Starlark execpolicy `.rules` content forbidding codex from re-invoking `review`
+    or any review-cli backend CLI as a shell command. GENERATED from
+    `CODEX_RECURSION_GUARD_FORBIDDEN_COMMANDS` (single source of truth) so the
+    installed file and the constant can never drift. Every entry is asserted to be a
+    plain identifier (no quotes/backslashes) before interpolation, so a future
+    addition to the tuple can never emit invalid/injected Starlark (review-cli#180
+    review finding, glm-5.2) — the current hardcoded values are all safe already, this
+    is future-proofing, not a fix for an observed break."""
+    for cmd in CODEX_RECURSION_GUARD_FORBIDDEN_COMMANDS:
+        # A raise, not `assert` — `assert` is compiled out entirely under `python -O`/
+        # `-OO`, which would silently remove this guarantee (review-cli#180 review
+        # round 4, Opus).
+        if not (cmd.isidentifier() or cmd.replace("-", "_").isidentifier()):
+            raise ValueError(f"unsafe command name for Starlark interpolation: {cmd!r}")
+    rules = (
+        "prefix_rule(\n"
+        f'    pattern = ["{cmd}"],\n'
+        '    decision = "forbidden",\n'
+        f'    justification = "{_CODEX_RECURSION_GUARD_MARKER}: codex must not '
+        f're-invoke {cmd} as a shell command — unbounded self-reinvocation loop",\n'
+        ")\n"
+        for cmd in CODEX_RECURSION_GUARD_FORBIDDEN_COMMANDS
+    )
+    return (
+        f"# {_CODEX_RECURSION_GUARD_MARKER}: installed by review-cli — DO NOT hand-edit,\n"
+        "# it is checked (and rewritten if stale/missing) on the FIRST codex backend call\n"
+        "# of each review-cli process — not on every call (review-cli#180 review finding,\n"
+        "# glm-5.2: this file is safe to delete by hand, it is simply recreated the next\n"
+        "# time a codex backend call happens in a NEW review-cli process). See\n"
+        "# reviewlib/install.py install_codex_recursion_guard() for the rationale.\n\n"
+        + "\n".join(rules)
+    )
+
+
+def codex_home() -> Path:
+    """`$CODEX_HOME`, or `~/.codex` when unset/empty — matching codex's own resolution
+    for its execpolicy rules-discovery user layer in the common (unset) case. An
+    explicitly-EMPTY `CODEX_HOME=""` is treated the same as unset (falls back to
+    `~/.codex`) rather than resolved literally — this is an untested edge case (nobody
+    sets `CODEX_HOME=""` deliberately); if codex itself ever resolves an empty value
+    differently, the guard file could land in a directory codex doesn't read from,
+    silently defeating it for that one case (review-cli#180 review finding, Opus)."""
+    override = os.environ.get("CODEX_HOME")
+    return Path(override) if override else Path.home() / ".codex"
+
+
+def install_codex_recursion_guard() -> bool:
+    """Idempotently write the review-cli#180 execpolicy guard into codex's user-level
+    rules directory. Returns True if it CHANGED anything (created or rewrote a stale
+    copy), False if already up to date OR the write failed.
+
+    Best-effort and NEVER raises: a locked-down/unwritable `$CODEX_HOME` must not break
+    a review run. The `_write_if_changed` failure modes (permissions, read-only FS,
+    ENOSPC) collapse to `False` here rather than propagating, and so does a
+    `codex_home()` resolution failure (`Path.home()` raises `RuntimeError` when $HOME
+    is unset AND the pwd-database fallback also fails — review-cli#180 review finding,
+    glm-5.2: a bare `except (OSError, ValueError)` did not cover that case, silently
+    contradicting this docstring). The caller (`backends._ensure_codex_recursion_guard`)
+    treats "did nothing" and "wrote it" the same way (fire-and-forget) either way, so
+    there is nothing for a caller to branch on besides the boolean."""
+    try:
+        path = codex_home() / "rules" / _CODEX_RECURSION_GUARD_FILENAME
+        return _write_if_changed(path, _codex_recursion_guard_rules())
+    except Exception:  # noqa: BLE001 — must never break a review call, see docstring
+        return False
+
+
 def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
     """Idempotently install the agent skill across detected harnesses. Reports each target's
     STATE (ROADMAP "install-* commands must show INSTALLED state"): a green check + "already
