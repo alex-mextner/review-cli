@@ -1425,15 +1425,30 @@ diagnostic stays silent in exactly the case (a stuck seat masked by working fail
 it exists to surface. Tracked as
 [review-cli#227](https://github.com/alex-mextner/review-cli/issues/227).
 
-**Scope gap (known, tracked):** this whole mechanism is wired into
-only the two claude dispatch paths (`review_with_images`, `review_claude` in
-`backends.py`) — `review_opencode`/`review_codex`/the `commandcode:`/`zai:` HTTP backends
-have no cooldown consult/record/clear at all. The review-cli#221 incident that motivated
-this feature was actually an `oc:zai/glm-5.2` (opencode) seat, which this escalation
-mechanism does **not** cover yet — that seat still relies purely on manual
-`models:`/`board:` config exclusion (see this file's model-roster section). Extending the
-same check/record/clear trio to the non-claude backends is tracked as
-[review-cli#226](https://github.com/alex-mextner/review-cli/issues/226), not done here.
+**Scope gap (known, tracked):** the FULL check/record/clear trio — including the
+administrative-sentinel/quota-marker body detection that decides a call is
+chronically-unavailable in the first place — is wired into only the two claude
+dispatch paths (`review_with_images`, `review_claude` in `backends.py`).
+`review_opencode` (review-cli#235) additionally consults + records + clears this same
+store, but ONLY for its own narrower TRUE-SILENCE failure mode (see the next section):
+a seat that never produces a single byte of output within `REVIEW_TRUE_SILENCE_SECONDS`
+is reaped and cooled down the same way a chronically-unavailable claude seat is.
+`review_opencode`'s success path now ALSO reuses the SAME shared chronic-unavailable/
+quota-marker body detector `review_claude`'s clear-gate uses (`_chronic_unavailable_reason`
+— not actually claude-specific in implementation, it just wasn't wired into any other
+call site before this) — a rc=0 body matching one of those known marker phrases is
+recorded as a chronic failure rather than wrongly clearing true-silence escalation
+history. This narrows, but does not fully close, the gap: an opencode-specific quota
+wording that matches NONE of the shared marker phrases is treated as a genuine success
+and DOES clear the cooldown (any non-empty rc=0 body defaults to "recovered" unless it
+matches a known chronic sentinel) — the same behavior `review_claude`'s identical
+sibling pattern has always had for an unrecognised claude quota wording, not a new gap
+this feature introduces. `review_codex` and the `commandcode:`/`zai:` HTTP backends
+have no cooldown consult/record/clear at all. Extending the full trio (including
+genuinely opencode-specific body detection, so an unrecognised wording is correctly
+classified as chronic rather than defaulting to "success") to the non-claude backends
+is tracked as [review-cli#226](https://github.com/alex-mextner/review-cli/issues/226),
+not done here.
 
 **Memory-aware concurrency cap.** Each heavy seat (codex / claude / opencode) spawns a fat
 model-runner subprocess, and a `review` runs its whole pool in parallel — so a high `--pool`
@@ -1568,15 +1583,27 @@ exists but the provider is not currently paid/entitled, configure `unpaid_provid
 `REVIEW_UNPAID_PROVIDERS` so the seat is skipped before launch. Either way the board
 degrades gracefully rather than blocking. The default GLM
 seat pins `oc:zai/glm-5.2` (the flagship). Agentic opencode seats use the same per-seat
-idle timeout as every other subprocess backend: progress output keeps the call alive, while
-a fully silent call is reaped after the idle window and reserve backfill can take over. To
-run an older GLM, override the seat in a `config.yaml` `board:` list (e.g.
-`{ model: "oc:zai/glm-5.1", role: quality }`).
+idle timeout as every other subprocess backend: progress output keeps the call alive.
+A call that produces at least one byte of output but then goes quiet is reaped after the
+ordinary idle window, same as any other backend. A call that NEVER produces a single byte
+is instead governed SOLELY by a separate TRUE-SILENCE check (review-cli#235,
+`REVIEW_TRUE_SILENCE_SECONDS`, default 5 minutes) — the ordinary idle window does not
+apply at all pre-first-byte, only after. With the default 20-minute idle window this
+means a silent seat is normally reaped sooner (5 min vs 20 min); but an operator who has
+tightened `REVIEW_IDLE_TIMEOUT_SECONDS` below 5 minutes will see the OPPOSITE — a silent
+seat now waits the full true-silence timeout instead of the operator's shorter idle
+window (review-cli#254). Tune `REVIEW_TRUE_SILENCE_SECONDS` directly if this matters for
+your setup. This only applies pre-first-byte and only to opencode seats today; see the
+seat-cooldown section above. Either reap lets reserve backfill take over. To run an older GLM, override the seat in a `config.yaml`
+`board:` list (e.g. `{ model: "oc:zai/glm-5.1", role: quality }`).
 
 **Advanced timeout env:** `REVIEW_IDLE_TIMEOUT_SECONDS=N` overrides the review/panel
 subprocess idle window for CLI seats; `0` disables idle reap and uses wall-clock
-`--timeout` instead. It does not change REST HTTP timeouts, QA wall-clock caps, or vision
-wall-clock caps.
+`--timeout` instead (and also disables the true-silence check below, since it runs inside
+the same idle-mode wait path). It does not change REST HTTP timeouts, QA wall-clock caps,
+or vision wall-clock caps. `REVIEW_TRUE_SILENCE_SECONDS=N` overrides how long an opencode
+seat gets before its FIRST byte of output arrives; `<= 0` disables that check. See the
+seat-cooldown section above for the full contract.
 
 **`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
 set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or

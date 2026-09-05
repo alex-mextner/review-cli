@@ -69,6 +69,15 @@ semantic versioning.
   must pass or fail on that basis alone, never falling back just because the
   role floor isn't met.
 
+- **True-silence detection + partial-result preservation for opencode seats
+  (#243, closes review-cli#243).** A per-model, versioned registry
+  (`reviewlib/model_behavior.py`) governs how long an opencode seat is given to
+  produce its first byte of output before it's treated as a stuck/silent model
+  (default 5 minutes) rather than merely idle — wired into the existing
+  escalating seat-cooldown schedule (#230) instead of a flat cooldown, and
+  surfaced on the dashboard as its own health class, distinct from a genuine
+  child exit(125) and from a quota/paywall cooldown skip.
+
 - **`review task CODE --check --min-roles N` — count covered board roles instead
   of distinct model names, and default to role-based counting (#221, #246).**
   The board's shortage-resilience behavior (`select_pool_with_reuse`, #207)
