@@ -3661,8 +3661,8 @@ def _build_top_level_parser() -> argparse.ArgumentParser:
         prog="review",
         description=(
             "Run read-only code reviews / AI panels across multiple model backends "
-            "(one narrow opt-in exception: `review diff --staged --commit` checkpoints "
-            "a commit). Everything is a SUBCOMMAND: `review diff` (review the git diff), "
+            "(one narrow opt-in exception: `review diff --staged --task CODE --commit` "
+            "checkpoints a commit). Everything is a SUBCOMMAND: `review diff` (review the git diff), "
             "`review brainstorm`, `review just-ask`, `review quorum`. A bare `review` "
             "(no subcommand) prints this help — it does NOT run a diff review; use "
             "`review diff` for that."
