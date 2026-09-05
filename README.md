@@ -214,11 +214,11 @@ engineer, security-paranoid reviewer, skeptical SRE, etc.), shown in the transcr
 `glm [Security-paranoid reviewer]`; when a distinct-model pool is scarce or some
 models are near their usage limit, one model can fill several seats (`fable#1`,
 `fable#2`, ...) and each of ITS seats gets a different lens, up to the size of the
-persona pool (currently 6) — beyond that a model's lens can repeat. **Phase 2:** a
-moderator runs sequentially, reads all expert answers, and emits a structured summary
-with three sections — QUORUM (points of majority agreement with evidence),
-DISAGREEMENT / NO QUORUM, and ABSTAINED. The moderator is told to treat all seats
-sharing one model as a single opinion, regardless of lens, for majority-counting.
+persona pool (currently 6) — beyond that a model's lens can repeat. A model covering
+multiple roles in parallel is a fully valid panel shape; each of its seats is a genuine,
+undiscounted opinion in its own right. **Phase 2:** a moderator runs sequentially, reads
+all expert answers, and emits a structured summary with three sections — QUORUM (points
+of majority agreement with evidence), DISAGREEMENT / NO QUORUM, and ABSTAINED.
 
 Use when a question has real stakes and you want cited consensus, not vibes.
 

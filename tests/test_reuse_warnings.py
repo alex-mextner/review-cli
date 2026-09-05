@@ -11,9 +11,10 @@ Covers, offline (no model call, no network):
       false-positive (Fable/k3 review finding, review-cli#205 round 2);
   (b) every quorum seat gets a distinct persona from brainstorm's role
       rotation (Alex, 2026-08-18); repeated models keep a `<model>#N` prefix
-      in their label and a moderator disclosure note so duplicate seats read
-      as ONE opinion, not two independent ones, despite reasoning from
-      different roles.
+      in their label so repeated seats stay identifiable in the transcript.
+      One model covering multiple roles in parallel is a fully valid panel
+      shape (Alex, 2026-08-21) — the moderator prompt does NOT discount or
+      relabel a duplicated model's seats as a lesser/single opinion.
 
 Plain-script harness (mirrors tests/test_pool_reuse.py): each test_* is run
 by __main__, and also pytest-discoverable.
@@ -153,7 +154,7 @@ def _run_quorum_with_fakes(models: list[str]) -> dict:
     return captured
 
 
-def test_quorum_labels_duplicate_seats_and_notes_them_to_the_moderator():
+def test_quorum_labels_duplicate_seats_without_discounting_them_to_the_moderator():
     captured = _run_quorum_with_fakes(
         ["fable", "glm", "fable"]
     )  # fable padded in twice
@@ -174,13 +175,17 @@ def test_quorum_labels_duplicate_seats_and_notes_them_to_the_moderator():
     assert "### Expert: fable#2 [Security-paranoid reviewer]" in captured["mod_prompt"]
     assert "fable#1" in captured["mod_prompt"]
     assert "fable#2" in captured["mod_prompt"]
-    assert "SINGLE opinion" in captured["mod_prompt"]
+    # Alex, 2026-08-21: a model covering multiple roles in parallel is a fully
+    # valid panel shape -- the moderator prompt must NOT tell the moderator to
+    # discount a duplicated model's seats as a single/lesser opinion.
+    assert "SINGLE opinion" not in captured["mod_prompt"]
+    assert "single opinion" not in captured["mod_prompt"]
 
 
-def test_quorum_labels_distinct_seats_with_roles_but_no_dedup_note():
+def test_quorum_labels_distinct_seats_with_roles_and_no_discount_note():
     captured = _run_quorum_with_fakes(["fable", "glm"])
-    # No duplicates -> no "#N" and no dedup note, but every seat still carries
-    # a persona (Alex, 2026-08-18) -- distinct-model panels get roles too.
+    # No duplicates -> no "#N", but every seat still carries a persona
+    # (Alex, 2026-08-18) -- distinct-model panels get roles too.
     assert captured["labels"] == [
         "fable [Pragmatic staff engineer]",
         "glm [Security-paranoid reviewer]",
