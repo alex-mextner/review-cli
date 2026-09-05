@@ -5,6 +5,90 @@ semantic versioning.
 
 ## Unreleased
 
+- **Diff-identity binding for `review task CODE --check` — closes a real
+  quorum-pollution incident class (v4 run-stats records).** The self-merge-authority
+  quorum gate used to key PASSED iterations purely by task-code STRING, with no
+  binding to which repo or which diff was actually reviewed. Three real incidents in
+  one session (2026-08-11) showed task-code reuse (a typo, a shared parent-ticket
+  convention, or an accidental/naive substitution) let one diff's real reviews
+  silently count toward a completely different diff's quorum — a wrong-repo review,
+  a swapped task code between two unrelated PRs, and years of unrelated cross-repo
+  history piled onto one code. Every recorded iteration now carries `repo_id` (the
+  normalized `origin` remote — lowercased, default-SSH-port-normalized so https/ssh
+  forms of the same remote match — or a local path fallback) and `diff_files` (the
+  touched-file set), plus `diff_sha256` (diagnostic-only). `review task CODE --check`
+  resolves `-C`'s current repo/diff and EXCLUDES any recorded iteration whose repo
+  differs or whose files share nothing with the current diff, instead of trusting a
+  task-code match alone — matching is file-SET overlap, not diff-content-hash
+  equality, so the normal review-fix-re-review loop (where the diff's exact text
+  legitimately changes between iterations) still counts. History predating this
+  field is "unverifiable" and still counts, preserving old behavior for old data.
+  A stderr warning is now printed whenever verification did NOT run (disabled via
+  `--no-verify-identity`, or `-C` not resolving to a real directory), so "verified"
+  is never silently indistinguishable from "never checked". `gh ship`'s quorum gate
+  needs NO changes to benefit — it already resolves `-C` from its own repo root and
+  reads the same `passed_iterations`/`.error` keys, which now reflect the filtered
+  count automatically. **Threat-model boundary** (be honest about scope): the store
+  is a local, self-reported JSONL a caller with write access can append to directly
+  — this closes "wrong string matches real but unrelated history", not a
+  cryptographic guarantee against a fully malicious agent fabricating a fresh
+  record with spoofed identity. See `reviewlib/stats.py`'s "Diff-identity binding"
+  docstring section and `tests/test_diff_identity.py` for the full incident-shaped
+  regression coverage. Also fixes `_git_diff` to pin `--src-prefix=a/
+  --dst-prefix=b/` regardless of the invoking machine's `diff.noprefix` git config
+  (found live: a no-prefix diff silently produced an empty `diff_files` list), and
+  the `--check` post-push default-branch-diff fallback now uses `git diff
+  --name-only` (one call covering staged+unstaged together, immune to
+  `diff.noprefix` entirely, no full patch body transferred) — this closes a
+  regression a first cut of this same change shipped with, caught by dogfooding
+  `review diff` on this PR's own diff before commit (Codex/GLM/Opus/Fable all
+  independently found the same missing-prefix-pin bug on the fallback path). A
+  SECOND dogfooded review round (same PR, after the round-1 fixes) caught one
+  more real bug, independently found by Opus and Fable: the check-time file-set
+  resolution took the FIRST non-empty of "local uncommitted changes" vs "branch
+  vs default-branch diff", so a single UNRELATED dirty file at post-push check
+  time (`gh ship`'s exact call shape) shadowed the branch's real PR files
+  entirely, spuriously excluding every legitimate iteration. Fixed to return the
+  UNION of both instead of first-match-wins. That round also hardened
+  `_compute_repo_id`'s local (no-remote) path fallback to self-normalize via
+  `git rev-parse --show-toplevel` instead of trusting the caller's `cwd`
+  verbatim, hoisted the per-check file-set into one `frozenset` instead of
+  rebuilding it per iteration (was O(iterations × files)), and capped
+  `mismatch_details` in `--check --json` at 50 entries (the count in
+  `excluded_mismatched_iterations` stays the uncapped true total) so a
+  thousands-of-iterations polluted task code — the exact HYP-858 shape — can't
+  balloon the JSON payload. A THIRD dogfooded round then added a
+  machine-readable `identity_verification: "ran"|"disabled"|"skipped_unresolvable"`
+  JSON field (the stderr warnings above weren't parseable by a `--json`-only
+  caller) and a regression test for the record-time `diff.noprefix` path (only
+  the check-time path had one). A fourth round found no blocking issues.
+  Separately (caught only by actually trying to COMMIT this change on this
+  repo's own `diff.noprefix=true` dev machine, not by any of the four review
+  rounds — none of them execute a live commit against the pre-commit hook):
+  `_git_diff`'s new `--src-prefix`/`--dst-prefix` pin made the REVIEWED diff
+  text byte-different from the pre-commit hook's own INDEPENDENT, unprefixed
+  `git diff --no-ext-diff --cached` recomputation, so the review-stamp hash
+  `_write_review_stamp` writes stopped matching the hook's own hash — silently
+  breaking the "you must review this exact diff before commit" gate on any
+  `diff.noprefix=true` machine. Fixed by having `_write_review_stamp`
+  independently re-derive the diff with the SAME unprefixed invocation the
+  hook uses, rather than hashing the (now possibly prefixed) reviewed text.
+  A FIFTH dogfooded round then caught a subtler consequence of that same fix
+  (k3 + Opus, independently): re-deriving the hash at stamp-WRITE time (right
+  after the multi-model panel finishes, potentially minutes after dispatch)
+  reopened a narrow TOCTOU window — a concurrent index mutation DURING the
+  review (a second agent/session in a shared checkout; AGENTS.md documents
+  this has happened in production) would get silently certified as reviewed,
+  where the pre-fix behavior (hashing the actually-reviewed `diff` text)
+  failed closed instead. Fixed by capturing the hook-compatible hash ONCE, at
+  DIFF-DISPATCH time (`cli._stamp_hash_for_staged_diff`, called immediately
+  adjacent to the diff capture that feeds the models), and threading it
+  through `mode_review`/`_mode_review_board`/`_stamp_if_staged_commit_review`
+  into `_write_review_stamp` — so the stamp certifies what the models actually
+  saw again, while staying hash-compatible with the hook's own unprefixed
+  recomputation. Falls back to the write-time re-derive for any non-CLI caller
+  of `mode_review` that doesn't thread the new `stamp_diff_hash` parameter.
+
 - **`review stat` — per-harness/per-model usage + health report, and two concrete
   token-burn fixes (2026-08 investigation).** `review stat` (`--days`, `--since`,
   `--top`, `--harness`, `--json`) parses the real per-call logs into a per-backend

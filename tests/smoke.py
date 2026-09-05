@@ -782,6 +782,9 @@ _UNIT_FILES = [
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # Diff-identity binding (review-cli#213): repo/diff mismatch detection for
+    # `review task CODE --check`'s self-merge-authority gate.
+    ("test_diff_identity.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_backstop.py", {}),
     # From main's review-UX-chain (review-cli#44): help defaults, install hook text / state, topic help.
     ("test_help_defaults.py", {}),

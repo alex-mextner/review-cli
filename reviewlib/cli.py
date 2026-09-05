@@ -76,8 +76,11 @@ from .process import _run, git_repo_env, strip_control_sequences
 from .retry import max_retry_count
 from .stats import (
     announce_eta,
+    diff_content_hash,
+    extract_diff_files,
     fmt_duration,
     iterations_for_task,
+    normalize_repo_remote,
     normalize_task_code,
     quorum_check,
     record_run,
@@ -222,8 +225,23 @@ def _git_diff(cwd: Path, staged: bool) -> str:
     /repoB diff --cached` reads the env's repo, not repoB — the review-gate then reviews the
     wrong (or empty) diff (review-cli#71). `git_repo_env` KEEPS the target repo's own hook env
     (a legit pre-commit's GIT_INDEX_FILE/temp `next-index` that scopes `--cached` to the partial
-    commit), dropping only env vars that resolve outside `cwd`'s git dir (codex P2 on PR #72)."""
-    args = ["git", "-C", str(cwd), "diff", "--no-ext-diff"]
+    commit), dropping only env vars that resolve outside `cwd`'s git dir (codex P2 on PR #72).
+
+    `--src-prefix=a/ --dst-prefix=b/` pins the header format regardless of the invoking
+    machine's `diff.noprefix`/custom-prefix git config (some machines set
+    `diff.noprefix=true` globally, which emits headers with NO a/b prefix at all —
+    `diff --git f.txt f.txt` — silently breaking `stats.extract_diff_files`'s
+    `diff --git a/<path> b/<path>` parse, found live on this repo's own dev machine).
+    Content is unaffected — only the path labels in the header/`---`/`+++` lines."""
+    args = [
+        "git",
+        "-C",
+        str(cwd),
+        "diff",
+        "--no-ext-diff",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ]
     if staged:
         args.append("--cached")
     try:
@@ -233,6 +251,199 @@ def _git_diff(cwd: Path, staged: bool) -> str:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "git diff failed")
     return proc.stdout
+
+
+def _stamp_hash_for_staged_diff(cwd: Path) -> str | None:
+    """Sha256 of `git diff --no-ext-diff --cached` with NO `--src-prefix`/
+    `--dst-prefix` — i.e. exactly what the pre-commit hook's own independent
+    verification computes, whatever the machine's ambient `diff.noprefix`/prefix
+    git config happens to produce. None on any failure (best-effort; the review
+    still proceeds without the tightened stamp, falling back to
+    `_write_review_stamp`'s own re-derive at write time).
+
+    Called ONCE, immediately adjacent to the `_git_diff(cwd, staged=True)` call
+    that captures the diff actually sent to the models (reviewlib.install
+    "_write_review_stamp" docstring has the full story of why this exists —
+    round-5 review finding, k3+Opus: hashing at stamp-WRITE time instead of
+    dispatch-CAPTURE time reopened a multi-minute TOCTOU window where a
+    concurrent index mutation during the panel run could get silently
+    certified as reviewed)."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--cached"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    import hashlib
+
+    return hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest()
+
+
+def _git_remote_origin_url(cwd: Path) -> str | None:
+    """`git -C cwd remote get-url origin`, or None on ANY failure (no remote, not a
+    repo, no git binary, a wedge) — best-effort, this only feeds an identity label,
+    never a required path."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "remote", "get-url", "origin"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    url = proc.stdout.strip()
+    return url or None
+
+
+def _git_toplevel(cwd: Path) -> Path | None:
+    """`git -C cwd rev-parse --show-toplevel`, or None on any failure (not a repo,
+    no git binary, a wedge)."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return Path(proc.stdout.strip())
+
+
+def _compute_repo_id(cwd: Path) -> str | None:
+    """Best-effort stable identity for the repo at `cwd`, for run-stats diff-identity
+    binding (reviewlib.stats "Diff-identity binding") — see that module's docstring for
+    WHY this exists (closes 3 real task-code quorum-pollution incidents).
+
+    Prefers the normalized `origin` remote URL (stable across worktrees/clones of the
+    SAME repo, unlike a local path). Falls back to the resolved absolute repo root
+    for a remote-less repo, prefixed `path:` so a path-based id can never collide with
+    a remote-based one. The path fallback SELF-NORMALIZES via `_git_toplevel` rather
+    than trusting `cwd` as-is (review finding on this feature's own PR, round 2: every
+    CURRENT caller already passes an `_effective_cwd`-resolved toplevel, so this was
+    not a live bug today, but the id would silently diverge — `path:/repo/subdir` at
+    record time vs `path:/repo` at check time, a spurious `repo_mismatch` — the moment
+    any future caller passed a subdirectory, and nothing enforced the invariant this
+    function's OWN docstring asserted). Falls back to `cwd` itself only when `cwd` is
+    a real directory but git can't resolve its toplevel (a non-repo directory, kept
+    for the same "reviewing it as-is" posture `_effective_cwd` already has elsewhere).
+    None only when `cwd` isn't even a real directory.
+    """
+    url = _git_remote_origin_url(cwd)
+    if url:
+        normalized = normalize_repo_remote(url)
+        if normalized:
+            return normalized
+    toplevel = _git_toplevel(cwd)
+    if toplevel is not None:
+        return f"path:{toplevel}"
+    try:
+        if cwd.is_dir():
+            return f"path:{cwd}"
+    except OSError:
+        pass
+    return None
+
+
+def _default_branch_ref(cwd: Path) -> str | None:
+    """Best-effort `origin/<default-branch>` ref for `cwd`, or None.
+
+    Tries the recorded `origin/HEAD` symref first (what `git clone` sets up), then
+    falls back to probing the two common default-branch names directly — a shallow
+    CI checkout or a repo cloned with `--single-branch` may lack `origin/HEAD`
+    entirely. Feeds `--check`'s diff-identity file-set comparison for the common
+    post-push case (clean working tree, nothing to diff locally); never raises.
+    """
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip().replace("refs/remotes/", "")
+    for candidate in ("origin/main", "origin/master"):
+        try:
+            proc = _run(
+                ["git", "-C", str(cwd), "rev-parse", "--verify", candidate],
+                cwd=cwd,
+                env=git_repo_env(cwd),
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0:
+            return candidate
+    return None
+
+
+def _diff_name_only(cwd: Path, ref_args: list[str]) -> list[str] | None:
+    """`git diff --name-only <ref_args>` -> sorted touched-file list, or None on ANY
+    failure (non-repo, unresolvable ref, a wedge). `--name-only` sidesteps the
+    `diff.noprefix` footgun `_git_diff` otherwise has to pin `--src-prefix`/
+    `--dst-prefix` against (`extract_diff_files`'s `diff --git a/... b/...` regex
+    doesn't even apply here — there IS no `diff --git` header, just bare file
+    paths) — a real bug this exact fallback shipped with once already (codex/
+    GLM/opus/fable review finding on this feature's own PR: the first cut only
+    pinned the prefix on `_git_diff`, not on this fallback's own separate `git
+    diff` call, silently disabling file-level matching on any `diff.noprefix=true`
+    machine — precisely the class this feature targets). Also far cheaper than a
+    full patch body for an identity check: file NAMES only, not hunks."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--name-only", *ref_args],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
+
+
+def _current_diff_files_for_check(cwd: Path) -> list[str] | None:
+    """Best-effort file list for the diff currently under review at `cwd`, for
+    `--check`'s repo/diff mismatch detection (reviewlib.stats "Diff-identity
+    binding").
+
+    Returns the UNION of `git diff --name-only HEAD` (local uncommitted changes —
+    staged AND unstaged together, the dev-loop case) and the branch's diff against
+    its own default branch when one resolves (the post-push `gh ship` case).
+    Deliberately a UNION, not first-non-empty-wins: two independent review
+    findings (Opus + Fable) on this feature's own PR caught that "HEAD probe wins
+    whenever the tree has ANY uncommitted change" lets a single unrelated dirty
+    file at check time (a stray edit, a version bump in progress) SHADOW the
+    branch's real PR files entirely — the post-push case is exactly when the
+    branch diff is what matters, and it's exactly when a stray local edit is most
+    likely to be sitting around. Unioning means a legitimate iteration whose files
+    overlap the REAL branch diff still verifies even with local dirt present.
+    Returns None (skip the file-level check; `repo_id` alone still gates) only
+    when NEITHER source resolves to anything — never raises.
+    """
+    local = set(_diff_name_only(cwd, ["HEAD"]) or [])
+    default_ref = _default_branch_ref(cwd)
+    branch = (
+        set(_diff_name_only(cwd, [f"{default_ref}...HEAD"]) or [])
+        if default_ref
+        else set()
+    )
+    union = sorted(local | branch)
+    return union or None
 
 
 def _read_stdin_if_piped() -> str | None:
@@ -794,6 +1005,21 @@ def _task_subcommand(rest: list[str]) -> int:
         default=3,
         help="review-bar floor: distinct models among the PASSED iterations (default 3)",
     )
+    parser.add_argument(
+        "-C",
+        "--cwd",
+        default=".",
+        help="--check only: repo to verify recorded iterations against "
+        "(diff-identity binding — see reviewlib.stats module docstring)",
+    )
+    parser.add_argument(
+        "--no-verify-identity",
+        action="store_true",
+        help="--check only: skip repo/diff mismatch detection entirely (legacy "
+        "behavior — every PASSED iteration counts, exactly as before this gate "
+        "existed). Escape hatch for a cwd that can't resolve a repo; NOT a way "
+        "around a genuine mismatch finding.",
+    )
     ns = parser.parse_args(rest)
 
     if ns.check:
@@ -812,7 +1038,12 @@ def _task_subcommand(rest: list[str]) -> int:
             )
             return 2
         return _quorum_check_subcommand(
-            ns.code, ns.min_iter, ns.min_models, as_json=ns.json
+            ns.code,
+            ns.min_iter,
+            ns.min_models,
+            as_json=ns.json,
+            cwd_raw=ns.cwd,
+            verify_identity=not ns.no_verify_identity,
         )
 
     if not ns.code:
@@ -1200,10 +1431,55 @@ def _render_stat_oversized_section(top: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _resolve_quorum_check_context(
+    cwd_raw: str, verify_identity: bool
+) -> tuple[str | None, list[str] | None, str]:
+    """Resolve the (repo_id, diff_files, status) check context for `--check`. See
+    `_quorum_check_subcommand`.
+
+    `status` is one of ``"ran"`` (repo_id/diff_files are usable), ``"disabled"``
+    (`--no-verify-identity`), or ``"skipped_unresolvable"`` (`-C`/`cwd_raw` isn't
+    even a real directory — `_compute_repo_id` otherwise always has a `path:`
+    fallback). This is a MACHINE-READABLE version of the same distinction the
+    stderr warnings below already make for a human — review finding (Fable) on
+    this feature's own PR: the original cut only had the stderr text, so a
+    machine caller like `gh ship` had no JSON field to assert "verification
+    actually ran" against; it could only infer it from the ABSENCE of the
+    diagnostic keys, which is indistinguishable from "verification ran and this
+    task genuinely has zero passed iterations". `_quorum_check_subcommand` writes
+    `status` into the result as `"identity_verification"`.
+    """
+    if not verify_identity:
+        print(
+            "[review task] warning: diff-identity verification disabled "
+            "(--no-verify-identity) — every PASSED iteration counts regardless of "
+            "recorded repo/diff, exactly as before this gate existed",
+            file=sys.stderr,
+        )
+        return None, None, "disabled"
+    cwd = _effective_cwd(cwd_raw, warn=False)
+    repo_id = _compute_repo_id(cwd)
+    if repo_id is None:
+        print(
+            f"[review task] warning: could not resolve a repo at -C {cwd_raw!r} — "
+            "diff-identity verification skipped, falling back to legacy counting "
+            "(every PASSED iteration counts regardless of recorded repo/diff)",
+            file=sys.stderr,
+        )
+        return None, None, "skipped_unresolvable"
+    return repo_id, _current_diff_files_for_check(cwd), "ran"
+
+
 def _quorum_check_subcommand(
-    code: str, min_iter: int, min_models: int, *, as_json: bool
+    code: str,
+    min_iter: int,
+    min_models: int,
+    *,
+    as_json: bool,
+    cwd_raw: str = ".",
+    verify_identity: bool = True,
 ) -> int:
-    """`review task CODE --check [--min-iter N] [--min-models M]`.
+    """`review task CODE --check [--min-iter N] [--min-models M] [-C DIR]`.
 
     Exit 0 iff CODE has >= min_iter PASSED recorded iterations across >= min_models
     distinct models among those passed iterations; exit 1 otherwise, including the
@@ -1211,8 +1487,45 @@ def _quorum_check_subcommand(
     or a task whose only history predates the verdict field) where reviewlib.stats.
     quorum_check sets an "error" key or simply comes up short. See quorum_check's
     docstring for the "passed, not just dispatched" semantics this check enforces.
+
+    `verify_identity` (default True) resolves `cwd_raw` (`-C`) to a repo id + the
+    current diff's touched-file set and hands both to `quorum_check`, so a PASSED
+    iteration recorded against a DIFFERENT repo, or a diff sharing no touched file,
+    is EXCLUDED from the count rather than silently trusted — see reviewlib.stats
+    "Diff-identity binding" for why (closes 3 real quorum-pollution incidents).
+    `--no-verify-identity` restores the pre-binding behavior (every passed iteration
+    counts, no repo/diff cross-check) — an escape hatch for a cwd that can't resolve
+    a repo, not a way around a genuine mismatch finding.
     """
-    result = quorum_check(code, min_iter=min_iter, min_models=min_models)
+    repo_id, diff_files, verification_status = _resolve_quorum_check_context(
+        cwd_raw, verify_identity
+    )
+    result = quorum_check(
+        code,
+        min_iter=min_iter,
+        min_models=min_models,
+        repo_id=repo_id,
+        diff_files=diff_files,
+    )
+    # Machine-readable counterpart to the stderr warnings below: a caller like
+    # `gh ship` parsing --json alone (never sees stderr) can assert on this
+    # directly instead of inferring "did verification run" from key absence.
+    result["identity_verification"] = verification_status
+    # This warning goes to stderr in BOTH --json and text mode: --json's structured
+    # payload already carries excluded_mismatched_iterations/mismatch_details for a
+    # machine reader, but a human watching stderr (e.g. `gh ship`'s own console
+    # output) must see the mismatch surfaced too, not just a smaller-than-expected
+    # number with no explanation.
+    excluded = result.get("excluded_mismatched_iterations", 0)
+    if excluded:
+        print(
+            f"[review task] warning: excluded {excluded} recorded iteration(s) for "
+            f"{result['task_code']} — recorded repo/diff did not match the code "
+            "currently being checked (--json for detail; --no-verify-identity disables "
+            "this check)",
+            file=sys.stderr,
+        )
+
     if as_json:
         import json as _json
 
@@ -1899,6 +2212,9 @@ def _run_mode_with_stats(
     models_after=None,
     *,
     task_code: str | None = None,
+    repo_id: str | None = None,
+    diff_files: list[str] | None = None,
+    diff_sha256: str | None = None,
 ) -> int:
     """Announce the ETA, time the run on a monotonic clock, and append a stat record.
 
@@ -1922,6 +2238,11 @@ def _run_mode_with_stats(
     ~0s record would drag every future ETA for that pool toward zero — defeating the
     whole point. The ETA line is still printed (it costs nothing and warns the agent),
     but only real runs land in the history. Stats failures NEVER affect the run.
+
+    `repo_id`/`diff_files`/`diff_sha256` are the diff-identity fields (reviewlib.stats
+    "Diff-identity binding") threaded straight through to `record_run` unchanged — this
+    function doesn't compute or interpret them, it just carries them from the caller
+    (which already has `cwd`/`diff` in scope) to the stat record.
     """
     import time
 
@@ -2019,6 +2340,9 @@ def _run_mode_with_stats(
                 fail_count=fail_count,
                 started=started,
                 passed=verdict,
+                repo_id=repo_id,
+                diff_files=diff_files,
+                diff_sha256=diff_sha256,
             )
 
 
@@ -4023,6 +4347,30 @@ def _dispatch(argv: list[str] | None = None) -> int:
             diff = ""
     diff = diff or ""
 
+    # Diff-identity binding (reviewlib.stats "Diff-identity binding"): captured from
+    # the FULL, uncapped diff — computed BEFORE the dispatch-time cap below and before
+    # mode_review's own internal capping, so a huge diff's identity is never truncated
+    # away. `repo_id` is independent of `diff` (cwd alone), so it's computed even for a
+    # diff-less just-ask/quorum/brainstorm run — that still lets --check catch a
+    # cross-REPO mismatch (incident #1) even with no file-set signal to add.
+    repo_id = _compute_repo_id(cwd)
+    diff_files = extract_diff_files(diff)
+    diff_sha256 = diff_content_hash(diff) if diff else None
+
+    # Review-stamp integrity (round-5 review finding, k3+Opus, on this same
+    # diff-identity feature): the pre-commit gate's stamp must certify the diff
+    # actually DISPATCHED to the models, not whatever happens to be staged
+    # MINUTES later when the multi-model panel finishes. Captured HERE,
+    # immediately adjacent to the `diff` capture above (a millisecond gap, not
+    # the minutes-long panel-run gap `_write_review_stamp` used to have when it
+    # independently re-ran `git diff --cached` at stamp-WRITE time) — see
+    # `reviewlib.install._write_review_stamp`'s docstring for the full story
+    # (why it can't just hash `diff` directly: the pre-commit hook's own
+    # verification is UNPREFIXED, `diff` is prefixed via `_git_diff`'s
+    # `diff.noprefix` fix). Only meaningful for `--staged` (the only case
+    # `_write_review_stamp` is ever reached from); None otherwise.
+    stamp_diff_hash = _stamp_hash_for_staged_diff(cwd) if args.staged else None
+
     # Dispatch-time diff cap for the flat PANEL modes (brainstorm/quorum/just-ask) —
     # see reviewlib.backends.cap_diff_for_dispatch's docstring for why this is NOT
     # applied to `review`/`visual` (mode_review owns capping its own two dispatch
@@ -4184,6 +4532,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         extra={
             "diff_from_stdin": diff_from_stdin,
             "diff_already_capped": diff_already_capped,
+            "stamp_diff_hash": stamp_diff_hash,
         },
     )
 
@@ -4203,6 +4552,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             brainstorm_pool(models),
             lambda: mode.handler(ctx),
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
 
     if mode.name == "qa":
@@ -4219,6 +4571,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             qa_seat,
             lambda: mode.handler(ctx),
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
 
     if mode.name not in ("review", "visual"):
@@ -4228,6 +4583,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             models,
             lambda: mode.handler(ctx),
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
 
     # The review mode. Validate the board now if it wasn't already (the no-visual path);
@@ -4303,6 +4661,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             lambda: mode.handler(ctx),
             models_after=_ran_models,
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
     # Flat review path (no board): explicit `-m` with no configured board/models. The
     # foolproofing guard STILL applies here — an explicit selection whose live subset can't
@@ -4330,6 +4691,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         models,
         lambda: mode.handler(ctx),
         task_code=task_code,
+        repo_id=repo_id,
+        diff_files=diff_files,
+        diff_sha256=diff_sha256,
     )
 
 

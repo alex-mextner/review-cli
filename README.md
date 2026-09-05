@@ -508,7 +508,35 @@ JSON top-level shapes:
 | `review task --json` | `{"tasks": [{"task_code": str, "iterations": int, "models": [str], "modes": [str], "first_ts": str, "last_ts": str, "duration_seconds": number, "ok_count": int, "fail_count": int}]}` |
 | `review task CODE --json` | `{"task_code": str, "iterations": [run_stats_record], "sessions": [dashboard_session_summary]}` |
 | `review task CODE --detail N --json` | `dashboard_session_detail` with `session_id`, `task_code`, `calls`, `errors`, `brainstorm`, and `roles` |
-| `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models": int, "passed": bool, "error"?: str}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). |
+| `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models": int, "passed": bool, "error"?: str, "identity_verification": "ran" \| "disabled" \| "skipped_unresolvable", "verified_iterations"?: int, "unverifiable_iterations"?: int, "excluded_mismatched_iterations"?: int, "mismatch_details"?: [{"iteration": int, "reason": str, "recorded_repo_id": str, "recorded_diff_files": [str] | null, "ts": str}], "mismatch_details_truncated"?: true}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). `mismatch_details` is capped at 50 entries — `excluded_mismatched_iterations` is always the uncapped true count. |
+
+`--check` also runs **diff-identity verification** by default: it resolves `-C`/cwd
+to a repo id (the normalized `origin` remote, or a local path when there is no
+remote) and the current diff's touched files, then EXCLUDES any recorded PASSED
+iteration whose own repo differs, or whose touched files share nothing with the
+current diff — instead of trusting a task-code match alone. This closes a real
+incident class: task-code reuse (a typo, a shared parent-ticket convention, or an
+accidental/naive substitution) that let one diff's real reviews silently count
+toward a completely different diff's quorum. **Threat-model boundary:** the store
+is a local, self-reported JSONL an agent can append to directly (as the test
+suite does, deliberately, to simulate history) — this closes the "wrong string
+still matches history that's actually unrelated" class of bug, not a
+cryptographic guarantee against a FULLY malicious agent fabricating a fresh
+record with spoofed `repo_id`/`diff_files` that happen to match. Nor is file-set
+overlap a strong signal in a repo where every PR conventionally touches the same
+file (a CHANGELOG, a lockfile) — a shared "always touched" file alone can make
+an unrelated same-repo iteration look verified; this gate substantially narrows
+the incident classes it targets, it does not eliminate every same-repo
+false-positive (tracked: issue #214).
+`identity_verification` is the MACHINE-READABLE form of whether verification
+actually ran — `"ran"`, `"disabled"` (`--no-verify-identity`), or
+`"skipped_unresolvable"` (`-C` didn't resolve to a real directory) — so a
+`--json`-only caller (which never sees the stderr warning printed in the same
+two skip cases) can assert on it directly instead of inferring "did
+verification run" from whether the `verified_iterations`/etc. keys are present.
+`unverifiable_iterations` covers history recorded before this field existed,
+which still counts (fail-open only for "no data to check", never for a confirmed
+mismatch). `--no-verify-identity` restores the old task-code-only behavior.
 
 ---
 
