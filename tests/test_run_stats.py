@@ -1543,6 +1543,13 @@ def test_skill_docs_show_required_task_code_for_recorded_modes():
         assert 'review quorum "Q" --task CODE' in text
 
 
+def test_skill_blurb_pre_commit_invocation_carries_a_task_code():
+    """GLM finding on #359: the blurb's pre-commit sentence is imperative advice an agent
+    copy-pastes, not a capability description — so it must not regress to the bare
+    `review diff --staged` that fails the moment $REVIEW_TASK_CODE is unset."""
+    assert "review diff --staged --task CODE" in SKILL_BLURB
+
+
 # ---------------------------------------------------------------------------
 # quorum_check + `review task CODE --check` (self-merge-authority PR1 gate)
 #

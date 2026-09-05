@@ -4,7 +4,7 @@ Agent-facing notes for working IN this repo. (User-facing docs live in `README.m
 
 ## What this is
 
-multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic — with one explicit, narrow opt-in exception: `review diff --staged --commit` creates a checkpoint commit of the staged diff it just reviewed (see "Fix loops" below).
+multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic — with one explicit, narrow opt-in exception: `review diff --staged --task CODE --commit` creates a checkpoint commit of the staged diff it just reviewed (see "Fix loops" below).
 
 Operationally, `review` fans a git diff (or a question / topic) out to several model
 backends in parallel and prints their findings.
@@ -63,8 +63,8 @@ this tool gives the caller a safe primitive for it.
 unrelated uncommitted work belonging to a DIFFERENT session/agent sharing the same checkout
 (this has happened in production: a fix-loop agent reset hard mid-cycle and wiped another
 session's uncommitted changes). Safe alternatives: `git checkout -- <file>` to discard
-specific files, or `review diff --staged --commit` to checkpoint each round with a real
-commit — undo a bad checkpoint with `git reset --soft HEAD~1`, which does NOT touch
+specific files, or `review diff --staged --task CODE --commit` to checkpoint each round
+with a real commit — undo a bad checkpoint with `git reset --soft HEAD~1`, which does NOT touch
 untracked/foreign files (unlike `reset --hard`, which wipes everything in the working tree
 regardless of who it belongs to).
 
