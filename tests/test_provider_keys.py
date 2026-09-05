@@ -41,7 +41,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import reviewlib.backends as backends  # noqa: E402
-from reviewlib.config import BoardReviewer, split_pool_reserve, _expand_alias  # noqa: E402
+from reviewlib.config import (  # noqa: E402
+    ASTRA_SEAT,
+    SOL_SEAT,
+    BoardReviewer,
+    split_pool_reserve,
+    _expand_alias,
+)
 
 _KEY_ENV_NAMES = (
     "ZAI_API_KEY",
@@ -200,6 +206,13 @@ def test_aliases_expand():
     assert _expand_alias("cc") == "commandcode"
     # Pre-existing aliases survive.
     assert _expand_alias("fable5") == "claude:claude-fable-5"
+    # Sol/Astra: pinned so a bare `-m sol`/`-m astra` doesn't fall through
+    # `_match_named_backend` to the opencode catch-all (the same failure class `opus`
+    # was pinned against, config.py's MODEL_ALIASES comment).
+    assert _expand_alias("sol") == SOL_SEAT
+    assert _expand_alias("gpt56sol") == SOL_SEAT
+    assert _expand_alias("astra") == ASTRA_SEAT
+    assert _expand_alias("gpt6astra") == ASTRA_SEAT
 
 
 # === z.ai request shape (OpenAI-compatible, NOT gemini contents/parts) ===========
