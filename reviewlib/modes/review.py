@@ -201,7 +201,7 @@ def mode_review(
         print(
             "[review-cli] --commit requires --staged: a checkpoint commits the reviewed "
             "STAGED diff, and there is no such thing as checkpointing an unstaged/piped "
-            "diff.\n  fix: add --staged (`review diff --staged --commit`), or drop --commit.",
+            f"diff.\n  fix: add --staged (`{_RERUN_STAGED_COMMIT}`), or drop --commit.",
             file=sys.stderr,
             flush=True,
         )
@@ -485,6 +485,16 @@ def _warn_if_board_reused(
     )
 
 
+# The one pre-commit invocation every gate remediation points at. Spelled ONCE: every
+# recorded review mode requires `--task CODE`, so a rerun command without a task-code
+# placeholder fails at the first keystroke whenever $REVIEW_TASK_CODE is unset (Codex
+# finding on #359) — five copies drifting apart is how that regresses one string at a time.
+_RERUN_STAGED = "review diff --task <CODE> --staged -C <repo>"
+# Its `--commit` sibling, for the `--commit` usage and checkpoint refusals (all of which
+# already run inside the repo, so no `-C <repo>`).
+_RERUN_STAGED_COMMIT = "review diff --task <CODE> --staged --commit"
+
+
 # Why an OK review did not satisfy the commit gate — and what to do about it.
 #
 # This is the single source of truth for the DIFF-SHAPE half of the gate predicate:
@@ -514,6 +524,8 @@ def _warn_if_board_reused(
 # The REMEDIATION is per-reason, not one shared suffix: "re-run it `--staged`" is right for an
 # unstaged or piped run and WRONG for a truncated one (re-running truncates again — advice that
 # loops is how an agent burns another 40 minutes).
+
+
 def _commit_gate_skip_reason(
     staged: bool, diff_from_stdin: bool, truncated: bool
 ) -> tuple[str, str] | None:
@@ -532,19 +544,19 @@ def _commit_gate_skip_reason(
         return (
             "the diff was truncated for dispatch, so no seat saw all of it",
             "split the change into smaller staged commits (or raise $REVIEW_DIFF_MAX_BYTES) "
-            "and review each part with `review diff --staged -C <repo>` — re-running this "
+            f"and review each part with `{_RERUN_STAGED}` — re-running this "
             "same diff truncates again, and piping a smaller one in still fails the "
             "index-provenance check",
         )
     if not staged:
         return (
             "the review was not `--staged` (the gate certifies the staged index)",
-            "stage what you are about to commit and re-run `review diff --staged -C <repo>`",
+            f"stage what you are about to commit and re-run `{_RERUN_STAGED}`",
         )
     if diff_from_stdin:
         return (
             "the diff was piped on stdin, not read from `git diff --cached`",
-            "re-run `review diff --staged -C <repo>` and let it read the index itself",
+            f"re-run `{_RERUN_STAGED}` and let it read the index itself",
         )
     return None
 
@@ -704,13 +716,13 @@ def _stamp_if_staged_commit_review(
         _warn_commit_gate_not_satisfied(
             f"the marker file could not be written ({marker_error})",
             "point $REVIEW_MARKER at a writable path (or fix the permissions on the "
-            "default one) and re-run `review diff --staged -C <repo>`",
+            f"default one) and re-run `{_RERUN_STAGED}`",
         )
     if stamp_error is not None:
         _warn_commit_gate_not_satisfied(
             f"the write failed ({stamp_error})",
             "check that `.git/review-stamp` (`git rev-parse --git-path review-stamp`) is "
-            "writable, then re-run `review diff --staged -C <repo>`",
+            f"writable, then re-run `{_RERUN_STAGED}`",
             artifact_and_consequence=_GATE_STAMP,
         )
 
@@ -1076,7 +1088,7 @@ def _checkpoint_if_requested(
             "was TRUNCATED for dispatch — no checkpoint created (a checkpoint must certify "
             "the FULL reviewed diff, and every seat here only saw a partial view). Scope "
             "the review (`git diff --cached -- <path>`) or raise $REVIEW_DIFF_MAX_BYTES, "
-            "then re-run `review diff --staged --commit`.",
+            f"then re-run `{_RERUN_STAGED_COMMIT}`.",
             file=sys.stderr,
             flush=True,
         )
@@ -1093,7 +1105,7 @@ def _checkpoint_if_requested(
         "[review-cli] --commit: the review succeeded but the checkpoint commit itself "
         f"FAILED — no checkpoint was created.\n  git commit failed: {detail}\n"
         "  fix: check the repo's commit-msg/pre-commit hooks (lint/typecheck/tests may be "
-        "blocking it), then re-run `review diff --staged --commit`.",
+        f"blocking it), then re-run `{_RERUN_STAGED_COMMIT}`.",
         file=sys.stderr,
         flush=True,
     )

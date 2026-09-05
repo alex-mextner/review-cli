@@ -17,11 +17,15 @@ Run from the repo root::
 
     python3 tests/test_review_marker.py
 """
+
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
+import itertools
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -109,7 +113,9 @@ def test_touch_helper_advances_mtime():
         os.utime(marker, (old - 100, old - 100))
         backdated = marker.stat().st_mtime
         install._touch_review_marker()
-        assert marker.stat().st_mtime > backdated, "re-touch must refresh the marker mtime"
+        assert marker.stat().st_mtime > backdated, (
+            "re-touch must refresh the marker mtime"
+        )
 
 
 def test_touch_helper_expands_default_home_path_when_env_unset():
@@ -144,9 +150,13 @@ def test_staged_review_touches_marker():
         marker = tmp / "cache" / "agent-tools" / "last-review"
         os.environ["REVIEW_MARKER"] = str(marker)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"  # deterministic in-process backend
-        rc = mode_review(["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True)
+        rc = mode_review(
+            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True
+        )
         assert rc == 0, rc
-        assert marker.exists(), "a successful staged review must touch the session marker"
+        assert marker.exists(), (
+            "a successful staged review must touch the session marker"
+        )
 
 
 def test_unstaged_review_does_not_touch_marker():
@@ -156,16 +166,23 @@ def test_unstaged_review_does_not_touch_marker():
         marker = tmp / "cache" / "agent-tools" / "last-review"
         os.environ["REVIEW_MARKER"] = str(marker)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
-        rc = mode_review(["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=False)
+        rc = mode_review(
+            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=False
+        )
         assert rc == 0, rc
-        assert not marker.exists(), "an unstaged/piped review must NOT touch the gate marker"
+        assert not marker.exists(), (
+            "an unstaged/piped review must NOT touch the gate marker"
+        )
 
 
 def test_failed_staged_review_does_not_touch_marker():
     """A staged review whose backend FAILS (rc != 0) must NOT satisfy the gate. The
     marker touch is gated on `ok and staged`, so a failed review leaves it absent."""
+
     def _failing_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
-        return ReviewResult(model=model, command="fake-fail", returncode=1, stdout="", stderr="boom")
+        return ReviewResult(
+            model=model, command="fake-fail", returncode=1, stdout="", stderr="boom"
+        )
 
     with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -177,11 +194,15 @@ def test_failed_staged_review_does_not_touch_marker():
         original = review_mode.resolve_backend
         review_mode.resolve_backend = lambda model: _failing_backend
         try:
-            rc = mode_review(["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True)
+            rc = mode_review(
+                ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True
+            )
         finally:
             review_mode.resolve_backend = original
         assert rc == 1, rc
-        assert not marker.exists(), "a FAILED staged review must NOT touch the gate marker"
+        assert not marker.exists(), (
+            "a FAILED staged review must NOT touch the gate marker"
+        )
 
 
 def test_piped_staged_review_does_not_touch_marker():
@@ -196,11 +217,18 @@ def test_piped_staged_review_does_not_touch_marker():
         os.environ["REVIEW_MARKER"] = str(marker)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
         rc = mode_review(
-            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True,
+            ["codex"],
+            prompt="p",
+            diff=_DIFF,
+            cwd=repo,
+            timeout=30,
+            staged=True,
             diff_from_stdin=True,
         )
         assert rc == 0, rc
-        assert not marker.exists(), "a piped --staged review must NOT touch the gate marker"
+        assert not marker.exists(), (
+            "a piped --staged review must NOT touch the gate marker"
+        )
 
 
 def test_staged_review_returns_zero_even_if_marker_unwritable():
@@ -214,8 +242,12 @@ def test_staged_review_returns_zero_even_if_marker_unwritable():
         blocker.write_text("x", encoding="utf-8")
         os.environ["REVIEW_MARKER"] = str(blocker / "child" / "last-review")
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
-        rc = mode_review(["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True)
-        assert rc == 0, "an unwritable marker must never fail an otherwise-successful review"
+        rc = mode_review(
+            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True
+        )
+        assert rc == 0, (
+            "an unwritable marker must never fail an otherwise-successful review"
+        )
 
 
 # The stderr line an OK-but-not-gate-eligible review must print. Matched on a stable
@@ -235,8 +267,14 @@ def _review_capturing_stderr(**kwargs) -> tuple[int, str]:
     buf = io.StringIO()
     diff = kwargs.pop("diff", _DIFF)
     with contextlib.redirect_stderr(buf):
-        rc = mode_review(["codex"], prompt="p", diff=diff, cwd=kwargs.pop("cwd"),
-                         timeout=30, **kwargs)
+        rc = mode_review(
+            ["codex"],
+            prompt="p",
+            diff=diff,
+            cwd=kwargs.pop("cwd"),
+            timeout=30,
+            **kwargs,
+        )
     return rc, buf.getvalue()
 
 
@@ -291,8 +329,11 @@ def test_gate_eligible_staged_review_prints_no_notice():
 def test_failed_staged_review_prints_no_gate_notice():
     """A FAILED review skips silently: the failure output is the reason, and a gate line
     on top of it would be noise pointing at the wrong problem."""
+
     def _failing_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
-        return ReviewResult(model=model, command="fake-fail", returncode=1, stdout="", stderr="boom")
+        return ReviewResult(
+            model=model, command="fake-fail", returncode=1, stdout="", stderr="boom"
+        )
 
     with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -323,13 +364,22 @@ def test_truncated_staged_review_gets_its_own_remediation():
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             review_mode._stamp_if_staged_commit_review(
-                True, True, False, repo, _DIFF, True,
+                True,
+                True,
+                False,
+                repo,
+                _DIFF,
+                True,
             )
         err = buf.getvalue()
-        assert not marker.exists(), "a truncated staged review must not satisfy the gate"
+        assert not marker.exists(), (
+            "a truncated staged review must not satisfy the gate"
+        )
         assert _GATE_NOTICE in err, err
         assert "truncated" in err, err
-        assert "split the change" in err, "the truncated branch needs its own remediation"
+        assert "split the change" in err, (
+            "the truncated branch needs its own remediation"
+        )
         assert "stage what you are about to commit" not in err, (
             "looping advice: re-running the same oversized diff truncates again"
         )
@@ -442,7 +492,12 @@ def test_stamp_asks_the_helper_instead_of_re_spelling_the_predicate():
             with contextlib.redirect_stderr(buf):
                 # Unstaged + piped + truncated: ineligible by every real condition.
                 review_mode._stamp_if_staged_commit_review(
-                    True, False, True, repo, _DIFF, True,
+                    True,
+                    False,
+                    True,
+                    repo,
+                    _DIFF,
+                    True,
                 )
             assert marker.exists(), (
                 "the caller re-spelled the predicate instead of asking the helper"
@@ -459,7 +514,12 @@ def test_stamp_asks_the_helper_instead_of_re_spelling_the_predicate():
             with contextlib.redirect_stderr(buf):
                 # Staged, from the index, untruncated: eligible by every real condition.
                 review_mode._stamp_if_staged_commit_review(
-                    True, True, False, repo, _DIFF, False,
+                    True,
+                    True,
+                    False,
+                    repo,
+                    _DIFF,
+                    False,
                 )
             err = buf.getvalue()
             assert not marker.exists(), "the caller ignored the helper's skip reason"
@@ -506,7 +566,9 @@ def test_marker_pointing_at_a_directory_is_reported_as_a_failure():
         os.environ["REVIEW_MARKER"] = str(as_dir)
         os.environ["REVIEW_FAKE_BACKEND"] = "1"
         rc, err = _review_capturing_stderr(cwd=repo, staged=True)
-        assert rc == 0, "a bad marker target must not fail an otherwise-successful review"
+        assert rc == 0, (
+            "a bad marker target must not fail an otherwise-successful review"
+        )
         assert as_dir.is_dir(), "the directory must be left alone, not replaced"
         assert _GATE_NOTICE in err, err
         assert "not a regular file" in err, err
@@ -585,7 +647,9 @@ def test_empty_review_marker_env_falls_back_to_the_default_path():
         finally:
             os.chdir(original_cwd)
         default = Path(os.path.expanduser(install.DEFAULT_REVIEW_MARKER))
-        assert default.is_file(), "an empty value must resolve to the default marker path"
+        assert default.is_file(), (
+            "an empty value must resolve to the default marker path"
+        )
         assert os.stat(scratch).st_mtime_ns == before, (
             "an empty REVIEW_MARKER degenerated to the current directory and 'wrote' the "
             "marker by bumping its mtime"
@@ -618,7 +682,10 @@ def test_unresolvable_stamp_path_is_reported_but_a_non_repo_is_not():
     def _dubious_ownership(cmd, *args, **kwargs):
         if "rev-parse" in cmd:
             return subprocess.CompletedProcess(
-                cmd, 128, stdout="", stderr="fatal: detected dubious ownership in repository\n"
+                cmd,
+                128,
+                stdout="",
+                stderr="fatal: detected dubious ownership in repository\n",
             )
         return original(cmd, *args, **kwargs)
 
@@ -661,7 +728,9 @@ def test_unstaged_board_review_says_why_the_gate_is_unsatisfied():
             BoardReviewer(model="codex", role="correctness", display="codex"),
             BoardReviewer(model="claude", role="security", display="claude"),
         ]
-        rc, err = _review_capturing_stderr(cwd=repo, staged=False, board=board, pool_size=2)
+        rc, err = _review_capturing_stderr(
+            cwd=repo, staged=False, board=board, pool_size=2
+        )
         assert rc == 0, rc
         assert not marker.exists()
         assert _GATE_NOTICE in err, err
@@ -682,11 +751,70 @@ def test_staged_board_review_touches_marker():
             BoardReviewer(model="claude", role="security", display="claude"),
         ]
         rc = mode_review(
-            ["codex"], prompt="p", diff=_DIFF, cwd=repo, timeout=30, staged=True,
-            board=board, pool_size=2,
+            ["codex"],
+            prompt="p",
+            diff=_DIFF,
+            cwd=repo,
+            timeout=30,
+            staged=True,
+            board=board,
+            pool_size=2,
         )
         assert rc == 0, rc
-        assert marker.exists(), "a successful staged board review must touch the session marker"
+        assert marker.exists(), (
+            "a successful staged board review must touch the session marker"
+        )
+
+
+def test_every_rerun_remediation_carries_a_task_code():
+    """Codex finding on PR #359: every recorded review mode requires `--task CODE`, so a
+    remediation that says "re-run `review diff --staged`" without one fails on the very
+    first keystroke when $REVIEW_TASK_CODE is unset — the advertised fix must be runnable.
+    Pins every non-None shape of the gate predicate (all 8 boolean triples, so a fourth
+    skip condition cannot dodge it) AND, via a source scan, the write-failure and
+    `--commit` notices that are only reachable by breaking a real filesystem write."""
+    for staged, diff_from_stdin, truncated in itertools.product(
+        (False, True), repeat=3
+    ):
+        skipped = review_mode._commit_gate_skip_reason(
+            staged, diff_from_stdin, truncated
+        )
+        if skipped is None:
+            assert (staged, diff_from_stdin, truncated) == (True, False, False)
+            continue
+        _reason, remediation = skipped
+        assert re.search(r"--task\s+<CODE>", remediation), remediation
+    for constant in (review_mode._RERUN_STAGED, review_mode._RERUN_STAGED_COMMIT):
+        assert re.search(r"--task\s+<CODE>", constant), constant
+    # Anchor on the backticked COMMAND span, not on the prose around it, so a rephrased
+    # notice cannot slip out of the scan. Comments AND docstrings are stripped first: both
+    # mention `review diff --staged`/`--commit` as history or design rationale, never as
+    # advice a caller would copy-paste — the module docstring's opening line, and the
+    # design-comment prose above `_commit_gate_skip_reason`, would otherwise false-positive
+    # the scan (the module has no other triple-quoted strings, so a naive `"""..."""`
+    # pair-strip is exact here; the assert below catches a strip that ate too much).
+    # GLM finding on #359: a PREFIX-anchored scan (only spans starting `review diff `) is
+    # dodged by any rephrase like "`cd <repo> && review diff --staged`" — so this collects
+    # EVERY backtick span and only requires ones actually mentioning `review diff` (or
+    # interpolating one of the two shared constants) to carry the placeholder. The eight
+    # ACTIONABLE sites today: the three gate reasons, the two write-failure notices, and
+    # the three `--commit` refusals (usage, truncated checkpoint, failed checkpoint) —
+    # `_CHECKPOINT_COMMIT_MESSAGE` (a git commit message, never shown as a rerun
+    # instruction, and containing no backticks) is deliberately not one of them.
+    src = re.sub(r"(?m)^\s*#.*$", "", inspect.getsource(review_mode))
+    src = re.sub(r'"""(?:[^"]|"(?!""))*"""', "", src)
+    assert "_RERUN_STAGED =" in src, "the comment/docstring strip ate real code"
+    constants = ("{_RERUN_STAGED}", "{_RERUN_STAGED_COMMIT}")
+    rerun_spans = [
+        span
+        for span in re.findall(r"`([^`]*)`", src)
+        if "review diff" in span or span in constants
+    ]
+    assert len(rerun_spans) >= 8, rerun_spans
+    for span in rerun_spans:
+        if span in constants:
+            continue
+        assert re.search(r"--task\s+<CODE>", span), span
 
 
 if __name__ == "__main__":

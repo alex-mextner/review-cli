@@ -3,7 +3,7 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
-## Unreleased
+## 0.35.3 — 2026-09-05
 
 - **`review diff` now says WHY a passing review did not satisfy the commit gate
   (review-cli#350).** The gate marker that agent-tools'
@@ -38,7 +38,10 @@ semantic versioning.
   verifies the stamp — so losing either one blocks a commit on its own, and each
   gets its own line rather than a merged one that would send the caller to fix
   the wrong file. The `review` skill blurb and SKILL.md now
-  name `review diff --staged` as the pre-commit invocation.
+  name `review diff --staged --task CODE` as the pre-commit invocation.
+  Every rerun command the notice (and the `--commit` refusals) print carries a
+  `--task <CODE>` placeholder — a recorded review mode requires a task code, so a
+  remediation without one failed at the first keystroke (Codex finding on #359).
 
 ## 0.35.2 — 2026-09-01
 

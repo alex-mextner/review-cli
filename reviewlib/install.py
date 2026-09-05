@@ -243,7 +243,7 @@ SKILL_BLURB = (
     "`review`); the old --quorum/--brainstorm/--just-ask flags were removed. "
     "Always pass -C <project-root>. Always pass --task CODE (or set REVIEW_TASK_CODE) for "
     "review iterations; `review task CODE` shows iterations, models, and transcripts. "
-    "Use before commits and for hard decisions. Before a COMMIT use `review diff --staged`: only a PASSING staged review satisfies agent-tools' require-review-before-commit gate (it writes that gate's marker itself — never `touch` the marker by hand). "
+    "Use before commits and for hard decisions. Before a COMMIT use `review diff --staged --task CODE`: only a PASSING staged review satisfies agent-tools' require-review-before-commit gate (it writes that gate's marker itself — never `touch` the marker by hand). "
     "NEVER wrap it in a short timeout — it is multi-model / multi-round and takes "
     "MINUTES (brainstorm 10–20m); it prints the expected duration for your pool "
     "size at startup, so wait for that, don't short-timeout it. Use NO external "
