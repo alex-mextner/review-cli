@@ -397,14 +397,17 @@ def test_board_flags_and_listing():
     ):
         assert_in(needle, board, "in --show-board")
     heavy = review_out("--show-board", "--preset", "heavy")
+    # review-cli#fable-seat-reliability: claude:claude-fable-5 is EXCLUDED from the
+    # heavy preset (a confirmed ~100% dispatch failure rate) — 9 seats, not 10, and no
+    # "architect" lens (Fable was the only seat carrying it).
     for needle in (
         "source: preset:heavy",
-        "architect",
-        "claude:claude-fable-5",
         "codex:gpt-5.6-sol",
-        "10 seats",
+        "9 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
+    assert_not_in("claude:claude-fable-5", heavy)
+    assert_not_in("architect", heavy)
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())

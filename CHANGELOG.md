@@ -38,6 +38,27 @@ semantic versioning.
   surfaced on the dashboard as its own health class, distinct from a genuine
   child exit(125) and from a quota/paywall cooldown skip.
 
+- **Fable seat reliability: fix a cooldown-recording gap, demote it from priority 1
+  to last-resort reserve (review-cli#fable-seat-reliability, #286).** `review stat`
+  telemetry showed a 97.9-100% dispatch failure rate for the Fable seat
+  (`claude:claude-fable-5`) — up from 67.7% two weeks earlier — driven by chronic
+  session/usage-limit exhaustion on the account it runs through. Two fixes:
+  - `_chronic_unavailable_reason` (the function deciding whether
+    `reviewlib.seat_cooldown` caches a dispatch as chronically doomed) now
+    recognizes the administrative "is currently unavailable" sentinel on a
+    NON-ZERO exit code too, not just `rc=0` — a real production log confirmed
+    Fable's CLI wrapper sometimes relays that exact notice with `exit=1`, a shape
+    the cooldown cache previously never caught. A new guard keeps this from
+    mis-caching a genuinely TRANSIENT failure (a real 503/529 gateway blip, or a
+    process timeout) as an hours-long chronic cooldown, since some of the same
+    wording is also retry.py's own transient vocabulary.
+  - `reviewlib/config.py`'s `DEFAULT_BOARD` demotes Fable from priority 1 to the
+    last seat (mirroring the existing review-cli#65 precedent for a different
+    pathologically-bad seat) — it stays on the board as a last-resort reserve but
+    no longer occupies the routinely-dispatched pool. `HEAVY_PRESET_BOARD` now
+    excludes it entirely (matching `DEFAULT_PRESET_BOARD`'s existing exclusion),
+    so `--preset heavy --pool 0` covers 9 built-in seats, not 10.
+
 - **`review task CODE --check --min-roles N` — count covered board roles instead
   of distinct model names, and default to role-based counting (#221, #246).**
   The board's shortage-resilience behavior (`select_pool_with_reuse`, #207)

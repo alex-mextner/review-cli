@@ -114,8 +114,10 @@ a file, reach for `-o file.md`, never `> file.md`.
 ## Reviewer board, presets, and `--pool` (priority-ordered failover pool)
 A plain `review diff` runs the **default preset**: pool 4, high effort, no Fable/Sol.
 Use `--preset light` for quick/cheap preflight (pool 2, medium effort), and
-`--preset heavy` for release/risky changes (Fable, Sol, Opus, GLM-cc at highest effort,
-with the remaining board seats as highest-effort reserve). The built-in reviewer board is
+`--preset heavy` for release/risky changes (Sol, Opus, GLM-cc, Kimi at highest effort,
+with the remaining board seats as highest-effort reserve). Fable is excluded from
+every preset (a confirmed ~100% dispatch failure rate) and sits last-resort in the raw
+board instead. The built-in reviewer board is
 a **priority-ordered** panel where each model also gets its own role/lens. The active pool
 is chosen by **priority + availability** with two failovers so the run keeps its requested
 reviewer count: **startup failover** picks the top N AVAILABLE seats by priority (a
@@ -130,7 +132,9 @@ failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "over
 501 / refusal) is never retried and falls straight to the reserve. `--retry N` (or
 `$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
 `--pool N` sizes the pool (top-N available, same failover); `--pool 0` runs all available
-seats in the selected preset/board (`--preset heavy --pool 0` covers all 10 built-ins).
+seats in the selected preset/board (`--preset heavy --pool 0` covers all 9
+heavy-preset-built-ins; the raw 10-seat board, incl. last-resort Fable, needs an
+explicit `board:`).
 The board is **never disabled** — there is **no `--no-board` flag**. An explicit `-m`
 always limits the run to exactly those models; with no configured `models:`/`board:` it is
 the legacy flat panel unless an explicit preset supplies metadata, and with config present it
@@ -803,7 +807,10 @@ def _write_review_stamp(
         else:
             hook_diff = subprocess.run(
                 ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--cached"],
-                cwd=cwd, env=git_repo_env(cwd), capture_output=True, text=True,
+                cwd=cwd,
+                env=git_repo_env(cwd),
+                capture_output=True,
+                text=True,
                 timeout=30,
             )
             # Fall back to the reviewed `diff` text if the independent recompute
