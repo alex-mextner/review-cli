@@ -29,6 +29,20 @@ semantic versioning.
   pure `chmod` or 100%-similarity rename (no content hunk to count at all) fails CLOSED
   to a full review instead of reading as a free, unboundedly-sized trivial change.
 
+## 0.35.2 — 2026-09-01
+
+- **Dashboard: fix the review-cli#326 memory balloon — every streamed call
+  body/stderr was retained uncapped forever, hitting 32.8GB RSS on the real
+  ~132k-log install.** Body and stderr are now capped (head+tail, sized to
+  bound worst-case memory regardless of Unicode/script mix). Classification
+  (`completed`/`has_error`/`is_paywall`/`is_cf_blocked`/`is_bad_key`/
+  `has_real_content`) is computed once from the FULL untruncated text at
+  parse time and stored, so a marker or the empty-vs-real-verdict split
+  surviving only in a truncated part of a huge log is still classified
+  correctly. `top_oversized_calls`/`compute_harness_stats` still scanning
+  the now-capped body for `SKILL.md`/`MEMORY.md`/diff markers is a known,
+  lower-severity follow-up (review-cli#335).
+
 ## 0.35.1 — 2026-08-30
 
 - **Dashboard: fix `/api/stats`/`/api/runs` hanging or returning nothing on a
