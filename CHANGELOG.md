@@ -3,6 +3,32 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.35.6 — 2026-09-05
+
+- **Pre-commit gate: trivial-follow-up delta tolerance (review-cli#208).** The
+  `review install-commit-hook` gate used to require the staged diff's sha256 to match
+  the last reviewed one EXACTLY — any restage, even a one-line follow-up fix during an
+  iterative review-fix cycle, forced a brand-new full multi-model review round (observed:
+  9 rounds for one ticket). `review diff --staged` now also writes a `review-stamp-diff`
+  companion holding the reviewed diff's raw text; on a hash miss the gate re-diffs the
+  current staged diff against it and allows the commit — without dispatching a fresh
+  review — when the line-level delta is within `$REVIEW_TRIVIAL_DELTA_LINES` (default
+  10; `0` restores the old exact-hash-only behavior). Fails CLOSED (falls through to a
+  full review requirement) on binary-file or submodule-gitlink content, which a line
+  count can't measure, and excludes diff-generation metadata (`index` lines, shifted `@@`
+  hunk headers) from the count so a genuine one-line edit in a file with existing hunks
+  doesn't get miscounted as a large change. The baseline only ever advances via a real
+  `review diff --staged` pass, so drift is always measured from the last genuine review.
+  The count is `max(insertions, removals)` between the reviewed diff and the current one,
+  not a raw `+`/`-` line total — a modified line shows up as a `-old`/`+new` pair in a
+  unified diff, so a raw total would silently count every genuinely-edited line as 2,
+  making `REVIEW_TRIVIAL_DELTA_LINES=N` roughly half as tolerant as documented. The
+  metadata-exclusion patterns are anchored to git's actual header shapes, not bare
+  prefixes — a removed source line that itself starts with `-- ` (SQL/Lua/Haskell
+  comments) can't be misread as a `--- ` file header and silently undercounted — and a
+  pure `chmod` or 100%-similarity rename (no content hunk to count at all) fails CLOSED
+  to a full review instead of reading as a free, unboundedly-sized trivial change.
+
 ## 0.35.5 — 2026-09-05
 
 - **`review diff` board mode: print a visible STDOUT notice when the pool comes up
@@ -78,29 +104,6 @@ semantic versioning.
   `--task <CODE>` placeholder — a recorded review mode requires a task code, so a
   remediation without one failed at the first keystroke (Codex finding on #359).
 
-- **Pre-commit gate: trivial-follow-up delta tolerance (review-cli#208).** The
-  `review install-commit-hook` gate used to require the staged diff's sha256 to match
-  the last reviewed one EXACTLY — any restage, even a one-line follow-up fix during an
-  iterative review-fix cycle, forced a brand-new full multi-model review round (observed:
-  9 rounds for one ticket). `review diff --staged` now also writes a `review-stamp-diff`
-  companion holding the reviewed diff's raw text; on a hash miss the gate re-diffs the
-  current staged diff against it and allows the commit — without dispatching a fresh
-  review — when the line-level delta is within `$REVIEW_TRIVIAL_DELTA_LINES` (default
-  10; `0` restores the old exact-hash-only behavior). Fails CLOSED (falls through to a
-  full review requirement) on binary-file or submodule-gitlink content, which a line
-  count can't measure, and excludes diff-generation metadata (`index` lines, shifted `@@`
-  hunk headers) from the count so a genuine one-line edit in a file with existing hunks
-  doesn't get miscounted as a large change. The baseline only ever advances via a real
-  `review diff --staged` pass, so drift is always measured from the last genuine review.
-  The count is `max(insertions, removals)` between the reviewed diff and the current one,
-  not a raw `+`/`-` line total — a modified line shows up as a `-old`/`+new` pair in a
-  unified diff, so a raw total would silently count every genuinely-edited line as 2,
-  making `REVIEW_TRIVIAL_DELTA_LINES=N` roughly half as tolerant as documented. The
-  metadata-exclusion patterns are anchored to git's actual header shapes, not bare
-  prefixes — a removed source line that itself starts with `-- ` (SQL/Lua/Haskell
-  comments) can't be misread as a `--- ` file header and silently undercounted — and a
-  pure `chmod` or 100%-similarity rename (no content hunk to count at all) fails CLOSED
-  to a full review instead of reading as a free, unboundedly-sized trivial change.
 
 ## 0.35.3 — 2026-09-05
 
