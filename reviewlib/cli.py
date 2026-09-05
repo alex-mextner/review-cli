@@ -83,6 +83,7 @@ from .stats import (
     iterations_for_task,
     normalize_repo_remote,
     normalize_task_code,
+    parse_iso_ts,
     quorum_check,
     record_run,
     task_summaries,
@@ -882,12 +883,8 @@ _TASK_SESSION_MATCH_WINDOW_SECONDS = 10 * 60
 
 
 def _parse_task_record_started(record: dict) -> datetime | None:
-    ts = record.get("ts")
-    if not isinstance(ts, str) or not ts:
-        return None
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
+    dt = parse_iso_ts(record.get("ts"))
+    if dt is None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -991,10 +988,19 @@ def _task_subcommand(rest: list[str]) -> int:
         help="exit 0 iff the task has enough PASSED recorded iterations across enough "
         "distinct board roles (self-merge-authority gate, default) or distinct "
         "models (when --min-models is explicitly given); see --min-iter/"
-        "--min-models/--min-roles. Counts only iterations whose run came back "
-        "clean — a review that ran but failed/degraded does not count toward "
-        "the bar, and pre-verdict-field history never satisfies it either "
-        "(fail-closed)",
+        "--min-models/--min-roles. If the task has ZERO recorded role data at "
+        "all AND every in-scope (non-mismatched) iteration predates "
+        "role-tracking (PR #246), the default falls back to the old "
+        "distinct-model count instead of a guaranteed fail — the result's "
+        "quorum_mode_fallback field/note explains when this happened. A task "
+        "with at least one iteration recorded AFTER role-tracking became "
+        "possible but reviewed only via quorum/just-ask/brainstorm/qa does NOT "
+        "get that fallback (review-cli#252) — it stays role-based and fails, "
+        "with a role_tracking_gap field/hint naming the fix (run `review diff "
+        "--task CODE` through a role-tracking board). Counts only iterations "
+        "whose run came back clean — a review that ran but failed/degraded "
+        "does not count toward the bar, and pre-verdict-field history never "
+        "satisfies it either (fail-closed)",
     )
     parser.add_argument(
         "--min-iter",
@@ -1186,10 +1192,8 @@ def _resolve_stat_since(since_arg: str | None, days: int) -> datetime | None | b
     on 3.9/3.10 while the identical value worked on 3.11+. Normalize the shorthand
     ourselves before parsing so the accepted syntax doesn't depend on the interpreter."""
     if since_arg:
-        normalized = since_arg[:-1] + "+00:00" if since_arg.endswith("Z") else since_arg
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
+        parsed = parse_iso_ts(since_arg)
+        if parsed is None:
             return False
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     if days <= 0:
@@ -1571,6 +1575,13 @@ def _print_quorum_bar_met(result: dict, role_mode: bool, model_mode: bool) -> No
         _print_quorum_model_audit_line(result)
     if advisory := result.get("min_models_advisory"):
         print(f"  note: {advisory}")
+    # Alex's review-cli#246 follow-up: a bare `--check` that fell back to
+    # model-counting because the task has zero role-tagged history looks
+    # IDENTICAL to an explicit `--min-models` pass otherwise (same result
+    # shape, same printed line above) -- this note is the one visible signal
+    # that the bar-met floor came from the fallback, not from a real flag.
+    if fallback := result.get("quorum_mode_fallback"):
+        print(f"  note: {fallback}")
 
 
 def _print_quorum_bar_not_met(result: dict, role_mode: bool, model_mode: bool) -> None:
@@ -1627,6 +1638,20 @@ def _print_quorum_bar_not_met(result: dict, role_mode: bool, model_mode: bool) -
         _print_quorum_model_audit_line(result, detail_stream)
     if advisory := result.get("min_models_advisory"):
         print(f"  note: {advisory}", file=detail_stream)
+    if fallback := result.get("quorum_mode_fallback"):
+        # Alex's review-cli#246 follow-up: same rationale as the met-path note --
+        # this is the one visible signal that the ratio above (`N/M distinct
+        # models`) came from the zero-role-data fallback, not an explicit
+        # `--min-models` flag.
+        print(f"  note: {fallback}", file=detail_stream)
+    if gap := result.get("role_tracking_gap"):
+        # review-cli#252 follow-up: case (b) ("not genuinely old" -- see
+        # quorum_check's docstring) never fires alongside quorum_mode_fallback
+        # (they're mutually exclusive branches of the same fallback decision),
+        # so this is never a duplicate of the note above -- it explains exactly
+        # WHY the ordinary "N/M distinct roles" ratio above can't be satisfied by
+        # the old model-counting escape hatch, and what to run instead.
+        print(f"  hint: {gap}", file=detail_stream)
     if suggestion := result.get("min_roles_suggestion"):
         print(f"  hint: {suggestion}", file=detail_stream)
     # review-cli#221: a bare N/M count (or a bare mismatch-error line) leaves a human
