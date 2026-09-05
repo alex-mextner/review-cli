@@ -87,6 +87,17 @@ semantic versioning.
   field, or comes from a mode with no role concept (quorum/just-ask/brainstorm/
   qa), simply contributes no roles to a `--min-roles` count.
 
+- **`quorum` — dropped the "single opinion" discount note from the moderator
+  prompt (Alex, 2026-08-21).** When one model fills several seats under distinct
+  roles (`fable#1`, `fable#2`, ...), the moderator used to be told to treat all of
+  that model's seats as one opinion for majority-counting, never extra weight
+  toward QUORUM. Alex's call: a model covering multiple roles in parallel is a
+  fully valid panel shape, not a lesser one — nothing should discount it. The
+  per-seat `<model>#N [<lens>]` labelling stays (it keeps the transcript
+  grep-able by seat), but the moderator prompt no longer carries any caveat
+  telling it to weigh a duplicated model's seats differently from any other
+  seat's.
+
 - **Cross-process/cross-thread locking for the seat-cooldown store (#188).** A board
   dispatches its seats in parallel, so two concurrent `record_cooldown`/`clear_cooldown`
   calls could race on the same unlocked read-modify-write and silently lose one side's
@@ -196,9 +207,8 @@ semantic versioning.
   multiple seats with one model, each of that model's seats gets a DIFFERENT lens
   (keyed by per-model occurrence, not raw seat index) instead of a bare `<model>#N`
   disclosure label with an otherwise-identical prompt — up to the size of the
-  persona pool (currently 6) per model; the moderator is told to still treat all
-  seats sharing one model as a single opinion regardless of lens. One persona was
-  also renamed in the shared pool: `"DX / ergonomics designer"` →
+  persona pool (currently 6) per model. One persona was also renamed in the
+  shared pool: `"DX / ergonomics designer"` →
   `"Developer-experience designer"` (a user-visible change to any brainstorm
   transcript/log referencing the old name).
 

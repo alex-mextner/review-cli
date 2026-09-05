@@ -48,7 +48,7 @@ def _expert_prompt(
 
 def _seat_assignments(
     models: list[str],
-) -> tuple[list[str], list[tuple[str, str]], bool]:
+) -> tuple[list[str], list[tuple[str, str]]]:
     """One (label, persona) pair per seat, computed ONCE and shared by both the
     transcript label and the seat's own prompt (Fable/k3 review finding: computing
     `PERSONAS[i % len(PERSONAS)]` independently in two places can silently desync a
@@ -85,7 +85,6 @@ def _seat_assignments(
     for i, model in enumerate(models):
         first_index.setdefault(model, i)
         seat_counts[model] = seat_counts.get(model, 0) + 1
-    has_duplicates = any(n > 1 for n in seat_counts.values())
 
     occurrence: dict[str, int] = {}
     labels: list[str] = []
@@ -104,7 +103,7 @@ def _seat_assignments(
             labels.append(f"{model}#{occ + 1} [{persona[0]}]")
         else:
             labels.append(f"{model} [{persona[0]}]")
-    return labels, personas, has_duplicates
+    return labels, personas
 
 
 def mode_quorum(
@@ -155,15 +154,15 @@ def mode_quorum(
     # once (reviewlib.config's reuse-aware panel padding — see cli.py's
     # `expand_flat_models_with_reuse` wiring): when a distinct-model pool is scarce or
     # some models are near their usage limit, one model fills several seats instead of
-    # shrinking the panel. `_seat_assignments` picks ONE (label, persona) pair per
-    # seat and both the label and the prompt below consume that SAME value — see its
-    # docstring for why persona is keyed on per-model occurrence rather than raw seat
-    # index. Repeated occurrences stay grep-able via a "<model>#N" prefix (via
-    # PanelJob.label, which `run_panel` uses to relabel the result) — without the
-    # numbering, two identical "### Expert: fable" blocks would read as two
-    # INDEPENDENT opinions, silently double-weighting one account's answer in the
-    # moderator's own "majority of experts" judgement.
-    labels, personas, has_duplicates = _seat_assignments(models)
+    # shrinking the panel — a model covering multiple roles in parallel is a perfectly
+    # valid panel shape, not a lesser one (Alex, 2026-08-21). `_seat_assignments` picks
+    # ONE (label, persona) pair per seat and both the label and the prompt below consume
+    # that SAME value — see its docstring for why persona is keyed on per-model
+    # occurrence rather than raw seat index. Repeated occurrences stay grep-able via a
+    # "<model>#N" prefix (via PanelJob.label, which `run_panel` uses to relabel the
+    # result), so the transcript and stats can always tell which seat produced which
+    # answer even when one model fills several of them.
+    labels, personas = _seat_assignments(models)
 
     jobs = [
         PanelJob(
@@ -218,21 +217,6 @@ def mode_quorum(
         "from that role, but the lens does not change how their answer should be "
         "weighted."
     )
-    duplicate_note = (
-        # Deliberately silent on WHY the panel has duplicates (scarcity/usage-limit
-        # padding vs an explicit `-m fable,fable` request both reach this same
-        # code path) — asserting a specific cause here would be a claim this
-        # function can't verify (Fable review finding, review-cli#205 round 3).
-        "\n\nNOTE: this panel contains one or more models on multiple seats, each "
-        "assigned a role/lens (labelled `<model>#1 [<lens>]`, `<model>#2 [<lens>]`, "
-        f"...) that's distinct across a model's first {len(PERSONAS)} seats. Treat "
-        "ALL seats sharing one model (e.g. `fable#1` and `fable#2` together) as a "
-        "SINGLE opinion for majority-counting purposes — do NOT count a repeated "
-        "model's agreement with itself as extra weight toward QUORUM, even though "
-        "its seats usually reason from different roles."
-        if has_duplicates
-        else ""
-    )
     mod_prompt = (
         "You are the MODERATOR of an expert panel. Below are independent expert answers to "
         "one question. Produce a structured summary with exactly these sections:\n"
@@ -241,7 +225,7 @@ def mode_quorum(
         "2. DISAGREEMENT / NO QUORUM — points where experts conflict or no majority exists.\n"
         "3. ABSTAINED — experts who said INSUFFICIENT EVIDENCE, and on what.\n"
         "Do not invent agreement. Do not edit files."
-        f"{lens_note}{duplicate_note}\n\n"
+        f"{lens_note}\n\n"
         f"QUESTION:\n{question}\n\n=== EXPERT ANSWERS ===\n{transcript}"
     )
     # No `diff=` here — pre-existing (not something this diff-cap feature changed): the
