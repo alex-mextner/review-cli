@@ -32,6 +32,7 @@ from dataclasses import replace
 from ..backends import (
     ReviewResult,
     backend_available,
+    backend_unavailable_reason,
     call_backend,
     cap_diff_for_dispatch,
     resolve_backend,
@@ -42,6 +43,7 @@ from ..config import (
     DEFAULT_POOL_SIZE,
     DEFAULT_PROMPT,
     BoardReviewer,
+    _effective_pool_size,
     apply_effort_override,
     select_pool_and_reserve_with_reuse,
 )
@@ -483,6 +485,131 @@ def _warn_if_board_reused(
         file=sys.stderr,
         flush=True,
     )
+
+
+def _report_pool_shortfall(
+    board: list[BoardReviewer],
+    pool: list[BoardReviewer],
+    *,
+    reserve: list[BoardReviewer],
+    pool_size: int,
+) -> None:
+    """`pool`/`reserve` are keyword-only past `pool` on purpose (GLM review finding,
+    round 5): both are same-typed `list[BoardReviewer]` sitting side by side, and a
+    future caller writing `(board, reserve, pool, pool_size)` type-checks cleanly while
+    silently inverting the semantics -- with a typical short pool, `len(reserve) >=
+    requested` would suppress the notice entirely, the exact silent-shrink bug this
+    function exists to catch. Forcing `reserve=` at the call site makes that transposition
+    a TypeError instead of a silent regression.
+
+    STDOUT (not stderr) notice naming every board seat that is unavailable, whenever
+    the live pool comes up short of the requested `pool_size`. This is the pre-dispatch
+    counterpart to `outcome.degraded`'s existing notice: that one only fires for the
+    rarer reserve-exhausted-DURING-dispatch case, and only to stderr. A pool that never
+    even reached `pool_size` because seats were unavailable BEFORE dispatch had NO
+    notice anywhere -- an agent piping review output into a PR/TG report keeps stdout
+    and drops stderr, so this silent shrink was invisible to every downstream reader of
+    the review (Alex, 2026-08-28: a report said "reviewed via codex + Fable" with zero
+    mention that Opus/GLM were configured but missing -- two different seats, two
+    different root causes, both silent).
+
+    A healthy seat sitting in `reserve` (not unavailable, just outranked by priority or
+    already covering another role) is NOT reported -- unused reserve capacity is normal,
+    not a gap. Only board seats absent from BOTH `pool` and `reserve` (i.e. genuinely
+    unreachable per `backend_unavailable_reason`) count as the gap.
+
+    `pool_size` is the RAW requested size. The selector itself (`select_pool_with_reuse`
+    / `split_pool_reserve` in config.py) clamps it against `len(reachable)` -- the LIVE
+    seat count -- via its own `_effective_pool_size` call, which is a TIGHTER clamp than
+    this notice needs: an operator asking for `--pool 8` against a 4-seat board
+    legitimately gets a 4-seat live pool with nothing unavailable. Reporting against the
+    raw, unclamped `pool_size` in that case prints an arithmetically nonsensical
+    "requested 8, only 3 live -- 1 unavailable" (k3 review finding, round 1: 8-3=5
+    unaccounted-for vs. 1 named seat, because 4 of the 8 never existed on the board). So
+    this notice re-clamps separately, against the LOOSER `min(pool_size, len(board))` --
+    what the board could ever actually deliver, board size rather than live-seat count --
+    not the raw ask (GLM review finding, round 2: this is deliberately NOT the same
+    clamp the selector applies; syncing the two would silence the exact
+    `2-of-6-seats-down --pool 5` case this notice exists to catch).
+
+    `pool_size <= 0` means "run every available seat" (`--pool 0`/no preset) -- there is
+    still a real target here, `len(board)`, so this must NOT be treated the same as "no
+    shortfall concept applies" (k3 review finding, round 2: a `--pool 0` run against a
+    10-seat board with 2 seats down would otherwise print nothing, reproducing the exact
+    incident this notice exists to kill under the "all seats" configuration).
+
+    KNOWN LIMITATIONS (tracked as review-cli#277, not fixed here -- this notice is
+    strictly more visible than the prior silence, but none of the gaps below block
+    that): (1) the reason shown is RE-PROBED via `backend_unavailable_reason` on the
+    RAW board spelling rather than the actual reason the selector excluded the seat
+    for; for a seat truly excluded by the chain-aware availability probe (which
+    alias-expands) this is usually still accurate (the chain probe is strictly
+    weaker-or-equal to this re-probe for a CONCRETE spelling, so a seat that failed the
+    former usually fails the latter too, with a real reason). Narrow exception (k3
+    review finding, round 4): a bare-ALIAS board seat (e.g. `glm52`, not `oc:zai/glm-5.2`)
+    re-probes the unexpanded alias, which can miss an unpaid-provider mark or resolve to
+    a different backend than the chain actually tried -- "reason unknown" (or a
+    misleading reason) is reachable for that specific shape, not fully dead code. (2) a
+    seat excluded for being NEAR its usage limit (the `usage_percent`-based reuse path in
+    config.py) is technically reachable, so the selector pads the pool back up with a
+    duplicate seat instead of leaving a gap -- `len(pool) >= requested` then true, and
+    this function returns before ever inspecting that seat, so the near-limit exclusion
+    is invisible here, not merely mislabeled (Fable review finding, round 2). This is
+    strictly the PADDING-SUCCEEDS case (the function never reaches the code below); the
+    padding-FAILS case (a role-less or too-few-role board can't pad at all, so `pool`
+    stays short with the near-limit/role-excluded seats sitting healthy in `reserve`) IS
+    handled below -- see the `reserve` line in the printed notice (Codex review finding,
+    PR #278). (3) This notice prints at pre-dispatch time, before whatever produces a
+    "reviewed via X + Y" summary runs -- an agent that only pastes the final summary (not
+    the full terminal output) still misses it."""
+    # `_effective_pool_size` (config.py) is the single source of truth for this clamp
+    # (its own docstring: "so the two [select_pool + split_pool_reserve] can never
+    # drift") -- re-deriving the rule inline here would let a future change to that
+    # helper silently desync the notice's "requested N" from what the selector actually
+    # targeted (GLM review finding, round 8).
+    requested = _effective_pool_size(len(board), pool_size)
+    if len(pool) >= requested:
+        return
+    live_ids = {id(r) for r in pool} | {id(r) for r in reserve}
+    missing = [r for r in board if id(r) not in live_ids]
+    # No early `if not missing: return` here (Codex review finding, PR #278): `board`
+    # is exactly `pool | reserve | missing` (disjoint), and `requested <= len(board)`
+    # by construction of `_effective_pool_size` above -- so having reached this line
+    # (`len(pool) < requested`), `missing` and `reserve` can never BOTH be empty. A
+    # role-less (or too-few-distinct-roles) board can shrink `pool` below `requested`
+    # via `select_pool_with_reuse`'s role-padding cutoff with EVERY seat reachable --
+    # `missing` empty, `reserve` holding the unused-but-healthy seats -- and the old
+    # guard silently returned here, reproducing the exact "zero signal" bug this
+    # notice exists to kill, just via a role-limit cause instead of an availability one.
+    lines = [
+        f"[review-cli] pool came up short: requested {requested} seats "
+        f"(board has {len(board)}), only {len(pool)} live"
+        + (f" -- {len(missing)} board seat(s) unavailable:" if missing else ":")
+    ]
+    for r in missing:
+        reason = backend_unavailable_reason(r.model) or "unavailable (reason unknown)"
+        label = r.display or r.model
+        lines.append(f"  - {label} ({r.model}): {reason}")
+    if reserve:
+        # Codex review finding, PR #278: printing ONLY `missing` here made a role/usage
+        # -driven shrink (healthy seats sitting unused in `reserve` because the board
+        # had too few distinct roles to pad into, or because they're near their usage
+        # limit) look like it was fully explained by whatever unavailable seat happened
+        # to also be on the board -- e.g. "1 selected + 3 healthy reserve + 1 unavailable"
+        # printed as "only 1 live -- 1 unavailable", falsely pinning a 3-seat gap on one
+        # seat. State the reserve count as its own fact instead of folding it into the
+        # unavailable-seat blame.
+        lines.append(
+            f"  ({len(reserve)} more board seat(s) are reachable but sitting in "
+            "reserve -- excluded from the pool by role/usage-based selection, not "
+            "availability)"
+        )
+    # flush=True (GLM review finding, round 5): every sibling operator notice in this
+    # file flushes (_warn_if_board_reused, the degraded warning, the provider-switch
+    # notice) -- without it, a piped/teed run (`review diff | tee report.md`) block-
+    # buffers this print, and a run killed mid-dispatch loses it entirely, silently
+    # reproducing the exact "zero signal" incident this notice exists to fix.
+    print("\n".join(lines), flush=True)
 
 
 # The one pre-commit invocation every gate remediation points at. Spelled ONCE: every
@@ -1190,6 +1317,7 @@ def _mode_review_board(
             usage_percent=usage_percent,
         )
         _warn_if_board_reused(board, pool)
+        _report_pool_shortfall(board, pool, reserve=reserve, pool_size=pool_size)
     if not pool:
         print(
             "[review-cli] board: no reviewers are available — configure at least one "

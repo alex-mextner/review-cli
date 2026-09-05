@@ -732,6 +732,17 @@ _UNIT_FILES = [
     # duplicate-seat labelling (review-cli#205 round 2). Pure functions +
     # mocked run_panel/run_moderator, no real dispatch.
     ("test_reuse_warnings.py", {}),
+    # The pre-dispatch "pool came up short" STDOUT notice (2026-08-28): names every
+    # board seat unavailable before dispatch whenever the live pool is smaller than
+    # requested, so the shrink is visible in the review output itself, not only in
+    # stderr/logs. Mostly a pure function with `backend_unavailable_reason`
+    # monkeypatched, no real backend/network -- except one call-site wiring test that
+    # drives the real mode_review -> run_board_with_failover dispatch path (with a
+    # patched-in fake backend), so it gets REVIEW_LOG_DIR isolated like its sibling
+    # dispatch-driving tests (test_streaming.py, test_board_deadline_wiring.py) rather
+    # than writing to the real log dir if a seat there ever fails (GLM review finding,
+    # round 8).
+    ("test_pool_shortfall_warning.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     # Adversarial review-rigor audit fixes (Alex, 2026-08-21): the adversarial base
     # prompt + evidence-for-a-clean-verdict surfacing, the security/tests role
     # blending, and quorum's opt-in --adversarial-check refutation pass. Pure
