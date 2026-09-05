@@ -923,8 +923,10 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
     ACTUALLY produced verdicts (a backfilled reserve under its real id), not the planned
     pool. review-cli#286: Fable is demoted to last-resort in DEFAULT_BOARD and excluded
     from HEAVY_PRESET_BOARD entirely, so heavy pool 4 is now [Sol, Opus, GLM-cc, Kimi];
-    the top seat (Sol) fails, Codex (the next reserve seat) backfills, and the record
+    the top seat (Sol) fails, Astra (the next reserve seat) backfills, and the record
     excludes Sol while keeping pool_size 4."""
+    from reviewlib.config import ASTRA_SEAT
+
     # Sol (priority #1 in the heavy pool of 4, now that Fable is excluded) fails;
     # everything else succeeds.
     resolver = _stub_resolve_backend({"codex:gpt-5.6-sol": 1})
@@ -939,7 +941,7 @@ def test_cli_failover_backfill_records_actual_models_not_planned():
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",  # the promoted reserve (#5, post-exclusion), recorded by its real id
+        ASTRA_SEAT,  # the promoted reserve (#5, post-exclusion), by its real id
     }, r
     assert "claude:claude-fable-5" not in r["models"], r
     assert "codex:gpt-5.6-sol" not in r["models"], r  # the failed seat, not backfilled
