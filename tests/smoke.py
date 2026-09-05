@@ -719,6 +719,11 @@ _UNIT_FILES = [
     # duplicate-seat labelling (review-cli#205 round 2). Pure functions +
     # mocked run_panel/run_moderator, no real dispatch.
     ("test_reuse_warnings.py", {}),
+    # Adversarial review-rigor audit fixes (Alex, 2026-08-21): the adversarial base
+    # prompt + evidence-for-a-clean-verdict surfacing, the security/tests role
+    # blending, and quorum's opt-in --adversarial-check refutation pass. Pure
+    # functions + mocked run_panel/run_moderator, no real dispatch.
+    ("test_adversarial_review_rigor.py", {}),
     # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
     # give it a FRESH temp log dir like the other log-touching tests (review-cli#65).
     ("test_concurrency_cap.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),

@@ -98,6 +98,288 @@ semantic versioning.
   telling it to weigh a duplicated model's seats differently from any other
   seat's.
 
+- **Adversarial review-rigor fixes: neutral prompts, no evidence requirement for a
+  clean pass, no refutation step, and a non-adversarial default board (Alex,
+  2026-08-21).** An audit of review-cli's own rigor found four gaps and Alex asked
+  for all of them fixed:
+  1. `config.DEFAULT_PROMPT` (every reviewer's shared base instruction) now tells
+     the model to actively try to break the change — walk through concrete failure
+     scenarios and genuinely attempt to find a bug — before concluding it's fine,
+     instead of a neutral "review this diff" ask with no skepticism built in.
+  2. That same prompt now requires EVIDENCE for any verdict, not just a shape
+     constraint on findings: a clean/"no issues" verdict must state which specific
+     failure modes were checked and why each is ruled out (`checked: race condition
+     on X — none found, guarded by a lock at Y`), not a bare "looks good". A new
+     `panel.clean_verdict_missing_evidence` heuristic surfaces a body that skips
+     this as a visible WARNING wherever results are rendered (`format_result`) — a
+     heuristic surfacing, not a hard enforcement gate (a real content-based verdict
+     for the diff-review exit code is a larger, separate effort tracked as #137).
+  3. `review quorum` gets an opt-in `--adversarial-check` flag: after the panel
+     reaches a clean verdict, one more pass tries to REFUTE "no issues found"; a
+     successful refutation is surfaced as a new finding and flips the run
+     non-zero, instead of the moderator's synthesis being the last word with no
+     independent attack on it. Opt-in (not the default) so it doesn't double the
+     cost/latency of every routine `review quorum` call — reach for it specifically
+     before a merge/ship decision.
+  4. `REVIEW_ROLES["security"]` / `["tests"]` (the default `review diff` board's own
+     role lenses) now blend in the adversarial framing from the quorum/brainstorm
+     persona pool's "security-paranoid reviewer" / "skeptical SRE" personas, so the
+     default board — which previously used NONE of those personas — gets some of
+     their adversarial tone on the two roles closest in spirit, without turning the
+     whole 8-role board into personas.
+
+  Dogfooded on its own diff (`review diff --staged`) before landing, which surfaced
+  and fixed three real bugs in the new code: `quorum_verdict_is_clean`'s separator
+  regex greedily ate the newline a lookahead depended on, misreading a genuinely
+  empty "no disagreement" section as unclean and silently skipping the whole
+  `--adversarial-check` pass on exactly the clean verdict it exists to double-check
+  (k3/Opus finding); `refutation_succeeded`'s exact-prefix marker match flipped the
+  ship-gate exit code to a false failure whenever the adversarial model reworded or
+  markdown-decorated its null answer instead of using the literal marker, replaced
+  with a three-way `refutation_verdict` (`found` / `not_found` / `inconclusive`) that
+  never silently misreads a rewording as a finding (k3/Opus finding); and the
+  missing-evidence WARNING fired in quorum/just-ask/brainstorm output even though
+  their prompts never ask for the "checked: ..." phrasing DEFAULT_PROMPT introduced
+  — `format_result` now takes an opt-in `check_evidence` flag, set only by the two
+  diff-review render paths (glm-cc finding).
+
+  A second dogfood round on the fixes THEMSELVES caught one more real regression:
+  `refutation_verdict`'s affirmative-marker check ran before the null-marker check,
+  and the null marker's own text — "NO REFUTATION FOUND" — literally CONTAINS
+  "REFUTATION FOUND" as a substring, so a model naturally introducing its null
+  answer's checked-scenario list with a colon (`NO REFUTATION FOUND: checked X,
+  Y, Z.`) matched the affirmative pattern and flipped a clean pass to a false
+  failure (glm-cc/Opus finding) — fixed by checking the null marker first and
+  excluding its tail from the affirmative pattern via a negative lookbehind. That
+  same round also added end-to-end tests driving `mode_review`'s real flat/board
+  dispatch and asserting the WARNING actually renders, closing a gap where every
+  existing test proved `check_evidence` in isolation but nothing would have
+  noticed if it were quietly dropped from its two real call sites (Opus finding).
+
+  A third dogfood round found: (1) the null-marker regex only matched a single
+  ASCII space between "NO"/"REFUTATION"/"FOUND", so a model's double-space or
+  tab/NBSP variant still fell through to a false FOUND classification (k3
+  finding) — fixed by joining the marker's words with `\s+` instead of one
+  literal-escaped multi-word string; (2) the AFFIRMATIVE marker's decoration
+  tolerance was asymmetric with the null marker's — `**REFUTATION FOUND**: ...`
+  (bold around the phrase, colon outside it) downgraded a REAL refutation to
+  "inconclusive," the more dangerous direction since the ship gate then passed
+  despite a genuine finding (Opus finding) — fixed by widening the FOUND
+  pattern's post-"FOUND" separator to the same decoration class the null
+  pattern already tolerates; and (3) the disagreement-section regex hard-coded
+  its own copy of the moderator-prompt heading text with no link to the actual
+  prompt, so every test validated it only against a hand-rolled fixture, never
+  the real prompt (Opus finding) — fixed by extracting the heading text into
+  shared constants used to BUILD the moderator prompt and to compile the
+  regex, with a new test capturing the real prompt `mode_quorum` sends and
+  asserting the constants are genuinely in it.
+
+  A fourth round found the round-2/round-3 fixes still didn't fully compose:
+  Python's `re` module forbids a VARIABLE-width lookbehind, so no fixed
+  `(?<!NO )` (exactly 3 characters, one space) could ever cover "NO" followed
+  by a tab, a double space, or a newline before "REFUTATION" — and the null
+  and affirmative patterns' asymmetric anchoring (null anchored to
+  answer-start, affirmative a free search) meant a short preamble combined
+  with a double-spaced null defeated BOTH layers at once, misreading a
+  genuinely clean answer as a refutation and failing the ship gate (k3/Opus
+  finding). The affirmative marker was also still narrower than the null
+  marker in three more ways — a double space between "REFUTATION"/"FOUND", a
+  dash instead of a colon, and a header form with no colon at all — each
+  silently downgrading a REAL refutation to "inconclusive" (Opus finding).
+  Rather than patch the lookbehind again, `refutation_verdict` was rewritten
+  around a single unanchored regex with an optional "NO" CAPTURE GROUP:
+  whether "NO" is present becomes a plain Python group check instead of a
+  regex lookbehind, sidestepping the width limitation entirely and making
+  both readings tolerate the exact same preamble and decoration. The colon
+  requirement was dropped for the affirmative side too, since the null form
+  never had one. The same round also found the disagreement section's
+  trivial-content check misread ordinary bulleted ("- None.") or bolded
+  ("**None.**") clean sections, and the plural "No disagreements.", as
+  unclean — silently skipping the whole adversarial-check pass on exactly the
+  verdict it exists to double-check (Opus finding) — fixed by widening that
+  pattern to tolerate the same decoration and the plural form.
+
+  A fifth round found two more real issues: (1) `refutation_verdict` still took the
+  FIRST marker match in the body via a single `search`, but the prompt's own "a
+  short list of the specific scenarios you checked" ask invites a model to narrate
+  per-scenario verdicts — an earlier null mention for one scenario could hide a
+  LATER genuine affirmative for a different scenario, silently discarding a real
+  finding (k3/Opus finding) — fixed by switching to `finditer` and treating ANY
+  affirmative occurrence anywhere in the body as `'found'`, regardless of how many
+  null mentions surround it; (2) the marker regex's leading decoration class can
+  backtrack O(L^2) over a long run of decoration-only characters with no real match
+  inside it, the same shape `panel.py`'s `_EVIDENCE_SCAN_MAX_LEN` guard already caps
+  for the finding-evidence scan (glm-cc finding) — fixed by adding the equivalent
+  `_MARKER_SCAN_MAX_LEN` cap, above which the marker scan is skipped and the result
+  is `'inconclusive'` (a body that long was never a real marker answer either way).
+
+  A sixth round (an actual `review diff --staged` self-review pass, not another
+  patch-and-guess cycle) found round 5's length cap had its OWN false-negative, and
+  a more dangerous one: a genuine, VERBOSE refutation (prose + a code snippet + the
+  per-scenario "checked" list the prompt explicitly asks for) routinely exceeds a
+  few thousand characters with NO pathological decoration run in it at all, and got
+  silently downgraded to `'inconclusive'` before the scan even started — discarding
+  a real finding, exactly the "more dangerous direction" this file swears off
+  repeatedly (Opus finding). Fixed at the root instead of raising the cap again:
+  every decoration-matching character class in this section is now BOUNDED (`{0,24}`
+  / `{1,24}` instead of an unbounded `*`), which keeps each match attempt's
+  backtracking cost small regardless of the body's total length — so the whole-body
+  length gate (`_MARKER_SCAN_MAX_LEN`) is no longer needed for safety and was
+  removed outright. The same round found the null marker's "NO" separator (`\s+`,
+  literal whitespace only) still missed a model wrapping just "NO" in emphasis
+  (`**NO** REFUTATION FOUND`) or a colon (`NO: REFUTATION FOUND` — one of the audit's
+  own two reported trigger strings) — the immediate next character wasn't
+  whitespace, so the leftmost successful match started at "REFUTATION" itself with
+  no "NO" consumed, misreading a genuine null answer as an affirmative and flipping
+  a clean run to a false failure (Opus finding). Rather than patch the shared
+  optional-"NO"-capture-group pattern a fifth time, `refutation_verdict` was
+  rewritten around two SEPARATE regexes (`_NULL_MARKER_RE` / `_AFFIRMATIVE_MARKER_RE`)
+  plus explicit overlap exclusion: an affirmative match only counts if its span is
+  NOT contained inside a null match's own span, so "NO REFUTATION FOUND"'s internal
+  "REFUTATION FOUND" substring is recognized as part of the null marker rather than
+  fighting it for the same text — closing the whole class of asymmetry bug that
+  rounds 2 through 5 kept re-discovering new instances of. Two residuals remain
+  DOCUMENTED (not fixed) rather than silently missed: an ordinary sentence where a
+  real WORD (not decoration) separates "no" from "refutation found" — e.g. "No
+  actual refutation found." — still misreads as `'found'` on a clean run (k3
+  finding; the SAFE-direction residual, an unnecessary extra look, never a hidden
+  problem); and a model that uses the null marker's own text inside a negated or
+  quoted sentence to describe a REAL problem — e.g. "I cannot honestly answer 'NO
+  REFUTATION FOUND': quorum.py:469 never sends the diff to the adversarial pass" —
+  still reads as `'not_found'` (k3 finding; the DANGEROUS-direction residual, not
+  closed here, pinned by its own regression test so it stays visible rather than
+  forgotten). This same self-review pass also found the moderator's synthesis
+  parse-miss and "real disagreement" cases were collapsed into one indistinguishable
+  SKIPPED message (Opus finding) — the message now says which case it is, so a human
+  reading the transcript can tell "the panel already disagreed" from "the synthesis
+  wasn't legible at all" — and confirmed the adversarial pass never receives the diff
+  directly, same as the pre-existing moderator call just above it (k3 finding);
+  documented as inheriting review-cli#189 rather than a new gap, not fixed here.
+  Separately (k3 finding, not part of the marker-parsing class above): `--prompt`
+  lets a caller replace `DEFAULT_PROMPT` outright for `review diff`, but both render
+  paths applied the missing-evidence WARNING unconditionally — a custom prompt that
+  never asked for the "checked: ..." phrasing (e.g. `--prompt 'Answer APPROVED if
+  safe; otherwise list blockers.'`) still got a compliant one-word answer flagged as
+  suspicious. `review.py`'s two render call sites now gate `check_evidence` on
+  `prompt == DEFAULT_PROMPT`.
+
+  A seventh round (a second `review diff --staged` self-review pass on round 6's own
+  fixes) found two more real issues, both in code round 6 itself introduced. (1) The
+  new `prompt == DEFAULT_PROMPT` equality check silently broke on `--visual`: `cli.py`'s
+  `_with_visual` APPENDS the image's context note to whatever prompt is in effect
+  (`text + visual_ctx.context_note`), so `review diff --visual shot.png` with no
+  `--prompt` dispatches `DEFAULT_PROMPT + context_note` — a DIFFERENT string from
+  `DEFAULT_PROMPT` even though the model still received DEFAULT_PROMPT's full
+  "checked: ..." contract verbatim (k3 finding) — fixed by switching the check to
+  `prompt.startswith(DEFAULT_PROMPT)`, which recognizes the composed prompt as still
+  carrying the unmodified base contract while still resolving to False for a
+  genuinely custom `--prompt`. (2) `_TRIVIAL_DISAGREEMENT_RE`'s character class was
+  missing the em dash `—` itself, even though the comment directly above it has
+  claimed since round 4 that "— No disagreements." is tolerated — a moderator that
+  puts the heading and the trivial phrase on separate lines (content reduces to
+  exactly "— None.") failed the match, read as "not clean," and silently skipped
+  `--adversarial-check` on a genuinely clean verdict, with round 6's own new skip
+  message then wrongly telling the user "the moderator synthesis reported real
+  disagreement" (k3 finding) — fixed by adding `—` to the character class, closing
+  a gap the comment had assumed was closed for three rounds.
+
+  An eighth round (a confirmation self-review pass on rounds 6-7's own fixes) found
+  the marker/section-parsing logic itself CLEAN on independent re-verification (Opus),
+  plus two more LOW-severity real issues (k3), both fixed. (1) `_REFUTATION_PHRASE`
+  had no right-side word boundary after "FOUND", so any word merely BEGINNING with
+  "found" — "FOUNDED", "FOUNDATION", "founders" — satisfied the affirmative marker
+  too: ordinary prose describing a clean verdict in different words ("the strongest
+  candidate refutation founded on the checkpoint/stamp race fails") false-fired
+  `'found'` with no real "NO" anywhere nearby, flipping a genuinely clean run to a
+  ship-gate exit 1 — fixed by adding `(?![A-Za-z])` right after "FOUND", symmetric
+  with `_NO_WORD_RE`'s own letter-only boundary. (2) `panel.py`'s `_CLEAN_VERDICT_RE`
+  (finding #2's original implementation) included a bare `\bapproved\b` alternative
+  that also matched inside a REJECTING verdict — "Not approved — the checkpoint
+  races the stamp write." — attaching the missing-evidence WARNING to a verdict
+  that already blocked the change and actively misdescribing it; fixed by dropping
+  "approved" from the word list entirely (DEFAULT_PROMPT never asks a reviewer to
+  say that word in the first place, and the remaining alternatives already catch
+  the common bare rubber-stamp shapes) rather than chasing every negation with more
+  lookbehinds. This round also hedged the "non-empty section 2" skip message
+  introduced in round 6: a non-empty `DISAGREEMENT / NO QUORUM` section is NOT
+  necessarily real disagreement — it could be ordinary clean phrasing
+  `_TRIVIAL_DISAGREEMENT_RE`'s fixed alternation doesn't yet recognize ("None to
+  report.", "No conflicts.", "All experts agree.") — so the message now says the
+  section "did not reduce to a recognized trivial/clean phrase" and points the
+  reader at it, rather than asserting disagreement the code cannot actually confirm.
+
+  A ninth round (Opus reached an independent CLEAN verdict re-verifying rounds 6-8's
+  fixes by construction, not spot-check) surfaced one more in-family observation and
+  two missing-test gaps, both addressed without further code risk. `panel.py`'s
+  `_CLEAN_VERDICT_RE` still has the same class of ambiguity round 8 fixed for
+  "approved": its remaining alternatives ("no issues", "no problems", "nothing
+  blocking") can fire on a scoped clause inside a body that DOES report a real
+  finding elsewhere (e.g. "Missing test: ... No issues found in the flat path.").
+  Unlike "approved", these are exactly the words DEFAULT_PROMPT's own "checked: ..."
+  contract expects a genuinely clean SECTION to use, so removing them would defeat
+  the heuristic's purpose — documented as an accepted, low-cost residual in
+  `clean_verdict_missing_evidence`'s own docstring rather than chased with more
+  regex, since telling "the whole verdict is clean" apart from "this one part is"
+  needs the same real-conclusion-location reasoning already out of reach for
+  `refutation_verdict`'s own two residuals. The two missing-test gaps: a THIRD,
+  previously-unpinned residual (a model that merely quotes the affirmative
+  instruction back without asserting a finding, e.g. "I considered whether a
+  'REFUTATION FOUND' response would be warranted — it isn't," still false-matches
+  as `'found'` on a clean run — the safe direction, now regression-pinned like its
+  two siblings); and a new end-to-end test proving `review quorum`'s own
+  `format_result` calls never apply the missing-evidence WARNING even when the
+  moderator's summary contains literal bait text ("Looks good overall.") that would
+  trigger it if `check_evidence=True` were ever accidentally added there — closing
+  the mirror image of the gap round 2's `review.py` tests closed for the
+  diff-review render paths.
+
+  A tenth self-review pass (Opus; k3 hit a billing-quota 403 and could not
+  participate this round) found three more real issues, all fixed, plus a test
+  fixed to actually exercise what it claims to. (1) The refutation marker text
+  existed as THREE independent literals — the exported
+  `REFUTATION_NOT_FOUND_MARKER` constant, a bare inline `'REFUTATION FOUND:'`
+  string hardcoded in `_adversarial_refutation_prompt`, and the regex patterns
+  spelling out "NO"/"REFUTATION"/"FOUND" again themselves — the identical
+  "hardcoded prompt vs. hardcoded regex, no link between them" anti-drift gap
+  round 3 already fixed for the DISAGREEMENT/ABSTAINED headings, just never
+  applied to the marker words. Fixed the same way: `_NO_WORD` / `_REFUTATION_WORD`
+  / `_FOUND_WORD` are now the single source of truth, with
+  `REFUTATION_NOT_FOUND_MARKER` and the new `AFFIRMATIVE_REFUTATION_MARKER`
+  derived from them, the regexes built via `re.escape()` on the same constants,
+  and a new test capturing the REAL prompt sent to the adversarial pass (not a
+  fixture) asserting both constants are genuinely in it. (2) The new second
+  `run_moderator` call for the adversarial pass reused `round_no=0`, identical to
+  the pre-existing moderator call — investigated whether this could collide in
+  the per-call log filename or the quorum-store/stats keying (both plausible
+  given recent commits binding quorum-store iterations to diff identity and
+  adding stalled-model diagnostics); verified neither actually collides (every
+  log filename is ALSO stamped to microsecond precision, and the quorum-store
+  keys off diff identity, not `round_no`), but passed `round_no=1` for the
+  adversarial call anyway as a real diagnostic improvement — a human tailing logs
+  can now tell the two calls apart at a glance instead of by timestamp order
+  alone. (3) `test_flat_diff_review_render_skips_the_warning_under_a_custom_prompt`
+  baited its "does the warning stay off" assertion with `"APPROVED"` — but round 8
+  had already dropped "approved" from `_CLEAN_VERDICT_RE` for an unrelated reason,
+  so the assertion passed regardless of whether `check_evidence` was gated
+  correctly at all; changed the bait to a phrase still in the word list, and
+  added the board path's equivalent negative-prompt test, which had none. Also
+  fixed the `INCONCLUSIVE` header to distinguish "the extra call itself was not
+  usable" from "it ran but matched neither marker" — the original wording always
+  assumed the second case even when there was no real answer to read at all.
+
+  An eleventh pass (Opus, single-seat — k3's quota had not refreshed) correctly
+  flagged that two prior fixes depend on code OUTSIDE this diff it could not itself
+  verify: `run_moderator`'s real signature accepting `round_no`, and `_with_visual`
+  truly appending rather than prepending/wrapping. Both were independently
+  confirmed by direct inspection of `panel.py`/`cli.py` (not assumed) — genuinely
+  safe. But the SECOND item exposed a real test-quality gap: the visual-composition
+  test built its "composed prompt" by hand-rolled string concatenation instead of
+  calling the real `cli._with_visual`, so it would keep passing even if that
+  function's actual behavior changed — fixed by driving the real function with a
+  minimal stand-in object (only `.context_note` is read, so a full `VisualContext`
+  isn't needed), closing the same "fixture instead of reality" gap the marker/
+  heading anti-drift tests already guard against elsewhere in this file.
+
 - **Cross-process/cross-thread locking for the seat-cooldown store (#188).** A board
   dispatches its seats in parallel, so two concurrent `record_cooldown`/`clear_cooldown`
   calls could race on the same unlocked read-modify-write and silently lose one side's

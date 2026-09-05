@@ -17,8 +17,23 @@ from pathlib import Path
 from .usage_limits import DEFAULT_LIMIT_THRESHOLD
 
 DEFAULT_PROMPT = (
-    "Review this uncommitted git diff for bugs, regressions, security issues, "
-    "and missing tests. Return only actionable findings. Do not edit files."
+    "Review this uncommitted git diff for bugs, regressions, security issues, and "
+    "missing tests. Before concluding the diff is fine, actively try to find a way it "
+    "is WRONG: walk through concrete failure scenarios (edge cases, concurrent access, "
+    "malformed or adversarial input, a caller/integration point you haven't traced) and "
+    "genuinely attempt to break the change, rather than skimming it for obviously bad "
+    "code. Only report 'no issues' after you have tried specific scenarios and failed "
+    "to break it — a skim is not a review.\n\n"
+    "Every verdict must show that work, not just an opinion:\n"
+    "- A FINDING must cite file:line and describe a concrete failure scenario — the "
+    "input or state that triggers it and what goes wrong.\n"
+    "- A CLEAN verdict (no findings) must explicitly state which specific failure "
+    "modes you checked and why each is ruled out, e.g. 'checked: race condition on "
+    "concurrent writes to X — none found, guarded by a lock at Y; checked: injection "
+    "via the user-supplied Z — sanitized before use at W'. A bare 'looks good' or 'no "
+    "issues found' with no such statement is not an acceptable answer.\n\n"
+    "Return only actionable findings (or the clean-verdict statement above). Do not "
+    "edit files."
 )
 # Canonical Kimi seat — the SINGLE source of truth for "the Kimi model the defaults use",
 # referenced by BOTH the flat DEFAULT_MODELS panel below and the priority-4 seat of
@@ -194,13 +209,18 @@ REVIEW_ROLES = {
     ),
     "security": (
         "Focus specifically on SECURITY: injection, broken authn/authz, secret "
-        "handling, unsafe deserialization, path traversal, and SSRF. Flag exploitable "
+        "handling, unsafe deserialization, path traversal, and SSRF. Think like a "
+        "security-paranoid reviewer: assume the worst actor and the worst case, and "
+        "actively probe every input, trust boundary, and secret-handling path for a "
+        "way to break it before concluding the change is safe. Flag exploitable "
         "issues, not theoretical ones."
     ),
     "tests": (
         "Focus specifically on TESTS: missing tests for new behavior, untested branches, "
-        "boundary conditions, and error-path coverage. Point at the exact cases that "
-        "should be tested but aren't."
+        "boundary conditions, and error-path coverage. Bring a skeptical-SRE mindset: "
+        "distrust anything without a failure plan — what breaks in production, under "
+        "concurrent or adversarial load, or at 3am with no one watching? Point at the "
+        "exact cases that should be tested but aren't."
     ),
     "contracts": (
         "Focus specifically on PUBLIC API SHAPE and CONTRACTS: exported function/type "

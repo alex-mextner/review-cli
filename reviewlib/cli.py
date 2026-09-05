@@ -3366,6 +3366,8 @@ _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset(
         "--project",
         "--retry",
         "--commit",
+        # quorum's opt-in adversarial refutation pass (modes/quorum.py).
+        "--adversarial-check",
         # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
         # etc. must get the friendly "use the subcommand" pointer, not argparse's opaque error.
         # Phase 3 adds the SUT-env flags `--stage-url` / `--config` / `--keep-env`.

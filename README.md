@@ -222,6 +222,20 @@ of majority agreement with evidence), DISAGREEMENT / NO QUORUM, and ABSTAINED.
 
 Use when a question has real stakes and you want cited consensus, not vibes.
 
+**`--adversarial-check` — an opt-in refutation pass for ship-gate-critical
+questions.** After Phase 2 reaches a CLEAN verdict (no blocking disagreement), this
+spawns one more pass whose only job is to try to REFUTE "no issues found" — not
+another vote, an explicit attempt to find what the panel missed. If it finds a
+genuine problem, that's surfaced as a new finding (never silently discarded) and the
+run exits non-zero. Skipped automatically when the panel already disagreed (nothing
+clean to refute) or when the flag is absent, so it costs nothing on routine
+questions — reach for it specifically before a merge/ship decision, not every
+`review quorum` call:
+
+```bash
+review quorum "should we ship this?" --adversarial-check --task HYP-742
+```
+
 **Live logs & partial output.** Each backend call streams its output in real time
 to a per-call log in the OS-standard per-user log dir — **macOS** `~/Library/Logs/review-cli/`,
 **Linux** `$XDG_STATE_HOME/review-cli/logs/` (default `~/.local/state/review-cli/logs/`);
