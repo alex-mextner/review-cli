@@ -383,14 +383,16 @@ def test_board_flags_and_listing():
     assert_not_in("--no-board", top)
     board = review_out("--show-board")
     for needle in (
-        "source: preset:default",
+        # Bare `--show-board` now resolves to the "light" preset (Alex, 2026-08-28:
+        # cheap/quick preflight is the default; "default"/"heavy" are opt-in).
+        "source: preset:light",
         "claude:claude-opus-4-8",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "oc:zai/glm-5.2",
         "contracts",
         "8 seats",
         "#1",
-        # The CTO-directed GLM-5.2-via-commandcode seat (default preset, diff-only keyed HTTP).
+        # The CTO-directed GLM-5.2-via-commandcode seat (light preset, diff-only keyed HTTP).
         "commandcode:zai-org/GLM-5.2",
         "GLM-cc",
     ):
@@ -424,7 +426,14 @@ def test_failover_pool_listing():
     board = review_out("--show-board")
     assert_in("live pool", board.lower())
     assert_in("reserve", board)
-    assert_in("pool 4", board.lower())
+    # Bare --show-board resolves the light preset (Alex, 2026-08-28): pool 2.
+    assert_in("pool 2", board.lower())
+    # Review finding: the bare invocation must NOT claim to be "sized" (it wasn't —
+    # this is the exact bug the light-default change fixed), but an explicit --pool
+    # override must.
+    assert_not_in("sized by preset", board)
+    sized_pool3 = review_out("--show-board", "--pool", "3")
+    assert_in("sized by preset", sized_pool3)
     pool2 = review_out("--show-board", "--pool", "2")
     if pool2.count("[pool") > 2:
         raise SmokeError(f"--pool 2 tagged more than 2 seats:\n{pool2}")
@@ -860,6 +869,10 @@ _UNIT_FILES = [
     # `review stat`'s CLI surface (argparse wiring, --since/--days resolution, --json vs
     # text rendering, --harness table filtering). Deterministic, no network/backend.
     ("test_stat_subcommand.py", {}),
+    # The persistent call-log cache (reviewlib.dashboard.call_log_cache) that lets a
+    # repeat `review stat`/dashboard scan skip re-parsing unchanged log files.
+    # Deterministic — synthetic tmpdirs, no real log dir, no network.
+    ("test_call_log_cache.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in
