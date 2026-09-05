@@ -56,6 +56,7 @@ from reviewlib.config import (  # noqa: E402
     DEFAULT_BOARD,
     DEFAULT_POOL_SIZE,
     GLM_COMMANDCODE_SEAT,
+    SOL_SEAT,
     BoardReviewer,
     split_pool_reserve,
 )
@@ -172,24 +173,32 @@ def test_unusable_short_temporarily_unavailable_sentinel():
 
 # === startup failover (split_pool_reserve) ======================================
 def test_startup_failover_skips_unavailable_top_seat():
-    """Fable (priority #1) unavailable -> the top-4 pool starts at Sol and pulls one
-    more in from the reserve, so it is still 4 WORKING seats."""
+    """review-cli#fable-seat-reliability (GLM review finding): this used to mark
+    Fable unavailable, but Fable is now DEFAULT_BOARD's LAST seat -- excluding it is
+    a no-op for the top-4 pool (Sol/Opus/GLM-cc/Kimi either way), so the "skip an
+    unavailable TOP seat, pull the next one up" behavior this test exists to defend
+    went unexercised. Sol (the new #1) unavailable -> the top-4 pool starts at Opus
+    and pulls Codex in from the reserve, so it is still 4 WORKING seats."""
     board = list(DEFAULT_BOARD)
-    available = {r.model for r in board if r.model != "claude:claude-fable-5"}
+    available = {r.model for r in board if r.model != SOL_SEAT}
     pool, reserve = split_pool_reserve(board, 4, _avail(available))
     assert [r.model for r in pool] == [
-        "codex:gpt-5.6-sol",
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "codex",
     ], [r.model for r in pool]
-    # Fable is NOT in the pool nor the reserve — it's unavailable.
-    assert "claude:claude-fable-5" not in {r.model for r in pool + reserve}
+    # Sol is NOT in the pool nor the reserve — it's unavailable.
+    assert SOL_SEAT not in {r.model for r in pool + reserve}
 
 
-def test_fable_backfill_keeps_four_distinct_lenses_with_sol():
-    """With Sol inserted after Fable, losing Fable now backfills with Kimi and keeps four
-    distinct lenses: consistency/correctness/performance/quality."""
+def test_fable_unavailability_is_noop_for_default_pool_roles():
+    """GLM review finding (review-cli#286, round 2): this test's PREVIOUS name
+    ("...backfill...") claimed to exercise a backfill, but it does not -- see below.
+    review-cli#fable-seat-reliability: Fable is now DEFAULT_BOARD's LAST seat, so
+    marking it unavailable is a no-op for the top-4 pool (Kimi is already a PLANNED
+    pool seat, not a backfill) -- the pool is Sol/Opus/GLM-cc/Kimi either way, still
+    four distinct lenses: consistency/correctness/performance/quality."""
     board = list(DEFAULT_BOARD)
     available = {r.model for r in board if r.model != "claude:claude-fable-5"}
     pool, _ = split_pool_reserve(board, DEFAULT_POOL_SIZE, _avail(available))
@@ -199,17 +208,29 @@ def test_fable_backfill_keeps_four_distinct_lenses_with_sol():
     assert "architect" not in roles, roles  # Fable's lens is the one lost, as expected.
 
 
-def test_glm_cc_unavailable_keeps_four_distinct_lenses():
-    """When GLM-cc itself is unavailable, Kimi backfills and the pool still keeps four
-    distinct lenses (architect/consistency/correctness/quality)."""
+def test_glm_cc_unavailable_backfills_from_codex_with_a_duplicate_lens():
+    """When GLM-cc itself is unavailable, Kimi and then Codex backfill. Before
+    review-cli#fable-seat-reliability, Fable's UNIQUE `architect` lens sat right behind
+    GLM-cc in priority, so this exact combo still kept four distinct lenses. Now that
+    Fable is demoted to the very last reserve seat (a confirmed ~100% dispatch failure
+    rate made that trade worth it — see DEFAULT_BOARD's Fable comment), the next
+    backfill is Codex, whose `consistency` lens duplicates Sol's — a real, accepted,
+    narrow trade-off: this combo (GLM-cc down AND a 4th seat needed) is far rarer than
+    Fable's near-certain failure on literally every default review."""
     board = list(DEFAULT_BOARD)
     available = {r.model for r in board if r.model != GLM_COMMANDCODE_SEAT}
     pool, _ = split_pool_reserve(board, DEFAULT_POOL_SIZE, _avail(available))
     models = [r.model for r in pool]
     assert GLM_COMMANDCODE_SEAT not in models, models
+    assert models == [
+        SOL_SEAT,
+        "claude:claude-opus-4-8",
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+        "codex",
+    ], models
     roles = [r.role for r in pool]
-    assert len(set(roles)) == 4, roles  # four DISTINCT lenses, none lost
-    assert set(roles) == {"architect", "consistency", "correctness", "quality"}, roles
+    assert roles.count("consistency") == 2, roles  # Sol + Codex, the accepted trade-off
+    assert set(roles) == {"consistency", "correctness", "quality"}, roles
 
 
 def test_startup_failover_respects_priority_order():
@@ -259,7 +280,8 @@ def test_midrun_failed_seat_is_backfilled_keeps_count():
     run still ends with `pool_size` (4) usable verdicts — it does NOT degrade to 3."""
     board = list(DEFAULT_BOARD)
     pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in board}))
-    # The 4th pool seat (Kimi) errors out mid-run; the next reserve (GLM) backfills it.
+    # The 4th pool seat (Kimi) errors out mid-run; the next reserve (Codex, priority 5
+    # post-Fable-demotion) backfills it.
     failing = pool[3].model
     with _FakeBackends({failing: (1, "boom")}) as fb:
         outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
@@ -273,14 +295,24 @@ def test_midrun_failed_seat_is_backfilled_keeps_count():
 
 
 def test_midrun_unavailable_body_triggers_backfill_fable_case():
-    """The exact CTO scenario: Fable is in the startup pool (the cheap probe says
-    available — its paywall is invisible) but returns an 'unavailable' body at run time.
-    Mid-run failover treats that as a failure and backfills, so the working pool-4 ends as
-    Sol / Opus / GLM-cc / Kimi — Fable replaced by the first reserve (Kimi, #5)."""
+    """The exact CTO scenario THAT MOTIVATED review-cli#fable-seat-reliability's
+    seat_cooldown/board fixes: a startup probe can't see Fable's paywall/quota
+    exhaustion (invisible to the cheap availability check), so if it lands in a pool —
+    an explicit `-m`/custom `board:` config can still prioritize it, even though
+    DEFAULT_BOARD no longer does — the mid-run 'unavailable' body still must be
+    correctly treated as a failure and backfilled from reserve. Hand-builds the pool
+    (rather than deriving it from `split_pool_reserve(DEFAULT_BOARD, ...)`, which no
+    longer selects Fable by default) to keep exercising this exact scenario."""
     board = list(DEFAULT_BOARD)
-    # Cheap probe: ALL available (Fable's paywall is invisible to it).
-    pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in board}))
-    assert pool[0].model == "claude:claude-fable-5"  # Fable IS selected at startup
+    by_model = {r.model: r for r in board}
+    pool = [
+        by_model["claude:claude-fable-5"],
+        by_model[SOL_SEAT],
+        by_model["claude:claude-opus-4-8"],
+        by_model[GLM_COMMANDCODE_SEAT],
+    ]
+    reserve = [r for r in board if r.model not in {p.model for p in pool}]
+    assert pool[0].model == "claude:claude-fable-5"  # Fable IS selected in this pool
     fable_body = (
         "Claude Fable 5 is currently unavailable. "
         "Learn more: https://www.anthropic.com/news/fable-mythos-access"

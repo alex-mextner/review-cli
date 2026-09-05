@@ -10,6 +10,7 @@ instruction file; and an idempotent SessionStart hook that surfaces every
 installed agent-CLI at the top of each session. `install-commit-hook` adds the
 optional hard review-before-commit gate.
 """
+
 from __future__ import annotations
 
 import json
@@ -113,8 +114,10 @@ a file, reach for `-o file.md`, never `> file.md`.
 ## Reviewer board, presets, and `--pool` (priority-ordered failover pool)
 A plain `review diff` runs the **default preset**: pool 4, high effort, no Fable/Sol.
 Use `--preset light` for quick/cheap preflight (pool 2, medium effort), and
-`--preset heavy` for release/risky changes (Fable, Sol, Opus, GLM-cc at highest effort,
-with the remaining board seats as highest-effort reserve). The built-in reviewer board is
+`--preset heavy` for release/risky changes (Sol, Opus, GLM-cc, Kimi at highest effort,
+with the remaining board seats as highest-effort reserve). Fable is excluded from
+every preset (a confirmed ~100% dispatch failure rate) and sits last-resort in the raw
+board instead. The built-in reviewer board is
 a **priority-ordered** panel where each model also gets its own role/lens. The active pool
 is chosen by **priority + availability** with two failovers so the run keeps its requested
 reviewer count: **startup failover** picks the top N AVAILABLE seats by priority (a
@@ -129,7 +132,9 @@ failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "over
 501 / refusal) is never retried and falls straight to the reserve. `--retry N` (or
 `$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
 `--pool N` sizes the pool (top-N available, same failover); `--pool 0` runs all available
-seats in the selected preset/board (`--preset heavy --pool 0` covers all 10 built-ins).
+seats in the selected preset/board (`--preset heavy --pool 0` covers all 9
+heavy-preset-built-ins; the raw 10-seat board, incl. last-resort Fable, needs an
+explicit `board:`).
 The board is **never disabled** — there is **no `--no-board` flag**. An explicit `-m`
 always limits the run to exactly those models; with no configured `models:`/`board:` it is
 the legacy flat panel unless an explicit preset supplies metadata, and with config present it
@@ -227,9 +232,9 @@ SKILL_BLURB = (
     "`review` — multi-model read-only code review + AI panels "
     "(codex/claude/gemini/opencode). Modes are SUBCOMMANDS (the verb leads; -C follows): "
     "`review diff --task CODE -C <repo>` (diff review), "
-    "`review quorum \"Q\" --task CODE -C <repo>`, "
-    "`review brainstorm \"topic\" --task CODE -C <repo>`, "
-    "`review just-ask \"Q\" --task CODE -C <repo>`. "
+    '`review quorum "Q" --task CODE -C <repo>`, '
+    '`review brainstorm "topic" --task CODE -C <repo>`, '
+    '`review just-ask "Q" --task CODE -C <repo>`. '
     "A bare `review` prints HELP — the diff review is `review diff` (NOT a bare "
     "`review`); the old --quorum/--brainstorm/--just-ask flags were removed. "
     "Always pass -C <project-root>. Always pass --task CODE (or set REVIEW_TASK_CODE) for "
@@ -243,9 +248,9 @@ SKILL_BLURB = (
 
 _HOOK_MARKER = "# agent-tools-awareness"
 _HOOK_COMMAND = (
-    "sh -c 'd=\"$HOME/.agents/skills/.blurbs\"; ls \"$d\"/*.md >/dev/null 2>&1 && "
-    '{ printf \"Agent CLI tools installed on this machine (prefer them):\\n\"; '
-    "cat \"$d\"/*.md; }' " + _HOOK_MARKER
+    'sh -c \'d="$HOME/.agents/skills/.blurbs"; ls "$d"/*.md >/dev/null 2>&1 && '
+    '{ printf "Agent CLI tools installed on this machine (prefer them):\\n"; '
+    'cat "$d"/*.md; }\' ' + _HOOK_MARKER
 )
 
 
@@ -262,6 +267,7 @@ def _append_marked(path, tool: str, blurb: str) -> bool:
     CHANGED (newly added or the block content differs), False if it was already up to date —
     so the caller can report "already configured" vs "updated" (install-* INSTALLED state)."""
     import re
+
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     start, end = f"<!-- skill:{tool} -->", f"<!-- /skill:{tool} -->"
@@ -273,7 +279,9 @@ def _append_marked(path, tool: str, blurb: str) -> bool:
     # a crash (glm review). OUR-generated files go through `_write_if_changed`, which safely
     # rewrites an undecodable file because we own its content.
     before = p.read_text(encoding="utf-8") if p.exists() else ""
-    existing = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"\n?", "", before, flags=re.S)
+    existing = re.sub(
+        re.escape(start) + r".*?" + re.escape(end) + r"\n?", "", before, flags=re.S
+    )
     block = f"{start}\n{blurb}\n{end}\n"
     after = (existing.rstrip() + "\n\n" + block) if existing.strip() else block
     if after == before:
@@ -331,7 +339,11 @@ def _ensure_sessionstart_hook(home) -> bool:
     try:
         # (OSError, ValueError) also covers UnicodeDecodeError (a non-UTF-8 settings.json) and
         # JSONDecodeError — degrade to "could not write" rather than crash (glm review).
-        data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
+        data = (
+            json.loads(settings.read_text(encoding="utf-8"))
+            if settings.exists()
+            else {}
+        )
     except (OSError, ValueError):
         return False
     if not isinstance(data, dict):
@@ -348,7 +360,9 @@ def _ensure_sessionstart_hook(home) -> bool:
                 return False
     sessionstart.append({"hooks": [{"type": "command", "command": _HOOK_COMMAND}]})
     if settings.exists():
-        settings.with_suffix(".json.bak").write_text(settings.read_text(encoding="utf-8"), encoding="utf-8")
+        settings.with_suffix(".json.bak").write_text(
+            settings.read_text(encoding="utf-8"), encoding="utf-8"
+        )
     settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return True
 
@@ -506,7 +520,9 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
     home = Path.home()
     # (label, changed?) per target — `changed` False == already-configured.
     results: list[tuple[str, bool]] = []
-    conflicts: list[str] = []  # targets we could NOT configure (left as-is) — block "nothing to do"
+    conflicts: list[
+        str
+    ] = []  # targets we could NOT configure (left as-is) — block "nothing to do"
 
     def _write_target(path: Path, content: str) -> None:
         # A write that fails (read-only FS, ENOSPC, EPERM, immutable flag) must become a
@@ -516,7 +532,9 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
         try:
             results.append((str(path), _write_if_changed(path, content)))
         except (OSError, ValueError) as exc:
-            conflicts.append(f"{path} could not be written ({exc}) — fix permissions and re-run")
+            conflicts.append(
+                f"{path} could not be written ({exc}) — fix permissions and re-run"
+            )
 
     skill_dir = home / ".agents" / "skills" / name
     _write_target(skill_dir / "SKILL.md", skill_md)
@@ -546,8 +564,12 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
             ):
                 results.append((str(link), False))  # correct symlink already present
             else:
-                target_desc = "an unreadable target" if points_at is None else f"{points_at}"
-                conflicts.append(f"{link} is a symlink to {target_desc} (expected {want})")
+                target_desc = (
+                    "an unreadable target" if points_at is None else f"{points_at}"
+                )
+                conflicts.append(
+                    f"{link} is a symlink to {target_desc} (expected {want})"
+                )
         elif link.exists():
             # A regular file/dir occupies the path (is_symlink already handled all symlinks,
             # incl. dangling ones, above).
@@ -565,7 +587,11 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
     harness_files = [
         ("claude", home / ".claude" / "CLAUDE.md", ("~/.claude",)),
         ("codex", home / ".codex" / "AGENTS.md", ("~/.codex",)),
-        ("opencode", home / ".config" / "opencode" / "AGENTS.md", ("~/.config/opencode",)),
+        (
+            "opencode",
+            home / ".config" / "opencode" / "AGENTS.md",
+            ("~/.config/opencode",),
+        ),
         ("gemini", home / ".gemini" / "GEMINI.md", ("~/.gemini",)),
     ]
     for cmd, path, dirs in harness_files:
@@ -578,7 +604,9 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
                 # — never overwritten (data loss) and never a mid-loop crash that strands later
                 # targets. Record a conflict so the run exits non-zero and tells the user to
                 # fix the file (glm review: honor the `! conflict` contract for this case too).
-                conflicts.append(f"{path} is not readable as UTF-8 ({exc}) — left as-is, fix it manually")
+                conflicts.append(
+                    f"{path} is not readable as UTF-8 ({exc}) — left as-is, fix it manually"
+                )
 
     if (home / ".claude").is_dir():
         # _ensure_sessionstart_hook returns True if it ADDED the hook, False if already there
@@ -618,18 +646,24 @@ def install_agent_skill(name: str, skill_md: str, blurb: str) -> int:
     if conflicts:
         # A conflict means a target is NOT configured — never say "nothing to do" / done.
         # Return non-zero so a caller/script sees the install is incomplete (codex review).
-        print(f"{name}: install-skill — {changed} updated, "
-              f"{len(results) - changed} already configured, "
-              f"{len(conflicts)} CONFLICT(S) left unconfigured. Resolve the conflict(s) "
-              "above and re-run.")
+        print(
+            f"{name}: install-skill — {changed} updated, "
+            f"{len(results) - changed} already configured, "
+            f"{len(conflicts)} CONFLICT(S) left unconfigured. Resolve the conflict(s) "
+            "above and re-run."
+        )
         return 1
     if changed == 0:
-        print(f"{name}: install-skill — already configured, nothing to do "
-              f"({len(results)} target(s) ✓). Idempotent; re-run anytime.")
+        print(
+            f"{name}: install-skill — already configured, nothing to do "
+            f"({len(results)} target(s) ✓). Idempotent; re-run anytime."
+        )
     else:
-        print(f"{name}: install-skill done — {changed} updated, "
-              f"{len(results) - changed} already configured ({len(results)} target(s)). "
-              "Idempotent; re-run anytime.")
+        print(
+            f"{name}: install-skill done — {changed} updated, "
+            f"{len(results) - changed} already configured ({len(results)} target(s)). "
+            "Idempotent; re-run anytime."
+        )
     return 0
 
 
@@ -644,9 +678,12 @@ _PRECOMMIT_MARKER = "# review-before-commit-gate"
 # `command git` bypasses shell aliases/functions (e.g. an rtk-style wrapper that rewrites
 # `git diff` output) so the hash matches the one written by review-cli, which calls the
 # real git binary via subprocess directly.
-_PRECOMMIT = """\
+_PRECOMMIT = (
+    """\
 #!/bin/sh
-""" + _PRECOMMIT_MARKER + """ (installed by `review install-commit-hook`)
+"""
+    + _PRECOMMIT_MARKER
+    + """ (installed by `review install-commit-hook`)
 # Blocks a commit whose staged diff has not been reviewed. Bypass with
 # REVIEW_SKIP=1 git commit ...   or   git commit --no-verify
 root=$(command git rev-parse --show-toplevel 2>/dev/null) || exit 0
@@ -670,6 +707,7 @@ echo "  run:  review diff --staged --task TASK-CODE      (then commit)" >&2
 echo "  skip: REVIEW_SKIP=1 git commit ...   |   git commit --no-verify" >&2
 exit 1
 """
+)
 
 
 def _write_review_stamp(
@@ -716,10 +754,14 @@ def _write_review_stamp(
     import hashlib
 
     from .process import git_repo_env
+
     try:
         p = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--git-path", "review-stamp"],
-            cwd=cwd, env=git_repo_env(cwd), capture_output=True, text=True,
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            capture_output=True,
+            text=True,
         )
         if p.returncode != 0:
             return
@@ -730,7 +772,10 @@ def _write_review_stamp(
         else:
             hook_diff = subprocess.run(
                 ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--cached"],
-                cwd=cwd, env=git_repo_env(cwd), capture_output=True, text=True,
+                cwd=cwd,
+                env=git_repo_env(cwd),
+                capture_output=True,
+                text=True,
                 timeout=30,
             )
             # Fall back to the reviewed `diff` text if the independent recompute
@@ -819,7 +864,10 @@ def resolve_tg_cli_source(configured: str | None = None) -> Path:
     # (source label, raw value) — pairs so the error message attributes a bad path to
     # where it ACTUALLY came from (an explicit `configured` arg vs. the env var), not
     # always the env var name regardless of origin (review found).
-    for label, raw in (("configured", configured), ("REVIEW_TG_CLI_SOURCE", os.environ.get("REVIEW_TG_CLI_SOURCE"))):
+    for label, raw in (
+        ("configured", configured),
+        ("REVIEW_TG_CLI_SOURCE", os.environ.get("REVIEW_TG_CLI_SOURCE")),
+    ):
         if raw:
             p = Path(os.path.expanduser(raw)).resolve()
             if not _looks_like_tg_cli_checkout(p):
@@ -875,7 +923,10 @@ def _load_source_descriptor(src_descriptor: Path) -> tuple[dict | None, str | No
         )
     on_error = spec.get("on_error")
     if on_error is not None and on_error not in ("open", "closed"):
-        return None, f"descriptor at {src_descriptor} has on_error={on_error!r} (must be 'open' or 'closed')"
+        return (
+            None,
+            f"descriptor at {src_descriptor} has on_error={on_error!r} (must be 'open' or 'closed')",
+        )
     return spec, None
 
 
@@ -913,7 +964,9 @@ def _clear_stale_local_copy(target_dir: Path, script_name: str) -> tuple[bool, b
     non-idempotent paths, wrote_descriptor and warned_non_executable)."""
     local_copy = target_dir / script_name
     if local_copy.is_symlink():
-        if local_copy.exists():  # `exists()` follows the link — True here means it resolves
+        if (
+            local_copy.exists()
+        ):  # `exists()` follows the link — True here means it resolves
             return False, False  # a working symlink; leave it alone
         label, note = "broken symlink", "dangling; cmd points at the source checkout"
     elif local_copy.exists():
@@ -925,7 +978,9 @@ def _clear_stale_local_copy(target_dir: Path, script_name: str) -> tuple[bool, b
         print(f"  - removed {label}  {local_copy} ({note})")
         return True, False
     except OSError as exc:
-        print(f"      (warning: could not remove {label} {local_copy}: {exc} — harmless, the hook doesn't read it)")
+        print(
+            f"      (warning: could not remove {label} {local_copy}: {exc} — harmless, the hook doesn't read it)"
+        )
         return False, True
 
 
@@ -961,11 +1016,17 @@ def install_hook_tg() -> int:
     except OSError as exc:
         print(f"  ! conflict  {target_descriptor} could not be written ({exc})")
         return 1
-    print(f"  {'+ wrote/updated' if wrote_descriptor else '✓ already configured'}  {target_descriptor}")
+    print(
+        f"  {'+ wrote/updated' if wrote_descriptor else '✓ already configured'}  {target_descriptor}"
+    )
     print(f"      cmd -> {spec['cmd']}")
-    print(f"      (sourced live from {source}; `git pull` there resyncs the hook — no re-install needed)")
+    print(
+        f"      (sourced live from {source}; `git pull` there resyncs the hook — no re-install needed)"
+    )
 
-    removed_stale_copy, warned_stale_removal = _clear_stale_local_copy(target_dir, _TG_HOOK_SCRIPT_NAME)
+    removed_stale_copy, warned_stale_removal = _clear_stale_local_copy(
+        target_dir, _TG_HOOK_SCRIPT_NAME
+    )
 
     # "nothing to do" is only true when NOTHING changed and nothing needs attention — a
     # rewritten descriptor, a removed stale copy, a failed-but-harmless removal attempt, or a
@@ -973,11 +1034,17 @@ def install_hook_tg() -> int:
     # do" (review found: each of these could previously print a real action/warning right
     # above a contradicting "nothing to do" line).
     if wrote_descriptor or removed_stale_copy:
-        print(f"review: install-hook tg — done. Descriptor points at {source}. Idempotent; re-run anytime.")
+        print(
+            f"review: install-hook tg — done. Descriptor points at {source}. Idempotent; re-run anytime."
+        )
     elif warned_non_executable or warned_stale_removal:
-        print("review: install-hook tg — descriptor already configured, but see the warning above.")
+        print(
+            "review: install-hook tg — descriptor already configured, but see the warning above."
+        )
     else:
-        print("review: install-hook tg — already configured, nothing to do. Idempotent; re-run anytime.")
+        print(
+            "review: install-hook tg — already configured, nothing to do. Idempotent; re-run anytime."
+        )
     return 0
 
 
@@ -1006,7 +1073,9 @@ def _commit_gate_active() -> bool:
     delegation would print "rig owns the hooks" and return 0, silently leaving the user
     without the review gate they explicitly asked for (codex review)."""
     cur = subprocess.run(
-        ["git", "config", "--global", "--get", "core.hooksPath"], capture_output=True, text=True
+        ["git", "config", "--global", "--get", "core.hooksPath"],
+        capture_output=True,
+        text=True,
     )
     raw = cur.stdout.strip()
     if not raw:
@@ -1040,7 +1109,11 @@ def _commit_gate_active() -> bool:
     # neither (a contrived hook that both comments the token AND leaves a stray stage file is
     # not worth guarding beyond this).
     review_gate = hooks_dir / "review-gate"
-    return "review-gate" in body and review_gate.is_file() and os.access(review_gate, os.X_OK)
+    return (
+        "review-gate" in body
+        and review_gate.is_file()
+        and os.access(review_gate, os.X_OK)
+    )
 
 
 def install_commit_hook() -> int:
@@ -1069,7 +1142,9 @@ def install_commit_hook() -> int:
     if result.returncode != 0:
         return result.returncode  # a real rig failure — surfaced, not swallowed
     if _commit_gate_active():
-        print("review: rig owns the global git hooks (delegated to `rig apply --only git_hooks`).")
+        print(
+            "review: rig owns the global git hooks (delegated to `rig apply --only git_hooks`)."
+        )
         return 0
     # rig succeeded but provisions no commit gate here (no git_hooks block) — honor the
     # explicit request via the direct installer rather than silently leaving no gate.
@@ -1085,7 +1160,9 @@ def _install_commit_hook_direct() -> int:
     hooks_dir = home / ".config" / "git" / "hooks"
     # Respect an existing global hooksPath rather than hijacking it.
     cur = subprocess.run(
-        ["git", "config", "--global", "--get", "core.hooksPath"], capture_output=True, text=True
+        ["git", "config", "--global", "--get", "core.hooksPath"],
+        capture_output=True,
+        text=True,
     )
     existing_path = cur.stdout.strip()
     if existing_path:
@@ -1094,19 +1171,29 @@ def _install_commit_hook_direct() -> int:
             # Git resolves a relative core.hooksPath per-repo, so a single global
             # gate can't live there. Refuse rather than silently misinstall.
             print(f"review: global core.hooksPath is relative ('{existing_path}').")
-            print("        Git resolves it per repository, so a global gate can't be placed")
-            print("        there. Set an absolute core.hooksPath (or unset it) and re-run.")
+            print(
+                "        Git resolves it per repository, so a global gate can't be placed"
+            )
+            print(
+                "        there. Set an absolute core.hooksPath (or unset it) and re-run."
+            )
             return 1
         hooks_dir = Path(expanded)
     hooks_dir.mkdir(parents=True, exist_ok=True)
     pre_commit = hooks_dir / "pre-commit"
 
-    already = False  # the gate is ALREADY installed with our exact content AND executable
+    already = (
+        False  # the gate is ALREADY installed with our exact content AND executable
+    )
     if pre_commit.exists():
         body = pre_commit.read_text(encoding="utf-8", errors="replace")
         if _PRECOMMIT_MARKER not in body:
-            print(f"review: a pre-commit hook already exists at {pre_commit} and is NOT ours.")
-            print("        Not overwriting. Merge the gate manually or remove that hook first.")
+            print(
+                f"review: a pre-commit hook already exists at {pre_commit} and is NOT ours."
+            )
+            print(
+                "        Not overwriting. Merge the gate manually or remove that hook first."
+            )
             return 1
         # "Already configured" requires the exec bit too: a 0644 hook with our exact content
         # is SKIPPED by git, so reporting "already active" would be a false claim (codex
@@ -1125,9 +1212,11 @@ def _install_commit_hook_direct() -> int:
         # INSTALLED state") instead of silently rewriting identical content.
         print(f"  ✓ already configured  {pre_commit}")
         print(f"  ✓ already configured  core.hooksPath -> {hooks_dir}")
-        print("review: commit gate already active — nothing to do. "
-              "`review diff --staged --task TASK-CODE` before committing; "
-              "bypass with REVIEW_SKIP=1 or --no-verify.")
+        print(
+            "review: commit gate already active — nothing to do. "
+            "`review diff --staged --task TASK-CODE` before committing; "
+            "bypass with REVIEW_SKIP=1 or --no-verify."
+        )
         return 0
 
     if not already:
@@ -1138,8 +1227,10 @@ def _install_commit_hook_direct() -> int:
             # A write/chmod that fails (read-only FS, EPERM, ENOSPC) must be a structured
             # conflict + non-zero exit, NOT a traceback — same contract as install-skill's
             # write paths (glm review). Don't print "gate active": it isn't.
-            print(f"  ! conflict  {pre_commit} could not be written ({exc}) — fix permissions "
-                  "and re-run.")
+            print(
+                f"  ! conflict  {pre_commit} could not be written ({exc}) — fix permissions "
+                "and re-run."
+            )
             return 1
         print(f"  + wrote {pre_commit}")
     else:
@@ -1151,16 +1242,21 @@ def _install_commit_hook_direct() -> int:
         # (codex review).
         cfg = subprocess.run(
             ["git", "config", "--global", "core.hooksPath", str(hooks_dir)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if cfg.returncode != 0:
-            print(f"  ! conflict  could not set global core.hooksPath -> {hooks_dir} "
-                  f"({cfg.stderr.strip() or 'git config failed'}). The hook is written but git "
-                  "is not pointed at it; fix your global git config and re-run.")
+            print(
+                f"  ! conflict  could not set global core.hooksPath -> {hooks_dir} "
+                f"({cfg.stderr.strip() or 'git config failed'}). The hook is written but git "
+                "is not pointed at it; fix your global git config and re-run."
+            )
             return 1
         print(f"  + set global core.hooksPath -> {hooks_dir}")
     elif hookspath_ok:
         print(f"  ✓ already configured  core.hooksPath -> {hooks_dir}")
-    print("review: commit gate active. `review diff --staged --task TASK-CODE` before "
-          "committing; bypass with REVIEW_SKIP=1 or --no-verify.")
+    print(
+        "review: commit gate active. `review diff --staged --task TASK-CODE` before "
+        "committing; bypass with REVIEW_SKIP=1 or --no-verify."
+    )
     return 0

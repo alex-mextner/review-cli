@@ -261,7 +261,10 @@ def test_show_board_scope_label_tracks_cwd_for_opencode():
     # opencode: agentic iff cwd is a real repo.
     assert _seat_reads_repo("oc:opencode/m", True) is True
     assert _seat_reads_repo("oc:opencode/m", False) is False
-    # codex is the agentic route for the #3 GPT-5.5/codex seat — it reads the whole repo
+    # codex is the agentic route for the #5 GPT-5.5/codex seat (GLM review finding,
+    # review-cli#286 round 4: was #6 before Fable's demotion moved every subsequent
+    # seat up one slot — NOT "#3"/"two slots" as an earlier fix here wrongly
+    # claimed) — it reads the whole repo
     # (the diff-only `commandcode:gpt-5.5` route for the SAME model was retired). Unlike
     # opencode, codex's scope label does NOT gate on the repo bit (the helper returns True
     # for review_codex unconditionally), so it stays `agentic` regardless of cwd_is_repo.
@@ -342,7 +345,9 @@ def _capture_codex():
 
 
 def test_codex_bare_seat_runs_agentic_read_only_in_repo_no_model_flag():
-    """The #3 board seat is the bare `codex` string -> the AGENTIC codex CLI route:
+    """The #5 board seat (review-cli#286: was #6 before Fable's demotion moved every
+    subsequent seat up one slot) is the bare `codex` string -> the AGENTIC codex CLI
+    route:
     `codex exec -s read-only -C <cwd> --ephemeral -`. Bare `codex` (no `:model`) pins
     NO `-m` flag (the codex CLI default model), and the run is read-only inside the real
     repo, so it can read any project file — not just the diff."""
