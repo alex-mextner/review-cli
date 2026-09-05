@@ -286,18 +286,7 @@ def review_with_images(
         reason = _chronic_unavailable_reason(result)
         if reason is not None:
             record_cooldown(model, reason)
-        elif result.returncode == 0 and result.stdout.strip():
-            # review-cli#221: a genuine success clears any escalated cooldown history
-            # (see clear_cooldown's docstring) — `reason is None` alone isn't enough
-            # here, since it also covers a non-chronic FAILURE (returncode != 0) that
-            # must NOT be treated as recovery evidence. Round-4 review finding (k3):
-            # `returncode == 0` alone isn't "genuine success" either — panel.py's own
-            # `result_is_usable` treats rc=0 with an EMPTY body as a failure shape too
-            # ("a silently-disabled model often returns rc=0 with nothing"). Without
-            # this check, a seat oscillating between chronic-quota failures (escalates)
-            # and empty-rc0 responses (clears) would never actually escalate — pinned
-            # at the 10-minute window forever, the exact chronically-broken shape this
-            # feature exists to push out of the pool.
+        elif _clears_cooldown_history(result):
             clear_cooldown(model)
         return result
     return call_backend(
@@ -2231,9 +2220,7 @@ def review_claude(
     reason = _chronic_unavailable_reason(result)
     if reason is not None:
         record_cooldown(model, reason)
-    elif result.returncode == 0 and result.stdout.strip():
-        # review-cli#221: see the identical comment (incl. the round-4 empty-body
-        # finding) on the --visual call site above.
+    elif _clears_cooldown_history(result):
         clear_cooldown(model)
     return result
 
@@ -2273,6 +2260,124 @@ _CHRONIC_QUOTA_MARKERS = ("session limit", "usage-credits", "usage credits")
 # retry._is_rc0_sentinel too (both import this name), so all three agree on the bound.
 _UNAVAILABLE_MAX_LEN = 400
 
+# Byte-exact match for the numeric codes retry.py's `_TRANSIENT_PATTERNS` regex
+# targets (`\b429\b`, `\b5(?:0[0234]|2[0-4]|29)\b`): 429, 500/502/503/504, 520-524,
+# 529 — deliberately NOT 501 (retry.py classifies that SEAT_FATAL, not transient) or
+# any other 5xx. Used by `_looks_transient` to check `ReviewResult.returncode`
+# directly (the literal HTTP status for `review_claude_api`'s `HTTPError` path,
+# `rc = exc.code or 1`) rather than re-deriving it from a regex on `str(rc)`.
+_TRANSIENT_HTTP_STATUSES = frozenset(
+    {429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
+)
+
+# Byte-exact match for the numeric codes retry.py's `_SEAT_FATAL_PATTERNS` regex
+# targets AS BARE STATUS CODES (`\b401\b`, `\b403\b`, `\b501\b`) — mirrors
+# `_TRANSIENT_HTTP_STATUSES`'s same rationale, for the seat-fatal side. k3 review
+# finding (review-cli#fable-seat-reliability, round 8): `_is_seat_fatal` is a TEXT-only
+# check, so a gateway that conveys the status ONLY via `ReviewResult.returncode` (not
+# as digits anywhere in the body) — concrete repro: `returncode=401, stderr='{"error":
+# {"message": "model is currently unavailable to this account"}}'` — never matches ANY
+# `_SEAT_FATAL_PATTERNS` text pattern, so it falls through as "not seat-fatal" and gets
+# cached as an hours-long chronic cooldown for what is really just a bad key. Checked
+# directly against `returncode`, the same way `_TRANSIENT_HTTP_STATUSES` already is.
+_SEAT_FATAL_HTTP_STATUSES = frozenset({401, 403, 501})
+
+
+def _looks_transient(haystack: str, returncode: int) -> bool:
+    """True when `haystack` (the error channel — GLM review finding, round 3: this is
+    now ALSO called from the rc=0 branch, stderr-only there, not just rc!=0) ALSO
+    carries retry.py's own TRANSIENT signal (a process timeout, a 429/5xx status, or
+    a rate-limit/overload/service-unavailable
+    phrase) — used to keep `_chronic_unavailable_reason`'s rc!=0 `_UNAVAILABLE_MARKERS`
+    check (review-cli#fable-seat-reliability) from mis-caching a genuinely transient
+    blip as a chronic, hours-long cooldown (see that function's docstring for the
+    concrete 503/529 scenario this guards against).
+
+    Codex review finding: a process TIMEOUT (`returncode == 124`, `retry._TIMEOUT_
+    EXIT_CODE`) is retry.py's own FIRST, UNCONDITIONAL transient check — `classify_
+    failure` returns RETRYABLE for rc=124 before it ever looks at the body text
+    (retry.py:264). Without checking it here too, a timeout whose PARTIAL captured
+    output happens to contain "is currently unavailable" (plausible: a killed
+    subprocess's last buffered line) would be cached as chronic instead — retry.py
+    would still want to retry it, but the cooldown would short-circuit that retry on
+    every subsequent call. Checked directly, unconditionally, matching retry.py's own
+    precedence (before the numeric-status/text checks below).
+
+    `returncode` is ALSO checked directly for HTTP statuses (not just scanned as
+    text): `review_claude_api` sets it to the literal HTTP status on an `HTTPError`
+    (`rc = exc.code or 1`), so a real 503/529 reaches here as `returncode=503`/`529`,
+    not a generic `1` — a plain numeric check is a more precise signal than hoping the
+    status also appears in the body text. `haystack` (the SAME string the caller
+    already built from stderr + a short stdout) covers the CLI-transport case, where
+    the status is conveyed only in prose.
+
+    k3 review finding: `retry.classify_failure` checks `_SEAT_FATAL_PATTERNS` BEFORE
+    `_TRANSIENT_PATTERNS` — "a SEAT-FATAL channel wins over an incidental transient-
+    looking substring" (retry.py's own docstring). Without mirroring that precedence
+    here, a channel like `"401 Unauthorized: this account is temporarily unavailable"`
+    would have `_looks_transient` return True (the transient wording matches) even
+    though retry.py itself calls this SEAT_FATAL (401 wins there) — the worst outcome
+    of both: no in-seat retry (retry.py's own call) AND no cooldown cache (this
+    guard's call), so the seat pays a full doomed dispatch on literally every
+    subsequent invocation. Checking `_SEAT_FATAL_PATTERNS` first, and returning False
+    (never transient) on a match, restores the fatal-wins precedence: a seat-fatal
+    channel HAS a chronic-worthy cooldown decision to make (deferred to the caller's
+    own marker checks), never gets misrouted into "looks transient, withhold."
+
+    Lazy import: `reviewlib.retry` imports `ReviewResult` from THIS module and
+    `result_is_usable` from `panel` at its own module top level, so an eager
+    module-level import here would be a circular import — mirrors `panel.py`'s
+    existing lazy import of `reviewlib.retry` for the identical reason. Reusing
+    retry.py's own pattern tuples (rather than second, hand-copied lists) means the
+    two modules can never independently drift on what counts as transient/fatal."""
+    from .retry import (
+        _TIMEOUT_EXIT_CODE,
+        _TRANSIENT_PATTERNS,
+    )  # lazy: breaks the backends<->retry cycle
+
+    if returncode == _TIMEOUT_EXIT_CODE:
+        return True
+    if _is_seat_fatal(haystack, returncode):
+        return False
+    if returncode in _TRANSIENT_HTTP_STATUSES:
+        return True
+    return any(p.search(haystack) for p in _TRANSIENT_PATTERNS)
+
+
+def _is_seat_fatal(haystack: str, returncode: int) -> bool:
+    """True when `haystack` (the error channel — GLM review finding, round 3: this
+    is now ALSO called from the rc=0 branch, stderr-only there, not just rc!=0)
+    matches retry.py's own SEAT_FATAL vocabulary (auth failures, 401, refusals,
+    ...). Shared by `_looks_transient` (a seat-fatal
+    match wins over an incidental transient-looking substring, mirroring retry.py's
+    own precedence) AND by `_chronic_unavailable_reason`'s marker checks directly.
+
+    Codex review finding (review-cli#286): before this helper existed, a seat-fatal
+    channel that also happened to contain the administrative-unavailable wording
+    (concrete repro: `returncode=1, stderr="401 Unauthorized: model is currently
+    unavailable to this account"`) fell through `_looks_transient`'s False return
+    (correctly: an auth failure is not transient) straight into the unavailable-
+    marker check below, and got cached as an hours-long chronic cooldown. That
+    directly contradicts seat_cooldown.py's own documented contract that auth and
+    other seat-fatal failures must never be cached — an auth failure resolves the
+    moment credentials are fixed, not after a timer; caching it either strands the
+    seat for the full escalation window after the fix, or (if never fixed) wastes a
+    dispatch on the SAME account-level issue every window regardless. A seat-fatal
+    channel is deferred entirely to retry.py's own no-retry verdict; it is never a
+    cooldown-worthy CHRONIC reason from this module's cache.
+
+    k3 review finding (round 8): `returncode` is ALSO checked directly against
+    `_SEAT_FATAL_HTTP_STATUSES` (401/403/501) — not just scanned as text — mirroring
+    `_looks_transient`'s identical numeric-vs-text split for the transient side. A
+    gateway that conveys the status ONLY via the exit code (no digits anywhere in the
+    body) would otherwise never match any text pattern and be misread as "not
+    seat-fatal", reaching the marker check and getting wrongly cached."""
+    if returncode in _SEAT_FATAL_HTTP_STATUSES:
+        return True
+    from .retry import _SEAT_FATAL_PATTERNS  # lazy: breaks the backends<->retry cycle
+
+    return any(p.search(haystack) for p in _SEAT_FATAL_PATTERNS)
+
 
 def _chronic_unavailable_reason(result: ReviewResult) -> str | None:
     """A short reason string if ``result`` looks like a CHRONIC (cooldown-worthy)
@@ -2285,22 +2390,259 @@ def _chronic_unavailable_reason(result: ReviewResult) -> str | None:
     (rc=0, real content) is NEVER scanned for the quota markers, even though its prose
     could legitimately mention "session limit" (this repo's own README/code does) —
     codex/kimi review finding: the quota check originally scanned ANY body regardless
-    of exit code, so a real review of review-cli itself could self-starve the seat."""
+    of exit code, so a real review of review-cli itself could self-starve the seat.
+
+    review-cli#fable-seat-reliability: `_UNAVAILABLE_MARKERS` is now checked on BOTH
+    branches, not just rc=0. A real production log (2026-06-26) confirmed Fable's CLI
+    wrapper sometimes relays the identical "is currently unavailable" administrative
+    notice with a NON-ZERO exit code (`exit=1`) — before this fix, the rc!=0 branch
+    checked only `_CHRONIC_QUOTA_MARKERS`, so that confirmed-live shape was silently
+    never cached and the seat kept paying for a real dispatch on every invocation. This
+    is the same defect class as the already-fixed "only 1 of `_UNAVAILABLE_MARKERS`'s 4
+    wordings recognised" bug (see that tuple's own comment) — this time the gap was the
+    exit code, not the wording. The rc=0 branch's OWN quota-marker exclusion is
+    unchanged and deliberate (see `test_review_claude_does_not_cache_a_short_rc0_body_
+    mentioning_session_limit`): a short rc=0 body can genuinely, harmlessly mention
+    "session limit" in prose, so that marker set stays rc!=0-only.
+
+    GLM review finding (review-cli#fable-seat-reliability): the rc!=0 branch's
+    `_UNAVAILABLE_MARKERS` check above is NOT safe unconditionally.
+    GLM review finding (review-cli#286, round 5 — CORRECTING the paragraph above):
+    only ONE of the four wordings, "is temporarily unavailable", is directly
+    retry.py's own TRANSIENT TEXT vocabulary (`_TRANSIENT_PATTERNS`'s `temporarily
+    (?:limiting|unavailable)`). "is currently unavailable" does NOT itself match any
+    `_TRANSIENT_PATTERNS` text — it collides only INDIRECTLY, via the NUMERIC
+    503/529 status (see below) or the SEPARATE `service unavailable` text pattern
+    when that different phrase happens to also be present. The API transport
+    (`review_claude_api`) sets `returncode = exc.code` on an `HTTPError` — a REAL
+    503/529 blip therefore reaches this function with `returncode` literally equal to
+    the HTTP status, not a generic `1`. Caching that as an 8-hour-escalating CHRONIC
+    cooldown (seat_cooldown.py's `_ESCALATION_SCHEDULE`) directly contradicts this
+    module's own "a false-cache costs at most one cooldown window" contract (this
+    module's paragraph above) — it would cost up to 8 hours for a blip that clears
+    itself in seconds. `_looks_transient` below gates the rc!=0 unavailable-marker
+    check on retry.py's OWN transient classification (a lazy import — mirrors
+    panel.py's existing lazy import of retry.py for the identical backends<->retry
+    import-cycle reason).
+
+    GLM review finding (round 5): the guarantee is ONE-DIRECTIONAL, not mutual — say
+    so precisely rather than the stronger "can never disagree" this paragraph used to
+    claim. `_looks_transient` also checks `returncode in _TRANSIENT_HTTP_STATUSES`,
+    which `retry.classify_failure` has no equivalent of (its only numeric check is the
+    timeout code); a channel like `returncode=503` with body text that names neither
+    "503" nor any transient phrase would have `_looks_transient` return True (numeric
+    match) while `retry.classify_failure` would call it SEAT_FATAL by default (no
+    pattern matches either way). The asymmetry only ever WITHHOLDS a cooldown it
+    otherwise would have recorded — never the reverse — so the safety property that
+    actually matters still holds exactly ON THE rc!=0 BRANCH: a failure retry.py would
+    retry is never cached as chronic there.
+
+    GLM review finding (review-cli#286, round 6 — CORRECTING the paragraph that used
+    to sit here): an earlier revision of this function's rc=0 branch never consulted
+    `_looks_transient` at all, so the guarantee above was scoped to the rc!=0 branch
+    only. That gap is now CLOSED (round 2/3 findings, Codex): the rc=0 branch below
+    also calls `_looks_transient(stderr, ...) or _is_seat_fatal(stderr, ...)` before
+    caching its sentinel, on the SAME stderr-only channel `retry.classify_failure`
+    consults for an rc=0 result. The concrete repro this paragraph used to cite as an
+    uncaught counterexample — `ReviewResult(returncode=0, stdout=<the sentinel>,
+    stderr="upstream 503 while proxying")` — is now pinned as WITHHELD (not cached)
+    by `test_review_claude_does_not_cache_an_rc0_sentinel_with_transient_stderr`. The
+    guarantee now holds on both branches, not just rc!=0."""
     body = (result.stdout or "").strip()
-    if body and result.returncode == 0 and len(body) <= _UNAVAILABLE_MAX_LEN:
+    if result.returncode == 0:
+        if not body or len(body) > _UNAVAILABLE_MAX_LEN:
+            return None  # empty, or a long genuine review — never scanned
         if any(marker in body.lower() for marker in _UNAVAILABLE_MARKERS):
+            # Codex review finding (review-cli#286, round 2): retry.py's rc=0 error
+            # channel is stderr-only, so a stderr that independently looks transient
+            # (concrete repro: `returncode=0, stdout=<the short unavailable
+            # sentinel>, stderr="upstream HTTP 503 while proxying"`) means
+            # retry.classify_failure would call this RETRYABLE even though rc=0's
+            # stdout alone reads as the administrative sentinel. Caching it here as
+            # an 8-hour chronic cooldown would short-circuit that retry — the same
+            # transient-vs-chronic collision `_looks_transient` already guards
+            # against on the rc!=0 branch below, now mirrored for rc=0.
+            #
+            # Codex review finding (review-cli#286, round 3): `_looks_transient`
+            # returns False for a seat-fatal stderr (it correctly treats seat-fatal
+            # as "not transient"), so the transient check ALONE let a seat-fatal
+            # channel (401/403/...) fall through and still get cached here —
+            # contradicting the same seat-fatal-is-never-cooldown-worthy contract
+            # already enforced on the rc!=0 branch below via its own separate
+            # `_is_seat_fatal` check. Concrete repro: `returncode=0`, sentinel
+            # stdout, `stderr="401 Unauthorized: model is currently unavailable"`
+            # — retry.classify_failure calls this SEAT_FATAL, so caching it here
+            # would hide a credential rotation behind an hours-long cooldown.
+            stderr = (result.stderr or "").strip()
+            if stderr and (
+                _looks_transient(stderr.lower(), result.returncode)
+                or _is_seat_fatal(stderr.lower(), result.returncode)
+            ):
+                return None
             return "unavailable sentinel"
         return None  # a short rc=0 body that is NOT the sentinel is a real (if terse) answer
-    if result.returncode == 0:
-        return None  # a long rc=0 body is a genuine successful review — never scanned
-    # From here: a non-zero exit. Mirrors retry.py's _error_channel — stderr always,
-    # plus a SHORT stdout (a failed CLI often writes its error to stdout, not stderr).
-    haystack = (result.stderr or "").lower()
-    if len(body) <= _UNAVAILABLE_MAX_LEN:
-        haystack += "\n" + body.lower()
-    if any(marker in haystack for marker in _CHRONIC_QUOTA_MARKERS):
+    # From here: a non-zero exit.
+    stderr = (result.stderr or "").strip()
+    # k3 review finding (review-cli#286, round 3): a process TIMEOUT (`returncode ==
+    # 124`) is retry.py's own FIRST, UNCONDITIONAL transient check — `classify_
+    # failure` returns RETRYABLE for it before ever looking at the body text
+    # (mirrors `_looks_transient`'s identical unconditional check below). The quota
+    # check right after this is DELIBERATELY unguarded by `_looks_transient`
+    # (round-8/9 findings, see its own comment) — but that means, without this
+    # separate check, a killed subprocess whose partial output happens to contain
+    # "session limit" (plausible in a long partial transcript) would still get
+    # cached as an 8-hour chronic cooldown, short-circuiting the exact retry
+    # `test_review_claude_does_not_cache_a_process_timeout_with_incidental_
+    # unavailable_text` already pins for the sibling `_UNAVAILABLE_MARKERS` check.
+    from .retry import _TIMEOUT_EXIT_CODE  # lazy: breaks the backends<->retry cycle
+
+    if result.returncode == _TIMEOUT_EXIT_CODE:
+        return None
+    # GLM review finding (review-cli#286, round 4, HIGH): the quota-marker check and
+    # the transient/seat-fatal guard below used to each build their OWN
+    # byte-identical haystack (`quota_haystack`/`transient_haystack`, 30 lines
+    # apart, under different names) — this exact function has already been churned
+    # across 9 review rounds, so a future edit touching one copy and not the other
+    # is a real drift risk, not a hypothetical one. One shared `error_channel`,
+    # computed once, removes that risk structurally. Mirrors retry.py's own
+    # `_error_channel` EXACTLY (stderr always, unbounded — deliberately, see the
+    # round-8/9 comment below — plus a SHORT stdout, since a failed CLI often
+    # writes its error to stdout, not stderr) — Opus review finding (review-cli#286,
+    # round 3): `body` (stdout) is LENGTH-GATED before joining even here, mirroring
+    # the rc=0 branch's own reasoning ("a short rc=0 body can genuinely, harmlessly
+    # mention 'session limit' in prose, so a real review of review-cli itself could
+    # self-starve the seat"). Concrete failure this closes: an agentic seat
+    # reviewing review-cli itself streams a long, genuine review to STDOUT that
+    # happens to quote "session limit" / "usage credits" verbatim (this repo's own
+    # code/docs do), then exits rc!=0 for an unrelated reason (or rc=124 timeout,
+    # already excluded above) — an EARLIER version of this haystack joined the
+    # full, unbounded body too, which would have cached that healthy seat as
+    # chronically doomed. Every round-8/9 repro (below) uses a long STDERR, never a
+    # long body, so bounding body alone costs none of them.
+    error_channel = stderr.lower()
+    if body and len(body) <= _UNAVAILABLE_MAX_LEN:
+        error_channel += "\n" + body.lower()
+
+    # k3 review finding (rounds 8-9, three separate concrete repros converging on the
+    # same point): `_CHRONIC_QUOTA_MARKERS` ("session limit", "usage-credits", "usage
+    # credits") is checked FIRST, UNCONDITIONALLY — no transient guard, no seat-fatal
+    # guard, no STDERR length bound — deliberately UNLIKE `_UNAVAILABLE_MARKERS`
+    # below. Three rounds of this repo's own review gate converged on why the two
+    # marker sets need different treatment: (1) a genuinely chronic quota-exhaustion
+    # failure can arrive via `returncode=429` on the API transport (Anthropic's own
+    # status for BOTH a brief rate-limit spike and real usage exhaustion), which the
+    # transient guard would otherwise withhold forever; (2) `reviewlib/dashboard/
+    # parser.py`'s own comment on `_body_has_real_content` documents a VERIFIED real
+    # shape — a CLI call streaming a long partial transcript to STDERR before hitting
+    # the session-limit sentinel at the very end, past any reasonable byte cap —
+    # which a length bound would silently drop; (3) quota text can co-occur with
+    # fatal-looking wording in the same message, which the seat-fatal guard would
+    # otherwise treat as "defer entirely, never cache" even though quota exhaustion
+    # is exactly the chronic condition this whole cache exists to catch.
+    # `_UNAVAILABLE_MARKERS`' four wordings ("is currently unavailable" etc.) are
+    # comparatively GENERIC — plausible in an unrelated 503 gateway blip or a long
+    # stack trace by coincidence — which is why those three guards stay load-bearing
+    # for that check specifically. `_CHRONIC_QUOTA_MARKERS`'s phrasing is narrow and
+    # Fable-specific enough that no unrelated transient/fatal STDERR channel is
+    # realistically going to contain it by accident; this was ALSO the pre-existing,
+    # pre-review-cli#fable-seat-reliability behavior for this exact check (an earlier
+    # revision of this function briefly applied the same guards uniformly to both
+    # marker sets — reverted here after the round-8/9 findings). The BODY side of
+    # this haystack stays length-gated even here (round-3 finding above) — only
+    # stderr is unconditionally unbounded.
+    if any(marker in error_channel for marker in _CHRONIC_QUOTA_MARKERS):
         return "session limit / usage credits"
+
+    # The broader, more generic _UNAVAILABLE_MARKERS check below reuses the SAME
+    # `error_channel` for its transient/seat-fatal guard — so `_looks_transient`
+    # can never disagree with `retry.classify_failure` about what the error channel
+    # even is, and can never independently drift from the quota check's own channel
+    # above.
+    # Codex review finding (review-cli#fable-seat-reliability): a REAL 503/529/
+    # timeout blip whose message ALSO happens to say "is currently unavailable"
+    # (concrete repro: `returncode=503, stderr="Service is currently unavailable,
+    # please retry"`) must not be cached as an 8-hour-escalating chronic cooldown —
+    # retry.py would retry it, so this cache must not short-circuit that retry with
+    # a chronic verdict.
+    #
+    # Codex review finding (review-cli#286): a seat-fatal channel (401, refusal,
+    # ...) is separately never cooldown-worthy either — `_looks_transient` already
+    # calls `_is_seat_fatal` internally and correctly returns False for it (a
+    # seat-fatal channel is NOT transient), but WITHOUT this second, independent
+    # check, that False would let the SAME channel fall through to the
+    # unavailable-marker check below and still get cached if it also contains the
+    # administrative-unavailable wording (concrete repro: `returncode=1,
+    # stderr="401 Unauthorized: model is currently unavailable to this
+    # account"`), caching an auth problem as an hours-long chronic cooldown. See
+    # `_is_seat_fatal`'s own docstring for why that contradicts seat_cooldown.py's
+    # documented contract.
+    #
+    # GLM review finding (review-cli#286, round 4): the two checks used to run as
+    # separate `if` blocks, each re-deriving the fatal-wins precedence in its own
+    # comment — `_looks_transient` already runs `_is_seat_fatal` on the identical
+    # haystack internally, so calling it again here is a redundant second scan, not
+    # a second code path. Combined into one guard.
+    if _looks_transient(error_channel, result.returncode) or _is_seat_fatal(
+        error_channel, result.returncode
+    ):
+        return None
+    # k3 review finding: an administrative notice is a one-liner by construction (the
+    # rc=0 branch already enforces exactly this for stdout), so a long, multi-line
+    # stderr dump (a wrapped upstream error during a rolling deploy, a stack trace)
+    # must never be scanned for these generic-sounding phrases just because it happens
+    # to be long — unlike the quota check above, this bound is intentional here.
+    #
+    # Codex review finding (review-cli#286, round 2): bounding the CONCATENATED
+    # stderr+body length (rather than each channel independently) drops a genuine
+    # short sentinel when it's paired with an unrelated but moderately-sized stderr.
+    # Concrete repro: a 62-char sentinel stdout plus a 380-char non-transient wrapper
+    # diagnostic stderr — neither exceeds the bound alone, but their concatenation
+    # (with the joining newline) does, so the sentinel was silently never cached.
+    # Each channel is now scrutinized on its OWN length: an individually-long
+    # component (the actual case this bound exists for — a real stack trace) is
+    # dropped from the scan, but two individually-short components are both kept
+    # even when their sum would have exceeded the old combined bound.
+    bounded_haystack = "\n".join(
+        p for p in (stderr, body) if p and len(p) <= _UNAVAILABLE_MAX_LEN
+    ).lower()
+    if any(marker in bounded_haystack for marker in _UNAVAILABLE_MARKERS):
+        return "unavailable sentinel"
     return None
+
+
+def _clears_cooldown_history(result: ReviewResult) -> bool:
+    """True when `result` is genuine RECOVERY evidence — safe grounds to wipe any
+    escalated cooldown history via `clear_cooldown` (see its own docstring). Shared
+    by both `record_cooldown`/`clear_cooldown` call sites (the main `review_claude`
+    dispatch and the `--visual` images path) so the two can never independently
+    drift on what counts as "genuine success".
+
+    review-cli#221: `reason is None` (from `_chronic_unavailable_reason`) alone
+    isn't enough here, since it also covers a non-chronic FAILURE (returncode != 0)
+    that must NOT be treated as recovery evidence. Round-4 review finding (k3):
+    `returncode == 0` alone isn't "genuine success" either — panel.py's own
+    `result_is_usable` treats rc=0 with an EMPTY body as a failure shape too ("a
+    silently-disabled model often returns rc=0 with nothing"). Without this check,
+    a seat oscillating between chronic-quota failures (escalates) and empty-rc0
+    responses (clears) would never actually escalate — pinned at the 10-minute
+    window forever, the exact chronically-broken shape this feature exists to push
+    out of the pool.
+
+    Codex review finding (review-cli#286, round 3): a bare `returncode == 0 and
+    stdout.strip()` ALSO wrongly clears history for the rc=0 transient-stderr
+    exception `_chronic_unavailable_reason` now recognises — a result whose stdout
+    IS the unavailable sentinel, but whose stderr independently looks transient
+    (so the cache guard withholds a chronic verdict for it this particular call).
+    That is NOT genuine recovery evidence; it is the SAME "still unavailable"
+    sentinel, just not cached this time. `result_is_usable` (panel.py) already
+    excludes exactly this shape (rc=0 + a short body matching `_UNAVAILABLE_
+    MARKERS` returns False), so reusing it here instead of a second, ad hoc
+    truthiness check closes the gap without duplicating sentinel-detection logic a
+    third time."""
+    from .panel import result_is_usable  # lazy: panel imports FROM backends at its
+    # own module top level, so an eager import here would be a circular import.
+
+    return result_is_usable(result)
 
 
 def _bounded_cooldown_skip_body(model: str, reason: str, remaining: int) -> str:

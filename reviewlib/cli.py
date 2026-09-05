@@ -1431,16 +1431,21 @@ def _render_stat_harness_table(
 
 
 def _render_stat_fable_section(fable: dict) -> str:
-    """Surfaces the investigation's headline finding: the priority-1 Fable seat's
-    dispatch/failure rate and WHY it failed (session-limit vs paywall vs auth vs other)."""
+    """Surfaces the investigation's headline finding: the Fable seat's dispatch/failure
+    rate and WHY it failed (session-limit vs paywall vs auth vs other).
+
+    review-cli#fable-seat-reliability: the label dropped "priority-1" — that demotion
+    (DEFAULT_BOARD priority 1 -> last-resort reserve) is the whole point of that
+    change, so a report still claiming Fable sits at priority 1 would be actively
+    wrong about its own subject."""
     if not fable["dispatch_attempts"] and not fable["retry_events"]:
-        return "Fable (priority-1 board seat): no dispatch attempts recorded in this window."
+        return "Fable (board seat): no dispatch attempts recorded in this window."
     rate = (
         f"{fable['failure_rate']:.0%}" if fable["failure_rate"] is not None else "n/a"
     )
     reasons = fable["retry_event_reasons"]
     return (
-        "Fable (priority-1 board seat) pattern:\n"
+        "Fable (board seat) pattern:\n"
         f"  dispatch attempts: {fable['dispatch_attempts']}   "
         f"cached-skips: {fable['cached_skips']}   failure rate: {rate}\n"
         f"  retry/promotion events: {fable['retry_events']} "
@@ -3211,7 +3216,8 @@ def _add_global_options(
             help=(
                 "diff-review preset: light = quick/cheap preflight (pool 2, medium effort); "
                 "default = routine change review (pool 4, high effort, excludes Fable/Sol); "
-                "heavy = release/risky-change review (pool 4, highest effort, includes Fable/Sol). "
+                "heavy = release/risky-change review (pool 4, highest effort, excludes "
+                "Fable — a confirmed near-total dispatch failure rate — but includes Sol). "
                 f"If no config board/models are set, review diff uses {DEFAULT_PRESET!r}."
             ),
         )
@@ -3534,7 +3540,9 @@ REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints 
   A priority-ordered panel of seats, each model carrying its own
   role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool 4, high effort,
   without Fable/Sol. Use `--preset light` for quick preflight (pool 2, medium effort) and
-  `--preset heavy` for release/risky changes (Fable/Sol/Opus/GLM-cc at highest effort).
+  `--preset heavy` for release/risky changes (Sol/Opus/GLM-cc/Kimi at highest effort;
+  Fable is excluded from every preset — a confirmed ~100% dispatch failure rate, see
+  DEFAULT_BOARD's own comment — and sits last-resort in the raw board instead).
   `--pool N` sizes the selected board (`--pool 0` = all available). Explicit -m never lets config add extra seats; it narrows
   configured metadata when present, else uses the flat exact panel. To set the priority
   roster, configure `models:`. To add role/name/effort metadata (or a full board when

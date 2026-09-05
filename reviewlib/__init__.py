@@ -10,6 +10,7 @@ NOTE: `review_claude` and the other backends resolve `_which` / `_run_streamed`
 through the `reviewlib.backends` module namespace, so tests that monkeypatch
 those must patch `reviewlib.backends` (not this façade).
 """
+
 from __future__ import annotations
 
 # Re-exported for callers/tests that referenced these off the old single-file module
@@ -46,6 +47,7 @@ from .config import (
     DEFAULT_PRESET,
     DEFAULT_PRESET_BOARD,
     DEFAULT_PROMPT,
+    FABLE_SEAT,
     HEAVY_PRESET_BOARD,
     LIGHT_PRESET_BOARD,
     MODEL_ALIASES,
@@ -171,6 +173,7 @@ __all__ = [
     "DEFAULT_POOL_SIZE",
     "REVIEW_ROLES",
     "SOL_SEAT",
+    "FABLE_SEAT",
     "DEFAULT_MODELS",
     "DEFAULT_PROMPT",
     "MODEL_ALIASES",

@@ -1664,12 +1664,17 @@ def test_fallback_resolves_for_real_call_resolved_gateway_ids():
     # form today) resolves a real fallback, not None — the production failing-seat case.
     kimi_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Kimi")
     assert p._fallback_seat_for(kimi_seat) is not None
-    # The z.ai GLM seat is now the LAST-RESORT reserve (deprioritized, review-cli#65), so by
-    # construction it has no next-priority fallback — None is the correct hint for the lowest
-    # seat (the general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
+    # The z.ai GLM seat is deprioritized (review-cli#65) but no longer the very last
+    # seat: Fable is (review-cli#fable-seat-reliability, a confirmed ~100% dispatch
+    # failure rate demoted it below even GLM). GLM still resolves a real fallback (to
+    # Fable); Fable itself has none — None is the correct hint for the lowest seat (the
+    # general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
     glm_seat = next(b.model for b in DEFAULT_BOARD if b.display == "GLM")
-    assert glm_seat == DEFAULT_BOARD[-1].model, glm_seat  # pin: GLM is the last seat
-    assert p._fallback_seat_for(glm_seat) is None
+    fable_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Fable")
+    assert fable_seat == DEFAULT_BOARD[-1].model, fable_seat  # pin: Fable is last
+    fb = p._fallback_seat_for(glm_seat)
+    assert fb is not None and fb["model"] == fable_seat, fb
+    assert p._fallback_seat_for(fable_seat) is None
 
 
 def test_to_summary_exposes_enriched_errors_for_the_errors_tab():
@@ -2648,8 +2653,10 @@ def test_compute_model_health_covers_board_and_flags_problematic():
                 argv0="opencode -m zai/glm-5.2",
                 exit_code=401,
             )
-        # Fable (claude) is a heavy-preset seat; the dashboard covers the full built-in
-        # raw board so heavy runs still get priority/fallback/health treatment.
+        # k3 review finding (review-cli#286, round 3): Fable is now in NO preset
+        # (raw-board last-resort only, post-demotion) — the dashboard still covers
+        # the full built-in raw board (not just the active preset), so priority/
+        # fallback/health treatment for a raw-board-only seat is exercised here.
         _fable_paywall_log(ld, "20260601T120000_000000")
         # Codex — 4 healthy calls => NOT problematic (ok-rate 100%).
         for i in range(4):
