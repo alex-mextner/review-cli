@@ -120,6 +120,25 @@ semantic versioning.
   `DEFAULT_MODELS` panel (used by `--quorum`/`--brainstorm`) still keeps its
   own bare `codex` entry unchanged, by design.
 
+## 0.35.3 — 2026-09-05
+
+- **Dashboard: stop tabs from lying about an empty state during a background reload
+  (review-cli#362).** Every runs-reading panel falls back to `(state.runs || [])`, but
+  `state.runs` is briefly `null` whenever an SSE activity event or a write calls
+  `invalidate()`. Switching tabs during that window rendered a false "no errors / no
+  sessions" panel — reproduced live on a busy install where the Errors tab claimed "No
+  errors yet" while Overview/Metrics (rendered moments earlier) reported 42k+ recorded
+  errors. `render()` now shows a loading placeholder instead, except for the three panels
+  (Stats, Models & roles, Metrics) that read only `state.stats` and can safely keep
+  showing their still-valid snapshot — unless `state.stats` itself hasn't loaded yet
+  either (the initial-boot window). A failed load now surfaces the actual error (or a
+  toast, if data was already showing) instead of an eternal, misleading "Loading…".
+- **Dashboard: fix `fmtDur()` rendering a nonsense "19m 60s" (and, one branch over,
+  "60.0s") instead of rolling over correctly** — seen live on the Metrics tab's Duration
+  max card. Rounding the seconds remainder in isolation could land on 60; fixed by
+  rounding to one decimal before branching and decomposing minutes/seconds from the
+  original value.
+
 ## 0.35.2 — 2026-09-01
 
 - **Dashboard: fix the review-cli#326 memory balloon — every streamed call
