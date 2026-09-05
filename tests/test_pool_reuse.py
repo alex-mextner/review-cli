@@ -114,7 +114,7 @@ def test_real_default_board_duplicate_roles_never_dispatch_byte_identical_seats(
     # role — that would dispatch the same model under the same role/lens
     # twice, a pure-cost duplicate the "N distinct lenses" contract forbids
     # (k3 review finding, review-cli#205 round 3).
-    fable, sol, opus, glm_cc, kimi, codex, qwen, deepseek, gemini, glm = DEFAULT_BOARD
+    sol, opus, glm_cc, kimi, codex, qwen, deepseek, gemini, glm, fable = DEFAULT_BOARD
     assert sol.role == "consistency" and codex.role == "consistency"
     usage_percent = _usage(
         {m.model: 99 for m in DEFAULT_BOARD if m.model not in (sol.model, codex.model)}

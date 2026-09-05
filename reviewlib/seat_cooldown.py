@@ -10,14 +10,18 @@ attempt before discovering the seat is still down.
 
 The token-burn investigation (2026-08) found this is not theoretical: of 6,383 recorded
 review runs over ~2 months, 4,322 (67.7%) dispatched the Fable seat (``claude:claude-
-fable-5``, priority 1 in ``DEFAULT_BOARD``) and it failed — 1,836 with an explicit
-session/usage-limit message ("You've hit your session limit ... resets HH:MMam/pm"), 714
-with the rc=0 administrative "... is currently unavailable" sentinel. Fable runs through
-the SAME Claude account/session quota the CLI itself uses (tg-cli's 90%-usage-warning
-mechanism watches that exact channel), so a known-exhausted Fable dispatch is not free:
-it costs wall-clock (a real `claude-p` subprocess spawn + response) on every single
-review, and it does nothing useful — the seat cannot be reached again until the account's
-own session window resets.
+fable-5``, priority 1 in ``DEFAULT_BOARD`` AT THAT TIME) and it failed — 1,836 with an
+explicit session/usage-limit message ("You've hit your session limit ... resets
+HH:MMam/pm"), 714 with the rc=0 administrative "... is currently unavailable" sentinel.
+Fable runs through the SAME Claude account/session quota the CLI itself uses (tg-cli's
+90%-usage-warning mechanism watches that exact channel), so a known-exhausted Fable
+dispatch is not free: it costs wall-clock (a real `claude-p` subprocess spawn +
+response) on every single review, and it does nothing useful — the seat cannot be
+reached again until the account's own session window resets. (review-cli#fable-seat-
+reliability, 2026-08: the failure rate climbed to 97.9-100% and this cache was only
+catching a small fraction of it — see that change's own notes for the two-part fix,
+a gap in the recording logic below AND Fable's DEFAULT_BOARD priority itself, now
+demoted to last.)
 
 This module adds a small, best-effort, PERSISTENT (cross-process) cooldown: once a
 dispatch comes back with one of the two recognised CHRONIC signals, the seat is marked

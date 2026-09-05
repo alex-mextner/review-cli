@@ -1518,6 +1518,720 @@ def test_review_claude_records_cooldown_after_session_limit_response():
     _with_store(_run)
 
 
+def test_transient_http_statuses_matches_retrys_own_numeric_patterns():
+    """GLM + GLM-cc-last review finding (independently raised by both): `backends.
+    _TRANSIENT_HTTP_STATUSES` is a hand-derived numeric expansion of retry.py's
+    `_TRANSIENT_PATTERNS` regexes (`\\b429\\b`, `\\b5(?:0[0234]|2[0-4]|29)\\b`), kept in
+    sync only by a comment. A future edit to retry.py's regex (a new status added, an
+    existing one dropped) that forgets to update the frozenset would silently reopen
+    the exact false-chronic-cache regression `_looks_transient` exists to close, with
+    no test failing.
+
+    GLM round-5 review finding: an earlier version of this test picked the numeric
+    patterns by POSITION (`_TRANSIENT_PATTERNS[:2]`) — a reorder of retry.py's tuple
+    (unrelated to the numeric values themselves) would fail this test with a
+    confusing empty-set diff instead of a real drift signal. Selecting by SHAPE
+    instead (does the pattern match ANY bare 3-digit number at all?) is immune to
+    reordering: every non-numeric pattern in `_TRANSIENT_PATTERNS` is a text phrase or
+    a network-error string that can never match a bare number, so this derivation
+    finds exactly the two numeric patterns regardless of where they sit in the tuple."""
+    from reviewlib.retry import _TRANSIENT_PATTERNS
+
+    numeric_patterns = [
+        p for p in _TRANSIENT_PATTERNS if any(p.search(str(n)) for n in range(100, 600))
+    ]
+    derived = {
+        n for n in range(100, 600) if any(p.search(str(n)) for p in numeric_patterns)
+    }
+    assert derived == backends._TRANSIENT_HTTP_STATUSES, (
+        derived,
+        backends._TRANSIENT_HTTP_STATUSES,
+    )
+
+
+def test_seat_fatal_http_statuses_matches_retrys_own_numeric_patterns():
+    """k3 review finding (round 9): `backends._SEAT_FATAL_HTTP_STATUSES` is a
+    hand-derived numeric expansion of retry.py's `_SEAT_FATAL_PATTERNS` regexes
+    (`\\b401\\b`, `\\b403\\b`, `\\b501\\b`), kept in sync only by a comment -- the
+    same drift risk `test_transient_http_statuses_matches_retrys_own_numeric_
+    patterns` already guards on the transient side, now mirrored for the seat-fatal
+    side. Same shape-based derivation (reorder-immune): every non-numeric pattern in
+    `_SEAT_FATAL_PATTERNS` is a text phrase that can never match a bare 3-digit
+    number, so this finds exactly the three numeric patterns regardless of tuple
+    order."""
+    from reviewlib.retry import _SEAT_FATAL_PATTERNS
+
+    numeric_patterns = [
+        p
+        for p in _SEAT_FATAL_PATTERNS
+        if any(p.search(str(n)) for n in range(100, 600))
+    ]
+    derived = {
+        n for n in range(100, 600) if any(p.search(str(n)) for p in numeric_patterns)
+    }
+    assert derived == backends._SEAT_FATAL_HTTP_STATUSES, (
+        derived,
+        backends._SEAT_FATAL_HTTP_STATUSES,
+    )
+
+
+def test_review_claude_does_not_cache_an_rc0_sentinel_with_transient_stderr():
+    """Codex review finding (review-cli#286, round 2, HIGH): the rc=0 branch of
+    `_chronic_unavailable_reason` never consulted `_looks_transient`, unlike the
+    rc!=0 branch right below it -- so a genuinely transient stderr paired with an
+    rc=0 unavailable-sentinel stdout still got cached as an 8-hour chronic cooldown.
+    Concrete repro from the review finding: `returncode=0`, short stdout "Claude
+    Fable 5 is currently unavailable...", stderr "upstream HTTP 503 while
+    proxying" -- retry.classify_failure reads retry.py's rc=0 error channel
+    (stderr-only) and returns RETRYABLE (the `503` matches `_TRANSIENT_PATTERNS`),
+    so this cache must not short-circuit that retry with a chronic verdict."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=0,
+                stdout="Claude Fable 5 is currently unavailable. Learn more: https://x",
+                stderr="upstream HTTP 503 while proxying",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
+
+    _with_store(_run)
+
+
+def test_review_claude_records_cooldown_for_unavailable_sentinel_with_nonzero_exit():
+    """review-cli#(fable-seat-reliability): the administrative "is currently
+    unavailable" sentinel is NOT always rc=0 — a real production log (2026-06-26)
+    confirms Fable's CLI wrapper sometimes relays the identical notice with a
+    non-zero exit code: `exit=1`, body "Claude Fable 5 is currently unavailable.
+    Learn more: https://www.anthropic.com/news/fable-mythos-access". Before this
+    fix, `_chronic_unavailable_reason`'s non-zero-exit branch checked ONLY
+    `_CHRONIC_QUOTA_MARKERS` (never `_UNAVAILABLE_MARKERS`), so this exact,
+    confirmed-live failure shape was silently never cached — the seat kept paying
+    for a real dispatch on every single invocation, the same class of bug already
+    fixed once for "only 1 of 4 marker wordings" (see `_UNAVAILABLE_MARKERS`'s own
+    comment), this time gated on exit code instead of wording."""
+
+    def _run():
+        assert sc.active_cooldown(MODEL) is None
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout=(
+                    "Claude Fable 5 is currently unavailable. Learn more: "
+                    "https://www.anthropic.com/news/fable-mythos-access"
+                ),
+                stderr="",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is not None
+
+    _with_store(_run)
+
+
+def test_review_claude_records_cooldown_for_every_unavailable_marker_wording_nonzero_exit():
+    """Same coverage as `test_review_claude_records_cooldown_for_every_unavailable_marker_wording`
+    (all 4 canonical wordings), but on the non-zero-exit channel (stderr) instead of
+    the rc=0 stdout channel — pins that the fix applies uniformly to every wording,
+    not just the one wording the production log happened to show.
+
+    EXCEPT "is temporarily unavailable" (GLM review finding): that ONE wording is
+    ALSO, textually, retry.py's own TRANSIENT pattern (`temporarily
+    (?:limiting|unavailable)`), so `_looks_transient` deliberately withholds the
+    cooldown for it on the rc!=0 channel — a genuine 503/529 blip can legitimately
+    say "...is temporarily unavailable" too, and caching that for hours would be
+    far worse than the accepted cost of one more real dispatch. The rc=0 channel has
+    no such ambiguity (see the sibling rc=0 test, still asserting all 4 wordings
+    cache): a clean exit with this short administrative-shaped body is never a real
+    HTTP transient in the first place."""
+    for marker in backends._UNAVAILABLE_MARKERS:
+        ambiguous_with_transient = marker == "is temporarily unavailable"
+
+        def _run(marker=marker, ambiguous=ambiguous_with_transient):
+            assert sc.active_cooldown(MODEL) is None
+            saved_cli = _patched(
+                backends,
+                "review_claude_cli",
+                lambda *a, **k: ReviewResult(
+                    model=MODEL,
+                    command="claude-p",
+                    returncode=1,
+                    stdout="",
+                    stderr=f"Claude Fable 5 {marker}. Learn more: https://x",
+                ),
+            )
+            saved_unpaid = _patched(
+                backends, "unpaid_provider_result", lambda *a, **k: None
+            )
+            try:
+                backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+            finally:
+                backends.review_claude_cli = saved_cli
+                backends.unpaid_provider_result = saved_unpaid
+            cooldown = sc.active_cooldown(MODEL)
+            if ambiguous:
+                assert cooldown is None, marker
+            else:
+                assert cooldown is not None, marker
+                sc.clear_cooldown(MODEL)
+
+        _with_store(_run)
+
+
+def test_review_claude_does_not_cache_a_transient_5xx_status_even_with_unavailable_wording():
+    """GLM review finding: `review_claude_api` sets `returncode = exc.code` on an
+    `HTTPError`, so a REAL 503/529 gateway blip reaches `_chronic_unavailable_reason`
+    with `returncode` literally equal to the HTTP status -- and its message can easily
+    contain the exact wording "...is currently unavailable" (the canonical 503
+    phrasing), which is ALSO one of `_UNAVAILABLE_MARKERS`' four administrative-
+    sentinel wordings. Without a transient guard this would cache an 8-hour-escalating
+    chronic cooldown for a blip that clears itself in seconds -- `_looks_transient`
+    must catch this via the numeric status check, not just text."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=503,
+                stdout="",
+                stderr="503 Service is currently unavailable, please retry",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
+
+    _with_store(_run)
+
+
+def test_review_claude_does_not_cache_transient_wording_on_a_generic_cli_exit_code():
+    """Same transient-vs-chronic collision as the 5xx-status test above, but on the
+    CLI transport (`review_claude_cli`), where the transient status is conveyed only
+    in prose -- `returncode` here is a generic `1`, not the HTTP status itself, so
+    `_looks_transient` must also catch this via the TEXT pattern (retry.py's own
+    `_TRANSIENT_PATTERNS`, matching the embedded "503"), not just the numeric check."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout="",
+                stderr="503 Service is currently unavailable, please retry",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
+
+    _with_store(_run)
+
+
+def test_review_claude_does_not_cache_a_process_timeout_with_incidental_unavailable_text():
+    """Codex review finding: `retry.classify_failure` treats a process TIMEOUT
+    (`returncode == 124`) as transient UNCONDITIONALLY -- before it ever looks at the
+    body text (retry.py:264) -- so a killed subprocess's last buffered line happening
+    to read "...is currently unavailable" must not override that: retry.py would
+    still want to retry the SAME seat, but a cached chronic cooldown would silently
+    short-circuit every one of those retries instead. Concrete repro from the review
+    finding: `ReviewResult(returncode=124, stdout="Claude Fable 5 is currently
+    unavailable")`."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=124,
+                stdout="Claude Fable 5 is currently unavailable",
+                stderr="",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
+
+    _with_store(_run)
+
+
+def test_review_claude_does_not_cache_a_process_timeout_with_incidental_quota_text():
+    """k3 review finding (review-cli#286, round 3): the quota-marker check
+    (`_CHRONIC_QUOTA_MARKERS`) is deliberately UNGUARDED by `_looks_transient`
+    (round-8/9 findings) -- but that means, without a SEPARATE timeout check, a
+    killed subprocess whose partial output happens to contain "session limit"
+    (plausible in a long partial transcript) would still get cached, contradicting
+    the SAME precedence the sibling test above already pins for the
+    `_UNAVAILABLE_MARKERS` check. Concrete repro from the review finding:
+    `ReviewResult(returncode=124, stdout=<long partial transcript containing
+    "session limit">, stderr="")`."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=124,
+                stdout=(
+                    "partial review output... " * 30
+                    + "You've hit your session limit · resets 7:30pm"
+                ),
+                stderr="",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
+
+    _with_store(_run)
+
+
+def test_review_claude_caches_a_quota_marker_even_with_transient_looking_wording():
+    """REVERSED across the review gate's own rounds 4 -> 8/9 -- see
+    `_chronic_unavailable_reason`'s own comment on the quota-marker check for the
+    full reasoning. Round 4 (Codex) argued `returncode=503, stderr="session limit
+    reached; service unavailable"` must NOT cache (503 is a transient status,
+    "service unavailable" is transient wording). Rounds 8-9 (k3, three separate
+    concrete repros) argued the opposite: gating the highly-specific
+    `_CHRONIC_QUOTA_MARKERS` phrasing the SAME way as the broader
+    `_UNAVAILABLE_MARKERS` set traded away real catches of the module's own PRIMARY
+    confirmed-live failure shape (chronic quota exhaustion delivered as HTTP 429,
+    or a long partial transcript hitting the session-limit sentinel at the very
+    end -- both documented as real, not hypothetical). The round-4 scenario is the
+    more contrived one (an artificial mashup of "session limit" AND "service
+    unavailable" in one message); "session limit"/"usage-credits"/"usage credits"
+    are narrow enough that an unrelated transient blip realistically never contains
+    them by coincidence. Quota markers are now checked FIRST and unconditionally."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=503,
+                stdout="",
+                stderr="session limit reached; service unavailable",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is not None
+
+    _with_store(_run)
+
+
+def test_review_claude_caches_chronic_quota_exhaustion_delivered_as_429():
+    """k3 review finding (round 8): Anthropic's API signals BOTH a brief rate-limit
+    spike AND genuine account-level usage/session-limit exhaustion via the SAME HTTP
+    429 status. `review_claude_api` sets `returncode = exc.code` on an `HTTPError`
+    (backends.py), so genuine chronic exhaustion can reach this function as
+    `returncode=429` -- which must still cache, since the quota-marker text is the
+    authoritative signal here, not the transient-looking status code."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=429,
+                stdout="",
+                stderr="You've hit your session limit · resets 7:30pm (Europe/Belgrade)",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is not None
+
+    _with_store(_run)
+
+
+def test_review_claude_caches_a_quota_marker_in_a_long_partial_transcript():
+    """k3 review finding (round 9): `reviewlib/dashboard/parser.py` documents a
+    VERIFIED real shape -- a CLI call can stream a long partial review transcript
+    and only THEN hit the session-limit sentinel at the very end, past any
+    reasonable byte cap. The quota-marker check must not apply the same length
+    bound the broader `_UNAVAILABLE_MARKERS` check needs, or this genuinely chronic
+    failure would never be cached."""
+
+    def _run():
+        long_stderr = ("partial review output... " * 30) + (
+            "You've hit your session limit · resets 7:30pm (Europe/Belgrade)"
+        )
+        assert len(long_stderr) > 400, len(long_stderr)  # exceeds _UNAVAILABLE_MAX_LEN
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout="",
+                stderr=long_stderr,
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is not None
+
+    _with_store(_run)
+
+
+def test_review_claude_caches_a_quota_marker_alongside_fatal_looking_wording():
+    """k3 review finding (round 9): quota text can co-occur with fatal-looking
+    wording in the same message (e.g. a gateway that also names the account as
+    "unauthorized" once its session credits run out). The seat-fatal guard must not
+    withhold a cooldown a quota-marker match should independently win -- chronic
+    quota exhaustion is exactly the condition seat_cooldown exists to catch, unlike
+    a genuine bad-key auth failure the seat-fatal guard is meant to protect."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout="",
+                stderr="You've hit your session limit -- unauthorized until it resets",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is not None
+
+    _with_store(_run)
+
+
+def test_review_claude_never_caches_a_seat_fatal_channel_even_with_unavailable_wording():
+    """k3 review finding (superseded, see Codex review finding below): retry.
+    classify_failure checks _SEAT_FATAL_PATTERNS BEFORE _TRANSIENT_PATTERNS ("a
+    SEAT-FATAL channel wins over an incidental transient-looking substring" --
+    retry.py's own docstring), so `_looks_transient` must mirror that precedence and
+    return False (not transient) for a seat-fatal channel. Concrete repro:
+    `returncode=1, stderr="401 Unauthorized: this account is temporarily
+    unavailable"` -- retry.py calls this SEAT_FATAL (401 wins), so in-seat retry
+    never fires for it.
+
+    Codex review finding (review-cli#286): an EARLIER version of this test asserted
+    that `_looks_transient` returning False for this channel meant it fell through to
+    the `_UNAVAILABLE_MARKERS` check and got CACHED (`active_cooldown(MODEL) is not
+    None`) -- but that directly contradicts this module's own documented contract
+    (seat_cooldown.py's module docstring: "An auth failure ... is NOT cached here --
+    those can be a transient misconfiguration a human fixes moments later, and
+    silently skipping a 'real' retry after a key rotation would hide the fix").
+    Caching a 401 strands the seat for the full cooldown window even AFTER the human
+    rotates the credential -- worse than the doomed-repeat-dispatch cost the earlier
+    version of this test was trying to avoid. `_chronic_unavailable_reason` now calls
+    `_is_seat_fatal` directly (not just via `_looks_transient`) as an independent gate
+    before the marker checks, so a seat-fatal channel is NEVER cooldown-worthy here,
+    regardless of any overlapping unavailable-marker wording."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout="",
+                stderr="401 Unauthorized: this account is temporarily unavailable",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
+
+    _with_store(_run)
+
+
+def test_review_claude_does_not_cache_a_401_that_also_says_currently_unavailable():
+    """Codex review finding (review-cli#286, HIGH): before `_is_seat_fatal` gated the
+    marker checks directly, a seat-fatal channel that ALSO contained the
+    administrative-unavailable wording (not just the "temporarily unavailable" wording
+    covered by the sibling test above) still fell through to `_UNAVAILABLE_MARKERS`
+    and got cached. Concrete repro from the review finding: `returncode=1,
+    stderr="401 Unauthorized: model is currently unavailable to this account"`."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout="",
+                stderr="401 Unauthorized: model is currently unavailable to this account",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
+
+    _with_store(_run)
+
+
+def test_review_claude_caches_an_rc0_sentinel_with_benign_nonempty_stderr():
+    """Opus review finding (review-cli#286, round 7): every rc=0 test added by this
+    change drives the new `_looks_transient(...) or _is_seat_fatal(...)` guard with
+    stderr that is either empty, transient, or seat-fatal -- none pins the ORDINARY
+    case: an rc=0 sentinel whose stderr is a benign, non-empty, non-transient,
+    non-fatal line (e.g. a routine deprecation warning). That case must still
+    cache -- without this test, a future edit collapsing the guard's condition to a
+    bare `if stderr:` would silently stop caching the sentinel for any Fable
+    dispatch that writes ANYTHING to stderr, reopening the exact reliability gap
+    this change targets, while every existing test kept passing."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=0,
+                stdout="Claude Fable 5 is currently unavailable. Learn more: https://x",
+                stderr="warning: config option 'foo' is deprecated, ignoring",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is not None
+
+    _with_store(_run)
+
+
+def test_review_claude_does_not_cache_an_unavailable_marker_buried_in_a_long_stderr():
+    """k3 review finding: the rc=0 branch already enforces "an administrative notice
+    is a one-liner" by only scanning stdout when it is short — but the rc!=0 branch's
+    chronic-marker checks reused the SAME haystack the transient check needs
+    unbounded (mirroring retry.py's own `_error_channel`, which never bounds
+    stderr), so a long, multi-line stderr dump that happens to contain one of the
+    (fairly generic-sounding) unavailable-marker phrases would still get cached as
+    an escalating chronic cooldown -- even though nothing about a long dump looks
+    like Fable's actual one-line administrative notice. Concrete repro from the
+    review finding: a wrapped upstream line during a rolling deploy ("...requested
+    model is unavailable on this shard, retrying elsewhere...") buried inside a much
+    longer stack-trace-shaped stderr, rc=1 (no transient/seat-fatal signal either)."""
+
+    def _run():
+        long_stderr = (
+            "Traceback (most recent call last):\n"
+            + ('  File "gateway.py", line 42, in dispatch\n' * 20)
+            + "RuntimeError: upstream returned an error during rollout: "
+            "requested model is unavailable on this shard, retrying elsewhere\n"
+        )
+        assert len(long_stderr) > 400, len(
+            long_stderr
+        )  # must exceed _UNAVAILABLE_MAX_LEN
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout="",
+                stderr=long_stderr,
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
+
+    _with_store(_run)
+
+
+def test_review_claude_caches_a_short_sentinel_alongside_moderately_long_stderr():
+    """Codex review finding (review-cli#286, round 2, Medium): the length gate used
+    to bound the CONCATENATED stderr+body length, so a genuinely short sentinel
+    could be dropped just because it happened to be paired with an unrelated,
+    individually-short-enough stderr whose SUM crossed the bound. Concrete repro
+    from the review finding: a 62-char sentinel stdout plus a ~380-char
+    non-transient wrapper diagnostic stderr -- neither exceeds `_UNAVAILABLE_MAX_
+    LEN` (400) alone, but their concatenation (with the joining newline) did, so
+    the sentinel was silently never cached -- the exact reliability gap this whole
+    change targets. Each channel is now scrutinized on its own length instead."""
+
+    def _run():
+        sentinel = "Claude Fable 5 is currently unavailable. Learn more: https://x"
+        assert len(sentinel) <= 400, len(sentinel)
+        wrapper_stderr = "non-transient wrapper diagnostic: " + ("x" * 345)
+        assert len(wrapper_stderr) <= 400, len(wrapper_stderr)
+        assert len(sentinel) + 1 + len(wrapper_stderr) > 400, (
+            len(sentinel),
+            len(wrapper_stderr),
+        )  # the OLD combined-length gate would have dropped this
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=1,
+                stdout=sentinel,
+                stderr=wrapper_stderr,
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is not None
+
+    _with_store(_run)
+
+
+def test_review_claude_does_not_cache_a_numeric_only_401_with_unavailable_wording():
+    """k3 review finding (round 8): `_is_seat_fatal` was a TEXT-only check, so a
+    gateway that conveys the auth status ONLY via `ReviewResult.returncode` -- no
+    "401"/"unauthorized" digits or words anywhere in the body -- fell through as
+    "not seat-fatal" and got cached as an hours-long chronic cooldown for what is
+    really just a bad key. Concrete repro from the review finding:
+    `returncode=401, stderr='{"error": {"message": "model is currently unavailable
+    to this account"}}'` -- no seat-fatal TEXT pattern matches, but the numeric
+    status must still win."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=401,
+                stdout="",
+                stderr='{"error": {"message": "model is currently unavailable to this account"}}',
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
+
+    _with_store(_run)
+
+
 def test_review_claude_does_not_cache_a_plain_auth_failure():
     """A bare auth/bad-key failure is a POSSIBLY-transient misconfiguration (a key that
     gets rotated moments later) — seat_cooldown must stay narrow to the two CHRONIC
@@ -2287,6 +3001,86 @@ def test_wiring_review_claude_empty_rc0_body_does_not_clear_cooldown():
         cd = sc.active_cooldown(MODEL, now=1001.0, access_method="cli")
         assert cd is not None, "an empty-rc0 result must not clear escalation history"
         assert cd["fail_count"] == 2, "an empty-rc0 result must not itself escalate"
+
+    _with_store(_run)
+
+
+def test_wiring_review_claude_rc0_transient_stderr_sentinel_does_not_clear_cooldown():
+    """Codex review finding (review-cli#286, round 3, P2): `_chronic_unavailable_
+    reason`'s rc=0 branch returns `None` (withholds caching) when the sentinel
+    stdout is paired with a stderr that independently looks transient -- but a bare
+    `returncode == 0 and stdout.strip()` check at the call site would misread THAT
+    specific `None` as "genuine success" and wipe any escalated cooldown history.
+    Concrete repro: after a prior cooldown expires (fail_count retained), a NEW
+    dispatch comes back `returncode=0`, sentinel stdout, `stderr="upstream HTTP
+    503 while proxying"` -- this is the SAME "still unavailable" seat, not a
+    recovery; clearing history here would reset the next real chronic failure back
+    to the 10-minute window instead of escalating from where it left off."""
+
+    def _run():
+        sc.record_cooldown(MODEL, "hang", now=1000.0)
+        sc.record_cooldown(MODEL, "hang", now=1001.0)
+        assert sc.active_cooldown(MODEL, now=1001.0)["fail_count"] == 2
+
+        saved = backends.review_claude_cli
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        backends.review_claude_cli = lambda *a, **k: ReviewResult(
+            model=MODEL,
+            command="fake",
+            returncode=0,
+            stdout="Claude Fable 5 is currently unavailable. Learn more: https://x",
+            stderr="upstream HTTP 503 while proxying",
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "", Path("."), 60, 0)
+        finally:
+            backends.review_claude_cli = saved
+            backends.unpaid_provider_result = saved_unpaid
+        cd = sc.active_cooldown(MODEL, now=1001.0)
+        assert cd is not None, (
+            "the rc=0 transient-stderr exception must not clear escalation history "
+            "-- it is not genuine recovery evidence"
+        )
+        assert cd["fail_count"] == 2, "must not itself escalate either -- not cached"
+
+    _with_store(_run)
+
+
+def test_wiring_review_claude_rc0_seat_fatal_stderr_does_not_cache():
+    """Codex review finding (review-cli#286, round 3, P2): the rc=0 branch's
+    transient-stderr guard alone is not enough -- `_looks_transient` correctly
+    returns False for a seat-fatal stderr (it treats seat-fatal as "not
+    transient"), so without an independent `_is_seat_fatal` check, a seat-fatal
+    channel paired with the rc=0 sentinel still fell through and got cached.
+    Concrete repro: `returncode=0`, sentinel stdout, `stderr="401 Unauthorized:
+    model is currently unavailable"` -- retry.classify_failure calls this
+    SEAT_FATAL, so caching it would hide a credential rotation behind an
+    hours-long cooldown, contradicting seat_cooldown.py's own documented
+    "an auth failure ... is NOT cached here" contract."""
+
+    def _run():
+        saved_cli = _patched(
+            backends,
+            "review_claude_cli",
+            lambda *a, **k: ReviewResult(
+                model=MODEL,
+                command="claude-p",
+                returncode=0,
+                stdout="Claude Fable 5 is currently unavailable. Learn more: https://x",
+                stderr="401 Unauthorized: model is currently unavailable",
+            ),
+        )
+        saved_unpaid = _patched(
+            backends, "unpaid_provider_result", lambda *a, **k: None
+        )
+        try:
+            backends.review_claude(MODEL, "prompt", "diff", Path("."), 60)
+        finally:
+            backends.review_claude_cli = saved_cli
+            backends.unpaid_provider_result = saved_unpaid
+        assert sc.active_cooldown(MODEL) is None
 
     _with_store(_run)
 
