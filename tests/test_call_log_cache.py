@@ -505,9 +505,77 @@ def test_call_log_round_trips_every_field_through_serialize_deserialize():
         mtime=datetime(2026, 8, 1, 12, 31, 0, tzinfo=timezone.utc),
         exit_code=124,
         task_code="HYP-1",
+        # review-cli#326 round 2/3/6 (Opus finding): these seven used to be
+        # `@property`s (or a free function reading `call.body`) recomputed on every
+        # access, so the cache never needed to carry them. Now they are stored fields
+        # the cache MUST round-trip -- pinned here at non-default values so a
+        # regression (e.g. a hand-kept field list instead of the dataclass-derived
+        # one) would fail this test instead of only showing up on a live cache hit.
+        completed=True,
+        has_error=True,
+        error_summary="TIMEOUT after 1200s",
+        is_paywall=True,
+        is_cf_blocked=True,
+        is_bad_key=True,
+        has_real_content=False,
     )
     restored = clc._deserialize(clc._serialize(call))
     assert restored == call
+
+
+def test_get_or_parse_cache_hit_preserves_classification_fields():
+    """review-cli#326 round 3 (Opus finding, high severity): `classify_call` and
+    `model_id_for_call` now read `is_paywall`/`is_cf_blocked`/`is_bad_key`/`has_error`
+    directly off the `CallLog` instead of re-deriving them from `body` on every
+    access -- so a CACHE HIT must serve a `CallLog` with those fields intact, not
+    just the direct-parse path. `_serialize`/`_deserialize` are already derived
+    generically from the dataclass's own fields (`_calllog_fields()`), so this is an
+    end-to-end proof of that mechanism for exactly the classification fields the
+    round-2 fix introduced, on the cache-hit path the fix exists to serve.
+
+    review-cli#326 round 6 (Fable finding 2): `body` here is deliberately a STRING
+    THAT DOES NOT CONTAIN THE PAYWALL SENTINEL, with all seven classification fields
+    passed explicitly (`is_paywall=True` -- intentionally "wrong" relative to the
+    body). An earlier version used `body="currently unavailable"` with only THREE of
+    the fields set; `CallLog.__post_init__`'s all-or-nothing gate would then RE-DERIVE
+    all of them from that body on ANY dropped/missing field -- and since the body
+    legitimately contains the sentinel, the re-derived `is_paywall` would ALSO be
+    `True`, masking a real cache-serialization regression instead of catching it.
+    With a body that does NOT derive to `is_paywall=True`, a silently dropped field
+    would re-derive to `False` and this test would correctly fail."""
+    from reviewlib.dashboard.parser import HEALTH_PAYWALL, classify_call
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        f = d / "a.log"
+        f.write_text("hello", encoding="utf-8")
+        paywall_call = _call(
+            body="hello",
+            completed=True,
+            has_error=False,
+            error_summary=None,
+            is_paywall=True,
+            is_cf_blocked=False,
+            is_bad_key=False,
+            has_real_content=True,
+        )
+
+        first = clc.get_or_parse(d, f, lambda p: paywall_call)
+        clc.save(d)
+        assert first.is_paywall is True
+        assert classify_call(first) == HEALTH_PAYWALL
+
+        _reset(d)  # simulate a fresh process re-opening the same cache db
+
+        # The cache-hit path must NOT call `parse` again -- a wrong/differently
+        # classified CallLog here would prove the test is exercising a genuine cache
+        # hit, not silently re-parsing.
+        def fail_if_called(path: Path) -> CallLog:
+            raise AssertionError("cache hit must not re-parse")
+
+        second = clc.get_or_parse(d, f, fail_if_called)
+        assert second.is_paywall is True
+        assert classify_call(second) == HEALTH_PAYWALL
 
 
 def test_call_log_with_none_mtime_round_trips():

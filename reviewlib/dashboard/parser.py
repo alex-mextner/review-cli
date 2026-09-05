@@ -124,6 +124,18 @@ PROBLEMATIC_RECENT_N = 3
 # NORMALIZED (whitespace-stripped, lower-cased) form so both the spaced and the collapsed
 # rendering hit. "unavailable" alone is too broad (a real review could mention it), so we
 # anchor on the full `currentlyunavailable` phrase.
+#
+# review-cli#326 (Fable review, round 3): `_classify_from_full_text` now bakes what this
+# sentinel (and `_CF_BLOCK_MARKER`/`_BAD_KEY_MARKER`/`_ERROR_MARKERS` below) matches into
+# `CallLog.is_paywall`/`is_cf_blocked`/`is_bad_key`/`has_error` AT PARSE TIME, and that
+# result is PERSISTED in the SQLite cache keyed on `_PARSER_VERSION`
+# (`call_log_cache.py`). A finished `.log` file's (mtime, size) never changes again, so
+# editing any marker constant here has NO EFFECT on an already-cached row unless
+# `_PARSER_VERSION` is also bumped -- bump it in the SAME change as any edit to these four
+# constants (same rule applies to `CALL_BODY_STORE_CAP`/`_CAP_CHARS`/
+# `CALL_STDERR_LINE_CAP` below and to `_classify_from_full_text`'s own logic -- see the
+# fuller note on `_PARSER_VERSION` in call_log_cache.py), or the change silently never
+# applies on a long-lived install.
 _PAYWALL_SENTINEL = "currentlyunavailable"
 # Cloudflare bot-block body marker (commandcode gateway behind CF).
 _CF_BLOCK_MARKER = "error code: 1010"
@@ -199,6 +211,88 @@ class CallLog:
     # (HYP-742 finding 4: that grep inflated the Errors panel and tanked the success rate).
     exit_code: int | None = None
     task_code: str | None = None
+    # review-cli#326 review findings (Opus + Codex, all rounds): these seven used to be
+    # `@property`s (or, for `has_real_content`, a free function reading `call.body`)
+    # that re-derived from `self.body`/`self.stderr_lines` on every access. Once those
+    # fields are capped (memory fix above), a marker/boundary artifact landing in the
+    # OMITTED or MANGLED part of a huge log would silently flip the verdict --
+    # concretely reproduced by Codex for paywall detection, footer-less failed calls
+    # going permanently "running", and (round 6) an oversized single-line real verdict
+    # misclassifying as empty once `body` was capped down to just the truncation
+    # marker. `parse_call_log` computes them ONCE, from the FULL untruncated text via
+    # `_classify_from_full_text`, before `_cap_body` ever runs -- so classification is
+    # correct for the full body regardless of what's later retained for display.
+    #
+    # `None` is the sentinel for "caller left classification unset" -- `__post_init__`
+    # below auto-derives real values from `self.body`/`self.stderr_lines`/etc. in that
+    # case (round 3, Fable finding 3 / codex P2: a `CallLog` built directly -- a test
+    # fixture, a future non-`parse_call_log` constructor -- must still classify
+    # correctly, matching what the removed `@property`s did). `parse_call_log` always
+    # passes real computed bools/strs explicitly (from the FULL text, before
+    # `_cap_body`), so `__post_init__` is a no-op on that path -- see
+    # `test_direct_construction_auto_classifies_from_body` in tests/test_dashboard.py.
+    completed: bool | None = None
+    has_error: bool | None = None
+    error_summary: str | None = None
+    is_paywall: bool | None = None
+    is_cf_blocked: bool | None = None
+    is_bad_key: bool | None = None
+    # EXIT-0 empty-vs-real-verdict split (see `_body_has_real_content`) -- moved here
+    # in round 6 alongside the other six: `classify_call` used to call
+    # `_body_has_real_content(call)`, which read the CAPPED `call.body` directly, so an
+    # oversized single-line real verdict (no newlines anywhere) got capped down to just
+    # the truncation marker and misclassified as HEALTH_EMPTY (codex round 6
+    # reproduction). Computed from the full body here instead, same as the other six.
+    has_real_content: bool | None = None
+
+    def __post_init__(self) -> None:
+        # SHARP EDGE (round 4, Fable finding 2): this only runs at construction time.
+        # `dataclasses.replace(call, exit_code=...)` (or any post-construction mutation
+        # of `body`/`stderr_lines`/`exit_code`/`timed_out`/`true_silenced`) copies the
+        # EXISTING (already non-None) classification fields into the new instance, so
+        # this gate sees nothing to derive and the copy keeps its OLD, now-stale
+        # classification. Nothing in this codebase does that today (verified: no
+        # `dataclasses.replace(` / direct attribute assignment on a `CallLog` outside
+        # this file and `call_log_cache.py`) -- if you add one, either construct a fresh
+        # `CallLog` with the seven fields at their `None` default, or call
+        # `_classify_from_full_text` yourself and pass the results explicitly.
+        #
+        # ALL-OR-NOTHING gate (round 4, Opus finding): checking `completed` alone let a
+        # caller that explicitly sets SOME of the seven (e.g. `completed=True`) but not
+        # others (e.g. `is_cf_blocked`) skip auto-derivation and end up with a mixed
+        # state -- real bools next to a still-`None` `is_cf_blocked`/`is_bad_key`, which
+        # every current consumer happens to treat as falsy but is a latent trap for a
+        # future `is False`/schema check. `error_summary` is excluded: `None` is its own
+        # legitimate classified value (no error), not an "unset" signal. If ANY of the
+        # six bool fields is still `None`, auto-derive and overwrite ALL SEVEN -- a
+        # partial explicit override is not a supported shape; pass none of them (fully
+        # auto-derived) or all of them (fully explicit).
+        if None not in (
+            self.completed,
+            self.has_error,
+            self.is_paywall,
+            self.is_cf_blocked,
+            self.is_bad_key,
+            self.has_real_content,
+        ):
+            return
+        (
+            self.completed,
+            self.has_error,
+            self.error_summary,
+            self.is_paywall,
+            self.is_cf_blocked,
+            self.is_bad_key,
+            self.has_real_content,
+        ) = _classify_from_full_text(
+            self.body,
+            self.stderr_lines,
+            self.exit_code,
+            self.timed_out,
+            self.timeout_secs,
+            self.true_silenced,
+            self.true_silence_secs,
+        )
 
     @property
     def duration_seconds(self) -> float | None:
@@ -237,72 +331,6 @@ class CallLog:
         if (self.mtime - self.started) > _MAX_CALL_WALL:
             return self.started
         return self.mtime
-
-    @property
-    def completed(self) -> bool:
-        """Did this call FINISH (so its success/failure is known)?
-
-        Every writer stamps a terminal `EXIT {code}` footer (and a timeout also gets the
-        marker). A log with NEITHER an exit code NOR a timeout marker is NOT finished — it
-        is either a long call still streaming, or a call whose writer died before the footer
-        (e.g. a Popen / E2BIG failure). Such a log must NOT be counted as a success (codex
-        P2); it is `running`/unknown. (A truncated old log with a body error marker is still
-        surfaced as an error by has_error — only the clean, footerless case is `running`.)
-        A true-silence marker (codex review finding, review-cli#243 round 2) is the same
-        class as a timeout marker here: a log truncated right after the marker but before
-        its EXIT footer is still a finished, failed call, not a still-running one.
-        """
-        return (
-            self.exit_code is not None
-            or self.timed_out
-            or self.true_silenced
-            or bool(self.stderr_lines)
-            or _looks_like_error(self.body)
-        )
-
-    @property
-    def has_error(self) -> bool:
-        """Did this call FAIL?
-
-        Success/failure is decided by the EXPLICIT return code (the `EXIT {code}` footer),
-        never by grepping the body for `error:` — a review's own output legitimately
-        contains those strings (HYP-742 finding 4). When the explicit code exists it is
-        authoritative: rc 0 = success (even if the prose mentions errors), rc != 0 = fail.
-
-        A timeout is always a failure (the writer records it as EXIT 124, but a log
-        truncated before the footer can still carry the TIMEOUT marker — honor it either
-        way). Only when NO explicit code was recorded do we fall back to the legacy
-        heuristic (stderr present / error-marker grep) so pre-footer logs still surface.
-        A clean footerless log is neither an error NOR a success — it is `running` (see
-        `completed`); has_error stays False there but stats must not bucket it as OK.
-        """
-        if self.timed_out or self.true_silenced:
-            return True
-        if self.exit_code is not None:
-            return self.exit_code != 0
-        # Legacy fallback: log predates the EXIT footer (or was truncated before it).
-        return bool(self.stderr_lines) or _looks_like_error(self.body)
-
-    @property
-    def error_summary(self) -> str | None:
-        if not self.has_error:
-            return None
-        if self.timed_out:
-            return f"TIMEOUT after {self.timeout_secs}s"
-        if self.true_silenced:
-            return f"TRUE-SILENCE TIMEOUT after {self.true_silence_secs}s"
-        if self.exit_code is not None and self.exit_code != 0:
-            # Prefer a concrete stderr line; fall back to the explicit exit code so the
-            # Errors panel always has a reason even when stderr is empty.
-            if self.stderr_lines:
-                return self.stderr_lines[0].strip()[:300]
-            return f"exit code {self.exit_code}"
-        if self.stderr_lines:
-            return self.stderr_lines[0].strip()[:300]
-        if _looks_like_error(self.body):
-            first = next((ln for ln in self.body.splitlines() if ln.strip()), "")
-            return first.strip()[:300]
-        return None
 
     def to_dict(self) -> dict:
         return {
@@ -357,6 +385,8 @@ class BrainstormLog:
         }
 
 
+# See the `_PAYWALL_SENTINEL` comment above: editing this tuple needs a `_PARSER_VERSION`
+# bump in the same change, or an already-cached row silently never re-evaluates it.
 _ERROR_MARKERS = (
     "error:",
     "may not exist or you may not have access",
@@ -365,6 +395,81 @@ _ERROR_MARKERS = (
     "command not found",
     "permission denied",
 )
+
+
+# review-cli#326: on a real long-lived install (~132k call logs), keeping the FULL
+# streamed body of every CallLog in memory (the cross-request session cache never
+# releases them) ballooned the dashboard process to 32.8GB RSS and thrashed the whole
+# machine. `has_error`/`completed` are EXIT-code-authoritative (see `_looks_like_error`'s
+# own docstring) -- body-grepping is only a legacy fallback for logs with no `EXIT {code}`
+# footer -- so bounding what gets RETAINED here caps per-call memory without touching
+# that classification logic for the modern (footer-present) majority of calls. Half the
+# cap is kept from the START and half from the END (not just a head truncation) so an
+# error marker appearing near either end of a huge legacy log still survives -- the
+# common real shape for both "error up front, verbose output after" and "crash at the
+# tail of a long run". `CALL_BODY_STORE_CAP` is a BYTE budget, but the cap operates on
+# CHARACTER count at a QUARTER of it (`_CAP_CHARS` below) -- CPython's string
+# representation uses 1/2/4 bytes per character depending on the widest codepoint
+# present in the WHOLE string (PEP 393), so a body containing even a single non-Latin-1
+# character (any Cyrillic/CJK text -- routine for this project's own Russian-language
+# logs, not just an emoji edge case) forces the entire retained string to at least
+# 2 bytes/char, and a single emoji/astral character forces 4 bytes/char, REGARDLESS of
+# how many bytes that string encodes to. A byte-length cap on the ENCODED size (an
+# earlier version of this fix) does not bound the actual retained Python object size --
+# review-cli#326 round 4, codex P1 concretely reproduced ~262KB retained (4x the 64KB
+# byte cap) from a single retained astral character. Capping CHARACTER count at
+# `CAP // 4` is a simple, worst-case-provable guarantee: retained memory is always
+# <= `CALL_BODY_STORE_CAP` bytes regardless of script mix, at the cost of retaining
+# less content (16KB head + 16KB tail instead of 64KB) even for pure-ASCII bodies --
+# still generous for finding an error near either end of a huge log.
+CALL_BODY_STORE_CAP = 65536
+_CAP_CHARS = CALL_BODY_STORE_CAP // 4
+
+
+def _truncation_marker(omitted: int, unit: str) -> str:
+    return f"... [{omitted} {unit} truncated, review-cli#326 memory cap] ..."
+
+
+def _cap_body(text: str) -> str:
+    if len(text) <= _CAP_CHARS:
+        return text
+    half = _CAP_CHARS // 2
+    head_raw = text[:half]
+    tail_raw = text[-half:]
+    # Trim each raw char-offset slice back to the nearest LINE BOUNDARY, purely for
+    # DISPLAY quality -- a straight offset cut can land mid-line and leave a
+    # ragged partial-line fragment at either edge. This is NOT correctness-critical:
+    # `completed`/`has_error`/`is_paywall`/`has_real_content`/etc. are computed in
+    # `_classify_from_full_text` from the FULL, uncapped text before this function
+    # ever runs (round 6: moving `has_real_content` there too closed the last gap,
+    # where an earlier version scanned the CAPPED `call.body` for "real content" and
+    # a boundary/marker artifact could flip the verdict either direction -- round 5
+    # codex P1, round 6 codex P1). Falls back to the raw (possibly ragged) slice when
+    # the half itself contains no newline at all (one line longer than the whole
+    # per-side budget) -- harmless now that nothing safety-relevant reads this string.
+    head = head_raw.rsplit("\n", 1)[0] if "\n" in head_raw else head_raw
+    tail = tail_raw.split("\n", 1)[1] if "\n" in tail_raw else tail_raw
+    omitted = len(text) - len(head) - len(tail)
+    return head + f"\n\n{_truncation_marker(omitted, 'chars')}\n\n" + tail
+
+
+# review-cli#326 round 3 (codex P1): capping stderr by BYTES alone isn't enough. A
+# backend that emits e.g. `"[stderr] \n"` tens of thousands of times still produces a
+# byte-capped ~64KiB string, but `.split("\n")` on it turns that into tens of
+# thousands of separate (short) `str` objects — each one carries real CPython object
+# overhead well beyond its own bytes, so the LIST can cost far more than the 64KiB the
+# byte cap was meant to bound, across ~132k logs. This caps the retained LINE COUNT
+# independently of the byte cap, same head+tail split rationale as `_cap_body`.
+CALL_STDERR_LINE_CAP = 500
+
+
+def _cap_stderr_lines(lines: list[str]) -> list[str]:
+    capped = _cap_body("\n".join(lines)).split("\n")
+    if len(capped) <= CALL_STDERR_LINE_CAP:
+        return capped
+    half = CALL_STDERR_LINE_CAP // 2
+    omitted = len(capped) - CALL_STDERR_LINE_CAP
+    return capped[:half] + [_truncation_marker(omitted, "lines")] + capped[-half:]
 
 
 def _looks_like_error(text: str) -> bool:
@@ -376,6 +481,81 @@ def _looks_like_error(text: str) -> bool:
     applies to pre-footer / truncated logs where no return code was captured."""
     low = text.lower()
     return any(m in low for m in _ERROR_MARKERS)
+
+
+def _classify_from_full_text(
+    full_body: str,
+    stderr_lines: list[str],
+    exit_code: int | None,
+    timed_out: bool,
+    timeout_secs: int | None,
+    true_silenced: bool,
+    true_silence_secs: int | None,
+) -> tuple[bool, bool, str | None, bool, bool, bool, bool]:
+    """Compute completed/has_error/error_summary/is_paywall/is_cf_blocked/is_bad_key/
+    has_real_content from the FULL, untruncated body/stderr text.
+
+    Must run BEFORE `_cap_body` (review-cli#326 round 2, codex reproduction): deriving
+    these from the capped body would silently flip the verdict whenever the only marker
+    sits in the omitted middle of a huge legacy log -- a footer-less failed call would
+    stay `running` forever, a paywall sentinel past the cap would classify as `ok`, and
+    (round 6) an oversized single-line real verdict would cap down to nothing but the
+    truncation marker and misclassify as empty. `_has_paywall_sentinel`/
+    `_CF_BLOCK_MARKER`/`_BAD_KEY_MARKER`/`_body_has_real_content` are module globals
+    defined later in this file -- fine here since this function only runs at call time,
+    after the whole module is loaded."""
+    completed = (
+        exit_code is not None
+        or timed_out
+        or true_silenced
+        or bool(stderr_lines)
+        or _looks_like_error(full_body)
+    )
+    if timed_out or true_silenced:
+        has_error = True
+    elif exit_code is not None:
+        has_error = exit_code != 0
+    else:
+        has_error = bool(stderr_lines) or _looks_like_error(full_body)
+
+    error_summary: str | None = None
+    if has_error:
+        if timed_out:
+            error_summary = f"TIMEOUT after {timeout_secs}s"
+        elif true_silenced:
+            error_summary = f"TRUE-SILENCE TIMEOUT after {true_silence_secs}s"
+        elif exit_code is not None and exit_code != 0:
+            error_summary = (
+                stderr_lines[0].strip()[:300]
+                if stderr_lines
+                else f"exit code {exit_code}"
+            )
+        elif stderr_lines:
+            error_summary = stderr_lines[0].strip()[:300]
+        elif _looks_like_error(full_body):
+            first = next((ln for ln in full_body.splitlines() if ln.strip()), "")
+            error_summary = first.strip()[:300]
+
+    is_paywall = _has_paywall_sentinel(full_body)
+    blob = ("\n".join(stderr_lines) + "\n" + full_body).lower()
+    # `is_cf_blocked`/`is_bad_key` carry ONLY the body/stderr marker signal, not the
+    # exit_code check -- `exit_code` is already a live, directly-observable `CallLog`
+    # field (review-cli#326 round 3, Fable finding 2: baking `exit_code == 403/401` in
+    # here too made it a second, independent source of truth from the stored field,
+    # inconsistent with how `classify_call` still checks `exit_code == 124` live for
+    # HEALTH_TIMEOUT alongside the stored `timed_out`). `classify_call` combines the two.
+    is_cf_blocked = _CF_BLOCK_MARKER in blob
+    is_bad_key = _BAD_KEY_MARKER in blob
+    has_real_content = _body_has_real_content(full_body)
+    return (
+        completed,
+        has_error,
+        error_summary,
+        is_paywall,
+        is_cf_blocked,
+        is_bad_key,
+        has_real_content,
+    )
 
 
 def parse_call_log(path: Path) -> CallLog | None:
@@ -501,6 +681,24 @@ def parse_call_log(path: Path) -> CallLog | None:
     except OSError:
         size = len(raw.encode("utf-8"))
         mtime = None
+    full_body = "\n".join(body_lines).strip()
+    (
+        completed,
+        has_error,
+        error_summary,
+        is_paywall,
+        is_cf_blocked,
+        is_bad_key,
+        has_real_content,
+    ) = _classify_from_full_text(
+        full_body,
+        stderr_lines,
+        exit_code,
+        timed_out,
+        timeout_secs,
+        true_silenced,
+        true_silence_secs,
+    )
     return CallLog(
         path=str(path),
         filename=path.name,
@@ -508,14 +706,28 @@ def parse_call_log(path: Path) -> CallLog | None:
         backend=backend,
         round=round_no,
         argv0=argv0,
-        body="\n".join(body_lines).strip(),
-        stderr_lines=stderr_lines,
+        body=_cap_body(full_body),
+        # review-cli#326 review finding (Opus + Codex, round 1; line-count fix codex
+        # round 3 P1): a chatty backend dumping megabytes of `[stderr]`-prefixed
+        # diagnostics -- or thousands of near-empty ones -- reproduces the exact
+        # unbounded-retention blowup this fix exists for, just through this field
+        # instead of `body`; `_cap_stderr_lines` bounds both bytes and line count so
+        # every existing list-shaped caller (`stderr_lines[0]`, `"\n".join(...)`)
+        # still works.
+        stderr_lines=_cap_stderr_lines(stderr_lines) if stderr_lines else [],
         timed_out=timed_out,
         timeout_secs=timeout_secs,
         true_silenced=true_silenced,
         true_silence_secs=true_silence_secs,
         exit_code=exit_code,
         task_code=task_code,
+        completed=completed,
+        has_error=has_error,
+        error_summary=error_summary,
+        is_paywall=is_paywall,
+        is_cf_blocked=is_cf_blocked,
+        is_bad_key=is_bad_key,
+        has_real_content=has_real_content,
         size_bytes=size,
         mtime=mtime,
     )
@@ -1374,7 +1586,7 @@ def _has_paywall_sentinel(text: str) -> bool:
     return _PAYWALL_SENTINEL in _normalize_body(text)
 
 
-def _body_has_real_content(call: "CallLog") -> bool:
+def _body_has_real_content(full_body: str) -> bool:
     """Did this EXIT-0 call return a real verdict, or is it empty/framing-only?
 
     A call is EMPTY when it exited cleanly but produced no usable review: a body that —
@@ -1386,8 +1598,17 @@ def _body_has_real_content(call: "CallLog") -> bool:
     that returns REAL review text but omits usage metadata still appends a zero fallback
     usage line (`input_tokens=0 output_tokens=0`). The verdict above that line is real, so
     presence of actual prose decides — we only treat the usage line itself as non-content,
-    not the whole call (codex P2)."""
-    for raw in call.body.splitlines():
+    not the whole call (codex P2).
+
+    review-cli#326 round 6: takes the FULL, uncapped body (called from
+    `_classify_from_full_text`, before `_cap_body` ever runs) -- an earlier version
+    took the `CallLog` and read its already-CAPPED `call.body`, which broke two ways:
+    a genuinely-empty oversized call's injected truncation-marker line got counted as
+    real content (round 5, codex P1), and an oversized single-line REAL verdict (no
+    newlines anywhere) capped down to just the marker and misclassified as empty
+    (round 6, codex P1). Operating on the full text sidesteps both -- the marker
+    literally cannot appear in this function's input."""
+    for raw in full_body.splitlines():
         line = raw.strip()
         if not line:
             continue
@@ -1448,7 +1669,13 @@ def classify_call(call: "CallLog") -> str:
     # Paywall: the body sentinel is authoritative even when EXIT is 0 (Fable returns 0 with
     # an "unavailable" body — the EXIT code lies, the body tells the truth). This is the only
     # check that must run on the EXIT-0 happy path, so it leads.
-    if _has_paywall_sentinel(call.body):
+    #
+    # review-cli#326 round 2 (codex reproduction): `is_paywall`/`is_cf_blocked`/
+    # `is_bad_key` are precomputed once in `parse_call_log`, from the FULL untruncated
+    # body/stderr, before `_cap_body` ever runs — re-deriving them here from
+    # `call.body`/`call.stderr_lines` (which are capped for display) would miss a
+    # sentinel that only survives in the OMITTED middle of a huge legacy log.
+    if call.is_paywall:
         return HEALTH_PAYWALL
     if call.timed_out or call.exit_code == 124:
         return HEALTH_TIMEOUT
@@ -1460,19 +1687,24 @@ def classify_call(call: "CallLog") -> str:
     # the ordinary error/empty/ok classification below, same as before this feature.
     if call.true_silenced:
         return HEALTH_TRUE_SILENCE
-    # The CF bot-block / bad-key markers can land in stderr OR the body; build the haystack
-    # once, only for the error-bearing calls that need it (the healthy majority skips this).
-    blob = ("\n".join(call.stderr_lines) + "\n" + call.body).lower()
-    # Blocked (Cloudflare): EXIT 403 or the CF marker.
-    if call.exit_code == 403 or _CF_BLOCK_MARKER in blob:
+    # Blocked (Cloudflare): EXIT 403 or the CF marker. `is_cf_blocked` carries ONLY the
+    # marker signal (see `_classify_from_full_text`) -- exit_code is checked live here,
+    # same pattern as `exit_code == 124` for HEALTH_TIMEOUT above (round 3, Fable
+    # finding 2: an earlier version folded exit_code into the stored field too, a
+    # second, inconsistent source of truth for the same fact).
+    if call.exit_code == 403 or call.is_cf_blocked:
         return HEALTH_BLOCKED
-    # Auth: EXIT 401 or the bad-key marker.
-    if call.exit_code == 401 or _BAD_KEY_MARKER in blob:
+    # Auth: EXIT 401 or the bad-key marker -- same live-exit_code pattern.
+    if call.exit_code == 401 or call.is_bad_key:
         return HEALTH_AUTH
     if call.has_error:
         return HEALTH_ERROR
-    # EXIT 0 from here: real verdict vs empty/framing-only.
-    if not _body_has_real_content(call):
+    # EXIT 0 from here: real verdict vs empty/framing-only. `has_real_content` is
+    # precomputed on the full untruncated body (see `_classify_from_full_text`) --
+    # round 6, codex P1: reading the CAPPED `call.body` here missed both an oversized
+    # empty call's own truncation marker (looked like content) and an oversized
+    # single-line real verdict (capped down to nothing but the marker, looked empty).
+    if not call.has_real_content:
         return HEALTH_EMPTY
     return HEALTH_OK
 
@@ -1503,7 +1735,8 @@ def model_id_for_call(call: "CallLog") -> str:
         m = _CLAUDE_API_MODEL_RE.match(call.argv0)
         if m:
             return f"claude:{m.group('model')}"
-        if _has_paywall_sentinel(call.body):
+        # review-cli#326: precomputed on the full untruncated body (see classify_call).
+        if call.is_paywall:
             return _CLAUDE_FABLE_MODEL
         return _CLAUDE_OPUS_MODEL
     if backend == "codex":
