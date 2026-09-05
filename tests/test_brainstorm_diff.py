@@ -36,6 +36,13 @@ sys.path.insert(0, str(REPO_ROOT))
 import reviewlib.modes.brainstorm as bs  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 
+# Same directory as this file (tests/) — Python auto-adds a directly-run script's own
+# dir to sys.path, and pytest's classic (no __init__.py) import mode does the same for
+# a collected test file, so this sibling import works under both invocation styles.
+from _brainstorm_env_isolation import (  # noqa: E402
+    with_isolated_brainstorm_paths as _with_isolated_brainstorm_paths,
+)
+
 SAMPLE_DIFF = "diff --git a/x b/x\n@@\n-old\n+new\n"
 
 
@@ -92,15 +99,17 @@ def _run(diff: str) -> _Capture:
     cap = _Capture()
     with cap:
         # rounds=1/max_rounds=1 -> clamped to min 3 internally (min_rounds floor).
-        rc = bs.mode_brainstorm(
-            "How should we cache?",
-            ["codex", "gemini"],
-            REPO_ROOT,
-            5,
-            ["mod"],
-            rounds=1,
-            max_rounds=1,
-            diff=diff,
+        rc = _with_isolated_brainstorm_paths(
+            lambda: bs.mode_brainstorm(
+                "How should we cache?",
+                ["codex", "gemini"],
+                REPO_ROOT,
+                5,
+                ["mod"],
+                rounds=1,
+                max_rounds=1,
+                diff=diff,
+            )
         )
     assert rc == 0, rc
     return cap
@@ -139,18 +148,23 @@ def test_resumed_brainstorm_with_diff_grounds_its_first_executed_round():
     # its FIRST EXECUTED round (round_no == start_round), not round 1.
     cap = _Capture()
     with cap:
-        rc = bs.mode_brainstorm(
-            "How should we cache?",
-            ["codex", "gemini"],
-            REPO_ROOT,
-            5,
-            ["mod"],
-            rounds=1,
-            max_rounds=1,
-            diff=SAMPLE_DIFF,
-            seed_transcript=["## Round 1\nprior idea", "## Round 2\nmore prior idea"],
-            seed_persona_index=6,
-            start_round=3,
+        rc = _with_isolated_brainstorm_paths(
+            lambda: bs.mode_brainstorm(
+                "How should we cache?",
+                ["codex", "gemini"],
+                REPO_ROOT,
+                5,
+                ["mod"],
+                rounds=1,
+                max_rounds=1,
+                diff=SAMPLE_DIFF,
+                seed_transcript=[
+                    "## Round 1\nprior idea",
+                    "## Round 2\nmore prior idea",
+                ],
+                seed_persona_index=6,
+                start_round=3,
+            )
         )
     assert rc == 0, rc
     assert cap.persona_jobs, "no persona jobs ran"
@@ -206,14 +220,16 @@ def test_brainstorm_diff_default_is_empty_backward_compatible():
     """mode_brainstorm(diff=...) defaults to "" so existing callers are unaffected."""
     cap = _Capture()
     with cap:
-        rc = bs.mode_brainstorm(
-            "topic",
-            ["codex"],
-            REPO_ROOT,
-            5,
-            ["mod"],
-            rounds=1,
-            max_rounds=1,
+        rc = _with_isolated_brainstorm_paths(
+            lambda: bs.mode_brainstorm(
+                "topic",
+                ["codex"],
+                REPO_ROOT,
+                5,
+                ["mod"],
+                rounds=1,
+                max_rounds=1,
+            )
         )
     assert rc == 0, rc
     for job in cap.persona_jobs:

@@ -37,6 +37,13 @@ from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.modes import review as review_mode  # noqa: E402
 from reviewlib.modes.review import EXIT_COMMIT_DIFF_TRUNCATED, mode_review  # noqa: E402
 
+# Same directory as this file (tests/) — Python auto-adds a directly-run script's own
+# dir to sys.path, and pytest's classic (no __init__.py) import mode does the same for
+# a collected test file, so this sibling import works under both invocation styles.
+from _brainstorm_env_isolation import (  # noqa: E402
+    with_isolated_brainstorm_paths as _with_isolated_brainstorm_paths,
+)
+
 
 def _with_env(key, value, fn):
     saved = os.environ.get(key)
@@ -792,20 +799,29 @@ def test_brainstorm_diff_already_capped_skips_redundant_recap():
     bs_mod.run_panel = _fake_run_panel
     bs_mod.run_moderator = _fake_run_moderator
     try:
-        rc = _with_env(
-            "REVIEW_DIFF_MAX_BYTES",
-            "10",
-            lambda: bs_mod.mode_brainstorm(
-                "topic",
-                ["m1", "m2"],
-                REPO_ROOT,
-                5,
-                ["mod"],
-                rounds=1,
-                max_rounds=1,
-                diff=_DIFF_ALREADY_CAPPED_BIG,
-                diff_already_capped=True,
-            ),
+        # See `_with_isolated_brainstorm_paths` (belt-and-suspenders alongside
+        # conftest's autouse isolation fixture): this test drives the REAL
+        # mode_brainstorm, which writes a discussion log via log_dir(). Without this,
+        # a run outside pytest (`python tests/test_diff_cap.py`, which conftest.py
+        # never loads) wrote a real "TOPIC: topic" / panel=m1,m2 junk file straight
+        # into the dashboard's live ~/Library/Logs/review-cli — the exact bug Alex
+        # reported (2026-09-02).
+        rc = _with_isolated_brainstorm_paths(
+            lambda: _with_env(
+                "REVIEW_DIFF_MAX_BYTES",
+                "10",
+                lambda: bs_mod.mode_brainstorm(
+                    "topic",
+                    ["m1", "m2"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=1,
+                    max_rounds=1,
+                    diff=_DIFF_ALREADY_CAPPED_BIG,
+                    diff_already_capped=True,
+                ),
+            )
         )
     finally:
         bs_mod.run_panel = saved_panel
@@ -847,19 +863,25 @@ def test_brainstorm_diff_not_already_capped_still_caps_for_a_direct_caller():
     bs_mod.run_panel = _fake_run_panel
     bs_mod.run_moderator = _fake_run_moderator
     try:
-        rc = _with_env(
-            "REVIEW_DIFF_MAX_BYTES",
-            "10",
-            lambda: bs_mod.mode_brainstorm(
-                "topic",
-                ["m1", "m2"],
-                REPO_ROOT,
-                5,
-                ["mod"],
-                rounds=1,
-                max_rounds=1,
-                diff=_DIFF_ALREADY_CAPPED_BIG,
-            ),
+        # See `_with_isolated_brainstorm_paths`: redirect REVIEW_LOG_DIR/
+        # REVIEW_STATS_FILE explicitly so this real mode_brainstorm call can't write
+        # "TOPIC: topic" junk into the real log dir when run outside pytest
+        # (conftest's autouse fixture only covers pytest runs).
+        rc = _with_isolated_brainstorm_paths(
+            lambda: _with_env(
+                "REVIEW_DIFF_MAX_BYTES",
+                "10",
+                lambda: bs_mod.mode_brainstorm(
+                    "topic",
+                    ["m1", "m2"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=1,
+                    max_rounds=1,
+                    diff=_DIFF_ALREADY_CAPPED_BIG,
+                ),
+            )
         )
     finally:
         bs_mod.run_panel = saved_panel
@@ -999,20 +1021,26 @@ def test_brainstorm_diff_from_stdin_is_never_capped():
     bs_mod.run_panel = _fake_run_panel
     bs_mod.run_moderator = _fake_run_moderator
     try:
-        rc = _with_env(
-            "REVIEW_DIFF_MAX_BYTES",
-            "10",
-            lambda: bs_mod.mode_brainstorm(
-                "topic",
-                ["m1", "m2"],
-                REPO_ROOT,
-                5,
-                ["mod"],
-                rounds=1,
-                max_rounds=1,
-                diff=_DIFF_ALREADY_CAPPED_BIG,
-                diff_from_stdin=True,
-            ),
+        # See `_with_isolated_brainstorm_paths`: redirect REVIEW_LOG_DIR/
+        # REVIEW_STATS_FILE explicitly so this real mode_brainstorm call can't write
+        # "TOPIC: topic" junk into the real log dir when run outside pytest
+        # (conftest's autouse fixture only covers pytest).
+        rc = _with_isolated_brainstorm_paths(
+            lambda: _with_env(
+                "REVIEW_DIFF_MAX_BYTES",
+                "10",
+                lambda: bs_mod.mode_brainstorm(
+                    "topic",
+                    ["m1", "m2"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=1,
+                    max_rounds=1,
+                    diff=_DIFF_ALREADY_CAPPED_BIG,
+                    diff_from_stdin=True,
+                ),
+            )
         )
     finally:
         bs_mod.run_panel = saved_panel
