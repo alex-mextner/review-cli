@@ -1324,7 +1324,7 @@ on a fully-keyed environment):
 | 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
 | 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
 | 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
-| 5 | reserve | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| 5 | reserve | Astra | `codex:gpt-6-astra` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence (GPT-6-Astra, OpenAI's flagship codex model; explicitly pinned, unlike a bare `codex` seat which would silently track the CLI's own default) |
 | 6 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
 | 7 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
 | 8 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
@@ -1333,7 +1333,7 @@ on a fully-keyed environment):
 
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
 the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
-Anthropic API only on a host that lacks the CLI but has an API key), Codex via the codex
+Anthropic API only on a host that lacks the CLI but has an API key), Sol/Astra via the codex
 CLI, and Kimi/z.ai-GLM/Qwen/DeepSeek through opencode (`oc:provider/model`) — all run
 read-only *inside* `-C` and can open any project file, not just the diff. Two seats are
 always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-3
@@ -1513,7 +1513,7 @@ exit) — it never silently falls back to the paid default board.
 board:
   - { model: "claude:claude-fable-5",  role: architect, effort: xhigh }
   - { model: "claude:claude-opus-4-8", role: correctness, effort: high }
-  - { model: "codex",                  role: consistency, name: Codex, effort: high }
+  - { model: "codex:gpt-6-astra",      role: consistency, name: Astra, effort: high }
   # Agentic via opencode (oc:provider/model) — reads the repo read-only, like the default
   # board (review-cli#24). Use the diff-only `commandcode:`/`zai:` forms only if you want a
   # stateless keyed-HTTP seat that sees just the diff (and needs no opencode install).
@@ -1546,8 +1546,10 @@ Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`
 `GEMINI_ENV_FILE=/path/to/.env` overrides the search path.
 
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
-Codex is the #5 board seat (review-cli#286: was #6 before Fable's demotion moved every
-subsequent seat up one slot; GPT-5.5 IS codex — the agentic CLI route, free).
+Astra (GPT-6-Astra, pinned via `codex:gpt-6-astra`) is the #5 board seat (review-cli#286:
+was #6 before Fable's demotion moved every subsequent seat up one slot; it replaced a bare
+`"codex"` seat that silently tracked the CLI's own default model — see "Reviewer board"
+above). It runs through the same agentic codex CLI route as the bare `codex` seat / Sol.
 
 **omp (Oh My Pi) seats (`omp:<provider>/<model>`):** must be on PATH and authenticated
 via omp's own setup (`omp setup`; `omp token <provider>` shows the stored credential).

@@ -40,6 +40,7 @@ from .backends import (
     review_zai,
 )
 from .config import (
+    ASTRA_SEAT,
     CONFIG_PATH,
     DEFAULT_BOARD,
     DEFAULT_MODELS,
@@ -173,6 +174,7 @@ __all__ = [
     "DEFAULT_POOL_SIZE",
     "REVIEW_ROLES",
     "SOL_SEAT",
+    "ASTRA_SEAT",
     "FABLE_SEAT",
     "DEFAULT_MODELS",
     "DEFAULT_PROMPT",
