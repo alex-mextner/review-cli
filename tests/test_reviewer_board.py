@@ -32,6 +32,7 @@ import reviewlib.backends as backends  # noqa: E402
 import reviewlib.modes.review as _review_mod  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.config import (  # noqa: E402
+    ASTRA_SEAT,
     DEFAULT_BOARD,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
@@ -93,8 +94,9 @@ def test_default_board_matches_directive_table():
         ("commandcode:zai-org/GLM-5.2", "performance", "GLM-cc"),
         # Seat 4 is the first reserve and preserves lens diversity when a top seat drops.
         ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "quality", "Kimi"),
-        # Seat 5 is the agentic codex CLI route (see config.py / CHANGELOG for rationale).
-        ("codex", "consistency", "Codex"),
+        # Seat 5 is the agentic codex CLI route, pinned to GPT-6-Astra (ASTRA_SEAT) rather
+        # than the bare `"codex"` seat this used to be (see config.py for rationale).
+        ("codex:gpt-6-astra", "consistency", "Astra"),
         # Seats 4 and 6-7 route through opencode (`oc:`) so they run AGENTICALLY (read the repo
         # read-only), not the diff-only commandcode/z.ai REST call (review-cli#24).
         ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
@@ -118,7 +120,7 @@ def test_default_board_matches_directive_table():
 
 def test_default_board_is_priority_ordered():
     """The CTO's priority sketch (strongest-WORKING-model first): Sol, Opus,
-    GLM-5.2-via-commandcode, Kimi, Codex, Qwen, DeepSeek, Gemini, GLM-5.2-via-z.ai, Fable.
+    GLM-5.2-via-commandcode, Kimi, Astra, Qwen, DeepSeek, Gemini, GLM-5.2-via-z.ai, Fable.
     Re-ranking = reordering
     DEFAULT_BOARD; this pins the order. Seats 4 and 6-8 are the AGENTIC opencode (`oc:`)
     routes (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. The z.ai GLM
@@ -130,7 +132,7 @@ def test_default_board_is_priority_ordered():
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",
+        "codex:gpt-6-astra",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
@@ -254,7 +256,7 @@ def test_preset_boards_pin_model_order_pool_and_effort():
         "claude:claude-opus-4-8",
         GLM_COMMANDCODE_SEAT,
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",
+        ASTRA_SEAT,
     ]
     assert len({r.role for r in DEFAULT_PRESET_BOARD[:4]}) == 4
 
@@ -352,6 +354,34 @@ def test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat()
     assert board[0].effort == "medium"
     assert board[1].role == ""
     assert board[1].effort == "medium"
+
+
+def test_bare_codex_explicit_model_no_longer_matches_board_metadata_after_astra_pin():
+    """Opus review finding: before ASTRA_SEAT replaced the bare `"codex"` DEFAULT_BOARD
+    seat, `-m codex` matched that seat byte-for-byte and inherited its role/display/preset
+    effort. Now that the seat is pinned to `codex:gpt-6-astra`, a bare `-m codex` matches NO
+    board/preset entry, so it falls back to the SAME generic unmatched-model path any
+    unrecognised model already gets (role="", a display derived from the model string, and
+    `board_from_models`'s `preset_default_effort` -- the first NON-None `effort` among the
+    preset's own seats, in priority order).
+
+    Deliberately uses `preset="heavy"` (NOT the `preset="light"` that
+    `test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat` uses),
+    because "heavy" grades effort per seat (xhigh for the top 4, max after) while "light"
+    gives every seat a uniform "medium" -- so this test's expected "xhigh" (heavy's own
+    first-seat effort, Sol's) and that other test's expected "medium" (light's uniform
+    effort) are BOTH correct outputs of the identical fallback code path, just fed a
+    different preset; they are not in tension. This pins that the metadata loss for a bare
+    `-m codex` is a deliberate, non-crashing behavior change, not a regression."""
+    board = board_from_models(["codex"], {}, preset="heavy")
+
+    assert len(board) == 1
+    assert board[0].model == "codex"
+    assert board[0].role == ""
+    assert board[0].display == "codex"
+    # Preset default effort (the FIRST seat's effort in priority order, i.e. Sol's xhigh)
+    # -- NOT the "max" effort the old DEFAULT_BOARD seat #5 used to carry.
+    assert board[0].effort == "xhigh"
 
 
 def test_explicit_models_with_preset_prevent_config_effort_downgrade_for_out_of_preset_seat():
@@ -1134,12 +1164,12 @@ def test_select_pool_default_picks_first_four_seats():
         "commandcode:zai-org/GLM-5.2",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ]
-    # The reserve is exactly the remainder (priority order): Codex, the remaining opencode
+    # The reserve is exactly the remainder (priority order): Astra, the remaining opencode
     # routes (review-cli#24), the diff-only Gemini, the slow z.ai GLM seat (LAST-RESORT,
     # review-cli#65 deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
     assert reserve == [
-        "codex",
+        "codex:gpt-6-astra",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
@@ -1221,8 +1251,8 @@ def test_all_repo_capable_default_seats_are_agentic():
         the keyed-HTTP route is the only one that reaches it (verified live).
 
     This still pins the agentic-by-default contract for the seats that CAN be agentic:
-    Kimi/z.ai-GLM/Qwen/DeepSeek go through opencode (`oc:`), Codex through the codex CLI, the
-    two Anthropic seats through claude. A future edit that silently reverts one of THOSE to
+    Kimi/z.ai-GLM/Qwen/DeepSeek go through opencode (`oc:`), Sol/Astra through the codex CLI,
+    the two Anthropic seats through claude. A future edit that silently reverts one of THOSE to
     the diff-only REST route fails here. (claude is agentic via its CLI path; resolve_backend
     returns review_claude for both, and the board's claude seats run the CLI on a normal
     host.)"""
@@ -2867,10 +2897,14 @@ def test_show_board_explicit_model_is_exact():
 
 
 def test_show_board_explicit_model_with_preset_keeps_exact_model_and_preset_effort_metadata():
-    lines = _show_board_lines(4, preset="heavy", explicit_models=["codex"])
+    # Astra (codex:gpt-6-astra) is the preset seat now outside the xhigh top-4 (the bare
+    # `"codex"` seat this test used before ASTRA_SEAT was pinned no longer appears in the
+    # heavy preset at all), so -m'ing it exactly is what exercises "explicit model reuses
+    # the matching preset entry's effort metadata".
+    lines = _show_board_lines(4, preset="heavy", explicit_models=[ASTRA_SEAT])
     seat_lines = [ln for ln in lines if "[explicit]" in ln]
     assert len(seat_lines) == 1, lines
-    assert "codex  [available]" in seat_lines[0], lines
+    assert f"{ASTRA_SEAT}  [available]" in seat_lines[0], lines
     assert "effort=max" in seat_lines[0], lines
     assert "source: explicit -m + preset:heavy" in lines[0], lines
 
@@ -2970,16 +3004,17 @@ def test_show_board_pool_zero_marks_all_seats_pool():
 def test_show_board_heavy_preset_displays_effort_values():
     """review-cli#fable-seat-reliability: Fable is excluded from the heavy preset
     entirely (a confirmed ~100% dispatch failure rate), so it no longer has a row
-    here at all — Sol (the new #1) and Codex (still outside the xhigh top-4) stand
+    here at all — Sol (the new #1) and Astra (still outside the xhigh top-4) stand
     in as the xhigh/max examples instead."""
     lines = _show_board_lines(4, preset="heavy")
     assert not any("claude:claude-fable-5" in ln for ln in lines), lines
     sol = next(ln for ln in lines if SOL_SEAT in ln)
-    # Match the DISPLAY name ("Codex"), not the bare model string — "codex" is also a
-    # substring of Sol's model id (`codex:gpt-5.6-sol`), which would false-match here.
-    codex = next(ln for ln in lines if "Codex" in ln)
+    # Match the DISPLAY name ("Astra"), not the bare model string — "codex" is also a
+    # substring of both Sol's AND Astra's model ids (`codex:gpt-5.6-sol`,
+    # `codex:gpt-6-astra`), which would false-match here.
+    astra = next(ln for ln in lines if "Astra" in ln)
     assert "effort=xhigh" in sol, sol
-    assert "effort=max" in codex, codex
+    assert "effort=max" in astra, astra
 
 
 def test_show_board_tags_by_seat_not_model_for_duplicate_models():

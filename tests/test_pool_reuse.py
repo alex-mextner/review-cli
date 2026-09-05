@@ -108,16 +108,16 @@ def test_limit_exclusion_shrinks_pool_before_reuse():
 
 
 def test_real_default_board_duplicate_roles_never_dispatch_byte_identical_seats():
-    # DEFAULT_BOARD genuinely repeats two roles ("consistency": Sol + Codex;
+    # DEFAULT_BOARD genuinely repeats two roles ("consistency": Sol + Astra;
     # "quality": Kimi + GLM). Excluding everything except the two seats that
     # share ONE of those roles must never pad a second slot onto that SAME
     # role — that would dispatch the same model under the same role/lens
     # twice, a pure-cost duplicate the "N distinct lenses" contract forbids
     # (k3 review finding, review-cli#205 round 3).
-    sol, opus, glm_cc, kimi, codex, qwen, deepseek, gemini, glm, fable = DEFAULT_BOARD
-    assert sol.role == "consistency" and codex.role == "consistency"
+    sol, opus, glm_cc, kimi, astra, qwen, deepseek, gemini, glm, fable = DEFAULT_BOARD
+    assert sol.role == "consistency" and astra.role == "consistency"
     usage_percent = _usage(
-        {m.model: 99 for m in DEFAULT_BOARD if m.model not in (sol.model, codex.model)}
+        {m.model: 99 for m in DEFAULT_BOARD if m.model not in (sol.model, astra.model)}
     )
     result = select_pool_with_reuse(list(DEFAULT_BOARD), 4, usage_percent=usage_percent)
     seen = set()
@@ -125,7 +125,7 @@ def test_real_default_board_duplicate_roles_never_dispatch_byte_identical_seats(
         key = (r.model, r.role)
         assert key not in seen, f"byte-identical duplicate seat dispatched: {key}"
         seen.add(key)
-    # Both under-limit seats (sol, codex) share role "consistency" -- padding
+    # Both under-limit seats (sol, astra) share role "consistency" -- padding
     # must borrow roles from ELSEWHERE on the board (architect/correctness/...)
     # for the extra slots, never repeat "consistency" onto a second slot for
     # the same model. Plenty of other distinct roles exist on the 10-seat

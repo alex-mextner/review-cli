@@ -22,10 +22,12 @@ This module is the resolver. It is deliberately ADDITIVE and OPT-IN:
 Provider mapping
 ----------------
 The manifest's `provider` tokens are the BOARD's provider names, not review-cli's seat
-prefixes: `anthropic` -> `claude:`, `openai` -> `codex` (the agentic codex route GPT-5.5
-runs on), `gemini` -> `gemini`, `commandcode` -> `commandcode:`, `zai` -> `zai:`. A concrete
-manifest id is turned into a runnable review-cli seat string via `_seat_for()` so the
-resolved value drops straight into the same backend dispatch the board already uses.
+prefixes: `anthropic` -> `claude:`, `openai` -> `codex` (the agentic codex route running
+whatever model the codex CLI's own default currently is — see config.py's SOL_SEAT/
+ASTRA_SEAT for the pinned alternative), `gemini` -> `gemini`, `commandcode` ->
+`commandcode:`, `zai` -> `zai:`. A concrete manifest id is turned into a runnable
+review-cli seat string via `_seat_for()` so the resolved value drops straight into the
+same backend dispatch the board already uses.
 """
 
 from __future__ import annotations
@@ -44,8 +46,10 @@ MANIFEST_ENV = "REVIEW_MODELS_MANIFEST"
 
 # Manifest provider token (models.yaml `provider:`) -> the review-cli SEAT prefix builder.
 # A `None` value means "the provider IS the bare seat name" (gemini -> `gemini`, no id tail).
-# `openai` maps to the agentic `codex` route (GPT-5.5 runs there), matching DEFAULT_BOARD's
-# priority-5 Codex seat — NOT the diff-only `commandcode:gpt-5.5` HTTP route.
+# `openai` maps to the agentic `codex` route (GPT-5.5 runs there) — the SAME codex CLI
+# transport DEFAULT_BOARD's priority-1 Sol seat and priority-5 Astra seat use (both pin
+# an explicit model via `codex:<model>`; this resolver instead mints the bare, CLI-default
+# `codex` route) — NOT the diff-only `commandcode:gpt-5.5` HTTP route.
 _PROVIDER_SEAT = {
     "anthropic": "claude:{id}",
     "openai": "codex",
@@ -60,10 +64,11 @@ _PROVIDER_SEAT = {
 
 # NOTE: `openai` and `gemini` resolve to the PROVIDER-LEVEL bare seat (`codex` / `gemini`), not
 # a model-pinned id — those two review-cli routes pick their concrete model themselves (the
-# agentic codex CLI runs GPT-5.5; the gemini REST backend its configured model), so the seat is
-# the route name, not `route:<id>`. Resolution is therefore provider-level for those two and
-# model-level for the rest; `models_with_capability` dedupes so two openai entries can't yield a
-# duplicate `codex` seat.
+# agentic codex CLI runs whatever model ~/.codex/config.toml's own default currently is; the
+# gemini REST backend its configured model), so the seat is the route name, not `route:<id>`.
+# Resolution is therefore provider-level for those two and model-level for the rest;
+# `models_with_capability` dedupes so two openai entries can't yield a duplicate `codex`
+# seat.
 
 
 def _candidate_manifest_paths() -> list[Path]:

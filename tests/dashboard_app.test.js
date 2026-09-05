@@ -91,6 +91,13 @@ test('resolveModel: Sol seat resolves specifically, not generic GPT', () => {
   assert.equal(m.label, 'Sol');
 });
 
+test('resolveModel: Astra seat resolves specifically, not generic GPT', () => {
+  const m = resolveModel('codex:gpt-6-astra');
+  assert.equal(m.key, 'gpt-6-astra');
+  assert.equal(m.logo, 'codex');
+  assert.equal(m.label, 'Astra');
+});
+
 test('resolveModel: suffixed ids resolve to the right family', () => {
   assert.equal(resolveModel('opus-4-8').key, 'opus');
   assert.equal(resolveModel('glm-5.2').key, 'glm');
