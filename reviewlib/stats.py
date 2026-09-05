@@ -1314,7 +1314,7 @@ def quorum_check(
             # that never ran for a direct library caller -- exactly the
             # imprecision `scope` itself exists to avoid.
             in_scope_note = (
-                " -- excluding any recorded for a different repo/diff"
+                " -- excluding any recorded for a different repo/diff --"
                 if repo_id is not None
                 else ""
             )

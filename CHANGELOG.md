@@ -3,6 +3,72 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.35.6 — 2026-09-05
+
+- **`review task CODE --check` zero-role fallback — only for GENUINELY old
+  history, never a permanent way to dodge the role-based gate (#252
+  follow-up).** The zero-role-data fallback below (#252) didn't distinguish
+  two different situations: (a) a task whose entire history genuinely predates
+  role-tracking (PR #246's merge) — nothing more can be done, the fallback is
+  correct; vs. (b) a task with at least one iteration recorded AFTER
+  role-tracking became possible, that simply never happened to use a
+  role-tracking `review diff` board (reviewed only via `quorum`/`just-ask`/
+  `brainstorm`/`qa` instead). Silently granting case (a)'s free pass to case
+  (b) too would let ANY task dodge the role-based gate forever, permanently,
+  just by never choosing a role-tracking review mode — not the one-time
+  migration accommodation for old history the fallback was meant to be. Now:
+  the fallback only fires when EVERY recorded iteration provably predates
+  role-tracking (compared against PR #246's merge commit/timestamp). A task
+  with at least one post-cutoff, role-less iteration stays role-based (fails on
+  its own merits, same as an ordinary short-of-floor denial) and gains a
+  `role_tracking_gap` key (plus a text-mode `hint:` line) naming exactly what's
+  missing and what to run instead (`review diff --task CODE` through a
+  role-tracking board) — distinct from `quorum_mode_fallback`, which is now
+  reserved for case (a) only. **Non-monotonic gate, by design:** a task
+  currently passing via the model-counting fallback can flip to failing the
+  moment one more role-less `quorum`/`just-ask`/`brainstorm`/`qa` review is
+  recorded against it — doing additional review work can move the gate from
+  pass to fail. That's the intended incentive (stop taking the role-blind
+  shortcut once role-tracking is available), but it's the concrete form of the
+  breaking change here, and the shape an automated `gh ship` pipeline could
+  trip on if it re-checks a task after recording a fresh, role-less review.
+  This is any-VERDICT, same as case (a)'s population — a role-less quorum/
+  just-ask attempt that FAILED (produced no usable review at all) still trips
+  it, not only a passing one, which is the sharper shape a retry loop is most
+  likely to hit (record a failed attempt → re-check → now blocked for a new
+  reason).
+
+- **`review task CODE --check` bare default — fall back to model-counting when
+  a task has zero recorded role data (follow-up to #246).** The role-based
+  default #246 introduced (below) has a real gap: a task whose ENTIRE review
+  history predates role-tracking, or comes only from `review quorum`/
+  `review just-ask`/`review brainstorm`/`review qa` (modes that never record
+  per-seat roles at all), has ZERO role-tagged iterations — and the bare-check
+  default was treating that identically to "recorded some roles, just short of
+  the floor," a guaranteed hard fail even when the task genuinely has 3+
+  distinct MODELS in its history that would have satisfied the pre-#246
+  model-counting default. Now: in the bare-check path only (neither
+  `--min-models` nor `--min-roles` given), once real history is loaded and
+  found to carry NO role data whatsoever — checked across every recorded
+  iteration REGARDLESS OF VERDICT (a role-tagged review that failed still
+  counts as role data), excluding only iterations diff-identity-mismatched
+  against a genuinely different repo/diff — the default silently swaps to the
+  old model-counting check at the same numeric floor, and the JSON payload
+  gains a `quorum_mode_fallback` key (plus a text-mode `note:` line) explaining
+  why, PLUS a `min_models_source: "fallback" | "explicit"` key — so a caller can
+  tell this apart from a genuine explicit `--min-models` request, which
+  behaves exactly as before (`"min_models" in payload` alone is no longer
+  sufficient to detect an explicit request; `min_models_source` is the direct,
+  positive discriminator). A task whose ENTIRE history is diff-identity-
+  mismatched against the current repo/diff (e.g. a task-code collision with an
+  unrelated project) is treated the same as "no effective history for this
+  check" and does NOT trigger the fallback either — it keeps the pre-existing
+  role-based fail-closed shape, rather than a misleadingly-worded
+  model-counting shape. A task with even ONE role-tagged iteration of any
+  verdict, for the current repo/diff, is unaffected: it stays role-based and
+  must pass or fail on that basis alone, never falling back just because the
+  role floor isn't met.
+
 ## 0.35.5 — 2026-09-05
 
 - **`review diff` board mode: print a visible STDOUT notice when the pool comes up
@@ -78,69 +144,6 @@ semantic versioning.
   `--task <CODE>` placeholder — a recorded review mode requires a task code, so a
   remediation without one failed at the first keystroke (Codex finding on #359).
 
-- **`review task CODE --check` zero-role fallback — only for GENUINELY old
-  history, never a permanent way to dodge the role-based gate (#252
-  follow-up).** The zero-role-data fallback below (#252) didn't distinguish
-  two different situations: (a) a task whose entire history genuinely predates
-  role-tracking (PR #246's merge) — nothing more can be done, the fallback is
-  correct; vs. (b) a task with at least one iteration recorded AFTER
-  role-tracking became possible, that simply never happened to use a
-  role-tracking `review diff` board (reviewed only via `quorum`/`just-ask`/
-  `brainstorm`/`qa` instead). Silently granting case (a)'s free pass to case
-  (b) too would let ANY task dodge the role-based gate forever, permanently,
-  just by never choosing a role-tracking review mode — not the one-time
-  migration accommodation for old history the fallback was meant to be. Now:
-  the fallback only fires when EVERY recorded iteration provably predates
-  role-tracking (compared against PR #246's merge commit/timestamp). A task
-  with at least one post-cutoff, role-less iteration stays role-based (fails on
-  its own merits, same as an ordinary short-of-floor denial) and gains a
-  `role_tracking_gap` key (plus a text-mode `hint:` line) naming exactly what's
-  missing and what to run instead (`review diff --task CODE` through a
-  role-tracking board) — distinct from `quorum_mode_fallback`, which is now
-  reserved for case (a) only. **Non-monotonic gate, by design:** a task
-  currently passing via the model-counting fallback can flip to failing the
-  moment one more role-less `quorum`/`just-ask`/`brainstorm`/`qa` review is
-  recorded against it — doing additional review work can move the gate from
-  pass to fail. That's the intended incentive (stop taking the role-blind
-  shortcut once role-tracking is available), but it's the concrete form of the
-  breaking change here, and the shape an automated `gh ship` pipeline could
-  trip on if it re-checks a task after recording a fresh, role-less review.
-  This is any-VERDICT, same as case (a)'s population — a role-less quorum/
-  just-ask attempt that FAILED (produced no usable review at all) still trips
-  it, not only a passing one, which is the sharper shape a retry loop is most
-  likely to hit (record a failed attempt → re-check → now blocked for a new
-  reason).
-
-- **`review task CODE --check` bare default — fall back to model-counting when
-  a task has zero recorded role data (follow-up to #246).** The role-based
-  default #246 introduced (below) has a real gap: a task whose ENTIRE review
-  history predates role-tracking, or comes only from `review quorum`/
-  `review just-ask`/`review brainstorm`/`review qa` (modes that never record
-  per-seat roles at all), has ZERO role-tagged iterations — and the bare-check
-  default was treating that identically to "recorded some roles, just short of
-  the floor," a guaranteed hard fail even when the task genuinely has 3+
-  distinct MODELS in its history that would have satisfied the pre-#246
-  model-counting default. Now: in the bare-check path only (neither
-  `--min-models` nor `--min-roles` given), once real history is loaded and
-  found to carry NO role data whatsoever — checked across every recorded
-  iteration REGARDLESS OF VERDICT (a role-tagged review that failed still
-  counts as role data), excluding only iterations diff-identity-mismatched
-  against a genuinely different repo/diff — the default silently swaps to the
-  old model-counting check at the same numeric floor, and the JSON payload
-  gains a `quorum_mode_fallback` key (plus a text-mode `note:` line) explaining
-  why, PLUS a `min_models_source: "fallback" | "explicit"` key — so a caller can
-  tell this apart from a genuine explicit `--min-models` request, which
-  behaves exactly as before (`"min_models" in payload` alone is no longer
-  sufficient to detect an explicit request; `min_models_source` is the direct,
-  positive discriminator). A task whose ENTIRE history is diff-identity-
-  mismatched against the current repo/diff (e.g. a task-code collision with an
-  unrelated project) is treated the same as "no effective history for this
-  check" and does NOT trigger the fallback either — it keeps the pre-existing
-  role-based fail-closed shape, rather than a misleadingly-worded
-  model-counting shape. A task with even ONE role-tagged iteration of any
-  verdict, for the current repo/diff, is unaffected: it stays role-based and
-  must pass or fail on that basis alone, never falling back just because the
-  role floor isn't met.
 
 ## 0.35.3 — 2026-09-05
 
