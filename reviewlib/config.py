@@ -45,6 +45,17 @@ DEFAULT_PROMPT = (
 # the board was kept current (the flat panel rotted on the dead Fireworks route).
 KIMI_SEAT = "commandcode:moonshotai/Kimi-K2.7-Code"
 SOL_SEAT = "codex:gpt-5.6-sol"
+# GPT-6-Astra ("Astra") is OpenAI's new flagship codex model — "our most capable model
+# for complex, demanding work" per the codex CLI's own model catalog. Explicitly PINNED
+# (like SOL_SEAT), rather than left as a bare `"codex"` seat that silently tracks
+# whatever ~/.codex/config.toml's own `model =` default happens to be today. The bare
+# `"codex"` seat used to sit at DEFAULT_BOARD's priority 5 and, because that config
+# default is currently `gpt-5.6-sol`, it was accidentally running the SAME model as
+# SOL_SEAT (priority 1) — a silent duplicate that gave the board zero extra model
+# coverage for a full seat. Pinning to Astra here fixes that: the board gets a genuinely
+# distinct model, and this seat no longer drifts if the operator's global codex default
+# changes.
+ASTRA_SEAT = "codex:gpt-6-astra"
 # review-cli#fable-seat-reliability (GLM review finding): the single source of truth
 # for the Fable seat's model id — every sibling seat (KIMI_SEAT/SOL_SEAT/
 # GLM_COMMANDCODE_SEAT above) already has one; the Fable id was the one left as a
@@ -126,6 +137,10 @@ MODEL_ALIASES = {
     "fable5": FABLE_SEAT,
     "sol": SOL_SEAT,
     "gpt56sol": SOL_SEAT,
+    # Astra falls through `_match_named_backend` to the opencode catch-all without this —
+    # the same failure class documented on `opus` above. Pin it, like Sol.
+    "astra": ASTRA_SEAT,
+    "gpt6astra": ASTRA_SEAT,
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
     # directly in resolve_backend (env ZAI_MODEL / glm-5.2 default — the newest GLM,
     # reachable on the Coding-Plan endpoint). These aliases pin specific GLM model ids;
@@ -276,11 +291,11 @@ class BoardReviewer:
 # To RE-RANK the board, just reorder this tuple (top = highest priority). Model ids are
 # byte-exact against the provider catalogs (commandcode gateway /models, z.ai Coding-Plan)
 # — do not alter the strings. Each is the TOP available version of its model family
-# (fable-5, Sol, opus-4-8, GLM-5.2-via-gateway, Kimi-K2.7, codex/GPT-5.5,
+# (fable-5, Sol, opus-4-8, GLM-5.2-via-gateway, Kimi-K2.7, GPT-6-Astra,
 # Qwen3.7-Max, deepseek-v4-pro, Gemini, glm-5.2-via-z.ai).
 #
 # AGENTIC BY DEFAULT (review-cli#24): every board seat that CAN read the repo does. The
-# two claude seats run via the agentic claude CLI; Codex via the codex CLI
+# two claude seats run via the agentic claude CLI; Sol/Astra via the codex CLI
 # (`codex exec -s read-only -C <cwd>`); Kimi/z.ai-GLM/Qwen/DeepSeek through opencode
 # (`oc:provider/model`, built by `_agentic()` from the diff-only constant) so they ALSO
 # run read-only inside `-C` and can open ANY project file — not just the diff in the
@@ -324,9 +339,11 @@ DEFAULT_BOARD = (
     # priority 4 — Kimi K2.7, AGENTIC through opencode (reads the repo). Same model id as
     # the flat panel's KIMI_SEAT (one source of truth via `_agentic`); transport-only diff.
     BoardReviewer(_agentic(KIMI_SEAT), "quality", "Kimi"),
-    # priority 5 — Codex: the agentic codex CLI route (reads the whole repo), NOT the
-    # diff-only `commandcode:gpt-5.5` HTTP route. GPT-5.5 is codex; the agentic route wins.
-    BoardReviewer("codex", "consistency", "Codex"),
+    # priority 5 — Astra, the agentic codex CLI route (reads the whole repo), pinned via
+    # ASTRA_SEAT rather than the bare `"codex"` seat this used to be (see ASTRA_SEAT's
+    # comment for why). Same role (`consistency`) as before — this replaces the seat, it
+    # doesn't add a new one, so the board's role/lens coverage is unchanged.
+    BoardReviewer(ASTRA_SEAT, "consistency", "Astra"),
     # priority 6 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(_agentic("commandcode:Qwen/Qwen3.7-Max"), "security", "Qwen"),
     # priority 7 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
