@@ -29,6 +29,21 @@ semantic versioning.
   pure `chmod` or 100%-similarity rename (no content hunk to count at all) fails CLOSED
   to a full review instead of reading as a free, unboundedly-sized trivial change.
 
+- **Cross-process/cross-thread locking for the seat-cooldown store (#188).** A board
+  dispatches its seats in parallel, so two concurrent `record_cooldown`/`clear_cooldown`
+  calls could race on the same unlocked read-modify-write and silently lose one side's
+  update. `_locked()` now serializes the critical section with an in-process
+  `threading.Lock` plus a bounded cross-process `fcntl.flock`. The flock retry has its
+  OWN, much smaller sub-budget than the in-process lock's total deadline — a stalled
+  cross-process peer degrades that one thread to in-process-only quickly instead of
+  holding the in-process lock hostage (which would otherwise make every other thread
+  time out at once and race each other, reintroducing the exact bug this fixes) — and a
+  stalled in-process peer degrades further to fully unlocked, instead of hanging the
+  caller or blocking indefinitely. A lock failure only ever narrows the guarantee, it
+  never aborts the write. The pure disable checks
+  (`ttl_seconds=0`/`$REVIEW_SEAT_COOLDOWN_SECONDS<=0`) run before any lock is even
+  acquired, so the "un-stick a seat right now" escape hatch stays instant.
+
 - **Diff-identity binding for `review task CODE --check` — closes a real
   quorum-pollution incident class (v4 run-stats records).** The self-merge-authority
   quorum gate used to key PASSED iterations purely by task-code STRING, with no

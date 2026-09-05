@@ -18,11 +18,28 @@ failure).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+try:
+    import pytest
+except ImportError:  # pytest absent: @pytest.mark.skipif below is purely decorative —
+    # each guarded test's own early-return (right after its docstring) is what actually
+    # skips it in BOTH harnesses, since smoke.py's standalone runner ignores pytest
+    # markers anyway (matches the pattern in tests/test_board_deadline_wiring.py).
+    class _NoPytestMark:
+        @staticmethod
+        def skipif(*_args, **_kwargs):
+            return lambda fn: fn
+
+    class _NoPytest:
+        mark = _NoPytestMark()
+
+    pytest = _NoPytest()  # type: ignore[assignment]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -154,6 +171,81 @@ def test_ttl_le_zero_disables_recording():
     _with_store(_run)
 
 
+def test_disable_paths_never_acquire_the_lock():
+    """review-cli#188, Fable review finding: `record_cooldown`'s two TRUE disable
+    hatches (`ttl_seconds<=0`, `$REVIEW_SEAT_COOLDOWN_SECONDS<=0`) are pure env/argument
+    checks with genuinely ZERO I/O — they must never enter `_locked()`, since lock
+    acquisition itself does unbounded `mkdir`/`os.open` on the sidecar file, which
+    would defeat the whole point of these being the "un-stick a seat RIGHT NOW" escape
+    hatches on a hung filesystem. This exact guarantee already regressed once during a
+    merge (the disable checks got nested INSIDE `with _locked(path):`) and nothing
+    caught it until manual review — pin it directly so a future regression fails the
+    suite instead. (`clear_cooldown`'s "nothing to clear" pre-check is a DIFFERENT,
+    weaker guarantee — it still calls `_load`, so it's covered separately by
+    `test_clear_cooldown_noop_skips_the_lock_but_not_the_read` below, not here.)
+
+    Patches `sc._locked` to a stub that records a call and raises if entered. The
+    `AssertionError` itself is swallowed by `record_cooldown`'s own blanket `except
+    Exception` (best-effort cache, per its docstring) — it is the final `calls == []`
+    assertion below, not the raise, that actually catches a regression; don't drop it
+    as "redundant" with the stub's raise."""
+
+    def _run():
+        calls = []
+
+        @contextlib.contextmanager
+        def _tripwire(path):
+            calls.append(path)
+            raise AssertionError("disable fast path entered _locked()")
+            yield  # pragma: no cover - unreachable, keeps this a generator function
+
+        saved = sc._locked
+        sc._locked = _tripwire
+        try:
+            sc.record_cooldown(MODEL, "session limit", now=1000.0, ttl_seconds=0.0)
+            saved_env = os.environ.get("REVIEW_SEAT_COOLDOWN_SECONDS")
+            os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = "0"
+            try:
+                sc.record_cooldown(MODEL, "session limit", now=1000.0)
+            finally:
+                if saved_env is None:
+                    os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+                else:
+                    os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = saved_env
+        finally:
+            sc._locked = saved
+        assert calls == [], calls
+
+    _with_store(_run)
+
+
+def test_clear_cooldown_noop_skips_the_lock_but_not_the_read():
+    """review-cli#188: `clear_cooldown`'s unlocked pre-check avoids LOCK ACQUISITION in
+    the common "nothing to clear" case, but (unlike record_cooldown's true disable
+    hatches above) it still performs one `_load` — a real file read, not zero I/O. Pins
+    exactly that: `_locked` is never entered when there's nothing to clear, but the
+    store IS read once."""
+
+    def _run():
+        calls = []
+
+        @contextlib.contextmanager
+        def _tripwire(path):
+            calls.append(path)
+            raise AssertionError("no-op clear_cooldown entered _locked()")
+            yield  # pragma: no cover - unreachable, keeps this a generator function
+
+        saved = sc._locked
+        sc._locked = _tripwire
+        try:
+            sc.clear_cooldown(MODEL)  # nothing was ever recorded — the no-op path
+        finally:
+            sc._locked = saved
+        assert calls == [], calls
+
+    _with_store(_run)
+
+
 def test_nan_ttl_env_falls_back_to_default_not_crash():
     """codex review finding: nan/inf both pass `<= 0` checks in Python
     (`float("nan") <= 0` and `float("inf") <= 0` are both False), so a malformed
@@ -277,13 +369,14 @@ def test_concurrent_writes_from_multiple_threads_never_corrupt_the_store():
     truncated/interleaved garbage) and at least one cooldown survives (the mechanism
     works, it isn't silently deadlocked/broken).
 
-    NOT pinned here (a separate, pre-existing, explicitly-accepted limitation — Fable
-    review finding: "read-modify-write is also lock-free... acceptable for best-effort"):
-    the OUTER read-modify-write (`_load` then `_write`) is not itself locked, so under
-    concurrent calls for DIFFERENT models, a later write can still overwrite an earlier
-    one's entry — a "last-writer-wins" lost update, not corruption. That is within this
-    module's documented contract (best-effort; a lost cooldown just costs one more real
-    dispatch next run, never a broken review) and is not what this test guards."""
+    The OUTER read-modify-write (`_load` then `_write`) used to be a separate,
+    explicitly-accepted lost-update race (last-writer-wins, not corruption) — that is now
+    closed by `_locked()` (review-cli#188) UNDER NORMAL CONTENTION (Opus review finding,
+    round 7: stated flatly here before, contradicting the module docstring's own "FIXED…
+    CONDITIONALLY" — the guarantee degrades to fully unlocked if a lock is held past
+    `_LOCK_TOTAL_DEADLINE_SECONDS`); see
+    `test_concurrent_writes_from_multiple_threads_never_lose_an_entry` below for that
+    guarantee specifically."""
     import json
     import threading
 
@@ -306,6 +399,642 @@ def test_concurrent_writes_from_multiple_threads_never_corrupt_the_store():
         assert any(sc.active_cooldown(m) is not None for m in models), data
 
     _with_store(_run)
+
+
+def test_concurrent_writes_from_multiple_threads_never_lose_an_entry():
+    """review-cli#188: the OUTER read-modify-write (`_load` then `_write`) used to be
+    unlocked, so two threads recording cooldowns for DIFFERENT models in the same board
+    round could both `_load()` the store before either `_write()`d — the second thread's
+    write then didn't include the first thread's new entry, silently dropping it
+    ("last-writer-wins", not corruption; the collision `test_concurrent_writes_from_
+    multiple_threads_never_corrupt_the_store` above guards is a different bug).
+
+    `_write` is patched here to sleep briefly INSIDE the critical section (after `_load`,
+    before the atomic replace) — this widens the race window so the test reliably exposes
+    a lost update if the read-modify-write is ever unlocked again, rather than depending
+    on OS thread-scheduling luck to occasionally interleave two real `_load`/`_write`
+    pairs. Under the `_locked()` fix, every other thread's `_load()` blocks on the
+    module-level `_LOCK` (a plain `threading.Lock`) until the sleeping thread's critical
+    section completes and releases it, so all N entries must survive — not just "at least
+    one", the weaker guarantee the older test above pins. This is the IN-PROCESS half of
+    the guarantee only: these threads never actually contend the `flock` itself (`_LOCK`
+    already serializes them before the flock is ever attempted) — see
+    `test_locked_serialises_record_cooldown_across_real_processes` below for the
+    cross-process half, which is the one that actually exercises flock contention (k3
+    review finding, round 1: this docstring previously claimed threads exercise the flock
+    path too, which is wrong — corrected here).
+
+    Fable review finding, round 3: this races the PRODUCTION `_LOCK_TOTAL_DEADLINE_
+    SECONDS` (worst-case serialized queue here is ~8 x 0.05s = 0.4s against a 2.0s
+    deadline, normally comfortable) — on a sufficiently loaded CI box that margin could
+    theoretically compress, and the failure mode on timeout is exactly the one this test
+    exists to catch (a degraded, unlocked write silently drops an entry), which would
+    then read as a flaky *test* failure. Raises the deadline for the duration of this
+    test only, matching the pattern the subprocess tests already use, so this test's
+    result reflects the locking logic, not a race against a timeout tuned for
+    production."""
+    import threading
+
+    def _run():
+        models = [f"claude:m{i}" for i in range(8)]
+        saved_write = _patched(sc, "_write", _slow_write_factory(sc._write))
+        saved_deadline = sc._LOCK_TOTAL_DEADLINE_SECONDS
+        sc._LOCK_TOTAL_DEADLINE_SECONDS = 10.0
+        try:
+            threads = [
+                threading.Thread(target=sc.record_cooldown, args=(m, "session limit"))
+                for m in models
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            assert not any(t.is_alive() for t in threads), "a thread wedged/deadlocked"
+        finally:
+            sc._write = saved_write
+            sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
+        missing = [m for m in models if sc.active_cooldown(m) is None]
+        assert missing == [], missing
+
+    _with_store(_run)
+
+
+def _slow_write_factory(real_write):
+    import time as _time
+
+    def _slow_write(path, data):
+        _time.sleep(0.05)
+        real_write(path, data)
+
+    return _slow_write
+
+
+def test_record_and_clear_interleave_without_losing_either_side():
+    """review-cli#188, Fable review finding: the new lock also serializes `clear_cooldown`
+    against a concurrent `record_cooldown` for a DIFFERENT model — previously either
+    direction could lose an update (a clear resurrected by a concurrent record's stale
+    snapshot, or a fresh record clobbered by a concurrent clear's stale snapshot). Records
+    one model, then races clearing IT while recording N others; the cleared model must
+    stay cleared and every other model's record must still land.
+
+    Fable review finding, round 3: raises `_LOCK_TOTAL_DEADLINE_SECONDS` for the
+    duration, same reasoning as the sibling test above — this shouldn't race the
+    production timeout tuned for a stalled-peer scenario."""
+    import threading
+
+    def _run():
+        cleared_model = "claude:to-clear"
+        other_models = [f"claude:keep{i}" for i in range(6)]
+        sc.record_cooldown(cleared_model, "session limit")
+        saved_write = _patched(sc, "_write", _slow_write_factory(sc._write))
+        saved_deadline = sc._LOCK_TOTAL_DEADLINE_SECONDS
+        sc._LOCK_TOTAL_DEADLINE_SECONDS = 10.0
+        try:
+            threads = [
+                threading.Thread(target=sc.clear_cooldown, args=(cleared_model,))
+            ] + [
+                threading.Thread(target=sc.record_cooldown, args=(m, "session limit"))
+                for m in other_models
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            assert not any(t.is_alive() for t in threads), "a thread wedged/deadlocked"
+        finally:
+            sc._write = saved_write
+            sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
+        assert sc.active_cooldown(cleared_model) is None, "clear was lost"
+        missing = [m for m in other_models if sc.active_cooldown(m) is None]
+        assert missing == [], missing
+
+    _with_store(_run)
+
+
+@pytest.mark.skipif(
+    sc.fcntl is None,
+    reason="flock-specific; no-fcntl platforms use the in-process-only degrade path exercised elsewhere",
+)
+def test_locked_serialises_record_cooldown_across_real_processes():
+    """review-cli#188, k3 review finding: `_locked`'s claim of a CROSS-PROCESS guarantee
+    (not just in-process, which a plain `threading.Lock` would already give) is
+    unverified by any thread-only test — mirrors
+    `tests/test_specweb.py::test_store_guard_serialises_across_processes`'s pattern of
+    spawning real subprocesses contending on one store file.
+
+    Opus/k3/GLM review findings, round 1: the first version of this test spawned 8 cold
+    `python -c` interpreters whose real `_write` critical section is microseconds — startup
+    jitter alone (tens of milliseconds) already keeps them from overlapping, so the test
+    passed even with the flock removed entirely. Each child now patches its own `_write` to
+    sleep, mirroring `_slow_write_factory`, so the flock is actually contended — this is the
+    change that makes the test capable of failing if `_locked` regresses. Each child also
+    raises its own `_LOCK_TOTAL_DEADLINE_SECONDS` well above 4 processes' worst-case
+    queuing time — the production default is intentionally short (never block the caller
+    for long on a stalled peer, see `test_locked_degrades_instead_of_hanging_when_peer_
+    holds_the_flock`), and this test's whole point is proving REAL contention serializes
+    correctly, not racing that same short deadline.
+
+    GLM review finding, round 2: trimmed from 8 processes x 0.2s to 4 x 0.1s — the
+    lost-update failure mode only needs >=2 writers overlapping, and this keeps the wall
+    clock this inherently-unparallelizable test costs the suite down without weakening
+    what it proves."""
+    if sc.fcntl is None:
+        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
+        # pytest markers (it calls every test_* directly), so this early-return is
+        # what actually skips the test outside real pytest collection.
+    import subprocess
+    import sys as _sys
+
+    def _run():
+        models = [f"claude:proc{i}" for i in range(4)]
+        store_file = sc.cooldown_path()
+        prog = (
+            "import sys, time;"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r});"
+            "from reviewlib import seat_cooldown as sc;"
+            "sc._LOCK_TOTAL_DEADLINE_SECONDS = 10.0;"
+            "sc._FLOCK_SUB_BUDGET_SECONDS = 10.0;"
+            "_real = sc._write;"
+            "sc._write = lambda p, d: (time.sleep(0.1), _real(p, d))[1];"
+            "sc.record_cooldown(sys.argv[1], 'session limit')"
+        )
+        env = dict(os.environ, REVIEW_SEAT_COOLDOWN_FILE=str(store_file))
+        procs = [
+            subprocess.Popen([_sys.executable, "-c", prog, m], env=env) for m in models
+        ]
+        try:
+            for p in procs:
+                assert p.wait(timeout=30) == 0
+        finally:
+            # k3 review finding, round 4: `wait(timeout=...)` raises `TimeoutExpired`
+            # without killing the child on a hang regression (exactly the failure mode
+            # this test exists to catch) — leaking wedged interpreters into the rest of
+            # the suite. Kill anything still alive regardless of how we got here.
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+        missing = [m for m in models if sc.active_cooldown(m) is None]
+        assert missing == [], missing
+
+    _with_store(_run)
+
+
+@pytest.mark.skipif(
+    sc.fcntl is None,
+    reason="flock-specific; no-fcntl platforms use the in-process-only degrade path exercised elsewhere",
+)
+def test_locked_serialises_clear_cooldown_across_real_processes():
+    """review-cli#188, Opus review finding, round 2: only `record_cooldown` had a
+    cross-process test — `clear_cooldown` has the identical read-modify-write shape and no
+    coverage of its own, and it's arguably the more user-visible direction to lose (a
+    lost clear resurrects a cooldown, keeping a healthy seat wrongly skipped). Records N
+    models, then races clearing all of them across real subprocesses; every clear must
+    land."""
+    if sc.fcntl is None:
+        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
+        # pytest markers (it calls every test_* directly), so this early-return is
+        # what actually skips the test outside real pytest collection.
+    import subprocess
+    import sys as _sys
+
+    def _run():
+        models = [f"claude:clear-proc{i}" for i in range(4)]
+        for m in models:
+            sc.record_cooldown(m, "session limit")
+        store_file = sc.cooldown_path()
+        prog = (
+            "import sys, time;"
+            f"sys.path.insert(0, {str(REPO_ROOT)!r});"
+            "from reviewlib import seat_cooldown as sc;"
+            "sc._LOCK_TOTAL_DEADLINE_SECONDS = 10.0;"
+            "sc._FLOCK_SUB_BUDGET_SECONDS = 10.0;"
+            "_real = sc._write;"
+            "sc._write = lambda p, d: (time.sleep(0.1), _real(p, d))[1];"
+            "sc.clear_cooldown(sys.argv[1])"
+        )
+        env = dict(os.environ, REVIEW_SEAT_COOLDOWN_FILE=str(store_file))
+        procs = [
+            subprocess.Popen([_sys.executable, "-c", prog, m], env=env) for m in models
+        ]
+        try:
+            for p in procs:
+                assert p.wait(timeout=30) == 0
+        finally:
+            # k3 review finding, round 4: see the sibling record_cooldown test above —
+            # same rationale, kill anything left alive after a hang regression.
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+        still_cooling = [m for m in models if sc.active_cooldown(m) is not None]
+        assert still_cooling == [], still_cooling
+
+    _with_store(_run)
+
+
+def test_locked_degrades_to_in_process_lock_when_fcntl_is_unavailable():
+    """review-cli#188, Opus/GLM review findings, round 1: the module docstring promises
+    that on platforms without `fcntl` (Windows), locking degrades to the in-process `_LOCK`
+    alone rather than skipping the write — nothing pinned that a write still lands in this
+    branch. Simulates the Windows case by patching the module's `fcntl` reference to
+    `None`, mirroring how the module itself detects it at import time."""
+
+    def _run():
+        saved_fcntl = sc.fcntl
+        sc.fcntl = None
+        try:
+            sc.record_cooldown("claude:no-fcntl", "session limit")
+            assert sc.active_cooldown("claude:no-fcntl") is not None
+            sc.clear_cooldown("claude:no-fcntl")
+            assert sc.active_cooldown("claude:no-fcntl") is None
+        finally:
+            sc.fcntl = saved_fcntl
+
+    _with_store(_run)
+
+
+@pytest.mark.skipif(
+    sc.fcntl is None,
+    reason="flock-specific; the no-fcntl degrade path is covered directly by test_locked_degrades_to_in_process_lock_when_fcntl_is_unavailable",
+)
+def test_locked_degrades_to_in_process_lock_when_flock_raises_oserror():
+    """review-cli#188, Opus/GLM review findings, round 1: the module docstring promises
+    that a flock-acquisition `OSError` (an odd filesystem without working advisory locks)
+    degrades to the in-process `_LOCK` alone rather than aborting the write — nothing
+    pinned that a write still lands in this branch. Patches `fcntl.flock` to always raise,
+    which is exactly the `except OSError` path in `_locked`.
+
+    k3 review finding, round 2: `sc.fcntl` IS the stdlib `fcntl` module object, so
+    patching `sc.fcntl.flock` directly mutates a module every other consumer in the
+    process shares (e.g. `reviewlib.specweb.store.SpecStore._guard`) for the duration of
+    this test. Swap the module REFERENCE instead — a lightweight stand-in exposing only
+    what `_locked` touches — so nothing outside this test's own `finally` can observe the
+    raising stub."""
+    if sc.fcntl is None:
+        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
+        # pytest markers (it calls every test_* directly), so this early-return is
+        # what actually skips the test outside real pytest collection.
+    import types
+
+    def _run():
+        real_fcntl = sc.fcntl
+        fake_fcntl = types.SimpleNamespace(
+            LOCK_EX=real_fcntl.LOCK_EX,
+            LOCK_NB=real_fcntl.LOCK_NB,
+            LOCK_UN=real_fcntl.LOCK_UN,
+            flock=lambda *_a, **_k: (_ for _ in ()).throw(
+                OSError("simulated: no advisory locks on this filesystem")
+            ),
+        )
+        sc.fcntl = fake_fcntl
+        try:
+            sc.record_cooldown("claude:flock-oserror", "session limit")
+            assert sc.active_cooldown("claude:flock-oserror") is not None
+            sc.clear_cooldown("claude:flock-oserror")
+            assert sc.active_cooldown("claude:flock-oserror") is None
+        finally:
+            sc.fcntl = real_fcntl
+
+    _with_store(_run)
+
+
+@pytest.mark.skipif(
+    sc.fcntl is None,
+    reason="flock-specific; the no-fcntl degrade path is covered directly by test_locked_degrades_to_in_process_lock_when_fcntl_is_unavailable",
+)
+def test_locked_degrades_instead_of_hanging_when_peer_holds_the_flock():
+    """review-cli#188, Opus/GLM review findings, round 1 [High]: the original `_locked`
+    used a BLOCKING `fcntl.flock(fd, LOCK_EX)` acquire — a peer holding the lock past any
+    point (a stalled/paused process, a hung network filesystem) would hang this call
+    forever, violating the module's own "never blocks the caller" contract that every
+    other code path here honors. The fix bounds the retry to
+    `_LOCK_TOTAL_DEADLINE_SECONDS` and then degrades to the in-process `_LOCK` alone —
+    same as the OSError/no-fcntl degrade paths — instead of blocking indefinitely.
+
+    Holds the real flock open in THIS process (on the actual lock file `_locked` would
+    use) for longer than the retry deadline, then confirms `record_cooldown` still
+    completes promptly (not hung) and the write still lands once the peer's hold matters
+    no more than the degrade path allows.
+
+    Opus review finding, round 2 [High]: measuring `elapsed` AFTER `record_cooldown()`
+    returns means a REGRESSION to unbounded blocking would hang this test itself (and the
+    whole suite) instead of failing it — no assertion is ever reached. Runs the call in a
+    worker thread and joins with a timeout instead, matching the pattern the sibling
+    concurrency tests above already use, so a regression here is reported as a failure.
+
+    Opus review finding, round 7: the global-patching setup (deadline/interval) AND the
+    flock acquisition used to happen BEFORE the `try:` — if any of `mkdir`/`os.open`/
+    `flock(LOCK_EX)` raised, both globals stayed patched (leaking `0.3` into every OTHER
+    test in the session) and `held_fd` leaked with the real flock still held. Capturing
+    `saved_*` is pure reads (can't fail) and now happens first; everything that CAN fail
+    is inside `try`, so `finally` always restores the globals — and only releases
+    `held_fd` if it was actually opened.
+
+    Final review round: the flock retry now has its OWN sub-budget
+    (`_FLOCK_SUB_BUDGET_SECONDS`), separate from `_LOCK_TOTAL_DEADLINE_SECONDS` — that
+    is the constant actually bounding this scenario (a held FLOCK, not a held `_LOCK`),
+    so it's the one patched to make this test's timing assertions meaningful again."""
+    if sc.fcntl is None:
+        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
+        # pytest markers (it calls every test_* directly), so this early-return is
+        # what actually skips the test outside real pytest collection.
+    import threading
+    import time as _time
+
+    def _run():
+        saved_deadline = sc._LOCK_TOTAL_DEADLINE_SECONDS
+        saved_sub_budget = sc._FLOCK_SUB_BUDGET_SECONDS
+        saved_interval = sc._FLOCK_RETRY_INTERVAL_SECONDS
+        held_fd = None
+        try:
+            sc._LOCK_TOTAL_DEADLINE_SECONDS = 0.3
+            sc._FLOCK_SUB_BUDGET_SECONDS = 0.3
+            sc._FLOCK_RETRY_INTERVAL_SECONDS = 0.02
+            path = sc.cooldown_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = path.parent / f".{path.name}.lock"
+            held_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            sc.fcntl.flock(held_fd, sc.fcntl.LOCK_EX)
+
+            t = threading.Thread(
+                target=sc.record_cooldown, args=("claude:contended", "session limit")
+            )
+            started = _time.monotonic()
+            t.start()
+            t.join(timeout=5)
+            elapsed = _time.monotonic() - started
+            assert not t.is_alive(), (
+                f"record_cooldown hung waiting on a held peer lock (>{elapsed}s, wedged)"
+            )
+            assert elapsed < 2.0, (
+                f"record_cooldown took {elapsed}s, should degrade fast"
+            )
+            # Fable review finding, round 4: a lower bound too — without it, a future
+            # refactor that renamed the sidecar lock path (making `held_fd` contend
+            # nothing) would leave this passing vacuously (the worker just acquires the
+            # REAL, uncontended lock instantly). A near-zero `elapsed` means no
+            # contention happened at all.
+            assert elapsed >= 0.25, (
+                f"record_cooldown returned in {elapsed}s — too fast to have actually "
+                "contended the held lock; is the sidecar lock path still correct?"
+            )
+            assert sc.active_cooldown("claude:contended") is not None
+        finally:
+            if held_fd is not None:
+                sc.fcntl.flock(held_fd, sc.fcntl.LOCK_UN)
+                os.close(held_fd)
+            sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
+            sc._FLOCK_SUB_BUDGET_SECONDS = saved_sub_budget
+            sc._FLOCK_RETRY_INTERVAL_SECONDS = saved_interval
+
+    _with_store(_run)
+
+
+def test_flock_sub_budget_lets_inprocess_threads_serialize_despite_held_flock():
+    """review-cli#188, Fable review finding, final round: the sub-budget's headline
+    behavior — that a held CROSS-process flock degrades the FIRST in-process thread to
+    `_LOCK`-only quickly, so every OTHER in-process thread still serializes on `_LOCK`
+    and none of them lose an update — was previously pinned only by a numeric ratio
+    (`test_flock_sub_budget_is_meaningfully_smaller_than_the_total_deadline`), not by
+    behavior. A regression that set `flock_deadline = deadline` (ignoring the
+    sub-budget entirely) would pass every existing test — the constants test doesn't
+    change, and the single-thread flock-hold test can't distinguish which constant
+    bounded the spin — while silently reintroducing the exact convoy this mechanism
+    exists to prevent (this test file's own round-3 history already shows a
+    regression-that-passes-everything-else is a real failure mode here, not a
+    hypothetical one).
+
+    Holds the real flock externally (same technique as the single-thread test above),
+    then races several in-process threads (slow `_write`, same technique as
+    `test_concurrent_writes_from_multiple_threads_never_lose_an_entry`) against it, with
+    the constants at their PRODUCTION-shaped ratio (sub-budget << total deadline, not
+    patched equal to each other). Under the fix, the first thread to reach `_locked`
+    degrades to `_LOCK`-only within the small sub-budget, and the rest serialize
+    normally on `_LOCK` — every entry must land. Under the regression, all threads
+    queue on `_LOCK` for the full deadline and degrade to fully unlocked together,
+    losing entries."""
+    if sc.fcntl is None:
+        return  # pytest.mark.skipif above; smoke.py's standalone runner ignores
+        # pytest markers (it calls every test_* directly), so this early-return is
+        # what actually skips the test outside real pytest collection.
+    import threading
+
+    def _run():
+        models = [f"claude:budget{i}" for i in range(6)]
+        saved_write = _patched(sc, "_write", _slow_write_factory(sc._write))
+        saved_deadline = sc._LOCK_TOTAL_DEADLINE_SECONDS
+        saved_sub_budget = sc._FLOCK_SUB_BUDGET_SECONDS
+        held_fd = None
+        try:
+            # Production-shaped ratio, scaled up for test stability: sub-budget stays
+            # well under the total deadline, same relationship as the real defaults
+            # (0.15s / 2.0s), just slower so this test isn't itself flaky under load.
+            sc._LOCK_TOTAL_DEADLINE_SECONDS = 5.0
+            sc._FLOCK_SUB_BUDGET_SECONDS = 0.3
+            path = sc.cooldown_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = path.parent / f".{path.name}.lock"
+            held_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            sc.fcntl.flock(held_fd, sc.fcntl.LOCK_EX)  # external peer holds it for good
+
+            threads = [
+                threading.Thread(target=sc.record_cooldown, args=(m, "session limit"))
+                for m in models
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            assert not any(t.is_alive() for t in threads), "a thread wedged/deadlocked"
+        finally:
+            if held_fd is not None:
+                sc.fcntl.flock(held_fd, sc.fcntl.LOCK_UN)
+                os.close(held_fd)
+            sc._write = saved_write
+            sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
+            sc._FLOCK_SUB_BUDGET_SECONDS = saved_sub_budget
+        missing = [m for m in models if sc.active_cooldown(m) is None]
+        assert missing == [], missing
+
+    _with_store(_run)
+
+
+def test_locked_degrades_to_fully_unlocked_when_a_peer_holds_lock_itself():
+    """review-cli#188, Fable/k3 review findings, round 3 [Medium, both independently
+    found] — the round-2 headline fix (bounding `_LOCK.acquire()` itself, not just the
+    flock retry) had NO test: k3 proved this by reverting `_locked` to the round-1 shape
+    (`with _LOCK:`, a plain unbounded acquire) and confirming every other new test in this
+    file still passed. `test_locked_degrades_instead_of_hanging_when_peer_holds_the_flock`
+    only holds the FLOCK — the worker thread there acquires `_LOCK` instantly since
+    nothing contends it — so it exercises round 1's fix, not round 2's.
+
+    This test holds `_LOCK` itself (simulating a same-process thread stalled INSIDE its
+    own critical section — the exact scenario round 2's docstring describes, e.g. a
+    thread's `_write` hung on a stuck network filesystem) and confirms a second caller
+    degrades to FULLY unlocked (never even attempts the flock) and completes within the
+    shortened deadline instead of blocking on `_LOCK.acquire()` forever.
+
+    Opus review finding, round 7: `sc._LOCK_TOTAL_DEADLINE_SECONDS = 0.3` used to run
+    BEFORE `try:`, alongside the `_LOCK.acquire()` — if the acquire assertion ever failed
+    (e.g. a preceding test genuinely leaked `_LOCK`), the deadline stayed patched at `0.3`
+    and leaked into every OTHER test in the session, including
+    `test_lock_total_deadline_is_bounded_short` (which would then fail reporting "the
+    production deadline regressed" — actively misdirecting from the real cause). Capturing
+    `saved_deadline` is a pure read (can't fail) and now happens first; the mutation and
+    the acquire are both inside `try`, so `finally` always restores the deadline."""
+    import threading
+    import time as _time
+
+    def _run():
+        saved_deadline = sc._LOCK_TOTAL_DEADLINE_SECONDS
+        acquired = False
+        try:
+            sc._LOCK_TOTAL_DEADLINE_SECONDS = 0.3
+            # k3 review finding, round 4: a plain unbounded `acquire()` here means that IF
+            # a preceding test ever leaked `_LOCK` (exactly the regression class
+            # test_locked_releases_the_lock_when_the_body_raises above guards against),
+            # this test's own setup would hang the whole suite instead of failing cleanly.
+            acquired = sc._LOCK.acquire(timeout=5)
+            assert acquired, "could not acquire _LOCK for test setup"
+            t = threading.Thread(
+                target=sc.record_cooldown,
+                args=("claude:lock-contended", "session limit"),
+            )
+            started = _time.monotonic()
+            t.start()
+            t.join(timeout=5)
+            elapsed = _time.monotonic() - started
+            assert not t.is_alive(), (
+                f"record_cooldown hung waiting on a peer holding _LOCK (>{elapsed}s, wedged)"
+            )
+            assert elapsed < 2.0, (
+                f"record_cooldown took {elapsed}s, should degrade fast"
+            )
+            # Fable review finding, round 4: lower bound too, same rationale as the
+            # sibling flock-contention test above — a near-zero elapsed would mean this
+            # test never actually contended `_LOCK` at all.
+            assert elapsed >= 0.25, (
+                f"record_cooldown returned in {elapsed}s — too fast to have actually "
+                "contended the held _LOCK"
+            )
+        finally:
+            if acquired:
+                sc._LOCK.release()
+            sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
+        # The write happened fully unlocked (the "peer" never released _LOCK until after
+        # the worker thread returned), so it must still have landed via the pre-fix
+        # best-effort path — proving the degrade doesn't just complete fast, it still
+        # writes.
+        assert sc.active_cooldown("claude:lock-contended") is not None
+
+    _with_store(_run)
+
+
+def test_locked_releases_the_lock_when_the_body_raises():
+    """review-cli#188, Opus review finding, round 2: nothing pinned that `_locked` releases
+    `_LOCK` (and the flock) when the wrapped body raises mid-critical-section (a plausible
+    real case: `_write`'s `os.replace` hitting ENOSPC/EXDEV). If release ever regressed to
+    only happening on the success path, every SUBSEQUENT cooldown write in the process
+    would deadlock silently behind `record_cooldown`'s own `except Exception: pass` —
+    invisible until something notices cooldowns stopped recording entirely. Forces the body
+    to raise once via `_write`, then confirms a following normal call still completes and
+    persists (proving the lock actually let go).
+
+    Opus review finding, round 5 [High]: as originally written this test was VACUOUS —
+    it could not fail. Round 2's bounded `_LOCK.acquire(timeout=...)` means a genuinely
+    LEAKED `_LOCK` no longer deadlocks the next call: it just times out after
+    `_LOCK_TOTAL_DEADLINE_SECONDS` (unpatched here, so the production 2.0s), takes the
+    fully-unlocked degrade path, and the write lands anyway — identically to the
+    lock-was-released case, just ~2s slower with nothing asserting the delay. Mentally
+    deleting `_LOCK.release()` from `_locked` would still pass both assertions. Fixed by
+    directly probing that `_LOCK` is free (non-blocking acquire) right after the raising
+    call — this is the only way to actually distinguish "released" from "leaked but
+    silently degraded around".
+
+    Opus review finding, round 6 [Medium/High]: same vacuity class, the OTHER half. The
+    round-5 fix only probed `_LOCK` — a regression that stopped releasing the FLOCK on
+    exception (moved `LOCK_UN`/`close` to the success path only) would still pass both
+    existing assertions: `_LOCK` (the outer lock) is released regardless by the outer
+    `finally`, so the `_LOCK` probe reads free; the follow-up call opens a NEW fd, hits
+    `BlockingIOError` against the leaked flock, retries out the unpatched deadline, and
+    degrades to unlocked — landing the write anyway, just slower with nothing timing it.
+    Probes the flock the same way: a non-blocking `LOCK_EX` attempt on the real sidecar
+    lock file must succeed (meaning nothing still holds it) right after the raising call."""
+
+    def _run():
+        def _boom(_path, _data):
+            raise RuntimeError("simulated write failure mid-critical-section")
+
+        saved_write = _patched(sc, "_write", _boom)
+        try:
+            sc.record_cooldown(
+                "claude:boom", "session limit"
+            )  # swallowed by record_cooldown
+        finally:
+            sc._write = saved_write
+        assert sc.active_cooldown("claude:boom") is None, (
+            "the failed write must not land"
+        )
+
+        freed = sc._LOCK.acquire(blocking=False)
+        if freed:
+            sc._LOCK.release()
+        assert freed, "_LOCK was leaked by the raising body, not released"
+
+        if sc.fcntl is not None:
+            path = sc.cooldown_path()
+            lock_path = path.parent / f".{path.name}.lock"
+            probe = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                sc.fcntl.flock(probe, sc.fcntl.LOCK_EX | sc.fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise AssertionError(
+                    "the sidecar flock was leaked by the raising body, not released"
+                )
+            else:
+                sc.fcntl.flock(probe, sc.fcntl.LOCK_UN)
+            finally:
+                os.close(probe)
+
+        sc.record_cooldown("claude:after-boom", "session limit")
+        assert sc.active_cooldown("claude:after-boom") is not None, (
+            "a write after a raising body means the lock was released, not leaked"
+        )
+
+    _with_store(_run)
+
+
+def test_lock_total_deadline_is_bounded_short():
+    """review-cli#188, k3 review finding, round 1: the production
+    `_LOCK_TOTAL_DEADLINE_SECONDS` value itself was unpinned — a regression that silently
+    raised it to, say, 30s would gut the "never blocks the caller for long" contract this
+    fix exists to protect, and every mechanism test above patches the constant away before
+    exercising the degrade path, so none of them would notice. Pins the production default
+    directly.
+
+    Opus review finding, round 5 [Medium]: pinning only the UPPER bound leaves
+    `_LOCK_TOTAL_DEADLINE_SECONDS = 0.0` free to sail through — silently routing every
+    call to the fully-unlocked degrade path, reverting #188's actual guarantee with no
+    test failing. Pins a lower bound too."""
+    assert 0.5 <= sc._LOCK_TOTAL_DEADLINE_SECONDS <= 2.0, (
+        sc._LOCK_TOTAL_DEADLINE_SECONDS
+    )
+
+
+def test_flock_sub_budget_is_meaningfully_smaller_than_the_total_deadline():
+    """review-cli#188, final review round: `_FLOCK_SUB_BUDGET_SECONDS` is the actual
+    fix for the in-process convoy (see its own comment) — a regression that silently
+    raised it back up to (or past) `_LOCK_TOTAL_DEADLINE_SECONDS` would make the flock
+    retry spin for the full shared deadline again, reintroducing the exact
+    simultaneous-degrade bug this constant exists to prevent, with no test failing.
+    Pins both a sane absolute range and that it stays meaningfully smaller than the
+    total deadline (not just numerically less)."""
+    assert 0.05 <= sc._FLOCK_SUB_BUDGET_SECONDS <= 0.5, sc._FLOCK_SUB_BUDGET_SECONDS
+    assert sc._FLOCK_SUB_BUDGET_SECONDS <= sc._LOCK_TOTAL_DEADLINE_SECONDS / 2, (
+        sc._FLOCK_SUB_BUDGET_SECONDS,
+        sc._LOCK_TOTAL_DEADLINE_SECONDS,
+    )
 
 
 # ---- wiring into review_claude ------------------------------------------------------------
