@@ -28,7 +28,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
+from .config import _agentic
 from .install import install_codex_recursion_guard
+from .model_behavior import true_silence_timeout_seconds
 from .process import (
     _run,
     _run_streamed,
@@ -278,7 +280,7 @@ def review_with_images(
         # was the one dispatch path that never consulted or recorded seat_cooldown).
         cooldown = active_cooldown(model)
         if cooldown is not None:
-            return _cooldown_skip_result(model, round_no, cooldown)
+            return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
         result = review_claude_cli_with_images(
             model, prompt, diff, cwd, timeout, round_no, images, effort=effort
         )
@@ -663,6 +665,79 @@ def _opencode_runs_in_repo(cwd: Path) -> bool:
     return True
 
 
+def _record_true_silence_if_needed(model: str, proc) -> None:
+    """After an opencode `_run_streamed` call (codex review finding, round 13: only
+    opencode calls this today — omp is tracked for the same wiring in #235, not done
+    yet): if it was reaped for producing ZERO output (`proc.true_silenced` — see
+    process._run_streamed's
+    true_silence_timeout), record a cooldown so the NEXT invocation skips this seat
+    for a while instead of paying for another multi-minute stuck dispatch (Alex's
+    request 2026-08-19/20). A no-op for every other outcome (ordinary success,
+    ordinary idle-timeout, or a real error) — those are unrelated to true-silence and
+    already handled by their own existing paths.
+
+    Branches on the explicit `.true_silenced` attribute, NOT `proc.returncode == 125`
+    (round-2 review finding, codex + Fable): 125 is a real exit code some CLIs/
+    wrappers legitimately use on their own (`timeout(1)`'s "the wrapper itself
+    failed", docker run, git-bisect skip) — a child that happens to genuinely exit
+    125 by itself, even after producing full real output, must never be misdiagnosed
+    as a true-silence reap and wrongly benched. `getattr(..., False)` tolerates a
+    plain mock/fake CompletedProcess in tests that doesn't set the attribute at all.
+
+    Deliberately does NOT pass an explicit `ttl_seconds` to `record_cooldown` (codex
+    review finding, round 1): an explicit TTL makes `record_cooldown` treat every
+    occurrence as `fail_count = 1` (see its docstring), which would silently DISABLE
+    the escalating cooldown schedule this repo already ships (review-cli#230) for a
+    model that keeps going true-silent repeatedly. Letting the reason string alone
+    drive an un-parameterized `record_cooldown` call means it escalates exactly like
+    every other cooldown-worthy failure.
+
+    codex review finding, round 3: a genuine success ALSO clears any true-silence
+    cooldown history, mirroring `clear_cooldown`'s own documented contract (it names
+    this as one of backends.py's two intended call sites) and review_claude's sibling
+    pattern above. Without this, a seat that recovers after one true-silence reap,
+    then goes true-silent again later (still within the 24h escalation-reset window),
+    would wrongly resume at `fail_count=2` (30 minutes) instead of resetting to
+    `fail_count=1` (10 minutes) — the same "never actually recovers" shape #221 fixed
+    for the ordinary chronic-failure path.
+
+    codex review finding, round 12 (P1): a bare `returncode == 0 and stdout.strip()`
+    treated ANY non-empty rc=0 body as recovery — including a chronic-unavailable-
+    shaped sentinel body (the same 4 marker phrases `review_claude`'s sibling clear
+    already guards against via `_chronic_unavailable_reason`). `_chronic_unavailable_
+    reason` is NOT actually claude-specific in implementation — it only inspects the
+    generic `ReviewResult`-shaped `.stdout`/`.returncode`/`.stderr`, it is simply not
+    wired into any non-claude call site yet — so reusing it here, mirroring
+    `review_claude_with_images`'s exact pattern above, closes the false-clear for any
+    body matching that SHARED marker vocabulary, using zero new detection logic. This
+    narrows, but does not fully close, review-cli#226 (codex review finding, round 17:
+    an earlier version of this docstring wrongly claimed the unrecognised case is a
+    no-op — it is NOT): an opencode-specific quota wording that matches NONE of the 4
+    shared marker phrases falls through past `reason is None` to the `elif` below,
+    which DOES clear the cooldown (any non-empty rc=0 body is treated as recovery
+    unless it matches a known chronic sentinel) — the exact same behavior
+    `review_claude`'s identical sibling pattern has always had for an unrecognised
+    claude quota wording, not a new gap this diff introduces. Building genuine
+    opencode-specific quota-body detection (so an unrecognised wording is correctly
+    classified as chronic rather than defaulting to "success") remains #226's job.
+
+    Opus review finding, round 14 (doc accuracy): `_chronic_unavailable_reason` runs
+    on EVERY non-true-silenced outcome, not just the rc=0 sentinel case — a non-zero
+    exit whose stderr/short-stdout matches `_CHRONIC_QUOTA_MARKERS` ("session limit" /
+    "usage-credits" / "usage credits") ALSO records a cooldown here, mirroring
+    `review_claude`'s identical handling of that same signal. The narrower framing
+    above ("closes the false-clear ... rc=0 body") describes the round-12 FIX's
+    motivating scenario, not the full scope of what this call now covers."""
+    if getattr(proc, "true_silenced", False):
+        record_cooldown(model, "true-silence timeout")
+        return
+    reason = _chronic_unavailable_reason(proc)
+    if reason is not None:
+        record_cooldown(model, reason)
+    elif proc.returncode == 0 and proc.stdout.strip():
+        clear_cooldown(model)
+
+
 def review_opencode(
     model: str,
     prompt: str,
@@ -674,11 +749,61 @@ def review_opencode(
 ) -> ReviewResult:
     prompt = _prompt_with_effort(prompt, effort)
     oc_model = model.split(":", 1)[1] if ":" in model else model
+    # codex review finding, review-cli#243 round 22: `resolve_backend` routes BOTH the
+    # `oc:` and `opencode:` prefixes here (config.py's own `_agentic` docstring calls
+    # this pair "both spellings" deliberately), but the cooldown store and
+    # model_behavior registry are keyed by the raw, un-normalized `model` string —
+    # `oc:zai/glm-5.2` and `opencode:zai/glm-5.2` would build SEPARATE cooldown/
+    # behavior histories for what the board/dashboard treat as the SAME canonical
+    # seat. `_agentic` is idempotent+canonical for an already-agentic id (returns
+    # `oc:...` unchanged, rewrites `opencode:...` to it) — reused here rather than
+    # duplicating that normalization, so a true-silence trip via either spelling
+    # protects the next dispatch regardless of which spelling it uses.
+    #
+    # codex review finding, round 26 (P1 — supersedes the round-23/24 notes this
+    # replaced): `canonical_model` must NEVER leak into a RETURNED `ReviewResult.model`
+    # — only into internal cooldown-store / model_behavior-registry KEYS. Rounds 23-24
+    # made the returned `.model` canonical on every exit path (dispatch, skip, unpaid,
+    # preflight) to fix an inconsistency BETWEEN those paths — but that broke a
+    # load-bearing invariant a caller several layers up already depends on:
+    # `reviewlib/modes/review.py`'s flat-diff path builds `by_model = {result.model:
+    # result for result in results}` and then looks up `by_model[model]` for each
+    # ORIGINAL requested model string. `review diff -m opencode:zai/glm-5.2` would
+    # dispatch with `models = ["opencode:zai/glm-5.2"]`, get back a result whose
+    # `.model` was rewritten to `"oc:zai/glm-5.2"`, and KeyError on the lookup —
+    # crashing a basic, real CLI invocation. The correct fix keeps EVERY returned
+    # `ReviewResult.model` as the caller's own `model` string, unchanged — `canonical_
+    # model` is scoped to internal lookups only (`active_cooldown`, `record_cooldown`/
+    # `clear_cooldown` via `_record_true_silence_if_needed`, `true_silence_timeout_
+    # seconds`), which never leak their key back into anything a caller inspects.
+    #
+    # codex review finding, round 25 (deferred, tracked #259): `_agentic` and
+    # `oc_model` above parse a catch-all colon-form id (no `oc:`/`opencode:` prefix
+    # — `resolve_backend`'s documented back-compat fallback for an unrecognized
+    # model) DIFFERENTLY -- `oc_model` drops everything before the first colon
+    # (silently discarding the provider segment), `_agentic` keeps it as a provider/
+    # model pair. This is a real, narrow edge case (not the standard `oc:`/
+    # `opencode:` path this fix covers), and fixing it means deciding the correct
+    # provider-parsing contract for that pre-existing catch-all derivation — a
+    # product/design question, not a mechanical one — so it's tracked, not fixed here.
+    canonical_model = _agentic(model)
     unpaid = unpaid_provider_result(
         model, backend="opencode", command=f"opencode -m {oc_model}", round_no=round_no
     )
     if unpaid is not None:
         return unpaid
+    # codex review finding (round 1): recording a true-silence cooldown is useless if
+    # nothing ever CHECKS it before the next dispatch — mirrors review_claude's own
+    # cooldown-consult pattern, so a seat that just went true-silent is actually
+    # skipped (a synthetic sentinel, same shape failover already knows how to handle)
+    # instead of paying for another multi-minute stuck attempt on every invocation.
+    cooldown = active_cooldown(canonical_model)
+    if cooldown is not None:
+        # `backend="opencode"` (codex review finding, round 2): without this the skip
+        # was hard-coded to "claude" in the sidecar log/dashboard, mislabeling every
+        # opencode cooldown skip as a Claude/Fable event and hiding the real `oc:*`
+        # seat's health. `model` (not `canonical_model`) here too — round 26.
+        return _cooldown_skip_result(model, round_no, cooldown, backend="opencode")
     _which("opencode")
     preflight = provider_preflight_result(
         model, backend="opencode", command=f"opencode -m {oc_model}", round_no=round_no
@@ -728,7 +853,9 @@ def review_opencode(
             round_no=round_no,
             announce=_ANNOUNCE_LOGS,
             header_argv0=f"opencode -m {_safe_log_header(oc_model)}",
+            true_silence_timeout=true_silence_timeout_seconds(canonical_model),
         )
+        _record_true_silence_if_needed(canonical_model, proc)
         return ReviewResult(
             model=model,
             command=command,
@@ -780,7 +907,9 @@ def review_opencode(
             round_no=round_no,
             announce=_ANNOUNCE_LOGS,
             header_argv0=f"opencode -m {_safe_log_header(oc_model)}",
+            true_silence_timeout=true_silence_timeout_seconds(canonical_model),
         )
+    _record_true_silence_if_needed(canonical_model, proc)
     return ReviewResult(
         model=model,
         command=command,
@@ -2121,7 +2250,7 @@ def review_claude(
         return unpaid
     cooldown = active_cooldown(model)
     if cooldown is not None:
-        return _cooldown_skip_result(model, round_no, cooldown)
+        return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
     mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
     if mode == "api":
         result = review_claude_api(
@@ -2270,21 +2399,54 @@ def _bounded_cooldown_skip_body(model: str, reason: str, remaining: int) -> str:
     return _build(model[:model_budget], "")
 
 
-def _cooldown_skip_result(model: str, round_no: int, cooldown: dict) -> ReviewResult:
+def _cooldown_skip_result(
+    model: str, round_no: int, cooldown: dict, *, backend: str
+) -> ReviewResult:
     """Build the synthetic ReviewResult for a cached-cooldown skip, and log it via the
     same REST sidecar path REST backends use — so the dashboard still sees the call (as
     a skipped/paywall-shaped one) instead of the seat silently vanishing from a session.
+
+    ``backend`` attributes the skip to the ACTUAL seat that cooled down (codex review
+    finding, round 2: an earlier version of this function hard-coded "claude" for every
+    caller, so an opencode true-silence cooldown skip was logged/dashboarded as a
+    Claude/Fable event — corrupting attribution and hiding the real `oc:*` seat).
+    Required (no default) as of round 3 (Fable review finding): a default of "claude"
+    would silently reintroduce the exact same misattribution class for the NEXT
+    backend that grows a cooldown gate (review-cli#235 plans five more) if its author
+    simply forgets the keyword — every call site must now name its own backend
+    explicitly, enforced at call time, not by convention.
 
     The command label deliberately does NOT say "Anthropic API" (kimi review finding:
     that string is `_claude_api_command`'s REST-transport label and would mislabel a
     CLI-mode seat's skip as an API call in the sidecar log/dashboard, misleading a
     post-mortem) — the skip never chose a transport at all, it short-circuited before
-    either."""
-    command = "seat-cooldown skip (claude)"
+    either.
+
+    codex review finding, round 4: attributing to the BACKEND alone isn't enough for
+    opencode -- `model_id_for_call` (reviewlib/dashboard/parser.py) only resolves an
+    opencode call to its real board seat (`oc:<provider/model>`) via an `-m <model>`
+    token in argv0, same shape `review_opencode`'s own real dispatch already writes
+    (`header_argv0=f"opencode -m {oc_model}"`). Without it, a true-silence cooldown
+    skip fell through to the generic `opencode` bucket -- present in the log, but
+    invisible on the specific seat's health/error row, defeating the round-2 fix's
+    whole point. `-m <model>` must be followed by whitespace (the parser's regex is
+    greedy non-whitespace-run), so the parenthetical note goes AFTER the model token,
+    not glued to it. If a future backend growing its own cooldown gate (review-cli#235) resolves
+    the same way (omp does, per parser.py's comment), extend this the same way."""
+    if backend == "opencode":
+        # Opus review finding, round 5: matches the real dispatch's own header
+        # construction exactly (`header_argv0=f"opencode -m {_safe_log_header(oc_model)}"`
+        # in review_opencode) — cosmetic today for a normal `provider/model` selector, but
+        # keeps the skip's parser-facing header byte-for-byte consistent with the real
+        # call in case a model selector ever needs sanitizing.
+        oc_model = model.split(":", 1)[1] if ":" in model else model
+        command = f"opencode -m {_safe_log_header(oc_model)} (seat-cooldown skip)"
+    else:
+        command = f"seat-cooldown skip ({backend})"
     remaining = int(cooldown["remaining_seconds"])
     stdout = _bounded_cooldown_skip_body(model, cooldown["reason"], remaining)
     _emit_rest_log(
-        "claude", command, round_no=round_no, returncode=0, stdout=stdout, stderr=""
+        backend, command, round_no=round_no, returncode=0, stdout=stdout, stderr=""
     )
     return ReviewResult(
         model=model, command=command, returncode=0, stdout=stdout, stderr=""

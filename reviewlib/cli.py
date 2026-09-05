@@ -3628,16 +3628,67 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           <= 0 disables it. See `review stat`'s section
                                           in README.md.
     REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window for a
-                                          chronically-unavailable claude seat (Fable;
-                                          NOT wired into opencode/commandcode backends
-                                          yet — see review-cli#226). Unset:
-                                          the window ESCALATES per consecutive failure
-                                          (10min, 30min, 2h, then 8h cap), resetting to
-                                          10min after a success or a 24h quiet period.
-                                          Set: that fixed window every time, no
-                                          escalation; <= 0 disables cooldowns entirely.
+                                          chronically-unavailable claude seat (Fable).
+                                          opencode also consults + records + clears
+                                          this store for a TRUE-SILENCE trip
+                                          (review-cli#235, see
+                                          REVIEW_TRUE_SILENCE_SECONDS below), AND for
+                                          the SAME shared administrative-sentinel/
+                                          quota-marker phrases claude's own detection
+                                          uses (codex review finding, round 18: an
+                                          earlier version of this text wrongly said
+                                          that detection "remains claude-only" — it
+                                          does not, as of #243's round-12 fix).
+                                          opencode-SPECIFIC quota wording that matches
+                                          none of the shared phrases is still not
+                                          recognised (falls through as a genuine
+                                          success) — see review-cli#226.
+                                          commandcode/zai HTTP backends have no
+                                          cooldown consult/record/clear at all yet.
+                                          Unset: the window
+                                          ESCALATES per consecutive failure (10min,
+                                          30min, 2h, then 8h cap), resetting to 10min
+                                          after a success or a 24h quiet period. Set:
+                                          that fixed window every time, no escalation;
+                                          <= 0 disables cooldowns entirely.
     REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
                                           ~/.config/review-cli/seat-cooldown.json).
+    REVIEW_TRUE_SILENCE_SECONDS=N       — how many seconds of ZERO output an opencode
+                                          seat gets before it is reaped as stuck rather
+                                          than silently thinking (default 5min, per-model
+                                          overridable in reviewlib/model_behavior.py's
+                                          registry; review-cli#235). A trip records a
+                                          REVIEW_SEAT_COOLDOWN_SECONDS-governed cooldown
+                                          for that model. <= 0 disables the check
+                                          entirely (mirrors REVIEW_IDLE_TIMEOUT_SECONDS=0).
+                                          Only applies before the call's FIRST byte of
+                                          output ever arrives — see review-cli#239 for
+                                          the currently-uncovered mid-call-silence case.
+                                          Before the first byte, this REPLACES
+                                          REVIEW_IDLE_TIMEOUT_SECONDS as the sole reap
+                                          authority (not a min() of the two) — an
+                                          operator who tightens the idle timeout below
+                                          this value does NOT get an earlier pre-output
+                                          reap. There is no way to COMBINE the two for
+                                          an earlier pre-first-byte cutoff: for any
+                                          positive REVIEW_IDLE_TIMEOUT_SECONDS value,
+                                          it has NO effect before the first byte, no
+                                          matter what it is set to — the only lever
+                                          pre-first-byte is lowering
+                                          REVIEW_TRUE_SILENCE_SECONDS itself (codex
+                                          review finding, review-cli#243 round 15: an
+                                          earlier version of this text wrongly implied
+                                          setting both env vars together could make a
+                                          short idle floor also apply pre-output; it
+                                          cannot — see review-cli#254 for the related
+                                          deadline-clamp discussion). One EXCEPTION
+                                          (codex review finding, round 18):
+                                          REVIEW_IDLE_TIMEOUT_SECONDS=0 (the explicit
+                                          "disable idle reap entirely" value) also
+                                          disables true-silence — it is not just "no
+                                          effect", it turns the check OFF, since the
+                                          true-silence poll branch only runs at all
+                                          when idle reap is enabled.
   codex / opencode / omp carry their own CLI auth (no key here).
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.

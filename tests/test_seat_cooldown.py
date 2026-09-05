@@ -1063,11 +1063,74 @@ def test_cooldown_skip_result_contract_with_panel_and_retry():
     def _run():
         sc.record_cooldown(MODEL, "session limit", now=None, ttl_seconds=600.0)
         cooldown = sc.active_cooldown(MODEL)
-        result = backends._cooldown_skip_result(MODEL, 0, cooldown)
+        result = backends._cooldown_skip_result(MODEL, 0, cooldown, backend="claude")
         assert result_is_usable(result) is False, result.stdout
         assert classify_failure(result) == FailureClass.SEAT_FATAL
 
     _with_store(_run)
+
+
+def test_true_silence_result_contract_with_panel_and_retry():
+    """codex review finding (review-cli#243 round 7): the rc=125 true-silence result
+    shape is NEW (review-cli#235) -- nothing before this pinned that the panel/failover
+    layer actually treats it as a failed, non-usable seat that triggers reserve
+    backfill (the README's "Either reap lets reserve backfill take over" claim was
+    unverified for this specific shape). Mirrors
+    test_cooldown_skip_result_contract_with_panel_and_retry's shape, but drives a REAL
+    `_run_streamed` true-silence reap instead of hand-constructing the marker text, so
+    this can't drift from process.py's actual wording the way a copied literal could
+    (the same drift risk review-cli#243 round 6's footerless-quoted-marker test
+    documents for the parser side)."""
+    import sys as _sys
+
+    from reviewlib import process as review_process
+    from reviewlib.panel import result_is_usable
+    from reviewlib.retry import FailureClass, classify_failure
+
+    code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+    # codex review finding (round 11): a real _run_streamed reap writes a real sidecar
+    # log via process.log_dir() -- without this REVIEW_LOG_DIR isolation (matching
+    # test_dashboard.py's test_real_true_silence_reap_round_trips_through_the_real_
+    # parser, which already does this correctly), every run of this test polluted the
+    # DEVELOPER'S REAL dashboard log dir with a synthetic opencode true-silence
+    # failure, corrupting exactly the seat-health stats this feature exists to surface.
+    with tempfile.TemporaryDirectory() as log_dir:
+        saved_log_dir = os.environ.get("REVIEW_LOG_DIR")
+        os.environ["REVIEW_LOG_DIR"] = log_dir
+        try:
+            proc = review_process._run_streamed(
+                [_sys.executable, "-c", code],
+                cwd=REPO_ROOT,
+                timeout=30,
+                backend="opencode",
+                round_no=0,
+                true_silence_timeout=1,
+            )
+        finally:
+            if saved_log_dir is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = saved_log_dir
+    assert proc.true_silenced is True
+
+    # review_opencode wraps the raw _run_streamed CompletedProcess into a ReviewResult
+    # exactly this way (reviewlib/backends.py) -- mirror that here so the contract is
+    # checked on the SAME shape the failover loop actually receives.
+    result = backends.ReviewResult(
+        model="oc:zai/glm-5.2",
+        command="opencode -m zai/glm-5.2",
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+    )
+    assert result_is_usable(result) is False, result.stdout
+    # A true-silenced seat never produced a single byte -- a stronger "this seat is
+    # broken" signal than an ordinary timeout (which DID produce something, then went
+    # idle). classify_failure has no rc=125 special-case, so it falls through to the
+    # fail-closed default (SEAT_FATAL): straight to reserve, no same-seat retry --
+    # which matches the feature's own intent (record_cooldown benches the seat rather
+    # than expecting a same-seat retry to help).
+    assert classify_failure(result) == FailureClass.SEAT_FATAL
 
 
 def test_cooldown_skip_body_stays_usable_with_a_long_model_and_reason():
@@ -1092,7 +1155,9 @@ def test_cooldown_skip_body_stays_usable_with_a_long_model_and_reason():
     def _run():
         sc.record_cooldown(long_model, long_reason, now=None, ttl_seconds=600.0)
         cooldown = sc.active_cooldown(long_model)
-        result = backends._cooldown_skip_result(long_model, 0, cooldown)
+        result = backends._cooldown_skip_result(
+            long_model, 0, cooldown, backend="claude"
+        )
         assert len(result.stdout) <= backends._UNAVAILABLE_MAX_LEN, len(result.stdout)
         # The marker phrase itself must survive truncation — it's the one substring
         # every downstream consumer actually keys on.
@@ -1155,6 +1220,11 @@ def test_review_claude_skips_real_dispatch_while_cooling_down():
         assert result.returncode == 0
         assert "is currently unavailable" in result.stdout
         assert "cached:" in result.stdout
+        # Fable review finding (review-cli#235, round 3): _cooldown_skip_result's
+        # `backend` param became required (no more silent "claude" default) once
+        # review_opencode grew its own call site — pin that review_claude's own skip
+        # still attributes correctly to "claude", not some other backend.
+        assert result.command == "seat-cooldown skip (claude)"
 
     _with_store(_run)
 
