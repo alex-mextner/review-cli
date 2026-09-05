@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import _agentic
+from .install import install_codex_recursion_guard
 from .model_behavior import true_silence_timeout_seconds
 from .process import (
     TIMEOUT_KIND_STALL,
@@ -298,6 +299,42 @@ def review_with_images(
     )
 
 
+# Guards `_ensure_codex_recursion_guard` so the (cheap but non-zero: stat + maybe
+# write) install check runs at most ONCE per process, not once per codex seat/round.
+_codex_recursion_guard_ensured = False
+_codex_recursion_guard_lock = threading.Lock()
+
+
+def _ensure_codex_recursion_guard() -> None:
+    """Best-effort, once-per-process install of the review-cli#180 execpolicy guard
+    (see `install.install_codex_recursion_guard` for the rationale and its
+    limitations). Never raises — a failed write must not block a review run; the
+    REVIEW_CLI_ACTIVE reentrancy guard (`reviewlib.cli._reject_if_reentrant`) is the
+    mechanism that still holds either way. Prints a one-line stderr notice ONLY when
+    the file is actually created/rewritten (never on the common no-op "already up to
+    date" path) — this writes into the user's `$CODEX_HOME` as a side effect of an
+    ordinary review run, so it must not be silent (review-cli#180 review finding,
+    glm-5.2)."""
+    global _codex_recursion_guard_ensured
+    if _codex_recursion_guard_ensured:
+        return
+    with _codex_recursion_guard_lock:
+        if _codex_recursion_guard_ensured:
+            return
+        try:
+            if install_codex_recursion_guard():
+                print(
+                    "[review-cli] installed/updated the codex execpolicy recursion "
+                    "guard at $CODEX_HOME/rules/ (review-cli#180) — forbids codex "
+                    "from shelling out to review/codex/claude/opencode/omp.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception:  # noqa: BLE001 — must never break a review call
+            pass
+        _codex_recursion_guard_ensured = True
+
+
 def review_codex(
     model: str,
     prompt: str,
@@ -313,7 +350,13 @@ def review_codex(
     )
     if unpaid is not None:
         return unpaid
-    argv = [_which("codex"), "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
+    codex_path = _which("codex")
+    # Only after the unpaid short-circuit and the PATH check: installing the execpolicy
+    # guard writes into $HOME (review-cli#180 review finding, Opus) — a board that lists
+    # a codex seat the user has no binary for, or has disabled as unpaid, must not touch
+    # their home directory or print a guard-installed notice for a backend that never runs.
+    _ensure_codex_recursion_guard()
+    argv = [codex_path, "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
     if codex_model:
         argv += ["-m", codex_model]
     codex_effort = _codex_reasoning_effort(effort)

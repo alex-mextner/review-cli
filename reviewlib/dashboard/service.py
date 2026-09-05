@@ -24,8 +24,10 @@ Invariants:
     a re-``start`` lands on the same address), unlike the ad-hoc ``review dashboard run`` default
     of an ephemeral port. ``--port 0`` is still honored for an ephemeral bind in the foreground.
 """
+
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -85,13 +87,27 @@ def _review_on_path_is_us(review_path: str) -> bool:
     Invokes ``review --reviewlib-dir`` on the PATH candidate and compares its resolved ``reviewlib``
     package dir to ours. Best-effort: any probe error (no such flag on an old build, a crash, a
     timeout) ⇒ assume NOT us, so the caller falls back to the running interpreter and never launches
-    a different checkout's code (the live-symlink trap)."""
+    a different checkout's code (the live-symlink trap).
+
+    Every real caller of this function (``_review_argv0`` via ``run``/``start``/``enable``) is
+    ITSELF an active ``review`` invocation, so ``$REVIEW_CLI_ACTIVE`` is already set in this
+    process's environment. This probe is a full ``review --reviewlib-dir`` re-invocation, so
+    without clearing that var here too it would ALWAYS be refused by the child's own
+    ``_reject_if_reentrant`` — making this probe permanently return ``False`` in production and
+    silently defeating the whole point of the installed-console-script branch above: `enable`
+    would always pin a venv ``sys.executable`` into the persisted autostart unit instead of the
+    stable installed script (review-cli#180 review finding, GLM). Same fix as ``_serve_argv``'s
+    ``_env_clear_prefix()``, applied at this second, less-obvious call site."""
+    from ..cli import REVIEW_CLI_ACTIVE_ENV
+
+    env = {k: v for k, v in os.environ.items() if k != REVIEW_CLI_ACTIVE_ENV}
     try:
         out = subprocess.run(
             [review_path, "--reviewlib-dir"],
             capture_output=True,
             text=True,
             timeout=10,
+            env=env,
         )
     except Exception:
         return False
@@ -101,22 +117,60 @@ def _review_on_path_is_us(review_path: str) -> bool:
     return bool(reported) and Path(reported).resolve() == Path(_our_reviewlib_dir())
 
 
+def _env_clear_prefix() -> list[str]:
+    """Argv prefix that strips ``$REVIEW_CLI_ACTIVE`` before exec'ing the real command.
+
+    ``review dashboard run``/``start`` are themselves full ``review`` invocations, so by the
+    time they reach here ``main()`` has already set ``$REVIEW_CLI_ACTIVE=1`` for THIS dispatch
+    (the review-cli#180 reentrancy guard). ``agenttools_service.ServiceManager`` spawns the
+    foreground/detached child via plain ``subprocess.call``/``Popen`` with no ``env=``
+    override, so the child inherits that var — and since the child is itself a fresh ``review``
+    invocation (the hidden ``__serve`` entry), its own ``main()`` would immediately trip
+    ``_reject_if_reentrant`` on startup. That's a false positive: this is a deliberate,
+    sanctioned top-level re-invocation, not the backend self-reinvocation the guard exists to
+    catch — but without this prefix the managed dashboard/spec-web server could never actually
+    launch via ``run``/``start`` (review-cli#180 review finding, chatgpt-codex-connector, PR
+    #279).
+
+    Deliberately HARDCODED to ``/usr/bin/env``, NOT ``shutil.which("env")``: a PATH lookup is
+    caller-controlled — an attacker-poisoned PATH with a malicious ``env`` ahead of the real one
+    would run BEFORE the trusted ``review`` binary, and ``enable`` persists this argv into a
+    launchd/systemd autostart unit, turning a transient PATH poisoning into a boot-persistent
+    one (review-cli#180 review finding, codex P1/P2). ``/usr/bin/env`` is guaranteed present by
+    the same de-facto convention the ``#!/usr/bin/env`` shebang relies on universally on macOS
+    and every mainstream Linux distro (POSIX standardizes the ``env`` utility, not literally
+    this path — an exotic/minimal target without it would fail loudly at spawn, same as any
+    other missing argv0). References ``cli.REVIEW_CLI_ACTIVE_ENV`` rather than a bare string
+    literal so a rename of that constant can't silently decouple this prefix from the guard it
+    exists to bypass (review-cli#180 review finding, GLM/GLM-cc).
+    """
+    from ..cli import REVIEW_CLI_ACTIVE_ENV
+
+    return ["/usr/bin/env", "-u", REVIEW_CLI_ACTIVE_ENV]
+
+
 def _serve_argv(*, port: int, host: str) -> list[str]:
     """The FOREGROUND server command the service runs (``run``) or detaches (``start``).
 
     Targets the hidden ``dashboard __serve`` entry (which calls ``run_dashboard`` directly), so
     neither ``run`` nor a detached ``start`` re-enters the service dispatcher. ``--no-open`` is
-    always passed: a background/login daemon must never try to pop a browser.
+    always passed: a background/login daemon must never try to pop a browser. Prefixed with
+    ``_env_clear_prefix()`` so the child never inherits a poisoned ``$REVIEW_CLI_ACTIVE`` from
+    whatever ``review`` invocation is launching it (see that function's docstring).
     """
-    return _review_argv0() + [
-        "dashboard",
-        "__serve",
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--no-open",
-    ]
+    return (
+        _env_clear_prefix()
+        + _review_argv0()
+        + [
+            "dashboard",
+            "__serve",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--no-open",
+        ]
+    )
 
 
 def dashboard_service(

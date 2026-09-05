@@ -2926,12 +2926,89 @@ def _write_output_file(path: Path, text: str) -> None:
     path.write_text(strip_control_sequences(text), encoding="utf-8")
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Entry point: arm the internal run backstop around a review run, then dispatch.
+# Env var that marks "a `review` invocation is already running in this process tree"
+# (review-cli#180). Set for the lifetime of a run by `main()`; checked by
+# `_reject_if_reentrant()` before any backend is touched.
+REVIEW_CLI_ACTIVE_ENV = "REVIEW_CLI_ACTIVE"
+
+
+def _reject_if_reentrant(_argv: list[str]) -> int | None:
+    """Fail closed if this process is already nested inside a running `review`
+    invocation — the review-cli#180 fork-bomb guard.
+
+    A codex/claude/opencode backend can shell out to `review diff` again on the same
+    worktree, which spawns another backend, which can do it again — an unbounded
+    self-reinvocation loop (live-confirmed 2026-08-11: 40+ live `codex exec` processes
+    and 11 `review diff` processes across 4 worktrees, swap at 88.5%, load average
+    60+). The existing process-GROUP kill/backstop machinery (`process._run_streamed`,
+    `reviewlib.backstop`) cannot bound this: each backend child is spawned with
+    `start_new_session=True` so a per-call timeout can kill just that call's tree
+    without also taking down the CLI's own group — but that means every recursive
+    level re-roots into a BRAND NEW OS session, invisible to a `killpg` rooted at an
+    earlier level. An env var is the one signal that survives `exec`/`setsid`
+    regardless of how many session boundaries the recursion crosses, so it is checked
+    here instead.
+
+    Deliberately NOT reset by `call_backend`/panel concurrency — those run several
+    backends in threads WITHIN one process (review-cli#65), not nested `review`
+    invocations, so they never trip this.
+
+    VERIFIED (not assumed — re-raised by every review round on this ticket, so
+    recording the evidence here): $REVIEW_CLI_ACTIVE is set for a persistent SERVER
+    subcommand's (`review dashboard`/`review spec-web`) entire lifetime too (see
+    `main()` — it wraps the whole dispatch, server path included). This is safe
+    because neither server spawns `review` as a child process during normal request
+    handling: `reviewlib/dashboard/server.py` and `reviewlib/specweb/server.py` only
+    shell out to `tailscale`/`git`/`tmux`; `reviewlib/dashboard/service.py`'s
+    `_review_argv0()` launches the server's OWN foreground process at STARTUP (once,
+    from the user's shell — not a request-handling re-invocation) and is itself gated
+    against re-entering the service layer (see that module's docstring: "otherwise
+    run/start would re-enter the service layer and fork-bomb"). If a future change
+    adds a code path where a server-mode process dispatches an actual model review
+    while servicing a request, that path should call the mode/panel functions
+    directly (in-process, the way `reviewlib.panel`/`reviewlib.modes` are normally
+    invoked), not subprocess-invoke `review` on itself.
+
+    Checks PRESENCE (`is not None`), not truthiness: `REVIEW_CLI_ACTIVE= review diff`
+    (a shell setting the var to an EMPTY string for the child) must still trip the
+    guard — `os.environ.get(...)` would return `""`, which is falsy under a bare
+    `if`, and silently let the recursion through (review-cli#180 review finding,
+    glm-5.2). This does NOT defend against a shell that removes the var entirely
+    (`env -u REVIEW_CLI_ACTIVE review diff`) — no env-var-based guard can, since the
+    child then looks identical to a genuinely fresh top-level invocation. That
+    residual gap is why this is layered with, not a substitute for, the codex
+    execpolicy guard (`install.install_codex_recursion_guard`) and the existing
+    process-group timeout/backstop.
+
+    This exact `env -u REVIEW_CLI_ACTIVE` technique is also used DELIBERATELY, not just as an
+    attacker's residual gap: `dashboard.service._env_clear_prefix()` (reused by
+    `specweb.service._serve_argv`) prepends it to the managed `__serve` child's argv, because
+    `run`/`start` are themselves active `review` invocations and the spawned server must NOT
+    inherit that activity marker (review-cli#180 review finding, chatgpt-codex-connector, PR
+    #279) — a sanctioned use of the same bypass this paragraph documents as unstoppable."""
+    if os.environ.get(REVIEW_CLI_ACTIVE_ENV) is not None:
+        print(
+            "[review-cli] refusing to run: $REVIEW_CLI_ACTIVE is already set, meaning "
+            "this process is nested inside another `review` invocation. A backend "
+            "(codex/claude/opencode) appears to have re-invoked `review` on the same "
+            "worktree — this is the unbounded self-reinvocation loop tracked as "
+            "review-cli#180. Refusing to recurse.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def _dispatch_with_backstop(raw: list[str], output_path: str | None) -> int:
+    """Resolve and run `raw`, applying the internal backstop timer + `-o` tee.
+
+    Split out of `main()` so the REVIEW_CLI_ACTIVE reentrancy guard (review-cli#180)
+    can wrap this ENTIRE dispatch — server subcommand included — in one try/finally at
+    the call site, without main() itself growing past a screenful.
 
     `review` advertises NO external timeout — agents must not wrap it in a short
     shell `timeout` (the panel/brainstorm modes only emit their synthesis at the very
-    end). The ONLY time bound is this INTERNAL last-resort backstop, capped at <=4h
+    end). The ONLY time bound is the INTERNAL last-resort backstop, capped at <=4h
     (`reviewlib.backstop`): a watchdog that force-terminates a genuinely wedged run so
     "no external timeout" can never mean "runs forever". A healthy run finishes in
     minutes, far under the ceiling, and the watchdog is cancelled cleanly on return.
@@ -2942,33 +3019,12 @@ def main(argv: list[str] | None = None) -> int:
     at once (codex P2). Every other path (the review/panel run and the instant
     subcommands) is wrapped.
 
-    This is also where `-o FILE` is handled: the flag is pre-scanned out of argv (so it
-    works for every dispatch path, including the bare subcommands), and when present the
-    whole dispatch runs under a stdout TEE whose captured text is persisted to FILE via
-    Python — bypassing the shell redirect (and thus zsh noclobber). The file is always
-    written; stdout still prints live.
+    This is also where `-o FILE` is handled: the flag is pre-scanned out of argv by the
+    caller (so it works for every dispatch path, including the bare subcommands), and
+    when present the whole dispatch runs under a stdout TEE whose captured text is
+    persisted to FILE via Python — bypassing the shell redirect (and thus zsh
+    noclobber). The file is always written; stdout still prints live.
     """
-    raw = sys.argv[1:] if argv is None else argv
-    output_path, raw = _extract_output_path(list(raw))
-    raw = _normalize_leading_mode_options(raw)
-
-    # A REMOVED flag (--mcp/--ln, or a removed mode flag) OR the removed `review review`
-    # SUBCOMMAND verb is a USAGE error — it must behave like argparse's own usage errors
-    # w.r.t. `-o`: print the structured error and exit WITHOUT writing the `-o` file.
-    # Rejecting it INSIDE `_dispatch` only `return`s 2, which the tee path below treats as
-    # "the dispatch completed" and would persist the (empty) captured stdout — truncating a
-    # pre-existing `-o` target (codex P1/P2). Reject it here, before the tee is armed, so no
-    # write happens. Both are pure argv pre-scans; the later calls in `_dispatch` are then
-    # harmless no-ops.
-    for _reject in (
-        _reject_removed_flags,
-        _reject_removed_subcommand,
-        _reject_subcommand_only_flag_without_verb,
-    ):
-        rejected = _reject(raw)
-        if rejected is not None:
-            return rejected
-
     # The persistent SERVER subcommands stream until Ctrl-C — capturing/teeing their
     # output to a single `-o` file makes no sense (and the file would only be written
     # on shutdown), so `-o` is ignored for them and they bypass both the tee and the
@@ -3018,6 +3074,45 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
     return 1 if write_error is not None else rc
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point: reject a reentrant run, then dispatch under the backstop.
+
+    See `_reject_if_reentrant` for the review-cli#180 fork-bomb guard and
+    `_dispatch_with_backstop` for the backstop/`-o`-tee mechanics.
+    """
+    raw = sys.argv[1:] if argv is None else argv
+    output_path, raw = _extract_output_path(list(raw))
+    raw = _normalize_leading_mode_options(raw)
+
+    # A REMOVED flag (--mcp/--ln, or a removed mode flag) OR the removed `review review`
+    # SUBCOMMAND verb is a USAGE error — it must behave like argparse's own usage errors
+    # w.r.t. `-o`: print the structured error and exit WITHOUT writing the `-o` file.
+    # Rejecting it INSIDE `_dispatch` only `return`s 2, which the tee path below treats as
+    # "the dispatch completed" and would persist the (empty) captured stdout — truncating a
+    # pre-existing `-o` target (codex P1/P2). Reject it here, before the tee is armed, so no
+    # write happens. Both are pure argv pre-scans; the later calls in `_dispatch` are then
+    # harmless no-ops.
+    # _reject_if_reentrant runs FIRST: it is the cheapest check (one os.environ.get)
+    # and the highest-severity failure (review-cli#180 review finding, glm-5.2) — a
+    # recursive invocation that happens to also carry a removed flag/verb should get
+    # the reentrancy diagnostic, not a confusing unrelated usage error.
+    for _reject in (
+        _reject_if_reentrant,
+        _reject_removed_flags,
+        _reject_removed_subcommand,
+        _reject_subcommand_only_flag_without_verb,
+    ):
+        rejected = _reject(raw)
+        if rejected is not None:
+            return rejected
+
+    os.environ[REVIEW_CLI_ACTIVE_ENV] = "1"
+    try:
+        return _dispatch_with_backstop(raw, output_path)
+    finally:
+        os.environ.pop(REVIEW_CLI_ACTIVE_ENV, None)
 
 
 def _model_default_help(mode: ModeSpec | None) -> str:

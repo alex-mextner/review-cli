@@ -20,6 +20,7 @@ What this module owns (the review-cli-specific glue, nothing more):
     resolved to an ABSOLUTE path via the dashboard's shared resolver (launchd/systemd don't
     honor the caller's ``PATH``).
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -46,18 +47,26 @@ def _serve_argv(*, port: int, host: str, agent: str | None = None) -> list[str]:
     dashboard's ``_review_argv0`` so the argv[0] resolution (installed console script vs
     ``<this python> -m reviewlib`` in a dev worktree — the live-symlink trap) is shared, not
     re-implemented. ``agent`` (the daemon's default submit-delivery target) is baked into the
-    argv so a managed restart / OS autostart keeps delivering to the same session.
+    argv so a managed restart / OS autostart keeps delivering to the same session. Also reuses
+    the dashboard's ``_env_clear_prefix`` — ``run``/``start`` are themselves ``review``
+    invocations with ``$REVIEW_CLI_ACTIVE`` already set, and the spawned ``__serve`` child would
+    otherwise inherit it and trip its own reentrancy guard on startup (review-cli#180 review
+    finding, chatgpt-codex-connector, PR #279; see that function's docstring).
     """
-    from ..dashboard.service import _review_argv0
+    from ..dashboard.service import _env_clear_prefix, _review_argv0
 
-    argv = _review_argv0() + [
-        "spec-web",
-        "__serve",
-        "--host",
-        host,
-        "--port",
-        str(port),
-    ]
+    argv = (
+        _env_clear_prefix()
+        + _review_argv0()
+        + [
+            "spec-web",
+            "__serve",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
+    )
     if agent:
         argv += ["--agent", agent]
     return argv
