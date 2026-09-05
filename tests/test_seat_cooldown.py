@@ -1606,7 +1606,7 @@ def test_review_claude_does_not_cache_an_rc0_sentinel_with_transient_stderr():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -1625,7 +1625,7 @@ def test_review_claude_records_cooldown_for_unavailable_sentinel_with_nonzero_ex
     comment), this time gated on exit code instead of wording."""
 
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
         saved_cli = _patched(
             backends,
             "review_claude_cli",
@@ -1648,7 +1648,7 @@ def test_review_claude_records_cooldown_for_unavailable_sentinel_with_nonzero_ex
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 
@@ -1672,7 +1672,7 @@ def test_review_claude_records_cooldown_for_every_unavailable_marker_wording_non
         ambiguous_with_transient = marker == "is temporarily unavailable"
 
         def _run(marker=marker, ambiguous=ambiguous_with_transient):
-            assert sc.active_cooldown(MODEL) is None
+            assert sc.active_cooldown(MODEL, access_method="cli") is None
             saved_cli = _patched(
                 backends,
                 "review_claude_cli",
@@ -1692,12 +1692,12 @@ def test_review_claude_records_cooldown_for_every_unavailable_marker_wording_non
             finally:
                 backends.review_claude_cli = saved_cli
                 backends.unpaid_provider_result = saved_unpaid
-            cooldown = sc.active_cooldown(MODEL)
+            cooldown = sc.active_cooldown(MODEL, access_method="cli")
             if ambiguous:
                 assert cooldown is None, marker
             else:
                 assert cooldown is not None, marker
-                sc.clear_cooldown(MODEL)
+                sc.clear_cooldown(MODEL, access_method="cli")
 
         _with_store(_run)
 
@@ -1732,7 +1732,7 @@ def test_review_claude_does_not_cache_a_transient_5xx_status_even_with_unavailab
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -1764,7 +1764,7 @@ def test_review_claude_does_not_cache_transient_wording_on_a_generic_cli_exit_co
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -1799,7 +1799,7 @@ def test_review_claude_does_not_cache_a_process_timeout_with_incidental_unavaila
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -1838,7 +1838,7 @@ def test_review_claude_does_not_cache_a_process_timeout_with_incidental_quota_te
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -1880,7 +1880,7 @@ def test_review_claude_caches_a_quota_marker_even_with_transient_looking_wording
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 
@@ -1913,7 +1913,7 @@ def test_review_claude_caches_chronic_quota_exhaustion_delivered_as_429():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 
@@ -1950,7 +1950,7 @@ def test_review_claude_caches_a_quota_marker_in_a_long_partial_transcript():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 
@@ -1983,7 +1983,7 @@ def test_review_claude_caches_a_quota_marker_alongside_fatal_looking_wording():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 
@@ -2000,7 +2000,7 @@ def test_review_claude_never_caches_a_seat_fatal_channel_even_with_unavailable_w
 
     Codex review finding (review-cli#286): an EARLIER version of this test asserted
     that `_looks_transient` returning False for this channel meant it fell through to
-    the `_UNAVAILABLE_MARKERS` check and got CACHED (`active_cooldown(MODEL) is not
+    the `_UNAVAILABLE_MARKERS` check and got CACHED (`active_cooldown(MODEL, access_method="cli") is not
     None`) -- but that directly contradicts this module's own documented contract
     (seat_cooldown.py's module docstring: "An auth failure ... is NOT cached here --
     those can be a transient misconfiguration a human fixes moments later, and
@@ -2032,7 +2032,7 @@ def test_review_claude_never_caches_a_seat_fatal_channel_even_with_unavailable_w
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -2065,7 +2065,7 @@ def test_review_claude_does_not_cache_a_401_that_also_says_currently_unavailable
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -2101,7 +2101,7 @@ def test_review_claude_caches_an_rc0_sentinel_with_benign_nonempty_stderr():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 
@@ -2148,7 +2148,7 @@ def test_review_claude_does_not_cache_an_unavailable_marker_buried_in_a_long_std
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -2192,7 +2192,7 @@ def test_review_claude_caches_a_short_sentinel_alongside_moderately_long_stderr(
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="cli") is not None
 
     _with_store(_run)
 
@@ -2227,7 +2227,7 @@ def test_review_claude_does_not_cache_a_numeric_only_401_with_unavailable_wordin
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
@@ -3018,9 +3018,9 @@ def test_wiring_review_claude_rc0_transient_stderr_sentinel_does_not_clear_coold
     to the 10-minute window instead of escalating from where it left off."""
 
     def _run():
-        sc.record_cooldown(MODEL, "hang", now=1000.0)
-        sc.record_cooldown(MODEL, "hang", now=1001.0)
-        assert sc.active_cooldown(MODEL, now=1001.0)["fail_count"] == 2
+        sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="cli")
+        sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="cli")
+        assert sc.active_cooldown(MODEL, now=1001.0, access_method="cli")["fail_count"] == 2
 
         saved = backends.review_claude_cli
         saved_unpaid = _patched(
@@ -3038,7 +3038,7 @@ def test_wiring_review_claude_rc0_transient_stderr_sentinel_does_not_clear_coold
         finally:
             backends.review_claude_cli = saved
             backends.unpaid_provider_result = saved_unpaid
-        cd = sc.active_cooldown(MODEL, now=1001.0)
+        cd = sc.active_cooldown(MODEL, now=1001.0, access_method="cli")
         assert cd is not None, (
             "the rc=0 transient-stderr exception must not clear escalation history "
             "-- it is not genuine recovery evidence"
@@ -3080,7 +3080,7 @@ def test_wiring_review_claude_rc0_seat_fatal_stderr_does_not_cache():
         finally:
             backends.review_claude_cli = saved_cli
             backends.unpaid_provider_result = saved_unpaid
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="cli") is None
 
     _with_store(_run)
 
