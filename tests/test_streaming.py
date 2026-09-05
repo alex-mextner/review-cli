@@ -201,6 +201,90 @@ def test_idle_timeout_seconds_contract():
         assert process.idle_timeout_seconds(240) == process._DEFAULT_IDLE_TIMEOUT
 
 
+def test_idle_timeout_seconds_no_deadline_is_unchanged():
+    """Regression guard: with no board deadline armed (the default, and every caller
+    that predates review-cli#221), idle_timeout_seconds behaves exactly as before —
+    the deadline clamp must be fully opt-in."""
+    assert process._active_board_deadline() is None
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS=None):
+        assert process.idle_timeout_seconds(240) == process._DEFAULT_IDLE_TIMEOUT
+        assert process.idle_timeout_seconds(60, idle_floor=0) == 60
+
+
+def test_idle_timeout_seconds_clamps_to_a_near_deadline():
+    """review-cli#221: a reserve promoted late in a wall-clock-bounded board run must
+    not be handed the full 20-minute default floor — it gets whatever time genuinely
+    remains, so an external wrapper's timeout never SIGKILLs it mid-attempt."""
+    try:
+        # 150s remaining: comfortably above _MIN_DEADLINE_CLAMPED_IDLE_FLOOR (90) and
+        # well below the 20-minute default floor, so this demonstrates the clamp
+        # actually engaging rather than either edge case.
+        process.set_board_deadline(time.monotonic() + 150)
+        clamped = process.idle_timeout_seconds(240)
+        assert 145 <= clamped <= 150, clamped
+    finally:
+        process.set_board_deadline(None)
+
+
+def test_idle_timeout_seconds_clamp_never_starves_below_the_minimum_floor():
+    """A deadline that has already passed (or is seconds away) still gives the
+    promoted reserve one real attempt — never an instant, unhelpful ~0s timeout."""
+    try:
+        process.set_board_deadline(time.monotonic() - 5)
+        assert (
+            process.idle_timeout_seconds(240)
+            == process._MIN_DEADLINE_CLAMPED_IDLE_FLOOR
+        )
+    finally:
+        process.set_board_deadline(None)
+
+
+def test_idle_timeout_seconds_deadline_never_extends_a_shorter_request():
+    """The deadline is a ceiling, not a floor of its own — a caller's own tighter
+    request (or the ambient env var) still wins when it is already the smaller value
+    AND far enough from the deadline that the clamp doesn't even engage."""
+    try:
+        process.set_board_deadline(time.monotonic() + 3600)  # generous, far off
+        assert process.idle_timeout_seconds(240) == process._DEFAULT_IDLE_TIMEOUT
+    finally:
+        process.set_board_deadline(None)
+
+
+def test_idle_timeout_seconds_min_floor_never_extends_computed_above_its_own_request():
+    """Regression for a real bug caught in review (3 independent reviewers, review-cli#221
+    round 1): _MIN_DEADLINE_CLAMPED_IDLE_FLOOR (90s) exists to protect a promoted reserve
+    from being starved by a near/past deadline — it must never OVERRIDE a caller's own
+    smaller explicit request by handing back something LARGER than what was asked for.
+    An operator's REVIEW_IDLE_TIMEOUT_SECONDS=30 near a deadline must stay <= 30, not get
+    silently bumped to the 90s floor (which could itself outlive the external wrapper the
+    deadline exists to respect)."""
+    try:
+        process.set_board_deadline(time.monotonic() + 10)  # near: remaining < computed
+        with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="30"):
+            clamped = process.idle_timeout_seconds(240)
+            assert clamped <= 30, clamped
+        # Same bug, reached via the "tiny timeout, exact-preserve" contract instead of
+        # the env var — requested=45 is below _SHORT_TIMEOUT_EXACT_THRESHOLD (60).
+        with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS=None):
+            clamped = process.idle_timeout_seconds(45)
+            assert clamped <= 45, clamped
+    finally:
+        process.set_board_deadline(None)
+
+
+def test_idle_timeout_seconds_deadline_skips_explicit_disable_contracts():
+    """A caller/operator that explicitly opted OUT of idle reaping (idle_floor=0, or
+    REVIEW_IDLE_TIMEOUT_SECONDS=0) keeps that contract even with a live deadline armed —
+    the deadline clamp must never silently reintroduce a bound they turned off."""
+    try:
+        process.set_board_deadline(time.monotonic() + 5)
+        assert process.idle_timeout_seconds(240, idle_floor=0) == 240
+        with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
+            assert process.idle_timeout_seconds(240) is None
+    finally:
+        process.set_board_deadline(None)
+
+
 def test_silent_child_can_think_until_requested_timeout():
     """No output is not itself a hang signal; only the requested timeout can stop it."""
     code = "import time\ntime.sleep(1.2)\nprint('done', flush=True)\n"

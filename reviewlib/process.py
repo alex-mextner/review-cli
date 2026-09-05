@@ -97,6 +97,40 @@ _DEFAULT_IDLE_TIMEOUT = 20 * 60
 _SHORT_TIMEOUT_EXACT_THRESHOLD = 60
 _IDLE_TIMEOUT_ENV = "REVIEW_IDLE_TIMEOUT_SECONDS"
 
+# A reserve seat promoted late in a board run must still get a fair shot, even when
+# almost no wall-clock budget remains — otherwise a tight deadline would starve every
+# backfill attempt to zero and the board would degrade for no reason. 90s is enough
+# for a normal backend to at least attempt a call and fail fast if it's the one that's
+# actually stuck, without letting the deadline clamp become a no-op.
+_MIN_DEADLINE_CLAMPED_IDLE_FLOOR = 90
+
+# Process-wide wall-clock deadline (a time.monotonic() timestamp) that
+# idle_timeout_seconds() clamps its returned idle-silence budget against, so a board
+# run bounded by an external wrapper (e.g. `timeout 900 review diff ...`) degrades
+# gracefully instead of being SIGKILLed mid-reserve-promotion. Set/cleared once around
+# a single run_board_with_failover call (panel.py) — mirrors that function's existing
+# _suppress_autotally set/restore-in-finally shape: one board run owns this for the
+# process at a time, matching how the CLI actually invokes it (one `review` command =
+# one process = one board run). None (the default) preserves the pre-existing
+# unclamped behaviour exactly.
+_DEADLINE_LOCK = threading.Lock()
+_board_deadline: float | None = None
+
+
+def set_board_deadline(deadline: float | None) -> None:
+    """Set (or clear, with None) the active board-run wall-clock deadline that
+    idle_timeout_seconds() clamps against. See the module-level comment above
+    _board_deadline for the ownership contract."""
+    global _board_deadline
+    with _DEADLINE_LOCK:
+        _board_deadline = deadline
+
+
+def _active_board_deadline() -> float | None:
+    with _DEADLINE_LOCK:
+        return _board_deadline
+
+
 # Built lazily + cached: read $REVIEW_MAX_CONCURRENCY once on first spawn so a test can set
 # the env before importing/using the module, and so every seat in a run shares ONE semaphore
 # (a per-call build would never actually limit anything). Guarded by its own lock; None until
@@ -139,6 +173,15 @@ def idle_timeout_seconds(
     Set REVIEW_IDLE_TIMEOUT_SECONDS=0 to disable idle reap and use the requested wall-clock
     timeout instead. Callers that pass ``idle_floor=0`` have a tight user-facing contract,
     so their requested value stays exact even when the ambient env var is present.
+
+    When a board-run wall-clock deadline is active (set_board_deadline — normally by
+    run_board_with_failover for a run wrapped in an external timeout), the returned floor
+    is additionally clamped to whatever time genuinely remains before that deadline, down
+    to a minimum of _MIN_DEADLINE_CLAMPED_IDLE_FLOOR seconds so a late reserve promotion
+    still gets a fair shot instead of being starved to ~0. This clamp is skipped for the
+    two EXPLICIT-DISABLE contracts above (idle_floor<=0, and $REVIEW_IDLE_TIMEOUT_SECONDS=0)
+    — those are a caller/operator opting OUT of idle reaping entirely, and a deadline clamp
+    silently reintroducing a bound would violate that contract.
     """
     requested = max(int(timeout), 1)
     if idle_floor is not None and idle_floor <= 0:
@@ -153,14 +196,34 @@ def idle_timeout_seconds(
             if value == 0:
                 return None
             if value > 0:
-                return value
+                return _clamp_to_board_deadline(value)
     if idle_floor is None:
-        return requested
+        computed = requested
     # Tiny timeouts are test/debug contracts. Preserve them exactly so unit tests and
     # one-off probes can still finish quickly; normal human review timeouts get the floor.
-    if requested < _SHORT_TIMEOUT_EXACT_THRESHOLD:
-        return requested
-    return max(requested, idle_floor)
+    elif requested < _SHORT_TIMEOUT_EXACT_THRESHOLD:
+        computed = requested
+    else:
+        computed = max(requested, idle_floor)
+    return _clamp_to_board_deadline(computed)
+
+
+def _clamp_to_board_deadline(computed: int) -> int:
+    """Clamp an already-computed idle-timeout value down to whatever wall-clock time
+    remains before the active board deadline (if any), never below
+    _MIN_DEADLINE_CLAMPED_IDLE_FLOOR — but NEVER above `computed` either: the floor
+    protects a late reserve promotion from being starved by the DEADLINE, it must never
+    override a caller's own smaller request (an explicit REVIEW_IDLE_TIMEOUT_SECONDS, or
+    the exact-preserve contract for tiny timeouts) by handing back something LARGER than
+    what was asked for. A elapsed/past deadline still returns the minimum floor (never
+    zero/negative, so the caller gets one last real attempt), but capped at `computed`."""
+    deadline = _active_board_deadline()
+    if deadline is None:
+        return computed
+    remaining = int(deadline - time.monotonic())
+    if remaining >= computed:
+        return computed
+    return min(computed, max(remaining, _MIN_DEADLINE_CLAMPED_IDLE_FLOOR))
 
 
 def _get_concurrency_sem() -> threading.BoundedSemaphore | None:

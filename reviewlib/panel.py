@@ -7,8 +7,10 @@ decomposition — zero behaviour change).
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import sys
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -22,7 +24,28 @@ from .backends import (
     review_with_images,
 )
 from .config import MODERATOR_CANDIDATES, BoardReviewer
-from .process import write_retry_log
+from .process import set_board_deadline, write_retry_log
+
+# Overall wall-clock BUDGET (seconds, from the start of a board run) that
+# run_board_with_failover clamps its reserve-promotion idle timeouts against via
+# process.set_board_deadline — so a run wrapped in an external `timeout N` degrades
+# gracefully instead of being SIGKILLed mid reserve-promotion (review-cli#221: a
+# promoted reserve's default 20-minute idle floor can outlive a caller's 15-minute
+# external wrapper). Unset by default (None = pre-existing unclamped behaviour,
+# unchanged) since not every caller runs under an external timeout.
+_BOARD_DEADLINE_BUDGET_ENV = "REVIEW_BOARD_DEADLINE_SECONDS"
+
+
+def _board_deadline_budget() -> int | None:
+    raw = os.environ.get(_BOARD_DEADLINE_BUDGET_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
 
 # A backend can report rc=0 with a NON-empty body that is actually an "unavailable"
 # notice rather than a real answer (e.g. the paywalled Fable returns rc=0 with
@@ -414,6 +437,14 @@ def run_board_with_failover(
     usable_models: list[str] = []
     reserve_queue = list(reserve)
 
+    # If REVIEW_BOARD_DEADLINE_SECONDS names an overall wall-clock budget, arm the
+    # process-wide deadline for its duration so a reserve promoted late in this run gets
+    # a clamped (but never starved-to-zero) idle timeout instead of the full default
+    # floor — see process.idle_timeout_seconds / review-cli#221. Cleared in the finally
+    # below regardless of outcome, so it can never leak into an unrelated later call.
+    budget = _board_deadline_budget()
+    set_board_deadline(time.monotonic() + budget if budget is not None else None)
+
     # The failover loop owns the run-stats tally: suppress run_panel's per-call auto-tally
     # so a failed-then-replaced seat isn't double-counted, and record exactly one outcome
     # per logical seat below (its final usable/unusable verdict).
@@ -473,6 +504,7 @@ def run_board_with_failover(
     finally:
         with _TALLY_LOCK:
             _suppress_autotally = prev_suppress
+        set_board_deadline(None)
 
     degraded = len(usable) < target
     return FailoverOutcome(
