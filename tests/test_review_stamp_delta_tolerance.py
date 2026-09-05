@@ -759,6 +759,80 @@ def test_fresh_region_single_line_edit_does_not_count_context_lines():
         )
 
 
+def test_non_utf8_content_byte_does_not_defeat_the_line_count():
+    """Opus round-review finding: on Linux, GNU grep in a UTF-8 locale treats a byte
+    that's invalid for the current encoding as a "binary" signal and stops emitting
+    matches from that point on — NOT just a NUL byte, unlike the fail-closed pre-check's
+    own binary detection (`git diff`'s own `Binary files ... differ`, which is NUL-only
+    and never fires for a text file that merely contains a non-UTF-8 byte, e.g. a
+    Latin-1/CP1251 source comment). Before `LC_ALL=C` was pinned on every grep in this
+    block, the `content=$(... | grep -Ev ...)` pipeline could truncate at exactly such a
+    byte on Linux CI, undercounting (or zeroing) `changed` and letting a large unreviewed
+    follow-up pass the gate — invisible on this suite's dev platform (BSD grep has no
+    such locale-dependent behavior), which is exactly why this test pins `LC_ALL`/`LANG`
+    explicitly in `env_extra` rather than relying on the ambient shell's locale.
+
+    This test cannot reproduce the bug's SYMPTOM on a non-GNU-grep platform (BSD grep
+    counts correctly regardless of `LC_ALL`, so it would have passed even before the
+    fix here) — its value is pinning that the fix (`LC_ALL=C` everywhere in the block)
+    is actually present and doesn't itself break correct counting on a byte sequence a
+    locale-aware grep might otherwise stumble on, which IS platform-independent and
+    exercised by this run."""
+    with _isolated_repo() as repo:
+        hook = _install_hook(repo)
+        nlines = 20
+        lines = [f"line{i}" for i in range(nlines)]
+        (repo / "a.py").write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+        subprocess.run(["git", "-C", str(repo), "add", "a.py"], check=True)
+        _commit_all(repo, "initial: 20-line file")
+
+        reviewed = list(lines)
+        reviewed[3] = "line3-reviewed"
+        _write_and_stage(repo, "a.py", "\n".join(reviewed) + "\n")
+        baseline_diff = _staged_diff(repo)
+        install._write_review_stamp(repo, baseline_diff)
+
+        # A genuinely large, UNREVIEWED follow-up (well over any reasonable threshold)
+        # whose FIRST changed line carries a raw non-UTF-8 byte (`\xe9`, Latin-1 "é") --
+        # positioned early so a truncating grep would swallow everything after it,
+        # undercounting nearly the whole delta.
+        followup_lines = list(reviewed)
+        followup_lines[0] = "caf\xe9-line0-followup"
+        for i in range(6, 18):
+            followup_lines[i] = f"line{i}-followup-unreviewed"
+        (repo / "a.py").write_bytes(
+            ("\n".join(followup_lines) + "\n").encode("latin-1")
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "a.py"], check=True)
+        # Not `_staged_diff` (strict UTF-8 `text=True` decode, which the raw Latin-1
+        # byte this test deliberately stages would make raise `UnicodeDecodeError` --
+        # exactly the byte shape under test, so decode leniently here instead).
+        cur_diff_bytes = subprocess.run(
+            ["git", "diff", "--no-ext-diff", "--cached"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        ).stdout
+        cur_diff = cur_diff_bytes.decode("utf-8", errors="replace")
+        # Sanity: the follow-up really did stage, non-UTF-8 byte included.
+        assert "line6-followup-unreviewed" in cur_diff, cur_diff
+
+        proc = _run_hook(
+            hook,
+            repo,
+            {
+                "REVIEW_TRIVIAL_DELTA_LINES": "3",
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "en_US.UTF-8",
+            },
+        )
+        assert proc.returncode != 0, (
+            "a genuinely large unreviewed follow-up containing a non-UTF-8 byte must "
+            f"still BLOCK at a low threshold -- stdout={proc.stdout!r} "
+            f"stderr={proc.stderr!r}"
+        )
+
+
 if __name__ == "__main__":
     # Standalone runner (mirrors tests/test_review_marker.py / tests/smoke.py's expectations):
     # `python <file>` must exit 0 on success, non-zero on any failure.

@@ -817,13 +817,13 @@ if [ "$threshold" -gt 0 ]; then
   if [ -f "$stamp_diff" ]; then
     cur_tmp=$(mktemp 2>/dev/null) && trap 'rm -f "$cur_tmp"' EXIT
     if [ -n "$cur_tmp" ] && command git diff --no-ext-diff --cached > "$cur_tmp"; then
-      if ! grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$stamp_diff" "$cur_tmp" 2>/dev/null; then
+      if ! LC_ALL=C grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$stamp_diff" "$cur_tmp" 2>/dev/null; then
         diff_out=$(diff -U0 "$stamp_diff" "$cur_tmp" 2>/dev/null)
         diff_rc=$?
         if [ "$diff_rc" -le 1 ]; then
-          content=$(printf '%s\\n' "$diff_out" | tail -n +3 | grep -Ev '^[+-]( |@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
-          added=$(printf '%s\\n' "$content" | grep -c '^+')
-          removed=$(printf '%s\\n' "$content" | grep -c '^-')
+          content=$(printf '%s\\n' "$diff_out" | tail -n +3 | LC_ALL=C grep -Ev '^[+-]( |@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
+          added=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^+')
+          removed=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^-')
           changed=$added
           [ "$removed" -gt "$changed" ] && changed=$removed
           if [ "$changed" -le "$threshold" ] 2>/dev/null; then
