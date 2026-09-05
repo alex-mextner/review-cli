@@ -340,14 +340,19 @@ def review_codex(
     round_no: int = 0,
     effort: str | None = None,
 ) -> ReviewResult:
-    _ensure_codex_recursion_guard()
     codex_model = model.split(":", 1)[1] if ":" in model else None
     unpaid = unpaid_provider_result(
         model, backend="codex", command="codex", round_no=round_no
     )
     if unpaid is not None:
         return unpaid
-    argv = [_which("codex"), "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
+    codex_path = _which("codex")
+    # Only after the unpaid short-circuit and the PATH check: installing the execpolicy
+    # guard writes into $HOME (review-cli#180 review finding, Opus) — a board that lists
+    # a codex seat the user has no binary for, or has disabled as unpaid, must not touch
+    # their home directory or print a guard-installed notice for a backend that never runs.
+    _ensure_codex_recursion_guard()
+    argv = [codex_path, "exec", "-s", "read-only", "-C", str(cwd), "--ephemeral"]
     if codex_model:
         argv += ["-m", codex_model]
     codex_effort = _codex_reasoning_effort(effort)

@@ -272,7 +272,36 @@ def _run_review_codex_with_fake_binary(tmp: Path, record: Path) -> None:
 
 def test_review_codex_calls_ensure_codex_recursion_guard():
     """A future refactor that removes the `_ensure_codex_recursion_guard()` call site
-    from `review_codex()` should fail a test, not silently reopen the install gap."""
+    from `review_codex()` should fail a test, not silently reopen the install gap —
+    for a board that actually runs a codex backend."""
+    saved_ensure = b._ensure_codex_recursion_guard
+    saved_which = b._which_optional
+    saved_guard_ensured = b._codex_recursion_guard_ensured
+    called = {"n": 0}
+
+    def _spy():
+        called["n"] += 1
+
+    b._ensure_codex_recursion_guard = _spy
+    b._which_optional = lambda name: "/usr/bin/codex"  # codex resolves on PATH
+    try:
+        with _Env(REVIEW_UNPAID_PROVIDERS=None):
+            try:
+                b.review_codex("codex", "prompt", "", Path("."), timeout=5)
+            except Exception:
+                pass  # the real codex subprocess spawn isn't under test here
+    finally:
+        b._ensure_codex_recursion_guard = saved_ensure
+        b._which_optional = saved_which
+        b._codex_recursion_guard_ensured = saved_guard_ensured
+    assert called["n"] == 1, called
+
+
+def test_review_codex_skips_guard_install_when_codex_binary_absent():
+    """Opus finding on #279: installing the execpolicy guard writes into $HOME and
+    prints a stderr notice. A board that lists a codex seat but has no `codex` binary
+    on PATH (or the provider is disabled as unpaid) must not touch the user's home
+    directory or announce a guard install for a backend that never actually runs."""
     saved_ensure = b._ensure_codex_recursion_guard
     saved_which = b._which_optional
     saved_guard_ensured = b._codex_recursion_guard_ensured
@@ -288,12 +317,32 @@ def test_review_codex_calls_ensure_codex_recursion_guard():
             try:
                 b.review_codex("codex", "prompt", "", Path("."), timeout=5)
             except RuntimeError:
-                pass  # expected: no real `codex` binary resolved — irrelevant here
+                pass  # expected: no real `codex` binary resolved
     finally:
         b._ensure_codex_recursion_guard = saved_ensure
         b._which_optional = saved_which
         b._codex_recursion_guard_ensured = saved_guard_ensured
-    assert called["n"] == 1, called
+    assert called["n"] == 0, called
+
+
+def test_review_codex_skips_guard_install_when_provider_is_unpaid():
+    """Same Opus finding, the other short-circuit: a codex seat disabled via
+    $REVIEW_UNPAID_PROVIDERS must not install the guard either."""
+    saved_ensure = b._ensure_codex_recursion_guard
+    saved_guard_ensured = b._codex_recursion_guard_ensured
+    called = {"n": 0}
+
+    def _spy():
+        called["n"] += 1
+
+    b._ensure_codex_recursion_guard = _spy
+    try:
+        with _Env(REVIEW_UNPAID_PROVIDERS="codex"):
+            b.review_codex("codex", "prompt", "", Path("."), timeout=5)
+    finally:
+        b._ensure_codex_recursion_guard = saved_ensure
+        b._codex_recursion_guard_ensured = saved_guard_ensured
+    assert called["n"] == 0, called
 
 
 def test_codex_backend_self_reinvocation_is_blocked_when_guard_is_active():

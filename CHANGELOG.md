@@ -3,6 +3,27 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.35.4 — 2026-09-05
+
+- **Stop the codex-backend self-reinvocation loop (review-cli#180).** A codex reviewer
+  could re-invoke `review diff` on the same worktree as a plain shell command — codex's
+  only safety mechanism, `-s read-only`, restricts filesystem/network access but not
+  shell/exec, unlike the claude/opencode backends' explicit tool denial. This caused a
+  real incident (2026-08-11): 40+ live `codex exec` processes, 11 `review diff` processes
+  across 4 worktrees, swap at 88.5%, load average 60+.
+  - Primary defense: a `$REVIEW_CLI_ACTIVE` reentrancy guard, set for the lifetime of a
+    run and checked first in `main()`, refuses immediately on a recursive invocation. An
+    env var survives `exec`/`setsid` regardless of how a backend child re-roots its
+    process group, so it is the one signal that reaches every descendant.
+  - Defense-in-depth: an idempotently-installed codex execpolicy `.rules` file forbids
+    `review`/`codex`/`claude`/`opencode`/`omp` as shell commands.
+  - The managed dashboard/spec-web `run`/`start` servers are themselves full `review`
+    invocations and would otherwise trip their own reentrancy guard on launch; their
+    `__serve` child argv and the installed-console-script probe now strip
+    `$REVIEW_CLI_ACTIVE` before exec'ing, via a hardcoded `/usr/bin/env -u` prefix (never
+    a PATH-resolved `env`, to avoid a poisoned-PATH escalation into a persisted autostart
+    unit).
+
 ## 0.35.3 — 2026-09-05
 
 - **`review diff` now says WHY a passing review did not satisfy the commit gate
