@@ -244,7 +244,9 @@ def test_default_board_has_ten_seats():
 
 
 def test_preset_boards_pin_model_order_pool_and_effort():
-    assert DEFAULT_PRESET == "default"
+    # Bare `review diff` defaults to the "light" preset (Alex, 2026-08-28); "default"
+    # and "heavy" stay real, selectable presets with their own board/effort below.
+    assert DEFAULT_PRESET == "light"
     assert all(r.effort == "high" for r in DEFAULT_PRESET_BOARD)
     assert SOL_SEAT not in [r.model for r in DEFAULT_PRESET_BOARD]
     assert "claude:claude-fable-5" not in [r.model for r in DEFAULT_PRESET_BOARD]
@@ -286,14 +288,24 @@ def test_package_facade_exports_preset_surface():
     assert reviewlib.SOL_SEAT == SOL_SEAT
     assert reviewlib.preset_names() == ("default", "heavy", "light")
     assert reviewlib.preset_pool_size("light") == 2
+    # preset_board(None) resolves via DEFAULT_PRESET, which is "light" (Alex,
+    # 2026-08-28) — same model order as DEFAULT_PRESET_BOARD, but LIGHT's effort.
     assert [r.model for r in reviewlib.preset_board(None)] == [
         r.model for r in DEFAULT_PRESET_BOARD
     ]
     assert [r.model for r in preset_board(None)] == [
         r.model for r in DEFAULT_PRESET_BOARD
     ]
-    assert preset_board(None)[0] == DEFAULT_PRESET_BOARD[0]
-    assert preset_board(None)[0] is not DEFAULT_PRESET_BOARD[0]
+    assert preset_board(None)[0] == LIGHT_PRESET_BOARD[0]
+    assert preset_board(None)[0] is not LIGHT_PRESET_BOARD[0]
+    # Review finding (4 review rounds, multiple reviewers): preset_pool_size(None) must
+    # STAY at DEFAULT_POOL_SIZE (4), deliberately NOT tracking DEFAULT_PRESET the way
+    # preset_board(None) does — cli.py's pool guard (`preset_pool_size(active_preset)`)
+    # relies on this exact disagreement to give a config `models:`/`board:` roster (no
+    # explicit `pool:`) its correct no-override pool of 4, not the light preset's 2. A
+    # future "consistency" cleanup that makes these agree would silently re-break that
+    # path with the whole suite otherwise green — this assertion is the guard against it.
+    assert reviewlib.preset_pool_size(None) == DEFAULT_POOL_SIZE == 4
 
 
 def test_explicit_preset_board_overrides_config_board():
@@ -2515,30 +2527,27 @@ def _capture_default_review_board(argv: list[str]) -> dict:
 
 
 def test_cli_default_path_passes_full_preset_board_and_default_pool():
-    """No -m -> the full default-preset board is passed into mode_review (reserve incl.)
-    with pool_size = the default preset pool (4)."""
+    """No -m/--preset -> the full LIGHT-preset board is passed into mode_review (reserve
+    incl.) with pool_size = the light preset pool (2). Bare `review diff` defaults to
+    "light" (Alex, 2026-08-28) — "default"/"heavy" are now opt-in via --preset."""
     captured = _capture_default_review_board(
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)]
     )
     assert captured["board"] is not None, "board should be active by default"
-    assert len(captured["board"]) == len(DEFAULT_PRESET_BOARD), (
+    assert len(captured["board"]) == len(LIGHT_PRESET_BOARD), (
         "full board passed (reserve incl.)"
     )
-    assert [r.model for r in captured["board"]] == [
-        r.model for r in DEFAULT_PRESET_BOARD
-    ]
-    assert captured["pool_size"] == DEFAULT_POOL_SIZE, captured["pool_size"]
+    assert [r.model for r in captured["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
+    assert captured["pool_size"] == 2, captured["pool_size"]
 
 
-def test_cli_builtin_default_uses_default_preset_board():
+def test_cli_builtin_default_uses_light_preset_board():
     captured = _capture_default_review_board(
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)]
     )
-    assert [r.model for r in captured["board"]] == [
-        r.model for r in DEFAULT_PRESET_BOARD
-    ]
-    assert all(r.effort == "high" for r in captured["board"])
-    assert captured["pool_size"] == 4
+    assert [r.model for r in captured["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
+    assert all(r.effort == "medium" for r in captured["board"])
+    assert captured["pool_size"] == 2
 
 
 def test_cli_light_and_heavy_presets_set_board_and_default_pool():
@@ -2657,12 +2666,13 @@ def test_explicit_preset_overrides_config_pool():
 
 
 def test_invalid_config_pool_falls_back_to_preset_default():
-    """A non-positive / non-int config `pool:` is ignored (falls back to the preset)."""
+    """A non-positive / non-int config `pool:` is ignored (falls back to the preset —
+    DEFAULT_PRESET is "light", pool 2, since Alex's 2026-08-28 default change)."""
     cap = _capture_review_with_config(
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)],
         {"pool": 0},  # 0 = "all" is a CLI-only knob; as a config default it's ignored
     )
-    assert cap["pool_size"] == DEFAULT_POOL_SIZE, cap["pool_size"]
+    assert cap["pool_size"] == 2, cap["pool_size"]
 
 
 def test_cli_explicit_preset_overrides_config_board():

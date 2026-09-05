@@ -406,15 +406,18 @@ PRESET_POOL_SIZES = {
     "heavy": 4,
     "light": 2,
 }
-DEFAULT_PRESET = "default"
+DEFAULT_PRESET = "light"
 EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
 
 
-# DEFAULT_POOL_SIZE: how many of the board's seats a plain `review` runs by default.
-# The board (DEFAULT_BOARD or a config `board:`) is a priority-ordered list; by default
-# the top 4 AVAILABLE seats participate and the remaining (lower-priority) seats are the
-# RESERVE that backfills a skipped/failed seat. The board is NEVER disabled — `--pool`
-# only sizes how many seats run. See select_pool() / panel.run_board_with_failover().
+# DEFAULT_POOL_SIZE: the pool-size fallback ONLY for a custom config `board:` with no
+# `pool:` key set (not the bare-`review`-with-no-config-at-all case — that resolves via
+# DEFAULT_PRESET's own pool, PRESET_POOL_SIZES[DEFAULT_PRESET] = 2 as of Alex's
+# 2026-08-28 "light" default; see preset_pool_size()). The board (DEFAULT_BOARD or a
+# config `board:`) is a priority-ordered list; the top N AVAILABLE seats participate and
+# the remaining (lower-priority) seats are the RESERVE that backfills a skipped/failed
+# seat. The board is NEVER disabled — `--pool` only sizes how many seats run. See
+# select_pool() / panel.run_board_with_failover().
 DEFAULT_POOL_SIZE = 4
 
 

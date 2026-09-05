@@ -149,18 +149,20 @@ def mode_brainstorm(
     round loop entirely and produce a fresh synthesis over the seeded transcript — no new
     rounds, honouring the moderator's prior decision that the brainstorm was done.
     """
-    min_rounds = max(rounds, 5)
+    min_rounds = max(rounds, 3)
     max_rounds = max(max_rounds, min_rounds)
     # `synthesize_only` (a forced re-synthesis of a finished session): skip the round loop
     # entirely and go straight to the synthesis over the seeded transcript. Without this an
-    # explicit "no new rounds" intent is impossible — the min_rounds>=5 re-floor above would
-    # otherwise drag a low cap back up to 5 and run rounds the caller did not want.
+    # explicit "no new rounds" intent is impossible — the min_rounds>=3 re-floor above would
+    # otherwise drag a low cap back up to 3 and run rounds the caller did not want.
     loop_end = (start_round - 1) if synthesize_only else max_rounds
     panel = models  # run-as-is; personas always fill >= 3 slots even if panel < 3
     # OPTIONAL grounding diff: when a working-tree / --staged / piped diff is present,
-    # the brainstorm is ABOUT that specific change — the diff is fed to every persona
-    # (and the moderator) as constant context so the ideation is grounded, not abstract.
-    # An empty diff keeps the classic pure-ideation behaviour unchanged.
+    # the brainstorm is ABOUT that specific change. The moderator gets it as constant
+    # context on EVERY round; personas get it only on the first round of the invocation
+    # (incremental grounding, Alex 2026-08-28 — see the round loop below), so the
+    # ideation is grounded without re-transporting the diff every round. An empty diff
+    # keeps the classic pure-ideation behaviour unchanged.
     grounded = bool(diff.strip())
     # codex review finding: the dispatch-time diff cap used to be applied ONLY by
     # cli.py's `_dispatch`, so a caller reaching this function directly (a library
@@ -183,9 +185,11 @@ def mode_brainstorm(
     dispatch_diff = (
         diff if diff_from_stdin or diff_already_capped else cap_diff_for_dispatch(diff)
     )
-    # A one-line note appended to each persona prompt when grounded, so the model knows
-    # the fenced ```diff``` block (added by the backend's _payload from PanelJob.diff) is
-    # the concrete change to brainstorm about, not stray context.
+    # A one-line note appended to the FIRST round's persona prompts (and every
+    # moderator/synthesis prompt) when grounded, so the model knows the fenced
+    # ```diff``` block (added by the backend's _payload from PanelJob.diff) is the
+    # concrete change to brainstorm about, not stray context. Later rounds' personas
+    # get a different pointer note instead — see persona_diff_note in the round loop.
     diff_note = (
         "\n\nA specific code change is provided below as a ```diff``` block — brainstorm "
         "concretely ABOUT this change (its design, risks, alternatives, follow-ups), "
@@ -301,6 +305,35 @@ def mode_brainstorm(
                 if transcript_blocks
                 else "(this is the first round)"
             )
+            # Incremental diff-grounding (Alex, 2026-08-28): the FIRST round of THIS
+            # invocation gets the full diff, same as before; later rounds almost never
+            # need to re-read it — the shared transcript above already carries forward
+            # what earlier rounds found, so re-sending the (possibly large) diff every
+            # round is pure waste. Gated on `start_round`, NOT the literal `round_no == 1`
+            # (review finding, 3 independent reviewers): a RESUMED session with a freshly
+            # re-attached `--diff`/`--staged` (`review sessions -s <id> --diff`) starts its
+            # loop at `start_round > 1` and never executes round 1 in THIS process — keying
+            # on `round_no == 1` silently dropped the diff from every persona on that path
+            # while still telling them "already provided in round 1" (a false, hallucination-
+            # baiting claim). `start_round` is "the first round THIS invocation dispatches",
+            # correct for both a fresh run (`start_round == 1`) and a diff-bearing resume.
+            # The moderator and final synthesis still get the full diff every round (they
+            # need it to judge convergence / write the recommendation) — only the per-
+            # persona dispatch below is round-gated.
+            if round_no == start_round:
+                persona_diff = dispatch_diff
+                persona_diff_note = diff_note
+            else:
+                persona_diff = ""
+                persona_diff_note = (
+                    "\n\nA specific code change was shown to earlier-round personas — "
+                    "their reactions to it are in the shared transcript above. Ground "
+                    "your ideas in what THEY reported about it (the diff itself is not "
+                    "repeated here — you may not have seen it directly if you're new "
+                    "to this rotation)."
+                    if grounded
+                    else ""
+                )
             jobs: list[PanelJob] = []
             # Assign >= 3 distinct personas this round, rotating across the pool.
             slot_count = max(3, len(panel))
@@ -316,17 +349,17 @@ def mode_brainstorm(
                     "multi-round brainstorm. Build on the shared transcript of prior rounds — "
                     "react, extend, challenge, or propose new angles from YOUR perspective. "
                     "Be concrete; offer ideas, not pleasantries. Do not edit files."
-                    f"{diff_note}\n\n"
+                    f"{persona_diff_note}\n\n"
                     f"TOPIC:\n{topic}\n\n=== SHARED TRANSCRIPT (prior rounds) ===\n{shared}"
                 )
-                # The constant grounding diff (if any) rides PanelJob.diff so the backend's
-                # _payload appends it as a fenced ```diff``` block over STDIN — ARG_MAX-safe,
-                # the same transport the shared transcript uses.
+                # The grounding diff (round 1 only, see above) rides PanelJob.diff so the
+                # backend's _payload appends it as a fenced ```diff``` block over STDIN —
+                # ARG_MAX-safe, the same transport the shared transcript uses.
                 jobs.append(
                     PanelJob(
                         model=model,
                         prompt=prompt,
-                        diff=dispatch_diff,
+                        diff=persona_diff,
                         label=f"{persona_name} ({model})",
                         round_no=round_no,
                         images=visual_images,
@@ -379,7 +412,7 @@ def mode_brainstorm(
             #     dead backends" the CTO hit), and we do NOT consult the moderator — a moderator
             #     rubber-stamping `DECISION: STOP` over a dead round was the hollow-STOP vector;
             #     here the dead round itself, not the moderator, ends the loop. The min_rounds
-            #     floor is bypassed for a collapse: forcing 5 rounds of dead backends only wastes
+            #     floor is bypassed for a collapse: forcing 3 rounds of dead backends only wastes
             #     time. Mid-run transient-failure resilience (retry/reserve-swap) is a separate
             #     ROADMAP item.
             if round_dead:
@@ -559,8 +592,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--rounds",
         type=int,
-        default=5,
-        help="minimum rounds before STOP is allowed (min & default 5)",
+        default=3,
+        help="minimum rounds before STOP is allowed (min & default 3)",
     )
     parser.add_argument(
         "--max-rounds", type=int, default=8, help="hard cap on rounds (default 8)"
