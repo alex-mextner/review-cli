@@ -829,6 +829,488 @@ def test_log_dir_uses_os_standard_locations():
                 os.environ[key] = val
 
 
+# ── true_silence_timeout (review-cli graduated-timeout / Alex 2026-08-19/20 request) ──
+
+
+def test_true_silence_kills_a_never_talking_child_before_the_idle_floor():
+    """A child that NEVER writes anything must be reaped by true_silence_timeout, well
+    before the (much longer) ordinary idle timeout would have caught it."""
+    code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=30,
+        backend="fake-truesilence",
+        round_no=1,
+        true_silence_timeout=1,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 125, (
+        f"a never-talking child must be reaped with rc 125, got {result.returncode}"
+    )
+    assert result.true_silenced is True, (
+        "the authoritative .true_silenced attribute must be set on a real true-silence "
+        "kill, not just the (collision-prone) returncode"
+    )
+    assert elapsed < 20, (
+        f"true-silence kill took {elapsed:.2f}s, far longer than the 1s budget"
+    )
+    assert "TRUE-SILENCE" in result.stdout
+    assert "zero output" in result.stdout
+
+
+def test_a_genuine_child_exit_125_is_not_mistaken_for_true_silence():
+    """round-2 review finding (codex + Fable): 125 is a real exit code some CLIs/
+    wrappers use on their own (`timeout(1)`'s "the wrapper itself failed", docker run,
+    git-bisect skip). A child that exits 125 BY ITSELF — with real output, well
+    before any timeout — must get `.true_silenced is False`; only the poll loop's own
+    true-silence kill may ever set it True."""
+    code = "print('real output', flush=True)\nraise SystemExit(125)\n"
+    argv = [sys.executable, "-c", code]
+
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=10,
+        backend="fake-genuine-125",
+        round_no=1,
+        true_silence_timeout=1,  # armed, but must never fire here — the child exits on its own
+    )
+
+    assert result.returncode == 125, result.stdout + result.stderr
+    assert result.true_silenced is False, (
+        "a genuine child exit(125) was misdiagnosed as a true-silence reap"
+    )
+    assert "real output" in result.stdout
+    assert "TRUE-SILENCE" not in result.stdout
+
+
+def test_true_silence_still_fires_when_larger_than_the_idle_timeout():
+    """Fable review finding (round 4): a true_silence_timeout configured >= the
+    ordinary idle_timeout (e.g. a deliberately generous per-model registry entry for
+    a known slow starter, or REVIEW_IDLE_TIMEOUT_SECONDS shrunk below it) must still
+    fire eventually — an earlier version let the ordinary (smaller) idle check win
+    the race and reap with rc 124 first, silently making the generous true-silence
+    budget unreachable."""
+    code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+    argv = [sys.executable, "-c", code]
+
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        # timeout=1, below process._SHORT_TIMEOUT_EXACT_THRESHOLD (60), keeps
+        # idle_timeout_seconds' "exact" contract — idle_timeout ends up EXACTLY 1s.
+        timeout=1,
+        backend="fake-truesilence-outlasts-idle",
+        round_no=1,
+        true_silence_timeout=3,  # LARGER than the ~1s idle timeout above
+    )
+
+    assert result.returncode == 125, (
+        f"expected a true-silence reap (rc 125), got {result.returncode} — the "
+        "smaller idle_timeout won the race instead"
+    )
+    assert result.true_silenced is True
+    assert "TRUE-SILENCE" in result.stdout
+
+
+def test_true_silence_does_not_fire_once_any_output_arrives():
+    """A child that produces even ONE byte before the true-silence deadline must be
+    governed by the ordinary idle timeout from then on, not killed as if silent."""
+    code = (
+        "import time\n"
+        "print('hello', flush=True)\n"
+        "time.sleep(1.5)\n"
+        "print('done', flush=True)\n"
+    )
+    argv = [sys.executable, "-c", code]
+
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=10,
+        backend="fake-truesilence-then-talks",
+        round_no=2,
+        true_silence_timeout=1,  # would fire at 1s if output were ignored
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.true_silenced is False
+    assert "hello" in result.stdout
+    assert "done" in result.stdout
+    assert "TRUE-SILENCE" not in result.stdout
+
+
+def test_true_silence_does_not_fire_for_stderr_only_progress():
+    """(Opus review finding, review-cli#243 round 6) idle mode's own docstring says it
+    "treats stdout/stderr as progress" -- a child that only ever writes to STDERR (a
+    common shape: progress lines, spinners) must disarm true-silence the same way a
+    stdout-only child does above, not get reaped as if it produced nothing at all.
+    Both stream readers share the SAME `_drain` function (confirmed by direct code
+    inspection: `stdout_thread`/`stderr_thread` both target `_drain`, which sets
+    `activity["got_output"] = True` on any chunk from EITHER stream) -- this pins that
+    behavior with a real subprocess rather than relying on inspection alone."""
+    code = (
+        "import sys, time\n"
+        "print('progress', file=sys.stderr, flush=True)\n"
+        "time.sleep(1.5)\n"
+        "print('more progress', file=sys.stderr, flush=True)\n"
+    )
+    argv = [sys.executable, "-c", code]
+
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=10,
+        backend="fake-truesilence-stderr-only",
+        round_no=2,
+        true_silence_timeout=1,  # would fire at 1s if stderr didn't count as output
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.true_silenced is False, (
+        "stderr-only progress was wrongly reaped as true-silence"
+    )
+    assert "progress" in result.stderr
+    assert "TRUE-SILENCE" not in result.stdout
+
+
+def test_true_silence_does_not_fire_on_a_stalled_partial_multibyte_sequence():
+    """codex review finding (review-cli#243 round 15, P1): activity must be marked on
+    RAW byte receipt, not on decoded TEXT. `codecs.getincrementaldecoder('utf-8')`
+    buffers an INCOMPLETE multibyte sequence internally and returns "" until it
+    completes -- a genuinely-alive child whose first write happens to be only the
+    leading byte(s) of a multibyte character (a CJK/Cyrillic character split across a
+    read boundary, say) would otherwise look like zero bytes were ever received, even
+    though real output DID arrive. Writes just the first byte of a 3-byte UTF-8
+    character (U+65E5 "日" = b'\\xe6\\x97\\xa5'), flushes, stalls past
+    true_silence_timeout, THEN completes the character and exits -- must NOT be
+    reaped as true-silent."""
+    code = (
+        "import sys, time\n"
+        "sys.stdout.buffer.write(b'\\xe6')\n"  # first byte only -- an incomplete UTF-8 sequence
+        "sys.stdout.buffer.flush()\n"
+        "time.sleep(1.5)\n"
+        "sys.stdout.buffer.write(b'\\x97\\xa5 done\\n')\n"  # completes the character
+        "sys.stdout.buffer.flush()\n"
+    )
+    argv = [sys.executable, "-c", code]
+
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=10,
+        backend="fake-truesilence-partial-utf8",
+        round_no=2,
+        true_silence_timeout=1,  # would fire at 1s if the partial byte didn't count
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.true_silenced is False, (
+        "a stalled partial multibyte UTF-8 sequence was wrongly reaped as true-silence"
+    )
+    assert "done" in result.stdout
+    assert "TRUE-SILENCE" not in result.stdout
+
+
+def test_true_silence_timeout_none_disables_the_check():
+    """The default (true_silence_timeout=None) must not change ANY existing caller's
+    behavior — a silent-but-eventually-talking child still gets its full idle budget."""
+    code = "import time\ntime.sleep(1.2)\nprint('done', flush=True)\n"
+    argv = [sys.executable, "-c", code]
+
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=5,
+        backend="fake-truesilence-disabled",
+        round_no=3,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.true_silenced is False
+    assert "done" in result.stdout
+    assert "TRUE-SILENCE" not in result.stdout
+
+
+def test_true_silence_wall_mode_is_unaffected():
+    """true_silence_timeout is an idle-mode-only concept; wall mode must ignore it.
+    Uses a true_silence_timeout SMALLER than the wall timeout (Fable review finding,
+    round 1: a prior version of this test used 999 against a 1s wall cap, which
+    passes trivially regardless of whether wall mode actually gates the check — this
+    tighter budget would expose a real gating bug if one existed, since the child
+    would be reaped at 1s by the true-silence path if it were reachable, but must
+    instead run the full 3s wall budget it actually requested)."""
+    code = "import time\ntime.sleep(60)\n"
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=3,
+        backend="fake-truesilence-wall",
+        round_no=4,
+        timeout_mode="wall",
+        true_silence_timeout=1,  # SMALLER than the 3s wall timeout — must still be ignored
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 2.5, (
+        f"wall mode was reaped after {elapsed:.2f}s — the true-silence check leaked "
+        "into wall mode instead of being ignored"
+    )
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert result.true_silenced is False
+    assert "total runtime" in result.stdout
+    assert "TRUE-SILENCE" not in result.stdout
+
+
+def test_true_silence_timeout_is_clamped_to_a_near_board_deadline():
+    """codex review finding (review-cli#243 round 5, P1): true_silence_timeout must
+    respect an active board deadline the same way idle_timeout already does via
+    idle_timeout_seconds' own _clamp_to_board_deadline call (review-cli#221/#228).
+    Without this, a nearly-expired REVIEW_BOARD_DEADLINE_SECONDS clamps idle_timeout
+    down close to process._MIN_DEADLINE_CLAMPED_IDLE_FLOOR, but a silent seat
+    pre-first-byte would still wait the full, un-clamped true_silence_timeout
+    regardless — overrunning the very deadline #228 exists to enforce.
+
+    _clamp_to_board_deadline's own correctness (including its
+    _MIN_DEADLINE_CLAMPED_IDLE_FLOOR=90s floor, which makes any REAL end-to-end reap
+    of a clamped value take 90+ real seconds) is already covered by
+    test_idle_timeout_seconds_clamps_to_a_near_deadline and its siblings above — this
+    test proves the WIRING (that _run_streamed actually calls it on true_silence_timeout,
+    not just on idle_timeout), by monkeypatching the shared clamp function to a fast,
+    deterministic stand-in rather than waiting out the real floor."""
+    code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+    argv = [sys.executable, "-c", code]
+
+    calls: list[int] = []
+    orig_clamp = process._clamp_to_board_deadline
+
+    def _fake_clamp(computed: int) -> int:
+        calls.append(computed)
+        return 1 if computed == 60 else orig_clamp(computed)
+
+    process._clamp_to_board_deadline = _fake_clamp
+    try:
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=120,
+            backend="fake-truesilence-deadline-clamp",
+            round_no=1,
+            true_silence_timeout=60,
+        )
+    finally:
+        process._clamp_to_board_deadline = orig_clamp
+
+    assert 60 in calls, (
+        "true_silence_timeout was never passed through _clamp_to_board_deadline — "
+        "the board-deadline clamp is not wired into the true-silence path"
+    )
+    assert result.returncode == 125, result.stdout + result.stderr
+    assert result.true_silenced is True
+    assert "TRUE-SILENCE TIMEOUT after 1s" in result.stdout, (
+        "the reap used the raw true_silence_timeout (60s) instead of the clamped "
+        "stand-in value (1s) returned by _clamp_to_board_deadline"
+    )
+
+
+def test_true_silence_clamp_reflects_state_after_the_concurrency_wait_not_before():
+    """The sibling test above calls `_run_streamed` with an immediately-available
+    concurrency slot, so it passes identically whether the clamp is computed at
+    function entry (stale for a queued seat) or after the concurrency-slot wait --
+    it can't distinguish the two. This test forces real contention: it holds the
+    sole slot (`REVIEW_MAX_CONCURRENCY=1`) itself, starts `_run_streamed` in a
+    background thread (which must block waiting for the slot), and synchronizes on
+    real proof that the worker has reached ITS OWN acquire call -- not a fixed
+    `sleep()` -- before flipping the (monkeypatched) board-deadline clamp and
+    releasing. A regressed (entry-time) implementation reads the clamp as the very
+    first thing in `_run_streamed`, strictly earlier in the worker's program order
+    than the acquire call this test waits on, so by the time that signal fires a
+    regression has already committed to the PRE-flip value with certainty. Only the
+    fixed (post-acquire) implementation can observe the POST-flip value, since it
+    cannot compute the clamp until the real semaphore unblocks it -- no earlier
+    than our release()."""
+    code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+    argv = [sys.executable, "-c", code]
+
+    clamp_return = {"value": 999}  # the "pre-flip" (stale) value
+
+    def _fake_clamp(computed: int) -> int:
+        return clamp_return["value"]
+
+    # (GLM review finding, round 2 correction) This fake also intercepts the worker's
+    # entry-time `idle_timeout_seconds()` call, not just the post-acquire true-silence
+    # one -- so `idle_timeout` is ALSO 999 pre-flip. Harmless, not load-bearing: the
+    # child never emits a byte, so the round-4 "sole authority" branch is the only one
+    # that can ever fire here regardless of idle_timeout's value -- but noted so nobody
+    # is surprised the idle budget reads 999 mid-test.
+
+    result_box: dict[str, object] = {}
+    t: threading.Thread | None = None
+
+    with _with_env(REVIEW_MAX_CONCURRENCY="1"):
+        # Unlike test_concurrency_cap.py's own `_with_env`, this file's version (above)
+        # only saves/restores env vars -- it does NOT rebuild the cached concurrency
+        # semaphore, so a stale cap from an earlier test would otherwise silently leave
+        # extra free slots and this test would never actually contend.
+        process._reset_concurrency_sem_for_tests()
+        # Patched/restored entirely from the MAIN thread around the whole lifecycle
+        # (GLM review finding): the previous version patched inside the worker thread
+        # and only restored in the worker's own `finally`, which never ran if the
+        # worker hung past `t.join(timeout=...)` -- leaking a flipped global clamp
+        # into every later test in this process.
+        orig_clamp = process._clamp_to_board_deadline
+        process._clamp_to_board_deadline = _fake_clamp
+        sem = None
+        orig_acquire = None
+        held_by_test = False
+        acquire_wrapped = False
+        try:
+            sem = process._get_concurrency_sem()
+            assert sem is not None, "cap=1 must build a real semaphore"
+            orig_acquire = sem.acquire
+            held_by_test = sem.acquire(blocking=False)
+            assert held_by_test, (
+                "test must hold the sole slot itself before starting the call"
+            )
+            # Prove cap==1 behaviorally (GLM finding: avoid the CPython-private
+            # `_value` attribute) -- a second non-blocking acquire must fail while the
+            # first slot is still held.
+            contended = sem.acquire(blocking=False)
+            assert not contended, (
+                "expected a cap=1 semaphore -- a second non-blocking acquire "
+                "succeeded while the first slot was still held"
+            )
+
+            # Fires the instant the worker thread reaches ITS OWN acquire call --
+            # production tries a non-blocking probe first (which will fail, since we
+            # hold the only slot) and then falls back to a real blocking acquire();
+            # both go through this wrapper, so the event fires no later than the
+            # worker reaching the concurrency-slot section, which is well after any
+            # entry-time computation a regression would already have done.
+            reached_acquire = threading.Event()
+
+            def _acquire_and_signal(*a, **kw):
+                reached_acquire.set()
+                return orig_acquire(*a, **kw)
+
+            sem.acquire = _acquire_and_signal
+            acquire_wrapped = True
+
+            def _run():
+                try:
+                    result_box["result"] = review._run_streamed(
+                        argv,
+                        cwd=REPO_ROOT,
+                        timeout=120,
+                        backend="fake-truesilence-queue-clamp",
+                        round_no=1,
+                        true_silence_timeout=60,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- surfaced below, not swallowed
+                    result_box["error"] = exc
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            reached = reached_acquire.wait(timeout=10)
+            # (GLM + k3 review findings, round 4) Check for a worker exception BEFORE
+            # the synchronization asserts below: a worker that raises before ever
+            # reaching its own acquire call (e.g. `_open_log` hits an OSError) leaves
+            # `reached_acquire` unset, and the asserts below would previously fire
+            # first with a misleading "never reached acquire"/"never contended"
+            # message -- burying the real exception, unread, in `result_box`.
+            if "error" in result_box:
+                raise result_box["error"]  # noqa: TRY201 -- the worker's real exception
+            assert reached, (
+                "worker never reached the concurrency-slot acquire call -- "
+                "this test isn't proving anything"
+            )
+            assert t.is_alive(), (
+                "the call returned before the slot was released -- "
+                "it never actually contended for the concurrency cap"
+            )
+
+            # Flip the clamp's return value only now that the worker is proven to
+            # have reached its own acquire call, then release the slot it's blocked
+            # on (or about to block on).
+            clamp_return["value"] = 1
+            sem.release()
+            held_by_test = False
+            # Generous margin over the ~1s true-silence reap: kill_tree/registration/
+            # thread teardown under real concurrent machine load (this repo's own
+            # CI/local runs share the machine with other heavy processes) can add
+            # real seconds.
+            t.join(timeout=30)
+        finally:
+            # codex review finding: an early assertion failure (e.g. `reached_acquire`
+            # never fires) used to skip `sem.release()` entirely, leaving the worker's
+            # thread permanently blocked on a slot only the test itself was holding.
+            # Release it here so a failing test doesn't also orphan a hung thread.
+            if held_by_test and sem is not None:
+                sem.release()
+            if acquire_wrapped and sem is not None:
+                del sem.acquire  # drop the instance wrapper, restore the class method
+            process._clamp_to_board_deadline = orig_clamp
+            process._reset_concurrency_sem_for_tests()
+
+    # (GLM review finding, round 3) `t is not None` would be dead code here -- every
+    # path that reaches this line has already passed through `t = threading.Thread(...)`
+    # above; an earlier failure raises inside the `try` and never reaches this assert.
+    # The `| None` in `t`'s annotation above exists only for the type checker.
+    assert not t.is_alive(), (
+        "the call never completed after the slot was released -- if the clamp were "
+        "computed before the concurrency wait it would have read the pre-flip 999s "
+        "value and nothing would reap within the 30s join"
+    )
+    if "error" in result_box:
+        raise result_box["error"]  # noqa: TRY201 -- re-raised, not swallowed as KeyError
+    result = result_box["result"]
+    assert result.returncode == 125, result.stdout + result.stderr
+    assert result.true_silenced is True
+    assert "TRUE-SILENCE TIMEOUT after 1s" in result.stdout, (
+        "the reap used the PRE-flip clamp value computed before the concurrency wait, "
+        "instead of the POST-flip value the fix requires the clamp to be recomputed "
+        f"against after acquiring the slot; stdout={result.stdout!r}"
+    )
+
+
+def test_true_silence_is_also_disabled_when_idle_reap_is_disabled():
+    """(Opus review finding, review-cli#243 round 4) The true-silence branch lives in
+    the `else` of `if timeout_mode == "wall" or idle_timeout is None:` -- so disabling
+    the ordinary idle reap (REVIEW_IDLE_TIMEOUT_SECONDS=0) ALSO disables true-silence
+    detection, even with true_silence_timeout explicitly set: a never-talking child
+    then runs to the full wall-clock `timeout`, same as any other idle-reap-disabled
+    call. Documented in _run_streamed's docstring; this pins the behavior so a future
+    refactor of the wait paths can't silently re-arm true-silence under
+    idle_timeout=None with no test catching it."""
+    code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+    argv = [sys.executable, "-c", code]
+
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=2,
+            backend="fake-disabled-idle-truesilence",
+            round_no=12,
+            true_silence_timeout=1,  # SMALLER than the 2s wall timeout — must be ignored
+        )
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert result.true_silenced is False, (
+        "true-silence fired despite idle reap being disabled"
+    )
+    assert "TRUE-SILENCE" not in result.stdout
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

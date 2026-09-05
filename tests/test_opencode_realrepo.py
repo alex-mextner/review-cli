@@ -66,6 +66,7 @@ class _Captured:
         self.timeout: int | None = None
         self.header_argv0: str | None = None
         self.liveness_timeout: int | None = None
+        self.true_silence_timeout: int | None = None
 
     def __call__(
         self,
@@ -77,7 +78,9 @@ class _Captured:
         announce=False,
         header_argv0=None,
         liveness_timeout=None,
+        true_silence_timeout=None,
     ):
+        self.true_silence_timeout = true_silence_timeout
         self.argv = list(argv)
         self.cwd = Path(cwd)
         self.timeout = timeout
