@@ -2662,6 +2662,33 @@ def test_quorum_check_bare_default_post_cutoff_role_less_diff_mode_review_cli_25
         assert "`review --show-board`" in gap
 
 
+def test_quorum_check_bare_default_all_board_seats_failed_review_cli_252_followup():
+    """GLM round-review finding: a role-less `review diff` run with a REAL board
+    configured, whose seats all failed (dead API keys, broken auth, ...), records
+    the identical shape as "no board configured at all" -- no `roles` key, since
+    `usable_roles` is empty either way. The remediation must not tell an operator
+    whose board already exists to go configure one; it must point at the actual
+    problem (seat health)."""
+    with _TmpStore():
+        _stats.record_run(
+            task_code=TASK,
+            mode="review",
+            models=["codex", "gemini"],
+            duration_seconds=1.0,
+            ok_count=0,
+            fail_count=2,
+            passed=False,
+            # No `started=` -- post-cutoff. No `roles=` -- every seat failed, so
+            # `usable_roles` came back empty even though a board WAS configured.
+        )
+        result = _stats.quorum_check(TASK, min_iter=1)
+        assert result["passed"] is False, result
+        gap = result["role_tracking_gap"]
+        assert "configure a reviewer board" not in gap, gap
+        assert "restore the reviewer board's seats to health" in gap, gap
+        assert "`review --show-board`" in gap, gap
+
+
 def test_quorum_check_bare_default_post_cutoff_mixed_diff_and_panel_modes_review_cli_252_followup():
     """Second-round Opus round-review finding: when `not_legacy` mixes a
     role-less `review diff` iteration WITH a role-blind panel iteration (e.g.

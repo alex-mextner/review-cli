@@ -393,7 +393,14 @@ def _load_records() -> list[dict]:
     return out
 
 
-def _parse_ts(record: dict) -> str:
+def _record_ts_str(record: dict) -> str:
+    """The raw ``ts`` sort key for `iterations_for_task` -- NOT related to
+    `parse_iso_ts` below despite the similar name (GLM review finding on this
+    feature's own PR: the two used to be named `_parse_ts`/`parse_iso_ts`, a
+    near-miss for a call-site mix-up since one returns the raw string and the
+    other a parsed `datetime | None`). This one exists only to give
+    `list.sort(key=...)` a lexicographically-sortable string (ISO-8601
+    timestamps sort correctly as plain strings); it never parses anything."""
     ts = record.get("ts")
     return ts if isinstance(ts, str) else ""
 
@@ -407,7 +414,7 @@ def iterations_for_task(task_code: str) -> list[dict]:
     if clean is None:
         return []
     records = [r for r in _load_records() if r.get("task_code") == clean]
-    records.sort(key=_parse_ts)
+    records.sort(key=_record_ts_str)
     out: list[dict] = []
     for index, record in enumerate(records, start=1):
         item = dict(record)
@@ -1418,6 +1425,24 @@ def quorum_check(
                 m for m in modes_used if m in board_capable_modes
             )
             has_panel = any(m not in board_capable_modes for m in modes_used)
+            # GLM round-review finding on this feature's own PR: a board-capable
+            # record with `ok_count == 0 and fail_count > 0` means every configured
+            # seat FAILED that run (dead API keys, broken auth, ...) -- NOT that no
+            # board was ever configured. `_run_mode_with_stats` (cli.py) omits the
+            # `roles` key whenever the failover outcome's `usable_roles` comes back
+            # empty, which happens for BOTH "no board configured" and "board
+            # configured, every seat unusable" -- the two are indistinguishable from
+            # the record alone except via this exact signal. Telling an operator
+            # whose board IS configured (but whose seats are all broken) to
+            # "configure a reviewer board" sends them chasing a config problem that
+            # doesn't exist instead of restoring seat health -- the concrete failure
+            # scenario this check exists to catch.
+            board_seats_failed = any(
+                item.get("mode") in board_capable_modes
+                and item.get("ok_count") == 0
+                and (item.get("fail_count") or 0) > 0
+                for item in not_legacy
+            )
             # Codex round-review finding: don't render `` `review visual
             # --task CODE` `` as a copy-pasteable "run this again" command --
             # `review visual` REQUIRES an IMAGE positional argument the gate
@@ -1440,10 +1465,20 @@ def quorum_check(
                 )
             )
             board_fix = (
-                "configure a reviewer board for this repo (see `review "
-                "--show-board` / config.yaml's `board:` entry) and re-run "
-                f"{rerun_hint} through it -- a role-less run with no board "
-                "config records no per-seat roles"
+                (
+                    "restore the reviewer board's seats to health (see `review "
+                    "--show-board` for per-seat availability -- dead API keys, "
+                    "missing CLI auth, or an unpaid provider are the usual "
+                    f"causes) and re-run {rerun_hint} -- every configured seat "
+                    "failed on this run, which records no per-seat roles"
+                )
+                if board_seats_failed
+                else (
+                    "configure a reviewer board for this repo (see `review "
+                    "--show-board` / config.yaml's `board:` entry) and re-run "
+                    f"{rerun_hint} through it -- a role-less run with no board "
+                    "config records no per-seat roles"
+                )
             )
             # Opus round-review finding: when NO mode could be identified at
             # all (`modes_used` empty -- a corrupted/externally-written
