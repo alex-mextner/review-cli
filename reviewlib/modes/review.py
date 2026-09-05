@@ -40,6 +40,7 @@ from ..backends import (
 )
 from ..config import (
     DEFAULT_POOL_SIZE,
+    DEFAULT_PROMPT,
     BoardReviewer,
     apply_effort_override,
     select_pool_and_reserve_with_reuse,
@@ -318,7 +319,35 @@ def mode_review(
             _tally_ok(result_is_usable(results[-1]))
 
     by_model = {result.model: result for result in results}
-    print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))
+    # check_evidence=prompt.startswith(DEFAULT_PROMPT) (k3 review finding, round 6;
+    # `.startswith` not `==`, k3 finding round 7 — see below): only the diff-review
+    # render paths (here and the board path below) apply the missing-evidence
+    # WARNING at all — DEFAULT_PROMPT's "checked: ..." contract is a diff-review-only
+    # ask, so quorum/just-ask/brainstorm's own format_result calls stay at the
+    # default False (glm-cc review finding, round 1). But even within diff-review,
+    # `--prompt` lets a caller REPLACE DEFAULT_PROMPT entirely (e.g. `--prompt
+    # 'Answer APPROVED if safe; otherwise list blockers.'`) — a custom prompt never
+    # asked for the "checked: ..." phrasing, so a compliant one-word "APPROVED"
+    # response must not get a warning claiming it omitted evidence it was never
+    # asked to provide. An exact `==` check (round 6's first cut) silently broke on
+    # `--visual`: `_with_visual` APPENDS the image's context note to whatever prompt
+    # is in effect (`text + visual_ctx.context_note`, cli.py's `_with_visual`), so
+    # `review diff --visual shot.png` with no `--prompt` dispatches
+    # `DEFAULT_PROMPT + context_note` — a DIFFERENT string from `DEFAULT_PROMPT`,
+    # even though the model still received DEFAULT_PROMPT's full "checked: ..."
+    # contract verbatim. `==` silently disabled the WARNING on every visual diff
+    # review, exactly the composable path this feature needs to keep covering.
+    # `.startswith` recognizes DEFAULT_PROMPT as an unmodified PREFIX (true whether
+    # visual appended nothing, or appended a context note) while still resolving to
+    # False for a genuinely custom `--prompt` (with or without `--visual`), which by
+    # construction never starts with DEFAULT_PROMPT's text.
+    check_evidence = prompt.startswith(DEFAULT_PROMPT)
+    print(
+        "\n\n---\n\n".join(
+            format_result(by_model[model], check_evidence=check_evidence)
+            for model in models
+        )
+    )
     # Opus review finding: this used to check ONLY `returncode == 0`, not
     # `result_is_usable`. A live rc=0 "is currently unavailable" sentinel (the same
     # shape `_cooldown_skip_result` deliberately mirrors, and the board path already
@@ -978,7 +1007,14 @@ def _mode_review_board(
     if outcome_sink is not None:
         outcome_sink.append(outcome)
 
-    print("\n\n---\n\n".join(format_result(r) for r in outcome.results))
+    # check_evidence=prompt.startswith(DEFAULT_PROMPT) — see the flat path's
+    # identical note above (k3 review finding, rounds 6-7).
+    check_evidence = prompt.startswith(DEFAULT_PROMPT)
+    print(
+        "\n\n---\n\n".join(
+            format_result(r, check_evidence=check_evidence) for r in outcome.results
+        )
+    )
 
     if outcome.degraded:
         print(
