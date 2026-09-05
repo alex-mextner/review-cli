@@ -191,6 +191,7 @@ def mode_review(
     effort_override: "EffortOverride | None" = None,
     commit: bool = False,
     usage_percent: Callable[[str], float | None] | None = None,
+    stamp_diff_hash: str | None = None,
 ) -> int:
     # --commit REQUIRES --staged (see the exit-code block above). Checked BEFORE the (paid)
     # panel dispatch, not after — a usage mistake should fail fast, not after burning a full
@@ -229,6 +230,7 @@ def mode_review(
             exact_board,
             commit,
             usage_percent,
+            stamp_diff_hash,
         )
 
     # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets BOTH
@@ -346,7 +348,13 @@ def mode_review(
     # a review actually happened. Left as-is deliberately; not a regression to fix here.
     ok = all(result_is_usable(result) for result in results)
     _stamp_if_staged_commit_review(
-        ok, staged, diff_from_stdin, cwd, diff, dispatch_diff_truncated
+        ok,
+        staged,
+        diff_from_stdin,
+        cwd,
+        diff,
+        dispatch_diff_truncated,
+        stamp_diff_hash=stamp_diff_hash,
     )
     override = _checkpoint_if_requested(
         commit, ok, diff_from_stdin, cwd, diff, dispatch_diff_truncated
@@ -444,6 +452,8 @@ def _stamp_if_staged_commit_review(
     cwd: Path,
     diff: str,
     truncated: bool,
+    *,
+    stamp_diff_hash: str | None = None,
 ) -> None:
     """Write the diff-scoped review-stamp and touch the session marker iff this review
     genuinely satisfies the staged commit gate. Shared by the flat and board paths so the
@@ -468,9 +478,17 @@ def _stamp_if_staged_commit_review(
     fail-OPEN — a future call site that simply forgets to pass it would silently
     certify a truncated review again, exactly the bug this parameter exists to prevent.
     Every current caller already computes and threads it explicitly.
+
+    `stamp_diff_hash` (round-5 review finding, k3+Opus): the pre-commit-hook-compatible
+    hash captured by the CLI at DISPATCH time (adjacent to `diff`'s own capture), passed
+    straight through to `_write_review_stamp` so the stamp certifies what the models
+    actually reviewed rather than whatever `git diff --cached` returns MINUTES later at
+    stamp-write time (a real TOCTOU window: a concurrent index mutation during the panel
+    run could otherwise get silently certified as reviewed). None for any non-CLI caller
+    of `mode_review` — `_write_review_stamp` falls back to its own independent re-derive.
     """
     if ok and staged and not diff_from_stdin and not truncated:
-        _write_review_stamp(cwd, diff)
+        _write_review_stamp(cwd, diff, stamp_diff_hash=stamp_diff_hash)
         _touch_review_marker()
 
 
@@ -873,6 +891,7 @@ def _mode_review_board(
     exact_board: bool = False,
     commit: bool = False,
     usage_percent: Callable[[str], float | None] | None = None,
+    stamp_diff_hash: str | None = None,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -974,7 +993,13 @@ def _mode_review_board(
     # shortfall (reserve exhausted) does.
     ok = not outcome.degraded
     _stamp_if_staged_commit_review(
-        ok, staged, diff_from_stdin, cwd, diff, dispatch_diff_truncated
+        ok,
+        staged,
+        diff_from_stdin,
+        cwd,
+        diff,
+        dispatch_diff_truncated,
+        stamp_diff_hash=stamp_diff_hash,
     )
     override = _checkpoint_if_requested(
         commit, ok, diff_from_stdin, cwd, diff, dispatch_diff_truncated
@@ -1036,6 +1061,12 @@ def _handler(ctx: ModeContext) -> int:
     # commit gate even under --staged — see _stamp_if_staged_commit_review.
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
     commit = bool(getattr(ctx.args, "commit", False))
+    # Captured by the CLI immediately adjacent to `ctx.diff`'s own capture (a
+    # millisecond gap, not the multi-minute panel-run gap re-deriving it at
+    # stamp-WRITE time would have) — see `install._write_review_stamp`'s
+    # docstring. None for any non-CLI caller of `mode_review` (falls back to
+    # that function's own independent re-derive).
+    stamp_diff_hash = ctx.extra.get("stamp_diff_hash")
     base = (
         ctx.models,
         ctx.with_visual(ctx.args.prompt),
@@ -1052,6 +1083,7 @@ def _handler(ctx: ModeContext) -> int:
             visual_images=_visual_images(ctx),
             effort_override=ctx.effort_override,
             commit=commit,
+            stamp_diff_hash=stamp_diff_hash,
         )
     return mode_review(
         *base,
@@ -1062,6 +1094,7 @@ def _handler(ctx: ModeContext) -> int:
         visual_images=_visual_images(ctx),
         exact_board=bool(ctx.extra.get("exact_board", False)),
         commit=commit,
+        stamp_diff_hash=stamp_diff_hash,
         usage_percent=ctx.extra.get("usage_percent"),
     )
 

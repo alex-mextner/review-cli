@@ -30,12 +30,55 @@ the real pool size (models actually dispatched), and the real wall-clock from a
 monotonic clock — into its own append-only JSONL. The dashboard's per-call logs
 are untouched and keep serving their richer drill-down; this store serves the ETA.
 
-Privacy: the store holds model NAMES only — never prompts, diffs, or keys. It is
-created 0600 (same posture as the per-call logs, which can hold secrets) even
-though it shouldn't carry any.
+Privacy: the store holds model NAMES, plus (since v4 — see "Diff-identity
+binding" below) a normalized REPO IDENTIFIER (a remote URL with credentials
+stripped, or a local absolute path when there is no remote) and the list of FILE
+PATHS touched by the reviewed diff. It never holds prompts, diff BODIES, or keys.
+It is created 0600 (same posture as the per-call logs, which can hold secrets)
+even though it shouldn't carry any.
+
+Diff-identity binding (task-code quorum-pollution fix)
+--------------------------------------------------------
+The self-merge-authority quorum gate (`quorum_check` / `review task CODE
+--check`) counts PASSED iterations keyed purely by TASK CODE STRING. Three real
+incidents in one session (2026-08-11) showed that string alone is not enough:
+task-code reuse across unrelated repos/PRs/typos let one diff's real reviews
+silently count toward a completely different diff's quorum — a wrong-repo
+review, a deliberate task-code swap between two PRs sharing a parent ticket, and
+years of unrelated cross-repo history piling up under one shared code. In all
+three the reviewed content had nothing to do with the diff being merged.
+
+So every new record carries `repo_id` (which repo the review ran in) and
+`diff_files` (which files the reviewed diff touched). `quorum_check` can then be
+handed the CURRENT repo/diff context and flag/exclude iterations that don't
+match — see quorum_check's own docstring for the exact matching rules. This is
+INTENTIONALLY NOT a diff content-hash equality check: the whole point of
+multiple review iterations is that the code changes between them (findings get
+fixed, then re-reviewed), so the diff TEXT is expected to differ round to
+round — only the REPO and the FILE SET are expected to stay stable across a
+task's legitimate iterations. `diff_sha256` is recorded too (an exact hash of
+the reviewed diff text) purely as an additional diagnostic signal for
+`--detail`/debugging, not as part of the mismatch-detection gate.
+
+Threat-model boundary: this store is a local, self-reported JSONL file — nothing
+stops a caller with write access from appending a FRESH record with a fabricated
+`repo_id`/`diff_files` that happen to match the current check context (the test
+suite does exactly this, deliberately, to simulate history without a real
+`review diff` run). This fix closes the "wrong string still matches real but
+unrelated history" bug class the 3 incidents actually were — task-code reuse,
+typos, and shared-parent-ticket confusion — NOT a cryptographic guarantee against
+a fully malicious agent minting a convincing fake record from scratch. Don't
+oversell it as the latter in downstream docs/messaging.
+
+Old records (pre-v4) simply lack `repo_id`/`diff_files`/`diff_sha256` — readers
+must treat that as "identity unknown, can't verify" (still counted, per the
+gate's existing backward-compat contract for missing fields) rather than
+crashing or auto-failing them.
 """
+
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -54,8 +97,94 @@ from pathlib import Path
 # report-only by design). Readers must treat "no key" as unknown either way, never
 # crash, and — for the quorum gate specifically — fail-closed (unknown counts as
 # not-passed; see quorum_check).
-STATS_VERSION = 3
+#
+# v4 adds "repo_id" (normalized repo identity) and "diff_files" (sorted list of
+# file paths the reviewed diff touched), plus "diff_sha256" (an exact hash of the
+# reviewed diff text, diagnostic-only). See the module docstring's "Diff-identity
+# binding" section. A record with none of these predates v4 (or ran in a context
+# with no resolvable repo/diff) — readers must treat that as identity UNKNOWN,
+# not as a mismatch.
+STATS_VERSION = 4
 _TASK_CODE_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,120}$")
+# `diff --git a/<path> b/<path>` header. Paths containing spaces/special chars are
+# C-quoted by git (`"a/weird\tname"`) and NOT unescaped here — extraction degrades
+# to a best-effort miss for those rare paths rather than a wrong path, which is
+# fine for this module's purpose (file-SET overlap, not an exact manifest).
+_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
+# `git@host:org/repo(.git)` SCP-style SSH remote syntax.
+_SCP_STYLE_REMOTE_RE = re.compile(r"^[^@/]+@([^:/]+):(.+)$")
+# Cap on `quorum_check`'s `mismatch_details` list (the COUNT in
+# `excluded_mismatched_iterations` is always the true total, uncapped) -- a
+# task with thousands of polluted iterations (the HYP-858 shape this feature
+# targets) must not balloon `--check --json` into a multi-MB payload.
+_MISMATCH_DETAILS_CAP = 50
+
+
+def diff_content_hash(diff_text: str) -> str:
+    """Sha256 hex digest of the exact reviewed diff text (diagnostic-only; NOT part
+    of the mismatch-detection gate — see the module docstring)."""
+    return hashlib.sha256(
+        diff_text.encode("utf-8", errors="surrogateescape")
+    ).hexdigest()
+
+
+def extract_diff_files(diff_text: str) -> list[str]:
+    """Sorted, deduped file paths touched by a unified git diff's ``a/``/``b/`` sides.
+
+    Best-effort: pure regex over ``diff --git a/<path> b/<path>`` headers, no full
+    diff parse. Both sides are collected (not just the post-image) so a rename or a
+    delete (``b/`` side ``/dev/null``) still credits the pre-image path. Returns []
+    for an empty/header-less diff — never raises.
+    """
+    files: set[str] = set()
+    for a_path, b_path in _DIFF_GIT_HEADER_RE.findall(diff_text or ""):
+        for p in (a_path, b_path):
+            if p and p != "/dev/null":
+                files.add(p)
+    return sorted(files)
+
+
+def normalize_repo_remote(url: str) -> str | None:
+    """Normalize a git remote URL to a host/org/repo identity string, or None if
+    ``url`` is empty/unparseable.
+
+    Strips credentials, protocol, a trailing ``.git``, and trailing slashes so the
+    SAME remote reached over https vs ssh, with or without an embedded token,
+    normalizes to one identical id — e.g. ``https://x-access-token:ghp_abc@
+    github.com/org/repo.git`` and ``git@github.com:org/repo.git`` both become
+    ``github.com/org/repo``. Also lowercases the host (DNS hostnames are
+    case-insensitive; ``GitHub.com`` and ``github.com`` are the same remote) and
+    drops an explicit default SSH port (``:22``) so ``ssh://git@host:22/org/repo``
+    matches the portless ``git@host:org/repo`` form (codex/fable review findings on
+    this feature's own PR — both were real "same repo, spurious repo_mismatch"
+    false-positive gaps in the ORIGINAL cut of this function; a NON-default port is
+    intentionally NOT stripped since it plausibly names a different remote). This
+    is an identity key for cross-repo mismatch detection, not a URL a caller should
+    try to clone from.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    scp = _SCP_STYLE_REMOTE_RE.match(raw)
+    if scp:
+        host, path = scp.group(1), scp.group(2)
+    else:
+        # Strip a protocol scheme (https://, git://, ssh://, http://) if present.
+        no_scheme = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", raw)
+        # Drop embedded credentials (user[:pass]@host/...).
+        no_creds = re.sub(r"^[^/@]+@", "", no_scheme)
+        parts = no_creds.split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None
+        host, path = parts
+    host = host.strip().rstrip("/").lower()
+    host = re.sub(r":22$", "", host)  # default SSH port -> same remote as portless
+    path = path.strip().strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    if not host or not path:
+        return None
+    return f"{host}/{path}"
 
 
 def normalize_task_code(value: str | None) -> str | None:
@@ -70,7 +199,9 @@ def normalize_task_code(value: str | None) -> str | None:
     if not code:
         return None
     if not _TASK_CODE_RE.match(code):
-        raise ValueError("task code must be one non-whitespace token, max 120 characters")
+        raise ValueError(
+            "task code must be one non-whitespace token, max 120 characters"
+        )
     return code
 
 
@@ -112,6 +243,9 @@ def record_run(
     fail_count: int,
     started: datetime | None = None,
     passed: bool | None = None,
+    repo_id: str | None = None,
+    diff_files: list[str] | None = None,
+    diff_sha256: str | None = None,
 ) -> bool:
     """Append one run record to the JSONL store. Best-effort: never raises.
 
@@ -131,6 +265,13 @@ def record_run(
     (e.g. ``qa``, which is report-only — see the ``mode == "qa"`` branch in
     ``cli.py``'s ``_run_mode_with_stats``): a missing ``passed`` key means "verdict
     unknown", not specifically "written before v3".
+
+    ``repo_id``/``diff_files``/``diff_sha256`` are the diff-identity fields (v4 —
+    see the module docstring's "Diff-identity binding" section), each omitted from
+    the record when ``None`` (same "unknown, not written as null" convention as
+    ``passed``/``task_code``). ``diff_files`` MAY be an empty list (a real run with
+    no diff, e.g. a diff-less ``just-ask``) — that is recorded as ``[]``, distinct
+    from omitting the key entirely.
     """
     try:
         clean_task = normalize_task_code(task_code)
@@ -150,6 +291,12 @@ def record_run(
         record["task_code"] = clean_task
     if passed is not None:
         record["passed"] = bool(passed)
+    if repo_id is not None:
+        record["repo_id"] = repo_id
+    if diff_files is not None:
+        record["diff_files"] = list(diff_files)
+    if diff_sha256 is not None:
+        record["diff_sha256"] = diff_sha256
     try:
         p = stats_path()  # may raise RuntimeError on an unexpandable ~user / no HOME
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +309,9 @@ def record_run(
             # broader perms and keep them forever. fchmod on every write so the 0600
             # privacy guarantee holds for pre-existing files too.
             os.fchmod(fd, 0o600)
-            os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8"))
+            os.write(
+                fd, (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+            )
         finally:
             os.close(fd)
         return True
@@ -177,7 +326,9 @@ def _load_records() -> list[dict]:
     """Read every well-formed JSONL record. Skips junk lines; never raises."""
     out: list[dict] = []
     try:
-        raw = stats_path().read_text(encoding="utf-8")  # stats_path() may raise RuntimeError
+        raw = stats_path().read_text(
+            encoding="utf-8"
+        )  # stats_path() may raise RuntimeError
     except Exception:  # noqa: BLE001 — unreadable/unexpandable store -> no history, never crash
         return out
     for line in raw.splitlines():
@@ -230,7 +381,128 @@ def _store_unreadable_error() -> str | None:
     return None
 
 
-def quorum_check(task_code: str, *, min_iter: int, min_models: int) -> dict:
+def _classify_iteration_identity(
+    item: dict, repo_id: str, current_files: frozenset[str]
+) -> tuple[str, str | None]:
+    """Classify one PASSED iteration against the CURRENT check context.
+
+    ``current_files`` is a pre-built ``frozenset`` (hoisted ONCE by the caller,
+    not rebuilt per iteration — this loop runs once per PASSED iteration, which
+    for the exact "years of history" pollution shape this feature targets can be
+    thousands; review finding on this feature's own PR).
+
+    Returns ``(bucket, reason)``:
+      * ``"verified"`` — the iteration's recorded repo matches ``repo_id``, and
+        either it has no recorded file set, ``current_files`` (the current
+        context) is empty, or the two file sets share at least one file.
+        ``reason`` is None.
+      * ``"mismatched"`` — the recorded repo differs (``reason="repo_mismatch"``),
+        or the repo matches but BOTH file sets are non-empty and share NO file at
+        all (``reason="diff_mismatch"``) — this is the pattern all three real
+        incidents shared: iterations reviewing manifestly different content
+        counting toward an unrelated task's quorum.
+      * ``"unverifiable"`` — the iteration predates diff-identity recording (no
+        ``repo_id`` on the record); can't be verified either way, ``reason`` None.
+    """
+    item_repo = item.get("repo_id")
+    if not isinstance(item_repo, str) or not item_repo:
+        return "unverifiable", None
+    if item_repo != repo_id:
+        return "mismatched", "repo_mismatch"
+    item_files = item.get("diff_files")
+    if current_files and isinstance(item_files, list) and item_files:
+        if current_files.isdisjoint(item_files):
+            return "mismatched", "diff_mismatch"
+    return "verified", None
+
+
+def _sort_passed_iterations_into_buckets(
+    passed_iterations: list[dict], repo_id: str | None, diff_files: list[str] | None
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split PASSED iterations into (verified, mismatched_detail_dicts, unverifiable).
+
+    When ``repo_id`` is None (the caller supplied no check context — e.g. a direct
+    library call with no cwd to resolve), verification is skipped entirely: every
+    passed iteration is "verified" as-is, matching this function's pre-diff-identity
+    behavior exactly (no new keys, no filtering) for backward compatibility.
+    """
+    if repo_id is None:
+        return list(passed_iterations), [], []
+    current_files = frozenset(diff_files or ())
+    verified: list[dict] = []
+    mismatched: list[dict] = []
+    unverifiable: list[dict] = []
+    for item in passed_iterations:
+        bucket, reason = _classify_iteration_identity(item, repo_id, current_files)
+        if bucket == "verified":
+            verified.append(item)
+        elif bucket == "mismatched":
+            # recorded_diff_files is the actual evidence for a "diff_mismatch" (the
+            # repo already matched by definition in that case, so recorded_repo_id
+            # alone tells an operator nothing about WHY it was excluded — review
+            # finding on this feature's own PR).
+            mismatched.append(
+                {
+                    "iteration": item.get("iteration"),
+                    "reason": reason,
+                    "recorded_repo_id": item.get("repo_id"),
+                    "recorded_diff_files": item.get("diff_files"),
+                    "ts": item.get("ts"),
+                }
+            )
+        else:
+            unverifiable.append(item)
+    return verified, mismatched, unverifiable
+
+
+def _distinct_models(items: list[dict]) -> list[str]:
+    """Sorted, deduped model list across a set of run-stats iterations."""
+    models: list[str] = []
+    for item in items:
+        for model in item.get("models") or []:
+            if isinstance(model, str) and model not in models:
+                models.append(model)
+    models.sort()
+    return models
+
+
+def _finalize_quorum_result(
+    result: dict,
+    *,
+    store_error: str | None,
+    iterations: list[dict],
+    mismatched: list[dict],
+    clean: str,
+) -> None:
+    """Set the terminal ``passed``/``error`` keys on an in-progress quorum result, in
+    fail-closed priority order: an unreadable store, then zero history, then (only if
+    the bar still isn't met) surfacing that some history was excluded as mismatched --
+    mutates ``result`` in place."""
+    if store_error is not None:
+        result["passed"] = False
+        result["error"] = store_error
+    elif not iterations:
+        result["passed"] = False
+        result["error"] = f"no recorded review iterations for {clean}"
+    elif mismatched and not result["passed"]:
+        # Bar not met AND some history was excluded as mismatched -- surface WHY in
+        # the human-facing error too (not just the diagnostic keys), so an operator
+        # staring at "0/3 iterations" understands it isn't simply "never reviewed".
+        result["error"] = (
+            f"{len(mismatched)} recorded iteration(s) for {clean} were excluded: "
+            "recorded repo/diff did not match the code currently being checked "
+            "(see mismatch_details)"
+        )
+
+
+def quorum_check(
+    task_code: str,
+    *,
+    min_iter: int,
+    min_models: int,
+    repo_id: str | None = None,
+    diff_files: list[str] | None = None,
+) -> dict:
     """Compute the quorum verdict for one task: N PASSED iterations across M distinct
     models (self-merge-authority gate; CTO decision tg#7306 #1).
 
@@ -242,6 +514,20 @@ def quorum_check(task_code: str, *, min_iter: int, min_models: int) -> dict:
     is deliberately treated as not-passed: unverdicted iterations — old OR current —
     can never satisfy this gate, only verdict-tagged passed runs can. This is
     fail-closed by design, not a bug — see record_run's ``passed`` param.
+
+    ``repo_id``/``diff_files`` (both optional) are the CURRENT check context — "what
+    repo/diff are we deciding whether to merge right now" — and enable diff-identity
+    verification (v4, see the module docstring): a passed iteration whose OWN recorded
+    ``repo_id`` differs, or whose recorded ``diff_files`` shares no file with the
+    current ``diff_files``, is EXCLUDED from ``passed_iterations``/``models`` rather
+    than silently counted (this is what closes the three real quorum-pollution
+    incidents this field exists for). Iterations with no recorded identity (pre-v4,
+    or a run with no resolvable repo) are "unverifiable" and still count, preserving
+    the old behavior for history that predates this field. When ``repo_id`` is None
+    (the caller has no check context to give — direct library callers that omit it,
+    exactly as before this parameter existed), NO verification is attempted and the
+    return shape is IDENTICAL to the pre-v4 function: no mismatch/unverifiable keys,
+    every passed iteration counts. Passing a check context is what turns the gate on.
 
     Fail-closed (independent of the above): an invalid task code, an unreadable/missing
     store, or zero recorded iterations for the code all yield ``passed: False`` plus an
@@ -280,29 +566,47 @@ def quorum_check(task_code: str, *, min_iter: int, min_models: int) -> dict:
     # Fail-closed: a record with no "passed" key (pre-v3, verdict unknown) is NOT
     # passed — `is True` (not truthy) so it never accidentally matches None/missing.
     passed_iterations = [item for item in iterations if item.get("passed") is True]
-    models: list[str] = []
-    for item in passed_iterations:
-        for model in item.get("models") or []:
-            if isinstance(model, str) and model not in models:
-                models.append(model)
-    models.sort()
+    verified, mismatched, unverifiable = _sort_passed_iterations_into_buckets(
+        passed_iterations, repo_id, diff_files
+    )
+    # Gate-worthy = verified (identity checked out) + unverifiable (no identity to
+    # check, so unchanged from pre-v4 behavior) — mismatched iterations are excluded.
+    gate_iterations = verified + unverifiable
+    models = _distinct_models(gate_iterations)
 
     result = {
         "task_code": clean,
-        "passed_iterations": len(passed_iterations),
+        "passed_iterations": len(gate_iterations),
         "total_iterations": len(iterations),
         "distinct_models_passed": len(models),
         "models": models,
         "min_iter": min_iter,
         "min_models": min_models,
-        "passed": len(passed_iterations) >= min_iter and len(models) >= min_models,
+        "passed": len(gate_iterations) >= min_iter and len(models) >= min_models,
     }
-    if store_error is not None:
-        result["passed"] = False
-        result["error"] = store_error
-    elif not iterations:
-        result["passed"] = False
-        result["error"] = f"no recorded review iterations for {clean}"
+    # Verification-diagnostic keys are added ONLY when a check context was actually
+    # supplied — omitted entirely otherwise, so a caller that never opts in sees the
+    # exact pre-v4 shape (no new keys) — see this function's own docstring.
+    if repo_id is not None:
+        result["verified_iterations"] = len(verified)
+        result["unverifiable_iterations"] = len(unverifiable)
+        # The COUNT is always the true total (this is what the gate math above
+        # already used); only the detail LIST is capped below, so a task with
+        # thousands of polluted iterations (the exact HYP-858 shape this feature
+        # targets) can't balloon --check --json into a multi-MB payload (GLM
+        # review finding on this feature's own PR) — the count alone is enough
+        # for a machine gate, and a human debugging the exclusion has --detail.
+        result["excluded_mismatched_iterations"] = len(mismatched)
+        result["mismatch_details"] = mismatched[:_MISMATCH_DETAILS_CAP]
+        if len(mismatched) > _MISMATCH_DETAILS_CAP:
+            result["mismatch_details_truncated"] = True
+    _finalize_quorum_result(
+        result,
+        store_error=store_error,
+        iterations=iterations,
+        mismatched=mismatched,
+        clean=clean,
+    )
     return result
 
 
@@ -375,11 +679,14 @@ def estimate_eta(mode: str, pool_size: int) -> dict | None:
         durs = [
             float(r["duration_seconds"])
             for r in matching
-            if isinstance(r.get("duration_seconds"), (int, float)) and r["duration_seconds"] >= 0
+            if isinstance(r.get("duration_seconds"), (int, float))
+            and r["duration_seconds"] >= 0
         ]
         return (sum(durs) / len(durs)) if durs else None
 
-    exact = [r for r in records if r.get("mode") == mode and r.get("pool_size") == pool_size]
+    exact = [
+        r for r in records if r.get("mode") == mode and r.get("pool_size") == pool_size
+    ]
     avg = _avg(exact)
     if avg is not None:
         return {"avg_seconds": avg, "samples": len(exact), "basis": "mode+pool"}
