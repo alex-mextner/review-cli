@@ -929,7 +929,22 @@ def quorum_check(
         # worth a batch `active_cooldowns(models)` API in seat_cooldown if this ever
         # gets called in a loop over many task codes.
         for m in attempted_models:
-            cd = _seat_cooldown.active_cooldown(m)
+            # review-cli#153/#159/#179: the store is now keyed by (model, access_method)
+            # -- this diagnostic doesn't know in advance which transport a given model
+            # dispatches through (claude's cli/api split, opencode's own bucket), so it
+            # probes every known access method and reports the first active one found.
+            # A model realistically cools down under only ONE access method at a time
+            # in practice (the board dispatches each model through a single fixed
+            # route), so "first found" and "most severe" coincide for the common case
+            # this diagnostic exists to surface; a model genuinely cooling down under
+            # two methods at once would only ever show one here, which is still
+            # strictly better than the pre-#187 "always show the model" gap this
+            # diagnostic already accepts (see the module docstring above).
+            cd = None
+            for access_method in ("cli", "api", "opencode"):
+                cd = _seat_cooldown.active_cooldown(m, access_method=access_method)
+                if cd is not None:
+                    break
             if cd is not None:
                 stalled.append(
                     {

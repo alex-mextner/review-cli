@@ -219,11 +219,19 @@ def test_disable_paths_never_acquire_the_lock():
         saved = sc._locked
         sc._locked = _tripwire
         try:
-            sc.record_cooldown(MODEL, "session limit", now=1000.0, ttl_seconds=0.0)
+            sc.record_cooldown(
+                MODEL,
+                "session limit",
+                now=1000.0,
+                ttl_seconds=0.0,
+                access_method="test",
+            )
             saved_env = os.environ.get("REVIEW_SEAT_COOLDOWN_SECONDS")
             os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = "0"
             try:
-                sc.record_cooldown(MODEL, "session limit", now=1000.0)
+                sc.record_cooldown(
+                    MODEL, "session limit", now=1000.0, access_method="test"
+                )
             finally:
                 if saved_env is None:
                     os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
@@ -255,7 +263,9 @@ def test_clear_cooldown_noop_skips_the_lock_but_not_the_read():
         saved = sc._locked
         sc._locked = _tripwire
         try:
-            sc.clear_cooldown(MODEL)  # nothing was ever recorded — the no-op path
+            sc.clear_cooldown(
+                MODEL, access_method="test"
+            )  # nothing was ever recorded — the no-op path
         finally:
             sc._locked = saved
         assert calls == [], calls
@@ -471,7 +481,11 @@ def test_concurrent_writes_from_multiple_threads_never_lose_an_entry():
         sc._LOCK_TOTAL_DEADLINE_SECONDS = 10.0
         try:
             threads = [
-                threading.Thread(target=sc.record_cooldown, args=(m, "session limit"))
+                threading.Thread(
+                    target=sc.record_cooldown,
+                    args=(m, "session limit"),
+                    kwargs={"access_method": "test"},
+                )
                 for m in models
             ]
             for t in threads:
@@ -482,7 +496,9 @@ def test_concurrent_writes_from_multiple_threads_never_lose_an_entry():
         finally:
             sc._write = saved_write
             sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
-        missing = [m for m in models if sc.active_cooldown(m) is None]
+        missing = [
+            m for m in models if sc.active_cooldown(m, access_method="test") is None
+        ]
         assert missing == [], missing
 
     _with_store(_run)
@@ -514,15 +530,23 @@ def test_record_and_clear_interleave_without_losing_either_side():
     def _run():
         cleared_model = "claude:to-clear"
         other_models = [f"claude:keep{i}" for i in range(6)]
-        sc.record_cooldown(cleared_model, "session limit")
+        sc.record_cooldown(cleared_model, "session limit", access_method="test")
         saved_write = _patched(sc, "_write", _slow_write_factory(sc._write))
         saved_deadline = sc._LOCK_TOTAL_DEADLINE_SECONDS
         sc._LOCK_TOTAL_DEADLINE_SECONDS = 10.0
         try:
             threads = [
-                threading.Thread(target=sc.clear_cooldown, args=(cleared_model,))
+                threading.Thread(
+                    target=sc.clear_cooldown,
+                    args=(cleared_model,),
+                    kwargs={"access_method": "test"},
+                )
             ] + [
-                threading.Thread(target=sc.record_cooldown, args=(m, "session limit"))
+                threading.Thread(
+                    target=sc.record_cooldown,
+                    args=(m, "session limit"),
+                    kwargs={"access_method": "test"},
+                )
                 for m in other_models
             ]
             for t in threads:
@@ -533,8 +557,14 @@ def test_record_and_clear_interleave_without_losing_either_side():
         finally:
             sc._write = saved_write
             sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
-        assert sc.active_cooldown(cleared_model) is None, "clear was lost"
-        missing = [m for m in other_models if sc.active_cooldown(m) is None]
+        assert sc.active_cooldown(cleared_model, access_method="test") is None, (
+            "clear was lost"
+        )
+        missing = [
+            m
+            for m in other_models
+            if sc.active_cooldown(m, access_method="test") is None
+        ]
         assert missing == [], missing
 
     _with_store(_run)
@@ -585,7 +615,7 @@ def test_locked_serialises_record_cooldown_across_real_processes():
             "sc._FLOCK_SUB_BUDGET_SECONDS = 10.0;"
             "_real = sc._write;"
             "sc._write = lambda p, d: (time.sleep(0.1), _real(p, d))[1];"
-            "sc.record_cooldown(sys.argv[1], 'session limit')"
+            "sc.record_cooldown(sys.argv[1], 'session limit', access_method='test')"
         )
         env = dict(os.environ, REVIEW_SEAT_COOLDOWN_FILE=str(store_file))
         procs = [
@@ -603,7 +633,9 @@ def test_locked_serialises_record_cooldown_across_real_processes():
                 if p.poll() is None:
                     p.kill()
                     p.wait()
-        missing = [m for m in models if sc.active_cooldown(m) is None]
+        missing = [
+            m for m in models if sc.active_cooldown(m, access_method="test") is None
+        ]
         assert missing == [], missing
 
     _with_store(_run)
@@ -630,7 +662,7 @@ def test_locked_serialises_clear_cooldown_across_real_processes():
     def _run():
         models = [f"claude:clear-proc{i}" for i in range(4)]
         for m in models:
-            sc.record_cooldown(m, "session limit")
+            sc.record_cooldown(m, "session limit", access_method="test")
         store_file = sc.cooldown_path()
         prog = (
             "import sys, time;"
@@ -640,7 +672,7 @@ def test_locked_serialises_clear_cooldown_across_real_processes():
             "sc._FLOCK_SUB_BUDGET_SECONDS = 10.0;"
             "_real = sc._write;"
             "sc._write = lambda p, d: (time.sleep(0.1), _real(p, d))[1];"
-            "sc.clear_cooldown(sys.argv[1])"
+            "sc.clear_cooldown(sys.argv[1], access_method='test')"
         )
         env = dict(os.environ, REVIEW_SEAT_COOLDOWN_FILE=str(store_file))
         procs = [
@@ -656,7 +688,9 @@ def test_locked_serialises_clear_cooldown_across_real_processes():
                 if p.poll() is None:
                     p.kill()
                     p.wait()
-        still_cooling = [m for m in models if sc.active_cooldown(m) is not None]
+        still_cooling = [
+            m for m in models if sc.active_cooldown(m, access_method="test") is not None
+        ]
         assert still_cooling == [], still_cooling
 
     _with_store(_run)
@@ -673,10 +707,12 @@ def test_locked_degrades_to_in_process_lock_when_fcntl_is_unavailable():
         saved_fcntl = sc.fcntl
         sc.fcntl = None
         try:
-            sc.record_cooldown("claude:no-fcntl", "session limit")
-            assert sc.active_cooldown("claude:no-fcntl") is not None
-            sc.clear_cooldown("claude:no-fcntl")
-            assert sc.active_cooldown("claude:no-fcntl") is None
+            sc.record_cooldown("claude:no-fcntl", "session limit", access_method="test")
+            assert (
+                sc.active_cooldown("claude:no-fcntl", access_method="test") is not None
+            )
+            sc.clear_cooldown("claude:no-fcntl", access_method="test")
+            assert sc.active_cooldown("claude:no-fcntl", access_method="test") is None
         finally:
             sc.fcntl = saved_fcntl
 
@@ -718,10 +754,17 @@ def test_locked_degrades_to_in_process_lock_when_flock_raises_oserror():
         )
         sc.fcntl = fake_fcntl
         try:
-            sc.record_cooldown("claude:flock-oserror", "session limit")
-            assert sc.active_cooldown("claude:flock-oserror") is not None
-            sc.clear_cooldown("claude:flock-oserror")
-            assert sc.active_cooldown("claude:flock-oserror") is None
+            sc.record_cooldown(
+                "claude:flock-oserror", "session limit", access_method="test"
+            )
+            assert (
+                sc.active_cooldown("claude:flock-oserror", access_method="test")
+                is not None
+            )
+            sc.clear_cooldown("claude:flock-oserror", access_method="test")
+            assert (
+                sc.active_cooldown("claude:flock-oserror", access_method="test") is None
+            )
         finally:
             sc.fcntl = real_fcntl
 
@@ -746,7 +789,7 @@ def test_locked_degrades_instead_of_hanging_when_peer_holds_the_flock():
     completes promptly (not hung) and the write still lands once the peer's hold matters
     no more than the degrade path allows.
 
-    Opus review finding, round 2 [High]: measuring `elapsed` AFTER `record_cooldown()`
+    Opus review finding, round 2 [High]: measuring `elapsed` AFTER `record_cooldown(access_method="test")`
     returns means a REGRESSION to unbounded blocking would hang this test itself (and the
     whole suite) instead of failing it — no assertion is ever reached. Runs the call in a
     worker thread and joins with a timeout instead, matching the pattern the sibling
@@ -787,7 +830,9 @@ def test_locked_degrades_instead_of_hanging_when_peer_holds_the_flock():
             sc.fcntl.flock(held_fd, sc.fcntl.LOCK_EX)
 
             t = threading.Thread(
-                target=sc.record_cooldown, args=("claude:contended", "session limit")
+                target=sc.record_cooldown,
+                args=("claude:contended", "session limit"),
+                kwargs={"access_method": "test"},
             )
             started = _time.monotonic()
             t.start()
@@ -808,7 +853,9 @@ def test_locked_degrades_instead_of_hanging_when_peer_holds_the_flock():
                 f"record_cooldown returned in {elapsed}s — too fast to have actually "
                 "contended the held lock; is the sidecar lock path still correct?"
             )
-            assert sc.active_cooldown("claude:contended") is not None
+            assert (
+                sc.active_cooldown("claude:contended", access_method="test") is not None
+            )
         finally:
             if held_fd is not None:
                 sc.fcntl.flock(held_fd, sc.fcntl.LOCK_UN)
@@ -868,7 +915,11 @@ def test_flock_sub_budget_lets_inprocess_threads_serialize_despite_held_flock():
             sc.fcntl.flock(held_fd, sc.fcntl.LOCK_EX)  # external peer holds it for good
 
             threads = [
-                threading.Thread(target=sc.record_cooldown, args=(m, "session limit"))
+                threading.Thread(
+                    target=sc.record_cooldown,
+                    args=(m, "session limit"),
+                    kwargs={"access_method": "test"},
+                )
                 for m in models
             ]
             for t in threads:
@@ -883,7 +934,9 @@ def test_flock_sub_budget_lets_inprocess_threads_serialize_despite_held_flock():
             sc._write = saved_write
             sc._LOCK_TOTAL_DEADLINE_SECONDS = saved_deadline
             sc._FLOCK_SUB_BUDGET_SECONDS = saved_sub_budget
-        missing = [m for m in models if sc.active_cooldown(m) is None]
+        missing = [
+            m for m in models if sc.active_cooldown(m, access_method="test") is None
+        ]
         assert missing == [], missing
 
     _with_store(_run)
@@ -929,6 +982,7 @@ def test_locked_degrades_to_fully_unlocked_when_a_peer_holds_lock_itself():
             t = threading.Thread(
                 target=sc.record_cooldown,
                 args=("claude:lock-contended", "session limit"),
+                kwargs={"access_method": "test"},
             )
             started = _time.monotonic()
             t.start()
@@ -955,7 +1009,10 @@ def test_locked_degrades_to_fully_unlocked_when_a_peer_holds_lock_itself():
         # the worker thread returned), so it must still have landed via the pre-fix
         # best-effort path — proving the degrade doesn't just complete fast, it still
         # writes.
-        assert sc.active_cooldown("claude:lock-contended") is not None
+        assert (
+            sc.active_cooldown("claude:lock-contended", access_method="test")
+            is not None
+        )
 
     _with_store(_run)
 
@@ -998,11 +1055,11 @@ def test_locked_releases_the_lock_when_the_body_raises():
         saved_write = _patched(sc, "_write", _boom)
         try:
             sc.record_cooldown(
-                "claude:boom", "session limit"
+                "claude:boom", "session limit", access_method="test"
             )  # swallowed by record_cooldown
         finally:
             sc._write = saved_write
-        assert sc.active_cooldown("claude:boom") is None, (
+        assert sc.active_cooldown("claude:boom", access_method="test") is None, (
             "the failed write must not land"
         )
 
@@ -1026,10 +1083,10 @@ def test_locked_releases_the_lock_when_the_body_raises():
             finally:
                 os.close(probe)
 
-        sc.record_cooldown("claude:after-boom", "session limit")
-        assert sc.active_cooldown("claude:after-boom") is not None, (
-            "a write after a raising body means the lock was released, not leaked"
-        )
+        sc.record_cooldown("claude:after-boom", "session limit", access_method="test")
+        assert (
+            sc.active_cooldown("claude:after-boom", access_method="test") is not None
+        ), "a write after a raising body means the lock was released, not leaked"
 
     _with_store(_run)
 
@@ -1331,15 +1388,15 @@ def test_review_claude_skip_does_not_escalate_or_reclear_the_cooldown():
 
     def _run():
         # Real wall-clock timestamps, NOT a fixed 1970 epoch: the dispatch-time
-        # `active_cooldown(model)` check INSIDE `review_claude` calls with no `now=`
+        # `active_cooldown(model, access_method="cli")` check INSIDE `review_claude` calls with no `now=`
         # override, so it always checks against real time — an entry recorded at a
         # fixed past epoch would already read as expired there, letting the real CLI
         # dispatch through and defeating the whole point of this test (the same
         # pitfall k3's round-4 finding caught in a sibling test above).
         t0 = time.time()
-        sc.record_cooldown(MODEL, "hang", now=t0)
-        sc.record_cooldown(MODEL, "hang", now=t0)
-        before = sc.active_cooldown(MODEL, now=t0)
+        sc.record_cooldown(MODEL, "hang", now=t0, access_method="cli")
+        sc.record_cooldown(MODEL, "hang", now=t0, access_method="cli")
+        before = sc.active_cooldown(MODEL, now=t0, access_method="cli")
         assert before["fail_count"] == 2
         saved_cli = _patched(
             backends,
@@ -1358,7 +1415,7 @@ def test_review_claude_skip_does_not_escalate_or_reclear_the_cooldown():
             backends.unpaid_provider_result = saved_unpaid
         assert result.returncode == 0
         assert "is currently unavailable" in result.stdout
-        after = sc.active_cooldown(MODEL, now=t0)
+        after = sc.active_cooldown(MODEL, now=t0, access_method="cli")
         assert after is not None, "the skip must not have cleared the cooldown"
         assert after["fail_count"] == 2, "the skip must not have escalated fail_count"
         assert after["until"] == before["until"], (
@@ -1634,9 +1691,9 @@ def test_review_with_images_skip_does_not_escalate_or_reclear_the_cooldown():
 
     def _run():
         t0 = time.time()
-        sc.record_cooldown(MODEL, "hang", now=t0)
-        sc.record_cooldown(MODEL, "hang", now=t0)
-        before = sc.active_cooldown(MODEL, now=t0)
+        sc.record_cooldown(MODEL, "hang", now=t0, access_method="cli")
+        sc.record_cooldown(MODEL, "hang", now=t0, access_method="cli")
+        before = sc.active_cooldown(MODEL, now=t0, access_method="cli")
         assert before["fail_count"] == 2
         saved_images = _patched(
             backends,
@@ -1657,7 +1714,7 @@ def test_review_with_images_skip_does_not_escalate_or_reclear_the_cooldown():
             backends.unpaid_provider_result = saved_unpaid
         assert result.returncode == 0
         assert "is currently unavailable" in result.stdout
-        after = sc.active_cooldown(MODEL, now=t0)
+        after = sc.active_cooldown(MODEL, now=t0, access_method="cli")
         assert after is not None, "the skip must not have cleared the cooldown"
         assert after["fail_count"] == 2, "the skip must not have escalated fail_count"
         assert after["until"] == before["until"], (
@@ -1713,11 +1770,11 @@ def test_review_with_images_clears_cooldown_on_genuine_success():
         path = sc.cooldown_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            '{"' + MODEL + '": {"until": 1.0, "reason": "hang", '
-            '"recorded_at": 1.0, "fail_count": 2}}'
+            '{"' + MODEL + '": {"cli": {"until": 1.0, "reason": "hang", '
+            '"recorded_at": 1.0, "fail_count": 2}}}'
         )
         assert (
-            sc.active_cooldown(MODEL) is None
+            sc.active_cooldown(MODEL, access_method="cli") is None
         )  # already expired -> real dispatch runs
 
         saved_images = _patched(
@@ -1836,8 +1893,8 @@ def test_quorum_rc0_sentinel_moderator_result_is_not_reported_as_success():
 # ---- review-cli#221: escalating cooldown on repeated consecutive failures -------------
 def test_escalation_first_failure_uses_default_ttl():
     def _run():
-        sc.record_cooldown(MODEL, "hang", now=1000.0)
-        cd = sc.active_cooldown(MODEL, now=1000.0)
+        sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="test")
+        cd = sc.active_cooldown(MODEL, now=1000.0, access_method="test")
         assert cd["remaining_seconds"] == sc.DEFAULT_COOLDOWN_SECONDS
         assert cd["fail_count"] == 1
 
@@ -1849,8 +1906,8 @@ def test_escalation_climbs_the_schedule_on_consecutive_failures():
         t = 1000.0
         expected = list(sc._ESCALATION_SCHEDULE)
         for i, ttl in enumerate(expected):
-            sc.record_cooldown(MODEL, "hang", now=t)
-            cd = sc.active_cooldown(MODEL, now=t)
+            sc.record_cooldown(MODEL, "hang", now=t, access_method="test")
+            cd = sc.active_cooldown(MODEL, now=t, access_method="test")
             assert cd["remaining_seconds"] == ttl, (i, cd)
             assert cd["fail_count"] == i + 1
             t += 1.0  # well within the reset window, still climbing
@@ -1863,10 +1920,10 @@ def test_escalation_caps_at_the_schedule_ceiling():
         t = 1000.0
         last_t = t
         for _ in range(len(sc._ESCALATION_SCHEDULE) + 3):  # push well past the cap
-            sc.record_cooldown(MODEL, "hang", now=t)
+            sc.record_cooldown(MODEL, "hang", now=t, access_method="test")
             last_t = t
             t += 1.0
-        cd = sc.active_cooldown(MODEL, now=last_t)
+        cd = sc.active_cooldown(MODEL, now=last_t, access_method="test")
         assert cd["remaining_seconds"] == sc._ESCALATION_SCHEDULE[-1]
 
     _with_store(_run)
@@ -1874,13 +1931,13 @@ def test_escalation_caps_at_the_schedule_ceiling():
 
 def test_escalation_resets_after_a_long_quiet_period():
     def _run():
-        sc.record_cooldown(MODEL, "hang", now=1000.0)
-        sc.record_cooldown(MODEL, "hang", now=1001.0)
-        cd = sc.active_cooldown(MODEL, now=1001.0)
+        sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="test")
+        sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="test")
+        cd = sc.active_cooldown(MODEL, now=1001.0, access_method="test")
         assert cd["fail_count"] == 2
         far_future = 1001.0 + sc._ESCALATION_RESET_SECONDS + 1.0
-        sc.record_cooldown(MODEL, "hang", now=far_future)
-        cd = sc.active_cooldown(MODEL, now=far_future)
+        sc.record_cooldown(MODEL, "hang", now=far_future, access_method="test")
+        cd = sc.active_cooldown(MODEL, now=far_future, access_method="test")
         assert cd["fail_count"] == 1
         assert cd["remaining_seconds"] == sc.DEFAULT_COOLDOWN_SECONDS
 
@@ -1894,8 +1951,10 @@ def test_escalation_does_not_apply_when_ttl_seconds_is_explicit():
 
     def _run():
         for _ in range(5):
-            sc.record_cooldown(MODEL, "hang", now=1000.0, ttl_seconds=600.0)
-        cd = sc.active_cooldown(MODEL, now=1000.0)
+            sc.record_cooldown(
+                MODEL, "hang", now=1000.0, ttl_seconds=600.0, access_method="test"
+            )
+        cd = sc.active_cooldown(MODEL, now=1000.0, access_method="test")
         assert cd["remaining_seconds"] == 600.0
         # Round-4 review finding (k3): the docstring's "no fail_count climbing" half
         # of the claim was never actually asserted — a regression that kept the ttl
@@ -1913,8 +1972,8 @@ def test_escalation_does_not_apply_when_env_ttl_is_explicit():
         os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = "5"
         try:
             for i in range(4):
-                sc.record_cooldown(MODEL, "hang", now=1000.0 + i)
-            cd = sc.active_cooldown(MODEL, now=1003.0)
+                sc.record_cooldown(MODEL, "hang", now=1000.0 + i, access_method="test")
+            cd = sc.active_cooldown(MODEL, now=1003.0, access_method="test")
             assert cd["remaining_seconds"] == 5.0 - 0.0  # last record was at t=1003.0
         finally:
             os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
@@ -1934,22 +1993,25 @@ def test_env_override_resets_fail_count_and_a_later_bare_failure_does_not_resume
     anything and was silently ignored)."""
 
     def _run():
-        sc.record_cooldown(MODEL, "hang", now=1000.0)
-        sc.record_cooldown(MODEL, "hang", now=1001.0)
-        sc.record_cooldown(MODEL, "hang", now=1002.0)
-        assert sc.active_cooldown(MODEL, now=1002.0)["fail_count"] == 3
+        sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="test")
+        sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="test")
+        sc.record_cooldown(MODEL, "hang", now=1002.0, access_method="test")
+        assert (
+            sc.active_cooldown(MODEL, now=1002.0, access_method="test")["fail_count"]
+            == 3
+        )
 
         os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = "5"
         try:
-            sc.record_cooldown(MODEL, "hang", now=1003.0)
+            sc.record_cooldown(MODEL, "hang", now=1003.0, access_method="test")
         finally:
             os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
-        cd = sc.active_cooldown(MODEL, now=1003.0)
+        cd = sc.active_cooldown(MODEL, now=1003.0, access_method="test")
         assert cd["fail_count"] == 1, "the override write must reset fail_count to 1"
         assert cd["remaining_seconds"] == 5.0
 
-        sc.record_cooldown(MODEL, "hang", now=1004.0)
-        cd = sc.active_cooldown(MODEL, now=1004.0)
+        sc.record_cooldown(MODEL, "hang", now=1004.0, access_method="test")
+        cd = sc.active_cooldown(MODEL, now=1004.0, access_method="test")
         assert cd["fail_count"] == 2, (
             "escalation must resume fresh from the override-reset point (2), not "
             "silently carry the pre-override history forward (4)"
@@ -1959,14 +2021,16 @@ def test_env_override_resets_fail_count_and_a_later_bare_failure_does_not_resume
 
 
 def test_active_cooldown_defaults_fail_count_to_1_for_pre_escalation_records():
-    """A record written before this feature existed has no `fail_count` key — must read
-    as 1, not crash or read as 0/None."""
+    """A record written before this feature (but after #187's access-method nesting)
+    existed has no `fail_count` key — must read as 1, not crash or read as 0/None."""
 
     def _run():
         path = sc.cooldown_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('{"' + MODEL + '": {"until": 2000.0, "reason": "old"}}')
-        cd = sc.active_cooldown(MODEL, now=1000.0)
+        path.write_text(
+            '{"' + MODEL + '": {"test": {"until": 2000.0, "reason": "old"}}}'
+        )
+        cd = sc.active_cooldown(MODEL, now=1000.0, access_method="test")
         assert cd["fail_count"] == 1
 
     _with_store(_run)
@@ -1986,13 +2050,13 @@ def test_escalation_ignores_a_corrupt_fail_count_on_the_record_side():
             path.write_text(
                 '{"'
                 + MODEL
-                + '": {"until": 500.0, "reason": "old", "recorded_at": 999.0, '
+                + '": {"test": {"until": 500.0, "reason": "old", "recorded_at": 999.0, '
                 + '"fail_count": '
                 + corrupt
-                + "}}"
+                + "}}}"
             )
-            sc.record_cooldown(MODEL, "hang", now=1000.0)
-            cd = sc.active_cooldown(MODEL, now=1000.0)
+            sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="test")
+            cd = sc.active_cooldown(MODEL, now=1000.0, access_method="test")
             assert cd["fail_count"] == 1, corrupt
             assert cd["remaining_seconds"] == sc.DEFAULT_COOLDOWN_SECONDS, corrupt
 
@@ -2010,11 +2074,13 @@ def test_escalation_does_not_index_negative_on_a_future_recorded_at():
         path = sc.cooldown_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            '{"' + MODEL + '": {"until": 500.0, "reason": "old", '
-            '"recorded_at": 5000.0, "fail_count": 2}}'
+            '{"' + MODEL + '": {"test": {"until": 500.0, "reason": "old", '
+            '"recorded_at": 5000.0, "fail_count": 2}}}'
         )
-        sc.record_cooldown(MODEL, "hang", now=1000.0)  # now is BEFORE recorded_at
-        cd = sc.active_cooldown(MODEL, now=1000.0)
+        sc.record_cooldown(
+            MODEL, "hang", now=1000.0, access_method="test"
+        )  # now is BEFORE recorded_at
+        cd = sc.active_cooldown(MODEL, now=1000.0, access_method="test")
         assert cd["fail_count"] == 1  # treated as no valid prior, not "reset to 3"
 
     _with_store(_run)
@@ -2036,11 +2102,11 @@ def test_escalation_rejects_a_bool_recorded_at_same_as_a_bool_fail_count():
         # were accepted as an int (True == 1) -- proves the guard rejects it on TYPE,
         # not merely because the numeric value happens to fall outside the window.
         path.write_text(
-            '{"' + MODEL + '": {"until": 500.0, "reason": "old", '
-            '"recorded_at": true, "fail_count": 2}}'
+            '{"' + MODEL + '": {"test": {"until": 500.0, "reason": "old", '
+            '"recorded_at": true, "fail_count": 2}}}'
         )
-        sc.record_cooldown(MODEL, "hang", now=1.0)
-        cd = sc.active_cooldown(MODEL, now=1.0)
+        sc.record_cooldown(MODEL, "hang", now=1.0, access_method="test")
+        cd = sc.active_cooldown(MODEL, now=1.0, access_method="test")
         assert cd["fail_count"] == 1, (
             "a bool recorded_at must not count as a valid prior"
         )
@@ -2058,14 +2124,17 @@ def test_success_clears_an_escalated_cooldown_review_cli_221():
     wiring tests / manual read of backends.py, not re-simulated here)."""
 
     def _run():
-        sc.record_cooldown(MODEL, "hang", now=1000.0)
-        sc.record_cooldown(MODEL, "hang", now=1001.0)
-        assert sc.active_cooldown(MODEL, now=1001.0)["fail_count"] == 2
-        sc.clear_cooldown(MODEL)
-        assert sc.active_cooldown(MODEL, now=1001.0) is None
+        sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="test")
+        sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="test")
+        assert (
+            sc.active_cooldown(MODEL, now=1001.0, access_method="test")["fail_count"]
+            == 2
+        )
+        sc.clear_cooldown(MODEL, access_method="test")
+        assert sc.active_cooldown(MODEL, now=1001.0, access_method="test") is None
         # A failure AFTER the clear starts fresh at fail_count 1, not 3.
-        sc.record_cooldown(MODEL, "hang", now=1002.0)
-        cd = sc.active_cooldown(MODEL, now=1002.0)
+        sc.record_cooldown(MODEL, "hang", now=1002.0, access_method="test")
+        cd = sc.active_cooldown(MODEL, now=1002.0, access_method="test")
         assert cd["fail_count"] == 1
         assert cd["remaining_seconds"] == sc.DEFAULT_COOLDOWN_SECONDS
 
@@ -2082,15 +2151,18 @@ def test_clear_cooldown_deletes_escalated_entry_even_with_cooldowns_disabled():
     for up to the 8h cap despite the just-observed recovery."""
 
     def _run():
-        sc.record_cooldown(MODEL, "hang", now=1000.0)
-        sc.record_cooldown(MODEL, "hang", now=1001.0)
-        assert sc.active_cooldown(MODEL, now=1001.0)["fail_count"] == 2
+        sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="test")
+        sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="test")
+        assert (
+            sc.active_cooldown(MODEL, now=1001.0, access_method="test")["fail_count"]
+            == 2
+        )
         os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = "0"
         try:
-            sc.clear_cooldown(MODEL)
+            sc.clear_cooldown(MODEL, access_method="test")
         finally:
             os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
-        assert sc.active_cooldown(MODEL, now=1001.0) is None
+        assert sc.active_cooldown(MODEL, now=1001.0, access_method="test") is None
 
     _with_store(_run)
 
@@ -2104,16 +2176,19 @@ def test_wiring_review_claude_clears_cooldown_on_genuine_success():
 
     Round-4 review finding (k3): the original version of this test recorded entries at
     `now=1000.0/1001.0` (1970 — long expired relative to real wall-clock) and then
-    asserted `active_cooldown(MODEL) is None` with NO `now=` (i.e. at real time) — an
+    asserted `active_cooldown(MODEL, access_method="cli") is None` with NO `now=` (i.e. at real time) — an
     expired entry reads as None from `active_cooldown` regardless of whether
     `clear_cooldown` ever ran, so deleting the `clear_cooldown` call from
     `review_claude` entirely still left this test green. Fixed to assert store-level
     deletion instead (mirrors the correct sibling test for the --visual call site)."""
 
     def _run():
-        sc.record_cooldown(MODEL, "hang", now=1000.0)
-        sc.record_cooldown(MODEL, "hang", now=1001.0)
-        assert sc.active_cooldown(MODEL, now=1001.0)["fail_count"] == 2
+        sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="cli")
+        sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="cli")
+        assert (
+            sc.active_cooldown(MODEL, now=1001.0, access_method="cli")["fail_count"]
+            == 2
+        )
 
         saved = backends.review_claude_cli
         # Round-4 review finding (k3): every OTHER wiring test in this file stubs
@@ -2147,9 +2222,12 @@ def test_wiring_review_claude_clears_cooldown_on_genuine_success():
 
 def test_wiring_review_claude_non_chronic_failure_does_not_clear_cooldown():
     def _run():
-        sc.record_cooldown(MODEL, "hang", now=1000.0)
-        sc.record_cooldown(MODEL, "hang", now=1001.0)
-        assert sc.active_cooldown(MODEL, now=1001.0)["fail_count"] == 2
+        sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="cli")
+        sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="cli")
+        assert (
+            sc.active_cooldown(MODEL, now=1001.0, access_method="cli")["fail_count"]
+            == 2
+        )
 
         saved = backends.review_claude_cli
         saved_unpaid = _patched(
@@ -2169,7 +2247,7 @@ def test_wiring_review_claude_non_chronic_failure_does_not_clear_cooldown():
         finally:
             backends.review_claude_cli = saved
             backends.unpaid_provider_result = saved_unpaid
-        cd = sc.active_cooldown(MODEL, now=1001.0)
+        cd = sc.active_cooldown(MODEL, now=1001.0, access_method="cli")
         assert cd is not None, "a non-chronic failure must not erase escalation history"
         assert cd["fail_count"] == 2
 
@@ -2185,9 +2263,12 @@ def test_wiring_review_claude_empty_rc0_body_does_not_clear_cooldown():
     at 10 minutes forever despite being just as unusable on every dispatch."""
 
     def _run():
-        sc.record_cooldown(MODEL, "hang", now=1000.0)
-        sc.record_cooldown(MODEL, "hang", now=1001.0)
-        assert sc.active_cooldown(MODEL, now=1001.0)["fail_count"] == 2
+        sc.record_cooldown(MODEL, "hang", now=1000.0, access_method="cli")
+        sc.record_cooldown(MODEL, "hang", now=1001.0, access_method="cli")
+        assert (
+            sc.active_cooldown(MODEL, now=1001.0, access_method="cli")["fail_count"]
+            == 2
+        )
 
         saved = backends.review_claude_cli
         saved_unpaid = _patched(
@@ -2203,7 +2284,7 @@ def test_wiring_review_claude_empty_rc0_body_does_not_clear_cooldown():
         finally:
             backends.review_claude_cli = saved
             backends.unpaid_provider_result = saved_unpaid
-        cd = sc.active_cooldown(MODEL, now=1001.0)
+        cd = sc.active_cooldown(MODEL, now=1001.0, access_method="cli")
         assert cd is not None, "an empty-rc0 result must not clear escalation history"
         assert cd["fail_count"] == 2, "an empty-rc0 result must not itself escalate"
 

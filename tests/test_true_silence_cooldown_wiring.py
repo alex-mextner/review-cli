@@ -123,13 +123,13 @@ def _stub_run_streamed(
 
 def test_true_silence_records_a_cooldown():
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None
         with _stub_run_streamed(125, true_silenced=True) as captured:
             result = review_backends.review_opencode(
                 MODEL, "prompt", "diff", Path("."), 60
             )
         assert result.returncode == 125
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is not None
         # The registry-driven value must actually reach _run_streamed, not silently
         # stay None (which would disable the check) OR a hardcoded stand-in that just
         # happens to be truthy (Fable review finding, round 3: an earlier version of
@@ -172,13 +172,13 @@ def test_a_genuine_child_exit_125_without_true_silence_does_not_record_a_cooldow
     must never be misdiagnosed as a stuck seat and wrongly benched."""
 
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None
         with _stub_run_streamed(125, true_silenced=False):
             result = review_backends.review_opencode(
                 MODEL, "prompt", "diff", Path("."), 60
             )
         assert result.returncode == 125
-        assert sc.active_cooldown(MODEL) is None, (
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None, (
             "a genuine (non-true-silence) exit 125 wrongly recorded a cooldown"
         )
 
@@ -192,13 +192,13 @@ def test_true_silence_wiring_covers_the_in_repo_branch_too():
     `_record_true_silence_if_needed` plumbing that could silently drift out of sync."""
 
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None
         with _stub_run_streamed(125, true_silenced=True, runs_in_repo=True) as captured:
             result = review_backends.review_opencode(
                 MODEL, "prompt", "diff", Path("."), 60
             )
         assert result.returncode == 125
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is not None
         assert captured["true_silence_timeout"] is not None
 
     _with_store(_run)
@@ -206,13 +206,13 @@ def test_true_silence_wiring_covers_the_in_repo_branch_too():
 
 def test_ordinary_success_does_not_record_a_cooldown():
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None
         with _stub_run_streamed(0, true_silenced=False):
             result = review_backends.review_opencode(
                 MODEL, "prompt", "diff", Path("."), 60
             )
         assert result.returncode == 0
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None
 
     _with_store(_run)
 
@@ -225,13 +225,13 @@ def test_ordinary_idle_timeout_does_not_record_a_true_silence_cooldown():
     exercise)."""
 
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None
         with _stub_run_streamed(124, true_silenced=False):
             result = review_backends.review_opencode(
                 MODEL, "prompt", "diff", Path("."), 60
             )
         assert result.returncode == 124
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None
 
     _with_store(_run)
 
@@ -249,7 +249,7 @@ def test_a_recorded_cooldown_is_actually_consulted_on_the_next_call():
             )
         assert first.returncode == 125
         assert first_call["calls"] == 1
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is not None
 
         with _stub_run_streamed(0, true_silenced=False) as second_call:
             second = review_backends.review_opencode(
@@ -284,8 +284,8 @@ def test_true_silence_cooldown_crosses_the_oc_and_opencode_alias_spellings():
         assert first_call["calls"] == 1
         # The cooldown must be recorded under the CANONICAL `oc:` key, not the raw
         # `opencode:` alias that was actually passed in.
-        assert sc.active_cooldown(OC_MODEL) is not None
-        assert sc.active_cooldown(OPENCODE_ALIAS) is None
+        assert sc.active_cooldown(OC_MODEL, access_method="opencode") is not None
+        assert sc.active_cooldown(OPENCODE_ALIAS, access_method="opencode") is None
 
         with _stub_run_streamed(0, true_silenced=False) as second_call:
             second = review_backends.review_opencode(
@@ -327,7 +327,7 @@ def test_review_opencode_reports_the_callers_own_model_on_both_dispatch_and_skip
             f"{OPENCODE_ALIAS!r} -- this would KeyError in review.py's by_model lookup"
         )
 
-        sc.record_cooldown(CANONICAL, "true-silence timeout")
+        sc.record_cooldown(CANONICAL, "true-silence timeout", access_method="opencode")
         with _stub_run_streamed(0, true_silenced=False):
             skipped = review_backends.review_opencode(
                 OPENCODE_ALIAS, "prompt", "diff", Path("."), 60
@@ -352,7 +352,7 @@ def test_cooldown_skip_is_attributed_to_opencode_not_claude():
     def _run():
         with _stub_run_streamed(125, true_silenced=True):
             review_backends.review_opencode(MODEL, "prompt", "diff", Path("."), 60)
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is not None
 
         with _stub_run_streamed(0, true_silenced=False) as second_call:
             skip_result = review_backends.review_opencode(
@@ -385,7 +385,7 @@ def test_cooldown_skip_sidecar_log_resolves_to_the_real_board_seat():
                     review_backends.review_opencode(
                         MODEL, "prompt", "diff", Path("."), 60
                     )
-                assert sc.active_cooldown(MODEL) is not None
+                assert sc.active_cooldown(MODEL, access_method="opencode") is not None
 
                 with _stub_run_streamed(0, true_silenced=False) as second_call:
                     review_backends.review_opencode(
@@ -421,9 +421,9 @@ def test_a_non_true_silence_cooldown_reason_is_also_honored():
     recorded for a DIFFERENT reason is still correctly honored by the new gate."""
 
     def _run():
-        assert sc.active_cooldown(MODEL) is None
-        sc.record_cooldown(MODEL, "unavailable sentinel")
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None
+        sc.record_cooldown(MODEL, "unavailable sentinel", access_method="opencode")
+        assert sc.active_cooldown(MODEL, access_method="opencode") is not None
 
         with _stub_run_streamed(0, true_silenced=False) as captured:
             result = review_backends.review_opencode(
@@ -453,8 +453,8 @@ def test_repeated_true_silence_escalates_the_cooldown_instead_of_resetting_it():
         with _stub_run_streamed(125, true_silenced=True):
             review_backends.review_opencode(MODEL, "prompt", "diff", Path("."), 60)
         data = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
-        first_fail_count = data[MODEL]["fail_count"]
-        first_window = data[MODEL]["until"] - data[MODEL]["recorded_at"]
+        first_fail_count = data[MODEL]["opencode"]["fail_count"]
+        first_window = data[MODEL]["opencode"]["until"] - data[MODEL]["opencode"]["recorded_at"]
         assert first_fail_count == 1
 
         # A SECOND real true-silence trip, driven the same way _record_true_silence_if_
@@ -465,8 +465,8 @@ def test_repeated_true_silence_escalates_the_cooldown_instead_of_resetting_it():
             MODEL, _FakeProc(125, stdout="partial output", true_silenced=True)
         )
         data2 = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
-        second_window = data2[MODEL]["until"] - data2[MODEL]["recorded_at"]
-        assert data2[MODEL]["fail_count"] == 2, (
+        second_window = data2[MODEL]["opencode"]["until"] - data2[MODEL]["opencode"]["recorded_at"]
+        assert data2[MODEL]["opencode"]["fail_count"] == 2, (
             "second true-silence trip did not escalate fail_count"
         )
         assert second_window > first_window, (
@@ -487,12 +487,12 @@ def test_true_silence_then_empty_rc0_body_does_not_clear_the_cooldown():
         review_backends._record_true_silence_if_needed(
             MODEL, _FakeProc(125, stdout="", true_silenced=True)
         )
-        assert sc.active_cooldown(MODEL) is not None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is not None
 
         review_backends._record_true_silence_if_needed(
             MODEL, _FakeProc(0, stdout="   \n  ", true_silenced=False)
         )
-        assert sc.active_cooldown(MODEL) is not None, (
+        assert sc.active_cooldown(MODEL, access_method="opencode") is not None, (
             "an empty/whitespace-only rc=0 body wrongly cleared the cooldown"
         )
 
@@ -514,14 +514,14 @@ def test_true_silence_then_success_then_true_silence_resets_fail_count():
             MODEL, _FakeProc(125, stdout="", true_silenced=True)
         )
         data = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
-        assert data[MODEL]["fail_count"] == 1
+        assert data[MODEL]["opencode"]["fail_count"] == 1
 
         # A genuine success in between: must clear the cooldown entirely, not just
         # let it passively expire.
         review_backends._record_true_silence_if_needed(
             MODEL, _FakeProc(0, stdout="a real review verdict", true_silenced=False)
         )
-        assert sc.active_cooldown(MODEL) is None, (
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None, (
             "a genuine success after a true-silence trip did not clear the cooldown"
         )
 
@@ -531,7 +531,7 @@ def test_true_silence_then_success_then_true_silence_resets_fail_count():
             MODEL, _FakeProc(125, stdout="", true_silenced=True)
         )
         data2 = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
-        assert data2[MODEL]["fail_count"] == 1, (
+        assert data2[MODEL]["opencode"]["fail_count"] == 1, (
             "true-silence after a genuine success did not reset fail_count to 1"
         )
 
@@ -555,7 +555,7 @@ def test_true_silence_then_rc0_quota_body_then_true_silence_preserves_escalation
             MODEL, _FakeProc(125, stdout="", true_silenced=True)
         )
         data = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
-        assert data[MODEL]["fail_count"] == 1
+        assert data[MODEL]["opencode"]["fail_count"] == 1
 
         # rc=0 with a SHORT body matching a known chronic-unavailable marker phrase --
         # NOT a real review, must NOT clear the cooldown.
@@ -565,11 +565,11 @@ def test_true_silence_then_rc0_quota_body_then_true_silence_preserves_escalation
                 0, stdout="GLM-5.2 is currently unavailable", true_silenced=False
             ),
         )
-        assert sc.active_cooldown(MODEL) is not None, (
+        assert sc.active_cooldown(MODEL, access_method="opencode") is not None, (
             "a chronic-unavailable-shaped rc=0 body wrongly cleared the cooldown"
         )
         data_mid = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
-        assert data_mid[MODEL]["fail_count"] == 2, (
+        assert data_mid[MODEL]["opencode"]["fail_count"] == 2, (
             "the sentinel body did not itself record a (escalating) cooldown entry"
         )
 
@@ -579,7 +579,7 @@ def test_true_silence_then_rc0_quota_body_then_true_silence_preserves_escalation
             MODEL, _FakeProc(125, stdout="", true_silenced=True)
         )
         data2 = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
-        assert data2[MODEL]["fail_count"] == 3, (
+        assert data2[MODEL]["opencode"]["fail_count"] == 3, (
             "escalation was wrongly reset by the sentinel-body 'recovery'"
         )
 
@@ -597,18 +597,18 @@ def test_nonzero_exit_with_quota_marker_in_stderr_records_a_cooldown():
     dedicated test)."""
 
     def _run():
-        assert sc.active_cooldown(MODEL) is None
+        assert sc.active_cooldown(MODEL, access_method="opencode") is None
         review_backends._record_true_silence_if_needed(
             MODEL,
             _FakeProc(
                 1, stdout="", stderr="session limit reached", true_silenced=False
             ),
         )
-        assert sc.active_cooldown(MODEL) is not None, (
+        assert sc.active_cooldown(MODEL, access_method="opencode") is not None, (
             "a non-zero exit with a quota-marker stderr did not record a cooldown"
         )
         data = json.loads(sc.cooldown_path().read_text(encoding="utf-8"))
-        assert data[MODEL]["reason"] == "session limit / usage credits"
+        assert data[MODEL]["opencode"]["reason"] == "session limit / usage credits"
 
     _with_store(_run)
 

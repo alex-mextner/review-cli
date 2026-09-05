@@ -409,7 +409,7 @@ def test_quorum_check_stalled_models_coexists_with_mismatch_error():
                 passed=False,
                 repo_id=this_repo,
             )
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time())
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode")
 
             result = _stats.quorum_check(
                 TASK, min_iter=3, min_models=3, repo_id=this_repo, diff_files=None
@@ -469,7 +469,7 @@ def test_quorum_check_stalled_models_present_when_mismatch_exclusion_drops_below
                 passed=False,
                 repo_id=this_repo,
             )
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time())
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode")
 
             result = _stats.quorum_check(
                 TASK, min_iter=3, min_models=3, repo_id=this_repo, diff_files=None
@@ -867,7 +867,7 @@ def test_cli_check_error_branch_prints_header_and_stalled_lines_on_same_stream()
                 passed=False,
                 repo_id=f"path:{Path(repo_a.name).resolve()}",
             )
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time())
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time(), access_method="opencode")
 
             out = io.StringIO()
             err = io.StringIO()

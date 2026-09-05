@@ -1651,15 +1651,15 @@ def test_quorum_check_names_currently_stalled_models_review_cli_221():
             # ever produces "unavailable sentinel" or "session limit / usage credits";
             # a plain timeout does not currently start a cooldown (round-4 review
             # finding, k3 — see seat_cooldown.py's own docstring).
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=fixed_now)
-            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=fixed_now)
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=fixed_now, access_method="opencode")
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=fixed_now, access_method="opencode")
             # Round-4 review finding (k3): a model that's genuinely cooling down but was
             # NEVER attempted for THIS task code must still be excluded — the scoping
             # claim ("never lists an unrelated seat that simply isn't part of this
             # task's history") had no regression coverage; a change that dropped the
             # attempted_models filter and listed every cooling seat machine-wide would
             # otherwise pass the suite unnoticed.
-            _sc.record_cooldown("claude:claude-fable-5", "session limit", now=fixed_now)
+            _sc.record_cooldown("claude:claude-fable-5", "session limit", now=fixed_now, access_method="cli")
 
             result = _stats.quorum_check(TASK, min_iter=3, min_models=3)
             assert result["passed"] is False
@@ -1744,7 +1744,7 @@ def test_quorum_check_min_roles_met_has_no_stalled_models_key_review_cli_221():
             )
             # An unrelated model is cooling down -- must not surface, since the
             # gate PASSED via roles (2 >= min_roles=2) regardless of models.
-            _sc.record_cooldown("gemini", "timed out", now=time.time())
+            _sc.record_cooldown("gemini", "timed out", now=time.time(), access_method="cli")
             result = _stats.quorum_check(TASK, min_iter=2, min_roles=2)
             assert result["passed"] is True, result  # 2 distinct roles >= 2
             assert "stalled_models" not in result
@@ -2056,8 +2056,8 @@ def test_quorum_check_min_roles_not_met_shows_stalled_models_review_cli_221():
                 passed=True,
             )
             fixed_now = time.time()
-            _sc.record_cooldown("gemini", "timed out", now=fixed_now)
-            _sc.record_cooldown("gemini", "timed out", now=fixed_now)
+            _sc.record_cooldown("gemini", "timed out", now=fixed_now, access_method="cli")
+            _sc.record_cooldown("gemini", "timed out", now=fixed_now, access_method="cli")
             result = _stats.quorum_check(TASK, min_iter=2, min_models=2, min_roles=2)
             assert result["passed"] is False, result  # only 1 distinct role
             assert "stalled_models" in result
@@ -3177,7 +3177,11 @@ def test_cli_check_short_prints_stalled_model_line_review_cli_221():
                 passed=False,
             )
             _sc.record_cooldown(
-                "oc:zai/glm-5.2", "timed out", now=time.time(), ttl_seconds=1800.0
+                "oc:zai/glm-5.2",
+                "timed out",
+                now=time.time(),
+                ttl_seconds=1800.0,
+                access_method="opencode",
             )
             out = io.StringIO()
             with redirect_stderr(io.StringIO()), redirect_stdout(out):
