@@ -391,6 +391,11 @@ def test_shortfall_notice_fires_through_the_real_mode_review_board_call_site():
     assert "pool came up short" in out, out
     assert "Missing (missing-provider:model)" in out, out
     assert "patched unavailable (test)" in out, out
+    # Opus finding, round 2: the running codex seat must never be reported as
+    # missing -- a future identity-breaking transform on `pool` between selection
+    # and this call site (e.g. an effort-override `replace()`) would otherwise
+    # slip past this test undetected.
+    assert "Codex (codex)" not in out, out
 
 
 TESTS = [
@@ -403,6 +408,7 @@ TESTS = [
     test_shortfall_warning_distinguishes_unavailable_from_role_shrunk_reserve,
     test_shortfall_warning_fires_for_pure_role_shrunk_pool_with_no_unavailable_seat,
     test_shortfall_warning_wired_to_real_selector_output,
+    test_shortfall_warning_wired_to_real_selector_output_with_nonempty_reserve,
     test_shortfall_notice_fires_through_the_real_mode_review_board_call_site,
 ]
 

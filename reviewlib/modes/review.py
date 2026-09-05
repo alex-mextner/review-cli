@@ -518,14 +518,19 @@ def _report_pool_shortfall(
     not a gap. Only board seats absent from BOTH `pool` and `reserve` (i.e. genuinely
     unreachable per `backend_unavailable_reason`) count as the gap.
 
-    `pool_size` is the RAW requested size, which `_effective_pool_size` (config.py)
-    clamps down to `len(board)` before selection ever runs -- an operator asking for
-    `--pool 8` against a 4-seat board legitimately gets a 4-seat live pool with nothing
-    unavailable. Reporting against the raw, unclamped `pool_size` in that case prints an
-    arithmetically nonsensical "requested 8, only 3 live -- 1 unavailable" (k3 review
-    finding, round 1: 8-3=5 unaccounted-for vs. 1 named seat, because 4 of the 8 never
-    existed on the board). The notice must report against `min(pool_size, len(board))`
-    -- what the board could ever actually deliver -- not the raw ask.
+    `pool_size` is the RAW requested size. The selector itself (`select_pool_with_reuse`
+    / `split_pool_reserve` in config.py) clamps it against `len(reachable)` -- the LIVE
+    seat count -- via its own `_effective_pool_size` call, which is a TIGHTER clamp than
+    this notice needs: an operator asking for `--pool 8` against a 4-seat board
+    legitimately gets a 4-seat live pool with nothing unavailable. Reporting against the
+    raw, unclamped `pool_size` in that case prints an arithmetically nonsensical
+    "requested 8, only 3 live -- 1 unavailable" (k3 review finding, round 1: 8-3=5
+    unaccounted-for vs. 1 named seat, because 4 of the 8 never existed on the board). So
+    this notice re-clamps separately, against the LOOSER `min(pool_size, len(board))` --
+    what the board could ever actually deliver, board size rather than live-seat count --
+    not the raw ask (GLM review finding, round 2: this is deliberately NOT the same
+    clamp the selector applies; syncing the two would silence the exact
+    `2-of-6-seats-down --pool 5` case this notice exists to catch).
 
     `pool_size <= 0` means "run every available seat" (`--pool 0`/no preset) -- there is
     still a real target here, `len(board)`, so this must NOT be treated the same as "no
