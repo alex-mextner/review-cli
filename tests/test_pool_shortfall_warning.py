@@ -287,6 +287,55 @@ def test_shortfall_warning_wired_to_real_selector_output():
     assert "k3 (omp:kimi-code/k3)" in out, out
 
 
+def test_shortfall_warning_wired_to_real_selector_output_with_nonempty_reserve():
+    """Opus finding (round 1, this diff): the prior real-selector test above always
+    produces an EMPTY `reserve` (2 available seats, pool_size=3), so nothing proved
+    `reserve_seats` retains original board object identity when it is actually
+    non-empty — the exact case `_report_pool_shortfall`'s `id()`-based `missing`
+    computation depends on to avoid falsely labeling a healthy reserve seat
+    "unavailable (reason unknown)".
+
+    Drives the PADDING-FAILS branch through the real `select_pool_with_reuse`: a
+    role-less board (every seat's role is "") with two near-limit seats excluded
+    from `candidates`, so padding is skipped entirely (role-less boards gain
+    nothing from reuse) and the pool stays at the 2 under-limit seats while the
+    2 near-limit seats land in `reserve` — as themselves, not `replace()`-copies,
+    since `select_pool_with_reuse`'s reuse/padding path is never reached at all
+    here (`extra_needed` is short-circuited by the role-less check before any
+    `replace()` call could run)."""
+    board = [
+        BoardReviewer("claude:claude-opus-4-8", "", "Opus"),
+        BoardReviewer("codex:gpt-5.6-terra", "", "Codex"),
+        BoardReviewer("claude:claude-fable-5", "", "Fable"),
+        BoardReviewer("omp:kimi-code/k3", "", "k3"),
+    ]
+    near_limit = {"claude:claude-fable-5", "omp:kimi-code/k3"}
+
+    def _usage_percent(model: str) -> float | None:
+        return 95.0 if model in near_limit else 10.0
+
+    pool, reserve = select_pool_and_reserve_with_reuse(
+        board, 4, usage_percent=_usage_percent
+    )
+    assert [r.model for r in pool] == ["claude:claude-opus-4-8", "codex:gpt-5.6-terra"]
+    assert {r.model for r in reserve} == near_limit
+    # Identity, not just equality: reserve must be the SAME objects as in `board`.
+    assert {id(r) for r in reserve} == {id(board[2]), id(board[3])}
+
+    out = _captured_stdout(
+        review_mod._report_pool_shortfall,
+        board,
+        pool,
+        reserve=reserve,
+        pool_size=4,
+    )
+    # No seat is genuinely unavailable — both non-pool seats are healthy, just
+    # near their usage limit. A false "unavailable (reason unknown)" here would
+    # mean the id()-identity check failed to recognize a real reserve object.
+    assert "unavailable" not in out, out
+    assert "2 more board seat(s) are reachable but sitting in reserve" in out, out
+
+
 def test_shortfall_notice_fires_through_the_real_mode_review_board_call_site():
     """Locks the CALL SITE, not just the function: every reviewer across this PR's
     review rounds (Opus, Fable, k3, GLM) independently flagged that nothing proved
