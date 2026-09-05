@@ -15,11 +15,15 @@ Self-running (no pytest): the repo's CI runs ``python3 tests/test_dashboard_serv
 smoke.sh, matching every other test file here, so this file uses bare ``assert`` + a tiny
 discover-and-run ``__main__`` block instead of pytest fixtures.
 """
+
 from __future__ import annotations
 
 import contextlib
 import io
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -149,29 +153,109 @@ def test_serve_argv_targets_hidden_serve_entry():
     assert "--host" in argv and "127.0.0.1" in argv
 
 
+def test_env_clear_prefix_is_hardcoded_absolute_not_path_resolved():
+    """review-cli#180 review finding (codex P1/P2): must NOT be shutil.which("env")-resolved
+    (caller-controlled PATH could inject a malicious `env` ahead of the real one, and `enable`
+    persists this argv into a launchd/systemd autostart unit -- a transient PATH poisoning
+    would become boot-persistent). /usr/bin/env is the POSIX-standard, always-present path.
+    Asserts against cli.REVIEW_CLI_ACTIVE_ENV, not a duplicated literal (review-cli#180 review
+    finding, GLM/GLM-cc): a rename of that constant must fail THIS test, not silently decouple
+    the prefix from the guard it exists to bypass."""
+    assert svc._env_clear_prefix() == ["/usr/bin/env", "-u", cli.REVIEW_CLI_ACTIVE_ENV]
+
+
 def test_serve_argv0_is_absolute():
+    prefix = svc._env_clear_prefix()
     argv = svc._serve_argv(port=7878, host="127.0.0.1")
-    # argv[0] is either an absolute `review` on PATH or this interpreter (absolute) -m reviewlib.
-    assert Path(argv[0]).is_absolute(), argv[0]
-    if Path(argv[0]).name != "review":
+    assert argv[: len(prefix)] == prefix
+    # the actual review invocation starts right after the prefix, and is either an absolute
+    # `review` on PATH or this interpreter (absolute) -m reviewlib.
+    review_argv = argv[len(prefix) :]
+    assert Path(review_argv[0]).is_absolute(), review_argv[0]
+    if Path(review_argv[0]).name != "review":
         # fallback form: <python> -m reviewlib
-        assert argv[1:3] == ["-m", "reviewlib"], argv
+        assert review_argv[1:3] == ["-m", "reviewlib"], review_argv
+
+
+def test_serve_argv_clears_active_reentrancy_env_var():
+    """review-cli#180 review finding (chatgpt-codex-connector, PR #279): `review dashboard
+    run`/`start` are themselves `review` invocations, so main() has already set
+    $REVIEW_CLI_ACTIVE=1 before dispatching to the service layer. agenttools_service spawns the
+    __serve child via plain subprocess.call/Popen (no env= override), so the child would
+    otherwise inherit that var and immediately trip its own _reject_if_reentrant on startup --
+    the managed server could never launch. Prove the argv actually clears it when executed."""
+    prefix = svc._env_clear_prefix()
+    argv = svc._serve_argv(port=7878, host="127.0.0.1")
+    assert argv[: len(prefix)] == prefix
+    env = dict(os.environ)
+    env[cli.REVIEW_CLI_ACTIVE_ENV] = "1"
+    result = subprocess.run(
+        [
+            *prefix,
+            sys.executable,
+            "-c",
+            f"import os; print({cli.REVIEW_CLI_ACTIVE_ENV!r} in os.environ)",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout.strip() == "False", (result.stdout, result.stderr)
 
 
 def test_review_argv0_falls_back_when_path_review_is_a_different_checkout():
     # PATH has a `review`, but it reports a DIFFERENT reviewlib dir than ours -> must fall
     # back to `<python> -m reviewlib` (never launch the wrong checkout — the live-symlink trap).
-    with mock.patch.object(svc.shutil, "which", lambda name: "/somewhere/bin/review"), \
-            mock.patch.object(svc, "_review_on_path_is_us", lambda path: False):
+    with (
+        mock.patch.object(svc.shutil, "which", lambda name: "/somewhere/bin/review"),
+        mock.patch.object(svc, "_review_on_path_is_us", lambda path: False),
+    ):
         argv0 = svc._review_argv0()
     assert argv0 == [sys.executable, "-m", "reviewlib"], argv0
 
 
 def test_review_argv0_uses_path_review_when_it_is_us():
-    with mock.patch.object(svc.shutil, "which", lambda name: "/usr/local/bin/review"), \
-            mock.patch.object(svc, "_review_on_path_is_us", lambda path: True):
+    with (
+        mock.patch.object(svc.shutil, "which", lambda name: "/usr/local/bin/review"),
+        mock.patch.object(svc, "_review_on_path_is_us", lambda path: True),
+    ):
         argv0 = svc._review_argv0()
     assert argv0 == ["/usr/local/bin/review"], argv0
+
+
+def test_review_on_path_is_us_survives_active_reentrancy_env_var():
+    """review-cli#180 review finding (GLM, PR #279): every REAL caller of this probe
+    (_review_argv0 via run/start/enable) is itself an active `review` invocation, so
+    $REVIEW_CLI_ACTIVE is already set in this process. The probe spawns a full
+    `review --reviewlib-dir` re-invocation -- without clearing the var for that child too, the
+    child's own _reject_if_reentrant would ALWAYS refuse it (rc=1), making this probe
+    permanently return False in production and silently defeating the installed-console-script
+    branch: `enable` would always pin a venv sys.executable into the persisted autostart unit
+    instead of the stable installed script. Prove it survives with a real subprocess, not a
+    mock -- a fake `review` that itself enforces the same reentrancy check the real one does.
+
+    The fake script's guard checks cli.REVIEW_CLI_ACTIVE_ENV, NOT a hardcoded literal
+    (review-cli#180 review finding, GLM): a literal here would make this test vacuous after a
+    constant rename -- the fake would guard a var nobody sets, its exit(1) would never fire, and
+    the probe would trivially "succeed" while enforcing nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_review = Path(tmp) / "review"
+        fake_review.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            f"if os.environ.get({cli.REVIEW_CLI_ACTIVE_ENV!r}) is not None:\n"
+            "    sys.exit(1)\n"
+            "if sys.argv[1:] == ['--reviewlib-dir']:\n"
+            f"    print({str(svc._our_reviewlib_dir())!r})\n"
+            "    sys.exit(0)\n"
+            "sys.exit(2)\n"
+        )
+        fake_review.chmod(0o755)
+
+        with mock.patch.dict(os.environ, {cli.REVIEW_CLI_ACTIVE_ENV: "1"}):
+            assert svc._review_on_path_is_us(str(fake_review)) is True
 
 
 # A test raises this to signal "not applicable on this host" (vs PASS / FAIL); the runner
@@ -233,7 +317,9 @@ def test_serve_subcommand_routes_to_run_dashboard():
             ["__serve", "--port", "7878", "--host", "127.0.0.1", "--no-open"]
         )
     assert rc == 0
-    assert captured == {"port": 7878, "host": "127.0.0.1", "open_browser": False}, captured
+    assert captured == {"port": 7878, "host": "127.0.0.1", "open_browser": False}, (
+        captured
+    )
 
 
 # --- the action resolver: the action is the first NON-OPTION token -----------------------
@@ -243,7 +329,10 @@ def test_dashboard_action_resolves_action_after_global_options():
     # below misfires.
     assert cli._dashboard_action(["run"]) == "run"
     assert cli._dashboard_action(["--port", "7878", "run"]) == "run"
-    assert cli._dashboard_action(["--host", "0.0.0.0", "--port", "9999", "start"]) == "start"
+    assert (
+        cli._dashboard_action(["--host", "0.0.0.0", "--port", "9999", "start"])
+        == "start"
+    )
     assert cli._dashboard_action(["--port=7878", "__serve"]) == "__serve"
     assert cli._dashboard_action([]) is None
     assert cli._dashboard_action(["--port", "7878"]) is None  # options only, no action
@@ -253,10 +342,16 @@ def test_dashboard_action_resolves_action_after_global_options():
 def test_only_foreground_server_bypasses_backstop():
     # The blocking server (run / __serve) is persistent and must bypass the backstop.
     assert cli._is_persistent_server_invocation(["dashboard", "run"]) is True
-    assert cli._is_persistent_server_invocation(["dashboard", "__serve", "--port", "0"]) is True
+    assert (
+        cli._is_persistent_server_invocation(["dashboard", "__serve", "--port", "0"])
+        is True
+    )
     # …including when the global options come BEFORE the action (the P1 bug: argv[1] is then
     # `--port`, not `run`, so a naive `argv[1] in (...)` check would mis-wrap the server).
-    assert cli._is_persistent_server_invocation(["dashboard", "--port", "7878", "run"]) is True
+    assert (
+        cli._is_persistent_server_invocation(["dashboard", "--port", "7878", "run"])
+        is True
+    )
     assert (
         cli._is_persistent_server_invocation(
             ["dashboard", "--host", "0.0.0.0", "--port", "7878", "__serve"]
@@ -267,10 +362,15 @@ def test_only_foreground_server_bypasses_backstop():
     # normal backstop-wrapped path (they return immediately).
     assert cli._is_persistent_server_invocation(["dashboard"]) is False
     for action in ("start", "status", "stop", "enable", "disable"):
-        assert cli._is_persistent_server_invocation(["dashboard", action]) is False, action
+        assert cli._is_persistent_server_invocation(["dashboard", action]) is False, (
+            action
+        )
         # …and still NOT persistent with options before a non-server action.
         assert (
-            cli._is_persistent_server_invocation(["dashboard", "--port", "7878", action]) is False
+            cli._is_persistent_server_invocation(
+                ["dashboard", "--port", "7878", action]
+            )
+            is False
         ), action
 
 
