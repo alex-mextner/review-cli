@@ -26,8 +26,11 @@ semantic versioning.
   metadata-exclusion patterns are anchored to git's actual header shapes, not bare
   prefixes — a removed source line that itself starts with `-- ` (SQL/Lua/Haskell
   comments) can't be misread as a `--- ` file header and silently undercounted — and a
-  pure `chmod` or 100%-similarity rename (no content hunk to count at all) fails CLOSED
-  to a full review instead of reading as a free, unboundedly-sized trivial change.
+  mode change or rename/copy line anywhere in EITHER diff — the reviewed baseline or the
+  current staged one, whether or not that file also carries a real content hunk — fails
+  CLOSED to a full review instead of reading as a free, unboundedly-sized trivial change
+  (a rename/mode-change that also touches real content costs one full review it might not
+  strictly have needed; that's the accepted conservative trade).
 
 ## 0.35.5 — 2026-09-05
 

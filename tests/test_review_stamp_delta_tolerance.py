@@ -709,6 +709,56 @@ def test_subproject_commit_anchor_requires_a_real_sha():
         )
 
 
+def test_fresh_region_single_line_edit_does_not_count_context_lines():
+    """Opus round-review finding: a follow-up edit landing in a FRESH region of an
+    already-committed file (a new hunk, not adjacent to the reviewed baseline's own edit)
+    produces a diff-of-diffs where the entire new hunk -- including its surrounding
+    unchanged CONTEXT lines (`diff -U3`'s default 3-before/3-after window) -- appears as
+    outer `+` lines. Before the exclusion pattern also stripped `^[+-] ` (outer marker,
+    inner space = an unchanged source line quoted as context, never a real edit), each of
+    those context lines was miscounted as a genuine change: one single-line edit in a
+    fresh region inflated to ~8 "changed" lines, 8x the real number, defeating this
+    feature's own purpose for exactly the common case (editing a different part of an
+    already-reviewed file) it exists to help.
+
+    30-line baseline, reviewed edit at line 5, follow-up edit at line 25 -- far enough
+    apart (with `-U3` context) that the two hunks never overlap, so line 25's hunk is
+    entirely ABSENT from the reviewed baseline diff and entirely NEW in the diff-of-diffs.
+    One genuine edited line must count as 2 (the accepted `max()` semantics for an edit to
+    a line that was CONTEXT, not itself a change, in the baseline -- see the module
+    docstring above `_TRIVIAL_DELTA_BLOCK`), never the ~8 the context-line bug produced,
+    and must pass at a LOW threshold (2) that the pre-fix count would fail."""
+    with _isolated_repo() as repo:
+        hook = _install_hook(repo)
+        nlines = 30
+        lines = [f"line{i}" for i in range(nlines)]
+        (repo / "a.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "a.py"], check=True)
+        _commit_all(repo, "initial: 30-line file")
+
+        reviewed = list(lines)
+        reviewed[5] = "line5-reviewed"
+        _write_and_stage(repo, "a.py", "\n".join(reviewed) + "\n")
+        baseline_diff = _staged_diff(repo)
+        install._write_review_stamp(repo, baseline_diff)
+
+        followup = list(reviewed)
+        followup[25] = "line25-followup"
+        _write_and_stage(repo, "a.py", "\n".join(followup) + "\n")
+        cur_diff = _staged_diff(repo)
+        # Sanity: the two edits really do land in non-overlapping hunks (line 25's hunk
+        # is genuinely absent from the reviewed baseline), or this test isn't exercising
+        # the fresh-region shape it claims to.
+        assert "line25-followup" not in baseline_diff, baseline_diff
+        assert "line25" in cur_diff, cur_diff
+
+        proc = _run_hook(hook, repo, {"REVIEW_TRIVIAL_DELTA_LINES": "2"})
+        assert proc.returncode == 0, (
+            "a single-line fresh-region follow-up must pass at threshold=2 -- "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+
 if __name__ == "__main__":
     # Standalone runner (mirrors tests/test_review_marker.py / tests/smoke.py's expectations):
     # `python <file>` must exit 0 on success, non-zero on any failure.

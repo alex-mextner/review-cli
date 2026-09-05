@@ -816,13 +816,12 @@ if [ "$threshold" -gt 0 ]; then
   stamp_diff=$(command git rev-parse --git-path review-stamp-diff)
   if [ -f "$stamp_diff" ]; then
     cur_tmp=$(mktemp 2>/dev/null) && trap 'rm -f "$cur_tmp"' EXIT
-    if [ -n "$cur_tmp" ]; then
-      command git diff --no-ext-diff --cached > "$cur_tmp"
+    if [ -n "$cur_tmp" ] && command git diff --no-ext-diff --cached > "$cur_tmp"; then
       if ! grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$stamp_diff" "$cur_tmp" 2>/dev/null; then
         diff_out=$(diff -U0 "$stamp_diff" "$cur_tmp" 2>/dev/null)
         diff_rc=$?
         if [ "$diff_rc" -le 1 ]; then
-          content=$(printf '%s\\n' "$diff_out" | tail -n +3 | grep -Ev '^[+-](@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
+          content=$(printf '%s\\n' "$diff_out" | tail -n +3 | grep -Ev '^[+-]( |@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
           added=$(printf '%s\\n' "$content" | grep -c '^+')
           removed=$(printf '%s\\n' "$content" | grep -c '^-')
           changed=$added
@@ -982,14 +981,22 @@ def _write_review_stamp(
     return None
 
 
-def _write_review_stamp_diff(cwd: Path, diff: str) -> None:
+def _write_review_stamp_diff(cwd: Path, diff: str) -> str | None:
     """Companion to `_write_review_stamp` (review-cli#208): persist the RAW reviewed diff
     TEXT (not just its hash) next to the hash stamp, so the pre-commit gate can tolerate a
     small trailing follow-up instead of requiring an exact byte-for-byte restage match on
     every commit. Best-effort, like `_write_review_stamp` itself -- a failure here must
     never break a review or the exact-hash stamp it accompanies; it only means the gate's
     delta-tolerance fast path stays unavailable (falls back to exact-hash-only, same as
-    before this feature existed)."""
+    before this feature existed). Unlike `_write_review_stamp`'s marker/stamp, a failure
+    here is deliberately NOT surfaced as a stderr line (Opus review finding on this
+    feature's own PR corrected an earlier draft's docstring that falsely claimed it was):
+    the caller (`_write_review_stamp`) invokes this as a bare statement and discards the
+    return, exactly matching the "never break a review" contract above -- losing the
+    tolerance fast path costs at most one extra full review round, not a blocked commit,
+    so it doesn't warrant the same "green review, blocked commit, no reason anywhere"
+    alarm the marker/stamp notices exist to prevent. The return value exists only so a
+    future caller CAN surface it if that judgment call ever changes."""
     from .process import git_repo_env
 
     try:
@@ -1001,14 +1008,13 @@ def _write_review_stamp_diff(cwd: Path, diff: str) -> None:
             text=True,
         )
         if p.returncode != 0:
-            return
+            return None
         rel = p.stdout.strip()
         stamp_diff = Path(rel) if os.path.isabs(rel) else Path(cwd) / rel
         stamp_diff.write_text(diff, encoding="utf-8")
     except Exception as exc:
-        # Deliberately broad, as before — the stamp is never worth breaking a review
-        # over — but no longer INVISIBLE: the caller turns this into one stderr line.
         return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    return None
 
 
 # The session-scoped, mtime-windowed marker that the separate `agent-tools`
