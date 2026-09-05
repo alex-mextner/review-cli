@@ -14,6 +14,7 @@ package (the streaming runner in `reviewlib.process`, the backends in
 `reviewlib.backends`); `bin/review` is now a thin shim. These tests import the
 package directly — the RUNTIME behaviour is unchanged.
 """
+
 from __future__ import annotations
 
 import os
@@ -92,7 +93,9 @@ def test_log_file_grows_incrementally_before_exit():
     grew_while_running = False
     seen_path: Path | None = None
     while time.time() < deadline and t.is_alive():
-        candidates = sorted(log_dir.glob("*-faketest-*.log"), key=lambda p: p.stat().st_mtime)
+        candidates = sorted(
+            log_dir.glob("*-faketest-*.log"), key=lambda p: p.stat().st_mtime
+        )
         if candidates:
             seen_path = candidates[-1]
             text = seen_path.read_text(encoding="utf-8", errors="replace")
@@ -119,11 +122,7 @@ def test_log_file_grows_incrementally_before_exit():
 
 def test_timeout_preserves_partial_output():
     """(b) On idle timeout, return partial stdout + a TIMEOUT marker and rc 124."""
-    code = (
-        "import time\n"
-        "print('line-0', flush=True)\n"
-        "time.sleep(60)\n"
-    )
+    code = "import time\nprint('line-0', flush=True)\ntime.sleep(60)\n"
     argv = [sys.executable, "-c", code]
 
     result = review._run_streamed(
@@ -139,7 +138,9 @@ def test_timeout_preserves_partial_output():
     )
     assert result.stdout.strip(), "partial output was lost on timeout (stdout empty)"
     assert "line-0" in result.stdout, "early lines missing from the preserved buffer"
-    assert "TIMEOUT" in result.stdout, "TIMEOUT marker missing from the preserved buffer"
+    assert "TIMEOUT" in result.stdout, (
+        "TIMEOUT marker missing from the preserved buffer"
+    )
 
 
 def test_periodic_output_resets_idle_timeout():
@@ -200,9 +201,93 @@ def test_idle_timeout_seconds_contract():
         assert process.idle_timeout_seconds(240) == process._DEFAULT_IDLE_TIMEOUT
 
 
+def test_idle_timeout_seconds_no_deadline_is_unchanged():
+    """Regression guard: with no board deadline armed (the default, and every caller
+    that predates review-cli#221), idle_timeout_seconds behaves exactly as before —
+    the deadline clamp must be fully opt-in."""
+    assert process._active_board_deadline() is None
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS=None):
+        assert process.idle_timeout_seconds(240) == process._DEFAULT_IDLE_TIMEOUT
+        assert process.idle_timeout_seconds(60, idle_floor=0) == 60
+
+
+def test_idle_timeout_seconds_clamps_to_a_near_deadline():
+    """review-cli#221: a reserve promoted late in a wall-clock-bounded board run must
+    not be handed the full 20-minute default floor — it gets whatever time genuinely
+    remains, so an external wrapper's timeout never SIGKILLs it mid-attempt."""
+    try:
+        # 150s remaining: comfortably above _MIN_DEADLINE_CLAMPED_IDLE_FLOOR (90) and
+        # well below the 20-minute default floor, so this demonstrates the clamp
+        # actually engaging rather than either edge case.
+        process.set_board_deadline(time.monotonic() + 150)
+        clamped = process.idle_timeout_seconds(240)
+        assert 145 <= clamped <= 150, clamped
+    finally:
+        process.set_board_deadline(None)
+
+
+def test_idle_timeout_seconds_clamp_never_starves_below_the_minimum_floor():
+    """A deadline that has already passed (or is seconds away) still gives the
+    promoted reserve one real attempt — never an instant, unhelpful ~0s timeout."""
+    try:
+        process.set_board_deadline(time.monotonic() - 5)
+        assert (
+            process.idle_timeout_seconds(240)
+            == process._MIN_DEADLINE_CLAMPED_IDLE_FLOOR
+        )
+    finally:
+        process.set_board_deadline(None)
+
+
+def test_idle_timeout_seconds_deadline_never_extends_a_shorter_request():
+    """The deadline is a ceiling, not a floor of its own — a caller's own tighter
+    request (or the ambient env var) still wins when it is already the smaller value
+    AND far enough from the deadline that the clamp doesn't even engage."""
+    try:
+        process.set_board_deadline(time.monotonic() + 3600)  # generous, far off
+        assert process.idle_timeout_seconds(240) == process._DEFAULT_IDLE_TIMEOUT
+    finally:
+        process.set_board_deadline(None)
+
+
+def test_idle_timeout_seconds_min_floor_never_extends_computed_above_its_own_request():
+    """Regression for a real bug caught in review (3 independent reviewers, review-cli#221
+    round 1): _MIN_DEADLINE_CLAMPED_IDLE_FLOOR (90s) exists to protect a promoted reserve
+    from being starved by a near/past deadline — it must never OVERRIDE a caller's own
+    smaller explicit request by handing back something LARGER than what was asked for.
+    An operator's REVIEW_IDLE_TIMEOUT_SECONDS=30 near a deadline must stay <= 30, not get
+    silently bumped to the 90s floor (which could itself outlive the external wrapper the
+    deadline exists to respect)."""
+    try:
+        process.set_board_deadline(time.monotonic() + 10)  # near: remaining < computed
+        with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="30"):
+            clamped = process.idle_timeout_seconds(240)
+            assert clamped <= 30, clamped
+        # Same bug, reached via the "tiny timeout, exact-preserve" contract instead of
+        # the env var — requested=45 is below _SHORT_TIMEOUT_EXACT_THRESHOLD (60).
+        with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS=None):
+            clamped = process.idle_timeout_seconds(45)
+            assert clamped <= 45, clamped
+    finally:
+        process.set_board_deadline(None)
+
+
+def test_idle_timeout_seconds_deadline_skips_explicit_disable_contracts():
+    """A caller/operator that explicitly opted OUT of idle reaping (idle_floor=0, or
+    REVIEW_IDLE_TIMEOUT_SECONDS=0) keeps that contract even with a live deadline armed —
+    the deadline clamp must never silently reintroduce a bound they turned off."""
+    try:
+        process.set_board_deadline(time.monotonic() + 5)
+        assert process.idle_timeout_seconds(240, idle_floor=0) == 240
+        with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
+            assert process.idle_timeout_seconds(240) is None
+    finally:
+        process.set_board_deadline(None)
+
+
 def test_silent_child_can_think_until_requested_timeout():
     """No output is not itself a hang signal; only the requested timeout can stop it."""
-    code = "import time\n" "time.sleep(1.2)\n" "print('done', flush=True)\n"
+    code = "import time\ntime.sleep(1.2)\nprint('done', flush=True)\n"
     argv = [sys.executable, "-c", code]
 
     started = time.monotonic()
@@ -393,28 +478,36 @@ def test_no_daemon_traceback_when_escaped_writer_outlives_close():
     import tempfile
 
     driver = (
-        "import os, sys, time\n"
-        "os.environ.setdefault('REVIEW_LOG_DIR', %r)\n"
-        "sys.path.insert(0, %r)\n"  # repo root, so the in-repo reviewlib package imports
-        "import reviewlib as rv\n"
-        "code = (\n"
-        "  \"import sys, subprocess, time\\n\"\n"
-        "  \"print('p', flush=True)\\n\"\n"
-        "  \"subprocess.Popen([sys.executable,'-c','import sys,time\\\\n\"\n"
-        "  \"time.sleep(3)\\\\nwhile True:\\\\n \"\n"
-        "  \"sys.stdout.write(chr(120))\\\\n sys.stdout.flush()\\\\n time.sleep(0.2)'], \"\n"
-        "  \"start_new_session=True)\\n\"\n"
-        "  \"time.sleep(60)\\n\"\n"
-        ")\n"
-        "r = rv._run_streamed([sys.executable,'-c',code], cwd=rv.Path('.'), timeout=2, "
-        "backend='postclose', round_no=1)\n"
-        "assert r.returncode == 124 and 'p' in r.stdout\n"
-        "time.sleep(2)\n"  # let any post-close daemon write surface as a traceback
-        "print('DRIVER_OK')\n"
-    ) % (tempfile.mkdtemp(), str(REPO_ROOT))
+        (
+            "import os, sys, time\n"
+            "os.environ.setdefault('REVIEW_LOG_DIR', %r)\n"
+            "sys.path.insert(0, %r)\n"  # repo root, so the in-repo reviewlib package imports
+            "import reviewlib as rv\n"
+            "code = (\n"
+            '  "import sys, subprocess, time\\n"\n'
+            "  \"print('p', flush=True)\\n\"\n"
+            "  \"subprocess.Popen([sys.executable,'-c','import sys,time\\\\n\"\n"
+            '  "time.sleep(3)\\\\nwhile True:\\\\n "\n'
+            '  "sys.stdout.write(chr(120))\\\\n sys.stdout.flush()\\\\n time.sleep(0.2)\'], "\n'
+            '  "start_new_session=True)\\n"\n'
+            '  "time.sleep(60)\\n"\n'
+            ")\n"
+            "r = rv._run_streamed([sys.executable,'-c',code], cwd=rv.Path('.'), timeout=2, "
+            "backend='postclose', round_no=1)\n"
+            "assert r.returncode == 124 and 'p' in r.stdout\n"
+            "time.sleep(2)\n"  # let any post-close daemon write surface as a traceback
+            "print('DRIVER_OK')\n"
+        )
+        % (tempfile.mkdtemp(), str(REPO_ROOT))
+    )
 
-    proc = _sp.run([sys.executable, "-c", driver], cwd=str(REPO_ROOT),
-                   capture_output=True, text=True, timeout=40)
+    proc = _sp.run(
+        [sys.executable, "-c", driver],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
     # cleanup any survivors the driver spawned
     _sp.run(["pkill", "-f", "while True"], capture_output=True)
     assert "DRIVER_OK" in proc.stdout, f"driver failed: {proc.stdout}\n{proc.stderr}"
@@ -429,7 +522,9 @@ def test_log_file_is_private():
     import stat
 
     argv = [sys.executable, "-c", "print('x', flush=True)"]
-    review._run_streamed(argv, cwd=REPO_ROOT, timeout=10, backend="faketest", round_no=4)
+    review._run_streamed(
+        argv, cwd=REPO_ROOT, timeout=10, backend="faketest", round_no=4
+    )
     log_dir = review.log_dir()
     logs = sorted(log_dir.glob("*-faketest-*.log"), key=lambda p: p.stat().st_mtime)
     assert logs, "no log file produced"
@@ -438,8 +533,20 @@ def test_log_file_is_private():
 
 
 _CLAUDE_READONLY_TOOLS = (
-    "Edit", "MultiEdit", "Write", "Bash", "Read", "Grep", "Glob", "NotebookEdit",
-    "SlashCommand", "Task", "TodoWrite", "ExitPlanMode", "WebFetch", "WebSearch",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "Bash",
+    "Read",
+    "Grep",
+    "Glob",
+    "NotebookEdit",
+    "SlashCommand",
+    "Task",
+    "TodoWrite",
+    "ExitPlanMode",
+    "WebFetch",
+    "WebSearch",
 )
 
 
@@ -465,7 +572,9 @@ def _run_claude_cli_capture(which_fn):
         review_backends._ensure_workspace_trusted = lambda _cwd: None
         # Target the CLI variant directly: review_claude() is a dispatcher that routes
         # to the API backend when a key is configured, so calling it would be env-dependent.
-        result = review_backends.review_claude_cli("claude:opus", "prompt", "diff", REPO_ROOT, 10)
+        result = review_backends.review_claude_cli(
+            "claude:opus", "prompt", "diff", REPO_ROOT, 10
+        )
     finally:
         review_backends._which_optional = old_which
         review_backends._run_streamed = old_run_streamed
@@ -476,7 +585,9 @@ def _run_claude_cli_capture(which_fn):
 
 def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     # Default path: the real `claude` binary in genuine print mode (no PTY/TUI scrape).
-    cap = _run_claude_cli_capture(lambda name: "/bin/claude" if name == "claude" else None)
+    cap = _run_claude_cli_capture(
+        lambda name: "/bin/claude" if name == "claude" else None
+    )
     assert cap["result"].returncode == 0
     argv = cap["argv"]
     # Genuine headless print mode — no fullscreen TUI to bleed into the captured pipe.
@@ -486,7 +597,9 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
     # Read-only via an EMPTY tool allowlist (all built-in tools off) — stronger and more
     # future-proof than a denylist, and it avoids real `claude` warning on claude-p tool names.
     assert argv[argv.index("--tools") + 1] == ""
-    assert "--disallowedTools" not in argv  # the empty allowlist already forbids everything
+    assert (
+        "--disallowedTools" not in argv
+    )  # the empty allowlist already forbids everything
     assert "--strict-mcp-config" in argv
     assert "--disable-slash-commands" in argv
     assert "--safe-mode" in argv
@@ -503,7 +616,9 @@ def test_claude_backend_disables_tools_and_mcp_to_avoid_headless_approval():
 def test_claude_backend_falls_back_to_claude_p_when_claude_absent():
     # A host that ships only the legacy `claude-p` TUI-scraper still gets a working seat,
     # with its wrapper-specific surface (--cwd / --tools '' / --timeout-sec / -p) intact.
-    cap = _run_claude_cli_capture(lambda name: "/bin/claude-p" if name == "claude-p" else None)
+    cap = _run_claude_cli_capture(
+        lambda name: "/bin/claude-p" if name == "claude-p" else None
+    )
     assert cap["result"].returncode == 0
     argv = cap["argv"]
     assert "--print" not in argv  # claude-p has no --print
@@ -526,7 +641,9 @@ def test_run_streamed_feeds_large_input_over_stdin_without_deadlock():
     payload = "x" * 200_000 + "\nEND\n"  # > 64 KiB pipe buffer
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["REVIEW_LOG_DIR"] = tmp
-        proc = review._run_streamed(["cat"], cwd=Path(tmp), input_text=payload, timeout=30)
+        proc = review._run_streamed(
+            ["cat"], cwd=Path(tmp), input_text=payload, timeout=30
+        )
     assert proc.returncode == 0
     assert proc.stdout == payload
 
@@ -543,8 +660,10 @@ def test_run_streamed_forwards_env_to_the_child_process():
         os.environ["REVIEW_LOG_DIR"] = tmp
         child_env = {**os.environ, "TERM": "dumb", "REVIEW_ENV_PROBE": "probe-value-42"}
         proc = review._run_streamed(
-            ["sh", "-c", "printf '%s|%s' \"$TERM\" \"$REVIEW_ENV_PROBE\""],
-            cwd=Path(tmp), env=child_env, timeout=30,
+            ["sh", "-c", 'printf \'%s|%s\' "$TERM" "$REVIEW_ENV_PROBE"'],
+            cwd=Path(tmp),
+            env=child_env,
+            timeout=30,
         )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "dumb|probe-value-42", proc.stdout
@@ -564,11 +683,17 @@ def test_log_dir_uses_os_standard_locations():
             sys.platform = "darwin"
             assert review.log_dir() == Path(home) / "Library" / "Logs" / "review-cli"
             sys.platform = "linux"
-            assert review.log_dir() == Path(home) / ".local" / "state" / "review-cli" / "logs"
+            assert (
+                review.log_dir()
+                == Path(home) / ".local" / "state" / "review-cli" / "logs"
+            )
             os.environ["XDG_STATE_HOME"] = str(Path(home) / "xdg")
             assert review.log_dir() == Path(home) / "xdg" / "review-cli" / "logs"
             os.environ["XDG_STATE_HOME"] = "relative-ignored"  # XDG: relative → ignored
-            assert review.log_dir() == Path(home) / ".local" / "state" / "review-cli" / "logs"
+            assert (
+                review.log_dir()
+                == Path(home) / ".local" / "state" / "review-cli" / "logs"
+            )
     finally:
         sys.platform = saved_platform
         for key, val in saved.items():
