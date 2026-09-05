@@ -379,11 +379,21 @@ def _looks_like_error(text: str) -> bool:
 
 
 def parse_call_log(path: Path) -> CallLog | None:
-    """Parse one ``*-r{n}.log`` file. Returns None if the name doesn't match."""
+    """Parse one ``*-r{n}.log`` file. Returns None if the name doesn't match, INCLUDING
+    a name that matches the shape but carries a date `_parse_stamp` can't parse (a
+    corrupted/restored/typo'd filename) — review-cli#323 review finding: this used to
+    raise ValueError straight out of `_parse_stamp`, which is fatal to every caller that
+    doesn't specifically guard for it (both `load_sessions`'s directory scan AND the SSE
+    `_emit_activity` path reach this function with no such guard). Matching the
+    documented "Returns None if the name doesn't match" contract for an invalid date too
+    means every caller gets the fix for free, instead of needing its own guard."""
     m = _CALL_RE.match(path.name)
     if not m:
         return None
-    started = _parse_stamp(m.group(1), m.group(2))
+    try:
+        started = _parse_stamp(m.group(1), m.group(2))
+    except ValueError:
+        return None
     backend = m.group(3)
     round_no = int(m.group(4))
     try:
@@ -525,10 +535,17 @@ _BS_SECTION_RE = re.compile(r"^(?:## Moderator \(round \d+\)|# Final synthesis)\
 
 
 def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
+    """Returns None if the name doesn't match, INCLUDING a name that matches the shape
+    but carries a date `_parse_stamp` can't parse — same fix and rationale as
+    `parse_call_log` (review-cli#323 review finding: a `.log`-only guard left this
+    `.md` sibling still fatal to `load_sessions`'s directory scan)."""
     m = _BRAINSTORM_RE.match(path.name)
     if not m:
         return None
-    started = _parse_stamp(m.group(1), m.group(2))
+    try:
+        started = _parse_stamp(m.group(1), m.group(2))
+    except ValueError:
+        return None
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -832,11 +849,21 @@ def cluster_sessions(
     ordered = sorted(calls, key=lambda c: c.started)
     sessions: list[Session] = []
     cur: Session | None = None
+    # Tracks `cur.task_code` incrementally instead of calling the `Session.task_code`
+    # PROPERTY on every iteration — that property scans `cur.calls` from index 0 for the
+    # first truthy task_code, so calling it once per considered call made this loop O(n^2)
+    # in the (common, for a task-less ad-hoc review) case where no call in a growing
+    # session has a task_code: the scan never short-circuits and re-walks the whole
+    # (growing) list every time. Measured live: dominated `load_sessions` at real scale
+    # (review-cli#323 follow-on) even after the per-file parse itself was cached. `cur` is
+    # always brainstorm-less during this loop (brainstorms attach in a separate pass
+    # below), so "first truthy task_code among cur.calls" is exactly what this tracks.
+    cur_task_code: str | None = None
     for call in ordered:
         # Gap is measured from the prior call's END (last write), not its start, so a
         # single invocation whose individual call runs longer than `gap` is not split
         # into multiple sessions. `cur.ended` therefore tracks the max call end-time.
-        same_task = cur is not None and (cur.task_code or "") == (call.task_code or "")
+        same_task = cur is not None and (cur_task_code or "") == (call.task_code or "")
         if (
             cur is None
             or not same_task
@@ -849,8 +876,10 @@ def cluster_sessions(
                 calls=[call],
             )
             sessions.append(cur)
+            cur_task_code = call.task_code
         else:
             cur.calls.append(call)
+            cur_task_code = cur_task_code or call.task_code
             if call.ended_at > cur.ended:
                 cur.ended = call.ended_at
     # Attach each brainstorm.md to the session whose window contains/precedes it.
@@ -904,6 +933,13 @@ def load_sessions(
             # and re-parsing potentially tens of thousands of files on every request —
             # the documented cause of the dashboard's default view rendering blank
             # before a cold parse of a long-lived install's log dir finishes.
+            #
+            # A malformed filename (a bad date component `_parse_stamp` can't parse) is
+            # handled INSIDE `parse_call_log` now (returns None, same as any other
+            # non-matching name) — see its docstring for why (review-cli#323 review
+            # finding). One bad file must not crash the entire scan, and fixing it at
+            # that source covers every caller (this scan AND the SSE `_emit_activity`
+            # path) instead of needing a guard at each call site.
             c = call_log_cache.get_or_parse(log_dir_path, entry, parse_call_log)
             if c:
                 calls.append(c)
