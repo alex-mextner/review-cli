@@ -1426,17 +1426,18 @@ def quorum_check(
             )
             has_panel = any(m not in board_capable_modes for m in modes_used)
             # GLM round-review finding on this feature's own PR: a board-capable
-            # record with `ok_count == 0 and fail_count > 0` means every configured
-            # seat FAILED that run (dead API keys, broken auth, ...) -- NOT that no
-            # board was ever configured. `_run_mode_with_stats` (cli.py) omits the
-            # `roles` key whenever the failover outcome's `usable_roles` comes back
-            # empty, which happens for BOTH "no board configured" and "board
-            # configured, every seat unusable" -- the two are indistinguishable from
-            # the record alone except via this exact signal. Telling an operator
-            # whose board IS configured (but whose seats are all broken) to
-            # "configure a reviewer board" sends them chasing a config problem that
-            # doesn't exist instead of restoring seat health -- the concrete failure
-            # scenario this check exists to catch.
+            # record with `ok_count == 0 and fail_count > 0` means EITHER every
+            # configured seat failed that run (dead API keys, broken auth, ...) OR
+            # no board was configured at all and a flat `-m` dispatch's models all
+            # failed -- `_run_mode_with_stats` (cli.py) omits the `roles` key
+            # whenever the failover outcome's `usable_roles` comes back empty,
+            # which happens in BOTH shapes identically. A second-round GLM finding
+            # caught an EARLIER version of this fix confidently asserting "a board
+            # IS configured" from this signal alone -- it can't; the record simply
+            # doesn't say. The remediation below hedges both readings instead of
+            # picking one and risking sending a boardless operator to "fix" seat
+            # health that was never the problem, or a real-board operator to
+            # "configure" a board that already exists.
             board_seats_failed = any(
                 item.get("mode") in board_capable_modes
                 and item.get("ok_count") == 0
@@ -1466,11 +1467,13 @@ def quorum_check(
             )
             board_fix = (
                 (
-                    "restore the reviewer board's seats to health (see `review "
-                    "--show-board` for per-seat availability -- dead API keys, "
-                    "missing CLI auth, or an unpaid provider are the usual "
-                    f"causes) and re-run {rerun_hint} -- every configured seat "
-                    "failed on this run, which records no per-seat roles"
+                    "either configure a reviewer board for this repo (see "
+                    "`review --show-board` / config.yaml's `board:` entry) or, "
+                    "if one is already configured, restore its seats to health "
+                    "(dead API keys, missing CLI auth, and an unpaid provider "
+                    f"are the usual causes) -- then re-run {rerun_hint} -- this "
+                    "run recorded zero usable seats, which happens either way "
+                    "and records no per-seat roles"
                 )
                 if board_seats_failed
                 else (

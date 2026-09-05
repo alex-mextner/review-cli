@@ -2663,12 +2663,14 @@ def test_quorum_check_bare_default_post_cutoff_role_less_diff_mode_review_cli_25
 
 
 def test_quorum_check_bare_default_all_board_seats_failed_review_cli_252_followup():
-    """GLM round-review finding: a role-less `review diff` run with a REAL board
-    configured, whose seats all failed (dead API keys, broken auth, ...), records
-    the identical shape as "no board configured at all" -- no `roles` key, since
-    `usable_roles` is empty either way. The remediation must not tell an operator
-    whose board already exists to go configure one; it must point at the actual
-    problem (seat health)."""
+    """GLM round-review finding: a role-less `review diff` run whose seats all
+    failed (zero usable seats -- `ok_count == 0 and fail_count > 0`) records the
+    identical shape as "no board configured at all", since `usable_roles` is empty
+    either way -- the record alone cannot distinguish "a real board's seats all
+    failed" from "no board, a flat `-m` dispatch's models all failed" (second-round
+    GLM finding: an earlier version of this fix wrongly asserted the former with
+    confidence it doesn't have). The remediation must hedge both readings rather
+    than confidently misdiagnose either one."""
     with _TmpStore():
         _stats.record_run(
             task_code=TASK,
@@ -2678,14 +2680,15 @@ def test_quorum_check_bare_default_all_board_seats_failed_review_cli_252_followu
             ok_count=0,
             fail_count=2,
             passed=False,
-            # No `started=` -- post-cutoff. No `roles=` -- every seat failed, so
-            # `usable_roles` came back empty even though a board WAS configured.
+            # No `started=` -- post-cutoff. No `roles=` -- zero usable seats, the
+            # shape shared by both "board's seats all failed" and "no board at
+            # all, flat dispatch failed".
         )
         result = _stats.quorum_check(TASK, min_iter=1)
         assert result["passed"] is False, result
         gap = result["role_tracking_gap"]
-        assert "configure a reviewer board" not in gap, gap
-        assert "restore the reviewer board's seats to health" in gap, gap
+        assert "configure a reviewer board" in gap, gap
+        assert "restore its seats to health" in gap, gap
         assert "`review --show-board`" in gap, gap
 
 
