@@ -19,6 +19,13 @@ const state = {
   filterModel: null, // when set, session lists show only runs that used this model
   filterRole: null, // when set, session lists show only brainstorm runs with this persona
   filterTask: null, // when set, session lists show only runs for this task code
+  // Set by loadAll()'s catch when a fetch fails, cleared on the next successful load. Lets
+  // render()'s loading guard tell "a reload is genuinely in flight" (runs/stats null, no
+  // error) apart from "the last attempt failed and nothing is coming until the next SSE
+  // event or refresh click" — without this, a failed load left runs/stats permanently null
+  // and every subsequent tab switch showed an honest-looking "Loading…" that was actually a
+  // dead end.
+  loadError: null,
 };
 
 // ---- model identity --------------------------------------------------------
@@ -238,9 +245,23 @@ function fmtTime(iso) {
 }
 function fmtDur(s) {
   if (s == null) return '—';
-  if (s < 60) return s.toFixed(1) + 's';
-  const m = Math.floor(s / 60),
-    r = Math.round(s % 60);
+  // Round to one decimal FIRST, then branch on the rounded value — not the raw one. Branching
+  // on the raw `s < 60` left the exact same "rounds up to 60" bug in the sub-minute case: e.g.
+  // s=59.96 is < 60 so it took the `toFixed(1)` path and rendered "60.0s" (a duration that
+  // reads as a whole minute but isn't formatted as one). Rounding first means a value that
+  // rounds up to a full minute takes the minutes branch instead, and the minutes branch's
+  // `total % 60` is structurally confined to [0,59] so it can never print a "60s" remainder
+  // either (the original live bug: s=1199.6 -> old code rounded the 59.6s remainder alone ->
+  // 60 -> "19m 60s" instead of "20m 0s").
+  const rounded = Math.round(s * 10) / 10;
+  if (rounded < 60) return rounded.toFixed(1) + 's';
+  // Round the ORIGINAL value once here, not `rounded` again — double-rounding (round to one
+  // decimal, then round that to an integer) can push a value already rounded onto a `.5`
+  // boundary the wrong way (e.g. s=90.47 -> rounded=90.5 -> Math.round(90.5)=91 -> "1m 31s",
+  // one second later than the true "1m 30s" that a single `Math.round(90.47)=90` gives).
+  const total = Math.round(s);
+  const m = Math.floor(total / 60),
+    r = total % 60;
   return `${m}m ${r}s`;
 }
 function api(path, opts) {
@@ -301,15 +322,62 @@ function taskChip(code) {
 
 // ---- data loading ----------------------------------------------------------
 async function loadAll() {
+  // Clear a stale error from a PREVIOUS failed attempt as soon as a new one starts —
+  // otherwise a tab switch during this new attempt's flight would still show the old
+  // failure message instead of "Loading…", even though a fresh fetch is genuinely underway.
+  state.loadError = null;
+  let runs, stats;
   try {
-    const [runs, stats] = await Promise.all([api(`/api/runs?gap=${state.gap}`), api(`/api/stats?gap=${state.gap}`)]);
-    state.runs = runs;
-    state.stats = stats;
-    updateTabBadges();
-    render();
+    [runs, stats] = await Promise.all([api(`/api/runs?gap=${state.gap}`), api(`/api/stats?gap=${state.gap}`)]);
   } catch (e) {
-    $('panel').innerHTML = `<div class="empty">Failed to load data: ${esc(e.message)}</div>`;
+    // `e.message` can be empty/undefined for a non-Error rejection — fall back to String(e)
+    // so the guard's `state.loadError ? failed : loading` check can't be fooled by a falsy
+    // message into showing an eternal "Loading…" for a load that already failed.
+    const message = (e && e.message) || String(e);
+    state.loadError = message;
+    // Judge data-presence AT CATCH TIME (panelDataMissing(), the SAME predicate render()'s
+    // guard uses for the CURRENTLY visible panel), not a snapshot taken before the await.
+    // A start-time snapshot goes stale in two directions once other loadAll() calls can
+    // interleave: (a) the user can switch to a DIFFERENT panel mid-fetch — a snapshot from
+    // the panel active at entry would misjudge the panel actually on screen when this
+    // fails; (b) an OLDER, overlapping call can succeed and populate runs/stats WHILE this
+    // one is still in flight — a "had data before" snapshot taken at this call's own entry
+    // would then be stale by the time it reaches this catch, silently toasting instead of
+    // rendering the now-genuinely-missing state, or vice versa. Re-deriving from live state
+    // right here is what render()'s guard itself does, so the two can't disagree. (Safe to
+    // do at catch-time specifically because the try above is scoped to ONLY the fetch — a
+    // render()/updateTabBadges() throw can't land here and get misclassified as a fetch
+    // failure; see the success path below.)
+    if (panelDataMissing()) {
+      // The currently visible panel is missing data — this is what surfaces the loadError
+      // just recorded above (via render()'s guard) instead of leaving it on an eternal,
+      // dishonest "Loading…".
+      render();
+    } else {
+      // The currently visible panel already has valid data (e.g. the refresh button, which
+      // does NOT null state.runs/state.stats first — unlike invalidate()/scheduleReload()).
+      // It must still SEE this failure — silently leaving the stale panel up with nothing
+      // recorded would make a failed refresh indistinguishable from a successful no-op one
+      // — but toast rather than repaint, since the panel itself doesn't need to change.
+      toast(`refresh failed: ${message}`);
+    }
+    return;
   }
+  // Assignment and rendering happen OUTSIDE the try/catch above: if either throws, it must
+  // surface as a normal uncaught error, not get swallowed and reinterpreted as a fetch
+  // failure by the catch block above.
+  state.runs = runs;
+  state.stats = stats;
+  // Clear again here, not just at entry: with TWO overlapping loadAll() calls (e.g. two
+  // invalidate()s fired close together), the entry-time clear only protects THIS call's own
+  // window — if an OLDER, overlapping call's fetch fails and reaches its catch AFTER this
+  // one already succeeded, its `state.loadError = message` would otherwise stick around
+  // (harmless right now since runs/stats are populated and the guard ignores loadError when
+  // data isn't missing, but a stale value like that is exactly the kind of "relies on every
+  // caller pairing runs=null with an immediate loadAll()" fragility worth not carrying).
+  state.loadError = null;
+  updateTabBadges();
+  render();
 }
 
 // The tab buttons live in the static shell (they are NOT re-rendered with the panel), so
@@ -1224,9 +1292,53 @@ function wireChips() {
   });
 }
 
+// Panels that read only `state.stats` (never `state.runs`): Stats, Models & roles, Metrics.
+// `invalidate()`/the SSE `scheduleReload()` null `state.runs` while a reload is in flight but
+// never touch `state.stats`, so these three keep rendering correctly (on the still-valid,
+// slightly-stale stats snapshot) during that window — only the eight panels below that read
+// `state.runs` need the loading guard.
+const STATS_ONLY_PANELS = new Set(['stats', 'models', 'metrics']);
+
+// The single source of truth for "does the CURRENTLY selected panel have the data it needs
+// to render for real, right now" — a stats-only panel needs only state.stats, every other
+// panel needs state.runs. render()'s loading guard and loadAll()'s failure-classification
+// both need this exact question answered, and disagreeing (even briefly, even in a comment)
+// is what produced two real bugs in review: a stats-only panel silently showing stale data
+// on a failed reload, and a different, runs-reading panel left on an eternal "Loading…"
+// because the failure was classified against the panel active when the fetch STARTED, not
+// the one the guard judges at render time. One function, called from both places, is the
+// only way this can't drift apart again.
+function panelDataMissing() {
+  return STATS_ONLY_PANELS.has(state.panel) ? state.stats === null : state.runs === null;
+}
+
 function render() {
   if (state.panel === 'chat' && state.detail) {
     openDetail(state.detail);
+    return;
+  }
+  // `state.runs === null` means a runs reload is IN FLIGHT (SSE activity or a write called
+  // `invalidate()`), not that the log window is genuinely empty. Every runs-reading
+  // PANELS.* renderer falls back to `(state.runs || [])`, so calling one here would render a
+  // false "no sessions / no errors / 0 calls" panel — reproduced live: switching tabs while
+  // the busy install's SSE stream kept re-nulling state.runs made the Errors tab claim "No
+  // errors yet" while Overview/Metrics (rendered a moment earlier, before the reload)
+  // reported 42k+ recorded errors. Show the same loading placeholder the initial boot uses
+  // instead of rendering a panel against data that hasn't arrived yet.
+  //
+  // The STATS_ONLY exemption only holds once the FIRST load has landed: at initial boot
+  // `state.stats` is ALSO null (until loadAll() resolves), so a stats-only panel opened
+  // before that first fetch completes would hit the exact same false-empty bug one level
+  // down (PANELS.stats/models/metrics each render their own "no data yet" on a null
+  // `state.stats`). So the guard fires for a stats-only panel too when `state.stats` is
+  // still null — it only SKIPS the guard once stats have loaded at least once.
+  if (panelDataMissing()) {
+    // A recorded loadError means the data isn't "still loading" — the last attempt already
+    // failed and nothing else is coming until the user retries or a new SSE event fires
+    // another attempt. Saying "Loading…" there would be a dead end that looks like progress.
+    $('panel').innerHTML = state.loadError
+      ? `<div class="empty">Failed to load data: ${esc(state.loadError)}</div>`
+      : `<div class="loading">Loading…</div>`;
     return;
   }
   const fn = PANELS[state.panel] || PANELS.overview;
@@ -1321,11 +1433,14 @@ document.addEventListener('DOMContentLoaded', boot);
 // --- test hook (browser no-op) ----------------------------------------------
 // In the browser `module` is undefined, so this whole block is skipped — the SPA is
 // unaffected. Under Node (`node --test`) it exposes the PURE resolution/filter functions
-// (and the `state` object the filter reads) so they can be unit-tested without a DOM.
+// (and the `state` object the filter reads) so they can be unit-tested without a DOM, plus
+// `render`/`PANELS` for dispatch-level tests that exercise render()'s panel-selection logic
+// (render() itself is NOT pure — it writes to the DOM via `$('panel').innerHTML` — but the
+// tests that call it supply their own `document` stub to observe what gets written).
 // The test harness stubs `window`/`document` before requiring this file so the two
 // top-level browser calls above (`window.onImgError = …`, `document.addEventListener`)
 // are harmless no-ops. Keeping the export here (not a separate module) means the tests
 // exercise the EXACT code the browser runs — no copy that can drift.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { resolveModel, filteredRuns, monogram, cap, state, PANELS };
+  module.exports = { resolveModel, filteredRuns, monogram, cap, state, PANELS, fmtDur, render, STATS_ONLY_PANELS, loadAll };
 }
