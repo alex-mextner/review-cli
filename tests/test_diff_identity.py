@@ -31,6 +31,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -349,6 +350,120 @@ def test_quorum_check_all_mismatched_fails_bar_despite_raw_count_meeting_floor()
         assert result["passed"] is False
         assert result["passed_iterations"] == 0
         assert result["excluded_mismatched_iterations"] == 4
+
+
+def test_quorum_check_stalled_models_coexists_with_mismatch_error():
+    """review-cli#221 round-4 review finding (k3/Opus): a mismatch-error result is NOT
+    an early return (unlike the invalid-task-code/unreadable-store/no-iterations cases)
+    -- `_finalize_quorum_result` sets `result["error"]` on the ALREADY-CONSTRUCTED
+    result dict, after the `stalled_models` block already ran. cli.py's own comment
+    claims this combination is real ("stalled_models can genuinely be populated
+    alongside a mismatch error"), but no test drove it before this one -- a regression
+    reintroducing the early `if "error" in result: ... return 1` guard removed in this
+    diff would pass the full suite silently while breaking this exact case."""
+    from reviewlib import seat_cooldown as _sc
+
+    with tempfile.TemporaryDirectory() as d, _TmpStore():
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        saved_cd_ttl = os.environ.get("REVIEW_SEAT_COOLDOWN_SECONDS")
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(d) / "seat-cooldown.json")
+        os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+        try:
+            this_repo = "github.com/hyperide/agent-tools"
+            # A polluted, cross-repo passed iteration -- excluded, drives the bar to
+            # NOT met via the mismatch path (result["error"] gets set).
+            _record_passed(models=["codex"], repo_id="github.com/other-org/repo")
+            # A SEPARATE, real (unpassed) attempt at THIS task/repo by a seat that is
+            # currently cooling down -- this is what stalled_models must still surface.
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["oc:zai/glm-5.2"],
+                duration_seconds=1.0,
+                ok_count=0,
+                fail_count=1,
+                passed=False,
+                repo_id=this_repo,
+            )
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time())
+
+            result = _stats.quorum_check(
+                TASK, min_iter=3, min_models=3, repo_id=this_repo, diff_files=None
+            )
+            assert result["passed"] is False
+            assert "error" in result  # the mismatch-error path
+            assert "excluded" in result["error"] or "mismatch" in result["error"]
+            assert "stalled_models" in result, (
+                "stalled_models must survive the mismatch-error branch, not just the "
+                "bare-ratio-not-met branch"
+            )
+            assert result["stalled_models"][0]["model"] == "oc:zai/glm-5.2"
+        finally:
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
+            if saved_cd_ttl is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = saved_cd_ttl
+
+
+def test_quorum_check_stalled_models_present_when_mismatch_exclusion_drops_below_floor():
+    """review-cli#221 round-4 review finding (Opus/Fable): the prior coexistence test
+    used raw counts already below the floor, so `result["passed"]` was False the moment
+    the dict literal was built -- it couldn't distinguish "stalled_models runs on the
+    final passed value" from "stalled_models runs on a since-superseded early value".
+    This drives the OTHER shape both reviewers asked for: raw passed-iteration count
+    alone would CLEAR the floor, but mismatch (diff-identity) exclusion drops the
+    GATE-COUNTED total below it -- `gate_iterations`/`models` (what `result["passed"]`
+    is actually computed from) are already the POST-exclusion sets by the time the
+    dict literal runs, so this must behave identically to the simpler case."""
+    from reviewlib import seat_cooldown as _sc
+
+    with tempfile.TemporaryDirectory() as d, _TmpStore():
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        saved_cd_ttl = os.environ.get("REVIEW_SEAT_COOLDOWN_SECONDS")
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(Path(d) / "seat-cooldown.json")
+        os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+        try:
+            this_repo = "github.com/hyperide/agent-tools"
+            # 3 raw PASSED iterations -- enough to clear min_iter=3 on a raw count --
+            # but every one is cross-repo pollution, so post-exclusion gate_iterations
+            # is 0. The HYP-858 shape from the sibling test above, just with a cooling
+            # seat added.
+            for i, model in enumerate(("codex", "gemini", "fable5")):
+                _record_passed(models=[model], repo_id=f"github.com/other-org/repo-{i}")
+            # A separate, real (unpassed) attempt at THIS task/repo, currently cooling.
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["oc:zai/glm-5.2"],
+                duration_seconds=1.0,
+                ok_count=0,
+                fail_count=1,
+                passed=False,
+                repo_id=this_repo,
+            )
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time())
+
+            result = _stats.quorum_check(
+                TASK, min_iter=3, min_models=3, repo_id=this_repo, diff_files=None
+            )
+            # Raw count (3) meets min_iter (3), but post-exclusion it's 0 -- must fail.
+            assert result["passed"] is False
+            assert result["excluded_mismatched_iterations"] == 3
+            assert "stalled_models" in result
+            assert result["stalled_models"][0]["model"] == "oc:zai/glm-5.2"
+        finally:
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
+            if saved_cd_ttl is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = saved_cd_ttl
 
 
 def test_quorum_check_min_floor_still_validated_with_context():
@@ -679,6 +794,93 @@ def test_cli_check_end_to_end_excludes_cross_repo_iteration():
         finally:
             restore()
             os.environ.pop("REVIEW_LOG_DIR", None)
+            repo_a.cleanup()
+            repo_b.cleanup()
+
+
+def test_cli_check_error_branch_prints_header_and_stalled_lines_on_same_stream():
+    """review-cli#221 round-4 review finding (k3/Fable): the mismatch-error branch's
+    header and its `stalled:` detail lines must land on the SAME stream (both stderr,
+    matching the ratio branch's both-stdout choice) -- a caller capturing only one
+    stream must never see a bare header with no detail, or bare detail with no
+    context. Drives the REAL CLI end to end (not just quorum_check directly, which the
+    stats-level coexistence test already covers) in TEXT mode specifically, since
+    --json returns before this print logic runs at all."""
+    from reviewlib import seat_cooldown as _sc
+    from test_run_stats import _stub_resolve_backend, _with_backend_stub
+
+    with _TmpStore():
+        repo_a = _git_init_with_diff()
+        repo_b = _git_init_with_diff()
+        restore = _with_backend_stub(_stub_resolve_backend(0))
+        os.environ["REVIEW_LOG_DIR"] = tempfile.mkdtemp()
+        saved_cd_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+        saved_cd_ttl = os.environ.get("REVIEW_SEAT_COOLDOWN_SECONDS")
+        cd_dir = tempfile.mkdtemp()
+        os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(
+            Path(cd_dir) / "seat-cooldown.json"
+        )
+        os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+        try:
+            # One real, matching iteration for repo A -- not enough alone (min-iter 2).
+            with redirect_stderr(io.StringIO()), _capture_stdout():
+                rc = _cli.main(
+                    ["diff", "--task", TASK, "-C", repo_a.name, "-m", "codex"]
+                )
+            assert rc == 0, rc
+            # A cross-repo polluted PASSED iteration -- drives the mismatch-error path.
+            _write_iteration_for_other_repo(repo_b.name)
+            # A separate, real (unpassed) ATTEMPT at THIS task/repo by the cooling
+            # seat -- attempted_models scoping requires an actual recorded iteration,
+            # not just a cooldown entry (see the sibling stats-level test above).
+            _stats.record_run(
+                task_code=TASK,
+                mode="review",
+                models=["oc:zai/glm-5.2"],
+                duration_seconds=1.0,
+                ok_count=0,
+                fail_count=1,
+                passed=False,
+                repo_id=f"path:{Path(repo_a.name).resolve()}",
+            )
+            _sc.record_cooldown("oc:zai/glm-5.2", "timed out", now=time.time())
+
+            out = io.StringIO()
+            err = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(out):
+                rc = _cli.main(
+                    [
+                        "task",
+                        TASK,
+                        "--check",
+                        "-C",
+                        repo_a.name,
+                        "--min-iter",
+                        "2",
+                        "--min-models",
+                        "1",
+                    ]
+                )
+            assert rc != 0, rc
+            stdout_text = out.getvalue()
+            stderr_text = err.getvalue()
+            assert "review bar NOT met" in stderr_text
+            assert "stalled: oc:zai/glm-5.2" in stderr_text
+            # Neither line leaked onto stdout -- a stdout-only capture would otherwise
+            # see the bare, contextless `stalled:` line the finding described.
+            assert "review bar NOT met" not in stdout_text
+            assert "stalled:" not in stdout_text
+        finally:
+            restore()
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            if saved_cd_file is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cd_file
+            if saved_cd_ttl is None:
+                os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+            else:
+                os.environ["REVIEW_SEAT_COOLDOWN_SECONDS"] = saved_cd_ttl
             repo_a.cleanup()
             repo_b.cleanup()
 

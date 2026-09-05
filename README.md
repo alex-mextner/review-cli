@@ -516,7 +516,7 @@ JSON top-level shapes:
 | `review task --json` | `{"tasks": [{"task_code": str, "iterations": int, "models": [str], "modes": [str], "first_ts": str, "last_ts": str, "duration_seconds": number, "ok_count": int, "fail_count": int}]}` |
 | `review task CODE --json` | `{"task_code": str, "iterations": [run_stats_record], "sessions": [dashboard_session_summary]}` |
 | `review task CODE --detail N --json` | `dashboard_session_detail` with `session_id`, `task_code`, `calls`, `errors`, `brainstorm`, and `roles` |
-| `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models": int, "passed": bool, "error"?: str, "identity_verification": "ran" \| "disabled" \| "skipped_unresolvable", "verified_iterations"?: int, "unverifiable_iterations"?: int, "excluded_mismatched_iterations"?: int, "mismatch_details"?: [{"iteration": int, "reason": str, "recorded_repo_id": str, "recorded_diff_files": [str] | null, "ts": str}], "mismatch_details_truncated"?: true}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). `mismatch_details` is capped at 50 entries — `excluded_mismatched_iterations` is always the uncapped true count. |
+| `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models": int, "passed": bool, "error"?: str, "identity_verification": "ran" \| "disabled" \| "skipped_unresolvable", "verified_iterations"?: int, "unverifiable_iterations"?: int, "excluded_mismatched_iterations"?: int, "mismatch_details"?: [{"iteration": int, "reason": str, "recorded_repo_id": str, "recorded_diff_files": [str] | null, "ts": str}], "mismatch_details_truncated"?: true, "stalled_models"?: [{"model": str, "reason": str, "remaining_seconds": int, "consecutive_failures": int}]}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). `mismatch_details` is capped at 50 entries — `excluded_mismatched_iterations` is always the uncapped true count. `stalled_models` (review-cli#221) is present only when the bar ISN'T met and names any ATTEMPTED model that's currently cooling down (an unavailable-sentinel response or a session-limit/usage-credits notice — the two chronic signals `seat_cooldown` records; a plain timeout does NOT currently start a cooldown, see the "Deliberately narrow" note above) — the same signal `stalled: <model> (...)` lines print in text mode. |
 
 `--check` also runs **diff-identity verification** by default: it resolves `-C`/cwd
 to a repo id (the normalized `origin` remote, or a local path when there is no
@@ -1282,13 +1282,45 @@ paid for one full `claude-p` dispatch on *every* review invocation before fallin
 reserve — real evidence: 4,322 of 6,383 recorded runs dispatched Fable and it failed, most
 with an explicit session-limit notice. Once a dispatch comes back with that notice or the
 administrative "... is currently unavailable" sentinel, `reviewlib.seat_cooldown` records a
-short cooldown (default 10 minutes, `$REVIEW_SEAT_COOLDOWN_SECONDS`, `<= 0` disables it;
-store path overridable via `$REVIEW_SEAT_COOLDOWN_FILE`) so the *next* invocation within
-that window skips the real dispatch and returns the same sentinel shape immediately — every
-downstream consumer (failover, the dashboard's paywall classification) sees it exactly as it
-would a live paywall response. Deliberately narrow: only these two chronic signals start a
-cooldown, never a bare auth/bad-model seat-fatal (which can be a transient misconfiguration
-a human just fixed).
+cooldown (`$REVIEW_SEAT_COOLDOWN_SECONDS` pins a fixed window for FUTURE writes and
+disables escalation going forward — it does not retroactively shorten an already-
+escalated entry's `until`, only `<= 0` (the documented un-stick hatch, disabling
+cooldowns entirely) does that; store path overridable via `$REVIEW_SEAT_COOLDOWN_FILE`)
+so the *next* invocation within that window skips the real
+dispatch and returns the same sentinel shape immediately — every downstream consumer
+(failover, the dashboard's paywall classification) sees it exactly as it would a live
+paywall response. **Escalating window (review-cli#221):** left unset, the window starts at
+10 minutes and climbs per CONSECUTIVE failure (30min, 2h, then an 8-hour cap) — a seat that
+keeps getting re-dispatched and re-failing across many separate `review` invocations
+(minutes apart, so a flat 10-minute window kept lapsing before the next check) gets pushed
+out of the active pool long enough for `run_board_with_failover`'s reserve-promotion to
+substitute a different model instead. A genuine SUCCESSFUL dispatch clears the escalation
+immediately; absent that, a 24-hour gap since the last failure also resets it to 10 minutes.
+`review task CODE --check` (both text and `--json`) names any currently-stalled attempted
+model plus why, instead of leaving an operator to guess from a bare pass/fail count.
+Deliberately narrow: only these two chronic signals start a cooldown, never a bare
+auth/bad-model seat-fatal (which can be a transient misconfiguration a human just fixed).
+An explicit `$REVIEW_SEAT_COOLDOWN_SECONDS` override always resets `fail_count` to 1 on
+its next write, the same as a genuine success — it's a human asking for a specific window,
+which takes priority over the escalation history the way any explicit request does.
+
+**Diagnostic gap (known, tracked):** `stalled_models` is scoped to the models a task's
+recorded runs actually attempted (`record_run`'s `models=`), which on the normal
+board/failover dispatch path only ever contains the SEATS THAT SURVIVED — a chronically-
+cooling seat that a reserve successfully backfilled never appears there, so the
+diagnostic stays silent in exactly the case (a stuck seat masked by working failover)
+it exists to surface. Tracked as
+[review-cli#227](https://github.com/alex-mextner/review-cli/issues/227).
+
+**Scope gap (known, tracked):** this whole mechanism is wired into
+only the two claude dispatch paths (`review_with_images`, `review_claude` in
+`backends.py`) — `review_opencode`/`review_codex`/the `commandcode:`/`zai:` HTTP backends
+have no cooldown consult/record/clear at all. The review-cli#221 incident that motivated
+this feature was actually an `oc:zai/glm-5.2` (opencode) seat, which this escalation
+mechanism does **not** cover yet — that seat still relies purely on manual
+`models:`/`board:` config exclusion (see this file's model-roster section). Extending the
+same check/record/clear trio to the non-claude backends is tracked as
+[review-cli#226](https://github.com/alex-mextner/review-cli/issues/226), not done here.
 
 **Memory-aware concurrency cap.** Each heavy seat (codex / claude / opencode) spawns a fat
 model-runner subprocess, and a `review` runs its whole pool in parallel — so a high `--pool`
