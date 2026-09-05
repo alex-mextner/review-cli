@@ -220,7 +220,11 @@ All three resolve their key from the env first, then the shared
 `~/.config/review-cli/.env` (the same file the gemini key uses).
 
 ## When to use
-- Before committing — sanity-check a diff across multiple models in parallel (`review diff --task CODE`).
+- Before committing — stage the change and sanity-check it across multiple models in
+  parallel (`review diff --staged --task CODE`). The STAGED run is the one that satisfies
+  agent-tools' `require-review-before-commit` gate: on passing it writes that gate's marker
+  itself, so never `touch` the marker file by hand (an unstaged `review diff` reviews the
+  working tree and deliberately leaves the marker alone — it says so on stderr).
 - For a hard decision — `review quorum "Q" --task CODE` (settle with cited evidence) or
   `review brainstorm "TOPIC" --task CODE` (explore an open design space across rotating expert roles,
   in a loop). The moderator defaults to opus and falls back to codex/gemini automatically.
@@ -239,7 +243,7 @@ SKILL_BLURB = (
     "`review`); the old --quorum/--brainstorm/--just-ask flags were removed. "
     "Always pass -C <project-root>. Always pass --task CODE (or set REVIEW_TASK_CODE) for "
     "review iterations; `review task CODE` shows iterations, models, and transcripts. "
-    "Use before commits and for hard decisions. "
+    "Use before commits and for hard decisions. Before a COMMIT use `review diff --staged --task CODE`: only a PASSING staged review satisfies agent-tools' require-review-before-commit gate (it writes that gate's marker itself — never `touch` the marker by hand). "
     "NEVER wrap it in a short timeout — it is multi-model / multi-round and takes "
     "MINUTES (brainstorm 10–20m); it prints the expected duration for your pool "
     "size at startup, so wait for that, don't short-timeout it. Use NO external "
@@ -586,10 +590,18 @@ exit 1
 
 def _write_review_stamp(
     cwd: Path, diff: str, *, stamp_diff_hash: str | None = None
-) -> None:
+) -> str | None:
     """Record that this exact diff was reviewed, so the optional pre-commit gate
     can verify it. Uses `git rev-parse --git-path` so worktrees / pointer-file
     .git resolve correctly. Best-effort: never breaks a review on failure.
+
+    Returns None on success, or the reason it did not write, for the same reason
+    `_touch_review_marker` does (codex finding, review-cli#350 iteration 6): the LOCAL
+    git pre-commit gate keys on this stamp, not on the session marker, so a failed stamp
+    write with a healthy marker produces the identical trap one gate over — a green
+    staged review, a rejected commit, and no explanation anywhere. Not-a-repo is NOT a
+    failure and returns None: there is no gate to satisfy outside a git repo, and saying
+    so on every non-repo review would be noise.
 
     The rev-parse is anchored to `cwd` (`git -C`) AND runs with the repo-pinning git env
     stripped (`git_repo_env`), matching the diff probe in cli._git_diff: a leaked
@@ -630,15 +642,32 @@ def _write_review_stamp(
     from .process import git_repo_env
 
     try:
+        # LC_ALL=C pins git's own messages to English so the not-a-repo classification
+        # below can match on their text. Without it a localized shell or container
+        # (`LC_ALL=de_DE.UTF-8` → `fatal: kein Git-Repository`) turns every review run
+        # outside a repo into a spurious "the stamp could not be written" warning — a
+        # false alarm in exactly the tool whose job here is to stop false silence (Fable
+        # finding, iteration 10).
+        probe_env = {**git_repo_env(cwd), "LC_ALL": "C"}
         p = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--git-path", "review-stamp"],
             cwd=cwd,
-            env=git_repo_env(cwd),
+            env=probe_env,
             capture_output=True,
             text=True,
         )
         if p.returncode != 0:
-            return
+            # "Not a repo" and "git could not answer" are DIFFERENT outcomes and used to
+            # share this one silent return (codex P1 + Fable, iteration 9). Outside a repo
+            # there is no stamp-keyed gate to satisfy, so silence is right. But a real
+            # failure inside one — `fatal: detected dubious ownership` in a container, git
+            # metadata briefly unreadable in a shared worktree — leaves the gate installed
+            # and the stamp missing, which is the "green review, rejected commit, no reason
+            # anywhere" trap this return value exists to close.
+            detail = (p.stderr or "").strip()
+            if "not a git repository" in detail.lower():
+                return None
+            return f"`git rev-parse --git-path review-stamp` failed: {detail or 'no output'}"
         rel = p.stdout.strip()
         stamp = Path(rel) if os.path.isabs(rel) else Path(cwd) / rel
         if stamp_diff_hash is not None:
@@ -658,8 +687,11 @@ def _write_review_stamp(
             stamped_text = hook_diff.stdout if hook_diff.returncode == 0 else diff
             digest = hashlib.sha256(stamped_text.encode("utf-8")).hexdigest()
         stamp.write_text(f"{digest}\n", encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        # Deliberately broad, as before — the stamp is never worth breaking a review
+        # over — but no longer INVISIBLE: the caller turns this into one stderr line.
+        return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    return None
 
 
 # The session-scoped, mtime-windowed marker that the separate `agent-tools`
@@ -673,11 +705,19 @@ def _write_review_stamp(
 DEFAULT_REVIEW_MARKER = "~/.cache/agent-tools/last-review"
 
 
-def _touch_review_marker() -> None:
+def _touch_review_marker() -> str | None:
     """Touch the agent-tools review marker so the require-review-before-commit
     hook sees "a review ran this session". Best-effort: a failure here must
     never break a review (the marker is a discipline reminder, not correctness).
-    Honors the REVIEW_MARKER env var (same name the hook reads)."""
+    Honors the REVIEW_MARKER env var (same name the hook reads).
+
+    Returns None on success, or the OS error text when the write failed. The return
+    value exists because swallowing the failure SILENTLY reproduces the exact incident
+    this marker's caller was hardened against (review-cli#350): a passing staged review
+    prints nothing, the marker stays stale, the commit is blocked, and the caller — told
+    by every doc that a passing staged review writes the marker — concludes the gate is
+    broken and forges the marker by hand. The caller decides what to say about it; this
+    function still never raises."""
     try:
         # `.get(..., DEFAULT)` alone does NOT apply the default for REVIEW_MARKER=""
         # (explicitly set to empty, not unset) — os.environ.get returns "" itself, so the
@@ -691,12 +731,22 @@ def _touch_review_marker() -> None:
         )
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.touch()
-    except OSError:
+        if not marker.is_file():
+            # `Path.touch()` on an EXISTING DIRECTORY succeeds — it just bumps the
+            # directory's mtime — so a `REVIEW_MARKER` pointing at a directory (a typo, a
+            # path built by joining an empty variable, a symlink to one) would otherwise
+            # be reported as a marker successfully written while no marker FILE exists at
+            # all. A gate that stats for a regular file then blocks the commit anyway,
+            # with review-cli having just claimed success: the same silent-failure shape
+            # this return value was added to remove (codex finding, iteration 5).
+            return f"{marker} is not a regular file"
+    except OSError as exc:
         # Swallow only I/O failures (unwritable path, a dir in the way, a bad
         # REVIEW_MARKER) — the marker is a discipline reminder, never correctness, so a
         # disk hiccup must not break a review. A non-OSError (e.g. a bad default
         # constant) is a real bug and is intentionally NOT swallowed.
-        pass
+        return str(exc) or exc.__class__.__name__
+    return None
 
 
 # --- install-hook tg (review-visual pre-send-photo gate) -------------------
