@@ -815,19 +815,51 @@ case "$threshold" in ''|*[!0-9]*) threshold=10 ;; esac
 if [ "$threshold" -gt 0 ]; then
   stamp_diff=$(command git rev-parse --git-path review-stamp-diff)
   if [ -f "$stamp_diff" ]; then
-    cur_tmp=$(mktemp 2>/dev/null) && trap 'rm -f "$cur_tmp"' EXIT
-    if [ -n "$cur_tmp" ] && command git diff --no-ext-diff --cached > "$cur_tmp"; then
-      if ! LC_ALL=C grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$stamp_diff" "$cur_tmp" 2>/dev/null; then
-        diff_out=$(diff -U0 "$stamp_diff" "$cur_tmp" 2>/dev/null)
-        diff_rc=$?
-        if [ "$diff_rc" -le 1 ]; then
-          content=$(printf '%s\\n' "$diff_out" | tail -n +3 | LC_ALL=C grep -Ev '^[+-]( |@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
-          added=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^+')
-          removed=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^-')
-          changed=$added
-          [ "$removed" -gt "$changed" ] && changed=$removed
-          if [ "$changed" -le "$threshold" ] 2>/dev/null; then
-            exit 0
+    # Opus round-3 finding (gate bypass): a stale review-stamp-diff left on disk after
+    # the reviewed change is COMMITTED must never anchor the comparison -- without this
+    # check it becomes a fixed, small, permanent baseline, and an unrelated unreviewed
+    # change to a DIFFERENT file after that commit measures favorably against it and
+    # passes, repeatably and unboundedly. The file's first line is the HEAD the diff was
+    # reviewed against (written by _write_review_stamp_diff); only proceed if that still
+    # matches the current HEAD -- otherwise fall through to the exact-hash gate below,
+    # same as if no companion file existed at all.
+    # A repo with NO commits yet legitimately has an empty HEAD on both sides -- the
+    # documented, tested use case IS "stage + review, then a further uncommitted
+    # follow-up, all before the first commit ever lands" -- so an empty/empty match is
+    # a real match, not a bypass: nothing has been committed for the anchor to go stale
+    # against. What must NOT match is empty-recorded vs non-empty-current (reviewed
+    # before any commit, but a commit landed since) or two different non-empty shas.
+    recorded_head=$(head -n 1 "$stamp_diff" 2>/dev/null)
+    # `git rev-parse HEAD` on a repo with NO commits yet does not print an empty
+    # string on failure -- it echoes the unresolved arg ("HEAD" itself) to STDOUT
+    # and exits non-zero (verified live: exit 128, stdout "HEAD", the "fatal:
+    # ambiguous argument" text going to stderr only). Checking only stdout would
+    # read that as a real, distinct HEAD value and never match the equally
+    # legitimate empty `recorded_head` from a pre-first-commit review -- so the
+    # exit status, not just stdout, decides whether HEAD resolved at all.
+    if current_head=$(command git rev-parse HEAD 2>/dev/null); then
+      :
+    else
+      current_head=""
+    fi
+    if [ "$recorded_head" = "$current_head" ]; then
+      baseline_tmp=$(mktemp 2>/dev/null) && trap 'rm -f "$baseline_tmp"' EXIT
+      cur_tmp=$(mktemp 2>/dev/null) && trap 'rm -f "$baseline_tmp" "$cur_tmp"' EXIT
+      if [ -n "$baseline_tmp" ] && [ -n "$cur_tmp" ] \\
+        && tail -n +2 "$stamp_diff" > "$baseline_tmp" \\
+        && command git diff --no-ext-diff --cached > "$cur_tmp"; then
+        if ! LC_ALL=C grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$baseline_tmp" "$cur_tmp" 2>/dev/null; then
+          diff_out=$(diff -U0 "$baseline_tmp" "$cur_tmp" 2>/dev/null)
+          diff_rc=$?
+          if [ "$diff_rc" -le 1 ]; then
+            content=$(printf '%s\\n' "$diff_out" | tail -n +3 | LC_ALL=C grep -Ev '^[+-]( |@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
+            added=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^+')
+            removed=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^-')
+            changed=$added
+            [ "$removed" -gt "$changed" ] && changed=$removed
+            if [ "$changed" -le "$threshold" ] 2>/dev/null; then
+              exit 0
+            fi
           fi
         fi
       fi
@@ -996,10 +1028,39 @@ def _write_review_stamp_diff(cwd: Path, diff: str) -> str | None:
     tolerance fast path costs at most one extra full review round, not a blocked commit,
     so it doesn't warrant the same "green review, blocked commit, no reason anywhere"
     alarm the marker/stamp notices exist to prevent. The return value exists only so a
-    future caller CAN surface it if that judgment call ever changes."""
+    future caller CAN surface it if that judgment call ever changes.
+
+    Opus round-3 finding (gate bypass): the file's FIRST LINE is the reviewed HEAD sha
+    (`git rev-parse HEAD` at write time), with the raw diff text following. Without this
+    binding, a stale `review-stamp-diff` left on disk after the reviewed change is
+    COMMITTED becomes a fixed, small, permanent anchor: `git diff --cached` after that
+    commit is measured against the OLD diff regardless of which file changed or how many
+    commits have landed since, so an unrelated, unreviewed small change to a DIFFERENT
+    file compares favorably against it and passes the gate -- repeatably, unboundedly,
+    one small unreviewed commit at a time, directly contradicting this feature's own
+    "drift is always measured from the last genuine review" safety claim. The hook
+    (`_TRIVIAL_DELTA_BLOCK`) rejects the file outright when the recorded HEAD doesn't
+    match the current one, falling back to the pre-existing exact-hash gate."""
     from .process import git_repo_env
 
     try:
+        head = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            capture_output=True,
+            text=True,
+        )
+        # A repo with no commits yet has no HEAD to record -- writes an empty first
+        # line rather than skipping the write entirely. This is a real, matchable
+        # state (not a sentinel): the hook's HEAD check compares this string against
+        # `git rev-parse HEAD` verbatim, and BOTH sides read empty for "no commits
+        # yet" -- the documented review-then-uncommitted-followup use case this
+        # feature exists for. What the check actually catches is empty-vs-non-empty
+        # (reviewed pre-first-commit, but a commit landed since) or two different
+        # non-empty shas (reviewed against one commit, HEAD has since moved) --
+        # either way, the reviewed content and the current HEAD have diverged.
+        head_line = head.stdout.strip() if head.returncode == 0 else ""
         p = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--git-path", "review-stamp-diff"],
             cwd=cwd,
@@ -1011,7 +1072,7 @@ def _write_review_stamp_diff(cwd: Path, diff: str) -> str | None:
             return None
         rel = p.stdout.strip()
         stamp_diff = Path(rel) if os.path.isabs(rel) else Path(cwd) / rel
-        stamp_diff.write_text(diff, encoding="utf-8")
+        stamp_diff.write_text(f"{head_line}\n{diff}", encoding="utf-8")
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     return None

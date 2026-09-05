@@ -270,12 +270,16 @@ def test_custom_threshold_is_honored():
 
 def test_write_review_stamp_writes_companion_diff_file():
     """`_write_review_stamp` writes both the hash stamp AND the new `review-stamp-diff`
-    companion, byte-for-byte equal to the reviewed diff text."""
+    companion: a first line recording the reviewed HEAD (Opus round-3 finding -- binds
+    the tolerance anchor so it can't outlive a commit, see `_write_review_stamp_diff`'s
+    docstring), then the reviewed diff text verbatim. `_stage_baseline` reviews before
+    any commit exists, so the recorded HEAD line is empty here -- the real, matchable
+    "no commits yet" state, not a sentinel."""
     with _isolated_repo() as repo:
         diff = _stage_baseline(repo)
         stamp_diff = _git_path(repo, "review-stamp-diff")
         assert stamp_diff.is_file()
-        assert stamp_diff.read_text(encoding="utf-8") == diff
+        assert stamp_diff.read_text(encoding="utf-8") == f"\n{diff}"
 
 
 def test_write_review_stamp_diff_failure_does_not_break_hash_stamp():
@@ -831,6 +835,34 @@ def test_non_utf8_content_byte_does_not_defeat_the_line_count():
             f"still BLOCK at a low threshold -- stdout={proc.stdout!r} "
             f"stderr={proc.stderr!r}"
         )
+
+
+def test_stale_stamp_diff_does_not_anchor_an_unrelated_change_after_commit():
+    """Opus round-3 finding (gate bypass): a `review-stamp-diff` left on disk after the
+    reviewed change is COMMITTED must never anchor the comparison for what comes after --
+    without a binding to the reviewed HEAD, it becomes a fixed, small, permanent baseline
+    that a completely unrelated small change to a DIFFERENT file, against a DIFFERENT
+    HEAD, measures favorably against and passes -- repeatably, once per small unreviewed
+    commit, unboundedly. `_stage_baseline` + `_commit_all` (review, then commit -- no
+    prior test in this file exercises that sequence) followed by staging an unrelated new
+    file must fall through to the pre-existing exact-hash gate and BLOCK, exactly as it
+    would have before this whole feature existed."""
+    with _isolated_repo() as repo:
+        hook = _install_hook(repo)
+        _stage_baseline(repo)
+        _commit_all(repo, "initial: a.py")
+
+        # An UNRELATED, UNREVIEWED small change to a DIFFERENT file after the commit.
+        (repo / "y.py").write_text("y1\ny2\ny3\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "y.py"], check=True)
+
+        proc = _run_hook(hook, repo, {"REVIEW_TRIVIAL_DELTA_LINES": "10"})
+        assert proc.returncode != 0, (
+            "an unrelated unreviewed change after the reviewed baseline was committed "
+            f"must BLOCK, not ride the stale stamp-diff's small anchor -- "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+        assert "have not been reviewed" in proc.stderr, proc.stderr
 
 
 if __name__ == "__main__":
