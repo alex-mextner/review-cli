@@ -645,6 +645,33 @@ def _has_any_role_data(items: list[dict]) -> bool:
 _ROLE_TRACKING_CUTOFF = datetime(2026, 8, 21, 10, 52, 25, tzinfo=timezone.utc)
 
 
+def parse_iso_ts(ts: object) -> datetime | None:
+    """Parse an ISO-8601 timestamp, or ``None`` if `ts` isn't a non-empty string or
+    fails to parse. Normalizes a trailing ``Z`` (Zulu/UTC shorthand) to ``+00:00``
+    first — ``datetime.fromisoformat`` only accepts ``Z`` directly from Python 3.11
+    onward, but this project declares ``requires-python = ">=3.9"``.
+
+    GLM review finding on this feature's own PR: this exact fix (strip-trailing-Z,
+    then `fromisoformat`) used to be copied independently at THREE call sites across
+    two modules, and two of them had already drifted apart (`cli.py`'s
+    `_parse_task_record_started` used `.replace("Z", "+00:00")` — rewrites ANY `Z`
+    anywhere in the string, not just a trailing one — while the other two used the
+    suffix-strip form here). One shared helper, one fix surface.
+
+    Deliberately does NOT default a naive (tz-less) result to UTC or otherwise
+    interpret the parsed value — that's a caller decision (some callers reject naive
+    timestamps outright as unverifiable, others assume UTC for a field this module's
+    own writer always emits tz-aware), so every caller still inspects `.tzinfo`
+    itself before trusting the result."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    normalized = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
 def _iteration_predates_role_tracking(item: dict) -> bool:
     """True iff ``item``'s own ``ts`` is a parseable, timezone-aware timestamp
     strictly before ``_ROLE_TRACKING_CUTOFF`` (PR #246's merge instant).
@@ -683,24 +710,17 @@ def _iteration_predates_role_tracking(item: dict) -> bool:
     Without this, a genuinely pre-cutoff record using ``Z`` (a valid,
     unambiguous UTC marker -- unlike an offsetless naive string, which stays
     fail-closed below) would raise on 3.9/3.10 and get wrongly denied case (a)'s
-    fallback. Same fix, same rationale, as the pre-existing `_resolve_stat_since`
-    (codex/kimi review finding, that one for `--since`) and
-    `_parse_task_record_started` in `cli.py` -- applied here independently
-    because `record_run` itself never emits ``Z`` (`datetime.isoformat()` on a
-    UTC-aware value always writes ``+00:00``), so this guards only against
-    externally-written or historical records in an unverified format, not
-    anything this module's own writer produces (codex round-review finding on
-    this feature's own PR).
+    fallback. Delegates that normalization to `parse_iso_ts` (shared with
+    `_resolve_stat_since` and `_parse_task_record_started` in `cli.py`, which used to
+    each carry their own independent copy of this exact fix -- GLM review finding on
+    this feature's own PR) because `record_run` itself never emits ``Z``
+    (`datetime.isoformat()` on a UTC-aware value always writes ``+00:00``), so this
+    guards only against externally-written or historical records in an unverified
+    format, not anything this module's own writer produces (codex round-review
+    finding on this feature's own PR).
     """
-    ts = item.get("ts")
-    if not isinstance(ts, str) or not ts:
-        return False
-    normalized = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return False
-    if parsed.tzinfo is None:
+    parsed = parse_iso_ts(item.get("ts"))
+    if parsed is None or parsed.tzinfo is None:
         return False
     return parsed < _ROLE_TRACKING_CUTOFF
 
@@ -1239,6 +1259,15 @@ def quorum_check(
     # the non-passed remainder entirely, rather than always paying for it only to
     # discover the answer was already decided.
     quorum_mode_fallback: str | None = None
+    # GLM review finding on this feature's own PR: the removed `elif
+    # bare_check_default and store_error is None: role_data_population =
+    # gate_iterations` branch was dead -- reachable only when
+    # `_has_any_role_data(gate_iterations)` is True (the negation of the branch
+    # below), and its sole consumer (`if role_data_population and not
+    # _has_any_role_data(role_data_population):`) always evaluates False in that
+    # case. It also forced a second, redundant `_has_any_role_data` scan over
+    # `gate_iterations` on the steady-state path this module repeatedly notes is
+    # perf-sensitive (thousands-of-iterations shape). Computed once here instead.
     if (
         bare_check_default
         and store_error is None
@@ -1248,8 +1277,6 @@ def quorum_check(
         role_data_population = gate_iterations + _iterations_excluding_mismatched(
             non_passed, repo_id, diff_files
         )
-    elif bare_check_default and store_error is None:
-        role_data_population = gate_iterations
     else:
         role_data_population = []
     role_tracking_gap: str | None = None

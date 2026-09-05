@@ -83,6 +83,7 @@ from .stats import (
     iterations_for_task,
     normalize_repo_remote,
     normalize_task_code,
+    parse_iso_ts,
     quorum_check,
     record_run,
     task_summaries,
@@ -882,12 +883,8 @@ _TASK_SESSION_MATCH_WINDOW_SECONDS = 10 * 60
 
 
 def _parse_task_record_started(record: dict) -> datetime | None:
-    ts = record.get("ts")
-    if not isinstance(ts, str) or not ts:
-        return None
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
+    dt = parse_iso_ts(record.get("ts"))
+    if dt is None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -1195,10 +1192,8 @@ def _resolve_stat_since(since_arg: str | None, days: int) -> datetime | None | b
     on 3.9/3.10 while the identical value worked on 3.11+. Normalize the shorthand
     ourselves before parsing so the accepted syntax doesn't depend on the interpreter."""
     if since_arg:
-        normalized = since_arg[:-1] + "+00:00" if since_arg.endswith("Z") else since_arg
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
+        parsed = parse_iso_ts(since_arg)
+        if parsed is None:
             return False
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     if days <= 0:
