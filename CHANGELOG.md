@@ -3,6 +3,26 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.35.6 — 2026-09-05
+
+- **Opencode zai/glm stall watchdog + cooldown keyed by access method
+  (review-cli#153/#159/#179).** Opencode's `oc:zai/glm-5.2` agentic seat hangs
+  at ~0% CPU with zero output for the entire call when z.ai quota is
+  exhausted — no error, no partial answer, just silence until the idle
+  timeout eventually kills it after up to 20 minutes. A call from a
+  watchdog-scoped model (default: any model matching `zai/glm`, overridable
+  via `$REVIEW_OPENCODE_STALL_MODELS`) that produces zero output for
+  `$REVIEW_OPENCODE_STALL_SECONDS` (default 5 minutes) is now retried up to 3
+  total attempts; if every attempt stalls, the seat is cooled down so the next
+  `review` invocation skips the doomed dispatch entirely instead of paying for
+  another multi-minute stuck attempt.
+  - Folds in #187: the `seat_cooldown` store is now keyed by `(model,
+    access_method)` instead of `model` alone — `record_cooldown`/
+    `active_cooldown`/`clear_cooldown` all take a REQUIRED `access_method`
+    keyword, so a cooldown recorded from one transport (e.g. claude's CLI)
+    never shadows a different, independently-healthy one (claude's API route,
+    or opencode's separate route to the same underlying model/quota).
+
 ## 0.35.5 — 2026-09-05
 
 - **`review diff` board mode: print a visible STDOUT notice when the pool comes up
