@@ -865,6 +865,59 @@ def test_stale_stamp_diff_does_not_anchor_an_unrelated_change_after_commit():
         assert "have not been reviewed" in proc.stderr, proc.stderr
 
 
+def test_diff_binary_detection_mismatch_does_not_defeat_the_line_count():
+    """Opus round-4 finding (security / undercount -> gate bypass): git's OWN binary
+    check (the fail-closed pre-check above) scans the first ~8000 bytes of the BLOB and
+    decides "text" or "binary" by its own rule; the outer `diff -U0` (comparing the two
+    STORED diff texts) makes an INDEPENDENT binary determination on the diff text it was
+    handed. A NUL byte placed past git's own scan window can produce a diff `git diff
+    --cached` itself calls TEXT (no `Binary files` line -- the pre-check grep sees
+    nothing to reject) but that `diff -U0` still calls BINARY once it reads the resulting
+    diff TEXT containing that embedded NUL -- collapsing to a single "Binary files ...
+    differ" line instead of the normal two-header unified-diff shape a blind `tail -n +3`
+    assumed. Verified against the real `diff`/`git diff` on this machine before writing
+    this test (both binaries' actual behavior, not assumed): a >8000-byte text file with
+    a NUL placed only in the FOLLOW-UP edit (past git's own scan window) reproduces
+    exactly this split."""
+    with _isolated_repo() as repo:
+        hook = _install_hook(repo)
+        # >8000 bytes of plain ASCII text so a NUL added later, past that window, is
+        # invisible to git's own (blob-scanning) binary check.
+        base_content = "line" + ("x" * 8100) + "\n" + "\n".join(f"a{i}" for i in range(20))
+        (repo / "d.txt").write_text(base_content + "\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "d.txt"], check=True)
+        _commit_all(repo, "initial: >8000-byte text file")
+
+        _stage_baseline(repo)  # an unrelated reviewed baseline (a.py)
+
+        # Follow-up: a NUL embedded in a NEW line (past git's scan window) plus ~30
+        # more genuinely unreviewed lines -- git still calls this TEXT.
+        followup_lines = base_content.split("\n")
+        followup_lines.append("unrev\x00iewed")
+        followup_lines.extend(f"unrev{i}" for i in range(30))
+        (repo / "d.txt").write_text("\n".join(followup_lines) + "\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "d.txt"], check=True)
+        cur_diff_bytes = subprocess.run(
+            ["git", "diff", "--no-ext-diff", "--cached"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        ).stdout
+        assert b"Binary files" not in cur_diff_bytes, (
+            "test setup invalid: git itself must call this a TEXT diff"
+        )
+        assert b"\x00" in cur_diff_bytes, (
+            "test setup invalid: the NUL byte must reach the diff text"
+        )
+
+        proc = _run_hook(hook, repo, {"REVIEW_TRIVIAL_DELTA_LINES": "10"})
+        assert proc.returncode != 0, (
+            "a real ~30-line unreviewed change must BLOCK even when the inner `diff "
+            "-U0` binary-detects on an embedded NUL git itself calls text -- "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+
 if __name__ == "__main__":
     # Standalone runner (mirrors tests/test_review_marker.py / tests/smoke.py's expectations):
     # `python <file>` must exit 0 on success, non-zero on any failure.

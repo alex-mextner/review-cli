@@ -851,7 +851,23 @@ if [ "$threshold" -gt 0 ]; then
         if ! LC_ALL=C grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$baseline_tmp" "$cur_tmp" 2>/dev/null; then
           diff_out=$(diff -U0 "$baseline_tmp" "$cur_tmp" 2>/dev/null)
           diff_rc=$?
-          if [ "$diff_rc" -le 1 ]; then
+          # Opus round-4 finding (security / undercount -> gate bypass): git's OWN
+          # binary check (the fail-closed grep above) scans the first ~8000 bytes of
+          # the BLOB and decides per its own rules; this outer `diff -U0` makes an
+          # INDEPENDENT binary determination by scanning the DIFF TEXT it was just
+          # handed -- a different input, on a different threshold. A NUL byte placed
+          # past git's own scan window (or a `.gitattributes`-forced git-text file
+          # that still contains one) can therefore produce a diff git call TEXT but
+          # `diff -U0` calls BINARY -- collapsing to a single "Binary files ... differ"
+          # line instead of the expected two-header unified-diff shape. The blind
+          # `tail -n +3` below assumed that shape unconditionally and dropped this
+          # single line as if it were the two normal headers, leaving `content` EMPTY
+          # -- `changed=0` for a real, unreviewed, unbounded-size change. Must fail
+          # closed here instead, the same way the pre-check above already does for
+          # every OTHER unmeasurable-by-line-count shape.
+          case "$diff_out" in
+            "Binary files "*) : ;;
+            *)
             content=$(printf '%s\\n' "$diff_out" | tail -n +3 | LC_ALL=C grep -Ev '^[+-]( |@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
             added=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^+')
             removed=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^-')
@@ -860,7 +876,8 @@ if [ "$threshold" -gt 0 ]; then
             if [ "$changed" -le "$threshold" ] 2>/dev/null; then
               exit 0
             fi
-          fi
+            ;;
+          esac
         fi
       fi
     fi
