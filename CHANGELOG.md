@@ -3,6 +3,20 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.35.5 — 2026-09-05
+
+- **`review diff` board mode: print a visible STDOUT notice when the pool comes up
+  short of the requested size, naming every excluded seat + its unavailability
+  reason.** Before this, a seat unavailable BEFORE dispatch (missing CLI binary,
+  no auth, unpaid provider, …) that also had no healthy reserve to backfill it
+  silently shrank the pool with zero signal anywhere a human or agent would
+  actually see it — the existing `board: degraded` warning only covers a
+  different, rarer case (reserve exhausted mid-dispatch) and only prints to
+  stderr, which report-pasting workflows routinely drop. Root-caused 2026-08-28:
+  a review round reported as "reviewed via codex + Fable" gave no indication
+  that Opus/GLM were configured but missing. `_report_pool_shortfall` in
+  `reviewlib/modes/review.py`.
+
 ## 0.35.4 — 2026-09-05
 
 - **Stop the codex-backend self-reinvocation loop (review-cli#180).** A codex reviewer
@@ -63,18 +77,6 @@ semantic versioning.
   Every rerun command the notice (and the `--commit` refusals) print carries a
   `--task <CODE>` placeholder — a recorded review mode requires a task code, so a
   remediation without one failed at the first keystroke (Codex finding on #359).
-
-- **`review diff` board mode: print a visible STDOUT notice when the pool comes up
-  short of the requested size, naming every excluded seat + its unavailability
-  reason.** Before this, a seat unavailable BEFORE dispatch (missing CLI binary,
-  no auth, unpaid provider, …) that also had no healthy reserve to backfill it
-  silently shrank the pool with zero signal anywhere a human or agent would
-  actually see it — the existing `board: degraded` warning only covers a
-  different, rarer case (reserve exhausted mid-dispatch) and only prints to
-  stderr, which report-pasting workflows routinely drop. Root-caused 2026-08-28:
-  a review round reported as "reviewed via codex + Fable" gave no indication
-  that Opus/GLM were configured but missing. `_report_pool_shortfall` in
-  `reviewlib/modes/review.py`.
 
 ## 0.35.3 — 2026-09-05
 
