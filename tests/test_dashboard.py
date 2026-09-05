@@ -147,6 +147,383 @@ def test_parse_call_log_basic():
         assert c.has_error is False
 
 
+def test_parse_call_log_body_is_capped_for_a_huge_output():
+    """review-cli#326: CallLog kept the FULL streamed body for every one of ~132k calls
+    on a real install, ballooning the dashboard process to 32.8GB RSS. `has_error`/
+    `completed` are already documented as EXIT-code-authoritative (body-grepping is only
+    a legacy fallback for exit-code-less logs), so bounding what's RETAINED in `.body`
+    caps per-call memory without touching that classification logic. A call whose exit
+    code is present must classify correctly regardless of body size."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        huge_body = "line of real review output\n" * 200_000  # ~5.4MB on disk
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, huge_body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(huge_body), (
+            "the stored body must be bounded, not the full multi-MB text"
+        )
+        assert (
+            len(c.body) <= p.CALL_BODY_STORE_CAP + 200
+        )  # + slack for markers stripped
+        assert c.completed is True
+        assert c.has_error is False, (
+            "exit_code=0 is authoritative regardless of body size/truncation"
+        )
+
+
+def test_parse_call_log_body_cap_bounds_real_retained_memory_for_a_single_astral_char():
+    """review-cli#326 round 4 (codex P1): an encoded-UTF-8-byte-length check (an
+    earlier version of this test) is NOT the same guarantee as bounding the actual
+    retained Python object's memory. CPython's PEP 393 string representation stores
+    the WHOLE string at up to 4 bytes/char once even ONE astral-plane character (an
+    emoji) is present anywhere in it, regardless of how many bytes that string encodes
+    to -- codex concretely reproduced ~262KB retained (4x the 64KB byte cap) from a
+    single retained astral character with an otherwise-ASCII body. `_cap_body` now
+    caps CHARACTER count at a quarter of the byte budget (`_CAP_CHARS`), which bounds
+    `sys.getsizeof()` -- the metric that actually matters -- regardless of script mix."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # codex's own repro shape: one astral character (forces 4-byte/char storage
+        # for the WHOLE string) plus a large ASCII body.
+        huge_body = "😀" + ("a" * 200_000)
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, huge_body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        retained_bytes = sys.getsizeof(c.body)
+        assert retained_bytes <= p.CALL_BODY_STORE_CAP + 512, (
+            f"retained body object is {retained_bytes} bytes -- a single astral "
+            "character anywhere in the body must not blow the memory cap"
+        )
+
+
+def test_parse_call_log_oversized_empty_call_stays_empty_after_capping():
+    """review-cli#326 round 5 (codex P1): `_cap_body` inserts a human-readable
+    truncation marker line into the retained `body`. `_body_has_real_content` (which
+    decides HEALTH_EMPTY vs HEALTH_OK for an EXIT-0 call) must not mistake that marker
+    for real review prose -- a genuinely empty call (all `[review-cli]` framing plus a
+    zero usage line, no real content) that happens to be huge enough to get capped
+    must still classify as HEALTH_EMPTY, not flip to HEALTH_OK just because it was
+    long enough to trigger the cap."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # All framing/usage lines, no real prose -- well past the cap, so capping
+        # definitely fires and the marker line lands in the retained body.
+        body = ("[review-cli] framing line\n" * 2000) + "output_tokens=0\n"
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(body), "sanity check: capping actually fired"
+        assert p.classify_call(c) == p.HEALTH_EMPTY, (
+            "the cap marker line must not be counted as real content"
+        )
+
+
+def test_parse_call_log_oversized_single_line_framing_body_stays_empty():
+    """review-cli#326 round 6 (codex P1 reproduction, two rounds): a body that is ONE
+    giant `[review-cli] ...` framing line, far past the cap, has no newline for
+    `_cap_body`'s slices to anchor on -- an intermediate version of this fix had
+    `_cap_body` drop the un-anchored fragment to avoid it being misread as content,
+    which fixed THIS case but broke the mirror case (see the sibling test below).
+    The real fix: `has_real_content` is computed ONCE from the FULL, uncapped body in
+    `_classify_from_full_text` (same as the other six classification fields), so
+    `_cap_body`'s exact boundary behavior no longer matters for correctness at all --
+    only for what gets shown for display."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = "[review-cli] " + ("x" * 40_000)  # one line, no newlines anywhere
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(body), "sanity check: capping actually fired"
+        assert p.classify_call(c) == p.HEALTH_EMPTY, (
+            "an oversized single-line framing body must not misclassify as HEALTH_OK"
+        )
+
+
+def test_parse_call_log_oversized_single_line_real_verdict_stays_ok():
+    """review-cli#326 round 6 (codex P1, second reproduction): the MIRROR of the test
+    above. A body that is ONE giant line of REAL review prose (no `[review-cli]`
+    framing prefix, no newlines anywhere) must still classify as HEALTH_OK even though
+    `_cap_body` retains almost none of it for display -- `has_real_content` is computed
+    from the FULL body before any capping, so it is unaffected by how little (or how
+    ragged) the displayed `body` ends up being."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = "Looks correct, no further findings. " + ("x" * 40_000)
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(body), "sanity check: capping actually fired"
+        assert p.classify_call(c) == p.HEALTH_OK, (
+            "an oversized single-line real verdict must not misclassify as "
+            "HEALTH_EMPTY just because capping left little/no recognizable content "
+            "in the DISPLAYED body"
+        )
+
+
+def test_parse_call_log_legacy_error_marker_near_start_survives_truncation():
+    """The legacy (no exit-code footer) error-detection fallback still finds a marker
+    that appears early in a huge body -- the common real-world shape (an error message
+    up front, followed by verbose tool output) -- even after the size cap is applied."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = "error: not available\n" + ("filler output line\n" * 200_000)
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) <= p.CALL_BODY_STORE_CAP + 200
+        assert c.has_error is True
+        assert c.error_summary and "error: not available" in c.error_summary
+
+
+def test_parse_call_log_legacy_error_marker_near_end_survives_truncation():
+    """Mirrors the near-start test for the other headline motivation in `_cap_body`'s
+    comment: 'crash at the tail of a long run'. The marker sits in the final ~32KB
+    (`text[-half:]`), which the head+tail split must retain."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = ("filler output line\n" * 200_000) + "error: not available\n"
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) <= p.CALL_BODY_STORE_CAP + 200
+        assert "error: not available" in c.body, (
+            "the tail half must retain the marker, not just detect it blindly"
+        )
+        assert c.has_error is True, (
+            "_looks_like_error scans the whole (capped) body, so a tail marker "
+            "is still detected -- error_summary's own first-non-blank-line pick "
+            "is a separate, pre-existing display heuristic not covered here"
+        )
+
+
+def test_parse_call_log_legacy_error_marker_in_middle_is_still_detected():
+    """review-cli#326 round 2 (codex reproduction): a legacy log with no EXIT footer
+    whose ONLY error marker falls strictly between the retained head and tail halves
+    used to flip `has_error` True->False after capping -- classification is now
+    computed ONCE from the FULL untruncated text in `parse_call_log`, before
+    `_cap_body` ever runs, so a middle-only marker is still correctly detected even
+    though it does not survive into the (capped) `body` kept for display."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + "error: not available\n" + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert "error: not available" not in c.body, (
+            "sanity check: the marker really did land in the truncated-away middle"
+        )
+        assert c.completed is True
+        assert c.has_error is True, (
+            "classification runs on the full body before capping, so a middle-only "
+            "marker in a footerless legacy log is still caught"
+        )
+
+
+def test_parse_call_log_paywall_sentinel_in_middle_is_still_detected():
+    """Sibling of the error-marker case above, for the paywall sentinel: a codex call
+    can stream a long transcript and only hit the sentinel deep in the body (see
+    `_has_paywall_sentinel`'s own docstring) -- past the retained head+tail, that must
+    still classify as HEALTH_PAYWALL, not silently fall back to ok/error."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + "currently unavailable\n" + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert "currently unavailable" not in c.body, (
+            "sanity check: the sentinel really did land in the truncated-away middle"
+        )
+        assert c.is_paywall is True
+        assert p.classify_call(c) == p.HEALTH_PAYWALL
+
+
+def test_parse_call_log_cf_block_marker_in_middle_is_still_detected():
+    """review-cli#326 round 4 (Opus missing-test finding): same middle-truncation
+    class as the error-marker/paywall tests above, but for `_CF_BLOCK_MARKER` --
+    `is_cf_blocked` is computed from the FULL body/stderr in `_classify_from_full_text`,
+    so a marker that only survives in the omitted middle must still be caught."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + "error code: 1010\n" + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert "error code: 1010" not in c.body, (
+            "sanity check: the marker really did land in the truncated-away middle"
+        )
+        assert c.is_cf_blocked is True
+        assert p.classify_call(c) == p.HEALTH_BLOCKED
+
+
+def test_parse_call_log_bad_key_marker_in_middle_is_still_detected():
+    """Sibling of the CF-block test above, for `_BAD_KEY_MARKER`."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + '{"error":"bad key"}\n' + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert '{"error":"bad key"}' not in c.body, (
+            "sanity check: the marker really did land in the truncated-away middle"
+        )
+        assert c.is_bad_key is True
+        assert p.classify_call(c) == p.HEALTH_AUTH
+
+
+def test_parse_call_log_huge_stderr_is_capped_too():
+    """review-cli#326 review finding (Opus + Codex, round 1): stderr_lines was the same
+    unbounded-retention bug as body, just through a different field -- a chatty backend
+    dumping megabytes to stderr must not reproduce the RSS blowup this fix exists for."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        stderr_block = "".join(
+            f"[stderr] boom {i}\n" for i in range(200_000)
+        )  # several MB
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, stderr_block + "ok\n"
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        total_stderr = "\n".join(c.stderr_lines)
+        assert len(total_stderr) <= p.CALL_BODY_STORE_CAP + 200
+        assert c.stderr_lines[0] == "boom 0", (
+            "first line still usable for error_summary"
+        )
+        assert c.has_error is True
+
+
+def test_parse_call_log_many_near_empty_stderr_lines_caps_line_count_too():
+    """review-cli#326 round 3 (codex P1): byte-capping alone isn't enough -- a backend
+    emitting tens of thousands of SHORT `[stderr]` lines produces a byte-capped ~64KiB
+    string that still explodes into tens of thousands of separate `str` objects once
+    split back into a list, each one costing real interpreter overhead well beyond its
+    own bytes. `_cap_stderr_lines` must bound the LINE COUNT independently of bytes."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # 300,000 near-empty stderr lines: byte-cheap (~2.4MB raw) but line-count-huge.
+        stderr_block = "".join(f"[stderr] {i}\n" for i in range(300_000))
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, stderr_block + "ok\n"
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.stderr_lines) <= p.CALL_STDERR_LINE_CAP + 1, (
+            "line count must be bounded independently of the byte cap"
+        )
+        assert c.stderr_lines[0] == "0"
+        assert c.has_error is True
+
+
+def test_direct_construction_auto_classifies_from_body():
+    """review-cli#326 round 3 (Fable finding 3 / codex P2): a `CallLog` built directly
+    (a test fixture, any future non-`parse_call_log` constructor) with a paywall/
+    error-shaped body and no explicit classification kwargs must still classify
+    correctly -- matching what the removed `@property`s used to do. `None` is the
+    sentinel `__post_init__` uses to detect "caller left this unset" and auto-derive
+    from `self.body`/`self.stderr_lines`/etc.; passing an explicit value (as
+    `parse_call_log` always does, from the FULL untruncated text) skips it."""
+    from reviewlib.dashboard import parser as p
+
+    call = p.CallLog(
+        path="",
+        filename="x.log",
+        started=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="claude-p",
+        body="currently unavailable",
+        exit_code=0,
+    )
+    assert call.is_paywall is True
+    assert call.completed is True
+    assert call.is_cf_blocked is False, (
+        "auto-derivation fills in EVERY classification field, not just the ones "
+        "that happen to be truthy for this body"
+    )
+    assert p.classify_call(call) == p.HEALTH_PAYWALL
+
+    # ALL SEVEN explicit values are honored as-is, not overridden by auto-classification
+    # -- this is an all-or-nothing contract (round 4, Opus finding; extended to a
+    # seventh field in round 6): passing only SOME of the seven leaves the rest at the
+    # `None` sentinel, which re-triggers auto-derivation and overwrites the partial
+    # values too (see `__post_init__`).
+    healthy = p.CallLog(
+        path="",
+        filename="y.log",
+        started=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="claude-p",
+        body="currently unavailable",
+        exit_code=0,
+        is_paywall=False,
+        completed=True,
+        has_error=False,
+        is_cf_blocked=False,
+        is_bad_key=False,
+        has_real_content=True,
+    )
+    assert healthy.is_paywall is False
+
+    # A PARTIAL override (some but not all seven) is not honored -- it's treated as
+    # fully unset and re-derived from the body, overwriting the partial values too.
+    partial = p.CallLog(
+        path="",
+        filename="z.log",
+        started=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="claude-p",
+        body="currently unavailable",
+        exit_code=0,
+        is_paywall=False,  # would be overwritten -- the other five/six are unset
+    )
+    assert partial.is_paywall is True
+    assert p.classify_call(healthy) != p.HEALTH_PAYWALL
+
+
 def test_parse_call_log_task_code_and_dashboard_task_stats():
     from reviewlib.dashboard import parser as p
 
