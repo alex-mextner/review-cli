@@ -26,9 +26,11 @@ Design:
     C call or a non-daemon thread that a normal `sys.exit`/raise could not unwind. See
     `_fire` for the exact ordering and why nothing on that path may block the exit.
 """
+
 from __future__ import annotations
 
 import os
+import time
 import sys
 import threading
 from contextlib import contextmanager
@@ -94,7 +96,9 @@ def _fire(seconds: int, stream) -> None:
     # Deadman FIRST: a daemon timer that hard-exits even if everything below wedges
     # (e.g. the announce blocks on a full stderr pipe, or a reap hangs). os._exit in a
     # timer thread terminates the whole process.
-    deadman = threading.Timer(_DEADMAN_GRACE_SECONDS, os._exit, args=(BACKSTOP_EXIT_CODE,))
+    deadman = threading.Timer(
+        _DEADMAN_GRACE_SECONDS, os._exit, args=(BACKSTOP_EXIT_CODE,)
+    )
     deadman.daemon = True
     deadman.start()
     # Reap live backend subprocesses (their own session groups) so a wedged run's backends
@@ -125,6 +129,28 @@ def _fire(seconds: int, stream) -> None:
         sweep_pending_teardowns()
     except Exception:  # noqa: BLE001 — best-effort; the deadman + os._exit are the guarantee
         pass
+    # If THIS process is a detached `--detach` job's child (review-cli#160 companion;
+    # `$REVIEW_JOB_ID` is only set by `_spawn_detached_job`'s child env), record its
+    # terminal status BEFORE the `os._exit` below — that exit bypasses every `finally`/
+    # `atexit`, including `cli.main`'s own job-finalization wrapper, so without this a
+    # backstop-killed detached job would never get its OWN terminal status/exit code
+    # recorded; `review status`/`wait` would only ever see it reconciled to the generic
+    # "unknown-terminated" once the pid disappears, losing the specific 124 (codex
+    # review). Best-effort like every other step here: a job record we can't write must
+    # never block the guaranteed exit.
+    try:
+        job_id = os.environ.get("REVIEW_JOB_ID")
+        if job_id:
+            from . import jobs
+
+            jobs.write_job(
+                job_id,
+                status="failed",
+                exit_code=BACKSTOP_EXIT_CODE,
+                finished_at=time.time(),
+            )
+    except Exception:  # noqa: BLE001 — best-effort; the deadman + os._exit are the guarantee
+        pass
     # Announce LAST among the fallible steps: a full undrained stderr pipe could block this
     # print, but children + the qa env are already reaped and the deadman guarantees the exit.
     try:
@@ -151,7 +177,11 @@ def run_backstop(seconds: int | None = None, *, stream=None) -> Iterator[None]:
     the process alive on its own. Re-entrant-safe enough for the single top-level
     `main()` use it is built for.
     """
-    secs = backstop_seconds() if seconds is None else max(1, min(int(seconds), MAX_BACKSTOP_SECONDS))
+    secs = (
+        backstop_seconds()
+        if seconds is None
+        else max(1, min(int(seconds), MAX_BACKSTOP_SECONDS))
+    )
     out = stream if stream is not None else sys.stderr
     timer = threading.Timer(secs, _fire, args=(secs, out))
     timer.daemon = True

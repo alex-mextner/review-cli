@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -291,12 +292,40 @@ def _reregister_child(
     return new
 
 
+def register_external_child(
+    proc: subprocess.Popen, pgid: int | None = None
+) -> tuple[subprocess.Popen, int | None]:
+    """Public wrapper around `_register_child` for callers OUTSIDE this module's own
+    `_run_streamed` — the `reviewlib.qa` harnesses (`web_harness.py`, `bot_harness.py`,
+    `ext_harness.py`) each `Popen(..., start_new_session=True)` a SUT process the exact
+    same way a backend child is spawned, but were never added to `_LIVE_CHILDREN` — so
+    an external SIGTERM (or the internal backstop) reaped only model-backend children
+    and left the isolated SUT process group behind (codex review, review-cli#162
+    follow-up). `pgid` defaults to `proc.pid` (the session/group leader's pid, since
+    `start_new_session=True` always makes the child its own group leader) — the same
+    convention `_run_streamed` uses when its own `os.getpgid()` lookup is skipped.
+    Callers MUST pass the returned handle to `unregister_external_child` in a
+    `finally` once the process is reaped through its own normal teardown path."""
+    if pgid is None:
+        pgid = proc.pid
+    return _register_child(proc, pgid)
+
+
+def unregister_external_child(handle: tuple[subprocess.Popen, int | None]) -> None:
+    """Public wrapper around `_unregister_child` — see `register_external_child`."""
+    _unregister_child(handle)
+
+
 def kill_live_children() -> None:
     """Reap every still-registered backend child's process group. Best-effort, never
-    raises — called from the backstop's `_fire` right before its hard exit so a wedged
-    run's backend subprocesses don't outlive the force-terminated CLI. Each child is in
-    its own session, so this kills the backends WITHOUT touching the CLI's/caller's
-    group.
+    raises — called from the backstop's `_fire` right before its hard exit, AND from
+    `install_signal_reaper`'s SIGTERM/SIGINT handler, so a wedged/killed run's backend
+    subprocesses don't outlive the terminated CLI. Each child is in its own session, so
+    this kills the backends WITHOUT touching the CLI's/caller's group.
+
+    Also reaps any EXTERNALLY registered child (see `register_external_child`) — the
+    `reviewlib.qa` harnesses' SUT processes are registered the same way and torn down
+    by this same best-effort sweep.
 
     KILL-FIRST, never blocking. Unlike `_kill_tree` (the per-call path, which politely
     SIGTERMs then waits up to 3s before SIGKILL — the right etiquette for a normal
@@ -306,9 +335,33 @@ def kill_live_children() -> None:
     before later children are reached or before SIGKILL even lands, leaving a wedged
     backend alive (codex P2). SIGKILL is uncatchable, so no grace is needed anyway — the
     whole reap is a handful of non-blocking signals that complete in microseconds and
-    cannot be preempted."""
-    with _LIVE_CHILDREN_LOCK:
-        snapshot = list(_LIVE_CHILDREN)
+    cannot be preempted.
+
+    The snapshot read is lock-guarded with a SHORT TIMEOUT, not an unbounded `with
+    _LIVE_CHILDREN_LOCK:` (codex review, review-cli#160 follow-up). Reason: since
+    `install_signal_reaper`'s handler runs this on the MAIN thread — signal handlers in
+    CPython always execute there regardless of which thread the signal targets — a
+    signal that lands while the MAIN thread itself is inside `_register_child`/
+    `_reregister_child`/`_unregister_child`'s critical section (any call path where
+    `_run_streamed` runs synchronously on the main thread, e.g. a single-seat `--pool 1`
+    or non-panel call, not routed through the panel's ThreadPoolExecutor workers) would
+    otherwise try to re-acquire that SAME non-reentrant lock from within itself — an
+    unconditional `with _LIVE_CHILDREN_LOCK:` deadlocks FOREVER in exactly that window,
+    which defeats the entire point of this reaper (the process can no longer die at
+    all). A bounded `acquire(timeout=...)` caps the wait; if it can't get the lock in
+    time we fall back to an unlocked, best-effort read of `_LIVE_CHILDREN` (wrapped
+    against the rare `RuntimeError: set changed size during iteration` a concurrent
+    mutation can raise) rather than hang — a stale/partial snapshot here is far better
+    than never reaping and never exiting."""
+    got_lock = _LIVE_CHILDREN_LOCK.acquire(timeout=0.5)
+    try:
+        try:
+            snapshot = list(_LIVE_CHILDREN)
+        except RuntimeError:
+            snapshot = []
+    finally:
+        if got_lock:
+            _LIVE_CHILDREN_LOCK.release()
     for proc, pgid in snapshot:
         try:
             if pgid is not None:
@@ -319,6 +372,88 @@ def kill_live_children() -> None:
             pass
         except Exception:  # noqa: BLE001 — best-effort; reaping must never block the exit
             pass
+
+
+_SIGNAL_REAPER_LOCK = threading.Lock()
+_signal_reaper_installed = False
+
+
+def install_signal_reaper() -> None:
+    """Make an external SIGTERM/SIGINT to THIS process reap every live backend child
+    before the process dies (review-cli#160).
+
+    Gap this closes: `run_backstop` (reviewlib.backstop) only bounds a run that wedges
+    INSIDE its own logic — its watchdog fires from a live, running interpreter and can
+    call `kill_live_children()` on the way to its `os._exit`. But an EXTERNAL signal
+    (an agent's shell `kill <pid>`, a harness that SIGTERMs a Bash-tool timeout, or a
+    plain Ctrl-C) is delivered straight to the OS. Python's default SIGTERM disposition
+    is immediate process termination with NO interpreter code run at all — no
+    `finally`, no `atexit` — so `_run_streamed`'s own `finally: _kill_tree(...)` never
+    executes. Each backend child was started via `start_new_session=True` specifically
+    so `_kill_tree` could bound its whole process-group tree; that same isolation means
+    the child is in a DIFFERENT session from `review`, so the external signal never
+    reaches it either. The result: the child (and any grandchildren) reparent to init
+    (ppid=1) and run unbounded — exactly the `claude-opus-4-8`/`opencode` orphans this
+    issue reports (observed alive 3.5h+ after their `review` run had already exited).
+
+    Fix: install a handler for SIGTERM and SIGINT that calls `kill_live_children()`
+    (the same best-effort, non-blocking, whole-process-group reap the internal
+    backstop uses) and then CHAINS to whatever handler was ALREADY installed for that
+    signal before this call — never a blind `SIG_DFL` + re-kill. This matters because
+    SIGINT's pre-existing disposition is virtually never `SIG_DFL`: Python installs
+    `signal.default_int_handler` (which raises `KeyboardInterrupt`) as its own default
+    long before any of our code runs. The persistent SERVER subcommands (`dashboard`,
+    `spec-web`) rely on exactly that — Ctrl-C raising `KeyboardInterrupt` so their own
+    `try/except` can shut down gracefully (flush state, close sockets). An earlier
+    version of this handler unconditionally reset to `SIG_DFL` and re-signaled itself,
+    which for SIGINT means the process dies from the RAW signal instead of raising
+    `KeyboardInterrupt` — silently skipping every server's graceful-shutdown path
+    (codex review). Chaining to whatever was there before preserves that: for SIGINT
+    the previous handler is `default_int_handler` (or a REPL's own handler under
+    pytest/IPython), which we simply call after reaping — the exact same
+    `KeyboardInterrupt` still gets raised, servers still shut down gracefully, and the
+    reap now *additionally* happens first. Only when the previous disposition is NOT a
+    Python callable (`SIG_DFL`/`SIG_IGN` — SIGTERM's normal starting point, since Python
+    does not install its own SIGTERM handler) do we fall back to restore-default +
+    re-kill, which is the only way to reproduce "the process actually dies from this
+    signal" when there is no callable to chain to. Idempotent and safe to call more
+    than once (e.g. a test process invoking `main()` repeatedly in-process) — each call
+    simply re-registers the same handler for that signal (the previous-handler capture
+    only happens on the FIRST call, so re-installing never chains to itself). Must run
+    on the main thread (`signal.signal` requirement); `main()` in `cli.py` is always
+    the process's main thread.
+    """
+    global _signal_reaper_installed
+    with _SIGNAL_REAPER_LOCK:
+        if _signal_reaper_installed:
+            return
+        _signal_reaper_installed = True
+
+    prev_handlers: dict[int, object] = {
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+    }
+
+    def _handler(signum: int, frame: object) -> None:
+        try:
+            kill_live_children()
+        finally:
+            prev = prev_handlers.get(signum)
+            if callable(prev):
+                # Preserve whatever the previous disposition actually DID (e.g. Python's
+                # own `default_int_handler` raising KeyboardInterrupt for SIGINT) — the
+                # reap above just runs first.
+                prev(signum, frame)
+            else:
+                # No callable to chain to (SIGTERM's normal SIG_DFL starting point, or an
+                # explicit SIG_IGN): the only way to make the process actually die FROM
+                # this signal (correct 128+signum exit status) is to restore the default
+                # disposition and re-deliver it to ourselves.
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
 
 
 def _run(
@@ -427,6 +562,78 @@ def _path_belongs_to(raw: str, git_dir: Path) -> bool:
     return False
 
 
+def probe_writable_dir(path: Path) -> bool:
+    """True iff a real file can be created and removed under `path` right now — the
+    only reliable writability test. Existence, or `mkdir(..., exist_ok=True)`
+    succeeding, says NOTHING about permission on a directory that already existed: a
+    leftover from an earlier unsandboxed run (or a stale root-owned directory) passes
+    both silently while every actual write inside it still fails (codex review,
+    review-cli#162 follow-up — this is the one shared choke point every "is this
+    standard location usable" decision in this module and `jobs.py` funnels through,
+    so the check is never duplicated ad hoc at each call site)."""
+    probe = path / f".write-probe-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        fd = os.open(str(probe), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+    except OSError:
+        return False
+    try:
+        probe.unlink()
+    except OSError:
+        pass
+    return True
+
+
+# Memoizes the LAST-tier (`tempfile.mkdtemp()`) branch of `_fallback_log_dir` for the
+# life of this process. `mkdtemp()` mints a brand-new, uniquely-named directory on
+# EVERY call by design — without caching, each of the many `log_dir()` calls a single
+# `review` invocation makes (one per backend round) would land in a DIFFERENT
+# directory, scattering one run's logs across several temp dirs with no way to find
+# them all (codex review, review-cli#162 follow-up). The FIXED uid-keyed first tier
+# needs no such cache — it already returns the same path every call by construction.
+_fallback_log_dir_cache: Path | None = None
+
+
+def _fallback_log_dir() -> Path:
+    """A guaranteed-writable fallback used when the OS-standard log location can't be
+    created (review-cli#162): a SANDBOXED caller (an agent harness's restricted Bash
+    tool, a locked-down CI runner) commonly grants writes only under the system temp
+    dir, not under `~/Library/Logs` or `$XDG_STATE_HOME` — those live outside most
+    sandbox profiles' default allow-list. Under `tempfile.gettempdir()`, keyed by uid so
+    a shared multi-user box doesn't collide different users into one directory.
+
+    Two-tier: the FIXED uid-keyed path is preferred (stable across calls in the same
+    run — an external `tail -f` can follow it), but if it can't be created OR — same
+    "exists but not actually writable" trap `probe_writable_dir` exists for — already
+    exists as a stale, unwritable leftover, `tempfile.mkdtemp()` gets a brand-new,
+    guaranteed-unique directory under the same temp root instead (codex review,
+    review-cli#162 follow-up: the mkdir-only version silently kept returning the stale
+    unwritable path, and a separate version that only caught mkdir's own OSError still
+    raised uncaught when `_open_log_with_fallback`'s open of a file inside it failed
+    for a REASON OTHER than the standard PermissionError). The mkdtemp branch is
+    memoized in `_fallback_log_dir_cache` (see its docstring) so repeat calls within
+    the same process converge on ONE directory instead of scattering across many."""
+    global _fallback_log_dir_cache
+    if _fallback_log_dir_cache is not None and _fallback_log_dir_cache.is_dir():
+        return _fallback_log_dir_cache
+
+    import tempfile
+
+    base = Path(tempfile.gettempdir()) / f"review-cli-logs-{os.getuid()}"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        if not probe_writable_dir(base):
+            raise OSError(f"{base} exists but is not writable")
+    except OSError:
+        base = Path(tempfile.mkdtemp(prefix="review-cli-logs-"))
+        _fallback_log_dir_cache = base
+    try:
+        base.chmod(0o700)
+    except OSError:
+        pass
+    return base
+
+
 def log_dir() -> Path:
     """Predictable dir for per-call live logs (and the brainstorm discussion log)
     that an external `tail -f` can watch.
@@ -437,6 +644,18 @@ def log_dir() -> Path:
     Logs are state, not throwaway cache, so on Linux they live under XDG_STATE_HOME
     rather than the cache dir. Created private (0700) because logs persist reviewed
     prompts/diffs (possibly secrets).
+
+    If the standard location can't be CREATED (review-cli#162: a sandboxed caller
+    denies writes outside its allowed roots — observed live as a Fable/claude-p seat
+    dying with a raw `PermissionError`/"Operation not permitted" from deep inside
+    `_run_streamed`, since `_open_log` calls this before the backend subprocess is even
+    spawned), fall back to a writable temp dir (`_fallback_log_dir`) with a loud
+    stderr line, rather than letting the whole seat crash over an inability to persist
+    its OWN transcript log — a nice-to-have artifact, not the review itself. Every
+    seat hits the identical code path here regardless of backend (opus/codex/fable all
+    call `_open_log` -> `log_dir`), so this is not actually fable-specific; fable is
+    simply the slowest seat (commonly ~15 minutes) and so the most likely to still be
+    running when a time-scoped sandbox grant (if that is the trigger) has narrowed.
     """
     override = os.environ.get("REVIEW_LOG_DIR")
     if override:
@@ -452,12 +671,119 @@ def log_dir() -> Path:
             else (Path.home() / ".local" / "state")
         )
         base = root / "review-cli" / "logs"
-    base.mkdir(parents=True, exist_ok=True)
+    reason: OSError | None = None
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        reason = exc
+    # Mirrors `jobs.jobs_dir()`'s identical fix (codex review, review-cli#162
+    # follow-up): `mkdir(..., exist_ok=True)` succeeding only means the directory
+    # EXISTS, not that THIS caller can write to it. Without this probe, `log_dir()`
+    # reported the standard location as usable while `_open_log_with_fallback()`'s own
+    # per-file open then (correctly) fell back elsewhere — the two disagreed on where
+    # a log actually lands, so a consumer that lists logs via `log_dir()` (the
+    # dashboard, `review sessions`) never finds the ones a fallback-affected run
+    # actually wrote.
+    if reason is None and not probe_writable_dir(base):
+        reason = OSError(f"{base} exists but is not writable")
+    if reason is not None:
+        print(
+            f"[review-cli] cannot create/write log dir {base} ({reason}) — falling "
+            "back to a temp dir. This is usually a SANDBOXED caller denying writes "
+            "outside its allowed roots; disable the sandbox for the review call, or "
+            "set $REVIEW_LOG_DIR to a path the sandbox allows, to use the real "
+            "location.",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            return _fallback_log_dir()
+        except OSError as fallback_exc:
+            # The genuinely-extreme case (codex review, review-cli#162 follow-up:
+            # observed live during this very review run): the system temp root
+            # itself is unusable, so even `_fallback_log_dir()`'s own two-tier
+            # fallback raises. `log_dir()` must still return SOME path rather than
+            # propagate — callers upstream of `_open_log_with_fallback` (which has
+            # its own devnull last resort for the actual FILE open) resolve a path
+            # from this function directly and have no other safety net. The raw
+            # temp root, unadorned, is the last thing left to try.
+            print(
+                f"[review-cli] the temp-dir fallback also failed ({fallback_exc}) — "
+                "using the raw system temp root as an absolute last resort.",
+                file=sys.stderr,
+                flush=True,
+            )
+            import tempfile
+
+            return Path(tempfile.gettempdir())
     try:
         base.chmod(0o700)
     except OSError:
         pass
     return base
+
+
+# Default open flags for a per-call transcript log: write/create/truncate. Callers that
+# need the fd to also be READABLE (e.g. `cli._spawn_detached_job`'s spooled-stdin file,
+# which is written once then handed to the child as its stdin) pass O_RDWR instead —
+# see `_open_log_with_fallback`'s `flags` parameter.
+_LOG_OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+
+
+def _open_log_with_fallback(
+    path: Path, flags: int = _LOG_OPEN_FLAGS
+) -> tuple[int, Path]:
+    """Open `path` (0600, private — logs persist prompts/diffs that may carry secrets),
+    retrying under `_fallback_log_dir()` with the SAME filename if the open itself
+    fails, and as a last resort opening `os.devnull` if even the fallback directory
+    can't be written to (review-cli#162).
+
+    `log_dir()` already falls back when the DIRECTORY can't be created, but a sandboxed
+    caller can just as easily deny the FILE open even when the directory already exists
+    (e.g. `~/Library/Logs/review-cli` persists from earlier unsandboxed runs — no mkdir
+    is ever attempted, so `log_dir()`'s own fallback never triggers — yet a per-file
+    open still hits the sandbox's write deny-list). Every raw `os.open(...)` call in
+    this module for a PER-CALL log file goes through this helper so the fallback is
+    consistent regardless of which one fails; `write_retry_log`'s open is exempt
+    because it is already wrapped in its own best-effort `try/except OSError` at the
+    call site (a lost retry-event log must never break the review either way).
+
+    The `os.devnull` tier exists because `_fallback_log_dir()` itself can — in a
+    genuinely broken environment (the whole system temp root revoked) — still be
+    unwritable; the ONE hard invariant this helper exists to guarantee is that a
+    seat's log-open can NEVER raise and kill it before the backend subprocess is even
+    spawned (codex review, review-cli#162 follow-up: the earlier version let that
+    second-level OSError escape uncaught). `os.devnull` always exists and is opened
+    for write by any user on every platform this ships to.
+
+    Returns the open fd AND the path actually used, so a caller that reports the log
+    path to the user (or returns it, like `write_sidecar_log`) reports the real one."""
+    try:
+        fd = os.open(str(path), flags, 0o600)
+        return fd, path
+    except OSError as exc:
+        print(
+            f"[review-cli] cannot open log file {path} ({exc}) — falling back to a "
+            "temp dir. This is usually a SANDBOXED caller denying writes outside its "
+            "allowed roots; disable the sandbox for the review call, or set "
+            "$REVIEW_LOG_DIR to a path the sandbox allows, to use the real location.",
+            file=sys.stderr,
+            flush=True,
+        )
+    try:
+        fallback_path = _fallback_log_dir() / path.name
+        fd = os.open(str(fallback_path), flags, 0o600)
+        return fd, fallback_path
+    except OSError as exc:
+        print(
+            f"[review-cli] cannot open a fallback log file ({exc}) — giving up on "
+            "persisting this log; using os.devnull so the run still proceeds.",
+            file=sys.stderr,
+            flush=True,
+        )
+        devnull_path = Path(os.devnull)
+        fd = os.open(str(devnull_path), flags)
+        return fd, devnull_path
 
 
 def _safe_backend(backend: str) -> str:
@@ -562,7 +888,7 @@ def write_sidecar_log(
     """
     stamp = (started or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%S_%fZ")
     path = log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, path = _open_log_with_fallback(path)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(
             f"[review-cli] {_safe_log_header(backend)}: {_safe_log_header(argv0)} "
@@ -748,6 +1074,10 @@ def _run_streamed(
     callers like review_codex need no structural change.
     """
     path = _open_log(backend, round_no)
+    # Open (with the review-cli#162 fallback) BEFORE the announce line below, so a
+    # fallen-back path is what gets announced/logged everywhere else in this call —
+    # never the pre-fallback path the caller can't actually `tail -f`.
+    fd, path = _open_log_with_fallback(path)
     if announce:
         print(
             f"[review-cli] {backend} live log: {path} (tail -f to follow)",
@@ -789,8 +1119,9 @@ def _run_streamed(
     # (codex P2: an unanchored footer is unparsable). The header ends with "\n".
     log_tail = {"nl": True}
 
-    # Private file perms: logs persist prompts/diffs that may contain secrets.
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # `fd` (and possibly-fallen-back `path`) were already opened above, before the
+    # announce line — private file perms: logs persist prompts/diffs that may contain
+    # secrets.
     log_fh = os.fdopen(fd, "w", encoding="utf-8", buffering=1)  # line-buffered
     try:
         # Header records the backend + argv[0] only — NOT the full argv, which carries

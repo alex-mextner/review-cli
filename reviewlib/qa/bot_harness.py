@@ -43,6 +43,7 @@ real-looking ``TG_CHAT_ID`` is in the environment (the value that would target a
 a misconfigured run fails closed before it can leak. All chat ids used in injected updates are
 synthetic test ids in a reserved negative range.
 """
+
 from __future__ import annotations
 
 import json
@@ -58,6 +59,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..process import register_external_child, unregister_external_child
+
 # How much of the bot's stdout tail to retain in memory for a BLOCKED-report proof. The drain
 # thread keeps the OS pipe empty (so a chatty bot never blocks); we hold only the last few KiB,
 # which is plenty for a crash/traceback tail.
@@ -67,7 +70,12 @@ _OUTPUT_TAIL_BYTES = 16384
 # fixed so a suite author can address it, but unmistakably a TEST id — never a real chat.
 TEST_CHAT_ID = -1009999000001
 # The synthetic human "from" user that authors every injected update.
-TEST_FROM_USER = {"id": 424242, "is_bot": False, "first_name": "QA", "username": "qa_tester"}
+TEST_FROM_USER = {
+    "id": 424242,
+    "is_bot": False,
+    "first_name": "QA",
+    "username": "qa_tester",
+}
 
 # How long the bot has to make its FIRST outbound call against the fake (the capability
 # probe) before we declare TG_API_BASE unwired. Generous — a Node/Python bot's cold start +
@@ -78,7 +86,9 @@ _PROBE_TIMEOUT_S = float(os.environ.get("REVIEW_QA_BOT_PROBE_TIMEOUT_S", "30"))
 # then it sends). A case that produces no outbound within this window is a FAIL (the bot was
 # silent when the case expected a reply). Overridable via REVIEW_QA_BOT_RESPONSE_TIMEOUT_S so a
 # slow bot gets more room and a fast test suite can shrink it.
-_CASE_RESPONSE_TIMEOUT_S = float(os.environ.get("REVIEW_QA_BOT_RESPONSE_TIMEOUT_S", "15"))
+_CASE_RESPONSE_TIMEOUT_S = float(
+    os.environ.get("REVIEW_QA_BOT_RESPONSE_TIMEOUT_S", "15")
+)
 # A SILENT case (Expect-silent) only needs a SHORT window to confirm no reply — a bot that was
 # going to reply does so within a beat of receiving the update, so we don't pay the full
 # response timeout just to confirm silence. This keeps a suite full of silent cases fast.
@@ -134,7 +144,9 @@ def make_text_update(update_id: int, text: str, *, chat_id: int = TEST_CHAT_ID) 
     }
 
 
-def make_callback_update(update_id: int, data: str, *, chat_id: int = TEST_CHAT_ID) -> dict:
+def make_callback_update(
+    update_id: int, data: str, *, chat_id: int = TEST_CHAT_ID
+) -> dict:
     """A synthetic inbound callback-query update (a human tapping an inline button whose
     callback_data is ``data``) — the only faithful way to exercise a bot's button handlers."""
     return {
@@ -214,9 +226,13 @@ class FakeTelegram:
         with self._lock:
             if offset is not None and offset > self._delivered_offset:
                 self._delivered_offset = offset
-            return [u for u in self._updates if u["update_id"] >= self._delivered_offset]
+            return [
+                u for u in self._updates if u["update_id"] >= self._delivered_offset
+            ]
 
-    def _long_poll_updates(self, offset: int | None, client_timeout: float) -> list[dict]:
+    def _long_poll_updates(
+        self, offset: int | None, client_timeout: float
+    ) -> list[dict]:
         """The real ``getUpdates`` long-poll: return any pending updates immediately, else HOLD
         server-side until an update is injected OR a short capped timeout elapses, then return
         (possibly empty). This is what stops a real ``getUpdates?timeout=30`` poller from
@@ -224,7 +240,9 @@ class FakeTelegram:
         it, so it makes ONE request per hold window instead of thousands per second. The hold is
         clamped to ``_GET_UPDATES_HOLD_CAP_S`` so the driver stays responsive (it injects then
         waits for the reply on its own thread); a bot asking for less waits less."""
-        deadline = time.monotonic() + min(max(client_timeout, 0.0), _GET_UPDATES_HOLD_CAP_S)
+        deadline = time.monotonic() + min(
+            max(client_timeout, 0.0), _GET_UPDATES_HOLD_CAP_S
+        )
         while True:
             pending = self._drain_updates(offset)
             if pending or time.monotonic() >= deadline:
@@ -234,7 +252,9 @@ class FakeTelegram:
     # capture (the outbound "bot replying" side) --------------------------------------
     def _capture(self, method: str, payload: dict) -> None:
         with self._lock:
-            self.outbound.append(OutboundCall(method=method, payload=payload, at=time.monotonic()))
+            self.outbound.append(
+                OutboundCall(method=method, payload=payload, at=time.monotonic())
+            )
 
     def outbound_since(self, since: float) -> list[OutboundCall]:
         """Every captured outbound call AT OR AFTER monotonic time ``since`` — the per-case
@@ -259,7 +279,11 @@ class FakeTelegram:
         return self.outbound_since(since)
 
     def wait_until_satisfied(
-        self, since: float, *, predicate: Callable[[list[OutboundCall]], bool], timeout: float,
+        self,
+        since: float,
+        *,
+        predicate: Callable[[list[OutboundCall]], bool],
+        timeout: float,
     ) -> list[OutboundCall]:
         """Collect outbound calls at/after ``since`` until ``predicate`` is satisfied OR
         ``timeout`` expires, then return everything captured in the window.
@@ -284,12 +308,27 @@ class FakeTelegram:
 
 # Bot-API methods that produce an outbound call we CAPTURE (the bot replying). Anything else
 # (getUpdates / getMe / a webhook teardown) is handled as a benign stub.
-_CAPTURED_METHODS = frozenset({
-    "sendMessage", "sendPhoto", "sendDocument", "sendVoice", "sendAudio", "sendVideo",
-    "sendAnimation", "sendSticker", "sendDice", "sendChatAction", "answerCallbackQuery",
-    "editMessageText", "editMessageReplyMarkup", "editMessageCaption", "deleteMessage",
-    "answerInlineQuery", "sendMediaGroup",
-})
+_CAPTURED_METHODS = frozenset(
+    {
+        "sendMessage",
+        "sendPhoto",
+        "sendDocument",
+        "sendVoice",
+        "sendAudio",
+        "sendVideo",
+        "sendAnimation",
+        "sendSticker",
+        "sendDice",
+        "sendChatAction",
+        "answerCallbackQuery",
+        "editMessageText",
+        "editMessageReplyMarkup",
+        "editMessageCaption",
+        "deleteMessage",
+        "answerInlineQuery",
+        "sendMediaGroup",
+    }
+)
 
 
 def _make_handler(fake: FakeTelegram) -> type[BaseHTTPRequestHandler]:
@@ -438,9 +477,15 @@ def _benign_result(method: str) -> object:
     """The ``result`` for a non-captured handshake method. ``getMe`` returns a bot user;
     boolean methods (deleteWebhook / setMyCommands / close / logOut) return True."""
     if method == "getMe":
-        return {"id": 1, "is_bot": True, "first_name": "QA-bot", "username": "qa_bot",
-                "can_join_groups": True, "can_read_all_group_messages": False,
-                "supports_inline_queries": False}
+        return {
+            "id": 1,
+            "is_bot": True,
+            "first_name": "QA-bot",
+            "username": "qa_bot",
+            "can_join_groups": True,
+            "can_read_all_group_messages": False,
+            "supports_inline_queries": False,
+        }
     return True
 
 
@@ -486,12 +531,15 @@ class BotProcess:
     def __init__(self, proc: subprocess.Popen):
         self.proc = proc
         self._reaped = False
+        self._reaper_handle: tuple[subprocess.Popen, int | None] | None = None
         self._tail: deque[str] = deque()
         self._tail_len = 0
         self._tail_lock = threading.Lock()
         self._drain_thread: threading.Thread | None = None
         if proc.stdout is not None:
-            self._drain_thread = threading.Thread(target=self._drain_stdout, daemon=True)
+            self._drain_thread = threading.Thread(
+                target=self._drain_stdout, daemon=True
+            )
             self._drain_thread.start()
 
     def _drain_stdout(self) -> None:
@@ -527,6 +575,9 @@ class BotProcess:
             # The drain loop ends when the reaped bot closes stdout (EOF); join briefly so a
             # surviving child holding the pipe can't keep the thread alive past the run.
             self._drain_thread.join(timeout=2)
+        if self._reaper_handle is not None:
+            unregister_external_child(self._reaper_handle)
+            self._reaper_handle = None
 
 
 def _terminate_group(proc: subprocess.Popen) -> None:
@@ -608,11 +659,17 @@ def boot_bot(
     env.setdefault("BOT_TOKEN", "123456:hermetic-qa-test-token")
     env.setdefault("TG_BOT_TOKEN", env["BOT_TOKEN"])
     _refuse_real_telegram(env, exit_boot_failed=exit_boot_failed)
-    return _spawn_bot_process(command, cwd=cwd, env=env, exit_boot_failed=exit_boot_failed)
+    return _spawn_bot_process(
+        command, cwd=cwd, env=env, exit_boot_failed=exit_boot_failed
+    )
 
 
 def _spawn_bot_process(
-    command: list[str], *, cwd: Path, env: dict[str, str], exit_boot_failed: int,
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    exit_boot_failed: int,
 ) -> BotProcess:
     """Spawn ``command`` in its OWN process group (so the whole tree can be reaped), piping output
     into the bounded drain. Shared by ``boot_bot`` (the inbound SUT poller) and
@@ -620,15 +677,28 @@ def _spawn_bot_process(
     Raises ``BotHarnessError(exit_boot_failed)`` if the process cannot be launched."""
     try:
         proc = subprocess.Popen(  # noqa: S603 — command resolved from the SUT's own qa.yaml
-            command, cwd=str(cwd), env=env, start_new_session=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            command,
+            cwd=str(cwd),
+            env=env,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
     except (OSError, ValueError) as exc:
         raise BotHarnessError(
             f"could not launch the SUT bot {command!r} in {cwd}: {exc}",
             exit_code=exit_boot_failed,
         ) from exc
-    return BotProcess(proc=proc)
+    # Registered with the SAME signal-reaper/backstop registry a backend model child
+    # uses (codex review, review-cli#162 follow-up) — without this, an external
+    # SIGTERM/SIGINT (or the internal backstop) reaped only `_run_streamed`'s children
+    # and left this bot/poller process group behind, since `BotProcess.reap()`'s own
+    # teardown only runs from a live interpreter's normal control flow, not a signal.
+    handle = register_external_child(proc)
+    bot = BotProcess(proc=proc)
+    bot._reaper_handle = handle
+    return bot
 
 
 def _refuse_real_telegram(env: dict[str, str], *, exit_boot_failed: int) -> None:
@@ -687,7 +757,9 @@ _PROBE_UPDATE_ID = 900000001
 
 # How long the agent-side daemon has to create its readiness file (e.g. its hook socket) before the
 # first question is emitted. A cold bun/node daemon + first long-poll can take a few seconds.
-_DAEMON_READY_TIMEOUT_S = float(os.environ.get("REVIEW_QA_BOT_DAEMON_READY_TIMEOUT_S", "20"))
+_DAEMON_READY_TIMEOUT_S = float(
+    os.environ.get("REVIEW_QA_BOT_DAEMON_READY_TIMEOUT_S", "20")
+)
 # The fixed boot grace used when no ready_file is configured (a generic bridge bot whose readiness
 # signal the harness can't name): wait this long after boot before the first emit.
 _DAEMON_BOOT_GRACE_S = float(os.environ.get("REVIEW_QA_BOT_DAEMON_BOOT_GRACE_S", "3"))
@@ -726,7 +798,9 @@ def _reply_markup_dict(payload: dict) -> dict | None:
     form field. So decode a string value before inspecting it — else a perfectly valid inline-keyboard
     card posted via the form encoding would read as zero cards (and its ``Tap:`` labels as missing)."""
     markup = payload.get("reply_markup")
-    if isinstance(markup, (str, bytes)):  # str (form/multipart-text); bytes is a defensive belt
+    if isinstance(
+        markup, (str, bytes)
+    ):  # str (form/multipart-text); bytes is a defensive belt
         try:
             markup = json.loads(markup)
         except (ValueError, TypeError):
@@ -763,7 +837,10 @@ def card_button_data(card: OutboundCall, button_label: str) -> str | None:
     want = button_label.strip().lower()
     for row in markup.get("inline_keyboard", []):
         for btn in row:
-            if isinstance(btn, dict) and str(btn.get("text", "")).strip().lower() == want:
+            if (
+                isinstance(btn, dict)
+                and str(btn.get("text", "")).strip().lower() == want
+            ):
                 data = btn.get("callback_data")
                 return str(data) if data is not None else None
     return None
@@ -780,7 +857,9 @@ def card_button_labels(card: OutboundCall) -> list[str]:
     return labels
 
 
-def tap(fake: FakeTelegram, card: OutboundCall, button_label: str, *, from_id: int) -> bool:
+def tap(
+    fake: FakeTelegram, card: OutboundCall, button_label: str, *, from_id: int
+) -> bool:
     """Inject the user's TAP of the ``button_label`` button on ``card``: extract that button's
     ``callback_data`` and queue a synthetic ``callback_query`` from ``from_id``. Returns True when
     the button was found and the tap injected, False when ``card`` has no such button (the caller
@@ -815,6 +894,7 @@ class AskHandle:
     proc: subprocess.Popen
     _answer: str | None = None
     _read: bool = False
+    _reaper_handle: tuple[subprocess.Popen, int | None] | None = None
 
     def await_answer(self, *, timeout: float = _ANSWER_TIMEOUT_S) -> str | None:
         """Wait up to ``timeout`` for the hook client to EXIT and return its stdout (the answer the
@@ -838,6 +918,7 @@ class AskHandle:
                 pass
             self._answer = None
             return None
+        self._unregister()
         self._answer = (out or "").strip()
         return self._answer
 
@@ -845,15 +926,32 @@ class AskHandle:
         """SIGTERM->SIGKILL the hook client's whole process GROUP (it is spawned in its own session
         in ``emit_question``, so a forked child can't outlive it). Best-effort; never raises."""
         _terminate_group(self.proc)
+        self._unregister()
+
+    def _unregister(self) -> None:
+        """Drop this process from the signal-reaper registry once we know it's done (either
+        `_terminate`'s explicit kill, or a normal exit already observed by `await_answer`) —
+        idempotent, so it's safe to call from both paths (codex review, review-cli#162
+        follow-up: this hook client is spawned `start_new_session=True` exactly like the other
+        QA harness SUT processes, and was never registered at all before this fix)."""
+        if self._reaper_handle is not None:
+            unregister_external_child(self._reaper_handle)
+            self._reaper_handle = None
 
     def reap(self) -> None:
         """Kill the hook client if it is still running (guaranteed teardown). Never raises."""
         if self.proc.poll() is None:
             self._terminate()
+        else:
+            self._unregister()
 
 
 def emit_question(
-    *, ask_command: list[str], cwd: Path, env: dict[str, str], payload: str,
+    *,
+    ask_command: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    payload: str,
     exit_boot_failed: int = 1,
 ) -> AskHandle:
     """Run the hook client (``ask_command``) that emits ONE agent question: spawn it in its OWN
@@ -867,8 +965,14 @@ def emit_question(
     BLOCKED case with a stable exit class, never an uncaught ``OSError`` traceback."""
     try:
         proc = subprocess.Popen(  # noqa: S603 — ask_command resolved from the SUT's own qa.yaml
-            ask_command, cwd=str(cwd), env=env, start_new_session=True,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ask_command,
+            cwd=str(cwd),
+            env=env,
+            start_new_session=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
     except (OSError, ValueError, IndexError) as exc:
         # OSError/ValueError: a missing/typo'd binary or a bad argv. IndexError: an EMPTY argv
@@ -878,6 +982,15 @@ def emit_question(
             f"could not launch the agent-side hook client {ask_command!r} in {cwd}: {exc}",
             exit_code=exit_boot_failed,
         ) from exc
+    # Registered with the SAME signal-reaper/backstop registry a backend model child
+    # uses (codex review, review-cli#162 follow-up), and registered IMMEDIATELY after
+    # Popen — before the stdin write below, not after (codex review follow-up round
+    # 2): a hook client that doesn't drain its own stdin can block this process on
+    # `proc.stdin.write(payload)` for a large enough payload, and during that whole
+    # window an external SIGTERM/the backstop must already be able to find and reap
+    # it. This hook client is spawned `start_new_session=True` exactly like the other
+    # QA harness SUT processes but was never registered before this fix.
+    reaper_handle = register_external_child(proc)
     if proc.stdin is not None:
         try:
             proc.stdin.write(payload)
@@ -893,7 +1006,9 @@ def emit_question(
         # on every version — the fd is already closed at the OS level, which is what delivers EOF to
         # the hook client's ``sys.stdin.read()`` so it can proceed.
         proc.stdin = None
-    return AskHandle(proc=proc)
+    ask_handle = AskHandle(proc=proc)
+    ask_handle._reaper_handle = reaper_handle
+    return ask_handle
 
 
 def wait_for_file(target: Path, *, timeout: float) -> bool:
@@ -908,7 +1023,12 @@ def wait_for_file(target: Path, *, timeout: float) -> bool:
 
 
 def build_agent_env(
-    *, api_base: str, owner_id: int, token: str, config_dir: Path, home: Path,
+    *,
+    api_base: str,
+    owner_id: int,
+    token: str,
+    config_dir: Path,
+    home: Path,
     extra_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """The env SHARED by the agent-side daemon and the hook client (they must agree on the config
@@ -934,7 +1054,11 @@ def build_agent_env(
 
 
 def boot_agent_daemon(
-    *, command: list[str], cwd: Path, env: dict[str, str], exit_boot_failed: int,
+    *,
+    command: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    exit_boot_failed: int,
 ) -> BotProcess:
     """Boot the agent-side bridge DAEMON (the long-poller, e.g. ``tg-ctl run``) against the fake,
     using the harness-built ``env`` (see ``build_agent_env``). The hermetic guarantee is the
@@ -949,7 +1073,9 @@ def boot_agent_daemon(
             "bind 127.0.0.1 so the run stays hermetic.",
             exit_code=exit_boot_failed,
         )
-    return _spawn_bot_process(command, cwd=cwd, env=env, exit_boot_failed=exit_boot_failed)
+    return _spawn_bot_process(
+        command, cwd=cwd, env=env, exit_boot_failed=exit_boot_failed
+    )
 
 
 def _is_loopback(api_base: str) -> bool:

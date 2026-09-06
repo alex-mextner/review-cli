@@ -22,6 +22,7 @@ All deterministic: a stdlib HTTP fake + a stdlib-only subprocess daemon/hook-cli
 network, no token, no model. The waits are shrunk via REVIEW_QA_BOT_*_S so the suite runs in
 seconds. Runnable standalone (``python3 tests/test_qa_bot_agent_side.py``) or under pytest.
 """
+
 from __future__ import annotations
 
 import json
@@ -69,8 +70,8 @@ def test_parse_agent_case_question_with_tap():
 def test_parse_agent_case_permission_and_refire_zero_card():
     """Ask-permission sets the permission kind; a re-fire uses Expect-card: 0 with no Tap."""
     suite = (
-        "## Case: perm\nAsk-permission: {\"tool\": \"Bash\"}\nExpect-card: 1\nTap: Allow\n\n"
-        "## Case: refire\nAsk-question: {\"q\": \"Ship?\"}\nExpect-card: 0\nExpect-answer: Ship it\n"
+        '## Case: perm\nAsk-permission: {"tool": "Bash"}\nExpect-card: 1\nTap: Allow\n\n'
+        '## Case: refire\nAsk-question: {"q": "Ship?"}\nExpect-card: 0\nExpect-answer: Ship it\n'
     )
     perm, refire = bd.parse_agent_cases(suite)
     assert perm.kind == "permission" and perm.tap == "Allow"
@@ -84,7 +85,9 @@ def test_parse_agent_case_defaults_one_card_and_detects_suite():
     [case] = bd.parse_agent_cases(suite)
     assert case.expect_card == 1
     assert bd.suite_has_agent_directives(suite) is True
-    assert bd.suite_has_agent_directives("## Case: c\nSend: /start\nExpect: hi\n") is False
+    assert (
+        bd.suite_has_agent_directives("## Case: c\nSend: /start\nExpect: hi\n") is False
+    )
 
 
 def test_parse_agent_case_without_ask_is_not_runnable():
@@ -98,17 +101,22 @@ def test_config_agent_side_knobs_parse():
     """A sut.bot block with ask_command/seed/owner_id/sender_id/ready_file parses + is agent-side."""
     from reviewlib.qa.config import _bot_from
 
-    cfg = _bot_from({
-        "driver": "mock",
-        "command": ["bun", "tg-ctl", "run"],
-        "ask_command": ["bun", "tg-ctl", "ask", "--agent", "claude"],
-        "owner_id": 424242,
-        "sender_id": 999,
-        "ready_file": "{config_dir}/x.sock",
-        "seed": [{"path": "config/reg.json", "content": '[{"cwd": "{cwd}"}]'}],
-        "env": {"K": "v"},
-    }, Path("qa.yaml"))
-    assert cfg.is_agent_side and cfg.owner_id == 424242 and cfg.effective_sender_id == 999
+    cfg = _bot_from(
+        {
+            "driver": "mock",
+            "command": ["bun", "tg-ctl", "run"],
+            "ask_command": ["bun", "tg-ctl", "ask", "--agent", "claude"],
+            "owner_id": 424242,
+            "sender_id": 999,
+            "ready_file": "{config_dir}/x.sock",
+            "seed": [{"path": "config/reg.json", "content": '[{"cwd": "{cwd}"}]'}],
+            "env": {"K": "v"},
+        },
+        Path("qa.yaml"),
+    )
+    assert (
+        cfg.is_agent_side and cfg.owner_id == 424242 and cfg.effective_sender_id == 999
+    )
     assert cfg.ready_file == "{config_dir}/x.sock"
     assert cfg.seed == (SeedFile(path="config/reg.json", content='[{"cwd": "{cwd}"}]'),)
 
@@ -150,8 +158,14 @@ def test_config_opt_int_rejects_non_numeric_owner_id():
 
     try:
         _bot_from(
-            {"driver": "mock", "command": ["x"], "ask_command": ["y"], "owner_id": "abc"},
-            Path("qa.yaml"))
+            {
+                "driver": "mock",
+                "command": ["x"],
+                "ask_command": ["y"],
+                "owner_id": "abc",
+            },
+            Path("qa.yaml"),
+        )
         raise AssertionError("expected QaConfigError for a non-numeric owner_id")
     except QaConfigError as exc:
         assert "owner_id" in str(exc)
@@ -163,9 +177,9 @@ def test_bot_seed_from_rejects_bad_shapes():
     from reviewlib.qa.config import _bot_seed_from
 
     for bad, needle in (
-        ({"path": "x"}, "must be a list"),          # a mapping, not a list
-        ([42], "must be a mapping"),                  # an entry that is not a mapping
-        ([{"content": "x"}], "path is required"),    # an entry missing its path
+        ({"path": "x"}, "must be a list"),  # a mapping, not a list
+        ([42], "must be a mapping"),  # an entry that is not a mapping
+        ([{"content": "x"}], "path is required"),  # an entry missing its path
     ):
         try:
             _bot_seed_from(bad, Path("qa.yaml"))
@@ -188,7 +202,9 @@ def _card(text: str, buttons: list[list[str]]) -> bh.OutboundCall:
 def test_cards_captured_filters_inline_keyboard():
     """cards_captured keeps only outbound that carry an inline-button keyboard."""
     fake = bh.FakeTelegram()
-    fake.outbound.append(bh.OutboundCall("sendMessage", {"text": "plain"}, time.monotonic()))
+    fake.outbound.append(
+        bh.OutboundCall("sendMessage", {"text": "plain"}, time.monotonic())
+    )
     fake.outbound.append(_card("with buttons", [["A"], ["B"]]))
     cards = bh.cards_captured(fake)
     assert len(cards) == 1 and cards[0].payload["text"] == "with buttons"
@@ -199,10 +215,17 @@ def test_cards_captured_ignores_edits():
     else a bridge that edits its card after answering would false-FAIL the Expect-card: 0 re-fire."""
     fake = bh.FakeTelegram()
     fake.outbound.append(_card("posted", [["A"]]))
-    fake.outbound.append(bh.OutboundCall(
-        "editMessageReplyMarkup",
-        {"reply_markup": {"inline_keyboard": [[{"text": "A", "callback_data": "x"}]]}},
-        time.monotonic()))
+    fake.outbound.append(
+        bh.OutboundCall(
+            "editMessageReplyMarkup",
+            {
+                "reply_markup": {
+                    "inline_keyboard": [[{"text": "A", "callback_data": "x"}]]
+                }
+            },
+            time.monotonic(),
+        )
+    )
     assert len(bh.cards_captured(fake)) == 1  # only the sendMessage
 
 
@@ -210,12 +233,21 @@ def test_cards_captured_decodes_form_encoded_json_markup():
     """A bot posting via application/x-www-form-urlencoded leaves reply_markup as a JSON STRING (the
     fake's form decoder doesn't parse it). cards_captured + card_button_data must decode it, else a
     valid inline card reads as zero cards and its Tap: labels as missing."""
-    markup_json = json.dumps({"inline_keyboard": [[{"text": "Ship it", "callback_data": "cb:0"}]]})
+    markup_json = json.dumps(
+        {"inline_keyboard": [[{"text": "Ship it", "callback_data": "cb:0"}]]}
+    )
     fake = bh.FakeTelegram()
-    fake.outbound.append(bh.OutboundCall(
-        "sendMessage", {"chat_id": 1, "text": "q", "reply_markup": markup_json}, time.monotonic()))
+    fake.outbound.append(
+        bh.OutboundCall(
+            "sendMessage",
+            {"chat_id": 1, "text": "q", "reply_markup": markup_json},
+            time.monotonic(),
+        )
+    )
     cards = bh.cards_captured(fake)
-    assert len(cards) == 1, "a form-encoded (JSON-string) reply_markup must still count as a card"
+    assert len(cards) == 1, (
+        "a form-encoded (JSON-string) reply_markup must still count as a card"
+    )
     assert bh.card_button_data(cards[0], "ship it") == "cb:0"
     assert bh.card_button_labels(cards[0]) == ["Ship it"]
 
@@ -226,10 +258,14 @@ def test_reply_markup_dict_rejects_broken_and_non_dict():
     an absent markup. (str covers both the form-urlencoded and multipart-text decoders; neither emits
     bytes.)"""
     assert bh._reply_markup_dict({"reply_markup": "{not json"}) is None
-    assert bh._reply_markup_dict({"reply_markup": "[1, 2, 3]"}) is None  # valid JSON, not a dict
+    assert (
+        bh._reply_markup_dict({"reply_markup": "[1, 2, 3]"}) is None
+    )  # valid JSON, not a dict
     assert bh._reply_markup_dict({"reply_markup": 42}) is None
     assert bh._reply_markup_dict({}) is None
-    assert bh._reply_markup_dict({"reply_markup": {"inline_keyboard": []}}) == {"inline_keyboard": []}
+    assert bh._reply_markup_dict({"reply_markup": {"inline_keyboard": []}}) == {
+        "inline_keyboard": []
+    }
 
 
 def test_emit_question_missing_binary_is_blocked_not_traceback():
@@ -237,9 +273,15 @@ def test_emit_question_missing_binary_is_blocked_not_traceback():
     BLOCKED case), never an uncaught OSError traceback that kills the whole agent-side run."""
     try:
         bh.emit_question(
-            ask_command=["/no/such/hook-client-binary"], cwd=Path.cwd(),
-            env=dict(os.environ), payload="{}", exit_boot_failed=8)
-        raise AssertionError("expected a BotHarnessError for a missing ask_command binary")
+            ask_command=["/no/such/hook-client-binary"],
+            cwd=Path.cwd(),
+            env=dict(os.environ),
+            payload="{}",
+            exit_boot_failed=8,
+        )
+        raise AssertionError(
+            "expected a BotHarnessError for a missing ask_command binary"
+        )
     except bh.BotHarnessError as exc:
         assert exc.exit_code == 8 and "hook client" in str(exc)
 
@@ -249,7 +291,12 @@ def test_emit_question_empty_argv_is_blocked_not_traceback():
     BotHarnessError — the defensive IndexError branch, so a degenerate argv never tracebacks."""
     try:
         bh.emit_question(
-            ask_command=[], cwd=Path.cwd(), env=dict(os.environ), payload="{}", exit_boot_failed=8)
+            ask_command=[],
+            cwd=Path.cwd(),
+            env=dict(os.environ),
+            payload="{}",
+            exit_boot_failed=8,
+        )
         raise AssertionError("expected a BotHarnessError for an empty ask_command")
     except bh.BotHarnessError as exc:
         assert exc.exit_code == 8
@@ -270,7 +317,12 @@ def test_agent_side_missing_ask_command_blocks_the_case():
         owner_id=424242,
     )
     transcript = bd.run_hermetic_bot_test(
-        suite_text=suite, bot_config=cfg, cwd=Path.cwd(), sut_path=Path.cwd(), exit_boot_failed=8)
+        suite_text=suite,
+        bot_config=cfg,
+        cwd=Path.cwd(),
+        sut_path=Path.cwd(),
+        exit_boot_failed=8,
+    )
     assert "VERDICT: BLOCKED" in transcript, transcript
     assert "hook client" in transcript, transcript
 
@@ -279,11 +331,21 @@ def test_do_tap_with_no_card_fails_cleanly():
     """A Tap: with no card to tap (e.g. Expect-card: 0 + Tap:) FAILs honestly — no IndexError."""
     fake = bh.FakeTelegram()
     ctx = bd._AgentRunCtx(
-        fake=fake, ask_command=[], cwd=Path.cwd(), env={}, sender_id=1, handles=[],
-        exit_boot_failed=8)
+        fake=fake,
+        ask_command=[],
+        cwd=Path.cwd(),
+        env={},
+        sender_id=1,
+        handles=[],
+        exit_boot_failed=8,
+    )
     case = bd.AgentCase(title="t", payload="{}", expect_card=0, tap="Allow")
     result = bd._do_tap(case, ctx)
-    assert result is not None and result.status == bd.FAIL and "no card to tap" in result.detail
+    assert (
+        result is not None
+        and result.status == bd.FAIL
+        and "no card to tap" in result.detail
+    )
 
 
 def test_card_button_data_and_labels():
@@ -302,7 +364,9 @@ def test_tap_injects_callback_query_from_owner():
     [update] = fake._updates
     cb = update["callback_query"]
     assert cb["data"] == "cb:Ship it" and cb["from"]["id"] == 424242
-    assert "message" not in cb  # message-less so the daemon skips the host-message-id match
+    assert (
+        "message" not in cb
+    )  # message-less so the daemon skips the host-message-id match
 
 
 def test_tap_missing_button_returns_false():
@@ -314,8 +378,14 @@ def test_tap_missing_button_returns_false():
 def test_ask_handle_reads_answer_then_caches():
     """await_answer returns the hook client's stdout and is idempotent (caches the first read)."""
     handle = bh.emit_question(
-        ask_command=[sys.executable, "-c", "import sys; sys.stdout.write('ANSWER:'+sys.stdin.read())"],
-        cwd=Path.cwd(), env=dict(os.environ), payload="Ship it",
+        ask_command=[
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('ANSWER:'+sys.stdin.read())",
+        ],
+        cwd=Path.cwd(),
+        env=dict(os.environ),
+        payload="Ship it",
     )
     # emit_question detaches the closed stdin (proc.stdin = None) so await_answer's communicate()
     # never flushes a closed stream — a version-independent pin for the CPython <3.13 crash the CI
@@ -325,11 +395,42 @@ def test_ask_handle_reads_answer_then_caches():
     assert handle.await_answer(timeout=10) == "ANSWER:Ship it"  # cached, no re-read
 
 
+def test_ask_handle_registers_with_the_signal_reaper_then_unregisters():
+    """review-cli#162 follow-up (codex review): `emit_question` must register the hook
+    client with `process._LIVE_CHILDREN` — the same registry `install_signal_reaper`'s
+    SIGTERM/SIGINT handler and the internal backstop's `kill_live_children()` sweep —
+    so an external signal reaps it too, not only `_run_streamed`'s own backend
+    children. And it must UNREGISTER once `await_answer` observes a normal exit —
+    otherwise the registry would grow forever across many QA test cases."""
+    from reviewlib import process as proc_mod
+
+    handle = bh.emit_question(
+        ask_command=[
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write(sys.stdin.read())",
+        ],
+        cwd=Path.cwd(),
+        env=dict(os.environ),
+        payload="hi",
+    )
+    assert handle._reaper_handle is not None
+    with proc_mod._LIVE_CHILDREN_LOCK:
+        live_pids = {p.pid for p, _pgid in proc_mod._LIVE_CHILDREN}
+    assert handle.proc.pid in live_pids
+    handle.await_answer(timeout=10)
+    with proc_mod._LIVE_CHILDREN_LOCK:
+        live_pids_after = {p.pid for p, _pgid in proc_mod._LIVE_CHILDREN}
+    assert handle.proc.pid not in live_pids_after
+
+
 def test_ask_handle_hang_returns_none():
     """A hook client that never exits (the tap-loss bug) yields None within the timeout + is reaped."""
     handle = bh.emit_question(
         ask_command=[sys.executable, "-c", "import time; time.sleep(60)"],
-        cwd=Path.cwd(), env=dict(os.environ), payload="",
+        cwd=Path.cwd(),
+        env=dict(os.environ),
+        payload="",
     )
     assert handle.await_answer(timeout=1.0) is None
     handle.reap()
@@ -341,9 +442,14 @@ def test_ask_handle_survives_a_stderr_flood():
     answer must NOT deadlock — await_answer drains both channels (a real bun/node tg-ctl logs to
     stderr). The naive wait-then-read would hang here and false-FAIL as a lost answer."""
     handle = bh.emit_question(
-        ask_command=[sys.executable, "-c",
-                     "import sys; sys.stderr.write('E'*200000); sys.stdout.write('Ship it')"],
-        cwd=Path.cwd(), env=dict(os.environ), payload="",
+        ask_command=[
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('E'*200000); sys.stdout.write('Ship it')",
+        ],
+        cwd=Path.cwd(),
+        env=dict(os.environ),
+        payload="",
     )
     assert handle.await_answer(timeout=10) == "Ship it"
 
@@ -362,8 +468,11 @@ def test_wait_for_file():
 def test_build_agent_env_overrides_and_strips_tmux():
     """build_agent_env pins the hermetic core vars and strips TMUX so a question stays unscoped."""
     env = bh.build_agent_env(
-        api_base="http://127.0.0.1:5000", owner_id=424242, token="123:tok",
-        config_dir=Path("/c"), home=Path("/h"),
+        api_base="http://127.0.0.1:5000",
+        owner_id=424242,
+        token="123:tok",
+        config_dir=Path("/c"),
+        home=Path("/h"),
         extra_env={"TG_BOT_TOKEN": "should-be-overridden", "K": "v", "TMUX": "leaked"},
     )
     assert env["TG_API_BASE"] == "http://127.0.0.1:5000"
@@ -375,11 +484,16 @@ def test_build_agent_env_overrides_and_strips_tmux():
 def test_boot_agent_daemon_refuses_non_loopback():
     """The daemon boot refuses a non-loopback TG_API_BASE so a misbuilt env can't reach real TG."""
     env = bh.build_agent_env(
-        api_base="http://198.51.100.7:443", owner_id=1, token="1:t",
-        config_dir=Path("/c"), home=Path("/h"),
+        api_base="http://198.51.100.7:443",
+        owner_id=1,
+        token="1:t",
+        config_dir=Path("/c"),
+        home=Path("/h"),
     )
     try:
-        bh.boot_agent_daemon(command=["true"], cwd=Path.cwd(), env=env, exit_boot_failed=8)
+        bh.boot_agent_daemon(
+            command=["true"], cwd=Path.cwd(), env=env, exit_boot_failed=8
+        )
         raise AssertionError("expected a refusal for a non-loopback api_base")
     except bh.BotHarnessError as exc:
         assert "loopback" in str(exc) and exc.exit_code == 8
@@ -407,8 +521,16 @@ def test_write_seed_substitutes_and_writes():
     try:
         variables = {"bot_id": "777", "cwd": "/proj"}
         bd._write_seed(
-            (SeedFile(path="config/tg-ctl.{bot_id}.registration.json",
-                      content='[{"cwd": "{cwd}"}]'),), ws, variables, exit_boot_failed=8)
+            (
+                SeedFile(
+                    path="config/tg-ctl.{bot_id}.registration.json",
+                    content='[{"cwd": "{cwd}"}]',
+                ),
+            ),
+            ws,
+            variables,
+            exit_boot_failed=8,
+        )
         written = (ws.config_dir / "tg-ctl.777.registration.json").read_text()
         assert json.loads(written) == [{"cwd": "/proj"}]
     finally:
@@ -421,8 +543,11 @@ def test_write_seed_rejects_escape_outside_workdir():
     ws = bd._AgentWorkspace.create()
     try:
         bd._write_seed(
-            (SeedFile(path="../escaped.json", content="x"),), ws, {}, exit_boot_failed=8)
-        raise AssertionError("expected a BotHarnessError for a workdir-escaping seed path")
+            (SeedFile(path="../escaped.json", content="x"),), ws, {}, exit_boot_failed=8
+        )
+        raise AssertionError(
+            "expected a BotHarnessError for a workdir-escaping seed path"
+        )
     except bh.BotHarnessError as exc:
         assert "OUTSIDE" in str(exc) and not (ws.root.parent / "escaped.json").exists()
     finally:
@@ -446,13 +571,20 @@ def _run_agent_fixture(*, dup_bug: bool) -> str:
         ask_command=("python3", "{sut_dir}/sut.py", "ask"),
         owner_id=424242,
         ready_file="{config_dir}/tg-ctl.{bot_id}.sock",
-        seed=(SeedFile(path="config/tg-ctl.{bot_id}.registration.json",
-                       content='[{"cwd": "{cwd}", "registeredAt": 0}]'),),
+        seed=(
+            SeedFile(
+                path="config/tg-ctl.{bot_id}.registration.json",
+                content='[{"cwd": "{cwd}", "registeredAt": 0}]',
+            ),
+        ),
         env=env,
     )
     return bd.run_hermetic_bot_test(
-        suite_text=suite_text, bot_config=cfg,
-        cwd=_AGENT_FIXTURE.resolve(), sut_path=_AGENT_FIXTURE.resolve(), exit_boot_failed=8,
+        suite_text=suite_text,
+        bot_config=cfg,
+        cwd=_AGENT_FIXTURE.resolve(),
+        sut_path=_AGENT_FIXTURE.resolve(),
+        exit_boot_failed=8,
     )
 
 
@@ -460,10 +592,18 @@ def test_agent_side_routing_blocks_an_inbound_suite():
     """ask_command set (agent-side tier) but the suite is inbound-only (Send:/Expect:) → a clear
     BLOCKED with the mismatch pointer, NOT a daemon boot. suite_has_agent_directives is the gate."""
     cfg = BotConfig(
-        driver="mock", command=("python3", "x"), ask_command=("python3", "ask"), owner_id=424242)
+        driver="mock",
+        command=("python3", "x"),
+        ask_command=("python3", "ask"),
+        owner_id=424242,
+    )
     transcript = bd.run_hermetic_bot_test(
-        suite_text="## Case: c\nSend: /start\nExpect: hi\n", bot_config=cfg,
-        cwd=Path.cwd(), sut_path=Path.cwd(), exit_boot_failed=8)
+        suite_text="## Case: c\nSend: /start\nExpect: hi\n",
+        bot_config=cfg,
+        cwd=Path.cwd(),
+        sut_path=Path.cwd(),
+        exit_boot_failed=8,
+    )
     assert "VERDICT: BLOCKED" in transcript and "ask_command is set" in transcript
 
 
@@ -499,7 +639,12 @@ def test_agent_side_daemon_crash_is_blocked_with_output_tail():
         owner_id=424242,
     )
     transcript = bd.run_hermetic_bot_test(
-        suite_text=suite, bot_config=cfg, cwd=Path.cwd(), sut_path=Path.cwd(), exit_boot_failed=8)
+        suite_text=suite,
+        bot_config=cfg,
+        cwd=Path.cwd(),
+        sut_path=Path.cwd(),
+        exit_boot_failed=8,
+    )
     assert "VERDICT: BLOCKED" in transcript, transcript
     assert "DAEMON-BOOM" in transcript, transcript  # the output tail is the proof
 
@@ -520,7 +665,12 @@ def test_agent_side_seed_escape_is_blocked():
         seed=(SeedFile(path="../escaped-by-qa.json", content="x"),),
     )
     transcript = bd.run_hermetic_bot_test(
-        suite_text=suite, bot_config=cfg, cwd=Path.cwd(), sut_path=Path.cwd(), exit_boot_failed=8)
+        suite_text=suite,
+        bot_config=cfg,
+        cwd=Path.cwd(),
+        sut_path=Path.cwd(),
+        exit_boot_failed=8,
+    )
     assert "VERDICT: BLOCKED" in transcript, transcript
     assert "OUTSIDE" in transcript, transcript
 
@@ -538,7 +688,9 @@ def test_real_tgctl_agent_side_proof():
 
     tgctl_dir = os.environ.get("REVIEW_QA_TGCTL_DIR")
     if not tgctl_dir or not shutil.which("bun"):
-        print("   (skipped: set REVIEW_QA_TGCTL_DIR to a tg-cli checkout + install bun)")
+        print(
+            "   (skipped: set REVIEW_QA_TGCTL_DIR to a tg-cli checkout + install bun)"
+        )
         return
     from reviewlib.qa.config import load_qa_config
     from reviewlib.qa.suites import load_suites_text
@@ -546,10 +698,15 @@ def test_real_tgctl_agent_side_proof():
     fixture = _FIXTURES / "tgctl-real"
     sut = load_qa_config(fixture, None)
     suite_text = load_suites_text(
-        sorted((fixture / "docs" / "tests" / "suites").glob("*.md")), max_cases=None)
+        sorted((fixture / "docs" / "tests" / "suites").glob("*.md")), max_cases=None
+    )
     transcript = bd.run_hermetic_bot_test(
-        suite_text=suite_text, bot_config=sut.bot,
-        cwd=Path(tgctl_dir).resolve(), sut_path=Path(tgctl_dir).resolve(), exit_boot_failed=8)
+        suite_text=suite_text,
+        bot_config=sut.bot,
+        cwd=Path(tgctl_dir).resolve(),
+        sut_path=Path(tgctl_dir).resolve(),
+        exit_boot_failed=8,
+    )
     expect = os.environ.get("REVIEW_QA_TGCTL_EXPECT", "PASS").upper()
     assert f"VERDICT: {expect}" in transcript, transcript
     print(f"   real tg-ctl proof: got VERDICT {expect} (as expected) for {tgctl_dir}")

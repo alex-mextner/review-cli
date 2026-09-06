@@ -679,6 +679,41 @@ JSON top-level shape:
 
 ---
 
+## `--detach` / `review jobs` / `review status` / `review wait` — background jobs
+
+`review` advertises no EXTERNAL timeout — a healthy run finishes in minutes, so agents
+must not wrap it in a short shell `timeout`. But some CALLERS genuinely cannot block for
+the whole run (a subagent whose own shell tool has a short foreground cap, a pre-commit
+hook with a tight budget). `--detach` is the supported way to stop blocking WITHOUT
+resorting to an external timeout or a bypass: it spawns the identical review as a
+session-detached background process and returns almost immediately with a job-id.
+
+```bash
+review diff --staged --task HYP-1234 --detach
+# [review-cli] detached job 20260718T211853-0db637ed started (pid 86989)
+# [review-cli]   log:    ~/Library/Caches/review-cli/jobs/20260718T211853-0db637ed.log
+# [review-cli]   result: ~/Library/Caches/review-cli/jobs/20260718T211853-0db637ed.result.txt
+# [review-cli]   check:  review status 20260718T211853-0db637ed
+
+review jobs                                   # list every recorded job, newest first
+review jobs --json
+review status 20260718T211853-0db637ed        # status + paths + a log tail
+review status 20260718T211853-0db637ed --json
+review wait 20260718T211853-0db637ed          # block until it finishes (for a human /
+                                               # unbounded caller — NOT for a capped subagent;
+                                               # poll `review status` instead)
+```
+
+The detached run is the SAME review — same backstop, same `-o`/quorum-stamp output, same
+child-reaping on kill (`reviewlib.process.install_signal_reaper`, review-cli#160) — just
+running in the background; a caller's own `-o FILE` is honored as the job's result file,
+otherwise a default path under the job's cache dir is used. Job status is one of
+`running`, `done`, `failed`, or `unknown-terminated` (the process died — crash, SIGKILL, a
+reboot — before it could record its own terminal status). `--detach` is rejected for
+`dashboard`/`spec-web`, which already have their own `start`/`stop` service lifecycle.
+
+---
+
 ## `review dashboard` — local web dashboard (managed service)
 
 The dashboard is a **managed service**: it gets the same lifecycle subcommands every
@@ -1174,6 +1209,9 @@ qa SUT              Agent-as-tester mode for authored QA suites.
 dashboard           Local web dashboard over review-cli runs.
 sessions            List / resume brainstorm sessions (-a all, -s <id> resume).
 task [CODE]         List task-coded review iterations, models, and transcript details.
+jobs                List detached (--detach) review jobs.
+status JOB-ID       Show one detached job's status, paths, and a log tail.
+wait JOB-ID         Block until a detached job finishes; exits with its status.
 spec-web            Multi-spec web reviewer daemon (start/status/stop/add SPEC; also `spec-web SPEC.md`).
 install-skill | install-commit-hook | install-hook tg | register-module
 
@@ -1195,6 +1233,11 @@ TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what a
                     as the HTTP request timeout, and QA/vision keep wall-clock caps. Values
                     under 60s stay exact for tests/probes; REVIEW_IDLE_TIMEOUT_SECONDS
                     overrides the review/panel idle window when set.
+--detach            Spawn this review as a session-detached BACKGROUND process and return
+                    almost immediately with a job-id, instead of blocking the caller for
+                    the whole run. See "review --detach / jobs / status / wait" below.
+                    Not supported on `dashboard`/`spec-web` (they have their own
+                    start/stop lifecycle).
 --list-defaults     Print effective default backends and exit.
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
 --preset NAME       Diff-review and --show-board preset: light for quick preflight,

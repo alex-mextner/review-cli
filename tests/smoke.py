@@ -840,6 +840,15 @@ _UNIT_FILES = [
     # `review task CODE --check`'s self-merge-authority gate.
     ("test_diff_identity.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_backstop.py", {}),
+    # External SIGTERM/SIGINT child reaper (review-cli#160) and its `--detach`/`jobs`/
+    # `status`/`wait` companion feature. Both spawn real subprocesses (a throwaway
+    # backend child + the actual `bin/review` CLI with the deterministic fake backend)
+    # but need no network/creds/real model CLIs.
+    ("test_signal_reaper.py", {}),
+    ("test_detach_jobs.py", {}),
+    # Log-dir/log-file sandboxed-write fallback (review-cli#162): a seat must survive an
+    # unwritable log location rather than crashing before its backend subprocess spawns.
+    ("test_log_dir_fallback.py", {}),
     # review-cli#180: the $REVIEW_CLI_ACTIVE reentrancy guard that stops a codex/claude/
     # opencode backend from re-invoking `review` on the same worktree (each level of
     # recursion re-roots into a fresh OS session via `start_new_session=True`, so the

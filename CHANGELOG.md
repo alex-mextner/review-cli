@@ -63,6 +63,78 @@ semantic versioning.
     `security` was held only by Qwen (unpaid/disabled) and the slow, quota-fragile
     GLM seat. `_oc_auth_has_provider`'s docstring trimmed to its invariants.
 
+## 0.35.10 — 2026-09-07
+
+- **`--detach` hardening from its first review round (review-cli#162 follow-up).**
+  The spawning parent no longer reads stdin to EOF itself (a non-tty stdin held open
+  with nothing in it — agent tool wrappers, pre-commit hooks — used to block the very
+  call that promises to return at once); the caller's stdin fd is handed straight to
+  the detached child, which reads it exactly as a synchronous run would. Leading
+  global options are normalized BEFORE the detachable-mode check, and that check is a
+  whitelist of review modes — `review -m x dashboard run --detach` can no longer sneak
+  past the dashboard/spec-web rejection, and `review jobs/wait/install-skill --detach`
+  is rejected instead of spawning a meaningless background job. A dead pid observed on
+  a "running" record is now written back as `unknown-terminated` once, so a later pid
+  reuse (or a reboot) can never flip the job back to "running" and make `review wait`
+  block; a brand-new record with no pid yet stays "running" for a short spawn grace
+  instead of being misreported as terminated by a concurrent `review jobs`. The
+  finalizer's own job-status write is best-effort: a jobs dir that became unwritable
+  after spawn no longer turns a finished review into a traceback exit, and one
+  schema-malformed `<id>.json` (`{}`, `[]`, a bare string) no longer crashes
+  `review jobs` — it is skipped like a corrupt file.
+
+- **A sandboxed caller's unwritable log location no longer kills the whole seat
+  (review-cli#162).** `log_dir()` (`~/Library/Logs/review-cli` on macOS,
+  `$XDG_STATE_HOME/review-cli/logs` elsewhere) and the per-call log file it opens are
+  both outside most agent-harness sandbox allow-lists, which commonly permit writes
+  only under the system temp dir. Before this fix, a denied `mkdir` or file `open`
+  raised an uncaught `PermissionError`/`OSError` straight out of `_run_streamed`
+  *before the backend subprocess was even spawned* — silently killing that seat
+  (observed live as a Fable/claude-p seat dying with "Operation not permitted"; every
+  seat shares the identical code path, so this was never actually fable-specific —
+  fable is simply the slowest seat, ~15 minutes, and so the most likely to still be
+  running if a time-scoped sandbox grant is the trigger). `log_dir()` and the new
+  `_open_log_with_fallback()` now catch the failure, print a loud stderr line naming
+  the fix (disable the sandbox, or set `$REVIEW_LOG_DIR` to an allowed path), and
+  retry under a writable temp-dir fallback instead of crashing the seat. Covered by
+  `tests/test_log_dir_fallback.py`, including an end-to-end `_run_streamed` call
+  against a deliberately unwritable (chmod 0) log directory that still runs the real
+  backend subprocess and returns its result.
+
+- **External SIGTERM/SIGINT now reap live backend children — no more orphaned reviewer
+  subprocesses (review-cli#160, duplicate #159).** A `review` process killed or timed out
+  from OUTSIDE (an agent's `kill <pid>`, a harness timeout, Ctrl-C) left its spawned
+  backend children (`claude`/`codex`/`opencode` model-runners, and their own
+  descendants) running — Python's default SIGTERM disposition terminates the process
+  with no `finally`/`atexit`, and each backend child runs in its own session
+  (`start_new_session=True`, so the internal per-call reap can bound its whole process
+  tree) which also means an external signal to `review` never reaches it. Orphans were
+  observed alive 3.5h+ after their run had already exited. `reviewlib.process.
+  install_signal_reaper()` (wired at the top of `cli.main`) now reaps every registered
+  live child (`kill_live_children()`, the same reap the internal 4h backstop already
+  used) before re-delivering the same signal to the process, so it still dies with the
+  correct exit status. Covered by `tests/test_signal_reaper.py`, which sends a REAL
+  external SIGTERM/SIGINT to a child process holding a REAL spawned backend and asserts
+  the backend is dead afterward.
+
+- **New `--detach` / `review jobs` / `review status` / `review wait` — background
+  review jobs (review-cli#160 companion).** A caller with its own short foreground cap
+  (a capped subagent shell tool, a tight pre-commit budget) previously had no supported
+  way to avoid blocking for a whole review other than wrapping it in an external
+  timeout — explicitly the wrong move (`review` only emits panel/brainstorm synthesis
+  at the very end). `--detach` spawns the identical review as a session-detached
+  background process (`python -m reviewlib`, its own session) and returns almost
+  immediately with a job-id; `review jobs` lists recorded jobs, `review status
+  <job-id>` shows status/paths/a log tail, and `review wait <job-id>` blocks until
+  done (for an unbounded caller, not a capped one). The detached run reuses the exact
+  same code path as a synchronous run — backstop, the new signal reaper above, `-o`/
+  quorum-stamp output — so its result is valid for `gh ship`'s review-quorum gate.
+  Covered by `tests/test_detach_jobs.py` (a real `bin/review` subprocess with the
+  deterministic fake backend): immediate return, running -> done transition, the
+  detached result matching a synchronous run byte-for-byte, `wait` returning the job's
+  exit code, and a killed detached job reconciling to `unknown-terminated` instead of
+  reporting "running" forever.
+
 ## 0.35.9 — 2026-09-06
 
 - **Opencode zai/glm stall watchdog + cooldown keyed by access method
