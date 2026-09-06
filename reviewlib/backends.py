@@ -3595,17 +3595,19 @@ def _oc_selector_is_well_formed(selector: str, provider: str) -> bool:
     shape opencode's `-m` wants: a slash, the segment before the FIRST slash canonicalising
     to the effective `provider` (so a colon-contaminated `xai:grok/model` — whose provider
     peels as `xai` on the colon — or `zai:/glm` fails, while `gemini-api/...` still matches
-    its canonical `gemini`), and a non-blank model that does not start with `/` (rejects
-    the empty inner segment of `zai//glm-5.2`)."""
-    if "/" not in selector:
+    its canonical `gemini`), no whitespace anywhere, and no empty `/`-separated segment
+    (rejects `zai//glm-5.2`, an interior `deepseek//v4` and a trailing `grok-4.5/` alike).
+
+    Whitespace is REJECTED, never canonicalised away (review round 2, GH-165, Codex): the
+    selector is forwarded to `opencode -m` verbatim by `review_opencode`, so a
+    `oc: xai/grok-4.5` or `oc:xai /grok-4.5` default that this guard stripped into shape
+    would pass the anti-rot CI check and then fail at dispatch."""
+    if "/" not in selector or any(ch.isspace() for ch in selector):
         return False
-    seg_provider, seg_model = selector.split("/", 1)
-    seg_model = seg_model.strip()
-    return (
-        _canonical_provider(seg_provider) == provider
-        and bool(seg_model)
-        and not seg_model.startswith("/")
-    )
+    segments = selector.split("/")
+    if not all(segments):
+        return False
+    return _canonical_provider(segments[0]) == provider
 
 
 def effective_provider(model: str) -> str:

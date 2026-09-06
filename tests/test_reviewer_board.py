@@ -119,8 +119,9 @@ def test_default_board_matches_directive_table():
         # Seat 11 — Grok 4.5 via opencode's native `xai` provider, agentic (oauth-
         # authenticated, no diff-only fallback route exists for this provider). Sits
         # BEFORE the z.ai GLM last-resort seat so deep mid-run failover reaches a fast
-        # reserve before paying GLM's #65 pathological-slowness cost. Role `performance`
-        # duplicates GLM-cc's lens — tolerated among low-priority reserves.
+        # reserve before paying GLM's #65 pathological-slowness cost. Role `security`
+        # (NOT `performance`, which already has a live paid fallback in Terra) — see the
+        # seat's own comment in `reviewlib/config.py`.
         ("oc:xai/grok-4.5", "security", "Grok"),
         # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
         # from the seat-3 commandcode GLM: same model family, different provider/transport.
@@ -360,6 +361,24 @@ def test_transport_peel_is_shared_by_provider_and_guard():
     assert backends._oc_selector_is_well_formed("xai:grok/model", "xai") is False
     assert backends._oc_selector_is_well_formed("xai//grok", "xai") is False
     assert backends._oc_selector_is_well_formed("xai", "xai") is False
+
+
+def test_oc_selector_rejects_whitespace_and_empty_segments():
+    """Review round 2 (GH-165), Codex: `_canonical_provider` strips its argument, so a
+    whitespace-contaminated selector (`oc: xai/grok-4.5`, `oc:xai /grok-4.5`, a tab, a
+    trailing space on the model) used to pass the guard — yet `review_opencode` hands
+    the selector to `opencode -m` untrimmed, so such a default would clear the anti-rot
+    CI check and fail at dispatch. Whitespace is rejected outright, never canonicalised
+    away; and an EMPTY segment anywhere (interior `deepseek//v4`, trailing `grok-4.5/`)
+    is malformed too, not just the one right after the provider."""
+    for selector in (" xai/grok-4.5", "xai /grok-4.5", "xai\t/grok-4.5", "xai/grok-4.5 "):
+        assert backends._oc_selector_is_well_formed(selector, "xai") is False, selector
+        assert backends.default_routes_live(f"oc:{selector}") is False, selector
+    for selector in ("xai/grok-4.5/", "commandcode/deepseek//v4"):
+        assert backends._oc_selector_is_well_formed(selector, selector.split("/")[0]) is False
+    assert backends.default_routes_live("oc: xai/grok-4.5") is False
+    assert backends.default_routes_live("opencode:xai\t/grok-4.5") is False
+    assert backends.default_routes_live("oc:commandcode/deepseek/deepseek-v4-pro") is True
 
 
 def test_glm_commandcode_seat_routes_readonly_through_review_commandcode():

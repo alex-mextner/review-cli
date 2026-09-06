@@ -55,7 +55,7 @@ semantic versioning.
     is one helper (`_peel_oc_transport`) shared by `effective_provider` and
     `default_routes_live`, and the `provider/model` selector well-formedness check
     (`_oc_selector_is_well_formed`: slash required, non-blank model, no colon
-    contamination, no double slash) now runs for EVERY `oc:` id before the provider
+    contamination, no whitespace, no empty `/`-segment) now runs for EVERY `oc:` id before the provider
     check — a malformed `oc:zai/` or `oc:zai//glm-5.2` default on a NAMED provider
     no longer slips past the #25 guard; `_AGENTIC_ONLY_PROVIDERS` is a pure
     membership exemption. Grok's role is `security`, not `performance`: after
