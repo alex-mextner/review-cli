@@ -207,7 +207,7 @@ def test_record_run_writes_correct_shape():
         # ban) so a future leaked field (`prompt_text`, `user_prompt`, an API key…)
         # fails this test by not being on the list, rather than needing its own new
         # substring rule (Fable review finding: `"prompt" not in blob` was too broad —
-        # it also rejected the legitimate `prompt_tokens` int field this v4 adds).
+        # it also rejected the legitimate `prompt_tokens` int field this v5 adds).
         allowed_keys = {
             "v",
             "ts",
@@ -315,13 +315,13 @@ def test_task_summaries_sums_tokens_across_iterations():
         assert summaries[0]["output_tokens"] == 80
 
 
-def test_task_summaries_pre_v4_record_with_no_token_keys_does_not_crash():
-    """A record written before v4 has no prompt_tokens/output_tokens keys at all.
+def test_task_summaries_pre_v5_record_with_no_token_keys_does_not_crash():
+    """A record written before v5 has no prompt_tokens/output_tokens keys at all.
     task_summaries() must skip it silently (contribute 0), never crash, and a LATER
-    v4 record in the same task must still sum correctly on top of it."""
+    v5 record in the same task must still sum correctly on top of it."""
     with _TmpStore() as store:
         legacy = {
-            "v": 3,
+            "v": 4,
             "ts": "2026-01-01T00:00:00+00:00",
             "mode": "review",
             "pool_size": 1,

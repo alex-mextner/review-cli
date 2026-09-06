@@ -3,6 +3,22 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.35.8 — 2026-09-06
+
+- **Real token counts now reach `run-stats.jsonl` (review-cli#195).** `record_run()` (the
+  ETA/quorum-gate JSONL store) never recorded token usage even though the REST backends
+  already parse it from every provider response. `ReviewResult` now carries
+  `prompt_tokens`/`output_tokens` (set only at the REST construction sites), the panel's
+  call tally sums them per run across EVERY dispatch attempt (an in-seat retry or a
+  provider failover no longer undercounts), the flat `-m` review path tallies at all (it
+  previously always recorded 0/0), and `record_run`/`task_summaries` persist and aggregate
+  them. STATS_VERSION 4 → 5; older records without the keys read as "usage unknown", not
+  zero. Two Codex review findings folded in: a 2xx with a valid `usage` but no assistant
+  content still fails closed but keeps the prompt tokens it spent on the failed result;
+  and a `usage` object with only one valid field collapses to 0/0 ("unknown") instead of
+  persisting a half-real `(prompt, 0)` pair — matching the rule `review stat`'s
+  `tokenstats` already applies, so the two stores agree.
+
 ## 0.35.7 — 2026-09-06
 
 - **Pre-commit gate: trivial-follow-up delta tolerance (review-cli#208).** The
