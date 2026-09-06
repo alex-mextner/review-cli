@@ -2457,6 +2457,8 @@ def _run_mode_with_stats(
         elapsed = time.monotonic() - start
         tally = end_call_tally()
         ok_count, fail_count = tally["ok"], tally["fail"]
+        prompt_tokens = tally["prompt_tokens"]
+        output_tokens = tally["output_tokens"]
         recorded_models = pool_models
         models_after_fell_back = False
         if models_after is not None:
@@ -2565,6 +2567,8 @@ def _run_mode_with_stats(
                 diff_files=diff_files,
                 diff_sha256=diff_sha256,
                 roles=recorded_roles,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
             )
 
 

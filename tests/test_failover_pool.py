@@ -517,7 +517,7 @@ def test_tally_counts_final_outcomes_not_failed_attempts():
     with _FakeBackends():
         run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
     tally = panel.end_call_tally()
-    assert tally == {"ok": 4, "fail": 0}, tally
+    assert tally == {"ok": 4, "fail": 0, "prompt_tokens": 0, "output_tokens": 0}, tally
 
     # One seat fails then backfills: 1 fail (the failed seat) + 4 ok (3 healthy pool + the
     # backfill) = 5 calls tallied, exactly one per attempt's final verdict.
@@ -525,7 +525,7 @@ def test_tally_counts_final_outcomes_not_failed_attempts():
     with _FakeBackends({pool[3].model: (1, "boom")}):
         run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
     tally = panel.end_call_tally()
-    assert tally == {"ok": 4, "fail": 1}, tally
+    assert tally == {"ok": 4, "fail": 1, "prompt_tokens": 0, "output_tokens": 0}, tally
 
 
 def test_results_include_failed_and_replacement_seats():

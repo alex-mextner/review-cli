@@ -59,6 +59,15 @@ class ReviewResult:
     returncode: int
     stdout: str
     stderr: str
+    # Real token usage, set ONLY at the REST call sites that parse a provider's own
+    # usage payload (gemini/openai-shape/anthropic below). Every other construction
+    # site (every CLI/agentic backend, every error path) leaves these at the default
+    # 0 — "no usage data for this call", never scraped from stdout text, so an
+    # agentic backend that happens to quote a usage-shaped line in its own output
+    # (a real cross-contamination case review-cli hit before, see tokenstats.py's
+    # `_REST_USAGE_BACKENDS`) can never be misattributed here.
+    prompt_tokens: int = 0
+    output_tokens: int = 0
 
 
 def _which(name: str) -> str:
@@ -1192,24 +1201,61 @@ def review_gemini(
         )
         with urllib.request.urlopen(req, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
-        usage = payload.get("usageMetadata", {})
-        stdout = (
-            text.strip()
-            + f"\n\nprompt_tokens={usage.get('promptTokenCount', 0)} output_tokens={usage.get('candidatesTokenCount', 0)}\n"
+        # Shape-guarded walk: `{"candidates": []}` (a filtered/blocked response) used to
+        # raise IndexError here and surface as a generic failure with the spent tokens
+        # lost; it is now the same fail-closed empty-content result as any other
+        # candidate-less 2xx, with usage still parsed below.
+        candidates = payload.get("candidates") if isinstance(payload, dict) else None
+        first = candidates[0] if isinstance(candidates, list) and candidates else {}
+        content = first.get("content") if isinstance(first, dict) else None
+        parts = content.get("parts") if isinstance(content, dict) else None
+        parts = parts if isinstance(parts, list) else []
+        # Only real string parts count as content: a `"text": null`/object/array part
+        # must not be stringified into a fake verdict ("None") that passes
+        # `result_is_usable()`.
+        text = "".join(
+            part["text"]
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
+        usage = _usage_dict(payload, "usageMetadata")
+        # Empty success is a failure, exactly as on the OpenAI-compatible and Anthropic
+        # paths: a 2xx with no candidate text has nothing to review with, and a bare
+        # `prompt_tokens=...` footer would otherwise pass `result_is_usable()` as
+        # review content and consume a seat instead of failing over. The tokens the
+        # call SPENT still ride on the failed result for the per-attempt tally.
+        rc = 0 if text.strip() else 1
+        prompt_tokens, output_tokens = _validated_usage_pair(
+            usage.get("promptTokenCount"),
+            usage.get("candidatesTokenCount"),
+            completed=rc == 0,
+        )
+        if rc == 0:
+            stdout = (
+                text.strip()
+                + f"\n\nprompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+            )
+            stderr = ""
+        else:
+            stdout = ""
+            stderr = f"Gemini API returned no candidate text: {json.dumps(payload)[:500]}"
         _emit_rest_log(
             "gemini",
             command,
             round_no=round_no,
-            returncode=0,
+            returncode=rc,
             stdout=stdout,
-            stderr="",
+            stderr=stderr,
             started=started,
         )
         return ReviewResult(
-            model=model, command=command, returncode=0, stdout=stdout, stderr=""
+            model=model,
+            command=command,
+            returncode=rc,
+            stdout=stdout,
+            stderr=stderr,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
         )
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
@@ -1408,16 +1454,61 @@ def _parse_openai_choice(payload: object) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _parse_openai_usage(payload: object) -> tuple[int, int]:
-    """Return (prompt_tokens, output_tokens) from a response, 0/0 on any wrong shape."""
-    usage = payload.get("usage") if isinstance(payload, dict) else None
-    if not isinstance(usage, dict):
+def _valid_token_count(count: object) -> bool:
+    """A real token count: a non-negative int (and not a bool, which is an int subclass)."""
+    return isinstance(count, int) and not isinstance(count, bool) and count >= 0
+
+
+def _usage_dict(payload: object, key: str) -> dict:
+    """The provider's usage object under `key` in a JSON response, or `{}` when the
+    response or the usage entry is not a dict -- so every REST path reads usage through
+    one shape guard instead of re-deriving it."""
+    usage = payload.get(key) if isinstance(payload, dict) else None
+    return usage if isinstance(usage, dict) else {}
+
+
+def _validated_usage_pair(
+    prompt: object, output: object, *, completed: bool
+) -> tuple[int, int]:
+    """The ONE validity rule for a provider usage reading, shared by every REST path
+    (OpenAI-compatible, Anthropic, Gemini) so `run-stats.jsonl` and `review stat`'s
+    log-derived `tokenstats` can never disagree on what counts as a measurement.
+
+    All-or-nothing: a `usage` object with only one valid field is a partial reading,
+    and defaulting the missing field to 0 independently would persist `(prompt, 0)` as
+    a real total. 0/0 is the one value every reader already treats as "usage unknown",
+    so anything short of a complete pair collapses to it.
+
+    `completed` = the response carried real assistant content. A completed call can
+    never genuinely have zero prompt OR zero output tokens, so either field being 0 is
+    the same "absent/defaulted" signal `tokenstats.extract_usage_tokens` already
+    rejects, and collapses to 0/0 too. A NON-completed call (a 2xx with no content,
+    which fails closed) legitimately has output 0 while still having SPENT its prompt
+    tokens, so that pair is kept as parsed -- provider failover tallies every dispatch
+    attempt, and dropping it would lose real spend from the run record.
+    """
+    if not completed and output is None:
+        # A provider that produced no content commonly OMITS the output field rather
+        # than writing an explicit 0 (Gemini blocked responses, some OpenAI-compatible
+        # gateways). That is the same "nothing generated" reading, so coalesce it --
+        # otherwise the prompt tokens the call spent are lost on exactly the shape
+        # this branch exists for.
+        output = 0
+    if not (isinstance(prompt, int) and isinstance(output, int)):
         return 0, 0
-    prompt = usage.get("prompt_tokens", 0)
-    output = usage.get("completion_tokens", 0)
-    return (
-        prompt if isinstance(prompt, int) else 0,
-        output if isinstance(output, int) else 0,
+    if not (_valid_token_count(prompt) and _valid_token_count(output)):
+        return 0, 0
+    if completed and (prompt == 0 or output == 0):
+        return 0, 0
+    return prompt, output
+
+
+def _parse_openai_usage(payload: object, *, completed: bool = True) -> tuple[int, int]:
+    """Return (prompt_tokens, output_tokens) from an OpenAI-shape response via
+    `_validated_usage_pair`'s rule; 0/0 ("unknown") on any wrong or partial shape."""
+    usage = _usage_dict(payload, "usage")
+    return _validated_usage_pair(
+        usage.get("prompt_tokens"), usage.get("completion_tokens"), completed=completed
     )
 
 
@@ -1507,6 +1598,13 @@ def _openai_compatible_request(
             raw = response.read().decode("utf-8")
         payload = json.loads(raw)
         text = _parse_openai_choice(payload)
+        # Usage is parsed BEFORE the empty-content check: a 2xx with a valid `usage`
+        # but no assistant content still SPENT its prompt tokens, and provider
+        # failover tallies every dispatch attempt -- the failed result must carry
+        # them or they vanish from `run-stats.jsonl` (see `_validated_usage_pair`).
+        prompt_tokens, output_tokens = _parse_openai_usage(
+            payload, completed=bool(text.strip())
+        )
         if not text.strip():
             # A 2xx whose body carries NO assistant content (`[]`, `{"choices":[null]}`,
             # `{"error":...}` with HTTP 200, an empty completion) is NOT a successful
@@ -1524,9 +1622,14 @@ def _openai_compatible_request(
                 started=started,
             )
             return ReviewResult(
-                model=model, command=command, returncode=1, stdout="", stderr=stderr
+                model=model,
+                command=command,
+                returncode=1,
+                stdout="",
+                stderr=stderr,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
             )
-        prompt_tokens, output_tokens = _parse_openai_usage(payload)
         stdout = text.strip() + (
             f"\n\nprompt_tokens={prompt_tokens} output_tokens={output_tokens}\n"
         )
@@ -1540,7 +1643,13 @@ def _openai_compatible_request(
             started=started,
         )
         return ReviewResult(
-            model=model, command=command, returncode=0, stdout=stdout, stderr=""
+            model=model,
+            command=command,
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
         )
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")
@@ -2080,14 +2189,20 @@ def review_claude_api(
             for p in parts
             if isinstance(p, dict) and p.get("type") == "text"
         )
-        usage = payload.get("usage") if isinstance(payload, dict) else None
-        usage = usage if isinstance(usage, dict) else {}
-        stdout = text.strip() + (
-            f"\n\ninput_tokens={usage.get('input_tokens', 0)} "
-            f"output_tokens={usage.get('output_tokens', 0)}\n"
-        )
+        usage = _usage_dict(payload, "usage")
         # Empty success is a failure for the panel/moderator fallback path.
         rc = 0 if text.strip() else 1
+        prompt_tokens, output_tokens = _validated_usage_pair(
+            usage.get("input_tokens"), usage.get("output_tokens"), completed=rc == 0
+        )
+        # A footer-only stdout on the empty-content failure would read as review
+        # content to `result_is_usable()`; keep the failed result's stdout empty
+        # like the other REST paths (tokens still ride on the result fields).
+        stdout = (
+            text.strip() + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+            if rc == 0
+            else ""
+        )
         _emit_rest_log(
             "claude",
             command,
@@ -2098,7 +2213,13 @@ def review_claude_api(
             started=started,
         )
         return ReviewResult(
-            model=model, command=command, returncode=rc, stdout=stdout, stderr=""
+            model=model,
+            command=command,
+            returncode=rc,
+            stdout=stdout,
+            stderr="",
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
         )
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", "replace")

@@ -755,6 +755,158 @@ def test_zai_empty_with_no_reasoning_still_fails_closed():
         assert "no assistant content" in res.stderr, (payload, res.stderr)
 
 
+def test_zai_empty_content_failure_still_carries_spent_prompt_tokens():
+    """Codex review finding (review-cli#200): a 2xx with a valid `usage` object but no
+    assistant content still fails closed (rc=1) -- but the prompt tokens it SPENT must
+    ride along on the failed result, so provider failover's per-attempt tally (and
+    `run-stats.jsonl`) does not silently lose them. Mirrors the Anthropic path."""
+    for usage in (
+        {"prompt_tokens": 1234, "completion_tokens": 0},
+        {"prompt_tokens": 1234},  # output field omitted, the common empty shape
+    ):
+        payload = {"choices": [{"message": {"content": ""}}], "usage": usage}
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen({}, payload)
+        with _EnvSandbox():
+            os.environ["ZAI_API_KEY"] = "k"
+            try:
+                res = backends.review_zai("zai", "q", "+x", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert res.returncode == 1 and "no assistant content" in res.stderr, res
+        assert (res.prompt_tokens, res.output_tokens) == (1234, 0), (usage, res)
+        assert res.stdout == "", res
+
+
+def test_validated_usage_pair_is_all_or_nothing():
+    """Unit rule: a usage reading is a measurement only as a complete, non-negative int
+    pair; a completed call additionally cannot have a zero in either field. Anything
+    else collapses to 0/0 ("unknown") -- the shape `dashboard/tokenstats.py` already
+    rejects, so the two stores agree."""
+    parse = backends._parse_openai_usage
+    assert parse({"usage": {"prompt_tokens": 500}}) == (0, 0)
+    assert parse({"usage": {"completion_tokens": 7}}) == (0, 0)
+    assert parse({"usage": {"prompt_tokens": 500, "completion_tokens": "7"}}) == (0, 0)
+    assert parse({"usage": {"prompt_tokens": True, "completion_tokens": 7}}) == (0, 0)
+    assert parse({"usage": {"prompt_tokens": -1, "completion_tokens": 7}}) == (0, 0)
+    assert parse({"usage": {"prompt_tokens": 500, "completion_tokens": 7}}) == (500, 7)
+    assert parse({"usage": {"prompt_tokens": 500, "completion_tokens": 0}}) == (0, 0)
+    assert parse(
+        {"usage": {"prompt_tokens": 500, "completion_tokens": 0}}, completed=False
+    ) == (500, 0)
+    assert parse([]) == (0, 0) and parse({"usage": None}) == (0, 0)
+    assert backends._validated_usage_pair(1234, 0, completed=False) == (1234, 0)
+    assert backends._validated_usage_pair(1234, 0, completed=True) == (0, 0)
+    # A non-completed call that OMITS the output field is the "nothing generated"
+    # reading -- coalesced to 0 so the spent prompt tokens survive; a missing PROMPT
+    # field is still unknown, and on a completed call a missing output stays unknown.
+    assert backends._validated_usage_pair(1234, None, completed=False) == (1234, 0)
+    assert backends._validated_usage_pair(None, 0, completed=False) == (0, 0)
+    assert backends._validated_usage_pair(1234, None, completed=True) == (0, 0)
+    assert parse({"usage": {"prompt_tokens": 1234}}, completed=False) == (1234, 0)
+
+
+def test_openai_compatible_success_carries_validated_tokens_on_the_result():
+    """Integration: the RESULT OBJECT's fields are what the panel tally reads -- not
+    just the stdout footer -- so a complete pair lands on `ReviewResult`, and a
+    partial or zero-output pair on a completed call is recorded as unknown."""
+    for usage, expected in (
+        ({"prompt_tokens": 500}, (0, 0)),
+        ({"prompt_tokens": 500, "completion_tokens": 0}, (0, 0)),
+        ({"prompt_tokens": 500, "completion_tokens": 7}, (500, 7)),
+    ):
+        payload = {"choices": [{"message": {"content": "looks fine"}}], "usage": usage}
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen({}, payload)
+        with _EnvSandbox():
+            os.environ["ZAI_API_KEY"] = "k"
+            try:
+                res = backends.review_zai("zai", "q", "+x", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert res.returncode == 0, res
+        assert (res.prompt_tokens, res.output_tokens) == expected, (usage, res)
+        assert res.stdout.rstrip().endswith(
+            f"prompt_tokens={expected[0]} output_tokens={expected[1]}"
+        ), res.stdout
+
+
+def test_gemini_applies_the_same_usage_validity_rule_and_fails_closed_when_empty():
+    """The Gemini REST path shares `_validated_usage_pair` AND now fails closed on a
+    2xx with no candidate text (previously it returned rc=0 with only the token
+    footer, which `result_is_usable()` would accept as review content) -- while
+    still carrying the prompt tokens that empty call spent."""
+    cases = (
+        ("fine", {"promptTokenCount": 1234}, 0, (0, 0)),
+        ("fine", {"promptTokenCount": 1234, "candidatesTokenCount": 56}, 0, (1234, 56)),
+        ("fine", {"promptTokenCount": 1234, "candidatesTokenCount": 0}, 0, (0, 0)),
+        ("", {"promptTokenCount": 1234, "candidatesTokenCount": 0}, 1, (1234, 0)),
+        # The common blocked-response shape: output field OMITTED, not written as 0.
+        ("", {"promptTokenCount": 1234}, 1, (1234, 0)),
+        # Non-string `text` parts are not content -- never stringified into a verdict.
+        (None, {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
+        ({"nested": 1}, {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
+        (["a"], {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
+    )
+    for text, usage, rc, expected in cases:
+        payload = {
+            "candidates": [{"content": {"parts": [{"text": text}]}}],
+            "usageMetadata": usage,
+        }
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen({}, payload)
+        with _EnvSandbox():
+            os.environ["GEMINI_API_KEY"] = "k"
+            try:
+                res = backends.review_gemini("gemini", "q", "+x", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert res.returncode == rc, (text, usage, res)
+        assert (res.prompt_tokens, res.output_tokens) == expected, (text, usage, res)
+        if rc:
+            assert res.stdout == "" and "no candidate text" in res.stderr, res
+            assert "None" not in res.stdout, res
+    # `{"candidates": []}` -- the exact shape Codex flagged -- must also fail closed.
+    old_open = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen({}, {"candidates": [], "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0}})
+    with _EnvSandbox():
+        os.environ["GEMINI_API_KEY"] = "k"
+        try:
+            res = backends.review_gemini("gemini", "q", "+x", REPO_ROOT, 10)
+        finally:
+            urllib.request.urlopen = old_open
+    assert res.returncode == 1 and (res.prompt_tokens, res.output_tokens) == (9, 0), res
+
+
+def test_anthropic_api_applies_the_same_usage_validity_rule():
+    """The Anthropic REST path shares `_validated_usage_pair`: a partial `usage`
+    (`input_tokens` only) collapses to 0/0 exactly like the OpenAI-compatible path,
+    a complete pair on a completed call is kept, and an empty-content failure keeps
+    the prompt spend."""
+    cases = (
+        ("fine", {"input_tokens": 1234}, 0, (0, 0)),
+        ("fine", {"input_tokens": 1234, "output_tokens": 56}, 0, (1234, 56)),
+        ("fine", {"input_tokens": 1234, "output_tokens": 0}, 0, (0, 0)),
+        ("", {"input_tokens": 1234, "output_tokens": 0}, 1, (1234, 0)),
+        ("", {"input_tokens": 1234}, 1, (1234, 0)),
+    )
+    for text, usage, rc, expected in cases:
+        payload = {"content": [{"type": "text", "text": text}], "usage": usage}
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen({}, payload)
+        with _EnvSandbox():
+            os.environ["ANTHROPIC_API_KEY"] = "k"
+            try:
+                res = backends.review_claude_api("claude:claude-opus-4-8", "q", "+x", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert res.returncode == rc, (text, usage, res)
+        assert (res.prompt_tokens, res.output_tokens) == expected, (text, usage, res)
+        if rc:
+            # No footer-only stdout that `result_is_usable()` could mistake for content.
+            assert res.stdout == "", res
+
+
 def test_commandcode_never_injects_thinking_field():
     """The commandcode backend speaks the generic OpenAI shape and never injects the
     DeepSeek-specific `thinking` field — not on the default gateway, an explicit model,
