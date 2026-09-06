@@ -760,20 +760,22 @@ def test_zai_empty_content_failure_still_carries_spent_prompt_tokens():
     assistant content still fails closed (rc=1) -- but the prompt tokens it SPENT must
     ride along on the failed result, so provider failover's per-attempt tally (and
     `run-stats.jsonl`) does not silently lose them. Mirrors the Anthropic path."""
-    payload = {
-        "choices": [{"message": {"content": ""}}],
-        "usage": {"prompt_tokens": 1234, "completion_tokens": 0},
-    }
-    old_open = urllib.request.urlopen
-    urllib.request.urlopen = _fake_urlopen({}, payload)
-    with _EnvSandbox():
-        os.environ["ZAI_API_KEY"] = "k"
-        try:
-            res = backends.review_zai("zai", "q", "+x", REPO_ROOT, 10)
-        finally:
-            urllib.request.urlopen = old_open
-    assert res.returncode == 1 and "no assistant content" in res.stderr, res
-    assert (res.prompt_tokens, res.output_tokens) == (1234, 0), res
+    for usage in (
+        {"prompt_tokens": 1234, "completion_tokens": 0},
+        {"prompt_tokens": 1234},  # output field omitted, the common empty shape
+    ):
+        payload = {"choices": [{"message": {"content": ""}}], "usage": usage}
+        old_open = urllib.request.urlopen
+        urllib.request.urlopen = _fake_urlopen({}, payload)
+        with _EnvSandbox():
+            os.environ["ZAI_API_KEY"] = "k"
+            try:
+                res = backends.review_zai("zai", "q", "+x", REPO_ROOT, 10)
+            finally:
+                urllib.request.urlopen = old_open
+        assert res.returncode == 1 and "no assistant content" in res.stderr, res
+        assert (res.prompt_tokens, res.output_tokens) == (1234, 0), (usage, res)
+        assert res.stdout == "", res
 
 
 def test_validated_usage_pair_is_all_or_nothing():
@@ -795,7 +797,13 @@ def test_validated_usage_pair_is_all_or_nothing():
     assert parse([]) == (0, 0) and parse({"usage": None}) == (0, 0)
     assert backends._validated_usage_pair(1234, 0, completed=False) == (1234, 0)
     assert backends._validated_usage_pair(1234, 0, completed=True) == (0, 0)
-    assert backends._validated_usage_pair(1234, None, completed=False) == (0, 0)
+    # A non-completed call that OMITS the output field is the "nothing generated"
+    # reading -- coalesced to 0 so the spent prompt tokens survive; a missing PROMPT
+    # field is still unknown, and on a completed call a missing output stays unknown.
+    assert backends._validated_usage_pair(1234, None, completed=False) == (1234, 0)
+    assert backends._validated_usage_pair(None, 0, completed=False) == (0, 0)
+    assert backends._validated_usage_pair(1234, None, completed=True) == (0, 0)
+    assert parse({"usage": {"prompt_tokens": 1234}}, completed=False) == (1234, 0)
 
 
 def test_openai_compatible_success_carries_validated_tokens_on_the_result():
@@ -833,6 +841,12 @@ def test_gemini_applies_the_same_usage_validity_rule_and_fails_closed_when_empty
         ("fine", {"promptTokenCount": 1234, "candidatesTokenCount": 56}, 0, (1234, 56)),
         ("fine", {"promptTokenCount": 1234, "candidatesTokenCount": 0}, 0, (0, 0)),
         ("", {"promptTokenCount": 1234, "candidatesTokenCount": 0}, 1, (1234, 0)),
+        # The common blocked-response shape: output field OMITTED, not written as 0.
+        ("", {"promptTokenCount": 1234}, 1, (1234, 0)),
+        # Non-string `text` parts are not content -- never stringified into a verdict.
+        (None, {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
+        ({"nested": 1}, {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
+        (["a"], {"promptTokenCount": 1234, "candidatesTokenCount": 3}, 1, (1234, 3)),
     )
     for text, usage, rc, expected in cases:
         payload = {
@@ -851,6 +865,7 @@ def test_gemini_applies_the_same_usage_validity_rule_and_fails_closed_when_empty
         assert (res.prompt_tokens, res.output_tokens) == expected, (text, usage, res)
         if rc:
             assert res.stdout == "" and "no candidate text" in res.stderr, res
+            assert "None" not in res.stdout, res
     # `{"candidates": []}` -- the exact shape Codex flagged -- must also fail closed.
     old_open = urllib.request.urlopen
     urllib.request.urlopen = _fake_urlopen({}, {"candidates": [], "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0}})
@@ -873,6 +888,7 @@ def test_anthropic_api_applies_the_same_usage_validity_rule():
         ("fine", {"input_tokens": 1234, "output_tokens": 56}, 0, (1234, 56)),
         ("fine", {"input_tokens": 1234, "output_tokens": 0}, 0, (0, 0)),
         ("", {"input_tokens": 1234, "output_tokens": 0}, 1, (1234, 0)),
+        ("", {"input_tokens": 1234}, 1, (1234, 0)),
     )
     for text, usage, rc, expected in cases:
         payload = {"content": [{"type": "text", "text": text}], "usage": usage}
@@ -886,6 +902,9 @@ def test_anthropic_api_applies_the_same_usage_validity_rule():
                 urllib.request.urlopen = old_open
         assert res.returncode == rc, (text, usage, res)
         assert (res.prompt_tokens, res.output_tokens) == expected, (text, usage, res)
+        if rc:
+            # No footer-only stdout that `result_is_usable()` could mistake for content.
+            assert res.stdout == "", res
 
 
 def test_commandcode_never_injects_thinking_field():

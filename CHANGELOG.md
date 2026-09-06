@@ -16,8 +16,13 @@ semantic versioning.
   zero. Two Codex review findings folded in: a 2xx with a valid `usage` but no assistant
   content still fails closed but keeps the prompt tokens it spent on the failed result;
   and a `usage` object with only one valid field collapses to 0/0 ("unknown") instead of
-  persisting a half-real `(prompt, 0)` pair — matching the rule `review stat`'s
-  `tokenstats` already applies, so the two stores agree.
+  persisting a half-real `(prompt, 0)` pair — the same validity rule `review stat`'s
+  `tokenstats` applies to successful calls. The two stores still differ by design on
+  FAILED-but-billed attempts: `run-stats.jsonl` counts the prompt tokens an empty-content
+  failure spent (it aggregates every dispatch attempt), while `review stat` reads only
+  successful calls' log footers and reports those as unknown. Gemini now also fails
+  closed on a 2xx with no candidate text (it used to return rc=0 with only the token
+  footer, which passed `result_is_usable()` as review content).
 
 ## 0.35.7 — 2026-09-06
 

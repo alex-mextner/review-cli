@@ -1210,8 +1210,13 @@ def review_gemini(
         content = first.get("content") if isinstance(first, dict) else None
         parts = content.get("parts") if isinstance(content, dict) else None
         parts = parts if isinstance(parts, list) else []
+        # Only real string parts count as content: a `"text": null`/object/array part
+        # must not be stringified into a fake verdict ("None") that passes
+        # `result_is_usable()`.
         text = "".join(
-            str(part.get("text", "")) for part in parts if isinstance(part, dict)
+            part["text"]
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
         usage = _usage_dict(payload, "usageMetadata")
         # Empty success is a failure, exactly as on the OpenAI-compatible and Anthropic
@@ -1482,6 +1487,13 @@ def _validated_usage_pair(
     tokens, so that pair is kept as parsed -- provider failover tallies every dispatch
     attempt, and dropping it would lose real spend from the run record.
     """
+    if not completed and output is None:
+        # A provider that produced no content commonly OMITS the output field rather
+        # than writing an explicit 0 (Gemini blocked responses, some OpenAI-compatible
+        # gateways). That is the same "nothing generated" reading, so coalesce it --
+        # otherwise the prompt tokens the call spent are lost on exactly the shape
+        # this branch exists for.
+        output = 0
     if not (isinstance(prompt, int) and isinstance(output, int)):
         return 0, 0
     if not (_valid_token_count(prompt) and _valid_token_count(output)):
@@ -2183,8 +2195,13 @@ def review_claude_api(
         prompt_tokens, output_tokens = _validated_usage_pair(
             usage.get("input_tokens"), usage.get("output_tokens"), completed=rc == 0
         )
-        stdout = text.strip() + (
-            f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+        # A footer-only stdout on the empty-content failure would read as review
+        # content to `result_is_usable()`; keep the failed result's stdout empty
+        # like the other REST paths (tokens still ride on the result fields).
+        stdout = (
+            text.strip() + f"\n\ninput_tokens={prompt_tokens} output_tokens={output_tokens}\n"
+            if rc == 0
+            else ""
         )
         _emit_rest_log(
             "claude",
