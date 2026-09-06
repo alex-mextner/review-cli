@@ -125,6 +125,47 @@ def test_active_cooldown_never_raises_when_cooldown_path_raises_runtimeerror():
         sc.cooldown_path = saved
 
 
+def test_pre_187_flat_store_shape_reads_as_no_cooldown_and_is_replaced_on_write():
+    """A store written BEFORE the (model, access_method) nesting (#187) holds a flat
+    `{model: {"until", "reason", "recorded_at"}}` entry. It must read as "no cooldown"
+    under every access method (fail-open: one extra dispatch, never a crash or a
+    wrong-forever verdict), be DISCARDED -- not merged into -- by the next record (so
+    the model key can still fully empty out), and not count as prior fail history for
+    escalation (rounds 1+2 review finding, Opus + Fable: three migration code paths
+    with zero coverage)."""
+    import json
+
+    def _run():
+        model = "oc:zai/glm-5.2"
+        store = Path(os.environ["REVIEW_SEAT_COOLDOWN_FILE"])
+        store.write_text(
+            json.dumps(
+                {
+                    model: {
+                        "until": time.time() + 3600,
+                        "reason": "legacy flat entry",
+                        "recorded_at": time.time() - 60,
+                        "fail_count": 4,
+                    }
+                }
+            )
+        )
+        for access_method in sc.ACCESS_METHODS:
+            assert sc.active_cooldown(model, access_method=access_method) is None
+        sc.record_cooldown(model, "fresh", ttl_seconds=600.0, access_method="opencode")
+        data = json.loads(store.read_text())
+        assert "until" not in data[model], data  # flat shape discarded, not merged
+        assert set(data[model]) == {"opencode"}, data
+        fresh = sc.active_cooldown(model, access_method="opencode")
+        assert fresh is not None and fresh["fail_count"] == 1, fresh  # no legacy history
+        assert sc.active_cooldown(model, access_method="cli") is None
+        sc.clear_cooldown(model, access_method="opencode")
+        assert sc.active_cooldown(model, access_method="opencode") is None
+        assert model not in json.loads(store.read_text())  # key fully emptied out
+
+    _with_store(_run)
+
+
 def test_record_then_active_within_window():
     def _run():
         sc.record_cooldown(

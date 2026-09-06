@@ -33,11 +33,19 @@ from reviewlib import backends as review_backends  # noqa: E402
 
 
 class _FakeProc:
-    def __init__(self, returncode=0, stdout="ok", stderr="", timeout_kind=None):
+    def __init__(
+        self,
+        returncode=0,
+        stdout="ok",
+        stderr="",
+        timeout_kind=None,
+        stall_bound_clamped=False,
+    ):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
         self.timeout_kind = timeout_kind
+        self.stall_bound_clamped = stall_bound_clamped
 
 
 def _stalled_proc() -> _FakeProc:
@@ -308,6 +316,59 @@ def test_opencode_exhausting_stall_retries_records_a_cooldown():
         cooldown = active_cooldown("oc:zai/glm-5.2", access_method="opencode")
         assert cooldown is not None, "no cooldown was recorded after exhausting retries"
         assert "stalled" in cooldown["reason"], cooldown
+        # Exactly ONE record for the whole 3-attempt cycle -- a second writer (e.g.
+        # `_record_true_silence_if_needed` also matching the stalled proc) would
+        # escalate this to 2 (round-2 review finding, Fable).
+        assert cooldown["fail_count"] == 1, cooldown
+
+
+def test_clamped_stall_is_not_retried_and_records_no_cooldown():
+    """A stall whose liveness bound was clamped below the requested window (board
+    deadline / small idle window -- `stall_bound_clamped=True` on the result) is an
+    honest bounded failure, NOT the quota-exhaustion signature: no retry, no cooldown
+    (round-2 review finding, Fable: under deadline pressure a merely slow-to-first-byte
+    seat would otherwise rack up three sub-minute "stalls" and be benched)."""
+    clamped = _FakeProc(
+        returncode=124,
+        stdout="\n[review-cli] TIMEOUT after 40s waiting for first output]\n",
+        timeout_kind="waiting for first output",
+        stall_bound_clamped=True,
+    )
+    with _capture_opencode([clamped, clamped, clamped]) as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            result = review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
+        assert len(cap.calls) == 1, cap.calls
+        assert result.returncode == 124, result
+        from reviewlib.seat_cooldown import active_cooldown
+
+        assert active_cooldown("oc:zai/glm-5.2", access_method="opencode") is None
+
+
+def test_stall_seconds_zero_keeps_true_silence_for_watched_model():
+    """$REVIEW_OPENCODE_STALL_SECONDS=0 disables the liveness watchdog; the watched
+    model must then fall back to the registry-driven true-silence bound instead of
+    losing zero-output protection entirely (round-2 review finding, Fable)."""
+    from reviewlib import model_behavior
+
+    with _capture_opencode() as cap:
+        os.environ["REVIEW_OPENCODE_STALL_SECONDS"] = "0"
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
+        assert cap.liveness_timeout is None
+        assert cap.true_silence_timeout == model_behavior.true_silence_timeout_seconds(
+            "oc:zai/glm-5.2"
+        )
+        assert cap.true_silence_timeout is not None
 
 
 def test_stall_watchdog_owns_zero_output_for_watched_model():

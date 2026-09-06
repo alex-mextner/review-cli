@@ -974,7 +974,7 @@ def quorum_check(
             # strictly better than the pre-#187 "always show the model" gap this
             # diagnostic already accepts (see the module docstring above).
             cd = None
-            for access_method in ("cli", "api", "opencode"):
+            for access_method in _seat_cooldown.ACCESS_METHODS:
                 cd = _seat_cooldown.active_cooldown(m, access_method=access_method)
                 if cd is not None:
                     break

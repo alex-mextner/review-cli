@@ -761,6 +761,7 @@ def _run_streamed(
     stopping = threading.Event()
     timed_out = False
     true_silenced = False
+    liveness_clamped = False
     if timeout_mode not in {"idle", "wall"}:
         raise ValueError(f"unknown timeout_mode: {timeout_mode}")
     idle_timeout = (
@@ -1045,6 +1046,15 @@ def _run_streamed(
                 if liveness_timeout is not None
                 else None
             )
+            # Remember whether the clamp actually SHORTENED the caller's bound: a stall
+            # that fired at a board-deadline-clamped window (round-2 review finding,
+            # Fable) says "no output before the deadline ran out", not "no output for
+            # the configured stall window" — the opencode retry loop must not read the
+            # former as the quota-exhaustion signature and bench a healthy seat.
+            liveness_clamped = (
+                liveness_timeout is not None
+                and effective_liveness_timeout < liveness_timeout
+            )
             while True:
                 try:
                     proc.wait(timeout=0.5)
@@ -1229,6 +1239,13 @@ def _run_streamed(
         # even carry the exact seconds value a caller expected). `None` when the call
         # did not time out at all.
         result.timeout_kind = timeout_marker_kind if timed_out else None
+        # True only for a STALL that fired at a bound SHORTER than the caller asked
+        # for (board-deadline / idle clamp) — see `liveness_clamped` above. Consumers
+        # (`backends._opencode_call_stalled`) treat such a stall as an honest bounded
+        # failure, never as retry/cooldown-worthy.
+        result.stall_bound_clamped = bool(
+            timed_out and timeout_marker_kind == TIMEOUT_KIND_STALL and liveness_clamped
+        )
         # Explicit, OUT-OF-BAND signal (round-2 review finding, codex + Fable): 125 is
         # a real exit code some CLIs/wrappers use on their own (`timeout(1)`'s "the
         # wrapper itself failed", docker run, git-bisect skip) — a child that happens

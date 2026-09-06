@@ -430,6 +430,32 @@ def test_liveness_timeout_is_clamped_to_a_smaller_idle_window():
     assert "waiting for first output" in result.stdout, result.stdout
     assert "without output" not in result.stdout, result.stdout
     assert result.timeout_kind == "waiting for first output"
+    # ...but the result must SAY the bound was clamped below the requested 300s, so a
+    # consumer can tell "no output before the (deadline-shortened) window" apart from
+    # "no output for the configured stall window" (round-2 review finding, Fable).
+    assert result.stall_bound_clamped is True
+
+
+def test_liveness_stall_at_the_requested_bound_is_not_marked_clamped():
+    """The counterpart of the clamp test above: when the requested liveness bound is
+    the one that actually fires (idle window larger), `stall_bound_clamped` is False --
+    this is the genuine quota-exhaustion signature the opencode retry loop acts on."""
+    code = "import time\ntime.sleep(30)\n"
+    argv = [sys.executable, "-c", code]
+
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="100"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=30,
+            backend="fake-silent-requested-bound",
+            round_no=16,
+            liveness_timeout=1,
+        )
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert result.timeout_kind == "waiting for first output"
+    assert result.stall_bound_clamped is False
 
 
 def test_disabled_idle_reap_falls_back_to_wall_timeout():

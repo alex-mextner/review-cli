@@ -135,6 +135,11 @@ _ESCALATION_RESET_SECONDS = 24 * 3600.0  # 24 hours
 # How much of the triggering reason text to persist. Enough to show a human "why", short
 # enough that the cooldown file never carries a meaningful fragment of a reviewed diff.
 _REASON_MAX_LEN = 200
+# Every access method a cooldown can be recorded under (the second key of the nested
+# store shape). Owned HERE so a reader that enumerates methods (`stats.quorum_check`'s
+# stalled-model probe) can never silently miss one a recorder started using (round-1/2
+# review finding, Fable/Sonnet): add a transport here, not at a call site.
+ACCESS_METHODS: tuple[str, ...] = ("cli", "api", "opencode")
 
 
 def cooldown_path() -> Path:

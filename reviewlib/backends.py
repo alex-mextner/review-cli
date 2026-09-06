@@ -748,10 +748,18 @@ def _opencode_call_stalled(proc: subprocess.CompletedProcess[str]) -> bool:
     rather than text-scraping `stdout` for a marker substring (codex review finding: a
     substring search is both forgeable — a reviewed model could itself emit matching
     prose — and, after `_run_streamed`'s own idle/liveness clamping, the marker's exact
-    embedded seconds value may not match what this caller requested anyway)."""
+    embedded seconds value may not match what this caller requested anyway).
+
+    A stall whose bound was CLAMPED below the requested window (`stall_bound_clamped`,
+    stamped by `_run_streamed` when the board-deadline / idle clamp shortened it) is
+    NOT a stall in this sense (round-2 review finding, Fable): under deadline pressure
+    a merely slow-to-first-byte seat would otherwise rack up three sub-minute "stalls"
+    and be benched for the next invocation on a signal that says nothing about quota.
+    Such a result is returned as an honest bounded failure — no retry, no cooldown."""
     return (
         proc.returncode == 124
         and getattr(proc, "timeout_kind", None) == TIMEOUT_KIND_STALL
+        and not getattr(proc, "stall_bound_clamped", False)
     )
 
 
@@ -799,8 +807,7 @@ def _run_opencode_with_stall_retry(
         if _opencode_model_needs_stall_watchdog(model)
         else None
     )
-    if stall_seconds is not None:
-        true_silence_timeout = None
+    effective_true_silence = None if stall_seconds is not None else true_silence_timeout
     proc = None
     for attempt in range(1, _OPENCODE_MAX_STALL_RETRIES + 1):
         proc = _run_streamed(
@@ -812,7 +819,7 @@ def _run_opencode_with_stall_retry(
             announce=_ANNOUNCE_LOGS,
             header_argv0=header_argv0,
             liveness_timeout=stall_seconds,
-            true_silence_timeout=true_silence_timeout,
+            true_silence_timeout=effective_true_silence,
         )
         if not _opencode_call_stalled(proc):
             return proc

@@ -29,6 +29,13 @@ semantic versioning.
     "cool down on the first silence" was decided by poll-loop check order).
     Unwatched opencode seats keep the true-silence wiring unchanged, and the
     liveness check now keys off the same `got_output` latch as true-silence.
+  - A stall whose liveness bound was CLAMPED below the requested window by the
+    board deadline / idle clamp (`stall_bound_clamped` on the `_run_streamed`
+    result) is an honest bounded failure, not the quota-exhaustion signature:
+    no retry, no cooldown (review round 2, Fable — under deadline pressure a
+    merely slow-to-first-byte seat would otherwise be benched). `seat_cooldown`
+    now owns the access-method enumeration (`ACCESS_METHODS`) that
+    `quorum_check`'s stalled-model probe iterates.
 
 ## 0.35.8 — 2026-09-06
 
