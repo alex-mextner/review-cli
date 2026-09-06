@@ -100,7 +100,7 @@ Unique flags added by `_add_arguments(parser)` (the shared `-C`, `-m`, `--pool`,
 finding → exit `10`; without it, only infra/no-suite/unhealthy failures are non-zero and
 findings still print at exit `0` (usable as an exploratory pass).
 
-**Handler shape** (thin, mirrors `quorum.py:58`/`just_ask.py:32`): `_handler(ctx) -> int`
+**Handler shape** (thin, mirrors `quorum.py:274`/`just_ask.py:94`): `_handler(ctx) -> int`
 reads `ctx.args` + `ctx.cwd` (resolved SUT) + `ctx.models` (single-seat tester) +
 `ctx.timeout`, then:
 1. if `--scaffold-env`: write stubs, exit 0.

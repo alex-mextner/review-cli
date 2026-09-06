@@ -17,6 +17,7 @@ keeps the hot review path free of a directory scan. A future "drop a Python file
 modes plugin dir" discovery step would mirror `features/visual/registry.discover_specs`
 — the contract (`ModeSpec` + a top-level `MODE`) is already discovery-ready.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -141,8 +142,12 @@ REMOVED_FLAGS: dict[str, RemovedFlag] = {
         reason="`review task CODE --quorum-check` was renamed to `--check` to avoid "
         "colliding with the unrelated `review quorum` multi-model consensus panel — same "
         "word, two different features.",
-        fix="use `review task CODE --check` instead; `--min-iter`/`--min-models`/`--json` "
-        "are unchanged.",
+        fix="use `review task CODE --check` instead; `--min-iter`/`--json` are unchanged. "
+        "Note (review-cli#246): bare `--check` with NEITHER `--min-models` nor "
+        "`--min-roles` now defaults to a 3-distinct-BOARD-ROLE gate, not the old "
+        "3-distinct-MODEL gate — pass `--min-models 3` explicitly to keep the prior "
+        "default behavior (review-cli#221 added `--min-roles` as an opt-in alternative "
+        "counting mode; #246 made it the default).",
     ),
 }
 

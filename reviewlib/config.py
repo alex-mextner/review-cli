@@ -14,9 +14,26 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from pathlib import Path
 
+from .usage_limits import DEFAULT_LIMIT_THRESHOLD
+
 DEFAULT_PROMPT = (
-    "Review this uncommitted git diff for bugs, regressions, security issues, "
-    "and missing tests. Return only actionable findings. Do not edit files."
+    "Review this uncommitted git diff for bugs, regressions, security issues, and "
+    "missing tests. Before concluding the diff is fine, actively try to find a way it "
+    "is WRONG: walk through concrete failure scenarios (edge cases, concurrent access, "
+    "malformed or adversarial input, a caller/integration point you haven't traced) and "
+    "genuinely attempt to break the change, rather than skimming it for obviously bad "
+    "code. Only report 'no issues' after you have tried specific scenarios and failed "
+    "to break it — a skim is not a review.\n\n"
+    "Every verdict must show that work, not just an opinion:\n"
+    "- A FINDING must cite file:line and describe a concrete failure scenario — the "
+    "input or state that triggers it and what goes wrong.\n"
+    "- A CLEAN verdict (no findings) must explicitly state which specific failure "
+    "modes you checked and why each is ruled out, e.g. 'checked: race condition on "
+    "concurrent writes to X — none found, guarded by a lock at Y; checked: injection "
+    "via the user-supplied Z — sanitized before use at W'. A bare 'looks good' or 'no "
+    "issues found' with no such statement is not an acceptable answer.\n\n"
+    "Return only actionable findings (or the clean-verdict statement above). Do not "
+    "edit files."
 )
 # Canonical Kimi seat — the SINGLE source of truth for "the Kimi model the defaults use",
 # referenced by BOTH the flat DEFAULT_MODELS panel below and the priority-4 seat of
@@ -28,11 +45,40 @@ DEFAULT_PROMPT = (
 # the board was kept current (the flat panel rotted on the dead Fireworks route).
 KIMI_SEAT = "commandcode:moonshotai/Kimi-K2.7-Code"
 SOL_SEAT = "codex:gpt-5.6-sol"
+# GPT-6-Astra ("Astra") is OpenAI's new flagship codex model — "our most capable model
+# for complex, demanding work" per the codex CLI's own model catalog. Explicitly PINNED
+# (like SOL_SEAT), rather than left as a bare `"codex"` seat that silently tracks
+# whatever ~/.codex/config.toml's own `model =` default happens to be today. The bare
+# `"codex"` seat used to sit at DEFAULT_BOARD's priority 5 and, because that config
+# default is currently `gpt-5.6-sol`, it was accidentally running the SAME model as
+# SOL_SEAT (priority 1) — a silent duplicate that gave the board zero extra model
+# coverage for a full seat. Pinning to Astra here fixes that: the board gets a genuinely
+# distinct model, and this seat no longer drifts if the operator's global codex default
+# changes.
+ASTRA_SEAT = "codex:gpt-6-astra"
+# GPT-5.6-Terra ("Terra") — review-cli#382: a THIRD, distinct codex model on the same
+# already-paid OpenAI/Codex account as SOL_SEAT/ASTRA_SEAT. Live `performance` fallback
+# for the disabled GLM_COMMANDCODE_SEAT. Pinned explicitly (not bare `"codex"`), same
+# anti-duplicate reason as ASTRA_SEAT above.
+TERRA_SEAT = "codex:gpt-5.6-terra"
+# claude-sonnet-5 ("Sonnet") — review-cli#382: a SECOND, distinct Anthropic model on the
+# same already-paid Claude account as Opus/FABLE_SEAT. Live `quality` fallback for Kimi
+# (commandcode) and the quota-fragile z.ai-GLM seat. `review stat` telemetry (2026-09-05):
+# dispatched cleanly 7/7 times historically, zero recorded failures — unlike FABLE_SEAT's
+# ~100% dispatch failure rate (see its own entry below).
+SONNET_SEAT = "claude:claude-sonnet-5"
+# review-cli#fable-seat-reliability (GLM review finding): the single source of truth
+# for the Fable seat's model id — every sibling seat (KIMI_SEAT/SOL_SEAT/
+# GLM_COMMANDCODE_SEAT above) already has one; the Fable id was the one left as a
+# repeated literal across DEFAULT_BOARD's entry, DEFAULT_PRESET_BOARD's exclusion set,
+# and HEAVY_PRESET_BOARD's filter (three places that must never independently drift).
+FABLE_SEAT = "claude:claude-fable-5"
 
 # Canonical GLM-5.2-via-commandcode seat — the SINGLE source of truth for "GLM 5.2 routed
 # through the Command Code gateway" (as opposed to the z.ai-subscription route used by the
-# lower-priority `oc:zai/glm-5.2` seat). It is the priority-4 board seat, immediately after
-# Opus. The wire id is byte-exact against the commandcode gateway
+# lower-priority `oc:zai/glm-5.2` seat). It is the priority-3 board seat, immediately after
+# Opus (review-cli#fable-seat-reliability: was priority-4 before Fable's demotion moved
+# every subsequent seat up one slot). The wire id is byte-exact against the commandcode gateway
 # /models catalog (`zai-org/GLM-5.2`), verified live. This is DIFF-ONLY (a stateless keyed-
 # HTTP POST through review_commandcode, like Gemini): opencode's `commandcode` provider does
 # NOT register this model, so the agentic `oc:commandcode/zai-org/GLM-5.2` form errors — the
@@ -98,10 +144,20 @@ MODEL_ALIASES = {
     # FAILOVER alternate, not the default.)
     "opus": "claude:claude-opus-4-8",
     "opus48": "claude:claude-opus-4-8",
-    "fable": "claude:claude-fable-5",
-    "fable5": "claude:claude-fable-5",
+    "fable": FABLE_SEAT,
+    "fable5": FABLE_SEAT,
     "sol": SOL_SEAT,
     "gpt56sol": SOL_SEAT,
+    # Astra falls through `_match_named_backend` to the opencode catch-all without this —
+    # the same failure class documented on `opus` above. Pin it, like Sol.
+    "astra": ASTRA_SEAT,
+    "gpt6astra": ASTRA_SEAT,
+    # Terra falls through the same opencode catch-all without this — same class as
+    # opus/astra above. Pin it too (review-cli#382).
+    "terra": TERRA_SEAT,
+    "gpt56terra": TERRA_SEAT,
+    "sonnet": SONNET_SEAT,
+    "sonnet5": SONNET_SEAT,
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
     # directly in resolve_backend (env ZAI_MODEL / glm-5.2 default — the newest GLM,
     # reachable on the Coding-Plan endpoint). These aliases pin specific GLM model ids;
@@ -192,13 +248,18 @@ REVIEW_ROLES = {
     ),
     "security": (
         "Focus specifically on SECURITY: injection, broken authn/authz, secret "
-        "handling, unsafe deserialization, path traversal, and SSRF. Flag exploitable "
+        "handling, unsafe deserialization, path traversal, and SSRF. Think like a "
+        "security-paranoid reviewer: assume the worst actor and the worst case, and "
+        "actively probe every input, trust boundary, and secret-handling path for a "
+        "way to break it before concluding the change is safe. Flag exploitable "
         "issues, not theoretical ones."
     ),
     "tests": (
         "Focus specifically on TESTS: missing tests for new behavior, untested branches, "
-        "boundary conditions, and error-path coverage. Point at the exact cases that "
-        "should be tested but aren't."
+        "boundary conditions, and error-path coverage. Bring a skeptical-SRE mindset: "
+        "distrust anything without a failure plan — what breaks in production, under "
+        "concurrent or adversarial load, or at 3am with no one watching? Point at the "
+        "exact cases that should be tested but aren't."
     ),
     "contracts": (
         "Focus specifically on PUBLIC API SHAPE and CONTRACTS: exported function/type "
@@ -229,10 +290,11 @@ class BoardReviewer:
         return REVIEW_ROLES.get(self.role, "")
 
 
-# DEFAULT_BOARD: the raw 10-seat board used as the source of truth for built-in presets
+# DEFAULT_BOARD: the raw 12-seat board used as the source of truth for built-in presets
 # and for custom/config fallback paths. A plain `review diff` runs the default preset,
-# not this tuple directly. The board is ordered by *priority* — strongest model first,
-# weakest last — NOT by role. Priority drives the FAILOVER pool: the selected board runs
+# not this tuple directly. The board is ordered by *priority* — strongest WORKING model
+# first, weakest (or least-reliable, review-cli#fable-seat-reliability) last — NOT by
+# role. Priority drives the FAILOVER pool: the selected board runs
 # the top-N AVAILABLE seats, skipping a higher-priority seat whose backend isn't reachable
 # and promoting the next-priority reserve to keep a full pool (startup failover); a seat
 # that fails *during* the run is likewise replaced by the next reserve (mid-run failover).
@@ -246,18 +308,39 @@ class BoardReviewer:
 # To RE-RANK the board, just reorder this tuple (top = highest priority). Model ids are
 # byte-exact against the provider catalogs (commandcode gateway /models, z.ai Coding-Plan)
 # — do not alter the strings. Each is the TOP available version of its model family
-# (fable-5, Sol, opus-4-8, GLM-5.2-via-gateway, Kimi-K2.7, codex/GPT-5.5,
-# Qwen3.7-Max, deepseek-v4-pro, Gemini, glm-5.2-via-z.ai).
+# (fable-5, Sol, opus-4-8, GLM-5.2-via-gateway, Kimi-K2.7, GPT-6-Astra, GPT-5.6-Terra,
+# claude-sonnet-5, Qwen3.7-Max, deepseek-v4-pro, Gemini, glm-5.2-via-z.ai).
+#
+# review-cli#382: TERRA_SEAT/SONNET_SEAT were added as live `performance`/`quality`
+# fallbacks (unpaid_providers disabling commandcode left those roles with zero live
+# seats — full incident writeup in CHANGELOG.md), and the z.ai-GLM seat was re-lensed
+# `quality` -> `security`. Astra's pre-existing `consistency` role (a duplicate of Sol's)
+# was DELIBERATELY LEFT UNCHANGED — an earlier draft flipped it to `security`, but that
+# left `consistency` with zero live fallback board-wide; see its own entry below. `tests`/
+# `contracts`/`architect` stay thin (no third distinct already-paid model existed to give
+# them one too). Stopgap within the existing hardcoded seat-string mechanism, not the
+# "roles declare models, harness auto-resolves" redesign tracked as review-cli#364/
+# rig-cli#337.
+#
+# KNOWN LIMIT: `pool: 4` can't fit every distinct role once Sol AND commandcode disabled
+# are both in play (`--preset heavy`'s available top-4 becomes Sol/Opus/Astra/Terra —
+# `consistency` x2, `correctness`, `performance` — with `quality`/`security` in reserve),
+# and `pool: 2` (the `light` preset a bare `review diff` uses) can never show more than 2
+# roles at all. Neither is a #382 regression (both predate it) and neither is fixed by
+# reordering — only a role-aware selector (review-cli#364/rig-cli#337, out of scope) or
+# more paid seats would. See test_heavy_preset_double_failure_still_beats_pre_382_board /
+# test_light_preset_double_failure_pool_unchanged_but_reserve_deepens for the traced proof
+# that #382 still strictly improves both (deeper reserve, no fewer pool seats) even here.
 #
 # AGENTIC BY DEFAULT (review-cli#24): every board seat that CAN read the repo does. The
-# two claude seats run via the agentic claude CLI; Codex via the codex CLI
+# claude seats run via the agentic claude CLI; Sol/Astra/Terra via the codex CLI
 # (`codex exec -s read-only -C <cwd>`); Kimi/z.ai-GLM/Qwen/DeepSeek through opencode
 # (`oc:provider/model`, built by `_agentic()` from the diff-only constant) so they ALSO
 # run read-only inside `-C` and can open ANY project file — not just the diff in the
 # prompt. The board has a reserve, so an `oc:` seat that opencode can't reach on a given
 # host probes UNAVAILABLE and is backfilled (startup or mid-run failover) — the board
 # degrades gracefully rather than blocking. Two seats stay diff-only stateless HTTP calls:
-# Gemini (no agentic transport) and the priority-4 GLM-5.2-via-commandcode seat
+# Gemini (no agentic transport) and the GLM-5.2-via-commandcode seat
 # (`GLM_COMMANDCODE_SEAT` — opencode's commandcode provider does not register this GLM id, so
 # the agentic form errors; the keyed-HTTP route is the one that reaches it). Both are read-
 # only by construction (they POST only the diff). The diff-only `commandcode:`/`zai:` REST
@@ -274,47 +357,88 @@ class BoardReviewer:
 #   - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx, agentic
 #   - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx
 DEFAULT_BOARD = (
-    # priority 1 — Fable 5 (Anthropic flagship). Currently paywalled/"unavailable", so
-    # the failover skips it at startup (the cheap probe can't see the paywall, but its
-    # run-time "currently unavailable" body is treated as a failure and backfilled).
-    BoardReviewer("claude:claude-fable-5", "architect", "Fable"),
-    # priority 2 — Sol through Codex CLI, immediately after Fable.
+    # priority 1 — Sol through Codex CLI.
     BoardReviewer(SOL_SEAT, "consistency", "Sol"),
-    # priority 3 — Opus 4.8. Also the moderator (MODERATOR_CANDIDATES[0]).
+    # priority 2 — Opus 4.8. Also the moderator (MODERATOR_CANDIDATES[0]).
     BoardReviewer("claude:claude-opus-4-8", "correctness", "Opus"),
-    # priority 4 — GLM-5.2 via the Command Code gateway (CTO directive: directly under Opus).
+    # priority 3 — GLM-5.2 via the Command Code gateway (CTO directive: directly under Opus).
     # DIFF-ONLY (keyed HTTP through review_commandcode, like Gemini): opencode's commandcode
     # provider does NOT register `zai-org/GLM-5.2`, so the agentic `oc:commandcode/...` form
     # errors — the diff-only route is the one that actually reaches it. Read-only by
     # construction (POSTs only the diff; no repo/tools/exec). Distinct from the lower-priority
     # `oc:zai/glm-5.2` seat (same model FAMILY, different provider/transport: z.ai vs gateway).
-    # ROLE: `performance` — NOT `correctness` (which would duplicate Opus's lens). Inserting
-    # GLM-cc carries `performance` to keep the default top-4 pool's lens coverage intact
-    # (architect/consistency/correctness/performance), instead of dropping performance from a
-    # plain `review diff` and duplicating correctness (review of #57).
+    # ROLE: `performance` — NOT `correctness` (which would duplicate Opus's lens).
     BoardReviewer(GLM_COMMANDCODE_SEAT, "performance", "GLM-cc"),
-    # priority 5 — Kimi K2.7, AGENTIC through opencode (reads the repo). Same model id as
+    # priority 4 — Kimi K2.7, AGENTIC through opencode (reads the repo). Same model id as
     # the flat panel's KIMI_SEAT (one source of truth via `_agentic`); transport-only diff.
+    # Kept at this exact position: both the raw top-4 (Sol/Opus/GLM-cc/Kimi) and
+    # DEFAULT_PRESET_BOARD's top-4 (Opus/GLM-cc/Kimi/Astra) need it here to stay
+    # 4-distinct-roles — see test_default_pool_roles_are_distinct_no_lens_lost /
+    # test_preset_boards_pin_model_order_pool_and_effort. TERRA_SEAT/SONNET_SEAT (below)
+    # are placed AFTER Astra, outside both windows, for the same reason.
     BoardReviewer(_agentic(KIMI_SEAT), "quality", "Kimi"),
-    # priority 6 — Codex: the agentic codex CLI route (reads the whole repo), NOT the
-    # diff-only `commandcode:gpt-5.5` HTTP route. GPT-5.5 is codex; the agentic route wins.
-    BoardReviewer("codex", "consistency", "Codex"),
-    # priority 7 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
+    # priority 5 — Astra, the agentic codex CLI route (reads the whole repo), pinned via
+    # ASTRA_SEAT rather than the bare `"codex"` seat this used to be. ROLE LEFT AS
+    # `consistency` (a duplicate of Sol's) — an earlier draft of #382 flipped it to
+    # `security`, but that left `consistency` with ZERO live fallback board-wide; see the
+    # KNOWN LIMIT comment above DEFAULT_BOARD and
+    # test_glm_cc_unavailable_backfills_from_astra_with_a_duplicate_lens.
+    BoardReviewer(ASTRA_SEAT, "consistency", "Astra"),
+    # priority 6 — Terra (review-cli#382): live `performance` fallback, promoted whenever
+    # GLM-cc is unavailable.
+    BoardReviewer(TERRA_SEAT, "performance", "Terra"),
+    # priority 7 — Sonnet (review-cli#382): live `quality` fallback for Kimi — the exact
+    # role the 2026-09-05 z.ai-quota incident exposed (see CHANGELOG.md).
+    BoardReviewer(SONNET_SEAT, "quality", "Sonnet"),
+    # priority 8 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(_agentic("commandcode:Qwen/Qwen3.7-Max"), "security", "Qwen"),
-    # priority 8 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
+    # priority 9 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(
         _agentic("commandcode:deepseek/deepseek-v4-pro"), "tests", "DeepSeek"
     ),
-    # priority 9 — Gemini.
+    # priority 10 — Gemini. `contracts` has no other live seat (review-cli#382: there was
+    # no third distinct already-paid model left to give it without doubling up quota
+    # pressure on an account already carrying two board seats — see the block comment
+    # above DEFAULT_BOARD) — it stays thin until commandcode/gemini are re-enabled or a
+    # new paid seat is added.
     BoardReviewer("gemini", "contracts", "Gemini"),
-    # priority 10 (LAST-RESORT reserve) — GLM-5.2 (his z.ai subscription, the newest GLM),
-    # AGENTIC through opencode's `zai` provider. DELIBERATELY DEPRIORITIZED to the bottom of
-    # the reserve (review-cli#65): this seat is observed to be PATHOLOGICALLY SLOW under load,
-    # so promoting it onto the failover critical path stalls the pool's path to a verdict. It
-    # stays on the board (still backfills when every faster reserve is also exhausted), but it
-    # no longer blocks a fast verdict — Qwen / DeepSeek / Gemini are promoted before it. To
-    # re-rank, move this line up; its position IS its priority.
-    BoardReviewer(_agentic("zai:glm-5.2"), "quality", "GLM"),
+    # priority 11 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
+    # opencode's `zai` provider. DELIBERATELY DEPRIORITIZED to the bottom of the reserve
+    # (review-cli#65): this seat is observed to be PATHOLOGICALLY SLOW under load, so
+    # promoting it onto the failover critical path stalls the pool's path to a verdict.
+    # It stays on the board (still backfills when every faster reserve is also
+    # exhausted), but it no longer blocks a fast verdict — Qwen / DeepSeek / Gemini are
+    # promoted before it (review-cli#fable-seat-reliability: above only Fable). To
+    # re-rank, move this line up; its position IS its priority. ROLE CHANGED (review-cli#382)
+    # from `quality` to `security`: Sonnet now covers `quality` more reliably, freeing this
+    # live-but-fragile seat to backfill `security` (whose only other seat, Qwen, is
+    # disabled) instead of duplicating Sonnet.
+    BoardReviewer(_agentic("zai:glm-5.2"), "security", "GLM"),
+    # priority 12 (LAST-RESORT reserve) — Fable 5 (Anthropic flagship). DEMOTED from
+    # priority 1 to LAST (review-cli#fable-seat-reliability, 2026-08): `review stat`
+    # telemetry showed a 97.9-100% dispatch failure rate (chronic session/usage-limit
+    # exhaustion on the account it runs through — being priority 1 made it the FIRST
+    # seat to exhaust that account's quota on every run), up from 67.7% two weeks
+    # earlier and still climbing. STILL TRUE as of 2026-09-05 (review-cli#382 investigation,
+    # `review stat --days 14`): 422 dispatch attempts, 100% failure rate, 674 retry/
+    # promotion events (session_limit=7, paywall=278, auth=214, other=175) — no
+    # improvement, so Fable stays last-resort rather than being promoted to help any of
+    # the roles this change targets; a seat that answers ~0% of the time is not a real
+    # fallback, it is decoration. At priority 1 this cost a near-certain-doomed real
+    # dispatch on literally every default review before a single working seat ever
+    # answered. Mirrors the review-cli#65 precedent right above (a seat with a
+    # confirmed pathological failure mode is deprioritized to the bottom of the
+    # reserve, not removed outright — it still backfills on the rare occasion every
+    # other seat is also down). Worse than GLM's "merely slow" profile (Fable is
+    # "essentially never answers"), so it sits even later than GLM. The
+    # seat_cooldown.py catch-rate bug that let most of these doomed dispatches through
+    # despite the existing cooldown cache is fixed separately in this same change
+    # (`_chronic_unavailable_reason` — see its docstring); THIS demotion is the
+    # complementary fix for the seats that DO still get dispatched (as reserve, now
+    # rarely) — at priority 1 a paying seat had zero chance to answer first even with
+    # a perfect cooldown catch rate. To re-rank, move this line up; its position IS
+    # its priority.
+    BoardReviewer(FABLE_SEAT, "architect", "Fable"),
 )
 
 # Presets are named, opinionated board+pool bundles for day-to-day review selection.
@@ -323,11 +447,28 @@ DEFAULT_BOARD = (
 DEFAULT_PRESET_BOARD = tuple(
     BoardReviewer(r.model, r.role, r.display, "high")
     for r in DEFAULT_BOARD
-    if r.model not in {"claude:claude-fable-5", SOL_SEAT}
+    if r.model not in {FABLE_SEAT, SOL_SEAT}
 )
+# review-cli#fable-seat-reliability: FABLE_SEAT is excluded here too (mirrors
+# `DEFAULT_PRESET_BOARD` above), for the same reason documented on its `DEFAULT_BOARD` entry
+# — a ~100% dispatch failure rate makes a "heavy" preset's paying for it pure waste, on top of
+# the DEFAULT_PRESET_BOARD gap this closes (that comprehension already excluded Fable; this one
+# didn't). GLM review finding: filter FIRST, into a named intermediate, THEN `enumerate` it —
+# the earlier version enumerated the unfiltered `DEFAULT_BOARD` and filtered Fable's row out
+# afterward (buried inside `enumerate(...)`, easy to misread as a late filter), which only
+# produced the correct xhigh/max split because Fable happened to sit LAST; a future re-rank
+# moving Fable anywhere else would have silently shifted every later seat's tier by one slot
+# with no test catching it (the tuple-order pin would read as a membership change, not a
+# tier-boundary bug). The named `_heavy_eligible_seats` intermediate makes both the filter-
+# first ordering and the resulting seat-count invariant self-documenting (11 seats as of
+# review-cli#382's TERRA_SEAT/SONNET_SEAT addition — first 4 get `xhigh` effort: Sol, Opus,
+# GLM-cc, Kimi (unchanged from before #382 — TERRA_SEAT/SONNET_SEAT were inserted at raw
+# priority 6-7, AFTER Kimi at priority 4, so they land in the `max` tier, not `xhigh`); the
+# rest get `max`).
+_heavy_eligible_seats = tuple(r for r in DEFAULT_BOARD if r.model != FABLE_SEAT)
 HEAVY_PRESET_BOARD = tuple(
     BoardReviewer(r.model, r.role, r.display, "xhigh" if i < 4 else "max")
-    for i, r in enumerate(DEFAULT_BOARD)
+    for i, r in enumerate(_heavy_eligible_seats)
 )
 LIGHT_PRESET_BOARD = tuple(
     BoardReviewer(r.model, r.role, r.display, "medium") for r in DEFAULT_PRESET_BOARD
@@ -343,15 +484,18 @@ PRESET_POOL_SIZES = {
     "heavy": 4,
     "light": 2,
 }
-DEFAULT_PRESET = "default"
+DEFAULT_PRESET = "light"
 EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
 
 
-# DEFAULT_POOL_SIZE: how many of the board's seats a plain `review` runs by default.
-# The board (DEFAULT_BOARD or a config `board:`) is a priority-ordered list; by default
-# the top 4 AVAILABLE seats participate and the remaining (lower-priority) seats are the
-# RESERVE that backfills a skipped/failed seat. The board is NEVER disabled — `--pool`
-# only sizes how many seats run. See select_pool() / panel.run_board_with_failover().
+# DEFAULT_POOL_SIZE: the pool-size fallback ONLY for a custom config `board:` with no
+# `pool:` key set (not the bare-`review`-with-no-config-at-all case — that resolves via
+# DEFAULT_PRESET's own pool, PRESET_POOL_SIZES[DEFAULT_PRESET] = 2 as of Alex's
+# 2026-08-28 "light" default; see preset_pool_size()). The board (DEFAULT_BOARD or a
+# config `board:`) is a priority-ordered list; the top N AVAILABLE seats participate and
+# the remaining (lower-priority) seats are the RESERVE that backfills a skipped/failed
+# seat. The board is NEVER disabled — `--pool` only sizes how many seats run. See
+# select_pool() / panel.run_board_with_failover().
 DEFAULT_POOL_SIZE = 4
 
 
@@ -419,7 +563,7 @@ def _effort_provider_key(model_or_provider: str) -> str:
     Reuses `backends.provider_route_name` (the SAME resolution `review` uses to pick a
     seat's backend) so both a `--effort <provider>=<level>` token and a seat's model id
     collapse to the same route name — `codex`, `claude`, `opencode` (incl. every `oc:`/
-    unknown seat), `gemini`, `commandcode`, `zai`, `openrouter`. Imported lazily to keep
+    unknown seat), `omp`, `gemini`, `commandcode`, `zai`, `openrouter`. Imported lazily to keep
     `config` import-light and cycle-free (backends never imports config)."""
     from . import backends
 
@@ -428,7 +572,15 @@ def _effort_provider_key(model_or_provider: str) -> str:
 
 # Known route keys a `--effort <provider>=<level>` token may target (for the error message
 # when a token is unrecognised). Derived once from the backend routes.
-_EFFORT_PROVIDER_KEYS = ("codex", "claude", "gemini", "opencode", "commandcode", "zai", "openrouter")
+_EFFORT_PROVIDER_KEYS = (
+    "codex",
+    "claude",
+    "gemini",
+    "opencode",
+    "commandcode",
+    "zai",
+    "openrouter",
+)
 
 
 def _require_provider_key(provider: str) -> str:
@@ -464,7 +616,9 @@ class EffortOverride:
         # this keeps programmatic callers coherent. The result is frozen behind a
         # MappingProxyType so `frozen=True` is not defeated by an in-place dict mutation.
         # Frozen dataclass → object.__setattr__.
-        canonical = {_require_provider_key(key): value for key, value in self.by_provider.items()}
+        canonical = {
+            _require_provider_key(key): value for key, value in self.by_provider.items()
+        }
         object.__setattr__(self, "by_provider", MappingProxyType(canonical))
 
     @property
@@ -504,7 +658,9 @@ def parse_effort_flag(values: list[str] | None) -> EffortOverride:
                 provider, _, level = token.partition("=")
                 provider = provider.strip()
                 if not provider:
-                    raise EffortValueError(f"malformed --effort token {token!r}; expected provider=level")
+                    raise EffortValueError(
+                        f"malformed --effort token {token!r}; expected provider=level"
+                    )
                 by_provider[_require_provider_key(provider)] = _require_effort(level)
             else:
                 default = _require_effort(token)
@@ -512,7 +668,8 @@ def parse_effort_flag(values: list[str] | None) -> EffortOverride:
 
 
 def apply_effort_override(
-    board: list[BoardReviewer], override: EffortOverride | None,
+    board: list[BoardReviewer],
+    override: EffortOverride | None,
 ) -> list[BoardReviewer]:
     """Return a board with each seat's effort resolved through the run-scoped override
     (`override.resolve(model, seat_effort)`). Identity-returns the board when the override
@@ -575,6 +732,208 @@ def split_pool_reserve(
     seats = [r for r in board if available(r)]
     n = _effective_pool_size(len(seats), pool)
     return list(seats[:n]), list(seats[n:])
+
+
+def _is_near_limit(
+    model: str,
+    usage_percent: Callable[[str], float | None],
+    threshold: float,
+) -> bool:
+    pct = usage_percent(model)
+    return pct is not None and pct >= threshold
+
+
+def _least_depleted_index(
+    models: list[str], usage_percent: Callable[[str], float | None]
+) -> int:
+    """Index of the model with the LOWEST usage percent (None reads as 0 — the
+    most-available case — but this is only ever called on a set where every
+    known percent is already >= a threshold, per its callers, so a None here
+    would mean "not really near-limit" and callers filter those out first)."""
+    return min(
+        range(len(models)),
+        key=lambda i: (usage_percent(models[i]) or 0.0, i),
+    )
+
+
+def select_pool_with_reuse(
+    board: list[BoardReviewer],
+    pool: int,
+    available: Callable[[BoardReviewer], bool] = _always_available,
+    usage_percent: Callable[[str], float | None] | None = None,
+    limit_threshold: float = DEFAULT_LIMIT_THRESHOLD,
+) -> list[BoardReviewer]:
+    """Like `select_pool`, but reuses already-available models across the
+    remaining role slots instead of shrinking the board when the usage-aware
+    candidate pool is smaller than the target size.
+
+    Selection, in order:
+      1. `reachable` = seats passing `available` (the same distinct-model
+         liveness check `select_pool` uses).
+      2. If `usage_percent` is given, split `reachable` into seats whose model
+         is BELOW `limit_threshold` percent used (`under_limit` — None counts
+         as "not excluded", fail-open when usage data is unavailable for a
+         model/provider) and seats at/above it.
+      3. `candidates` = `under_limit` if non-empty; otherwise (every reachable
+         seat is near its limit) the SINGLE seat with the lowest usage
+         percentage (ties broken by board priority) — so the board never goes
+         empty just because every seat is somewhat depleted.
+      4. Target size `n` = `_effective_pool_size(len(reachable), pool)` — the
+         same clamp `select_pool` uses, based on RAW reachability (the usage
+         threshold shrinks the MODEL pool, not the requested seat count).
+      5. The first `min(n, len(candidates))` slots each keep their OWN role, in
+         priority order — IDENTICAL to `select_pool`'s output whenever
+         `len(candidates) >= n` (this function is a drop-in when `usage_percent`
+         is None or nothing is excluded/reused: zero behaviour change).
+      6. Any remaining slots (`n - len(candidates)`) are filled by cycling back
+         through `candidates`' models, each one taking the NEXT board role not
+         yet used by an earlier slot (in board priority order) — so a shrunk
+         model pool still reviews the diff under `n` distinct lenses instead of
+         fewer."""
+    reachable = [r for r in board if available(r)]
+    if not reachable:
+        return []
+    n = _effective_pool_size(len(reachable), pool)
+
+    if usage_percent is None:
+        return list(reachable[:n])
+
+    under_limit = [
+        r
+        for r in reachable
+        if not _is_near_limit(r.model, usage_percent, limit_threshold)
+    ]
+    if under_limit:
+        candidates = under_limit
+    else:
+        idx = _least_depleted_index([r.model for r in reachable], usage_percent)
+        candidates = [reachable[idx]]
+
+    primary = candidates[: min(n, len(candidates))]
+    extra_needed = n - len(primary)
+    if extra_needed <= 0:
+        return primary
+
+    if not any(r.role for r in board):
+        # A role-less board (every seat has role="" — e.g. a config `models:`
+        # roster with no lens metadata) has no distinct lenses to gain from
+        # reuse: duplicating a model here is pure cost with zero added review
+        # diversity. Leave the pool at its (smaller) primary size instead.
+        return primary
+
+    used_roles = {r.role for r in primary}
+    # Every DISTINCT board role not yet used by `primary`, in board priority
+    # order, deduped order-preservingly. A real board can carry the SAME role
+    # twice (DEFAULT_BOARD has "consistency" and "quality" each on two seats)
+    # — without the dedup, two padded extras could land on that same role,
+    # dispatching two BYTE-IDENTICAL prompts (same model AND same lens) in
+    # parallel: pure duplicate cost, contradicting this function's own "N
+    # distinct lenses" guarantee (k3 review finding, review-cli#205 round 3).
+    role_pool: list[str] = []
+    for r in board:
+        if r.role not in used_roles and r.role not in role_pool:
+            role_pool.append(r.role)
+
+    extra: list[BoardReviewer] = []
+    for i in range(extra_needed):
+        if i >= len(role_pool):
+            # Every distinct board role is already spoken for — stop padding
+            # SHORT rather than emit a model+role pair already in the pool.
+            # A smaller-than-`n` pool (still all-distinct lenses) beats a
+            # full-size pool with a wasted duplicate dispatch.
+            break
+        extra.append(replace(candidates[i % len(candidates)], role=role_pool[i]))
+    return primary + extra
+
+
+def select_pool_and_reserve_with_reuse(
+    board: list[BoardReviewer],
+    pool: int,
+    available: Callable[[BoardReviewer], bool] = _always_available,
+    usage_percent: Callable[[str], float | None] | None = None,
+    limit_threshold: float = DEFAULT_LIMIT_THRESHOLD,
+) -> tuple[list[BoardReviewer], list[BoardReviewer]]:
+    """`(pool_seats, reserve_seats)` for the board dispatch path — the reuse-aware
+    counterpart to `split_pool_reserve`, extracted as its own testable function
+    (Fable/k3 review finding: this exact pool/reserve seat-identity construction
+    had zero coverage before).
+
+    `available` is probed EXACTLY ONCE (both `pool_seats` and `reserve_seats`
+    are derived from the same `reachable` snapshot) — calling `available`
+    separately for each risks it disagreeing with itself between calls when
+    it wraps something non-deterministic (e.g. a live chain-aware liveness
+    probe), and wastes a non-free probe.
+
+    `reserve_seats` = every reachable seat NOT one of `pool_seats`'s ORIGINAL
+    picks, matched by object IDENTITY (not `.model` string) so a config board
+    that legitimately lists the same model under two distinct roles never
+    loses one seat's reserve slot just because the OTHER seat with the same
+    model landed in the pool. A seat's reserve MEMBERSHIP does not depend on
+    its raw board position: a seat excluded from the pool for being near its
+    usage limit is just as eligible a last-resort backfill as one that simply
+    didn't fit under `pool`. Its reserve ORDER does, however, get demoted:
+    under-limit overflow seats are offered FIRST (each keeps its relative
+    board-priority order), near-limit seats LAST (same) — otherwise a
+    near-limit seat sitting at a higher board position than a perfectly
+    healthy overflow seat would be promoted to the pool FIRST on mid-run
+    failover, defeating the reason it was excluded to begin with (Fable
+    review finding, review-cli#205 round 5)."""
+    reachable = [r for r in board if available(r)]
+    reachable_ids = {id(r) for r in reachable}
+    pool_seats = select_pool_with_reuse(
+        board,
+        pool,
+        lambda r: id(r) in reachable_ids,
+        usage_percent=usage_percent,
+        limit_threshold=limit_threshold,
+    )
+    consumed_ids = {id(r) for r in pool_seats} & reachable_ids
+    unused = [r for r in reachable if id(r) not in consumed_ids]
+    if usage_percent is None:
+        reserve_seats = unused
+    else:
+        # Stable sort: seats keep their relative board-priority order WITHIN
+        # each group (under-limit first, near-limit last) — this is a
+        # DEMOTION of near-limit seats, not a full re-rank.
+        reserve_seats = sorted(
+            unused,
+            key=lambda r: _is_near_limit(r.model, usage_percent, limit_threshold),
+        )
+    return pool_seats, reserve_seats
+
+
+def expand_flat_models_with_reuse(
+    models: list[str],
+    target: int,
+    usage_percent: Callable[[str], float | None] | None = None,
+    limit_threshold: float = DEFAULT_LIMIT_THRESHOLD,
+) -> list[str]:
+    """Reuse-aware padding for a FLAT model list (quorum / just-ask / brainstorm
+    — no per-seat role/board concept). Excludes any model at/above
+    `limit_threshold` percent of its usage window; if that empties the list,
+    falls back to the SINGLE least-depleted model (repeated for every slot)
+    rather than running nothing. Returns exactly `target` entries (or
+    `len(models)` when `target <= 0`), cycling through the surviving models in
+    their given order.
+
+    A no-op (returns `models` unchanged) when `usage_percent` is None, `models`
+    is empty, or nothing is excluded and `target <= len(models)` — so existing
+    callers see zero behaviour change until a model actually IS near its
+    limit."""
+    if usage_percent is None or not models:
+        return list(models)
+
+    n = target if target > 0 else len(models)
+    under_limit = [
+        m for m in models if not _is_near_limit(m, usage_percent, limit_threshold)
+    ]
+    if under_limit:
+        pool_models = under_limit
+    else:
+        idx = _least_depleted_index(models, usage_percent)
+        pool_models = [models[idx]]
+
+    return [pool_models[i % len(pool_models)] for i in range(n)]
 
 
 def _display_name(model: str) -> str:

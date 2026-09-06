@@ -4,7 +4,7 @@ Agent-facing notes for working IN this repo. (User-facing docs live in `README.m
 
 ## What this is
 
-multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic — with one explicit, narrow opt-in exception: `review diff --staged --commit` creates a checkpoint commit of the staged diff it just reviewed (see "Fix loops" below).
+multi-model read-only code review from one command: diff review, cited quorum, brainstorm, visual review, and interactive spec-review tooling. Read-only, CLI-first, harness-agnostic — with one explicit, narrow opt-in exception: `review diff --staged --task CODE --commit` creates a checkpoint commit of the staged diff it just reviewed (see "Fix loops" below).
 
 Operationally, `review` fans a git diff (or a question / topic) out to several model
 backends in parallel and prints their findings.
@@ -40,14 +40,16 @@ while `review visual IMAGE --diff` is a diff-review iteration and must carry a t
 Task codes are one non-whitespace token, max 120 characters, with no control characters.
 
 Bare subcommands also handled directly by the CLI: `dashboard`, `sessions`, `spec-web`,
-`task`, `install-skill`, `install-commit-hook`, `install-hook tg`, `register-module`,
+`task`, `stat`, `install-skill`, `install-commit-hook`, `install-hook tg`, `register-module`,
 `trust-module`.
 `sessions` is a
 MANAGEMENT command (list / resume brainstorm sessions parsed from the discussion logs), NOT
 a fan-out mode — it is wired in `cli._dispatch` like `dashboard` and its logic lives in the
 lib (`reviewlib/sessions.py`); it deliberately does NOT register a `ModeSpec`, so it never
 collides with the mode registry. `task` is also a MANAGEMENT command: it reads run-stats and
-dashboard logs to list task iterations, models used, and detailed transcripts.
+dashboard logs to list task iterations, models used, and detailed transcripts. `stat` is the
+same class: a per-harness/per-model usage + health report parsed from the real call logs
+(`reviewlib/dashboard/tokenstats.py`), added for the 2026-08 token-burn investigation.
 
 ### Fix loops — never `git reset --hard` mid-review-cycle
 
@@ -61,8 +63,8 @@ this tool gives the caller a safe primitive for it.
 unrelated uncommitted work belonging to a DIFFERENT session/agent sharing the same checkout
 (this has happened in production: a fix-loop agent reset hard mid-cycle and wiped another
 session's uncommitted changes). Safe alternatives: `git checkout -- <file>` to discard
-specific files, or `review diff --staged --commit` to checkpoint each round with a real
-commit — undo a bad checkpoint with `git reset --soft HEAD~1`, which does NOT touch
+specific files, or `review diff --staged --task CODE --commit` to checkpoint each round
+with a real commit — undo a bad checkpoint with `git reset --soft HEAD~1`, which does NOT touch
 untracked/foreign files (unlike `reset --hard`, which wipes everything in the working tree
 regardless of who it belongs to).
 
@@ -72,8 +74,12 @@ still gets committed (the checkpoint gates on the pool producing usable verdicts
 `ok` that gates the existing `--staged` commit-hook stamp, NOT on "zero findings"). The
 commit runs the repo's own commit-msg/pre-commit hooks; a hook rejection fails `--commit`
 loudly with its own exit code rather than silently skipping the checkpoint. See
-`reviewlib/modes/review.py` (`EXIT_COMMIT_REQUIRES_STAGED` / `EXIT_COMMIT_FAILED`,
-`_checkpoint_if_requested`) and the README's "Diff review" section for the full contract.
+`reviewlib/modes/review.py` (`EXIT_COMMIT_REQUIRES_STAGED` / `EXIT_COMMIT_FAILED` /
+`EXIT_COMMIT_DIFF_TRUNCATED`, `_checkpoint_if_requested`) and the README's "Diff review"
+section for the full contract. A staged diff big enough to hit the dispatch cap
+(`$REVIEW_DIFF_MAX_BYTES`) also refuses `--commit` — a checkpoint must certify the FULL
+reviewed diff, and a truncated dispatch never did; the plain `--staged` stamp is skipped
+the same way (see `reviewlib.backends.cap_diff_for_dispatch`'s docstring).
 
 ### Option scoping — global vs subcommand
 

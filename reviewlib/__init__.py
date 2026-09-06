@@ -10,6 +10,7 @@ NOTE: `review_claude` and the other backends resolve `_which` / `_run_streamed`
 through the `reviewlib.backends` module namespace, so tests that monkeypatch
 those must patch `reviewlib.backends` (not this façade).
 """
+
 from __future__ import annotations
 
 # Re-exported for callers/tests that referenced these off the old single-file module
@@ -34,10 +35,12 @@ from .backends import (
     review_commandcode,
     review_gemini,
     review_opencode,
+    review_omp,
     review_openrouter,
     review_zai,
 )
 from .config import (
+    ASTRA_SEAT,
     CONFIG_PATH,
     DEFAULT_BOARD,
     DEFAULT_MODELS,
@@ -45,6 +48,7 @@ from .config import (
     DEFAULT_PRESET,
     DEFAULT_PRESET_BOARD,
     DEFAULT_PROMPT,
+    FABLE_SEAT,
     HEAVY_PRESET_BOARD,
     LIGHT_PRESET_BOARD,
     MODEL_ALIASES,
@@ -52,6 +56,8 @@ from .config import (
     PANEL_TIMEOUT_DEFAULT,
     REVIEW_ROLES,
     SOL_SEAT,
+    SONNET_SEAT,
+    TERRA_SEAT,
     BoardConfigError,
     BoardReviewer,
     _expand_alias,
@@ -124,6 +130,7 @@ __all__ = [
     "review_gemini",
     "review_claude",
     "review_opencode",
+    "review_omp",
     "review_zai",
     "review_commandcode",
     "review_openrouter",
@@ -169,6 +176,10 @@ __all__ = [
     "DEFAULT_POOL_SIZE",
     "REVIEW_ROLES",
     "SOL_SEAT",
+    "ASTRA_SEAT",
+    "TERRA_SEAT",
+    "SONNET_SEAT",
+    "FABLE_SEAT",
     "DEFAULT_MODELS",
     "DEFAULT_PROMPT",
     "MODEL_ALIASES",

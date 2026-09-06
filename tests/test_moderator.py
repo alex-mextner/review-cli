@@ -10,6 +10,7 @@ So a moderator that passes the cheap availability probe but dies at run time
 Same harness style as tests/test_streaming.py: plain test_* functions run by the
 __main__ block; backends are stubbed by reassigning panel module globals.
 """
+
 from __future__ import annotations
 
 import sys
@@ -23,7 +24,9 @@ from reviewlib.backends import ReviewResult  # noqa: E402
 
 
 def _result(model: str, rc: int = 0, out: str = "ok") -> ReviewResult:
-    return ReviewResult(model=model, command=f"cmd {model}", returncode=rc, stdout=out, stderr="")
+    return ReviewResult(
+        model=model, command=f"cmd {model}", returncode=rc, stdout=out, stderr=""
+    )
 
 
 def _with_stubs(*, available=None, runner=None):
@@ -94,7 +97,9 @@ def test_run_moderator_returns_first_success_without_fallback():
 
     restore = _with_stubs(runner=runner)
     try:
-        res = _panel.run_moderator(["claude:claude-opus-4-8", "codex"], "p", Path("."), 5)
+        res = _panel.run_moderator(
+            ["claude:claude-opus-4-8", "codex"], "p", Path("."), 5
+        )
         assert res.returncode == 0 and res.model == "claude:claude-opus-4-8"
         assert calls == ["claude:claude-opus-4-8"], calls  # never touched the fallback
     finally:
@@ -104,12 +109,16 @@ def test_run_moderator_returns_first_success_without_fallback():
 def test_run_moderator_falls_back_on_nonzero_exit():
     def runner(model, prompt, cwd, timeout, diff="", round_no=0):
         if model == "claude:claude-opus-4-8":
-            return _result(model, rc=124, out="")  # timeout-like failure (dead moderator)
+            return _result(
+                model, rc=124, out=""
+            )  # timeout-like failure (dead moderator)
         return _result(model, rc=0, out="recovered")
 
     restore = _with_stubs(runner=runner)
     try:
-        res = _panel.run_moderator(["claude:claude-opus-4-8", "codex"], "p", Path("."), 5)
+        res = _panel.run_moderator(
+            ["claude:claude-opus-4-8", "codex"], "p", Path("."), 5
+        )
         assert res.returncode == 0 and res.model == "codex", res
         assert res.stdout == "recovered"
     finally:
@@ -126,6 +135,36 @@ def test_run_moderator_falls_back_on_empty_output():
     try:
         res = _panel.run_moderator(["codex", "gemini"], "p", Path("."), 5)
         assert res.model == "gemini" and res.stdout == "real answer", res
+    finally:
+        restore()
+
+
+def test_run_moderator_falls_back_on_rc0_unavailable_sentinel():
+    """codex review finding (2026-08 seat-cooldown feature): a cached-cooldown-skip
+    result is rc=0 with NON-EMPTY stdout (the "is currently unavailable" cache-hit
+    notice) — the same shape a genuine short moderator answer has. Before this fix,
+    `_run_moderator_inner`'s bare `rc==0 and non-empty` check accepted it as a real
+    summary, so a cooling-down FIRST candidate silently blocked fallback to a healthy
+    one, and the cache-hit notice could be reported as the actual moderator synthesis.
+    Pins that this sentinel shape now falls through to the next candidate exactly like
+    a genuine failure."""
+
+    def runner(model, prompt, cwd, timeout, diff="", round_no=0):
+        if model == "claude:claude-fable-5":
+            return _result(
+                model,
+                rc=0,
+                out=f"{model} is currently unavailable (cached: session limit; skip "
+                "expires in 300s — reviewlib.seat_cooldown).",
+            )
+        return _result(model, rc=0, out="a real moderator summary")
+
+    restore = _with_stubs(runner=runner)
+    try:
+        res = _panel.run_moderator(
+            ["claude:claude-fable-5", "codex"], "p", Path("."), 5
+        )
+        assert res.model == "codex" and res.stdout == "a real moderator summary", res
     finally:
         restore()
 

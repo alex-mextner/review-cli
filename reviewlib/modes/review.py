@@ -25,26 +25,35 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
+
+from dataclasses import replace
 
 from ..backends import (
     ReviewResult,
     backend_available,
+    backend_unavailable_reason,
     call_backend,
+    cap_diff_for_dispatch,
     resolve_backend,
     review_with_images,
+    runtime_provider_marked_unpaid,
 )
 from ..config import (
     DEFAULT_POOL_SIZE,
+    DEFAULT_PROMPT,
     BoardReviewer,
+    _effective_pool_size,
     apply_effort_override,
-    split_pool_reserve,
+    select_pool_and_reserve_with_reuse,
 )
 from ..install import _touch_review_marker, _write_review_stamp
 from ..panel import (
     FailoverOutcome,
-    _tally_result,
+    _tally_ok,
+    _tally_tokens,
     format_result,
+    result_is_usable,
     run_board_with_failover,
 )
 from ..process import _run, git_repo_env
@@ -70,9 +79,112 @@ EXIT_COMMIT_REQUIRES_STAGED = 11
 # checkpoint guarantee and did not get one — that must be a visible, distinct failure, never
 # silently swallowed as if the review itself failed (which already has its own 0/1 result).
 EXIT_COMMIT_FAILED = 12
+# codex review finding: the stamp/checkpoint always certify against the UNCAPPED
+# canonical diff (by design), while every backend actually saw only the CAPPED,
+# possibly-truncated copy — so a truncated staged review used to still pass the
+# commit-hook gate / create a checkpoint that CLAIMS the full diff was reviewed when
+# only a partial view was. Automation invoking `review diff --staged --commit`
+# non-interactively never sees the stderr warning, so a warning alone does not protect
+# it. A truncated staged diff now REFUSES to stamp or checkpoint (this exit code for
+# `--commit`; the plain `--staged` stamp is skipped the same way, silently, matching how
+# it already skips silently on `ok=False`) — the gate exists specifically to certify
+# "the full diff was reviewed", and a partial review must never certify as one.
+EXIT_COMMIT_DIFF_TRUNCATED = 13
 
 if TYPE_CHECKING:
     from ..config import EffortOverride
+
+
+def _flat_seat_with_provider_failover(
+    model: str, dispatch: Callable[[str], ReviewResult]
+) -> ReviewResult:
+    """The flat `-m` path's per-seat runner: SAME provider-failover cascade as the board
+    path (reviewlib.panel's `_seat`), applied to a single flat seat.
+
+    Each provider in `model`'s chain first gets the in-seat transient retry
+    (`run_seat_with_retry`); a still-unusable result FAILS OVER to the chain's next provider,
+    continuing the review — the seat only reports failure once every provider is exhausted.
+    The provider that produces a usable verdict is cached as last-working (tried first next
+    run); a total failure rotates the cache. Returned results always carry `model` (the
+    caller-facing name), never the concrete provider spelling, so callers keying results by
+    the ORIGINAL requested model (as `mode_review`'s flat path does) still find them.
+
+    `dispatch` is called with the CONCRETE provider spelling for each attempt (not the
+    original `model`), so a per-provider `--effort <route>=<level>` override
+    (`_seat_effort`/`EffortOverride.effort_for`, keyed on the backend ROUTE) resolves against
+    whichever provider is ACTUALLY running at that attempt — e.g. after `zai:glm-5.2` fails
+    over to `oc:zai/glm-5.2`, an `--effort opencode=high` override applies (the seat now
+    genuinely runs the opencode route) while a `--effort zai=high` override no longer does.
+    This is intentional (raised as a 'please confirm' item on review of #157): a route-keyed
+    override exists to size whichever backend executes, not the originally-requested route.
+    See test_flat_failover_effort_follows_the_actually_dispatched_provider_route.
+
+    `dispatch` is wrapped per-attempt so a RAISE (not just a nonzero `ReviewResult`) from
+    one provider still fails over to the next, instead of aborting the whole seat and
+    skipping the rest of the chain. The board path gets this for free because `run_panel`'s
+    `_run_job` already catches every exception and normalizes it to a failed `ReviewResult`
+    before its provider-failover loop (`panel._seat`) ever sees it; the flat path's
+    `dispatch` has no such wrapper, so this cascade must do it itself (codex review of
+    #157). See test_flat_m_failover_survives_a_provider_that_raises_instead_of_returning.
+
+    The last-working-cache WRITE (`remember_working_provider`/`forget_working_provider`) is
+    gated the SAME way `provider_chain`'s cache-reorder READ is
+    (`is_default_provider_selection`): an explicit alternate pin (`-m
+    commandcode:zai-org/GLM-5.2`) succeeding/failing must not train/clear the shared
+    logical-key cache entry a later BARE alias request (`-m glm52`) reads (review of #157:
+    'cache write isn't gated the way the read is')."""
+    from ..provider_failover import (
+        forget_working_provider,
+        is_default_provider_selection,
+        provider_chain,
+        remember_working_provider,
+    )
+
+    def _safe_dispatch(provider_model: str) -> ReviewResult:
+        try:
+            result = dispatch(provider_model)
+        except Exception as exc:  # noqa: BLE001 - normalize so failover can continue
+            result = ReviewResult(
+                model=provider_model,
+                command="internal",
+                returncode=127,
+                stdout="",
+                stderr=str(exc),
+            )
+        # Tally tokens for EVERY real dispatch attempt, not just the seat's final
+        # outcome: `run_seat_with_retry` below can invoke this multiple times for
+        # ONE provider (in-seat retry) and the chain loop invokes it again per
+        # provider on failover -- each call is a real backend round-trip that may
+        # have spent real tokens (codex review finding: tallying only the final
+        # result undercounted a seat that needed a retry or a provider failover).
+        _tally_tokens(result)
+        return result
+
+    chain = provider_chain(
+        model, available=backend_available, unpaid=runtime_provider_marked_unpaid
+    )
+    cache_eligible = len(chain) > 1 and is_default_provider_selection(model)
+    last: ReviewResult | None = None
+    for idx, provider_model in enumerate(chain):
+        result = run_seat_with_retry(
+            model, lambda pm=provider_model: _safe_dispatch(pm)
+        )
+        if result_is_usable(result):
+            if cache_eligible:
+                remember_working_provider(model, provider_model)
+            return replace(result, model=model)
+        last = result
+        if idx + 1 < len(chain):
+            print(
+                f"[review-cli] seat {model}: provider {provider_model} failed — "
+                f"switching to {chain[idx + 1]} (review continues)",
+                file=sys.stderr,
+                flush=True,
+            )
+    if cache_eligible:
+        forget_working_provider(model)
+    final = last if last is not None else _safe_dispatch(model)
+    return replace(final, model=model)
 
 
 def mode_review(
@@ -90,6 +202,8 @@ def mode_review(
     exact_board: bool = False,
     effort_override: "EffortOverride | None" = None,
     commit: bool = False,
+    usage_percent: Callable[[str], float | None] | None = None,
+    stamp_diff_hash: str | None = None,
 ) -> int:
     # --commit REQUIRES --staged (see the exit-code block above). Checked BEFORE the (paid)
     # panel dispatch, not after — a usage mistake should fail fast, not after burning a full
@@ -98,7 +212,7 @@ def mode_review(
         print(
             "[review-cli] --commit requires --staged: a checkpoint commits the reviewed "
             "STAGED diff, and there is no such thing as checkpointing an unstaged/piped "
-            "diff.\n  fix: add --staged (`review diff --staged --commit`), or drop --commit.",
+            f"diff.\n  fix: add --staged (`{_RERUN_STAGED_COMMIT}`), or drop --commit.",
             file=sys.stderr,
             flush=True,
         )
@@ -127,14 +241,16 @@ def mode_review(
             visual_images,
             exact_board,
             commit,
+            usage_percent,
+            stamp_diff_hash,
         )
 
-    # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets in-seat
-    # retry on a transient failure (`--retry` / $REVIEW_RETRY_COUNT) — not just the board path.
-    # Each seat's per-attempt dispatch goes through `resolve_backend` (kept as THIS module's
-    # name so existing tests that stub `review.resolve_backend` still drive the fakes), wrapped
-    # in `run_seat_with_retry` which retries the same seat on a transient class and returns the
-    # final outcome. The per-call run-stats tally records that final outcome once per seat.
+    # The flat `-m` / config-`models:` path: each seat runs in parallel AND now gets BOTH
+    # in-seat retry on a transient failure (`--retry` / $REVIEW_RETRY_COUNT) AND provider
+    # failover (reviewlib.provider_failover) — not just the board path (codex P2 on
+    # review-cli#157: "Apply provider failover to flat -m reviews"). Each provider first gets
+    # the same-provider retry; a still-unusable result switches this SAME model to its NEXT
+    # provider, so the seat only fails once every provider is exhausted.
     results: list[ReviewResult] = []
 
     def _seat_effort(model: str) -> str | None:
@@ -144,26 +260,50 @@ def mode_review(
             effort_override.effort_for(model) if effort_override is not None else None
         )
 
+    # Capped copy for backend dispatch ONLY — never for the stamp/checkpoint `diff`
+    # below (see cap_diff_for_dispatch's docstring: capping the canonical diff broke
+    # the --commit checkpoint's integrity check, codex P1 finding). A PIPED diff
+    # (`diff_from_stdin`) is exempt from the cap — the user already explicitly, and
+    # deliberately, scoped what they piped in; capping it too would silently truncate
+    # an intentional `git diff | review diff ...` (a second codex P1 finding on the
+    # same PR: the cap originally ignored this flag even though the stamp/checkpoint
+    # calls right below already receive it).
+    dispatch_diff = diff if diff_from_stdin else cap_diff_for_dispatch(diff)
+    dispatch_diff_truncated = _warn_if_dispatch_diff_truncated(
+        diff, dispatch_diff, staged
+    )
+
     def _dispatch(model: str) -> ReviewResult:
         backend = resolve_backend(model)
         effort = _seat_effort(model)
         if visual_images:
             if effort is None:
                 return review_with_images(
-                    model, prompt, diff, cwd, timeout, 0, visual_images
+                    model, prompt, dispatch_diff, cwd, timeout, 0, visual_images
                 )
             return review_with_images(
-                model, prompt, diff, cwd, timeout, 0, visual_images, effort=effort
+                model,
+                prompt,
+                dispatch_diff,
+                cwd,
+                timeout,
+                0,
+                visual_images,
+                effort=effort,
             )
         if effort is None:
-            return backend(model, prompt, diff, cwd, timeout)
-        return call_backend(backend, model, prompt, diff, cwd, timeout, effort=effort)
+            return backend(model, prompt, dispatch_diff, cwd, timeout)
+        return call_backend(
+            backend, model, prompt, dispatch_diff, cwd, timeout, effort=effort
+        )
 
-    def _run_seat_with_retry(model: str) -> ReviewResult:
-        return run_seat_with_retry(model, lambda: _dispatch(model))
+    def _run_seat_with_failover(model: str) -> ReviewResult:
+        return _flat_seat_with_provider_failover(model, _dispatch)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
-        futures = {pool.submit(_run_seat_with_retry, model): model for model in models}
+        futures = {
+            pool.submit(_run_seat_with_failover, model): model for model in models
+        }
         for future in concurrent.futures.as_completed(futures):
             model = futures[future]
             try:
@@ -180,16 +320,465 @@ def mode_review(
                 )
             # One tally per logical seat (its FINAL outcome after any retry). No-op outside a
             # CLI-driven run; this flat path runs its own executor, so it tallies here.
-            _tally_result(results[-1].returncode)
+            # glm-5.2 review finding (2026-08 seat-cooldown feature): this used to tally by
+            # bare returncode, so a cached-cooldown sentinel (rc=0, non-empty "unavailable"
+            # body) recorded as `ok` in run-stats — the same distortion `run_moderator`'s
+            # `_tally_ok(result_is_usable(...))` already fixed. `result_is_usable` is the
+            # SAME predicate this function's own `ok` determination uses below, so a
+            # cooling-down seat can no longer report differently to run-stats than it does
+            # to the review's own pass/fail result.
+            _tally_ok(result_is_usable(results[-1]))
+            # Token tallying happens PER DISPATCH ATTEMPT inside `_safe_dispatch`
+            # above (codex review finding: tallying only the seat's final result
+            # here undercounted a seat that needed an in-seat retry or a provider
+            # failover -- each such attempt is a separate real backend call). Do
+            # NOT also tally `results[-1]` here -- it was already counted once as
+            # the last `_safe_dispatch` call that produced it; tallying it again
+            # would double-count that one attempt.
 
     by_model = {result.model: result for result in results}
-    print("\n\n---\n\n".join(format_result(by_model[model]) for model in models))
-    ok = all(result.returncode == 0 for result in results)
-    _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
-    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd, diff)
+    # check_evidence=prompt.startswith(DEFAULT_PROMPT) (k3 review finding, round 6;
+    # `.startswith` not `==`, k3 finding round 7 — see below): only the diff-review
+    # render paths (here and the board path below) apply the missing-evidence
+    # WARNING at all — DEFAULT_PROMPT's "checked: ..." contract is a diff-review-only
+    # ask, so quorum/just-ask/brainstorm's own format_result calls stay at the
+    # default False (glm-cc review finding, round 1). But even within diff-review,
+    # `--prompt` lets a caller REPLACE DEFAULT_PROMPT entirely (e.g. `--prompt
+    # 'Answer APPROVED if safe; otherwise list blockers.'`) — a custom prompt never
+    # asked for the "checked: ..." phrasing, so a compliant one-word "APPROVED"
+    # response must not get a warning claiming it omitted evidence it was never
+    # asked to provide. An exact `==` check (round 6's first cut) silently broke on
+    # `--visual`: `_with_visual` APPENDS the image's context note to whatever prompt
+    # is in effect (`text + visual_ctx.context_note`, cli.py's `_with_visual`), so
+    # `review diff --visual shot.png` with no `--prompt` dispatches
+    # `DEFAULT_PROMPT + context_note` — a DIFFERENT string from `DEFAULT_PROMPT`,
+    # even though the model still received DEFAULT_PROMPT's full "checked: ..."
+    # contract verbatim. `==` silently disabled the WARNING on every visual diff
+    # review, exactly the composable path this feature needs to keep covering.
+    # `.startswith` recognizes DEFAULT_PROMPT as an unmodified PREFIX (true whether
+    # visual appended nothing, or appended a context note) while still resolving to
+    # False for a genuinely custom `--prompt` (with or without `--visual`), which by
+    # construction never starts with DEFAULT_PROMPT's text.
+    check_evidence = prompt.startswith(DEFAULT_PROMPT)
+    print(
+        "\n\n---\n\n".join(
+            format_result(by_model[model], check_evidence=check_evidence)
+            for model in models
+        )
+    )
+    # Opus review finding: this used to check ONLY `returncode == 0`, not
+    # `result_is_usable`. A live rc=0 "is currently unavailable" sentinel (the same
+    # shape `_cooldown_skip_result` deliberately mirrors, and the board path already
+    # guards against via `result_is_usable` in `run_board_with_failover`) would
+    # therefore read as `ok=True` on the FLAT path whenever provider failover exhausts
+    # without a working alternate — e.g. a single-seat `-m fable` review with no
+    # failover chain left. That is not a hypothetical: `_flat_seat_with_provider_
+    # failover` already returns the CHAIN'S FINAL (possibly still-unusable) result
+    # unchanged once every provider is exhausted (`final = last if last is not None
+    # else ...`); this cooldown feature makes an rc=0 unusable result far more common
+    # than the rare live-paywall case that could already trigger this pre-existing gap.
+    # A checkpoint/stamp must never certify a diff that produced ZERO real review
+    # content — `result_is_usable` is the same predicate the board path already uses
+    # for exactly this reason.
+    #
+    # ACCEPTED LIMITATION (glm review finding, this feature's own PR): `result_is_usable`
+    # marks any rc=0 body <= 400 chars containing a marker phrase like "is currently
+    # unavailable" as unusable, with no check for WHERE in the body it appears — so a
+    # genuine terse verdict that happens to QUOTE that phrase (e.g. reviewing this exact
+    # code, "the cooldown check only fires on 'is currently unavailable'; add the other
+    # markers") reads as `ok=False` and withholds the stamp/checkpoint. This is not new
+    # here — the board path (`run_board_with_failover`) already carried the identical
+    # heuristic before this diff; this change only extends the SAME accepted trade-off
+    # to the flat path for consistency. Narrowing it (e.g. only matching the marker on
+    # its own line) risks a false NEGATIVE — letting a real cache-hit sentinel through
+    # as "usable" — which is the more dangerous direction for a commit-gate certifying
+    # a review actually happened. Left as-is deliberately; not a regression to fix here.
+    ok = all(result_is_usable(result) for result in results)
+    _stamp_if_staged_commit_review(
+        ok,
+        staged,
+        diff_from_stdin,
+        cwd,
+        diff,
+        dispatch_diff_truncated,
+        stamp_diff_hash=stamp_diff_hash,
+    )
+    override = _checkpoint_if_requested(
+        commit, ok, diff_from_stdin, cwd, diff, dispatch_diff_truncated
+    )
     if override is not None:
         return override
     return 0 if ok else 1
+
+
+def _warn_if_dispatch_diff_truncated(
+    diff: str, dispatch_diff: str, staged: bool
+) -> bool:
+    """Print a visible stderr warning whenever the dispatch cap actually truncated the
+    diff, and return WHETHER IT DID (codex review finding, round 5, then round 6): the
+    stamp/checkpoint always certify against the UNCAPPED canonical `diff` (by design —
+    see cap_diff_for_dispatch's docstring), so `review diff --staged` on an oversized
+    staged diff used to still pass the commit-hook gate ("the staged index was
+    reviewed") even though every seat actually saw only the first
+    $REVIEW_DIFF_MAX_BYTES plus a truncation note. A stderr warning alone does NOT
+    protect automation (a non-interactive `review diff --staged --commit` never sees it)
+    — the return value here lets the caller REFUSE to stamp/checkpoint on a truncated
+    staged diff, not just warn about it (see EXIT_COMMIT_DIFF_TRUNCATED).
+
+    This return used to be STAGED-SCOPED — `False` for an unstaged truncated run, on the
+    reasoning that such a run has no commit-gate certification to refuse. That became
+    wrong the moment `_commit_gate_skip_reason` started using the same value to pick
+    WHICH remediation to print (codex finding, iteration 4): an unstaged oversized run
+    arrived as `truncated=False`, fell through to the not-staged branch, and was told to
+    "stage and re-run `--staged`" — which truncates again, the exact looping advice that
+    branch ordering exists to prevent. The value is now the plain fact "the cap cut this
+    diff", and staged-scoping happens where it belongs, in the callers that act on it:
+    the stamp path refuses an unstaged run anyway (it is not `staged`), and the
+    checkpoint path is only ever reached under `--staged` (`--commit` without `--staged`
+    is rejected before dispatch, EXIT_COMMIT_REQUIRES_STAGED). Only the WORDING of the
+    warning below is still staged-specific.
+
+    Opus review finding (this feature's own PR): an unstaged, over-cap `review diff`
+    used to truncate completely SILENTLY to the user — the only signal was the marker
+    embedded in the payload handed to the backend, which never reaches the user's own
+    stdout. Not printing a warning here just because there's no gate to refuse left a
+    real, common case (a plain `review diff` on a huge change) reviewing a partial diff
+    with zero visible notice. Both branches below share the same byte-count facts; only
+    the framing (commit-gate consequence vs none) and the git command hint differ."""
+    truncated = dispatch_diff != diff
+    if not truncated:
+        return False
+    full_bytes = len(diff.encode("utf-8"))
+    reviewed_bytes = len(dispatch_diff.encode("utf-8"))
+    if staged:
+        print(
+            "[review-cli] WARNING: the staged diff exceeded $REVIEW_DIFF_MAX_BYTES and "
+            "was TRUNCATED for every seat — this review covers only a PARTIAL view of "
+            "the staged change, not the full diff, so no commit-gate stamp/checkpoint "
+            f"will be created. Full diff: {full_bytes} bytes; reviewed: "
+            f"{reviewed_bytes} bytes. Scope the review "
+            "(`git diff --cached -- <path>`) or raise the cap to review the full change.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return True
+    print(
+        "[review-cli] WARNING: the diff exceeded $REVIEW_DIFF_MAX_BYTES and was "
+        "TRUNCATED for every seat — this review covers only a PARTIAL view of the "
+        f"change. Full diff: {full_bytes} bytes; reviewed: {reviewed_bytes} bytes. "
+        "Scope the review (`git diff -- <path>`) or raise $REVIEW_DIFF_MAX_BYTES to "
+        "review the full change.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return True
+
+
+def _warn_if_board_reused(
+    board: list[BoardReviewer], pool: list[BoardReviewer]
+) -> None:
+    """Operator-facing stderr notice when `select_pool_with_reuse` actually
+    padded the pool with a repeated model -- NOT inferred from "does `pool`
+    contain a duplicate model" (a config board MAY legitimately list the same
+    model under two distinct roles as two separate seats, which would
+    false-positive that check — Fable/k3 review finding). The accurate
+    signal: `select_pool_with_reuse`'s padding entries are always fresh
+    `replace()` copies (see its docstring), so their `id()` is never one of
+    `board`'s own seat objects — an ORIGINAL board seat repeated verbatim in
+    `pool` is a legitimate duplicate-model board, not reuse.
+
+    Mirrors the existing failover promotion message (`run_board_with_failover`'s
+    stderr line) so the duplicated dispatch cost is attributable, not silent."""
+    board_ids = {id(r) for r in board}
+    reused_models = [r.model for r in pool if id(r) not in board_ids]
+    if not reused_models:
+        return
+    counts = {m: reused_models.count(m) for m in dict.fromkeys(reused_models)}
+    repeated = ", ".join(f"{m} x{n}" for m, n in counts.items())
+    print(
+        f"[review-cli] board padded — reusing {repeated} across extra roles "
+        "(too few distinct models were under their usage limit)",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _report_pool_shortfall(
+    board: list[BoardReviewer],
+    pool: list[BoardReviewer],
+    *,
+    reserve: list[BoardReviewer],
+    pool_size: int,
+) -> None:
+    """`pool`/`reserve` are keyword-only past `pool` on purpose (GLM review finding,
+    round 5): both are same-typed `list[BoardReviewer]` sitting side by side, and a
+    future caller writing `(board, reserve, pool, pool_size)` type-checks cleanly while
+    silently inverting the semantics -- with a typical short pool, `len(reserve) >=
+    requested` would suppress the notice entirely, the exact silent-shrink bug this
+    function exists to catch. Forcing `reserve=` at the call site makes that transposition
+    a TypeError instead of a silent regression.
+
+    STDOUT (not stderr) notice naming every board seat that is unavailable, whenever
+    the live pool comes up short of the requested `pool_size`. This is the pre-dispatch
+    counterpart to `outcome.degraded`'s existing notice: that one only fires for the
+    rarer reserve-exhausted-DURING-dispatch case, and only to stderr. A pool that never
+    even reached `pool_size` because seats were unavailable BEFORE dispatch had NO
+    notice anywhere -- an agent piping review output into a PR/TG report keeps stdout
+    and drops stderr, so this silent shrink was invisible to every downstream reader of
+    the review (Alex, 2026-08-28: a report said "reviewed via codex + Fable" with zero
+    mention that Opus/GLM were configured but missing -- two different seats, two
+    different root causes, both silent).
+
+    A healthy seat sitting in `reserve` (not unavailable, just outranked by priority or
+    already covering another role) is NOT reported -- unused reserve capacity is normal,
+    not a gap. Only board seats absent from BOTH `pool` and `reserve` (i.e. genuinely
+    unreachable per `backend_unavailable_reason`) count as the gap.
+
+    `pool_size` is the RAW requested size. The selector itself (`select_pool_with_reuse`
+    / `split_pool_reserve` in config.py) clamps it against `len(reachable)` -- the LIVE
+    seat count -- via its own `_effective_pool_size` call, which is a TIGHTER clamp than
+    this notice needs: an operator asking for `--pool 8` against a 4-seat board
+    legitimately gets a 4-seat live pool with nothing unavailable. Reporting against the
+    raw, unclamped `pool_size` in that case prints an arithmetically nonsensical
+    "requested 8, only 3 live -- 1 unavailable" (k3 review finding, round 1: 8-3=5
+    unaccounted-for vs. 1 named seat, because 4 of the 8 never existed on the board). So
+    this notice re-clamps separately, against the LOOSER `min(pool_size, len(board))` --
+    what the board could ever actually deliver, board size rather than live-seat count --
+    not the raw ask (GLM review finding, round 2: this is deliberately NOT the same
+    clamp the selector applies; syncing the two would silence the exact
+    `2-of-6-seats-down --pool 5` case this notice exists to catch).
+
+    `pool_size <= 0` means "run every available seat" (`--pool 0`/no preset) -- there is
+    still a real target here, `len(board)`, so this must NOT be treated the same as "no
+    shortfall concept applies" (k3 review finding, round 2: a `--pool 0` run against a
+    10-seat board with 2 seats down would otherwise print nothing, reproducing the exact
+    incident this notice exists to kill under the "all seats" configuration).
+
+    KNOWN LIMITATIONS (tracked as review-cli#277, not fixed here -- this notice is
+    strictly more visible than the prior silence, but none of the gaps below block
+    that): (1) the reason shown is RE-PROBED via `backend_unavailable_reason` on the
+    RAW board spelling rather than the actual reason the selector excluded the seat
+    for; for a seat truly excluded by the chain-aware availability probe (which
+    alias-expands) this is usually still accurate (the chain probe is strictly
+    weaker-or-equal to this re-probe for a CONCRETE spelling, so a seat that failed the
+    former usually fails the latter too, with a real reason). Narrow exception (k3
+    review finding, round 4): a bare-ALIAS board seat (e.g. `glm52`, not `oc:zai/glm-5.2`)
+    re-probes the unexpanded alias, which can miss an unpaid-provider mark or resolve to
+    a different backend than the chain actually tried -- "reason unknown" (or a
+    misleading reason) is reachable for that specific shape, not fully dead code. (2) a
+    seat excluded for being NEAR its usage limit (the `usage_percent`-based reuse path in
+    config.py) is technically reachable, so the selector pads the pool back up with a
+    duplicate seat instead of leaving a gap -- `len(pool) >= requested` then true, and
+    this function returns before ever inspecting that seat, so the near-limit exclusion
+    is invisible here, not merely mislabeled (Fable review finding, round 2). This is
+    strictly the PADDING-SUCCEEDS case (the function never reaches the code below); the
+    padding-FAILS case (a role-less or too-few-role board can't pad at all, so `pool`
+    stays short with the near-limit/role-excluded seats sitting healthy in `reserve`) IS
+    handled below -- see the `reserve` line in the printed notice (Codex review finding,
+    PR #278). (3) This notice prints at pre-dispatch time, before whatever produces a
+    "reviewed via X + Y" summary runs -- an agent that only pastes the final summary (not
+    the full terminal output) still misses it."""
+    # `_effective_pool_size` (config.py) is the single source of truth for this clamp
+    # (its own docstring: "so the two [select_pool + split_pool_reserve] can never
+    # drift") -- re-deriving the rule inline here would let a future change to that
+    # helper silently desync the notice's "requested N" from what the selector actually
+    # targeted (GLM review finding, round 8).
+    requested = _effective_pool_size(len(board), pool_size)
+    if len(pool) >= requested:
+        return
+    live_ids = {id(r) for r in pool} | {id(r) for r in reserve}
+    missing = [r for r in board if id(r) not in live_ids]
+    # No early `if not missing: return` here (Codex review finding, PR #278): `board`
+    # is exactly `pool | reserve | missing` (disjoint), and `requested <= len(board)`
+    # by construction of `_effective_pool_size` above -- so having reached this line
+    # (`len(pool) < requested`), `missing` and `reserve` can never BOTH be empty. A
+    # role-less (or too-few-distinct-roles) board can shrink `pool` below `requested`
+    # via `select_pool_with_reuse`'s role-padding cutoff with EVERY seat reachable --
+    # `missing` empty, `reserve` holding the unused-but-healthy seats -- and the old
+    # guard silently returned here, reproducing the exact "zero signal" bug this
+    # notice exists to kill, just via a role-limit cause instead of an availability one.
+    lines = [
+        f"[review-cli] pool came up short: requested {requested} seats "
+        f"(board has {len(board)}), only {len(pool)} live"
+        + (f" -- {len(missing)} board seat(s) unavailable:" if missing else ":")
+    ]
+    for r in missing:
+        reason = backend_unavailable_reason(r.model) or "unavailable (reason unknown)"
+        label = r.display or r.model
+        lines.append(f"  - {label} ({r.model}): {reason}")
+    if reserve:
+        # Codex review finding, PR #278: printing ONLY `missing` here made a role/usage
+        # -driven shrink (healthy seats sitting unused in `reserve` because the board
+        # had too few distinct roles to pad into, or because they're near their usage
+        # limit) look like it was fully explained by whatever unavailable seat happened
+        # to also be on the board -- e.g. "1 selected + 3 healthy reserve + 1 unavailable"
+        # printed as "only 1 live -- 1 unavailable", falsely pinning a 3-seat gap on one
+        # seat. State the reserve count as its own fact instead of folding it into the
+        # unavailable-seat blame.
+        lines.append(
+            f"  ({len(reserve)} more board seat(s) are reachable but sitting in "
+            "reserve -- excluded from the pool by role/usage-based selection, not "
+            "availability)"
+        )
+    # flush=True (GLM review finding, round 5): every sibling operator notice in this
+    # file flushes (_warn_if_board_reused, the degraded warning, the provider-switch
+    # notice) -- without it, a piped/teed run (`review diff | tee report.md`) block-
+    # buffers this print, and a run killed mid-dispatch loses it entirely, silently
+    # reproducing the exact "zero signal" incident this notice exists to fix.
+    print("\n".join(lines), flush=True)
+
+
+# The one pre-commit invocation every gate remediation points at. Spelled ONCE: every
+# recorded review mode requires `--task CODE`, so a rerun command without a task-code
+# placeholder fails at the first keystroke whenever $REVIEW_TASK_CODE is unset (Codex
+# finding on #359) — five copies drifting apart is how that regresses one string at a time.
+_RERUN_STAGED = "review diff --task <CODE> --staged -C <repo>"
+# Its `--commit` sibling, for the `--commit` usage and checkpoint refusals (all of which
+# already run inside the repo, so no `-C <repo>`).
+_RERUN_STAGED_COMMIT = "review diff --task <CODE> --staged --commit"
+
+
+# Why an OK review did not satisfy the commit gate — and what to do about it.
+#
+# This is the single source of truth for the DIFF-SHAPE half of the gate predicate:
+# `_stamp_if_staged_commit_review` does not re-spell those conditions, it asks here and stamps
+# iff the answer is None. An earlier draft carried the predicate twice (the `if` plus this
+# function) with a comment promising they would not drift; a review pointed out that a future
+# fourth clause added to the `if` alone would fall through to "no reason" and skip the warning
+# SILENTLY — which is the very bug this code exists to kill. One copy, no promise needed.
+#
+# Two conditions deliberately live in the CALLER instead, because neither is a property of the
+# diff's shape (iteration-2 accuracy finding — the earlier "SINGLE source of truth for the gate
+# predicate" claim was overstated by exactly these two):
+#   * `ok`   — a FAILED review is not this function's business; its own failure output is the
+#              louder reason, and a gate line on top of it points at the wrong problem.
+#   * the marker WRITE actually succeeding — only knowable after attempting it.
+# Both still route their user-visible outcome through `_warn_commit_gate_not_satisfied` (or, for
+# `ok=False`, through the review's own failure output), so no path stays silent.
+#
+# The gate is satisfied by exactly ONE shape of review, and every other shape used to leave the
+# marker alone SILENTLY — which reads, from the caller's side, as "my review passed, so why is
+# my commit still blocked?". A real detached agent burned ~40 minutes on that gap: it ran
+# `review diff` (unstaged), saw every seat pass, found the marker stale, followed the gate's own
+# README advice to `touch` the marker path by hand, and its headless permission policy
+# auto-rejected the write to that external directory and killed the run. Naming the reason on
+# stderr turns that into a one-line fix.
+#
+# The REMEDIATION is per-reason, not one shared suffix: "re-run it `--staged`" is right for an
+# unstaged or piped run and WRONG for a truncated one (re-running truncates again — advice that
+# loops is how an agent burns another 40 minutes).
+
+
+def _commit_gate_skip_reason(
+    staged: bool, diff_from_stdin: bool, truncated: bool
+) -> tuple[str, str] | None:
+    """`(reason, remediation)` for the first condition this review fails, or None when it
+    satisfies the gate. Callers must only consult it for an OK review — a FAILED review has
+    its own, louder reason (the failure itself) and is not this function's business."""
+    # ORDER MATTERS, and `truncated` deliberately comes FIRST (Fable review finding on
+    # iteration 2). Only ONE reason is reported — the first failing condition — so the
+    # order decides which remediation a compound failure gets. `staged`/`diff_from_stdin`
+    # are fixed by re-running differently; `truncated` is NOT: it persists across every
+    # re-run of the same oversized diff. Checking `staged` first would tell an unstaged,
+    # oversized run to "stage and re-run `--staged`", it would truncate again, and only
+    # THEN would it hear "split the change" — one wasted multi-minute review round, which
+    # is precisely the looping-advice failure this whole notice exists to prevent.
+    if truncated:
+        return (
+            "the diff was truncated for dispatch, so no seat saw all of it",
+            "split the change into smaller staged commits (or raise $REVIEW_DIFF_MAX_BYTES) "
+            f"and review each part with `{_RERUN_STAGED}` — re-running this "
+            "same diff truncates again, and piping a smaller one in still fails the "
+            "index-provenance check",
+        )
+    if not staged:
+        return (
+            "the review was not `--staged` (the gate certifies the staged index)",
+            f"stage what you are about to commit and re-run `{_RERUN_STAGED}`",
+        )
+    if diff_from_stdin:
+        return (
+            "the diff was piped on stdin, not read from `git diff --cached`",
+            f"re-run `{_RERUN_STAGED}` and let it read the index itself",
+        )
+    return None
+
+
+# The two artifacts a gate-eligible review writes, and the consequence of losing each.
+# They are NOT interchangeable: agent-tools' `require-review-before-commit` hook stats the
+# session MARKER, while the local git pre-commit hook verifies the diff-scoped REVIEW-STAMP
+# against the diff being committed. A first version of this warning hard-coded the marker
+# into its frame and let the stamp branch borrow it, which produced a line that opened
+# "commit-gate marker not written" for a run whose marker HAD been written and then sent
+# the reader to check $REVIEW_MARKER while the broken file was the stamp (Fable finding,
+# iteration 7). Naming the artifact is the whole point of this warning; getting it wrong is
+# worse than staying silent.
+# Each entry is (artifact, consequence, closing warning). The CLOSING warning differs too,
+# and not decoratively: the marker is mtime-stat'd, so a hand-made one is indistinguishable
+# from a real one and forging it is the whole hazard. The stamp carries the hash of the
+# reviewed diff, so hand-making a USEFUL one means computing the hash of the very diff you
+# are about to commit — the forgery advice does not transfer, and printing it there would
+# be one more sentence pointing at the wrong problem (Fable finding, iteration 8).
+_GATE_MARKER = (
+    "commit-gate marker",
+    "A pre-commit review gate keyed on that marker (e.g. agent-tools' "
+    "require-review-before-commit) will not count this run:",
+    "Never create it by hand — a completed staged review is what writes it, so a "
+    "hand-made one certifies a review that did not happen.",
+)
+# The SKIP path (unstaged / piped / truncated) writes NEITHER artifact, so naming only one
+# of them invites the reader with the other gate installed to conclude the line is not
+# about them (Fable finding, iteration 12).
+_GATE_BOTH = (
+    "commit-gate marker and diff-scoped review-stamp",
+    "Neither pre-commit review gate — agent-tools' require-review-before-commit, which "
+    "stats the marker, nor the git hook that verifies the stamp — will accept this run:",
+    "Never create either by hand — a completed staged review is what writes them, so a "
+    "hand-made one certifies a review that did not happen.",
+)
+_GATE_STAMP = (
+    "diff-scoped review-stamp",
+    "A pre-commit git hook that verifies the reviewed diff against that stamp (the one "
+    "`review install-commit-hook` places) will reject the commit:",
+    "Re-running the review is the fix — the stamp records the hash of the diff that was "
+    "actually reviewed, so there is nothing useful to write there by hand.",
+)
+
+
+def _warn_commit_gate_not_satisfied(
+    reason: str,
+    remediation: str,
+    *,
+    artifact_and_consequence: tuple[str, str, str] = _GATE_MARKER,
+) -> None:
+    """One stderr line: which artifact is missing, why, and the fix for THAT reason.
+
+    States only what review-cli can observe — that it did not write the marker. It does
+    not claim a commit "will be blocked": whether a gate is installed at all, whether a
+    commit is even pending, and whether an earlier staged run left a still-fresh marker
+    are all outside this process's knowledge. It does warn off the hand-`touch`
+    workaround, which is review-cli's own contract to state: the marker means "review-cli
+    ran and passed", so a hand-written one certifies a review that never happened.
+
+    UNCONDITIONAL, and that is a deliberate trade-off rather than an oversight — three
+    review seats raised it across two iterations, so the reasoning is recorded here. The
+    obvious alternative is to stay quiet unless a gate is plausibly installed, proxied by
+    "$REVIEW_MARKER is set" or "the marker path already exists". Rejected: both proxies
+    are wrong in the direction that costs the most. The marker exists only AFTER a first
+    passing staged run, so on a fresh machine — a new checkout, a fresh container, a
+    detached agent's first task, exactly where nobody has the context to diagnose a
+    blocked commit — the proxy says "no gate" and the line disappears at the one moment
+    it is worth the most. The cost of being wrong the other way is one hedged stderr line
+    on a review that passed. The accepted price is that plain `review diff` (the default,
+    most common shape) always ends with this line, so it must stay one line and stay
+    hedged; if it ever grows into a paragraph, revisit the trade-off, not the wording."""
+    artifact, consequence, closing = artifact_and_consequence
+    print(
+        f"[review-cli] {artifact} not written — {reason}. {consequence} "
+        f"{remediation}. {closing}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _stamp_if_staged_commit_review(
@@ -198,12 +787,16 @@ def _stamp_if_staged_commit_review(
     diff_from_stdin: bool,
     cwd: Path,
     diff: str,
+    truncated: bool,
+    *,
+    stamp_diff_hash: str | None = None,
 ) -> None:
     """Write the diff-scoped review-stamp and touch the session marker iff this review
     genuinely satisfies the staged commit gate. Shared by the flat and board paths so the
-    gate condition stays in ONE place.
+    gate condition stays in ONE place — and the condition itself lives in
+    `_commit_gate_skip_reason`, which this function only consults.
 
-    Conditions (all required):
+    Conditions (all required; `ok` is checked here, the rest in `_commit_gate_skip_reason`):
       * `ok`             — the review actually passed (every seat usable / not degraded).
       * `staged`         — `--staged`; an unstaged/working-tree review is not the gate.
       * NOT `diff_from_stdin` — the diff came from `git diff --cached`, not piped stdin.
@@ -211,10 +804,70 @@ def _stamp_if_staged_commit_review(
         not satisfy the commit gate. The stamp is diff-scoped (the hook re-derives the
         cached diff and compares), but the marker is mtime-only and would otherwise be
         forgeable this way — so both are gated on real-index provenance.
+      * NOT `truncated` — codex review finding: the stamp certifies the UNCAPPED
+        canonical `diff`, but every seat only saw the CAPPED, truncated copy when this
+        is True — so a truncated staged review no longer satisfies the pre-commit hook
+        gate it would otherwise pass. (`_warn_if_dispatch_diff_truncated` has already
+        printed the loud stderr warning explaining the truncation itself before this
+        function is ever called; the gate line below adds only the gate consequence.)
+
+    When the review is `ok` but one of the other conditions fails, this NAMES the failed
+    condition on stderr (`_warn_commit_gate_not_satisfied`) instead of skipping silently
+    — see `_commit_gate_skip_reason` for the incident that motivated it. The same holds
+    for the one branch that DOES attempt the write and loses: a gate-eligible run whose
+    marker write fails is reported too, so "the review passed but the marker is stale" is
+    never an unexplained state. A FAILED review (`ok=False`) still skips silently: its own
+    failure output is the reason, and a gate line on top of it would just be noise.
+
+    `truncated` has NO default (Fable review finding): a defaulted `False` would be
+    fail-OPEN — a future call site that simply forgets to pass it would silently
+    certify a truncated review again, exactly the bug this parameter exists to prevent.
+    Every current caller already computes and threads it explicitly.
+
+    `stamp_diff_hash` (round-5 review finding, k3+Opus): the pre-commit-hook-compatible
+    hash captured by the CLI at DISPATCH time (adjacent to `diff`'s own capture), passed
+    straight through to `_write_review_stamp` so the stamp certifies what the models
+    actually reviewed rather than whatever `git diff --cached` returns MINUTES later at
+    stamp-write time (a real TOCTOU window: a concurrent index mutation during the panel
+    run could otherwise get silently certified as reviewed). None for any non-CLI caller
+    of `mode_review` — `_write_review_stamp` falls back to its own independent re-derive.
     """
-    if ok and staged and not diff_from_stdin:
-        _write_review_stamp(cwd, diff)
-        _touch_review_marker()
+    if not ok:
+        return  # the review's own failure output already says why; no gate line on top of it.
+    skipped = _commit_gate_skip_reason(staged, diff_from_stdin, truncated)
+    if skipped is not None:
+        _warn_commit_gate_not_satisfied(*skipped, artifact_and_consequence=_GATE_BOTH)
+        return
+    stamp_error = _write_review_stamp(cwd, diff, stamp_diff_hash=stamp_diff_hash)
+    marker_error = _touch_review_marker()
+    if stamp_error is None and marker_error is None:
+        return
+    # The gate-ELIGIBLE run whose own writes failed (iteration-2 review finding, raised
+    # independently by three seats; extended to the stamp on iteration 6). Both writes are
+    # best-effort by design — neither an unwritable REVIEW_MARKER nor an unwritable
+    # `.git/review-stamp` may fail a good review — but swallowing a failure silently
+    # rebuilds the original trap one level down: the review passes, every doc says a
+    # passing staged run satisfies the gate, it does not, and the caller concludes the
+    # gate is broken and forges the marker by hand.
+    #
+    # The two feed DIFFERENT gates and so are reported separately: agent-tools'
+    # `require-review-before-commit` stats the marker, while the local git pre-commit hook
+    # verifies the diff-scoped stamp. Losing either one blocks a commit on its own, and
+    # each has its own remediation, so a merged "something failed" line would send the
+    # caller to fix the wrong file half the time.
+    if marker_error is not None:
+        _warn_commit_gate_not_satisfied(
+            f"the marker file could not be written ({marker_error})",
+            "point $REVIEW_MARKER at a writable path (or fix the permissions on the "
+            f"default one) and re-run `{_RERUN_STAGED}`",
+        )
+    if stamp_error is not None:
+        _warn_commit_gate_not_satisfied(
+            f"the write failed ({stamp_error})",
+            "check that `.git/review-stamp` (`git rev-parse --git-path review-stamp`) is "
+            f"writable, then re-run `{_RERUN_STAGED}`",
+            artifact_and_consequence=_GATE_STAMP,
+        )
 
 
 _CHECKPOINT_COMMIT_MESSAGE = "chore: checkpoint via review diff --staged --commit"
@@ -521,12 +1174,14 @@ def _checkpoint_if_requested(
     diff_from_stdin: bool,
     cwd: Path,
     diff: str,
+    truncated: bool,
 ) -> int | None:
     """Create the `--commit` checkpoint commit after a review, if requested.
 
     Called only after `mode_review` has already validated commit-implies-staged up
     front, so `staged` is always True here by construction — the remaining gate mirrors
-    `_stamp_if_staged_commit_review`'s other two conditions (`ok`, not `diff_from_stdin`).
+    `_stamp_if_staged_commit_review`'s other conditions (`ok`, not `diff_from_stdin`,
+    not `truncated`).
 
     Precisely: this CHECKPOINTS the reviewed staged diff after the review completes —
     it does NOT mean "commits when the review passes". `ok` means the pool produced
@@ -535,13 +1190,22 @@ def _checkpoint_if_requested(
     same as the existing `--staged` stamp gate). That is intended, not a bug.
 
     Returns `None` to leave the review's own 0/1 result standing (covers: `--commit`
-    not requested; the gate not satisfied — the review failed, or the diff was piped —
-    in which case a note is printed but the review's own result is untouched; or the
-    checkpoint commit itself succeeded). Returns `EXIT_COMMIT_FAILED` to OVERRIDE an
-    otherwise-successful review's exit code when the review passed, the gate was
-    satisfied, but the `git commit` subprocess itself failed — the user asked for a
-    checkpoint guarantee and did not get one, so that must be visible, never silently
-    swallowed.
+    not requested; the gate not satisfied — the review failed, the diff was piped, or
+    the diff was truncated for dispatch — in which case a note is printed but the
+    review's own result is untouched; or the checkpoint commit itself succeeded).
+    Returns `EXIT_COMMIT_FAILED` to OVERRIDE an otherwise-successful review's exit code
+    when the review passed, the gate was satisfied, but the `git commit` subprocess
+    itself failed. Returns `EXIT_COMMIT_DIFF_TRUNCATED` when the staged diff exceeded
+    the dispatch cap (codex review finding): a checkpoint is supposed to certify the
+    FULL reviewed diff, but every seat only saw the truncated copy — a stderr warning
+    alone does not protect non-interactive automation from silently checkpointing a
+    partial review, so this REFUSES rather than checkpoints. Either override is a
+    visible, distinct failure, never silently swallowed as the review's own 0/1 result.
+
+    `truncated` has NO default (Fable review finding): a defaulted `False` would be
+    fail-OPEN — a future call site that simply forgets to pass it would silently
+    checkpoint a truncated review again. Every current caller already computes and
+    threads it explicitly.
     """
     if not commit:
         return None
@@ -561,6 +1225,17 @@ def _checkpoint_if_requested(
             flush=True,
         )
         return None
+    if truncated:
+        print(
+            "[review-cli] --commit: the staged diff exceeded $REVIEW_DIFF_MAX_BYTES and "
+            "was TRUNCATED for dispatch — no checkpoint created (a checkpoint must certify "
+            "the FULL reviewed diff, and every seat here only saw a partial view). Scope "
+            "the review (`git diff --cached -- <path>`) or raise $REVIEW_DIFF_MAX_BYTES, "
+            f"then re-run `{_RERUN_STAGED_COMMIT}`.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return EXIT_COMMIT_DIFF_TRUNCATED
     succeeded, detail = _checkpoint_commit(cwd, diff)
     if succeeded:
         print(
@@ -573,7 +1248,7 @@ def _checkpoint_if_requested(
         "[review-cli] --commit: the review succeeded but the checkpoint commit itself "
         f"FAILED — no checkpoint was created.\n  git commit failed: {detail}\n"
         "  fix: check the repo's commit-msg/pre-commit hooks (lint/typecheck/tests may be "
-        "blocking it), then re-run `review diff --staged --commit`.",
+        f"blocking it), then re-run `{_RERUN_STAGED_COMMIT}`.",
         file=sys.stderr,
         flush=True,
     )
@@ -593,6 +1268,8 @@ def _mode_review_board(
     visual_images: tuple[Path, ...] = (),
     exact_board: bool = False,
     commit: bool = False,
+    usage_percent: Callable[[str], float | None] | None = None,
+    stamp_diff_hash: str | None = None,
 ) -> int:
     """Board path: a priority-ordered FAILOVER pool of role-lensed reviewers.
 
@@ -612,13 +1289,51 @@ def _mode_review_board(
     paywalled-Fable case would make every `review --staged` fail despite a full, healthy
     pool). Only a genuine shortfall (reserve exhausted before the pool refilled) is a
     failure. `outcome_sink`, when given, receives the FailoverOutcome so the CLI can
-    report the models that actually ran."""
+    report the models that actually ran.
+
+    `usage_percent`, when given, enables reuse-aware pool composition (Alex,
+    2026-08-18) — the CALLER (cli.py's `_dispatch`) builds ONE tg-ctl usage
+    snapshot per dispatch and passes the resulting closure down, rather than
+    this function loading it itself. Defaults to None: NO usage-limit
+    awareness, byte-identical to the pre-reuse `split_pool_reserve` selection
+    — this keeps every existing/direct caller of `_mode_review_board` (tests
+    included) hermetic by default; it never touches the real
+    ~/.config/tg-cli/ file unless the caller explicitly opts in (k3/Fable
+    review finding: an unconditional internal load broke test hermeticity for
+    board-path tests that assert exact dispatched model sets)."""
     if exact_board:
         pool, reserve = list(board), []
     else:
-        pool, reserve = split_pool_reserve(
-            board, pool_size, lambda r: backend_available(r.model)
+        # Chain-aware, matching the pool guard (cli._chain_aware_available) — a raw
+        # `backend_available` here would silently shrink the pool the guard just approved:
+        # a seat whose head provider is down but has a live failover alternate is REAL live
+        # (provider_chain would route around it at dispatch time), so the startup split must
+        # agree (codex P1 on review of #157: 'the chain-aware guard approves seats that
+        # board dispatch still removes').
+        from ..provider_failover import any_provider_available
+
+        def _chain_aware_available(r: BoardReviewer) -> bool:
+            return any_provider_available(
+                r.model,
+                available=backend_available,
+                unpaid=runtime_provider_marked_unpaid,
+            )
+
+        # Reuse-aware pool + reserve, both derived from ONE `_chain_aware_available`
+        # pass (see select_pool_and_reserve_with_reuse's docstring): fills every
+        # role slot even when fewer than `pool_size` DISTINCT models are
+        # reachable/under their usage limit, by repeating an already-available
+        # model across the remaining roles instead of shrinking the board
+        # (Alex, 2026-08-18). `usage_percent` is None by default (see this
+        # function's docstring) -- the caller opts in explicitly.
+        pool, reserve = select_pool_and_reserve_with_reuse(
+            board,
+            pool_size,
+            _chain_aware_available,
+            usage_percent=usage_percent,
         )
+        _warn_if_board_reused(board, pool)
+        _report_pool_shortfall(board, pool, reserve=reserve, pool_size=pool_size)
     if not pool:
         print(
             "[review-cli] board: no reviewers are available — configure at least one "
@@ -629,13 +1344,27 @@ def _mode_review_board(
         )
         return 1
 
+    # Capped copy for backend dispatch ONLY — `diff` itself (used below for the
+    # stamp/checkpoint) stays uncapped (see cap_diff_for_dispatch's docstring). Same
+    # stdin exemption as the flat path above.
+    dispatch_diff = diff if diff_from_stdin else cap_diff_for_dispatch(diff)
+    dispatch_diff_truncated = _warn_if_dispatch_diff_truncated(
+        diff, dispatch_diff, staged
+    )
     outcome = run_board_with_failover(
-        pool, reserve, prompt, diff, cwd, timeout, visual_images
+        pool, reserve, prompt, dispatch_diff, cwd, timeout, visual_images
     )
     if outcome_sink is not None:
         outcome_sink.append(outcome)
 
-    print("\n\n---\n\n".join(format_result(r) for r in outcome.results))
+    # check_evidence=prompt.startswith(DEFAULT_PROMPT) — see the flat path's
+    # identical note above (k3 review finding, rounds 6-7).
+    check_evidence = prompt.startswith(DEFAULT_PROMPT)
+    print(
+        "\n\n---\n\n".join(
+            format_result(r, check_evidence=check_evidence) for r in outcome.results
+        )
+    )
 
     if outcome.degraded:
         print(
@@ -649,8 +1378,18 @@ def _mode_review_board(
     # A failed-then-replaced seat is handled, so it must not block — only a real
     # shortfall (reserve exhausted) does.
     ok = not outcome.degraded
-    _stamp_if_staged_commit_review(ok, staged, diff_from_stdin, cwd, diff)
-    override = _checkpoint_if_requested(commit, ok, diff_from_stdin, cwd, diff)
+    _stamp_if_staged_commit_review(
+        ok,
+        staged,
+        diff_from_stdin,
+        cwd,
+        diff,
+        dispatch_diff_truncated,
+        stamp_diff_hash=stamp_diff_hash,
+    )
+    override = _checkpoint_if_requested(
+        commit, ok, diff_from_stdin, cwd, diff, dispatch_diff_truncated
+    )
     if override is not None:
         return override
     return 0 if ok else 1
@@ -708,6 +1447,12 @@ def _handler(ctx: ModeContext) -> int:
     # commit gate even under --staged — see _stamp_if_staged_commit_review.
     diff_from_stdin = bool(ctx.extra.get("diff_from_stdin", False))
     commit = bool(getattr(ctx.args, "commit", False))
+    # Captured by the CLI immediately adjacent to `ctx.diff`'s own capture (a
+    # millisecond gap, not the multi-minute panel-run gap re-deriving it at
+    # stamp-WRITE time would have) — see `install._write_review_stamp`'s
+    # docstring. None for any non-CLI caller of `mode_review` (falls back to
+    # that function's own independent re-derive).
+    stamp_diff_hash = ctx.extra.get("stamp_diff_hash")
     base = (
         ctx.models,
         ctx.with_visual(ctx.args.prompt),
@@ -724,6 +1469,7 @@ def _handler(ctx: ModeContext) -> int:
             visual_images=_visual_images(ctx),
             effort_override=ctx.effort_override,
             commit=commit,
+            stamp_diff_hash=stamp_diff_hash,
         )
     return mode_review(
         *base,
@@ -734,6 +1480,8 @@ def _handler(ctx: ModeContext) -> int:
         visual_images=_visual_images(ctx),
         exact_board=bool(ctx.extra.get("exact_board", False)),
         commit=commit,
+        stamp_diff_hash=stamp_diff_hash,
+        usage_percent=ctx.extra.get("usage_percent"),
     )
 
 

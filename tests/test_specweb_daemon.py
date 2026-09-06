@@ -17,6 +17,7 @@ Same harness style as tests/test_specweb.py: plain test_* functions run by the _
 block; pytest collects them too. All offline — loopback ThreadingHTTPServer on an ephemeral
 port, torn down per test. No API keys, no network beyond loopback.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -24,6 +25,7 @@ import http.client
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,9 +37,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from reviewlib import cli  # noqa: E402
+from reviewlib.dashboard import service as dservice  # noqa: E402
 from reviewlib.specweb import deliver as sdeliver  # noqa: E402
 from reviewlib.specweb import registry as sregistry  # noqa: E402
 from reviewlib.specweb import server as sserver  # noqa: E402
+from reviewlib.specweb import service as sservice  # noqa: E402
 from reviewlib.specweb.store import SpecStore  # noqa: E402
 
 FIXTURE = REPO_ROOT / "fixtures" / "specweb" / "sample-spec.md"
@@ -171,8 +175,12 @@ class _Daemon:
 
     def post(self, path, obj):
         c = self.conn()
-        c.request("POST", path, body=json.dumps(obj).encode("utf-8"),
-                  headers={"Content-Type": "application/json"})
+        c.request(
+            "POST",
+            path,
+            body=json.dumps(obj).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
         r = c.getresponse()
         body = r.read()
         c.close()
@@ -219,7 +227,12 @@ def test_daemon_exposes_app_shell_routes_at_origin_root():
             st, _, headers = d.get("/")
             assert st == 200, st
             assert headers.get("X-Review-Specweb") == "1", headers
-            for path in ("/manifest.webmanifest", "/sw.js", "/offline.html", "/app-icon.svg"):
+            for path in (
+                "/manifest.webmanifest",
+                "/sw.js",
+                "/offline.html",
+                "/app-icon.svg",
+            ):
                 st, _, headers = d.get(path)
                 assert st == 200, (path, st)
                 assert headers.get("X-Review-Specweb") == "1", (path, headers)
@@ -236,13 +249,17 @@ def test_daemon_serves_spec_by_name_with_prefixed_base_and_assets():
             st, body, headers = d.get(f"/spec/{name}")
             assert st == 200, st
             assert headers.get("X-Review-Specweb") == "1", headers
-            assert f'window.__SPECWEB_BASE__ = "/spec/{name}"'.encode() in body, body[:600]
+            assert f'window.__SPECWEB_BASE__ = "/spec/{name}"'.encode() in body, body[
+                :600
+            ]
             # the rendered spec's figure URLs are prefixed too, and the asset route serves them
             st, body, headers = d.get(f"/spec/{name}/api/spec")
             data = json.loads(body)
             assert st == 200 and "<h1" in data["html"]
             assert headers.get("X-Review-Specweb") == "1", headers
-            assert f"/spec/{name}/asset/fig-arch.svg" in data["html"], "asset base not prefixed"
+            assert f"/spec/{name}/asset/fig-arch.svg" in data["html"], (
+                "asset base not prefixed"
+            )
             assert isinstance(data.get("mtime"), float), data.get("mtime")
             st, body, hdrs = d.get(f"/spec/{name}/asset/fig-arch.svg")
             assert st == 200 and b"<svg" in body
@@ -316,9 +333,9 @@ def _read_sse_until(resp, wanted_event: str, deadline_s: float) -> dict | None:
     while time.monotonic() < deadline:
         line = resp.fp.readline().decode("utf-8").rstrip("\n")
         if line.startswith("event: "):
-            event = line[len("event: "):]
+            event = line[len("event: ") :]
         elif line.startswith("data: ") and event == wanted_event:
-            return json.loads(line[len("data: "):])
+            return json.loads(line[len("data: ") :])
     return None
 
 
@@ -371,8 +388,14 @@ def test_watch_submits_emits_marker_framed_review_on_fresh_submit():
             t.join()
             assert rc == 0, rc
             out = buf.getvalue()
-            assert sserver.SUBMIT_MARKER_BEGIN in out and sserver.SUBMIT_MARKER_END in out, out
-            payload = out.split(sserver.SUBMIT_MARKER_BEGIN)[1].split(sserver.SUBMIT_MARKER_END)[0].strip()
+            assert (
+                sserver.SUBMIT_MARKER_BEGIN in out and sserver.SUBMIT_MARKER_END in out
+            ), out
+            payload = (
+                out.split(sserver.SUBMIT_MARKER_BEGIN)[1]
+                .split(sserver.SUBMIT_MARKER_END)[0]
+                .strip()
+            )
             review = json.loads(payload)
             assert review["counts"]["questions"] == 1, review
             assert review["comments"][0]["body"] == "please clarify", review
@@ -396,7 +419,9 @@ def test_watch_submits_honors_an_earlier_pinned_baseline():
                     spec, exit_on_submit=True, poll_seconds=0.05, baseline=baseline
                 )
             assert rc == 0, rc
-            assert buf.getvalue().count(sserver.SUBMIT_MARKER_BEGIN) == 1, buf.getvalue()
+            assert buf.getvalue().count(sserver.SUBMIT_MARKER_BEGIN) == 1, (
+                buf.getvalue()
+            )
 
 
 def test_watch_submits_ignores_a_stale_pre_watch_submit():
@@ -449,7 +474,11 @@ def test_watch_submits_emit_current_re_emits_an_already_submitted_batch():
             out = buf.getvalue()
             # exactly ONE emission — the already-submitted batch, with no fresh submit at all
             assert out.count(sserver.SUBMIT_MARKER_BEGIN) == 1, out
-            payload = out.split(sserver.SUBMIT_MARKER_BEGIN)[1].split(sserver.SUBMIT_MARKER_END)[0].strip()
+            payload = (
+                out.split(sserver.SUBMIT_MARKER_BEGIN)[1]
+                .split(sserver.SUBMIT_MARKER_END)[0]
+                .strip()
+            )
             review = json.loads(payload)
             assert review["comments"][0]["body"] == "reached nobody live", review
 
@@ -478,7 +507,9 @@ def test_watch_submits_emit_current_is_a_noop_when_nothing_submitted():
             t.join()
             assert rc == 0, rc
             # exactly ONE emission — the fresh submit, not a spurious empty emit_current one
-            assert buf.getvalue().count(sserver.SUBMIT_MARKER_BEGIN) == 1, buf.getvalue()
+            assert buf.getvalue().count(sserver.SUBMIT_MARKER_BEGIN) == 1, (
+                buf.getvalue()
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -498,10 +529,34 @@ def test_registry_records_and_updates_the_owning_agent():
 
 def test_match_agent_pane_prefers_window_then_session():
     rows = [
-        {"pane_id": "%1", "session": "work", "window": "zsh", "window_active": True, "pane_active": True},
-        {"pane_id": "%2", "session": "ext", "window": "node", "window_active": True, "pane_active": True},
-        {"pane_id": "%3", "session": "other", "window": "ext", "window_active": False, "pane_active": False},
-        {"pane_id": "%4", "session": "other", "window": "ext", "window_active": False, "pane_active": True},
+        {
+            "pane_id": "%1",
+            "session": "work",
+            "window": "zsh",
+            "window_active": True,
+            "pane_active": True,
+        },
+        {
+            "pane_id": "%2",
+            "session": "ext",
+            "window": "node",
+            "window_active": True,
+            "pane_active": True,
+        },
+        {
+            "pane_id": "%3",
+            "session": "other",
+            "window": "ext",
+            "window_active": False,
+            "pane_active": False,
+        },
+        {
+            "pane_id": "%4",
+            "session": "other",
+            "window": "ext",
+            "window_active": False,
+            "pane_active": True,
+        },
     ]
     # window NAME match wins over session match, active pane preferred within the window
     assert sdeliver.match_agent_pane(rows, "ext") == "%4"
@@ -516,10 +571,22 @@ def test_match_agent_pane_prefers_window_then_session():
 def test_format_review_message_is_batch_scoped_and_one_line_per_comment():
     review = {
         "comments": [
-            {"id": "aaa", "kind": "question", "batch": "B2", "section_title": "4 Goals",
-             "quote": "the quick\nbrown fox", "body": "why  is\nthis?"},
-            {"id": "old", "kind": "remark", "batch": "B1", "section_title": "1 Intro",
-             "quote": "", "body": "older, already delivered"},
+            {
+                "id": "aaa",
+                "kind": "question",
+                "batch": "B2",
+                "section_title": "4 Goals",
+                "quote": "the quick\nbrown fox",
+                "body": "why  is\nthis?",
+            },
+            {
+                "id": "old",
+                "kind": "remark",
+                "batch": "B1",
+                "section_title": "1 Intro",
+                "quote": "",
+                "body": "older, already delivered",
+            },
         ]
     }
     msg = sdeliver.format_review_message("my-spec", "/x/my-spec.md", review, "B2")
@@ -527,8 +594,13 @@ def test_format_review_message_is_batch_scoped_and_one_line_per_comment():
     assert "1 comment(s) submitted" in lines[0], lines[0]
     assert "old" not in msg, "a previous batch's comment must not be re-delivered"
     # the CTO-specified per-comment shape, newlines collapsed so one comment = one line
-    assert '[SPEC-WEB comment on my-spec §4 Goals] "the quick brown fox" — why is this? (question, id aaa)' in lines, lines
-    assert 'review spec-web reply <id> "<answer>" --spec /x/my-spec.md' in lines[-1], lines[-1]
+    assert (
+        '[SPEC-WEB comment on my-spec §4 Goals] "the quick brown fox" — why is this? (question, id aaa)'
+        in lines
+    ), lines
+    assert 'review spec-web reply <id> "<answer>" --spec /x/my-spec.md' in lines[-1], (
+        lines[-1]
+    )
 
 
 def test_daemon_submit_delivers_to_the_specs_registered_agent():
@@ -540,23 +612,37 @@ def test_daemon_submit_delivers_to_the_specs_registered_agent():
         calls = {}
 
         def _fake_deliver(*, agent, spec_name, spec_path, review, batch):
-            calls.update(agent=agent, spec_name=spec_name, batch=batch,
-                         n=len(review.get("comments") or []))
+            calls.update(
+                agent=agent,
+                spec_name=spec_name,
+                batch=batch,
+                n=len(review.get("comments") or []),
+            )
             return True, "injected into pane %7 (fake)"
 
         try:
             with mock.patch.object(sdeliver, "deliver_review", _fake_deliver):
-                st, _, _ = d.post(f"/spec/{name}/api/comments", {"quote": "q", "body": "deliver me"})
+                st, _, _ = d.post(
+                    f"/spec/{name}/api/comments", {"quote": "q", "body": "deliver me"}
+                )
                 assert st == 201, st
                 st, body, _ = d.post(f"/spec/{name}/api/submit", {})
                 assert st == 200, (st, body)
                 resp = json.loads(body)
         finally:
             d.stop()
-        assert calls["agent"] == "ext", calls  # the SPEC's agent, not the daemon default
-        assert calls["spec_name"] == name and calls["batch"] == resp["batch"], (calls, resp)
-        assert resp["delivery"] == {"agent": "ext", "delivered": True,
-                                    "detail": "injected into pane %7 (fake)"}, resp
+        assert calls["agent"] == "ext", (
+            calls
+        )  # the SPEC's agent, not the daemon default
+        assert calls["spec_name"] == name and calls["batch"] == resp["batch"], (
+            calls,
+            resp,
+        )
+        assert resp["delivery"] == {
+            "agent": "ext",
+            "delivered": True,
+            "detail": "injected into pane %7 (fake)",
+        }, resp
 
 
 def test_daemon_submit_falls_back_to_daemon_default_agent():
@@ -623,7 +709,9 @@ class _FakeManager:
 def test_spec_web_start_is_idempotent_when_already_running():
     with _TempStoreEnv():
         mgr = _FakeManager(running=True, pid=4242)
-        with mock.patch.object(cli, "_spec_web_manager", lambda host, port, agent=None: mgr):
+        with mock.patch.object(
+            cli, "_spec_web_manager", lambda host, port, agent=None: mgr
+        ):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = cli._spec_web(["start", "--agent", "ext"])
@@ -631,17 +719,27 @@ def test_spec_web_start_is_idempotent_when_already_running():
         assert rc == 0, (rc, out)  # idempotent: already-up start is SUCCESS, not exit 3
         assert "already running" in out and "4242" in out, out
         assert mgr.start_calls == 0, "must not double-start"
-        assert "navigator" in out, out  # says what it serves (status), not just 'running'
+        assert "navigator" in out, (
+            out
+        )  # says what it serves (status), not just 'running'
 
 
 def test_spec_web_daemon_launching_actions_require_agent():
     """start/run/enable (and serve/the positional) REFUSE without --agent — an agentless
     daemon strands submitted reviews in the store with nobody to deliver them to."""
-    for argv in (["start"], ["run"], ["enable"], ["__serve"],
-                 ["serve", str(FIXTURE)], [str(FIXTURE)]):
+    for argv in (
+        ["start"],
+        ["run"],
+        ["enable"],
+        ["__serve"],
+        ["serve", str(FIXTURE)],
+        [str(FIXTURE)],
+    ):
         with _TempStoreEnv():
             mgr = _FakeManager(running=False)
-            with mock.patch.object(cli, "_spec_web_manager", lambda host, port, agent=None: mgr):
+            with mock.patch.object(
+                cli, "_spec_web_manager", lambda host, port, agent=None: mgr
+            ):
                 out, err = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     rc = cli._spec_web(list(argv))
@@ -660,7 +758,9 @@ def test_spec_web_status_and_stop_do_not_require_agent():
 
 
 def test_spec_web_lifecycle_without_lib_fails_loudly_with_fix():
-    with mock.patch.object(cli, "_spec_web_manager", lambda host, port, agent=None: None):
+    with mock.patch.object(
+        cli, "_spec_web_manager", lambda host, port, agent=None: None
+    ):
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             rc = cli._spec_web(["status"])
@@ -672,7 +772,9 @@ def test_spec_web_lifecycle_without_lib_fails_loudly_with_fix():
 def test_spec_web_add_registers_and_prints_name_url_without_blocking():
     with _TempStoreEnv():
         mgr = _FakeManager(running=True)
-        with mock.patch.object(cli, "_spec_web_manager", lambda host, port, agent=None: mgr):
+        with mock.patch.object(
+            cli, "_spec_web_manager", lambda host, port, agent=None: mgr
+        ):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = cli._spec_web(["add", str(FIXTURE)])
@@ -685,11 +787,15 @@ def test_spec_web_add_registers_and_prints_name_url_without_blocking():
 
 def test_spec_web_add_starts_the_daemon_when_down_with_agent():
     if not _HAS_DAEMON_LIB:
-        print("SKIP test_spec_web_add_starts_the_daemon_when_down_with_agent: agenttools_daemon not installed")
+        print(
+            "SKIP test_spec_web_add_starts_the_daemon_when_down_with_agent: agenttools_daemon not installed"
+        )
         return
     with _TempStoreEnv():
         mgr = _FakeManager(running=False)
-        with mock.patch.object(cli, "_spec_web_manager", lambda host, port, agent=None: mgr):
+        with mock.patch.object(
+            cli, "_spec_web_manager", lambda host, port, agent=None: mgr
+        ):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = cli._spec_web(["add", str(FIXTURE), "--agent", "ext"])
@@ -703,7 +809,9 @@ def test_spec_web_add_refuses_to_autostart_without_agent():
     refuses (exit 2) instead of silently starting a daemon whose submits reach nobody."""
     with _TempStoreEnv():
         mgr = _FakeManager(running=False)
-        with mock.patch.object(cli, "_spec_web_manager", lambda host, port, agent=None: mgr):
+        with mock.patch.object(
+            cli, "_spec_web_manager", lambda host, port, agent=None: mgr
+        ):
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 rc = cli._spec_web(["add", str(FIXTURE)])
@@ -724,8 +832,12 @@ def test_spec_web_legacy_positional_falls_back_without_lib():
         return 0
 
     with _TempStoreEnv():
-        with mock.patch.object(cli, "_spec_web_manager", lambda host, port, agent=None: None), \
-             mock.patch.object(cli, "_spec_web_legacy_foreground", _fake_foreground):
+        with (
+            mock.patch.object(
+                cli, "_spec_web_manager", lambda host, port, agent=None: None
+            ),
+            mock.patch.object(cli, "_spec_web_legacy_foreground", _fake_foreground),
+        ):
             buf = io.StringIO()
             with contextlib.redirect_stderr(buf):
                 rc = cli._spec_web([str(FIXTURE), "--agent", "ext"])
@@ -740,7 +852,9 @@ def test_spec_web_no_watch_without_lib_refuses_instead_of_blocking():
     host there is no daemon, and the only fallback is a BLOCKING server — the opposite of what
     was asked. Refuse loudly (exit 4), matching the non-persistent backstop classification."""
     with _TempStoreEnv():
-        with mock.patch.object(cli, "_spec_web_manager", lambda host, port, agent=None: None):
+        with mock.patch.object(
+            cli, "_spec_web_manager", lambda host, port, agent=None: None
+        ):
             buf = io.StringIO()
             with contextlib.redirect_stderr(buf):
                 rc = cli._spec_web([str(FIXTURE), "--agent", "ext", "--no-watch"])
@@ -754,7 +868,18 @@ def test_spec_web_help_lists_all_actions_and_launches_nothing():
         rc = cli._spec_web([])
     out = buf.getvalue()
     assert rc == 0, rc
-    for action in ("start", "status", "stop", "run", "add", "serve", "list", "remove", "watch", "reply"):
+    for action in (
+        "start",
+        "status",
+        "stop",
+        "run",
+        "add",
+        "serve",
+        "list",
+        "remove",
+        "watch",
+        "reply",
+    ):
         assert action in out, (action, out)
 
 
@@ -762,17 +887,74 @@ def test_spec_web_backstop_classification():
     """Only the BLOCKING invocations bypass the `-o` tee + run backstop."""
     persistent = cli._is_persistent_server_invocation
     # fast management actions -> normal path
-    for argv in (["spec-web"], ["spec-web", "start"], ["spec-web", "status"],
-                 ["spec-web", "stop"], ["spec-web", "add", "x.md"], ["spec-web", "list"],
-                 ["spec-web", "remove", "n"], ["spec-web", "reply", "id", "answer"]):
+    for argv in (
+        ["spec-web"],
+        ["spec-web", "start"],
+        ["spec-web", "status"],
+        ["spec-web", "stop"],
+        ["spec-web", "add", "x.md"],
+        ["spec-web", "list"],
+        ["spec-web", "remove", "n"],
+        ["spec-web", "reply", "id", "answer"],
+    ):
         assert not persistent(argv), argv
     # blocking daemon / watch loops -> bypass
-    for argv in (["spec-web", "run"], ["spec-web", "__serve"], ["spec-web", "watch", "n"],
-                 ["spec-web", "serve", "x.md"], ["spec-web", "x.md"]):
+    for argv in (
+        ["spec-web", "run"],
+        ["spec-web", "__serve"],
+        ["spec-web", "watch", "n"],
+        ["spec-web", "serve", "x.md"],
+        ["spec-web", "x.md"],
+    ):
         assert persistent(argv), argv
     # a --no-watch serve / legacy positional returns fast
     assert not persistent(["spec-web", "serve", "x.md", "--no-watch"])
     assert not persistent(["spec-web", "x.md", "--no-watch"])
+
+
+# --- __serve argv must not inherit an active reentrancy guard (review-cli#180) -----------
+def test_specweb_serve_argv_targets_hidden_serve_entry():
+    argv = sservice._serve_argv(port=7920, host="0.0.0.0")
+    assert "spec-web" in argv and "__serve" in argv
+    assert argv[argv.index("spec-web") + 1] == "__serve"
+    assert "--port" in argv and "7920" in argv
+    assert "--host" in argv and "0.0.0.0" in argv
+
+
+def test_specweb_serve_argv_carries_env_clear_prefix():
+    """review-cli#180 review finding (GLM/k3/GLM-cc, PR #279): the dashboard's fix got a
+    behavioral test, the identical specweb wiring got none -- a future edit that drops or
+    misorders the prefix here would silently regress `review spec-web start`/`run` to the
+    exact #180 false-positive (the __serve child inherits $REVIEW_CLI_ACTIVE from its
+    already-active parent `review spec-web run`/`start` invocation and refuses to launch),
+    with the full suite staying green. Assert the shape AND prove it works when executed,
+    mirroring test_dashboard_service.py's coverage of the dashboard half."""
+    prefix = dservice._env_clear_prefix()
+    argv = sservice._serve_argv(port=7920, host="0.0.0.0")
+    assert argv[: len(prefix)] == prefix, argv
+
+    env = dict(os.environ)
+    env[cli.REVIEW_CLI_ACTIVE_ENV] = "1"
+    result = subprocess.run(
+        [
+            *prefix,
+            sys.executable,
+            "-c",
+            f"import os; print({cli.REVIEW_CLI_ACTIVE_ENV!r} in os.environ)",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout.strip() == "False", (result.stdout, result.stderr)
+
+
+def test_specweb_serve_argv_bakes_in_agent_after_env_clear_prefix():
+    argv = sservice._serve_argv(port=7920, host="0.0.0.0", agent="my-session")
+    assert "--agent" in argv and "my-session" in argv
+    assert argv[argv.index("--agent") + 1] == "my-session"
 
 
 if __name__ == "__main__":

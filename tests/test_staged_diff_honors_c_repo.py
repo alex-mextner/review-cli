@@ -24,6 +24,7 @@ Driven in-process: two real temp repos with DISTINCT staged content, the mode ha
 stubbed to capture the diff it receives (no backend), the repo-pointing git env vars set
 to repoA, and `-C repoB`. The RED state (pre-fix) captured repoA's diff.
 """
+
 from __future__ import annotations
 
 import io
@@ -54,8 +55,14 @@ def _init_repo(path: Path, filename: str, content: str) -> None:
     env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "t@t"
 
     def run(*a: str) -> None:
-        subprocess.run(["git", *a], cwd=str(path), env=env, check=True,
-                       capture_output=True, text=True)
+        subprocess.run(
+            ["git", *a],
+            cwd=str(path),
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     run("init", "-q")
     run("commit", "-q", "--allow-empty", "-m", "init")
@@ -84,10 +91,18 @@ def _run_capturing(handler_owner, handler_name, dispatch_argv, *, cwd_repo, leak
     saved_cfg = cli.load_config
     saved_cwd = os.getcwd()
     saved_env = {k: os.environ.get(k) for k in _LEAK_VARS}
+    saved_fake = os.environ.get("REVIEW_FAKE_BACKEND")
 
     setattr(handler_owner, handler_name, _fake)
     cli._read_stdin_if_piped = lambda: None
-    cli.load_config = lambda: {"models": ["codex"]}  # deterministic one-seat config board
+    cli.load_config = lambda: {
+        "models": ["codex"]
+    }  # deterministic one-seat config board
+    # This is a GIT-ROUTING test (which repo's staged diff reaches the handler), not a
+    # pool-assembly test. On a backend-less host the review-mode pool guard would otherwise
+    # bail (exit 10) before the stubbed handler runs, so force every seat live via the fake
+    # backend — the established hermetic-dispatch seam (see backend_available).
+    os.environ["REVIEW_FAKE_BACKEND"] = "1"
     os.chdir(str(cwd_repo))
     # The leak: point git at repoA via the env, exactly as a git hook / stale export would.
     os.environ["GIT_DIR"] = str(Path(leak_repo) / ".git")
@@ -106,6 +121,10 @@ def _run_capturing(handler_owner, handler_name, dispatch_argv, *, cwd_repo, leak
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        if saved_fake is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = saved_fake
     assert captured.get("ran"), f"{handler_name} never ran"
     return captured.get("diff") or ""
 
@@ -119,9 +138,11 @@ def test_diff_staged_honors_c_repo_despite_git_env_leak():
         _init_repo(repo_a, "fileA.txt", "AAAAA repoA unique content\n")
         _init_repo(repo_b, "fileB.txt", "BBBBB repoB unique content\n")
         diff = _run_capturing(
-            _review_mod, "mode_review",
+            _review_mod,
+            "mode_review",
             ["diff", "--task", "TEST-1", "--staged", "-C", str(repo_b)],
-            cwd_repo=repo_a, leak_repo=repo_a,
+            cwd_repo=repo_a,
+            leak_repo=repo_a,
         )
         assert "BBBBB repoB" in diff, f"expected repoB's staged diff, got: {diff!r}"
         assert "AAAAA repoA" not in diff, f"leaked repoA's diff: {diff!r}"
@@ -136,9 +157,19 @@ def test_just_ask_staged_honors_c_repo_despite_git_env_leak():
         _init_repo(repo_a, "fileA.txt", "AAAAA repoA unique content\n")
         _init_repo(repo_b, "fileB.txt", "BBBBB repoB unique content\n")
         diff = _run_capturing(
-            _ja_mod, "mode_just_ask",
-            ["just-ask", "review this", "--task", "TEST-1", "--staged", "-C", str(repo_b)],
-            cwd_repo=repo_a, leak_repo=repo_a,
+            _ja_mod,
+            "mode_just_ask",
+            [
+                "just-ask",
+                "review this",
+                "--task",
+                "TEST-1",
+                "--staged",
+                "-C",
+                str(repo_b),
+            ],
+            cwd_repo=repo_a,
+            leak_repo=repo_a,
         )
         assert "BBBBB repoB" in diff, f"expected repoB's staged diff, got: {diff!r}"
         assert "AAAAA repoA" not in diff, f"leaked repoA's diff: {diff!r}"
@@ -148,8 +179,13 @@ def _git(path: Path, *args: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "t"
     env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "t@t"
-    return subprocess.run(["git", "-C", str(path), *args], env=env, check=True,
-                          capture_output=True, text=True)
+    return subprocess.run(
+        ["git", "-C", str(path), *args],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_git_diff_preserves_target_repos_own_index_partial_commit():
@@ -180,10 +216,20 @@ def test_git_diff_preserves_target_repos_own_index_partial_commit():
             # `git commit keep.txt`), basing it on HEAD so it doesn't carry extra.txt.
             _git_partial = dict(os.environ)
             _git_partial["GIT_INDEX_FILE"] = str(partial)
-            subprocess.run(["git", "-C", str(repo), "read-tree", "HEAD"],
-                           env=_git_partial, check=True, capture_output=True, text=True)
-            subprocess.run(["git", "-C", str(repo), "add", "keep.txt"],
-                           env=_git_partial, check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "read-tree", "HEAD"],
+                env=_git_partial,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "add", "keep.txt"],
+                env=_git_partial,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             # Now invoke _git_diff WITH the target repo's own GIT_INDEX_FILE set (the hook env).
             os.environ["GIT_INDEX_FILE"] = str(partial)
             os.environ["GIT_DIR"] = str((repo / ".git").resolve())
@@ -194,7 +240,9 @@ def test_git_diff_preserves_target_repos_own_index_partial_commit():
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
-        assert "keep.txt" in diff, f"target repo's own partial index was dropped: {diff!r}"
+        assert "keep.txt" in diff, (
+            f"target repo's own partial index was dropped: {diff!r}"
+        )
         assert "extra.txt" not in diff, (
             f"the partial-commit index scope was lost — reviewed a file not in the commit: {diff!r}"
         )
