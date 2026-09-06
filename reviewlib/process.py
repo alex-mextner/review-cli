@@ -484,6 +484,26 @@ def _open_log(backend: str, round_no: int) -> Path:
     return log_dir() / f"{stamp}-{_safe_backend(backend)}-r{round_no}.log"
 
 
+# The `timeout_marker_kind` value stamped (via the `timeout_kind` result attribute,
+# see `_run_streamed`'s return) when a call times out via the LIVENESS/stall path
+# specifically — review-cli#153/#159/#179. A named constant, not a literal re-typed at
+# each call site (Fable review finding): a caller like `backends._opencode_call_stalled`
+# compares against THIS, so rewording the human-readable marker text can never silently
+# desync detection from display.
+TIMEOUT_KIND_STALL = "waiting for first output"
+
+
+def _timeout_marker_text(secs: int, kind: str) -> str:
+    """The exact `[review-cli] TIMEOUT ...]` line `_run_streamed` appends to `stdout`
+    on a timeout, WITHOUT the leading/trailing newlines. Internal to this module —
+    callers that need to tell timeout KINDS apart should read the `timeout_kind`
+    attribute `_run_streamed` stamps on its result (see `TIMEOUT_KIND_STALL` above),
+    never text-scrape `stdout` for this marker (a backend's own untrusted output could
+    coincidentally contain the same words, and after idle/liveness clamping the exact
+    embedded seconds value here may not equal what a caller originally requested)."""
+    return f"[review-cli] TIMEOUT after {secs}s {kind} — partial output above]"
+
+
 # Explicit status footer the dashboard parser reads to decide success/failure. The
 # parser must NOT infer failure from substrings like `error:` in the body — a review's
 # OUTPUT legitimately contains those (it is literally describing errors in the code).
@@ -685,6 +705,7 @@ def _run_streamed(
     header_argv0: str | None = None,
     idle_floor: int | None = _DEFAULT_IDLE_TIMEOUT,
     timeout_mode: str = "idle",
+    liveness_timeout: int | None = None,
     true_silence_timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a long backend call, streaming its output in real time.
@@ -740,6 +761,7 @@ def _run_streamed(
     stopping = threading.Event()
     timed_out = False
     true_silenced = False
+    liveness_clamped = False
     if timeout_mode not in {"idle", "wall"}:
         raise ValueError(f"unknown timeout_mode: {timeout_mode}")
     idle_timeout = (
@@ -966,7 +988,21 @@ def _run_streamed(
         # Enforce the configured timeout. Review seats use silence-from-backend so long
         # agent calls such as Fable can think for ~15 minutes; QA/vision use wall time
         # because their public `--timeout` flags are cost/latency caps.
-        if timeout_mode == "wall" or idle_timeout is None:
+        #
+        # A caller-supplied `liveness_timeout` must be honoured whenever it is set,
+        # REGARDLESS of whether idle reaping itself is enabled (codex review finding:
+        # the original version fell straight into the plain `proc.wait(timeout_secs)`
+        # branch whenever idle reaping was disabled — e.g. $REVIEW_IDLE_TIMEOUT_
+        # SECONDS=0 — silently ignoring `liveness_timeout` and waiting the FULL
+        # per-call timeout on a zero-output stall). So the polling loop (where
+        # `liveness_timeout` is actually checked) runs whenever EITHER idle reaping is
+        # on OR a liveness bound was requested; only `timeout_mode == "wall"` (bounded
+        # surfaces like QA/vision, which never pass `liveness_timeout`) or "neither is
+        # configured" falls back to the plain wall-clock wait.
+        use_polling = timeout_mode == "idle" and (
+            idle_timeout is not None or liveness_timeout is not None
+        )
+        if not use_polling:
             timeout_marker_kind = "total runtime"
             try:
                 proc.wait(timeout=timeout_secs)
@@ -979,6 +1015,46 @@ def _run_streamed(
                 except subprocess.TimeoutExpired:
                     pass
         else:
+            # If idle reaping itself is disabled but a liveness bound was still
+            # requested, the idle DIMENSION falls back to the wall-clock timeout
+            # (matching the plain-disabled-idle behaviour above) rather than polling
+            # forever on that axis. Fable review finding: this fallback must measure
+            # elapsed time from a FIXED start (true wall-clock), never from
+            # `activity["last"]` (silence since the last byte) — a backend that emits
+            # output periodically keeps resetting `activity["last"]`, so measuring the
+            # fallback that way would let it run UNBOUNDED, contradicting the very
+            # "REVIEW_IDLE_TIMEOUT_SECONDS=0 must not be an unbounded wait" contract
+            # `test_disabled_idle_reap_falls_back_to_wall_timeout` already pins for the
+            # no-liveness case.
+            idle_uses_wall_clock = idle_timeout is None
+            loop_started = time.monotonic()
+            effective_idle_timeout = (
+                idle_timeout if idle_timeout is not None else timeout_secs
+            )
+            effective_idle_kind = (
+                timeout_marker_kind if idle_timeout is not None else "total runtime"
+            )
+            # codex review finding: a smaller EFFECTIVE idle bound than
+            # `liveness_timeout` would otherwise fire the ordinary idle branch first
+            # (misclassified as "without output"/"total runtime", not a stall) even
+            # though the call genuinely never produced a single byte — clamping here
+            # guarantees a true zero-output call is ALWAYS classified as a stall
+            # whenever it times out at all, regardless of which numeric bound happens
+            # to be smaller.
+            effective_liveness_timeout = (
+                min(liveness_timeout, effective_idle_timeout)
+                if liveness_timeout is not None
+                else None
+            )
+            # Remember whether the clamp actually SHORTENED the caller's bound: a stall
+            # that fired at a board-deadline-clamped window (round-2 review finding,
+            # Fable) says "no output before the deadline ran out", not "no output for
+            # the configured stall window" — the opencode retry loop must not read the
+            # former as the quota-exhaustion signature and bench a healthy seat.
+            liveness_clamped = (
+                liveness_timeout is not None
+                and effective_liveness_timeout < liveness_timeout
+            )
             while True:
                 try:
                     proc.wait(timeout=0.5)
@@ -986,7 +1062,36 @@ def _run_streamed(
                 except subprocess.TimeoutExpired:
                     # CPython's GIL makes these single-value reads safe enough; stale
                     # reads are harmless because the next 0.5s poll sees any newer state.
-                    #
+                    elapsed_idle = time.monotonic() - activity["last"]
+                    # A backend that has NEVER emitted a byte gets a separate, much
+                    # shorter bound when the caller opts in via `liveness_timeout`
+                    # (review-cli#153/#159/#179: opencode's zai/glm seat hangs at 0%
+                    # CPU with ZERO output on provider quota exhaustion). This does
+                    # NOT change default behaviour: a backend that has produced SOME
+                    # output still gets the full, generous idle window below — "no
+                    # output yet" and "went quiet after producing output" are
+                    # different signals, and only the former is fast-failed here.
+                    # Keys off the SAME `activity["got_output"]` latch the true-silence
+                    # branch below uses (round-1 review finding, Opus + Fable: buffer
+                    # emptiness was a second, independent definition of "has produced
+                    # output" that could drift from the latch), and inherits the same
+                    # `activity["last"]`-first write ordering in `_drain` that closes
+                    # the first-byte race for that branch.
+                    no_output_yet = not activity["got_output"]
+                    if (
+                        effective_liveness_timeout is not None
+                        and no_output_yet
+                        and elapsed_idle >= effective_liveness_timeout
+                    ):
+                        timed_out = True
+                        timeout_marker_secs = effective_liveness_timeout
+                        timeout_marker_kind = TIMEOUT_KIND_STALL
+                        _kill_tree(proc, pgid)
+                        try:
+                            proc.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            pass
+                        break
                     # `timeout_mode == "idle"` is ALREADY structurally guaranteed here
                     # (this whole poll loop is the `else` of `if timeout_mode == "wall"
                     # or idle_timeout is None:` above, which wall mode always takes) —
@@ -1013,6 +1118,12 @@ def _run_streamed(
                         # crossed its larger one). Once output arrives, `got_output`
                         # flips True and this whole branch is skipped from then on —
                         # idle_timeout alone governs the rest of the call, unchanged.
+                        # `liveness_timeout`'s check above already ran first and would
+                        # have broken out of the loop if it tripped, so reaching here
+                        # means either liveness_timeout is unset for this call or it
+                        # hasn't tripped yet — the two mechanisms are independent and
+                        # both get a chance to fire each iteration, whichever is
+                        # SHORTER (or configured at all) wins.
                         # Uses the board-deadline-CLAMPED value (round 5), not the raw
                         # true_silence_timeout, so a nearly-expired board deadline still
                         # bounds this branch the same way it already bounds idle_timeout.
@@ -1026,10 +1137,7 @@ def _run_streamed(
                         # Pre-first-byte, activity["last"] == the spawn timestamp exactly
                         # (nothing else updates it while got_output is False), so the
                         # genuinely-silent case is byte-for-byte unchanged.
-                        if (
-                            time.monotonic() - activity["last"]
-                            >= effective_true_silence_timeout
-                        ):
+                        if elapsed_idle >= effective_true_silence_timeout:
                             true_silenced = True
                             timeout_marker_secs = effective_true_silence_timeout
                             _kill_tree(proc, pgid)
@@ -1039,10 +1147,16 @@ def _run_streamed(
                                 pass
                             break
                         continue  # still within the true-silence budget
-                    if time.monotonic() - activity["last"] < idle_timeout:
+                    idle_elapsed = (
+                        (time.monotonic() - loop_started)
+                        if idle_uses_wall_clock
+                        else elapsed_idle
+                    )
+                    if idle_elapsed < effective_idle_timeout:
                         continue
                     timed_out = True
-                    timeout_marker_secs = idle_timeout
+                    timeout_marker_secs = effective_idle_timeout
+                    timeout_marker_kind = effective_idle_kind
                     _kill_tree(proc, pgid)
                     try:
                         proc.wait(timeout=3)
@@ -1095,10 +1209,7 @@ def _run_streamed(
                 except (ValueError, OSError):
                     pass
             elif timed_out:
-                marker = (
-                    f"\n[review-cli] TIMEOUT after {timeout_marker_secs}s {timeout_marker_kind} "
-                    "— partial output above]\n"
-                )
+                marker = f"\n{_timeout_marker_text(timeout_marker_secs, timeout_marker_kind)}\n"
                 stdout += marker
                 try:
                     log_fh.write(marker)
@@ -1119,6 +1230,21 @@ def _run_streamed(
                 pass
         result = subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=stderr
+        )
+        # `subprocess.CompletedProcess` has no `__slots__`, so a dynamic attribute is a
+        # normal, safe way to carry WHICH timeout kind fired (if any) without a caller
+        # having to text-scrape `stdout` for a marker string (codex review finding:
+        # scraping for the "waiting for first output" substring is both forgeable by a
+        # backend's own output text AND, after the idle/liveness clamping above, may not
+        # even carry the exact seconds value a caller expected). `None` when the call
+        # did not time out at all.
+        result.timeout_kind = timeout_marker_kind if timed_out else None
+        # True only for a STALL that fired at a bound SHORTER than the caller asked
+        # for (board-deadline / idle clamp) — see `liveness_clamped` above. Consumers
+        # (`backends._opencode_call_stalled`) treat such a stall as an honest bounded
+        # failure, never as retry/cooldown-worthy.
+        result.stall_bound_clamped = bool(
+            timed_out and timeout_marker_kind == TIMEOUT_KIND_STALL and liveness_clamped
         )
         # Explicit, OUT-OF-BAND signal (round-2 review finding, codex + Fable): 125 is
         # a real exit code some CLIs/wrappers use on their own (`timeout(1)`'s "the

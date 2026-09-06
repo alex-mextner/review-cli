@@ -32,6 +32,7 @@ from .config import _agentic
 from .install import install_codex_recursion_guard
 from .model_behavior import true_silence_timeout_seconds
 from .process import (
+    TIMEOUT_KIND_STALL,
     _run,
     _run_streamed,
     _safe_log_header,
@@ -287,7 +288,10 @@ def review_with_images(
         # review_claude entirely to reach the images-capable CLI transport, so it must
         # opt back into the SAME contract explicitly — kimi review finding: --visual
         # was the one dispatch path that never consulted or recorded seat_cooldown).
-        cooldown = active_cooldown(model)
+        # Always the CLI transport (review_claude_cli_with_images), so it shares the
+        # "cli" cooldown bucket with review_claude()'s own CLI branch (review-cli#187) —
+        # both really are the same underlying CLI/quota.
+        cooldown = active_cooldown(model, access_method="cli")
         if cooldown is not None:
             return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
         result = review_claude_cli_with_images(
@@ -295,9 +299,9 @@ def review_with_images(
         )
         reason = _chronic_unavailable_reason(result)
         if reason is not None:
-            record_cooldown(model, reason)
+            record_cooldown(model, reason, access_method="cli")
         elif _clears_cooldown_history(result):
-            clear_cooldown(model)
+            clear_cooldown(model, access_method="cli")
         return result
     return call_backend(
         backend, model, prompt, diff, cwd, timeout, round_no, effort=effort
@@ -668,6 +672,167 @@ def _opencode_runs_in_repo(cwd: Path) -> bool:
     return True
 
 
+# opencode's agentic seats (esp. `oc:zai/glm-5.2`) can STALL — hang at ~0% CPU
+# producing ZERO output for the entire call — when the underlying provider's quota is
+# exhausted (review-cli#153/#159/#179): no error, no partial answer, just silence until
+# killed. That is a different failure signature from a backend that is legitimately
+# still thinking (some agentic seats take ~15 minutes between chunks): "never produced
+# a single byte" can be detected far sooner than "went quiet after producing output",
+# which still needs the generous default idle window.
+#
+# Alex, 2026-08-14 (design directive): "Некоторые модели могут думать молча но наверно
+# 20 минут это перебор. И если известно что модель думает вслух и 5 минут она ничего не
+# выдает надо ретраить до 3 раз а потом скипать" — a seat that's expected to stream
+# output and produces NOTHING for 5 minutes is a stall signal; retry up to 3 times (a
+# transient network hiccup should not permanently sideline a seat), and only after 3
+# consecutive stalls skip the seat for the rest of this run (cooldown-cached so the
+# NEXT invocation doesn't pay for a doomed dispatch either — review-cli#187 fold-in:
+# opencode's cooldown bucket is `access_method="opencode"`, kept separate from a
+# model's direct keyed-HTTP route, since the two access methods can fail independently
+# even for literally the same underlying model/provider quota).
+_OPENCODE_STALL_SECONDS_ENV = "REVIEW_OPENCODE_STALL_SECONDS"
+_OPENCODE_DEFAULT_STALL_SECONDS = 300  # 5 minutes, per Alex's explicit spec above
+# 3 TOTAL attempts (the initial dispatch + 2 retries), not 3 retries after the first —
+# pinned by test_opencode_exhausting_stall_retries_records_a_cooldown. Bounds worst-case
+# wall-clock at `_OPENCODE_MAX_STALL_RETRIES * _OPENCODE_DEFAULT_STALL_SECONDS` (~15
+# minutes) rather than ~20 for the "3 retries after the first" reading.
+_OPENCODE_MAX_STALL_RETRIES = 3
+_OPENCODE_ACCESS_METHOD = "opencode"
+_OPENCODE_STALL_MODELS_ENV = "REVIEW_OPENCODE_STALL_MODELS"
+# The default board also runs Kimi/Qwen/DeepSeek AGENTIC seats through opencode
+# (reviewlib/config.py) besides zai/glm — there is no evidence any of THOSE share the
+# zero-output hang failure mode, so the watchdog stays scoped to the one confirmed-bad
+# route rather than blanket-applied to every opencode dispatch (codex review finding,
+# round 2: a blanket liveness bound risks misclassifying another seat's legitimately
+# slow start as a stall, retrying it 3x, and wrongly cooling it down).
+_OPENCODE_DEFAULT_STALL_MODEL_SUBSTRINGS = ("zai/glm",)
+
+
+def _opencode_model_needs_stall_watchdog(model: str) -> bool:
+    """True iff `model` matches a route known to hang at 0% CPU with zero output on
+    quota exhaustion (review-cli#153/#159/#179 — confirmed so far only for zai/glm-5.2
+    via opencode). Overridable via $REVIEW_OPENCODE_STALL_MODELS (comma-separated
+    case-insensitive substrings) if a future model needs the same treatment."""
+    raw = os.environ.get(_OPENCODE_STALL_MODELS_ENV)
+    substrings = (
+        tuple(s.strip() for s in raw.split(",") if s.strip())
+        if raw is not None and raw.strip()
+        else _OPENCODE_DEFAULT_STALL_MODEL_SUBSTRINGS
+    )
+    model_lower = model.lower()
+    return any(s.lower() in model_lower for s in substrings)
+
+
+def _opencode_stall_seconds() -> int | None:
+    """Seconds of TOTAL silence (zero output since spawn) before an opencode seat is
+    declared stalled, distinct from (and much shorter than) the generic idle timeout.
+    None disables the check. Overridable via $REVIEW_OPENCODE_STALL_SECONDS for
+    tests/tuning; a value <= 0 disables it, mirroring $REVIEW_IDLE_TIMEOUT_SECONDS's own
+    convention."""
+    raw = os.environ.get(_OPENCODE_STALL_SECONDS_ENV)
+    if raw is not None and raw.strip():
+        try:
+            value = int(raw)
+        except ValueError:
+            value = None
+        if value is not None:
+            return value if value > 0 else None
+    return _OPENCODE_DEFAULT_STALL_SECONDS
+
+
+def _opencode_call_stalled(proc: subprocess.CompletedProcess[str]) -> bool:
+    """True iff `proc` is a `_run_streamed` result that timed out via the STALL
+    (liveness) path specifically — not a normal idle timeout, not a real error.
+
+    Reads the `timeout_kind` attribute `_run_streamed` stamps on its result (process.py)
+    rather than text-scraping `stdout` for a marker substring (codex review finding: a
+    substring search is both forgeable — a reviewed model could itself emit matching
+    prose — and, after `_run_streamed`'s own idle/liveness clamping, the marker's exact
+    embedded seconds value may not match what this caller requested anyway).
+
+    A stall whose bound was CLAMPED below the requested window (`stall_bound_clamped`,
+    stamped by `_run_streamed` when the board-deadline / idle clamp shortened it) is
+    NOT a stall in this sense (round-2 review finding, Fable): under deadline pressure
+    a merely slow-to-first-byte seat would otherwise rack up three sub-minute "stalls"
+    and be benched for the next invocation on a signal that says nothing about quota.
+    Such a result is returned as an honest bounded failure — no retry, no cooldown."""
+    return (
+        proc.returncode == 124
+        and getattr(proc, "timeout_kind", None) == TIMEOUT_KIND_STALL
+        and not getattr(proc, "stall_bound_clamped", False)
+    )
+
+
+def _run_opencode_with_stall_retry(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    round_no: int,
+    header_argv0: str,
+    model: str,
+    true_silence_timeout: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an opencode agentic seat, retrying up to `_OPENCODE_MAX_STALL_RETRIES` times
+    if it stalls (see the module-level comment above for the full rationale). After the
+    final attempt is ALSO a stall, records a cooldown for `(model, "opencode")` so the
+    NEXT `review` invocation skips the real dispatch entirely, and returns the last
+    (stalled) result to the caller — this run's pool still gets a bounded, honest
+    failure instead of hanging.
+
+    Composition with the outer in-seat retry (`reviewlib.retry`, capped at
+    `_MAX_TIMEOUT_RETRIES=1` for an rc=124 result): if every attempt here stalls, the
+    cooldown is already recorded by the time this returns, so the outer layer's ONE
+    permitted retry re-enters `review_opencode`, hits the fresh cooldown at the top of
+    that function, and short-circuits to the (fast, rc=0) cooldown-skip sentinel instead
+    of spending another `_OPENCODE_MAX_STALL_RETRIES` attempts — the same self-limiting
+    composition `review_claude`'s existing cooldown cache already relies on.
+
+    Only applies the stall bound to `model`s matching
+    `_opencode_model_needs_stall_watchdog` — every OTHER opencode seat dispatches
+    exactly as before this feature (no liveness bound, no retry, no cooldown).
+
+    For a WATCHED model the liveness watchdog is the SOLE owner of the "zero output
+    since spawn" signal: `true_silence_timeout` is NOT forwarded to `_run_streamed`
+    for it (round-1 review finding, Opus + Fable: both detectors fire on the same
+    signal but with opposite policies — liveness retries up to 3x then cools down,
+    true-silence cools down on the FIRST trip with no retry — and the registry's
+    true-silence value for zai/glm equals the 300s stall default, so which policy
+    applied was decided by poll-loop check order, not by design; a user raising
+    $REVIEW_OPENCODE_STALL_SECONDS above the registry value would silently have
+    flipped the seat to "cooldown on first silence"). Unwatched models keep the
+    true-silence wiring exactly as before."""
+    stall_seconds = (
+        _opencode_stall_seconds()
+        if _opencode_model_needs_stall_watchdog(model)
+        else None
+    )
+    effective_true_silence = None if stall_seconds is not None else true_silence_timeout
+    proc = None
+    for attempt in range(1, _OPENCODE_MAX_STALL_RETRIES + 1):
+        proc = _run_streamed(
+            argv,
+            cwd=cwd,
+            timeout=timeout,
+            backend="opencode",
+            round_no=round_no,
+            announce=_ANNOUNCE_LOGS,
+            header_argv0=header_argv0,
+            liveness_timeout=stall_seconds,
+            true_silence_timeout=effective_true_silence,
+        )
+        if not _opencode_call_stalled(proc):
+            return proc
+        if attempt >= _OPENCODE_MAX_STALL_RETRIES:
+            record_cooldown(
+                model,
+                f"opencode stalled with no output after {attempt} attempts",
+                access_method=_OPENCODE_ACCESS_METHOD,
+            )
+    assert proc is not None  # loop runs >= 1 time (_OPENCODE_MAX_STALL_RETRIES >= 1)
+    return proc
+
+
 def _record_true_silence_if_needed(model: str, proc) -> None:
     """After an opencode `_run_streamed` call (codex review finding, round 13: only
     opencode calls this today — omp is tracked for the same wiring in #235, not done
@@ -732,13 +897,15 @@ def _record_true_silence_if_needed(model: str, proc) -> None:
     above ("closes the false-clear ... rc=0 body") describes the round-12 FIX's
     motivating scenario, not the full scope of what this call now covers."""
     if getattr(proc, "true_silenced", False):
-        record_cooldown(model, "true-silence timeout")
+        record_cooldown(
+            model, "true-silence timeout", access_method=_OPENCODE_ACCESS_METHOD
+        )
         return
     reason = _chronic_unavailable_reason(proc)
     if reason is not None:
-        record_cooldown(model, reason)
+        record_cooldown(model, reason, access_method=_OPENCODE_ACCESS_METHOD)
     elif proc.returncode == 0 and proc.stdout.strip():
-        clear_cooldown(model)
+        clear_cooldown(model, access_method=_OPENCODE_ACCESS_METHOD)
 
 
 def review_opencode(
@@ -795,12 +962,18 @@ def review_opencode(
     )
     if unpaid is not None:
         return unpaid
+    # review-cli#153/#159/#179 fold-in of #187's cooldown design: checked BEFORE
+    # `_which`/preflight (codex review finding — a cached-unavailable seat must skip
+    # ALL real work, including the preflight network probe, not just the final
+    # dispatch) so a cooling-down seat costs nothing beyond this cheap store read.
     # codex review finding (round 1): recording a true-silence cooldown is useless if
     # nothing ever CHECKS it before the next dispatch — mirrors review_claude's own
     # cooldown-consult pattern, so a seat that just went true-silent is actually
     # skipped (a synthetic sentinel, same shape failover already knows how to handle)
     # instead of paying for another multi-minute stuck attempt on every invocation.
-    cooldown = active_cooldown(canonical_model)
+    # `canonical_model` (not `model`) for the lookup — see the module comment above
+    # about internal-lookup-only uses of `canonical_model`.
+    cooldown = active_cooldown(canonical_model, access_method=_OPENCODE_ACCESS_METHOD)
     if cooldown is not None:
         # `backend="opencode"` (codex review finding, round 2): without this the skip
         # was hard-coded to "claude" in the sidecar log/dashboard, mislabeling every
@@ -848,14 +1021,13 @@ def review_opencode(
         if variant:
             argv += ["--variant", variant]
         argv.append(message)
-        proc = _run_streamed(
+        proc = _run_opencode_with_stall_retry(
             argv,
             cwd=cwd,
             timeout=timeout,
-            backend="opencode",
             round_no=round_no,
-            announce=_ANNOUNCE_LOGS,
             header_argv0=f"opencode -m {_safe_log_header(oc_model)}",
+            model=canonical_model,
             true_silence_timeout=true_silence_timeout_seconds(canonical_model),
         )
         _record_true_silence_if_needed(canonical_model, proc)
@@ -902,14 +1074,13 @@ def review_opencode(
         if variant:
             argv += ["--variant", variant]
         argv.append(message)
-        proc = _run_streamed(
+        proc = _run_opencode_with_stall_retry(
             argv,
             cwd=tmp,
             timeout=timeout,
-            backend="opencode",
             round_no=round_no,
-            announce=_ANNOUNCE_LOGS,
             header_argv0=f"opencode -m {_safe_log_header(oc_model)}",
+            model=canonical_model,
             true_silence_timeout=true_silence_timeout_seconds(canonical_model),
         )
     _record_true_silence_if_needed(canonical_model, proc)
@@ -2363,17 +2534,19 @@ def review_claude(
     )
     if unpaid is not None:
         return unpaid
-    cooldown = active_cooldown(model)
+    # Resolve the transport BEFORE checking the cooldown (review-cli#187): a cooldown
+    # recorded from one transport must not shadow the other, independently-healthy one
+    # for the same model, so the store is keyed by (model, access_method) and the
+    # access_method must be known before the lookup, not after.
+    mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
+    use_api = mode == "api" or (
+        mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None
+    )
+    access_method = "api" if use_api else "cli"
+    cooldown = active_cooldown(model, access_method=access_method)
     if cooldown is not None:
         return _cooldown_skip_result(model, round_no, cooldown, backend="claude")
-    mode = os.environ.get("REVIEW_CLAUDE_MODE", "").strip().lower()
-    if mode == "api":
-        result = review_claude_api(
-            model, prompt, diff, cwd, timeout, round_no, effort=effort
-        )
-    elif (
-        mode != "cli" and not _have_claude_cli() and _anthropic_api_config() is not None
-    ):
+    if use_api:
         result = review_claude_api(
             model, prompt, diff, cwd, timeout, round_no, effort=effort
         )
@@ -2383,9 +2556,9 @@ def review_claude(
         )
     reason = _chronic_unavailable_reason(result)
     if reason is not None:
-        record_cooldown(model, reason)
+        record_cooldown(model, reason, access_method=access_method)
     elif _clears_cooldown_history(result):
-        clear_cooldown(model)
+        clear_cooldown(model, access_method=access_method)
     return result
 
 
