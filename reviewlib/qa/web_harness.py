@@ -28,6 +28,7 @@ the browser context is always closed (try/finally) — a web run leaks neither a
 browser. The browser is launched headless with a short navigation timeout, so a hung page can
 never wedge the run.
 """
+
 from __future__ import annotations
 
 import os
@@ -42,10 +43,13 @@ from typing import Protocol
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from ..process import register_external_child, unregister_external_child
+
 # How much of the dev server's stdout tail to retain for a BLOCKED-report proof. A drain thread
 # keeps the OS pipe empty (so a chatty server never blocks on a full pipe before it starts
 # serving); we hold only the last few KiB, plenty for a crash/traceback tail.
 _OUTPUT_TAIL_BYTES = 16384
+
 
 def _env_float(name: str, default: float) -> float:
     """A float from ``name`` in the environment, falling back to ``default`` on absent OR a
@@ -134,7 +138,13 @@ def playwright_available() -> tuple[bool, str]:
 
 
 def _flag_enabled(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no", "off")
+    return os.environ.get(name, "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 class PlaywrightPage:
@@ -162,9 +172,13 @@ class PlaywrightPage:
 
     def goto(self, url: str) -> None:
         try:
-            self._page.goto(self._resolve(url), wait_until="load", timeout=NAV_TIMEOUT_MS)
+            self._page.goto(
+                self._resolve(url), wait_until="load", timeout=NAV_TIMEOUT_MS
+            )
         except Exception as exc:  # noqa: BLE001 — any Playwright error becomes a case FAIL
-            raise WebActionError(f"navigation to {url!r} failed: {_short(exc)}") from exc
+            raise WebActionError(
+                f"navigation to {url!r} failed: {_short(exc)}"
+            ) from exc
 
     def click(self, selector: str) -> None:
         try:
@@ -177,14 +191,16 @@ class PlaywrightPage:
             self._page.wait_for_load_state("load", timeout=NAV_TIMEOUT_MS)
         except Exception as exc:  # noqa: BLE001
             raise WebActionError(
-                f"could not click selector {selector!r}: {_short(exc)}") from exc
+                f"could not click selector {selector!r}: {_short(exc)}"
+            ) from exc
 
     def fill(self, selector: str, value: str) -> None:
         try:
             self._page.fill(selector, value, timeout=NAV_TIMEOUT_MS)
         except Exception as exc:  # noqa: BLE001
             raise WebActionError(
-                f"could not fill selector {selector!r}: {_short(exc)}") from exc
+                f"could not fill selector {selector!r}: {_short(exc)}"
+            ) from exc
 
     def text_content(self) -> str:
         try:
@@ -210,7 +226,9 @@ class PlaywrightPage:
 def _short(exc: object, *, limit: int = 200) -> str:
     """A short, single-line form of an exception message for a proof line (Playwright errors are
     multi-line and verbose; the case proof wants the gist, not the stack)."""
-    text = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+    text = (
+        str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+    )
     return text[:limit]
 
 
@@ -280,6 +298,7 @@ class WebServer:
 
     proc: subprocess.Popen
     _reaped: bool = False
+    _reaper_handle: tuple[subprocess.Popen, int | None] | None = None
 
     def __post_init__(self) -> None:
         self._tail: deque[str] = deque()
@@ -287,7 +306,9 @@ class WebServer:
         self._tail_lock = threading.Lock()
         self._drain_thread: threading.Thread | None = None
         if self.proc.stdout is not None:
-            self._drain_thread = threading.Thread(target=self._drain_stdout, daemon=True)
+            self._drain_thread = threading.Thread(
+                target=self._drain_stdout, daemon=True
+            )
             self._drain_thread.start()
 
     def _drain_stdout(self) -> None:
@@ -295,7 +316,9 @@ class WebServer:
         if stream is None:
             return
         try:
-            for line in stream:  # blocks per line; EOF ends the loop when the server exits
+            for (
+                line
+            ) in stream:  # blocks per line; EOF ends the loop when the server exits
                 with self._tail_lock:
                     self._tail.append(line)
                     self._tail_len += len(line)
@@ -316,6 +339,9 @@ class WebServer:
         _terminate_group(self.proc)
         if self._drain_thread is not None:
             self._drain_thread.join(timeout=2)
+        if self._reaper_handle is not None:
+            unregister_external_child(self._reaper_handle)
+            self._reaper_handle = None
 
 
 def _terminate_group(proc: subprocess.Popen) -> None:
@@ -375,18 +401,33 @@ def boot_web_server(
     env.update(extra_env or {})
     try:
         proc = subprocess.Popen(  # noqa: S603 — command resolved from the SUT's own qa.yaml
-            command, cwd=str(cwd), env=env, start_new_session=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            command,
+            cwd=str(cwd),
+            env=env,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
     except (OSError, ValueError) as exc:
         raise WebHarnessError(
             f"could not launch the web dev server {command!r} in {cwd}: {exc}",
             exit_code=exit_boot_failed,
         ) from exc
-    return WebServer(proc=proc)
+    # Registered with the SAME signal-reaper/backstop registry a backend model child
+    # uses (codex review, review-cli#162 follow-up) — without this, an external
+    # SIGTERM/SIGINT (or the internal backstop) reaped only `_run_streamed`'s children
+    # and left this SUT process group behind, since `WebServer.reap()`'s own teardown
+    # only runs from a live interpreter's normal control flow, not from a raw signal.
+    handle = register_external_child(proc)
+    server = WebServer(proc=proc)
+    server._reaper_handle = handle
+    return server
 
 
-def wait_until_reachable(url: str, *, timeout_s: float, server: WebServer | None = None) -> bool:
+def wait_until_reachable(
+    url: str, *, timeout_s: float, server: WebServer | None = None
+) -> bool:
     """Poll ``url`` (bounded) until it answers an HTTP 2xx/3xx, returning True the moment it
     does. The health gate before any case runs: a dev server that never comes up makes the run a
     controlled BLOCKED instead of driving a browser at a dead address. If ``server`` is given and

@@ -59,6 +59,13 @@ NOTHING usable, not a partial result. So:
   let it run (background it and poll if you want progress). Any external cap only risks
   killing a good run before its synthesis and adds nothing the backstop doesn't already
   guarantee.
+- If YOUR OWN calling process has a short foreground cap you cannot lift (a capped
+  shell/tool budget), do not wrap `review` in a timeout to work around it — add
+  `--detach` instead: `review diff --staged --task CODE --detach` returns in seconds
+  with a job-id, and the review keeps running in a detached background process. Poll
+  it with `review status <job-id>` (or `review jobs` to list every job); `review wait
+  <job-id>` blocks until done and is for an UNCAPPED caller, not a capped one. This is
+  the first-class supported way to decouple your own timeout from the review's.
 
 ## No external timeout — `review` carries its OWN internal <=4h backstop
 Do NOT put ANY external timeout on `review`. It is designed to run unbounded from
