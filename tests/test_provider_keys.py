@@ -44,6 +44,8 @@ import reviewlib.backends as backends  # noqa: E402
 from reviewlib.config import (  # noqa: E402
     ASTRA_SEAT,
     SOL_SEAT,
+    SONNET_SEAT,
+    TERRA_SEAT,
     BoardReviewer,
     split_pool_reserve,
     _expand_alias,
@@ -213,6 +215,11 @@ def test_aliases_expand():
     assert _expand_alias("gpt56sol") == SOL_SEAT
     assert _expand_alias("astra") == ASTRA_SEAT
     assert _expand_alias("gpt6astra") == ASTRA_SEAT
+    # Terra/Sonnet (review-cli#382): pinned for the same reason as Sol/Astra above.
+    assert _expand_alias("terra") == TERRA_SEAT
+    assert _expand_alias("gpt56terra") == TERRA_SEAT
+    assert _expand_alias("sonnet") == SONNET_SEAT
+    assert _expand_alias("sonnet5") == SONNET_SEAT
 
 
 # === z.ai request shape (OpenAI-compatible, NOT gemini contents/parts) ===========

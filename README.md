@@ -1287,7 +1287,7 @@ out of the box — no config file required.
 
 ### Priority-ordered failover pool
 
-The raw built-in board is a **priority-ordered** list of 10 models — strongest WORKING
+The raw built-in board is a **priority-ordered** list of 12 models — strongest WORKING
 model first — and a plain `review diff` runs the `light` preset (Alex, 2026-08-28): a
 **pool of 2** without Fable/Sol, at medium effort — cheap by default for routine
 pre-commit checks. Use `--preset default` for a routine change review at a pool of 4,
@@ -1317,8 +1317,8 @@ the panel still covers a broad set of facets.
 
 `--pool N` overrides the preset default (the top-N available, with the same failover);
 `--pool 0` runs **all available** seats in the selected preset/board. Use
-`--preset heavy --pool 0` for all 9 heavy-preset built-in seats (the raw 10-seat board,
-including last-resort Fable, needs an explicit `board:` config). The board is **never
+`--preset heavy --pool 0` for all 11 heavy-preset built-in seats (the raw 12-seat board,
+including last-resort Fable, needs an explicit `board:`/`models:` config). The board is **never
 disabled** — `--pool` only sizes the pool.
 
 The built-in board, in **priority order** (the `tier` column shows the `heavy` preset split
@@ -1330,12 +1330,32 @@ on a fully-keyed environment):
 | 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
 | 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
 | 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
-| 5 | reserve | Astra | `codex:gpt-6-astra` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence (GPT-6-Astra, OpenAI's flagship codex model; explicitly pinned, unlike a bare `codex` seat which would silently track the CLI's own default) |
-| 6 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| 7 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
-| 8 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
-| 9 | reserve | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom (z.ai subscription route; **deprioritized — pathologically slow under load**, review-cli#65) |
-| 10 | reserve (last, no preset) | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~97.9-100% dispatch failure rate**, review-cli#fable-seat-reliability) |
+| 5 | reserve | Astra | `codex:gpt-6-astra` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence (GPT-6-Astra, OpenAI's flagship codex model; explicitly pinned, unlike a bare `codex` seat which would silently track the CLI's own default; duplicates Sol's lens — a pre-existing, deliberately accepted trade-off, see review-cli#382 below) |
+| 6 | reserve | Terra | `codex:gpt-5.6-terra` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (a distinct, already-paid codex model — live `performance` fallback for GLM-cc, review-cli#382) |
+| 7 | reserve | Sonnet | `claude:claude-sonnet-5` | `quality` | readability, naming, duplication, code smells, idiom (a distinct, already-paid Anthropic model — live `quality` fallback for Kimi, review-cli#382) |
+| 8 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| 9 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| 10 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+| 11 | reserve | GLM | `oc:zai/glm-5.2` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF (z.ai subscription route; **deprioritized — pathologically slow under load, and the single point of failure in the 2026-09-05 quota incident that motivated review-cli#382** — live `security` fallback for Qwen, freed from `quality` now that Sonnet covers it) |
+| 12 | reserve (last, no preset) | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~100% dispatch failure rate as of 2026-09-05**, review-cli#fable-seat-reliability) |
+
+**review-cli#382 (2026-09-05):** `unpaid_providers: [commandcode, gemini]` disables every
+commandcode-routed seat (GLM-cc/Kimi/Qwen/DeepSeek) plus Gemini at once, machine-wide. That
+used to leave `performance`/`quality`/`security`/`tests`/`contracts` with zero or exactly one
+live seat each — `quality`'s one live seat (GLM, the z.ai route above) hit a real weekly quota
+exhaustion with nothing left to promote, hard-blocking a real PR's review-quorum gate. Terra
+and Sonnet are genuinely distinct, already-paid fallbacks on the same OpenAI/Codex and
+Anthropic accounts Sol/Astra and Opus/Fable already use (no new provider), giving
+`performance`/`quality` a real live seat each. GLM was re-lensed off its now-redundant
+`quality` role (Sonnet covers it more reliably) onto `security`, which had none. `tests`
+(DeepSeek-only), `contracts` (Gemini-only), and `architect` (Fable-only, and Fable is ~100%
+failing) remain thin — there was no third distinct already-paid model to give every starved
+role its own seat without doubling up one account's quota pressure on a single review run,
+the exact failure class this same change fixes for Fable. Astra's pre-existing `consistency`
+role (a duplicate of Sol's) is deliberately left unchanged — an earlier draft flipped it to
+`security` to close that duplicate, but doing so left `consistency` with zero live fallback
+anywhere on the board, the exact single-point-of-failure class this change exists to fix,
+just relocated.
 
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
 the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
@@ -1457,8 +1477,8 @@ review --show-board        # active default preset board (light); add --preset h
 export REVIEW_TASK_CODE=HYP-742
 review diff                # default (light) failover pool: the top 2 AVAILABLE seats by priority
 review diff --pool 0       # run all available light-preset seats
-review diff --preset default --pool 0  # run all 8 default-preset built-in seats (Fable/Sol excluded)
-review diff --preset heavy --pool 0  # run all 9 heavy-preset built-in seats (Fable excluded)
+review diff --preset default --pool 0  # run all 10 default-preset built-in seats (Fable/Sol excluded)
+review diff --preset heavy --pool 0  # run all 11 heavy-preset built-in seats (Fable excluded)
 review diff --pool 2       # run the top 2 available seats (with failover)
 review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
 review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
@@ -1485,7 +1505,7 @@ configured `board:`   >   default preset (light)
   never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
   pool (default 2 for a bare `review diff` — the light preset, Alex 2026-08-28 — or 4 if
   you pass `--preset default`; `--pool 0` runs all available seats in the
-  selected preset/board; `--preset heavy --pool 0` currently covers all 9 heavy-preset
+  selected preset/board; `--preset heavy --pool 0` currently covers all 11 heavy-preset
   built-ins — Fable is excluded from every preset, see "Reviewer board" above).
   `--pool` does not reduce an explicit `-m` list:
   every requested `-m` seat is attempted.
@@ -1503,11 +1523,11 @@ When `models:` is present,
 An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
 warning); a single malformed entry is skipped (the valid ones are kept). With **no**
 `models:` or `board:` configured, the CLI uses the default preset (light as of
-2026-08-28); `--preset default` uses the same 8 seats at high effort, and `--preset
-heavy` uses the 9-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable
-excluded, see "Reviewer board" above) — the raw 10-seat board (including last-resort
+2026-08-28); `--preset default` uses the same 10 seats at high effort, and `--preset
+heavy` uses the 11-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable
+excluded, see "Reviewer board" above) — the raw 12-seat board (including last-resort
 Fable) is only reached by an EXPLICIT, non-empty `board:`/`models:` listing naming the
-seats you want; an absent or empty `board:`/`models:` falls back to the same 8-seat
+seats you want; an absent or empty `board:`/`models:` falls back to the same 10-seat
 `LIGHT_PRESET_BOARD` (no Fable, no Sol; same model order as `DEFAULT_PRESET_BOARD`, at
 medium instead of high effort) that the default preset now resolves to. A
 `board:` that is **present but has no usable entry at all** is a hard error (non-zero
@@ -1528,14 +1548,14 @@ board:
   - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
 ```
 
-**Optional heavyweight seats** (NOT enabled by default — the board stays at 10). Add
+**Optional heavyweight seats** (NOT enabled by default — the board stays at 12). Add
 either to your `board:` list for an extra 1M-context resilience / holistic-senior
 pass; both run agentically through opencode's commandcode provider (needs opencode +
 `opencode auth login`, like the default `oc:` seats):
 
 ```yaml
 board:
-  # ... the 10 built-in seats ...
+  # ... the 12 built-in seats ...
   - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
   - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
 ```
