@@ -3059,6 +3059,186 @@ def test_oc_auth_has_provider_missing_file():
         assert backends._oc_auth_has_provider("anthropic") is False
 
 
+def test_oc_auth_has_provider_recognizes_oauth_entry():
+    """A provider authenticated via opencode's OAuth flow (`opencode providers login`,
+    e.g. xai/GROK_SEAT — verified live: `opencode providers list` shows "xAI | oauth" on
+    a real host) stores `{"type": "oauth", "access": "...", "refresh": "...", ...}`, not
+    a `key` field. `_oc_auth_has_provider` must recognize a non-empty `access` token as a
+    valid credential — checking only `key` silently reports an oauth-authenticated
+    provider as unavailable and drops the seat from every pool."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(
+                tmpdir,
+                {
+                    "xai": {
+                        "type": "oauth",
+                        "access": "oauth_access_token",
+                        "refresh": "oauth_refresh_token",
+                        "expires": 1234567890,
+                    }
+                },
+            )
+            assert backends._oc_auth_has_provider("xai") is True
+            # A provider with no entry at all is still False.
+            assert backends._oc_auth_has_provider("anthropic") is False
+
+
+def test_oc_auth_has_provider_recognizes_refresh_only_entry():
+    """opencode auto-refreshes an expired `access` token from `refresh` on next use
+    (review of #166) — an entry with a valid `refresh` but no/empty `access` (the state
+    right after `access` expires and before the next call refreshes it) must still count
+    as a usable credential, not report unavailable and drop the seat."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(
+                tmpdir,
+                {
+                    "xai": {
+                        "type": "oauth",
+                        "access": "",
+                        "refresh": "oauth_refresh_token",
+                        "expires": 1234567890,
+                    }
+                },
+            )
+            assert backends._oc_auth_has_provider("xai") is True
+
+
+def test_oc_auth_has_provider_rejects_empty_and_type_only_entries():
+    """Boundary cases for the type-discriminated credential check (review of #166, all
+    three rounds): an entry that carries no actual token material -- empty dict, type-only,
+    every real token field explicitly empty/whitespace-only, or a metadata-only string
+    field (e.g. "note"/"account") alongside an empty real token -- must report False, not
+    True. "type" alone is metadata, never itself a credential, and neither is any OTHER
+    descriptive metadata field a future auth entry might carry alongside its real (but
+    empty) token -- a naive "any non-type string is a credential" check would wrongly
+    report these as usable and waste a real pool attempt on an unauthenticated seat."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(
+                tmpdir,
+                {
+                    "xai": {},
+                    "deepseek": {"type": "oauth"},
+                    "commandcode": {"type": "api", "key": ""},
+                    "zai": {"type": "oauth", "access": "", "refresh": ""},
+                    "groq": {"type": "api", "key": "   "},
+                    "mistral": {
+                        "type": "api",
+                        "note": "some account note",
+                        "key": "",
+                    },
+                    "together": {
+                        "type": "oauth",
+                        "account": "user@example.com",
+                        "access": "",
+                        "refresh": "",
+                    },
+                },
+            )
+            assert backends._oc_auth_has_provider("xai") is False
+            assert backends._oc_auth_has_provider("deepseek") is False
+            assert backends._oc_auth_has_provider("commandcode") is False
+            assert backends._oc_auth_has_provider("zai") is False
+            assert backends._oc_auth_has_provider("groq") is False
+            assert backends._oc_auth_has_provider("mistral") is False
+            assert backends._oc_auth_has_provider("together") is False
+
+
+def test_oc_auth_has_provider_unknown_type_falls_back_to_field_agnostic_check():
+    """An entry with an unrecognized/future "type" (neither "api" nor "oauth") falls back
+    to the field-name-agnostic check rather than reporting no credential outright -- a
+    genuinely new opencode auth method should not silently drop its seat just because this
+    function doesn't recognize the type string yet."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(
+                tmpdir,
+                {
+                    "xai": {"type": "future-method", "token": "realtoken"},
+                    "deepseek": {"type": "future-method"},
+                },
+            )
+            assert backends._oc_auth_has_provider("xai") is True
+            assert backends._oc_auth_has_provider("deepseek") is False
+
+
+def test_oc_auth_has_provider_unknown_type_rejects_common_metadata_fields():
+    """Codex review of #166 round 7: the unknown-type fallback must not treat a common
+    descriptive metadata field (account/note/url/email/label/name -- alongside type/
+    expires) as a credential when no real token field is present. This can't be
+    exhaustive against a genuinely novel field name (documented as a best-effort
+    denylist, not a guarantee), but it must close the foreseeable cases."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(
+                tmpdir,
+                {"xai": {"type": "future-method", "account": "user@example.com"}},
+            )
+            assert backends._oc_auth_has_provider("xai") is False
+
+
+def test_grok_availability_via_inline_config_apikey():
+    """The Grok/xai seat's SECOND documented auth method (review of #166 round 7 --
+    Opus review finding, only the OAuth path had a test): an inline
+    options.apiKey in opencode.json's xai provider block, checked via
+    _oc_config_has_provider_key, makes _oc_provider_auth_available("xai") report True
+    with an EMPTY auth.json (no OAuth entry at all)."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(
+                tmpdir,
+                {"xai": {"options": {"apiKey": "xai_inline_key"}}},
+            )
+            assert backends._oc_provider_auth_available("xai") is True
+
+
+def test_grok_availability_via_xai_api_key_env_var():
+    """The Grok/xai seat's THIRD documented auth method (review of #166 round 7 -- Opus
+    review finding): a plain XAI_API_KEY env var (opencode's own convention, read via
+    _oc_env_has_provider_key against _OC_PROVIDER_ENV_VARS["xai"]) makes
+    _oc_provider_auth_available("xai") report True with no auth.json OR opencode.json
+    credential at all -- and reports False again once the env var is removed, so this is
+    genuinely gating on the env var, not silently passing for an unrelated reason."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(tmpdir, {})
+            os.environ["OC_CONFIG_FILE"] = _write_oc_config(tmpdir, {})
+            os.environ["XAI_API_KEY"] = "xai_env_key"
+            try:
+                assert backends._oc_provider_auth_available("xai") is True
+            finally:
+                os.environ.pop("XAI_API_KEY", None)
+            assert backends._oc_provider_auth_available("xai") is False
+
+
+def test_oc_auth_has_provider_returns_false_not_raise_on_non_dict_entry():
+    """A corrupted auth.json can carry a truthy NON-dict value for a provider (a raw
+    string, a list, a number) -- (review of #166 round 4 regression): the dict-assuming
+    logic (entry.get/.items()) must stay inside the fail-closed try/except, so this
+    returns False instead of letting AttributeError escape and abort board selection
+    entirely (worse than one seat silently unavailable)."""
+    with _EnvSandbox():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["OC_AUTH_FILE"] = _write_oc_auth(
+                tmpdir,
+                {
+                    "xai": "raw-token",
+                    "deepseek": ["a", "b"],
+                    "commandcode": 42,
+                    "zai": None,
+                },
+            )
+            assert backends._oc_auth_has_provider("xai") is False
+            assert backends._oc_auth_has_provider("deepseek") is False
+            assert backends._oc_auth_has_provider("commandcode") is False
+            assert backends._oc_auth_has_provider("zai") is False
+            # And the availability probe built on top of it doesn't raise either.
+            assert backends._oc_provider_auth_available("xai") is False
+
+
 def test_oc_config_has_provider_key_missing_file():
     """Missing opencode.json → False, not an exception."""
     with _EnvSandbox():

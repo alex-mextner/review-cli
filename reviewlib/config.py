@@ -86,6 +86,15 @@ FABLE_SEAT = "claude:claude-fable-5"
 # only the diff; no repo access, no tools, no exec), so it needs no `-s read-only` cage.
 GLM_COMMANDCODE_SEAT = "commandcode:zai-org/GLM-5.2"
 
+# Canonical Grok seat — opencode's NATIVE `xai` provider (oauth-authenticated via
+# `opencode providers login`, verified live 2026-07-22: `opencode models` lists
+# `xai/grok-4.5` and `opencode providers list` shows an active xAI oauth credential on
+# this host). Already agentic (`oc:` prefix) — unlike Kimi/GLM-cc/Qwen/DeepSeek, there is
+# no diff-only REST fallback for this seat because xai is not one of the
+# commandcode/z.ai custom gateways `_agentic()` derives from; it is a first-class
+# opencode provider, so the seat is spelled directly.
+GROK_SEAT = "oc:xai/grok-4.5"
+
 
 def _agentic(seat: str) -> str:
     """Turn a diff-only keyed-HTTP seat (`provider:model`) into its AGENTIC opencode
@@ -158,6 +167,8 @@ MODEL_ALIASES = {
     "gpt56terra": TERRA_SEAT,
     "sonnet": SONNET_SEAT,
     "sonnet5": SONNET_SEAT,
+    "grok": GROK_SEAT,
+    "grok45": GROK_SEAT,
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
     # directly in resolve_backend (env ZAI_MODEL / glm-5.2 default — the newest GLM,
     # reachable on the Coding-Plan endpoint). These aliases pin specific GLM model ids;
@@ -290,7 +301,7 @@ class BoardReviewer:
         return REVIEW_ROLES.get(self.role, "")
 
 
-# DEFAULT_BOARD: the raw 12-seat board used as the source of truth for built-in presets
+# DEFAULT_BOARD: the raw 13-seat board used as the source of truth for built-in presets
 # and for custom/config fallback paths. A plain `review diff` runs the default preset,
 # not this tuple directly. The board is ordered by *priority* — strongest WORKING model
 # first, weakest (or least-reliable, review-cli#fable-seat-reliability) last — NOT by
@@ -402,19 +413,29 @@ DEFAULT_BOARD = (
     # above DEFAULT_BOARD) — it stays thin until commandcode/gemini are re-enabled or a
     # new paid seat is added.
     BoardReviewer("gemini", "contracts", "Gemini"),
-    # priority 11 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
+    # priority 11 — Grok 4.5 via opencode's native `xai` provider (agentic, reads the
+    # repo). Placed BEFORE the deliberately-slow z.ai GLM reserve below: this seat's own
+    # dogfooding review of its addition (`review diff` seat, round 1) flagged that
+    # appending it AFTER GLM meant deep mid-run failover always paid GLM's #65
+    # pathological-slowness cost before ever reaching Grok, defeating the point of having
+    # a faster reserve. ROLE `security`, not `performance`: after review-cli#382/#386
+    # `performance` already has a live paid fallback (Terra) while `security` is held only
+    # by Qwen (commandcode — unpaid/disabled machine-wide) and the slow, quota-fragile GLM
+    # seat below, so this fast, live, oauth-backed reserve is the lens that was missing.
+    BoardReviewer(GROK_SEAT, "security", "Grok"),
+    # priority 12 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
     # opencode's `zai` provider. DELIBERATELY DEPRIORITIZED to the bottom of the reserve
     # (review-cli#65): this seat is observed to be PATHOLOGICALLY SLOW under load, so
     # promoting it onto the failover critical path stalls the pool's path to a verdict.
     # It stays on the board (still backfills when every faster reserve is also
-    # exhausted), but it no longer blocks a fast verdict — Qwen / DeepSeek / Gemini are
-    # promoted before it (review-cli#fable-seat-reliability: above only Fable). To
+    # exhausted), but it no longer blocks a fast verdict — Qwen / DeepSeek / Gemini / Grok
+    # are promoted before it (review-cli#fable-seat-reliability: above only Fable). To
     # re-rank, move this line up; its position IS its priority. ROLE CHANGED (review-cli#382)
     # from `quality` to `security`: Sonnet now covers `quality` more reliably, freeing this
     # live-but-fragile seat to backfill `security` (whose only other seat, Qwen, is
     # disabled) instead of duplicating Sonnet.
     BoardReviewer(_agentic("zai:glm-5.2"), "security", "GLM"),
-    # priority 12 (LAST-RESORT reserve) — Fable 5 (Anthropic flagship). DEMOTED from
+    # priority 13 (LAST-RESORT reserve) — Fable 5 (Anthropic flagship). DEMOTED from
     # priority 1 to LAST (review-cli#fable-seat-reliability, 2026-08): `review stat`
     # telemetry showed a 97.9-100% dispatch failure rate (chronic session/usage-limit
     # exhaustion on the account it runs through — being priority 1 made it the FIRST
@@ -460,8 +481,9 @@ DEFAULT_PRESET_BOARD = tuple(
 # moving Fable anywhere else would have silently shifted every later seat's tier by one slot
 # with no test catching it (the tuple-order pin would read as a membership change, not a
 # tier-boundary bug). The named `_heavy_eligible_seats` intermediate makes both the filter-
-# first ordering and the resulting seat-count invariant self-documenting (11 seats as of
-# review-cli#382's TERRA_SEAT/SONNET_SEAT addition — first 4 get `xhigh` effort: Sol, Opus,
+# first ordering and the resulting seat-count invariant self-documenting (12 seats as of
+# review-cli#165's GROK_SEAT addition on top of review-cli#382's TERRA_SEAT/SONNET_SEAT —
+# first 4 get `xhigh` effort: Sol, Opus,
 # GLM-cc, Kimi (unchanged from before #382 — TERRA_SEAT/SONNET_SEAT were inserted at raw
 # priority 6-7, AFTER Kimi at priority 4, so they land in the `max` tier, not `xhigh`); the
 # rest get `max`).

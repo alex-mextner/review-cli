@@ -39,6 +39,7 @@ from reviewlib.config import (  # noqa: E402
     DEFAULT_PRESET,
     DEFAULT_PRESET_BOARD,
     GLM_COMMANDCODE_SEAT,
+    GROK_SEAT,
     HEAVY_PRESET_BOARD,
     KIMI_SEAT,
     LIGHT_PRESET_BOARD,
@@ -115,10 +116,17 @@ def test_default_board_matches_directive_table():
         ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
         ("oc:commandcode/deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
         ("gemini", "contracts", "Gemini"),
+        # Seat 11 — Grok 4.5 via opencode's native `xai` provider, agentic (oauth-
+        # authenticated, no diff-only fallback route exists for this provider). Sits
+        # BEFORE the z.ai GLM last-resort seat so deep mid-run failover reaches a fast
+        # reserve before paying GLM's #65 pathological-slowness cost. Role `security`
+        # (NOT `performance`, which already has a live paid fallback in Terra) — see the
+        # seat's own comment in `reviewlib/config.py`.
+        ("oc:xai/grok-4.5", "security", "Grok"),
         # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
         # from the seat-3 commandcode GLM: same model family, different provider/transport.
         # DEPRIORITIZED to LAST-RESORT reserve (review-cli#65): it is pathologically slow
-        # under load, so it is promoted before only Fable — Qwen/DeepSeek/Gemini go first.
+        # under load, so it is promoted before only Fable — Qwen/DeepSeek/Gemini/Grok go first.
         # review-cli#382: role changed from `quality` (now covered by Sonnet above, which
         # doesn't share this seat's real-world quota fragility) to `security`.
         ("oc:zai/glm-5.2", "security", "GLM"),
@@ -154,6 +162,7 @@ def test_default_board_is_priority_ordered():
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
+        "oc:xai/grok-4.5",
         "oc:zai/glm-5.2",
         "claude:claude-fable-5",
     ]
@@ -190,6 +199,186 @@ def test_glm_commandcode_seat_is_the_canonical_constant():
     assert GLM_COMMANDCODE_SEAT == "commandcode:zai-org/GLM-5.2"
     seat = next(r for r in DEFAULT_BOARD if r.model == GLM_COMMANDCODE_SEAT)
     assert seat.display == "GLM-cc"
+
+
+def test_grok_seat_is_the_canonical_constant_and_resolves_to_opencode():
+    """GROK_SEAT is byte-exact "oc:xai/grok-4.5" (review of #166 — pinned so the seat
+    can't silently drift to a different spelling), sits on the board as "Grok", and
+    resolves through review_opencode end-to-end (not the bare/colon xai forms, which are
+    deliberately NOT routed anywhere — see test_bare_and_colon_xai_forms_are_not_routed)."""
+    assert GROK_SEAT == "oc:xai/grok-4.5"
+    seat = next(r for r in DEFAULT_BOARD if r.model == GROK_SEAT)
+    assert seat.display == "Grok"
+    # `security`, not `performance` (review round 1 of #167, Fable): after review-cli#386
+    # `performance` already has a live paid fallback (Terra) while `security` is held
+    # only by Qwen (unpaid/disabled) and the slow z.ai GLM seat.
+    assert seat.role == "security"
+    assert backends.resolve_backend(GROK_SEAT) is backends.review_opencode
+    assert backends.default_routes_live(GROK_SEAT) is True
+    assert backends.effective_provider(GROK_SEAT) == "xai"
+
+
+def test_grok_aliases_resolve_to_the_canonical_seat():
+    """The "grok"/"grok45" shorthand aliases both expand to GROK_SEAT byte-exact."""
+    from reviewlib.config import MODEL_ALIASES
+
+    assert MODEL_ALIASES["grok"] == GROK_SEAT
+    assert MODEL_ALIASES["grok45"] == GROK_SEAT
+
+
+def test_bare_and_colon_xai_forms_are_not_named_routes():
+    """Bare "xai" and colon-form "xai:<model>" are deliberately UNMATCHED by
+    _match_named_backend (review of #166): "xai:grok-4.5" would hand opencode the wrong
+    spelling ("grok-4.5" instead of "xai/grok-4.5" — review_opencode peels only the first
+    colon), and bare "xai" has no default-model resolution at all — unlike "zai"/
+    "commandcode", which DO have a bare-form default.
+
+    This does NOT mean these forms are unreachable end-to-end: resolve_backend()'s
+    existing generic catch-all (any string _match_named_backend rejects still falls
+    through to review_opencode, for back-compat with arbitrary provider/model selectors)
+    still sends both forms to opencode with that broken argv — see
+    test_bare_and_colon_xai_forms_still_hit_the_generic_catch_all. What THIS test proves
+    is narrower and is the actual point of the change: neither form is a NAMED, documented
+    route, so neither can be mistaken for the supported seat spelling, and (the next test)
+    neither can ship as a DEFAULT via the #25 anti-rot guard. Only "oc:xai/<model>" is a
+    valid, working, DOCUMENTED invocation."""
+    assert backends._match_named_backend("xai") is None
+    assert backends._match_named_backend("xai:grok-4.5") is None
+    # But the guard still accepts GROK_SEAT as a safe default (agentic-only exception).
+    assert backends.default_routes_live("oc:xai/grok-4.5") is True
+
+
+def test_bare_and_colon_xai_forms_still_hit_the_generic_catch_all():
+    """Honesty check (review of #166 round 3): resolve_backend("xai") and
+    resolve_backend("xai:grok-4.5") are NOT specially blocked by this change — they still
+    resolve to review_opencode via the PRE-EXISTING generic catch-all
+    (`_match_named_backend(model.lower()) or review_opencode`), which sends ANY
+    unrecognized model id to opencode for back-compat with arbitrary
+    `provider/model` selectors. A user who types `-m xai` or `-m xai:grok-4.5` still gets
+    a real (broken) opencode invocation — the exact same generic risk as typing any other
+    unrecognized provider string, e.g. `-m definitely-not-a-provider`. This change never
+    attempted to close that general gap; it only keeps bare/colon xai forms OUT of the
+    NAMED-route surface (_match_named_backend) and the DEFAULT-shipping surface
+    (default_routes_live), so nothing about this diff could accidentally promote a broken
+    invocation shape to a supported default."""
+    assert backends.resolve_backend("xai") is backends.review_opencode
+    assert backends.resolve_backend("xai:grok-4.5") is backends.review_opencode
+    # Same generic behavior for an unrelated bogus provider string — not xai-specific.
+    assert (
+        backends.resolve_backend("definitely-not-a-provider")
+        is backends.review_opencode
+    )
+
+
+def test_bare_slash_form_reaches_opencode_correctly_but_is_not_the_default_safe_spelling():
+    """Codex review of #166 round 7: a bare "xai/grok-4.5" (no "oc:" prefix, no colon) is
+    DIFFERENT from the "xai"/"xai:grok-4.5" forms above — review_opencode splits on the
+    first ":" and passes the remainder unchanged when there is none, so this form actually
+    constructs the CORRECT opencode invocation ("opencode -m xai/grok-4.5") via the same
+    generic catch-all. It is not documented as invalid; it's just not the canonical,
+    DEFAULT-safe GROK_SEAT spelling, so default_routes_live correctly still rejects it as a
+    default (it isn't a NAMED route — only oc:/opencode:-prefixed or otherwise explicitly
+    matched ids are)."""
+    assert backends.resolve_backend("xai/grok-4.5") is backends.review_opencode
+    assert backends.default_routes_live("xai/grok-4.5") is False
+
+
+def test_bare_and_colon_xai_forms_fail_the_default_routes_live_guard():
+    """Bare "xai" and colon-form "xai:<model>" are not just unmatched by
+    _match_named_backend — they must ALSO fail default_routes_live itself (not merely
+    the matcher), so nobody could ship either spelling as a DEFAULT and have the #25
+    anti-rot guard wave it through via the new _AGENTIC_ONLY_PROVIDERS exemption. The
+    exemption is scoped to the under-transport check (a provider peeled from an oc:/
+    opencode: prefix), not to these bare/colon top-level ids."""
+    assert backends.default_routes_live("xai") is False
+    assert backends.default_routes_live("xai:grok-4.5") is False
+
+
+def test_agentic_only_exemption_does_not_widen_to_unknown_providers():
+    """_AGENTIC_ONLY_PROVIDERS is a narrow, closed set — an unrelated typo'd or unknown
+    provider under the oc:/opencode: transport must still fail default_routes_live, so a
+    regression that widens the exemption (or inverts the guard's "and") trips this test
+    immediately."""
+    assert "nosuchprovider" not in backends._AGENTIC_ONLY_PROVIDERS
+    assert backends.default_routes_live("oc:nosuchprovider/model") is False
+    assert backends.default_routes_live("oc:comandcode/some-model") is False
+
+
+def test_agentic_only_exemption_requires_a_real_model_selector():
+    """The _AGENTIC_ONLY_PROVIDERS exemption must not wave through a malformed default
+    with no model segment (review of #166 round 5): opencode's CLI wants
+    `-m provider/model`, so `oc:xai` (no slash at all), `oc:xai:` (colon-form, not the
+    agentic slash form), and `oc:xai/` (slash present but no model after it) are all
+    invalid invocations that must fail default_routes_live, not merely happen to name a
+    known agentic-only provider. Only a real `provider/model` selector — the documented
+    GROK_SEAT form — passes."""
+    assert backends.default_routes_live("oc:xai") is False
+    assert backends.default_routes_live("oc:xai:") is False
+    assert backends.default_routes_live("oc:xai/") is False
+    assert backends.default_routes_live("oc:xai/ ") is False
+    assert backends.default_routes_live(GROK_SEAT) is True
+
+
+def test_agentic_only_exemption_rejects_colon_contaminated_selectors():
+    """A naive "any slash + nonblank suffix" check (review of #166 round 5) let
+    colon-contaminated forms slip through, because effective_provider() peels on the
+    FIRST `:` OR `/` (whichever comes first) — so `oc:xai:grok/model` peels to provider
+    "xai" while the raw peeled string still contains a `/` further along. The guard must
+    require the segment BEFORE the first `/` to be EXACTLY the provider (no leftover
+    colon), and reject a double-slash (empty inner segment, model starting with `/`)."""
+    assert backends.default_routes_live("oc:xai:grok/model") is False
+    assert backends.default_routes_live("oc:xai:/grok") is False
+    assert backends.default_routes_live("oc:xai//grok") is False
+
+
+def test_selector_well_formedness_applies_to_named_providers_too():
+    """The `provider/model` well-formedness check is one helper applied to EVERY
+    `oc:`/`opencode:` id before the provider check (review round 1 of #167, Fable/Sonnet):
+    previously it ran only inside the `_AGENTIC_ONLY_PROVIDERS` branch, so a malformed
+    default on a NAMED provider — blank model, double slash, colon contamination, no
+    slash — sailed past the #25 anti-rot guard and would rot at runtime."""
+    assert backends.default_routes_live("oc:zai/glm-5.2") is True
+    assert backends.default_routes_live("oc:zai/") is False
+    assert backends.default_routes_live("oc:zai//glm-5.2") is False
+    assert backends.default_routes_live("oc:zai:glm/x") is False
+    assert backends.default_routes_live("oc:commandcode") is False
+    assert backends.default_routes_live("opencode:commandcode/deepseek/deepseek-v4-pro")
+    assert backends.default_routes_live("opencode:commandcode//deepseek") is False
+
+
+def test_transport_peel_is_shared_by_provider_and_guard():
+    """`effective_provider` and `default_routes_live` peel the agentic transport through
+    ONE helper (`_peel_oc_transport`, over `_OC_TRANSPORT_PREFIXES`), so the two can never
+    disagree on what counts as the transport prefix."""
+    assert backends._OC_TRANSPORT_PREFIXES == ("oc:", "opencode:")
+    assert backends._peel_oc_transport("oc:xai/grok-4.5") == "xai/grok-4.5"
+    assert backends._peel_oc_transport("opencode:zai/glm-5.2") == "zai/glm-5.2"
+    assert backends._peel_oc_transport("zai:glm-5.2") is None
+    # Only ONE prefix is peeled: a doubled transport is not a valid selector.
+    assert backends._peel_oc_transport("opencode:oc:xai/grok-4.5") == "oc:xai/grok-4.5"
+    assert backends.default_routes_live("opencode:oc:xai/grok-4.5") is False
+    assert backends._oc_selector_is_well_formed("xai/grok-4.5", "xai") is True
+    assert backends._oc_selector_is_well_formed("xai:grok/model", "xai") is False
+    assert backends._oc_selector_is_well_formed("xai//grok", "xai") is False
+    assert backends._oc_selector_is_well_formed("xai", "xai") is False
+
+
+def test_oc_selector_rejects_whitespace_and_empty_segments():
+    """Review round 2 (GH-165), Codex: `_canonical_provider` strips its argument, so a
+    whitespace-contaminated selector (`oc: xai/grok-4.5`, `oc:xai /grok-4.5`, a tab, a
+    trailing space on the model) used to pass the guard — yet `review_opencode` hands
+    the selector to `opencode -m` untrimmed, so such a default would clear the anti-rot
+    CI check and fail at dispatch. Whitespace is rejected outright, never canonicalised
+    away; and an EMPTY segment anywhere (interior `deepseek//v4`, trailing `grok-4.5/`)
+    is malformed too, not just the one right after the provider."""
+    for selector in (" xai/grok-4.5", "xai /grok-4.5", "xai\t/grok-4.5", "xai/grok-4.5 "):
+        assert backends._oc_selector_is_well_formed(selector, "xai") is False, selector
+        assert backends.default_routes_live(f"oc:{selector}") is False, selector
+    for selector in ("xai/grok-4.5/", "commandcode/deepseek//v4"):
+        assert backends._oc_selector_is_well_formed(selector, selector.split("/")[0]) is False
+    assert backends.default_routes_live("oc: xai/grok-4.5") is False
+    assert backends.default_routes_live("opencode:xai\t/grok-4.5") is False
+    assert backends.default_routes_live("oc:commandcode/deepseek/deepseek-v4-pro") is True
 
 
 def test_glm_commandcode_seat_routes_readonly_through_review_commandcode():
@@ -259,9 +448,10 @@ def test_default_pool_roles_are_distinct_no_lens_lost():
     assert set(roles) == {"consistency", "correctness", "performance", "quality"}, roles
 
 
-def test_default_board_has_twelve_seats():
-    # review-cli#382: TERRA_SEAT and SONNET_SEAT added as live fallbacks (10 -> 12).
-    assert len(DEFAULT_BOARD) == 12, len(DEFAULT_BOARD)
+def test_default_board_has_thirteen_seats():
+    # review-cli#382: TERRA_SEAT and SONNET_SEAT added as live fallbacks (10 -> 12);
+    # GROK_SEAT (review-cli#165) makes it 13.
+    assert len(DEFAULT_BOARD) == 13, len(DEFAULT_BOARD)
 
 
 def test_preset_boards_pin_model_order_pool_and_effort():
@@ -297,6 +487,13 @@ def test_preset_boards_pin_model_order_pool_and_effort():
         ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "xhigh"),
     ]
     assert all(r.effort == "max" for r in HEAVY_PRESET_BOARD[4:])
+
+    # Grok joins both presets automatically (derived from DEFAULT_BOARD) since it's not
+    # excluded like Fable/Sol above (review of #166 — membership was implicit via the
+    # derivation, not pinned by any assertion until this one).
+    assert GROK_SEAT in [r.model for r in DEFAULT_PRESET_BOARD]
+    assert GROK_SEAT in [r.model for r in LIGHT_PRESET_BOARD]
+    assert GROK_SEAT in [r.model for r in HEAVY_PRESET_BOARD]
     # review-cli#382 (round 4 review finding): explicitly pin Terra's/Sonnet's effort at
     # "max", not "xhigh" -- they land at raw priority 6-7 (AFTER Kimi at 4), outside the
     # `i < 4` xhigh-tier cutoff in `_heavy_eligible_seats`, unlike the config.py comment's
@@ -1184,7 +1381,7 @@ def test_default_pool_size_is_four():
 
 def test_select_pool_default_picks_first_four_seats():
     """Default pool (no availability predicate) = the FIRST 4 seats by priority of the
-    12-seat board (the rest are reserve). The pool now leads with Sol, Opus, then the
+    13-seat board (the rest are reserve). The pool now leads with Sol, Opus, then the
     GLM-5.2-via-commandcode seat, then Kimi (review-cli#fable-seat-reliability: Fable
     moved from priority 1 to the very last reserve seat — see
     `test_default_board_matches_directive_table`'s comment for the full rationale)."""
@@ -1199,7 +1396,8 @@ def test_select_pool_default_picks_first_four_seats():
     ]
     # The reserve is exactly the remainder (priority order): Astra, Terra/Sonnet
     # (review-cli#382 live fallbacks), the remaining opencode routes (review-cli#24), the
-    # diff-only Gemini, the slow z.ai GLM seat (LAST-RESORT, review-cli#65
+    # diff-only Gemini, Grok (agentic via opencode's native xai provider, directly BEFORE
+    # the slow GLM seat so failover reaches it first), the slow z.ai GLM seat (LAST-RESORT, review-cli#65
     # deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
     assert reserve == [
@@ -1209,6 +1407,7 @@ def test_select_pool_default_picks_first_four_seats():
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
+        "oc:xai/grok-4.5",
         "oc:zai/glm-5.2",
         "claude:claude-fable-5",
     ]
@@ -1341,7 +1540,7 @@ def test_install_skill_text_documents_agentic_default_board():
     # matching the raw string coupled this assertion to exactly where install.py's
     # paragraph happens to line-wrap — a future reflow of that markdown with no content
     # change would break it for no real reason.
-    assert "covers all 11 heavy-preset-built-ins" in " ".join(SKILL_MD.split())
+    assert "covers all 12 heavy-preset-built-ins" in " ".join(SKILL_MD.split())
     """review-cli#24 contract (codex review): the agentic `oc:` board seats authenticate via
     opencode's OWN provider config — NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
     So their availability gates on the `opencode` BINARY plus opencode's OWN provider
