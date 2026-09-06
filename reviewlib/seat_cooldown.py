@@ -40,15 +40,21 @@ cooldown. An auth failure, a bad model, or any other seat-fatal class is NOT cac
 skipping a "real" retry after a key rotation would hide the fix. Chronic-only means a
 false-cache costs at most one cooldown window of extra skips, never a wrong-forever verdict.
 
-KNOWN LIMITATION (codex review finding, not fixed here): the store is keyed by ``model``
-only, checked BEFORE ``REVIEW_CLAUDE_MODE``/CLI-vs-API transport selection. A session-
-limit recorded from the CLI transport (subscription quota) therefore also skips that
-model's separate, key-billed API transport for the same window — even though switching
-transport is a legitimate, immediate fix a human could make (unlike the auth-failure case
-above, which this module already protects). Impact is bounded: the synthetic sentinel
-names the cached reason + expiry, and ``$REVIEW_SEAT_COOLDOWN_SECONDS=0`` un-sticks it
-immediately. A real fix would key the store by ``(model, transport)`` — tracked as
-review-cli#187, out of scope for this change.
+FIXED (was review-cli#187): the store used to be keyed by ``model`` alone, checked BEFORE
+``REVIEW_CLAUDE_MODE``/CLI-vs-API transport selection, so a session-limit cooldown
+recorded from the CLI transport (subscription quota) also skipped that model's separate,
+key-billed API transport for the same window — even though switching transport is a
+legitimate, immediate fix a human could make. The store is now keyed by ``(model,
+access_method)`` (``record_cooldown``/``active_cooldown``/``clear_cooldown`` all take a
+REQUIRED ``access_method`` keyword — no default, so a caller that forgets to pass the
+same one it recorded under gets an immediate ``TypeError`` rather than a silent
+cache-miss); ``review_claude`` resolves ``"cli"``/``"api"`` BEFORE checking
+the cooldown and records into that same bucket, so a CLI cooldown never shadows a
+healthy API route for the same model (or vice versa). The identical fix applies to
+review-cli#153/#159/#179's opencode-agentic seats (``review_opencode`` uses
+``access_method="opencode"``), which hang on the SAME z.ai quota exhaustion the direct
+keyed-HTTP zai/glm route can hit independently — the two access methods must cool down
+independently too.
 
 FIXED (review-cli#188), CONDITIONALLY: ``record_cooldown``/``clear_cooldown``'s
 read-modify-write (``_load`` then ``_write``) used to be unlocked across the two calls,
@@ -129,6 +135,11 @@ _ESCALATION_RESET_SECONDS = 24 * 3600.0  # 24 hours
 # How much of the triggering reason text to persist. Enough to show a human "why", short
 # enough that the cooldown file never carries a meaningful fragment of a reviewed diff.
 _REASON_MAX_LEN = 200
+# Every access method a cooldown can be recorded under (the second key of the nested
+# store shape). Owned HERE so a reader that enumerates methods (`stats.quorum_check`'s
+# stalled-model probe) can never silently miss one a recorder started using (round-1/2
+# review finding, Fable/Sonnet): add a transport here, not at a call site.
+ACCESS_METHODS: tuple[str, ...] = ("cli", "api", "opencode")
 
 
 def cooldown_path() -> Path:
@@ -384,12 +395,24 @@ def record_cooldown(
     model: str,
     reason: str,
     *,
+    access_method: str,
     now: float | None = None,
     ttl_seconds: float | None = None,
 ) -> None:
-    """Mark ``model`` as chronically unavailable until ``now + ttl``. Best-effort: never
-    raises — a cooldown we failed to persist just means the next run pays for one more
-    real dispatch, never a broken review.
+    """Mark ``(model, access_method)`` as chronically unavailable until ``now + ttl``.
+    Best-effort: never raises — a cooldown we failed to persist just means the next run
+    pays for one more real dispatch, never a broken review.
+
+    ``access_method`` distinguishes independently-failing routes to the SAME model
+    (review-cli#187: claude's ``cli`` vs ``api`` transport; review-cli#153/#159/#179:
+    opencode's agentic route vs a model's direct keyed-HTTP route) — a cooldown on one
+    access method must never shadow a different, independently-healthy one for the same
+    model. REQUIRED (no default): two independent reviewers flagged, across two review
+    rounds, that a default bucket turns a missed migration into a SILENT fail-open —
+    `active_cooldown` is fail-open by design, so a caller that forgot to pass the same
+    `access_method` it recorded under would just see "no cooldown", never an error.
+    Forcing every caller to pass it explicitly turns that class of bug into an
+    immediate `TypeError` at the call site instead.
 
     Opus review finding: `_write` re-raises ANY `BaseException` after its temp-file
     cleanup (not just `OSError`) — this call runs on the hot path immediately after a
@@ -452,10 +475,20 @@ def record_cooldown(
             if escalate:
                 data = _load(path)
                 prior = data.get(model)
+                # A pre-#187 flat entry (`{"until": ..., "reason": ..., "recorded_at": ...}`)
+                # IS a dict, so it would otherwise be read as this ACCESS METHOD's own
+                # prior history — discard it wholesale (same detection as the write below)
+                # rather than let a stale flat shape masquerade as this access method's
+                # fail_count (review-cli#153/#159/#179 merge of #221's escalation with
+                # #187's access-method nesting).
+                if not isinstance(prior, dict) or "until" in prior:
+                    prior_for_access_method = None
+                else:
+                    prior_for_access_method = prior.get(access_method)
                 fail_count = 1
-                if isinstance(prior, dict):
-                    prior_recorded_at = prior.get("recorded_at")
-                    prior_count = prior.get("fail_count")
+                if isinstance(prior_for_access_method, dict):
+                    prior_recorded_at = prior_for_access_method.get("recorded_at")
+                    prior_count = prior_for_access_method.get("fail_count")
                     if (
                         # `type(x) in (int, float)`, not `isinstance(x, (int, float))`
                         # — round-6 review finding (Opus): the sibling `prior_count`
@@ -483,23 +516,42 @@ def record_cooldown(
                 ]
             else:
                 data = _load(path)
-            data[model] = {
+            model_entry = data.get(model)
+            # A pre-#187 flat entry (`{"until": ..., "reason": ..., "recorded_at": ...}`)
+            # IS a dict, so it would otherwise pass the isinstance check below and gain
+            # a new `access_method` key ALONGSIDE its stale flat keys — those never get
+            # cleaned up (they aren't a recognised access_method), so the model key
+            # could never fully empty out in `clear_cooldown`. Detect the old shape (a
+            # top-level "until" key — no valid access_method is ever literally named
+            # "until") and discard it wholesale rather than merge into it (codex
+            # review finding).
+            if not isinstance(model_entry, dict) or "until" in model_entry:
+                model_entry = {}
+            model_entry[access_method] = {
                 "until": now + ttl,
                 "reason": reason[:_REASON_MAX_LEN],
                 "recorded_at": now,
                 "fail_count": fail_count,
             }
+            data[model] = model_entry
             _write(path, data)
     except Exception:  # noqa: BLE001 — best-effort cache, see docstring above
         pass
 
 
-def active_cooldown(model: str, *, now: float | None = None) -> dict | None:
-    """``{"reason", "until", "remaining_seconds", "fail_count"}`` if ``model`` is
-    currently cooling down, else ``None``. Never raises — a corrupt/missing store
-    reads as "no cooldown",
-    fail-open toward dispatching (never fail-closed toward silently starving a seat that
-    would actually work).
+def active_cooldown(
+    model: str,
+    *,
+    access_method: str,
+    now: float | None = None,
+) -> dict | None:
+    """``{"reason", "until", "remaining_seconds", "fail_count"}`` if
+    ``(model, access_method)`` is currently cooling down, else ``None``. Never raises —
+    a corrupt/missing store reads as "no cooldown", fail-open toward dispatching (never
+    fail-closed toward silently starving a seat that would actually work). A store
+    entry recorded under a DIFFERENT access method (or the pre-#187 flat shape, from
+    before this key existed) reads as "no cooldown" here too — never a crash, worst
+    case one extra real dispatch.
 
     Re-checks ``$REVIEW_SEAT_COOLDOWN_SECONDS <= 0`` here too (not just in
     ``record_cooldown``): a user who sets it to 0 to un-stick a seat RIGHT NOW must see
@@ -530,7 +582,10 @@ def active_cooldown(model: str, *, now: float | None = None) -> dict | None:
         # `record_cooldown`/`clear_cooldown` were already widened to `Exception` to
         # avoid; this call site was missed.
         return None
-    entry = data.get(model)
+    model_entry = data.get(model)
+    if not isinstance(model_entry, dict):
+        return None
+    entry = model_entry.get(access_method)
     if not isinstance(entry, dict):
         return None
     until = entry.get("until")
@@ -563,15 +618,17 @@ def active_cooldown(model: str, *, now: float | None = None) -> dict | None:
     }
 
 
-def clear_cooldown(model: str) -> None:
+def clear_cooldown(model: str, *, access_method: str) -> None:
     """Remove any recorded cooldown (and its `fail_count` escalation history) for
-    ``model``. Best-effort. Called on the real success path (`backends.py`'s two
-    `record_cooldown` call sites, on a genuine `returncode == 0` result) so a seat
-    that recovers doesn't stay escalated by the 24h failure-only reset window alone
+    ``(model, access_method)``. Best-effort; used by tests and available for a future
+    ``review`` maintenance command. Also called on the real success path (`backends.py`'s
+    `record_cooldown` call sites, on a genuine `returncode == 0` result) so a seat that
+    recovers doesn't stay escalated by the 24h failure-only reset window alone
     (review-cli#221 round-2 review finding: without this, a seat failing more often
     than once per 24h — even with many successes in between — ratchets to the 8h cap
-    and stays there, since only FAILURES ever touched the store). Also used directly
-    by tests.
+    and stays there, since only FAILURES ever touched the store). A seat's cooldown for
+    one access method must never be cleared by a success on a DIFFERENT access method
+    for the same model (review-cli#187) — see the body below.
 
     Opus review finding: widened from `except OSError` to `except Exception` for the
     same reason as `record_cooldown` above — `_write` can re-raise a non-`OSError`
@@ -615,16 +672,25 @@ def clear_cooldown(model: str) -> None:
         # filesystem, equally unbounded on a hung disk. It buys ONLY avoidance of lock
         # ACQUISITION overhead in the overwhelmingly common no-op case (nothing to
         # clear), not hung-filesystem protection — do not group this with the true
-        # zero-I/O disable hatches. Re-checked under the lock below since this read is
-        # racy by construction (TOCTOU) — a concurrent write landing in the gap is just
-        # an ordering the caller could have observed anyway, same best-effort contract
-        # as the rest of this module.
+        # zero-I/O disable hatches. This is a coarse, MODEL-level check (not access-
+        # method-aware) — a false "something to clear" when only a DIFFERENT access
+        # method has an entry just costs one extra lock acquisition below, where the
+        # access-method-aware re-check is the one that actually matters. Re-checked
+        # under the lock below since this read is racy by construction (TOCTOU) — a
+        # concurrent write landing in the gap is just an ordering the caller could have
+        # observed anyway, same best-effort contract as the rest of this module.
         if model not in _load(path):
             return
         with _locked(path):
             data = _load(path)
-            if model in data:
+            model_entry = data.get(model)
+            if not isinstance(model_entry, dict) or access_method not in model_entry:
+                return
+            del model_entry[access_method]
+            if model_entry:
+                data[model] = model_entry
+            else:
                 del data[model]
-                _write(path, data)
+            _write(path, data)
     except Exception:  # noqa: BLE001 — best-effort cache, see docstring above
         pass

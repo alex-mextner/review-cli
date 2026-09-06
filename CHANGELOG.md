@@ -3,7 +3,7 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
-## 0.35.10 — 2026-09-06
+## 0.35.10 — 2026-09-07
 
 - **`--detach` hardening from its first review round (review-cli#162 follow-up).**
   The spawning parent no longer reads stdin to EOF itself (a non-tty stdin held open
@@ -70,6 +70,40 @@ semantic versioning.
   detached result matching a synchronous run byte-for-byte, `wait` returning the job's
   exit code, and a killed detached job reconciling to `unknown-terminated` instead of
   reporting "running" forever.
+
+## 0.35.9 — 2026-09-06
+
+- **Opencode zai/glm stall watchdog + cooldown keyed by access method
+  (review-cli#153/#159/#179).** Opencode's `oc:zai/glm-5.2` agentic seat hangs
+  at ~0% CPU with zero output for the entire call when z.ai quota is
+  exhausted — no error, no partial answer, just silence until the idle
+  timeout eventually kills it after up to 20 minutes. A call from a
+  watchdog-scoped model (default: any model matching `zai/glm`, overridable
+  via `$REVIEW_OPENCODE_STALL_MODELS`) that produces zero output for
+  `$REVIEW_OPENCODE_STALL_SECONDS` (default 5 minutes) is now retried up to 3
+  total attempts; if every attempt stalls, the seat is cooled down so the next
+  `review` invocation skips the doomed dispatch entirely instead of paying for
+  another multi-minute stuck attempt.
+  - Folds in #187: the `seat_cooldown` store is now keyed by `(model,
+    access_method)` instead of `model` alone — `record_cooldown`/
+    `active_cooldown`/`clear_cooldown` all take a REQUIRED `access_method`
+    keyword, so a cooldown recorded from one transport (e.g. claude's CLI)
+    never shadows a different, independently-healthy one (claude's API route,
+    or opencode's separate route to the same underlying model/quota).
+  - For a watchdog-scoped model the liveness bound is the SOLE owner of the
+    "zero output since spawn" signal — `true_silence_timeout` is not forwarded
+    for it (review round 1, Opus + Fable: the registry's true-silence value for
+    zai/glm equals the 300s stall default, so "retry 3x then cool down" vs
+    "cool down on the first silence" was decided by poll-loop check order).
+    Unwatched opencode seats keep the true-silence wiring unchanged, and the
+    liveness check now keys off the same `got_output` latch as true-silence.
+  - A stall whose liveness bound was CLAMPED below the requested window by the
+    board deadline / idle clamp (`stall_bound_clamped` on the `_run_streamed`
+    result) is an honest bounded failure, not the quota-exhaustion signature:
+    no retry, no cooldown (review round 2, Fable — under deadline pressure a
+    merely slow-to-first-byte seat would otherwise be benched). `seat_cooldown`
+    now owns the access-method enumeration (`ACCESS_METHODS`) that
+    `quorum_check`'s stalled-model probe iterates.
 
 ## 0.35.8 — 2026-09-06
 

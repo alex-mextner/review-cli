@@ -306,6 +306,158 @@ def test_silent_child_can_think_until_requested_timeout():
     assert "TIMEOUT" not in result.stdout
 
 
+def test_liveness_timeout_kills_a_totally_silent_process_fast():
+    """review-cli#153/#159/#179: a backend that NEVER produces a single byte (opencode's
+    zai/glm seat hanging on quota exhaustion) must be reaped at `liveness_timeout`, well
+    before the generous default idle window."""
+    code = "import time\ntime.sleep(30)\n"
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=30,
+        backend="fake-silent-hang",
+        round_no=12,
+        liveness_timeout=1,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert elapsed < 10, f"liveness timeout did not fire promptly (took {elapsed:.2f}s)"
+    assert "waiting for first output" in result.stdout, result.stdout
+
+
+def test_liveness_timeout_does_not_fire_once_output_arrives():
+    """A backend that DOES emit something must not be killed by the liveness bound --
+    only total silence from spawn is a liveness failure; silence AFTER output is still
+    governed by the normal (generous) idle timeout."""
+    code = "import time\nprint('alive', flush=True)\ntime.sleep(2)\nprint('done', flush=True)\n"
+    argv = [sys.executable, "-c", code]
+
+    result = review._run_streamed(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=30,
+        backend="fake-emits-then-quiet",
+        round_no=13,
+        liveness_timeout=1,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "done" in result.stdout
+    assert "TIMEOUT" not in result.stdout
+    assert result.timeout_kind is None
+
+
+def test_liveness_timeout_still_fires_when_idle_reap_is_disabled():
+    """codex review finding: REVIEW_IDLE_TIMEOUT_SECONDS=0 (disabling generic idle
+    reaping) must NOT also disable a caller's explicit `liveness_timeout` -- a
+    zero-output backend must still be reaped at the liveness bound, not left to wait
+    out the full wall-clock `timeout`."""
+    code = "import time\ntime.sleep(30)\n"
+    argv = [sys.executable, "-c", code]
+
+    started = time.monotonic()
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=30,
+            backend="fake-silent-idle-disabled",
+            round_no=14,
+            liveness_timeout=1,
+        )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert elapsed < 10, f"liveness timeout did not fire promptly (took {elapsed:.2f}s)"
+    assert "waiting for first output" in result.stdout, result.stdout
+    assert result.timeout_kind == "waiting for first output"
+
+
+def test_disabled_idle_reap_with_liveness_set_still_bounds_intermittent_output():
+    """Fable review finding: the disabled-idle-reap FALLBACK (when a caller also sets
+    `liveness_timeout`) must measure true wall-clock time, not silence-since-last-byte
+    -- a backend that keeps emitting output (so it never trips the liveness check)
+    must still be bounded by the requested `timeout`, exactly like the plain
+    disabled-idle case without `liveness_timeout` already is
+    (`test_disabled_idle_reap_falls_back_to_wall_timeout`). Measuring from
+    `activity["last"]` here would let a chatty backend run UNBOUNDED."""
+    argv = _slow_argv(lines=100, interval=0.3)  # keeps emitting for ~30s if unbounded
+
+    started = time.monotonic()
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="0"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=2,
+            backend="fake-chatty-idle-disabled",
+            round_no=16,
+            liveness_timeout=1,
+        )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert elapsed < 10, (
+        f"wall-clock fallback did not bound a chatty backend (took {elapsed:.2f}s)"
+    )
+    assert "total runtime" in result.stdout, result.stdout
+    assert "waiting for first output" not in result.stdout, result.stdout
+    assert result.timeout_kind == "total runtime"
+
+
+def test_liveness_timeout_is_clamped_to_a_smaller_idle_window():
+    """codex review finding: if the effective idle timeout is SMALLER than the
+    requested `liveness_timeout`, a totally-silent call must still be classified as a
+    stall (not an ordinary idle timeout) -- the idle bound firing first must not mask
+    the fact that the call never produced a single byte."""
+    code = "import time\ntime.sleep(30)\n"
+    argv = [sys.executable, "-c", code]
+
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="1"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=30,
+            backend="fake-silent-small-idle",
+            round_no=15,
+            liveness_timeout=300,  # deliberately LARGER than the 1s idle window
+        )
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert "waiting for first output" in result.stdout, result.stdout
+    assert "without output" not in result.stdout, result.stdout
+    assert result.timeout_kind == "waiting for first output"
+    # ...but the result must SAY the bound was clamped below the requested 300s, so a
+    # consumer can tell "no output before the (deadline-shortened) window" apart from
+    # "no output for the configured stall window" (round-2 review finding, Fable).
+    assert result.stall_bound_clamped is True
+
+
+def test_liveness_stall_at_the_requested_bound_is_not_marked_clamped():
+    """The counterpart of the clamp test above: when the requested liveness bound is
+    the one that actually fires (idle window larger), `stall_bound_clamped` is False --
+    this is the genuine quota-exhaustion signature the opencode retry loop acts on."""
+    code = "import time\ntime.sleep(30)\n"
+    argv = [sys.executable, "-c", code]
+
+    with _with_env(REVIEW_IDLE_TIMEOUT_SECONDS="100"):
+        result = review._run_streamed(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=30,
+            backend="fake-silent-requested-bound",
+            round_no=16,
+            liveness_timeout=1,
+        )
+
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert result.timeout_kind == "waiting for first output"
+    assert result.stall_bound_clamped is False
+
+
 def test_disabled_idle_reap_falls_back_to_wall_timeout():
     """REVIEW_IDLE_TIMEOUT_SECONDS=0 must not turn _run_streamed into an unbounded wait."""
     code = "import time\nprint('started', flush=True)\ntime.sleep(60)\n"
