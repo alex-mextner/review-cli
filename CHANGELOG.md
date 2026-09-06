@@ -3,10 +3,10 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
-## Unreleased
+## 0.35.11 — 2026-09-06
 
 - **New default board seat: Grok 4.5 via opencode's native `xai` provider
-  (`GROK_SEAT = "oc:xai/grok-4.5"`).** Added as priority-10 in `DEFAULT_BOARD`
+  (`GROK_SEAT = "oc:xai/grok-4.5"`).** Added as priority-11 in `DEFAULT_BOARD`
   (`reviewlib/config.py`), on-by-default — it participates in every normal
   `review diff` run exactly like the existing seats, no opt-in flag required.
   (`review quorum`/`review brainstorm` use the separate flat `DEFAULT_MODELS`
@@ -46,11 +46,764 @@ semantic versioning.
   appending it after GLM meant deep mid-run failover always paid GLM's
   pathological-slowness cost before ever reaching Grok. New `grok`/`grok45`
   aliases in `MODEL_ALIASES`. Board/doc tests, README, and the embedded
-  install-skill text updated for the 11-seat board. Filed review-cli#166
+  install-skill text updated for the 13-seat raw board (11-seat light/default presets,
+  12-seat heavy preset — Grok joins every preset since only Fable/Sol are excluded). Filed review-cli#166
   (out of scope here) for a pre-existing, unrelated gap this review surfaced:
   `_oc_config_has_provider_key` accepts a whitespace-only or non-string inline
   `options.apiKey` as a valid credential for ANY provider, not just xai.
 
+## 0.35.8 — 2026-09-06
+
+- **Real token counts now reach `run-stats.jsonl` (review-cli#195).** `record_run()` (the
+  ETA/quorum-gate JSONL store) never recorded token usage even though the REST backends
+  already parse it from every provider response. `ReviewResult` now carries
+  `prompt_tokens`/`output_tokens` (set only at the REST construction sites), the panel's
+  call tally sums them per run across EVERY dispatch attempt (an in-seat retry or a
+  provider failover no longer undercounts), the flat `-m` review path tallies at all (it
+  previously always recorded 0/0), and `record_run`/`task_summaries` persist and aggregate
+  them. STATS_VERSION 4 → 5; older records without the keys read as "usage unknown", not
+  zero. Two Codex review findings folded in: a 2xx with a valid `usage` but no assistant
+  content still fails closed but keeps the prompt tokens it spent on the failed result;
+  and a `usage` object with only one valid field collapses to 0/0 ("unknown") instead of
+  persisting a half-real `(prompt, 0)` pair — the same validity rule `review stat`'s
+  `tokenstats` applies to successful calls. The two stores still differ by design on
+  FAILED-but-billed attempts: `run-stats.jsonl` counts the prompt tokens an empty-content
+  failure spent (it aggregates every dispatch attempt), while `review stat` reads only
+  successful calls' log footers and reports those as unknown. Gemini now also fails
+  closed on a 2xx with no candidate text (it used to return rc=0 with only the token
+  footer, which passed `result_is_usable()` as review content).
+
+## 0.35.7 — 2026-09-06
+
+- **Pre-commit gate: trivial-follow-up delta tolerance (review-cli#208).** The
+  `review install-commit-hook` gate used to require the staged diff's sha256 to match
+  the last reviewed one EXACTLY — any restage, even a one-line follow-up fix during an
+  iterative review-fix cycle, forced a brand-new full multi-model review round (observed:
+  9 rounds for one ticket). `review diff --staged` now also writes a `review-stamp-diff`
+  companion holding the reviewed diff's raw text; on a hash miss the gate re-diffs the
+  current staged diff against it and allows the commit — without dispatching a fresh
+  review — when the line-level delta is within `$REVIEW_TRIVIAL_DELTA_LINES` (default
+  10; `0` restores the old exact-hash-only behavior). Fails CLOSED (falls through to a
+  full review requirement) on binary-file or submodule-gitlink content, which a line
+  count can't measure, and excludes diff-generation metadata (`index` lines, shifted `@@`
+  hunk headers) from the count so a genuine one-line edit in a file with existing hunks
+  doesn't get miscounted as a large change. The baseline only ever advances via a real
+  `review diff --staged` pass, so drift is always measured from the last genuine review.
+  The count is `max(insertions, removals)` between the reviewed diff and the current one,
+  not a raw `+`/`-` line total — a modified line shows up as a `-old`/`+new` pair in a
+  unified diff, so a raw total would silently count every genuinely-edited line as 2,
+  making `REVIEW_TRIVIAL_DELTA_LINES=N` roughly half as tolerant as documented. The
+  metadata-exclusion patterns are anchored to git's actual header shapes, not bare
+  prefixes — a removed source line that itself starts with `-- ` (SQL/Lua/Haskell
+  comments) can't be misread as a `--- ` file header and silently undercounted — and a
+  mode change or rename/copy line anywhere in EITHER diff — the reviewed baseline or the
+  current staged one, whether or not that file also carries a real content hunk — fails
+  CLOSED to a full review instead of reading as a free, unboundedly-sized trivial change
+  (a rename/mode-change that also touches real content costs one full review it might not
+  strictly have needed; that's the accepted conservative trade).
+
+## 0.35.6 — 2026-09-06
+
+- **The `quality`/`performance`/`security` review-board roles get a genuinely live
+  fallback instead of depending on a single disabled/quota-fragile seat (review-cli#382).**
+  `unpaid_providers: [commandcode, gemini]` disables every commandcode-routed seat
+  (GLM-cc/Kimi/Qwen/DeepSeek) plus Gemini at once, machine-wide. That left `performance`/
+  `quality`/`security`/`tests` with zero or exactly one live seat each, and `quality`'s one
+  live seat (the z.ai-routed GLM) hit a real weekly quota exhaustion with nothing left to
+  promote — hard-blocking a real PR's review-quorum gate with no path forward except a
+  multi-day wait or a manual hatch bypass. Two new `DEFAULT_BOARD` seats — `TERRA_SEAT`
+  (`codex:gpt-5.6-terra`) and `SONNET_SEAT` (`claude:claude-sonnet-5`) — are distinct,
+  already-paid models on the same OpenAI/Codex and Anthropic accounts Sol/Astra and
+  Opus/Fable already use (no new provider account), added as live fallbacks for
+  `performance` and `quality`; the z.ai-routed GLM seat is re-lensed off its now-redundant
+  `quality` role onto `security`, which had none. `tests` (DeepSeek-only), `contracts`
+  (Gemini-only), and `architect` (Fable-only — see Fable's ~100% dispatch failure rate
+  below, still true as of this investigation) remain thin: there was no third distinct
+  already-paid model to give every starved role its own seat without doubling up one
+  account's quota pressure on a single review run, the same failure class this change
+  fixes for Fable. An earlier draft of this change also re-lensed Astra off its
+  pre-existing (duplicate-of-Sol) `consistency` role onto `security`, but a second review
+  round caught that this left `consistency` with zero live fallback anywhere on the
+  board — the exact single-point-of-failure class this change exists to fix, just
+  relocated — so Astra's role is left unchanged. This is a stopgap within the existing
+  harness-prefixed seat-string mechanism, not the "roles declare models, harness/provider
+  auto-resolve" redesign tracked separately as review-cli#364 (this repo's own copy) and
+  rig-cli#337 (the umbrella tracking it across the harness ecosystem).
+
+## 0.35.5 — 2026-09-05
+
+- **`review diff` board mode: print a visible STDOUT notice when the pool comes up
+  short of the requested size, naming every excluded seat + its unavailability
+  reason.** Before this, a seat unavailable BEFORE dispatch (missing CLI binary,
+  no auth, unpaid provider, …) that also had no healthy reserve to backfill it
+  silently shrank the pool with zero signal anywhere a human or agent would
+  actually see it — the existing `board: degraded` warning only covers a
+  different, rarer case (reserve exhausted mid-dispatch) and only prints to
+  stderr, which report-pasting workflows routinely drop. Root-caused 2026-08-28:
+  a review round reported as "reviewed via codex + Fable" gave no indication
+  that Opus/GLM were configured but missing. `_report_pool_shortfall` in
+  `reviewlib/modes/review.py`.
+
+## 0.35.4 — 2026-09-05
+
+- **Stop the codex-backend self-reinvocation loop (review-cli#180).** A codex reviewer
+  could re-invoke `review diff` on the same worktree as a plain shell command — codex's
+  only safety mechanism, `-s read-only`, restricts filesystem/network access but not
+  shell/exec, unlike the claude/opencode backends' explicit tool denial. This caused a
+  real incident (2026-08-11): 40+ live `codex exec` processes, 11 `review diff` processes
+  across 4 worktrees, swap at 88.5%, load average 60+.
+  - Primary defense: a `$REVIEW_CLI_ACTIVE` reentrancy guard, set for the lifetime of a
+    run and checked first in `main()`, refuses immediately on a recursive invocation. An
+    env var survives `exec`/`setsid` regardless of how a backend child re-roots its
+    process group, so it is the one signal that reaches every descendant.
+  - Defense-in-depth: an idempotently-installed codex execpolicy `.rules` file forbids
+    `review`/`codex`/`claude`/`opencode`/`omp` as shell commands.
+  - The managed dashboard/spec-web `run`/`start` servers are themselves full `review`
+    invocations and would otherwise trip their own reentrancy guard on launch; their
+    `__serve` child argv and the installed-console-script probe now strip
+    `$REVIEW_CLI_ACTIVE` before exec'ing, via a hardcoded `/usr/bin/env -u` prefix (never
+    a PATH-resolved `env`, to avoid a poisoned-PATH escalation into a persisted autostart
+    unit).
+
+## 0.35.3 — 2026-09-05
+
+- **`review diff` now says WHY a passing review did not satisfy the commit gate
+  (review-cli#350).** The gate marker that agent-tools'
+  `require-review-before-commit` hook stats is written by exactly one shape of
+  run — a PASSING `review diff --staged` whose diff came from the real index.
+  Every other shape (unstaged, a diff piped on stdin, a diff truncated for
+  dispatch) used to skip writing it SILENTLY, so a caller saw a green review, a
+  stale marker and a blocked commit with no explanation. Such a run now prints
+  one stderr line naming the failed condition and the remediation for THAT
+  condition (the truncated case is told to split the change, not to re-run
+  `--staged`, which would truncate again), and warns off hand-creating the
+  marker. The same now holds for the one run that DOES try to write the marker
+  and loses it (an unwritable `$REVIEW_MARKER`): the write stays best-effort and
+  never fails the review, but it is no longer swallowed in silence, because
+  "green review, stale marker, no reason anywhere" is exactly the state that
+  sends a caller reaching for the forged marker. The diff-shape half of the gate
+  predicate now lives in exactly one place (`_commit_gate_skip_reason`), so a
+  future condition added to it cannot skip the warning by drift, and its reasons
+  are ordered so a truncated diff is told to be split rather than sent around a
+  re-run loop that truncates again. For that ordering to fire at all, the
+  dispatch-cap helper now reports the plain fact "the cap cut this diff" instead
+  of a `--staged`-only version of it: an unstaged oversized run used to arrive as
+  "not truncated", take the not-staged branch, and get sent around exactly that
+  loop. Nothing about WHEN the marker is written changed — an unstaged run was
+  refused before and is refused now, only the reason it gives is right. The
+  same silence is gone from the two writes themselves: an unwritable session
+  marker, a marker path that is not a regular file (pointing it at a directory
+  used to "succeed" — `touch` just bumps the directory's mtime), and a
+  `.git/review-stamp` that could not be written are each reported with the file
+  and the fix that belongs to them. The marker and the stamp feed DIFFERENT
+  gates — agent-tools' hook stats the marker, the local git pre-commit hook
+  verifies the stamp — so losing either one blocks a commit on its own, and each
+  gets its own line rather than a merged one that would send the caller to fix
+  the wrong file. The `review` skill blurb and SKILL.md now
+  name `review diff --staged --task CODE` as the pre-commit invocation.
+  Every rerun command the notice (and the `--commit` refusals) print carries a
+  `--task <CODE>` placeholder — a recorded review mode requires a task code, so a
+  remediation without one failed at the first keystroke (Codex finding on #359).
+
+
+## 0.35.3 — 2026-09-05
+
+- **`DEFAULT_BOARD` (the `review diff` reviewer board): replace the redundant
+  bare-`"codex"` #5 seat with GPT-6-Astra ("Astra"), pinned explicitly.** The
+  bare seat tracked `~/.codex/config.toml`'s own default model, which today is
+  `gpt-5.6-sol` — the SAME model the #1 Sol seat (`SOL_SEAT`) already pins, so
+  the board's #5 slot was silently reviewing with Sol twice instead of adding
+  real model coverage. `ASTRA_SEAT = "codex:gpt-6-astra"` (OpenAI's new
+  flagship codex model) is now the #5 `DEFAULT_BOARD` seat, keeping the same
+  `consistency` role/lens. Scoped to the board only — the separate flat
+  `DEFAULT_MODELS` panel (used by `--quorum`/`--brainstorm`) still keeps its
+  own bare `codex` entry unchanged, by design.
+
+## 0.35.3 — 2026-09-05
+
+- **Dashboard: stop tabs from lying about an empty state during a background reload
+  (review-cli#362).** Every runs-reading panel falls back to `(state.runs || [])`, but
+  `state.runs` is briefly `null` whenever an SSE activity event or a write calls
+  `invalidate()`. Switching tabs during that window rendered a false "no errors / no
+  sessions" panel — reproduced live on a busy install where the Errors tab claimed "No
+  errors yet" while Overview/Metrics (rendered moments earlier) reported 42k+ recorded
+  errors. `render()` now shows a loading placeholder instead, except for the three panels
+  (Stats, Models & roles, Metrics) that read only `state.stats` and can safely keep
+  showing their still-valid snapshot — unless `state.stats` itself hasn't loaded yet
+  either (the initial-boot window). A failed load now surfaces the actual error (or a
+  toast, if data was already showing) instead of an eternal, misleading "Loading…".
+- **Dashboard: fix `fmtDur()` rendering a nonsense "19m 60s" (and, one branch over,
+  "60.0s") instead of rolling over correctly** — seen live on the Metrics tab's Duration
+  max card. Rounding the seconds remainder in isolation could land on 60; fixed by
+  rounding to one decimal before branching and decomposing minutes/seconds from the
+  original value.
+
+## 0.35.2 — 2026-09-01
+
+- **Dashboard: fix the review-cli#326 memory balloon — every streamed call
+  body/stderr was retained uncapped forever, hitting 32.8GB RSS on the real
+  ~132k-log install.** Body and stderr are now capped (head+tail, sized to
+  bound worst-case memory regardless of Unicode/script mix). Classification
+  (`completed`/`has_error`/`is_paywall`/`is_cf_blocked`/`is_bad_key`/
+  `has_real_content`) is computed once from the FULL untruncated text at
+  parse time and stored, so a marker or the empty-vs-real-verdict split
+  surviving only in a truncated part of a huge log is still classified
+  correctly. `top_oversized_calls`/`compute_harness_stats` still scanning
+  the now-capped body for `SKILL.md`/`MEMORY.md`/diff markers is a known,
+  lower-severity follow-up (review-cli#335).
+
+## 0.35.1 — 2026-08-30
+
+- **Dashboard: fix `/api/stats`/`/api/runs` hanging or returning nothing on a
+  large install (review-cli#323).** Three compounding bugs in the session
+  cache: no cold-start handling (a fully cold cache blocked the request
+  thread on a full parse, ~130s on a ~10GB/132k-file install), the startup
+  prewarm held the cache lock for its entire parse (a real request racing it
+  blocked on the same lock), and fixing that naively let the cold-placeholder
+  path and the prewarm both kick a background parse at once. Also fixed an
+  O(n^2) session-clustering cost at this scale. See review-cli#329 for the
+  full list of concurrency-correctness fixes closed in the same change.
+  Follow-up work (a per-lineage in-flight-parse redesign, cold-window
+  write/detail 404s, and a client-side self-recovery nudge) is tracked
+  separately as review-cli#327 and review-cli#328.
+
+- **True-silence detection + partial-result preservation for opencode seats
+  (#243, closes review-cli#243).** A per-model, versioned registry
+  (`reviewlib/model_behavior.py`) governs how long an opencode seat is given to
+  produce its first byte of output before it's treated as a stuck/silent model
+  (default 5 minutes) rather than merely idle — wired into the existing
+  escalating seat-cooldown schedule (#230) instead of a flat cooldown, and
+  surfaced on the dashboard as its own health class, distinct from a genuine
+  child exit(125) and from a quota/paywall cooldown skip.
+
+- **Fable seat reliability: fix a cooldown-recording gap, demote it from priority 1
+  to last-resort reserve (review-cli#fable-seat-reliability, #286).** `review stat`
+  telemetry showed a 97.9-100% dispatch failure rate for the Fable seat
+  (`claude:claude-fable-5`) — up from 67.7% two weeks earlier — driven by chronic
+  session/usage-limit exhaustion on the account it runs through. Two fixes:
+  - `_chronic_unavailable_reason` (the function deciding whether
+    `reviewlib.seat_cooldown` caches a dispatch as chronically doomed) now
+    recognizes the administrative "is currently unavailable" sentinel on a
+    NON-ZERO exit code too, not just `rc=0` — a real production log confirmed
+    Fable's CLI wrapper sometimes relays that exact notice with `exit=1`, a shape
+    the cooldown cache previously never caught. A new guard keeps this from
+    mis-caching a genuinely TRANSIENT failure (a real 503/529 gateway blip, or a
+    process timeout) as an hours-long chronic cooldown, since some of the same
+    wording is also retry.py's own transient vocabulary.
+  - `reviewlib/config.py`'s `DEFAULT_BOARD` demotes Fable from priority 1 to the
+    last seat (mirroring the existing review-cli#65 precedent for a different
+    pathologically-bad seat) — it stays on the board as a last-resort reserve but
+    no longer occupies the routinely-dispatched pool. `HEAVY_PRESET_BOARD` now
+    excludes it entirely (matching `DEFAULT_PRESET_BOARD`'s existing exclusion),
+    so `--preset heavy --pool 0` covers 9 built-in seats, not 10.
+
+- **`review task CODE --check --min-roles N` — count covered board roles instead
+  of distinct model names, and default to role-based counting (#221, #246).**
+  The board's shortage-resilience behavior (`select_pool_with_reuse`, #207)
+  fills an otherwise-empty role by reusing an already-picked model rather than
+  shrinking the panel — each duplicated pass reviews under its OWN distinct
+  role, but the self-merge-authority quorum gate's `--min-models` still counted
+  it as the same model string it already counted once, so that pass could never
+  help satisfy model diversity even though it genuinely covered a different
+  facet of the review. `--min-roles` switches the gate's second half from "N
+  distinct model-name strings" to "N distinct board roles (architect/
+  correctness/security/…) covered by the passed iterations" — a role-fill pass
+  counts once per role, same as any other. Only a genuine `REVIEW_ROLES` key
+  ever counts as covered — a typo'd/unknown role string on a custom config board
+  (which the board itself already degrades to the generic, non-distinct prompt)
+  cannot inflate the count.
+
+  `--min-models` and `--min-roles` are both optional, and their semantics now
+  depend on which were actually typed (#246): passing NEITHER (the true
+  default) switches to a role-based check at the SAME numeric floor
+  `--min-models` used to default to (3) — role-based coverage is now the
+  default everywhere, with no default model-count floor. **Breaking for any
+  machine consumer of `--check --json` that reads `payload["min_models"]`
+  unconditionally**: that key is now OMITTED (not `null`) whenever
+  `--min-models` wasn't explicitly passed — including the bare-default
+  invocation, which previously always carried a resolved `min_models: 3` — and
+  `roles`/`distinct_roles_passed`/`min_roles` now appear by default instead.
+  Passing only `--min-models` reproduces the exact pre-#221 pass/fail decision
+  (the payload still gains the new `min_models_advisory` key described below).
+  Passing only `--min-roles` reproduces the pre-#246 `--min-roles` behavior
+  unchanged.
+  Passing BOTH explicitly now enforces BOTH as an AND — an explicitly requested
+  floor can no longer be silently outvoted by the other (fixes a #221 round-3
+  review finding: `quorum_check(..., min_models=5, min_roles=1)` used to return
+  `passed: true` from a single-model review because `--min-roles` governed
+  alone). Whenever `--min-models` is explicit and there's real history to
+  evaluate (not a fail-closed denial with zero recorded iterations or an
+  unreadable store), the response carries a non-blocking `min_models_advisory`
+  note (both in `--json` and as a text-mode `note:` line) suggesting role-based
+  coverage is usually sufficient on its own — it never affects `passed`.
+
+  A `--min-models`-only denial still suggests replacing it with `--min-roles`
+  at the same number when model diversity itself is the shortfall — but ONLY
+  when switching would actually pass (the iteration floor is met, at least 2
+  distinct models each actually EARNED a valid role — not merely shared a
+  record with one, and the recorded history covers enough real roles); a
+  role-less history or a same-model monoculture never gets steered toward the
+  hint. Role-mode text output also prints a secondary `models: N distinct
+  model (...)` audit line naming which models actually reviewed — on the MET
+  path only when `--min-models` wasn't ALSO explicit (whose own count clause
+  already lists names inline); on the NOT-met path the count clause is always
+  bare numbers, so the audit line prints whenever a role floor is active,
+  regardless of `--min-models`. Per-seat role tracking is new to the run-stats
+  record (`roles`, optional,
+  currently populated only by the `review diff`/`review visual` board dispatch
+  — `panel.FailoverOutcome.usable_roles`); a task whose history predates this
+  field, or comes from a mode with no role concept (quorum/just-ask/brainstorm/
+  qa), simply contributes no roles to a `--min-roles` count.
+
+- **`quorum` — dropped the "single opinion" discount note from the moderator
+  prompt (Alex, 2026-08-21).** When one model fills several seats under distinct
+  roles (`fable#1`, `fable#2`, ...), the moderator used to be told to treat all of
+  that model's seats as one opinion for majority-counting, never extra weight
+  toward QUORUM. Alex's call: a model covering multiple roles in parallel is a
+  fully valid panel shape, not a lesser one — nothing should discount it. The
+  per-seat `<model>#N [<lens>]` labelling stays (it keeps the transcript
+  grep-able by seat), but the moderator prompt no longer carries any caveat
+  telling it to weigh a duplicated model's seats differently from any other
+  seat's.
+
+- **Adversarial review-rigor fixes: neutral prompts, no evidence requirement for a
+  clean pass, no refutation step, and a non-adversarial default board (Alex,
+  2026-08-21).** An audit of review-cli's own rigor found four gaps and Alex asked
+  for all of them fixed:
+  1. `config.DEFAULT_PROMPT` (every reviewer's shared base instruction) now tells
+     the model to actively try to break the change — walk through concrete failure
+     scenarios and genuinely attempt to find a bug — before concluding it's fine,
+     instead of a neutral "review this diff" ask with no skepticism built in.
+  2. That same prompt now requires EVIDENCE for any verdict, not just a shape
+     constraint on findings: a clean/"no issues" verdict must state which specific
+     failure modes were checked and why each is ruled out (`checked: race condition
+     on X — none found, guarded by a lock at Y`), not a bare "looks good". A new
+     `panel.clean_verdict_missing_evidence` heuristic surfaces a body that skips
+     this as a visible WARNING wherever results are rendered (`format_result`) — a
+     heuristic surfacing, not a hard enforcement gate (a real content-based verdict
+     for the diff-review exit code is a larger, separate effort tracked as #137).
+  3. `review quorum` gets an opt-in `--adversarial-check` flag: after the panel
+     reaches a clean verdict, one more pass tries to REFUTE "no issues found"; a
+     successful refutation is surfaced as a new finding and flips the run
+     non-zero, instead of the moderator's synthesis being the last word with no
+     independent attack on it. Opt-in (not the default) so it doesn't double the
+     cost/latency of every routine `review quorum` call — reach for it specifically
+     before a merge/ship decision.
+  4. `REVIEW_ROLES["security"]` / `["tests"]` (the default `review diff` board's own
+     role lenses) now blend in the adversarial framing from the quorum/brainstorm
+     persona pool's "security-paranoid reviewer" / "skeptical SRE" personas, so the
+     default board — which previously used NONE of those personas — gets some of
+     their adversarial tone on the two roles closest in spirit, without turning the
+     whole 8-role board into personas.
+
+  Dogfooded on its own diff (`review diff --staged`) before landing, which surfaced
+  and fixed three real bugs in the new code: `quorum_verdict_is_clean`'s separator
+  regex greedily ate the newline a lookahead depended on, misreading a genuinely
+  empty "no disagreement" section as unclean and silently skipping the whole
+  `--adversarial-check` pass on exactly the clean verdict it exists to double-check
+  (k3/Opus finding); `refutation_succeeded`'s exact-prefix marker match flipped the
+  ship-gate exit code to a false failure whenever the adversarial model reworded or
+  markdown-decorated its null answer instead of using the literal marker, replaced
+  with a three-way `refutation_verdict` (`found` / `not_found` / `inconclusive`) that
+  never silently misreads a rewording as a finding (k3/Opus finding); and the
+  missing-evidence WARNING fired in quorum/just-ask/brainstorm output even though
+  their prompts never ask for the "checked: ..." phrasing DEFAULT_PROMPT introduced
+  — `format_result` now takes an opt-in `check_evidence` flag, set only by the two
+  diff-review render paths (glm-cc finding).
+
+  A second dogfood round on the fixes THEMSELVES caught one more real regression:
+  `refutation_verdict`'s affirmative-marker check ran before the null-marker check,
+  and the null marker's own text — "NO REFUTATION FOUND" — literally CONTAINS
+  "REFUTATION FOUND" as a substring, so a model naturally introducing its null
+  answer's checked-scenario list with a colon (`NO REFUTATION FOUND: checked X,
+  Y, Z.`) matched the affirmative pattern and flipped a clean pass to a false
+  failure (glm-cc/Opus finding) — fixed by checking the null marker first and
+  excluding its tail from the affirmative pattern via a negative lookbehind. That
+  same round also added end-to-end tests driving `mode_review`'s real flat/board
+  dispatch and asserting the WARNING actually renders, closing a gap where every
+  existing test proved `check_evidence` in isolation but nothing would have
+  noticed if it were quietly dropped from its two real call sites (Opus finding).
+
+  A third dogfood round found: (1) the null-marker regex only matched a single
+  ASCII space between "NO"/"REFUTATION"/"FOUND", so a model's double-space or
+  tab/NBSP variant still fell through to a false FOUND classification (k3
+  finding) — fixed by joining the marker's words with `\s+` instead of one
+  literal-escaped multi-word string; (2) the AFFIRMATIVE marker's decoration
+  tolerance was asymmetric with the null marker's — `**REFUTATION FOUND**: ...`
+  (bold around the phrase, colon outside it) downgraded a REAL refutation to
+  "inconclusive," the more dangerous direction since the ship gate then passed
+  despite a genuine finding (Opus finding) — fixed by widening the FOUND
+  pattern's post-"FOUND" separator to the same decoration class the null
+  pattern already tolerates; and (3) the disagreement-section regex hard-coded
+  its own copy of the moderator-prompt heading text with no link to the actual
+  prompt, so every test validated it only against a hand-rolled fixture, never
+  the real prompt (Opus finding) — fixed by extracting the heading text into
+  shared constants used to BUILD the moderator prompt and to compile the
+  regex, with a new test capturing the real prompt `mode_quorum` sends and
+  asserting the constants are genuinely in it.
+
+  A fourth round found the round-2/round-3 fixes still didn't fully compose:
+  Python's `re` module forbids a VARIABLE-width lookbehind, so no fixed
+  `(?<!NO )` (exactly 3 characters, one space) could ever cover "NO" followed
+  by a tab, a double space, or a newline before "REFUTATION" — and the null
+  and affirmative patterns' asymmetric anchoring (null anchored to
+  answer-start, affirmative a free search) meant a short preamble combined
+  with a double-spaced null defeated BOTH layers at once, misreading a
+  genuinely clean answer as a refutation and failing the ship gate (k3/Opus
+  finding). The affirmative marker was also still narrower than the null
+  marker in three more ways — a double space between "REFUTATION"/"FOUND", a
+  dash instead of a colon, and a header form with no colon at all — each
+  silently downgrading a REAL refutation to "inconclusive" (Opus finding).
+  Rather than patch the lookbehind again, `refutation_verdict` was rewritten
+  around a single unanchored regex with an optional "NO" CAPTURE GROUP:
+  whether "NO" is present becomes a plain Python group check instead of a
+  regex lookbehind, sidestepping the width limitation entirely and making
+  both readings tolerate the exact same preamble and decoration. The colon
+  requirement was dropped for the affirmative side too, since the null form
+  never had one. The same round also found the disagreement section's
+  trivial-content check misread ordinary bulleted ("- None.") or bolded
+  ("**None.**") clean sections, and the plural "No disagreements.", as
+  unclean — silently skipping the whole adversarial-check pass on exactly the
+  verdict it exists to double-check (Opus finding) — fixed by widening that
+  pattern to tolerate the same decoration and the plural form.
+
+  A fifth round found two more real issues: (1) `refutation_verdict` still took the
+  FIRST marker match in the body via a single `search`, but the prompt's own "a
+  short list of the specific scenarios you checked" ask invites a model to narrate
+  per-scenario verdicts — an earlier null mention for one scenario could hide a
+  LATER genuine affirmative for a different scenario, silently discarding a real
+  finding (k3/Opus finding) — fixed by switching to `finditer` and treating ANY
+  affirmative occurrence anywhere in the body as `'found'`, regardless of how many
+  null mentions surround it; (2) the marker regex's leading decoration class can
+  backtrack O(L^2) over a long run of decoration-only characters with no real match
+  inside it, the same shape `panel.py`'s `_EVIDENCE_SCAN_MAX_LEN` guard already caps
+  for the finding-evidence scan (glm-cc finding) — fixed by adding the equivalent
+  `_MARKER_SCAN_MAX_LEN` cap, above which the marker scan is skipped and the result
+  is `'inconclusive'` (a body that long was never a real marker answer either way).
+
+  A sixth round (an actual `review diff --staged` self-review pass, not another
+  patch-and-guess cycle) found round 5's length cap had its OWN false-negative, and
+  a more dangerous one: a genuine, VERBOSE refutation (prose + a code snippet + the
+  per-scenario "checked" list the prompt explicitly asks for) routinely exceeds a
+  few thousand characters with NO pathological decoration run in it at all, and got
+  silently downgraded to `'inconclusive'` before the scan even started — discarding
+  a real finding, exactly the "more dangerous direction" this file swears off
+  repeatedly (Opus finding). Fixed at the root instead of raising the cap again:
+  every decoration-matching character class in this section is now BOUNDED (`{0,24}`
+  / `{1,24}` instead of an unbounded `*`), which keeps each match attempt's
+  backtracking cost small regardless of the body's total length — so the whole-body
+  length gate (`_MARKER_SCAN_MAX_LEN`) is no longer needed for safety and was
+  removed outright. The same round found the null marker's "NO" separator (`\s+`,
+  literal whitespace only) still missed a model wrapping just "NO" in emphasis
+  (`**NO** REFUTATION FOUND`) or a colon (`NO: REFUTATION FOUND` — one of the audit's
+  own two reported trigger strings) — the immediate next character wasn't
+  whitespace, so the leftmost successful match started at "REFUTATION" itself with
+  no "NO" consumed, misreading a genuine null answer as an affirmative and flipping
+  a clean run to a false failure (Opus finding). Rather than patch the shared
+  optional-"NO"-capture-group pattern a fifth time, `refutation_verdict` was
+  rewritten around two SEPARATE regexes (`_NULL_MARKER_RE` / `_AFFIRMATIVE_MARKER_RE`)
+  plus explicit overlap exclusion: an affirmative match only counts if its span is
+  NOT contained inside a null match's own span, so "NO REFUTATION FOUND"'s internal
+  "REFUTATION FOUND" substring is recognized as part of the null marker rather than
+  fighting it for the same text — closing the whole class of asymmetry bug that
+  rounds 2 through 5 kept re-discovering new instances of. Two residuals remain
+  DOCUMENTED (not fixed) rather than silently missed: an ordinary sentence where a
+  real WORD (not decoration) separates "no" from "refutation found" — e.g. "No
+  actual refutation found." — still misreads as `'found'` on a clean run (k3
+  finding; the SAFE-direction residual, an unnecessary extra look, never a hidden
+  problem); and a model that uses the null marker's own text inside a negated or
+  quoted sentence to describe a REAL problem — e.g. "I cannot honestly answer 'NO
+  REFUTATION FOUND': quorum.py:469 never sends the diff to the adversarial pass" —
+  still reads as `'not_found'` (k3 finding; the DANGEROUS-direction residual, not
+  closed here, pinned by its own regression test so it stays visible rather than
+  forgotten). This same self-review pass also found the moderator's synthesis
+  parse-miss and "real disagreement" cases were collapsed into one indistinguishable
+  SKIPPED message (Opus finding) — the message now says which case it is, so a human
+  reading the transcript can tell "the panel already disagreed" from "the synthesis
+  wasn't legible at all" — and confirmed the adversarial pass never receives the diff
+  directly, same as the pre-existing moderator call just above it (k3 finding);
+  documented as inheriting review-cli#189 rather than a new gap, not fixed here.
+  Separately (k3 finding, not part of the marker-parsing class above): `--prompt`
+  lets a caller replace `DEFAULT_PROMPT` outright for `review diff`, but both render
+  paths applied the missing-evidence WARNING unconditionally — a custom prompt that
+  never asked for the "checked: ..." phrasing (e.g. `--prompt 'Answer APPROVED if
+  safe; otherwise list blockers.'`) still got a compliant one-word answer flagged as
+  suspicious. `review.py`'s two render call sites now gate `check_evidence` on
+  `prompt == DEFAULT_PROMPT`.
+
+  A seventh round (a second `review diff --staged` self-review pass on round 6's own
+  fixes) found two more real issues, both in code round 6 itself introduced. (1) The
+  new `prompt == DEFAULT_PROMPT` equality check silently broke on `--visual`: `cli.py`'s
+  `_with_visual` APPENDS the image's context note to whatever prompt is in effect
+  (`text + visual_ctx.context_note`), so `review diff --visual shot.png` with no
+  `--prompt` dispatches `DEFAULT_PROMPT + context_note` — a DIFFERENT string from
+  `DEFAULT_PROMPT` even though the model still received DEFAULT_PROMPT's full
+  "checked: ..." contract verbatim (k3 finding) — fixed by switching the check to
+  `prompt.startswith(DEFAULT_PROMPT)`, which recognizes the composed prompt as still
+  carrying the unmodified base contract while still resolving to False for a
+  genuinely custom `--prompt`. (2) `_TRIVIAL_DISAGREEMENT_RE`'s character class was
+  missing the em dash `—` itself, even though the comment directly above it has
+  claimed since round 4 that "— No disagreements." is tolerated — a moderator that
+  puts the heading and the trivial phrase on separate lines (content reduces to
+  exactly "— None.") failed the match, read as "not clean," and silently skipped
+  `--adversarial-check` on a genuinely clean verdict, with round 6's own new skip
+  message then wrongly telling the user "the moderator synthesis reported real
+  disagreement" (k3 finding) — fixed by adding `—` to the character class, closing
+  a gap the comment had assumed was closed for three rounds.
+
+  An eighth round (a confirmation self-review pass on rounds 6-7's own fixes) found
+  the marker/section-parsing logic itself CLEAN on independent re-verification (Opus),
+  plus two more LOW-severity real issues (k3), both fixed. (1) `_REFUTATION_PHRASE`
+  had no right-side word boundary after "FOUND", so any word merely BEGINNING with
+  "found" — "FOUNDED", "FOUNDATION", "founders" — satisfied the affirmative marker
+  too: ordinary prose describing a clean verdict in different words ("the strongest
+  candidate refutation founded on the checkpoint/stamp race fails") false-fired
+  `'found'` with no real "NO" anywhere nearby, flipping a genuinely clean run to a
+  ship-gate exit 1 — fixed by adding `(?![A-Za-z])` right after "FOUND", symmetric
+  with `_NO_WORD_RE`'s own letter-only boundary. (2) `panel.py`'s `_CLEAN_VERDICT_RE`
+  (finding #2's original implementation) included a bare `\bapproved\b` alternative
+  that also matched inside a REJECTING verdict — "Not approved — the checkpoint
+  races the stamp write." — attaching the missing-evidence WARNING to a verdict
+  that already blocked the change and actively misdescribing it; fixed by dropping
+  "approved" from the word list entirely (DEFAULT_PROMPT never asks a reviewer to
+  say that word in the first place, and the remaining alternatives already catch
+  the common bare rubber-stamp shapes) rather than chasing every negation with more
+  lookbehinds. This round also hedged the "non-empty section 2" skip message
+  introduced in round 6: a non-empty `DISAGREEMENT / NO QUORUM` section is NOT
+  necessarily real disagreement — it could be ordinary clean phrasing
+  `_TRIVIAL_DISAGREEMENT_RE`'s fixed alternation doesn't yet recognize ("None to
+  report.", "No conflicts.", "All experts agree.") — so the message now says the
+  section "did not reduce to a recognized trivial/clean phrase" and points the
+  reader at it, rather than asserting disagreement the code cannot actually confirm.
+
+  A ninth round (Opus reached an independent CLEAN verdict re-verifying rounds 6-8's
+  fixes by construction, not spot-check) surfaced one more in-family observation and
+  two missing-test gaps, both addressed without further code risk. `panel.py`'s
+  `_CLEAN_VERDICT_RE` still has the same class of ambiguity round 8 fixed for
+  "approved": its remaining alternatives ("no issues", "no problems", "nothing
+  blocking") can fire on a scoped clause inside a body that DOES report a real
+  finding elsewhere (e.g. "Missing test: ... No issues found in the flat path.").
+  Unlike "approved", these are exactly the words DEFAULT_PROMPT's own "checked: ..."
+  contract expects a genuinely clean SECTION to use, so removing them would defeat
+  the heuristic's purpose — documented as an accepted, low-cost residual in
+  `clean_verdict_missing_evidence`'s own docstring rather than chased with more
+  regex, since telling "the whole verdict is clean" apart from "this one part is"
+  needs the same real-conclusion-location reasoning already out of reach for
+  `refutation_verdict`'s own two residuals. The two missing-test gaps: a THIRD,
+  previously-unpinned residual (a model that merely quotes the affirmative
+  instruction back without asserting a finding, e.g. "I considered whether a
+  'REFUTATION FOUND' response would be warranted — it isn't," still false-matches
+  as `'found'` on a clean run — the safe direction, now regression-pinned like its
+  two siblings); and a new end-to-end test proving `review quorum`'s own
+  `format_result` calls never apply the missing-evidence WARNING even when the
+  moderator's summary contains literal bait text ("Looks good overall.") that would
+  trigger it if `check_evidence=True` were ever accidentally added there — closing
+  the mirror image of the gap round 2's `review.py` tests closed for the
+  diff-review render paths.
+
+  A tenth self-review pass (Opus; k3 hit a billing-quota 403 and could not
+  participate this round) found three more real issues, all fixed, plus a test
+  fixed to actually exercise what it claims to. (1) The refutation marker text
+  existed as THREE independent literals — the exported
+  `REFUTATION_NOT_FOUND_MARKER` constant, a bare inline `'REFUTATION FOUND:'`
+  string hardcoded in `_adversarial_refutation_prompt`, and the regex patterns
+  spelling out "NO"/"REFUTATION"/"FOUND" again themselves — the identical
+  "hardcoded prompt vs. hardcoded regex, no link between them" anti-drift gap
+  round 3 already fixed for the DISAGREEMENT/ABSTAINED headings, just never
+  applied to the marker words. Fixed the same way: `_NO_WORD` / `_REFUTATION_WORD`
+  / `_FOUND_WORD` are now the single source of truth, with
+  `REFUTATION_NOT_FOUND_MARKER` and the new `AFFIRMATIVE_REFUTATION_MARKER`
+  derived from them, the regexes built via `re.escape()` on the same constants,
+  and a new test capturing the REAL prompt sent to the adversarial pass (not a
+  fixture) asserting both constants are genuinely in it. (2) The new second
+  `run_moderator` call for the adversarial pass reused `round_no=0`, identical to
+  the pre-existing moderator call — investigated whether this could collide in
+  the per-call log filename or the quorum-store/stats keying (both plausible
+  given recent commits binding quorum-store iterations to diff identity and
+  adding stalled-model diagnostics); verified neither actually collides (every
+  log filename is ALSO stamped to microsecond precision, and the quorum-store
+  keys off diff identity, not `round_no`), but passed `round_no=1` for the
+  adversarial call anyway as a real diagnostic improvement — a human tailing logs
+  can now tell the two calls apart at a glance instead of by timestamp order
+  alone. (3) `test_flat_diff_review_render_skips_the_warning_under_a_custom_prompt`
+  baited its "does the warning stay off" assertion with `"APPROVED"` — but round 8
+  had already dropped "approved" from `_CLEAN_VERDICT_RE` for an unrelated reason,
+  so the assertion passed regardless of whether `check_evidence` was gated
+  correctly at all; changed the bait to a phrase still in the word list, and
+  added the board path's equivalent negative-prompt test, which had none. Also
+  fixed the `INCONCLUSIVE` header to distinguish "the extra call itself was not
+  usable" from "it ran but matched neither marker" — the original wording always
+  assumed the second case even when there was no real answer to read at all.
+
+  An eleventh pass (Opus, single-seat — k3's quota had not refreshed) correctly
+  flagged that two prior fixes depend on code OUTSIDE this diff it could not itself
+  verify: `run_moderator`'s real signature accepting `round_no`, and `_with_visual`
+  truly appending rather than prepending/wrapping. Both were independently
+  confirmed by direct inspection of `panel.py`/`cli.py` (not assumed) — genuinely
+  safe. But the SECOND item exposed a real test-quality gap: the visual-composition
+  test built its "composed prompt" by hand-rolled string concatenation instead of
+  calling the real `cli._with_visual`, so it would keep passing even if that
+  function's actual behavior changed — fixed by driving the real function with a
+  minimal stand-in object (only `.context_note` is read, so a full `VisualContext`
+  isn't needed), closing the same "fixture instead of reality" gap the marker/
+  heading anti-drift tests already guard against elsewhere in this file.
+
+- **Cross-process/cross-thread locking for the seat-cooldown store (#188).** A board
+  dispatches its seats in parallel, so two concurrent `record_cooldown`/`clear_cooldown`
+  calls could race on the same unlocked read-modify-write and silently lose one side's
+  update. `_locked()` now serializes the critical section with an in-process
+  `threading.Lock` plus a bounded cross-process `fcntl.flock`. The flock retry has its
+  OWN, much smaller sub-budget than the in-process lock's total deadline — a stalled
+  cross-process peer degrades that one thread to in-process-only quickly instead of
+  holding the in-process lock hostage (which would otherwise make every other thread
+  time out at once and race each other, reintroducing the exact bug this fixes) — and a
+  stalled in-process peer degrades further to fully unlocked, instead of hanging the
+  caller or blocking indefinitely. A lock failure only ever narrows the guarantee, it
+  never aborts the write. The pure disable checks
+  (`ttl_seconds=0`/`$REVIEW_SEAT_COOLDOWN_SECONDS<=0`) run before any lock is even
+  acquired, so the "un-stick a seat right now" escape hatch stays instant.
+
+- **Diff-identity binding for `review task CODE --check` — closes a real
+  quorum-pollution incident class (v4 run-stats records).** The self-merge-authority
+  quorum gate used to key PASSED iterations purely by task-code STRING, with no
+  binding to which repo or which diff was actually reviewed. Three real incidents in
+  one session (2026-08-11) showed task-code reuse (a typo, a shared parent-ticket
+  convention, or an accidental/naive substitution) let one diff's real reviews
+  silently count toward a completely different diff's quorum — a wrong-repo review,
+  a swapped task code between two unrelated PRs, and years of unrelated cross-repo
+  history piled onto one code. Every recorded iteration now carries `repo_id` (the
+  normalized `origin` remote — lowercased, default-SSH-port-normalized so https/ssh
+  forms of the same remote match — or a local path fallback) and `diff_files` (the
+  touched-file set), plus `diff_sha256` (diagnostic-only). `review task CODE --check`
+  resolves `-C`'s current repo/diff and EXCLUDES any recorded iteration whose repo
+  differs or whose files share nothing with the current diff, instead of trusting a
+  task-code match alone — matching is file-SET overlap, not diff-content-hash
+  equality, so the normal review-fix-re-review loop (where the diff's exact text
+  legitimately changes between iterations) still counts. History predating this
+  field is "unverifiable" and still counts, preserving old behavior for old data.
+  A stderr warning is now printed whenever verification did NOT run (disabled via
+  `--no-verify-identity`, or `-C` not resolving to a real directory), so "verified"
+  is never silently indistinguishable from "never checked". `gh ship`'s quorum gate
+  needs NO changes to benefit — it already resolves `-C` from its own repo root and
+  reads the same `passed_iterations`/`.error` keys, which now reflect the filtered
+  count automatically. **Threat-model boundary** (be honest about scope): the store
+  is a local, self-reported JSONL a caller with write access can append to directly
+  — this closes "wrong string matches real but unrelated history", not a
+  cryptographic guarantee against a fully malicious agent fabricating a fresh
+  record with spoofed identity. See `reviewlib/stats.py`'s "Diff-identity binding"
+  docstring section and `tests/test_diff_identity.py` for the full incident-shaped
+  regression coverage. Also fixes `_git_diff` to pin `--src-prefix=a/
+  --dst-prefix=b/` regardless of the invoking machine's `diff.noprefix` git config
+  (found live: a no-prefix diff silently produced an empty `diff_files` list), and
+  the `--check` post-push default-branch-diff fallback now uses `git diff
+  --name-only` (one call covering staged+unstaged together, immune to
+  `diff.noprefix` entirely, no full patch body transferred) — this closes a
+  regression a first cut of this same change shipped with, caught by dogfooding
+  `review diff` on this PR's own diff before commit (Codex/GLM/Opus/Fable all
+  independently found the same missing-prefix-pin bug on the fallback path). A
+  SECOND dogfooded review round (same PR, after the round-1 fixes) caught one
+  more real bug, independently found by Opus and Fable: the check-time file-set
+  resolution took the FIRST non-empty of "local uncommitted changes" vs "branch
+  vs default-branch diff", so a single UNRELATED dirty file at post-push check
+  time (`gh ship`'s exact call shape) shadowed the branch's real PR files
+  entirely, spuriously excluding every legitimate iteration. Fixed to return the
+  UNION of both instead of first-match-wins. That round also hardened
+  `_compute_repo_id`'s local (no-remote) path fallback to self-normalize via
+  `git rev-parse --show-toplevel` instead of trusting the caller's `cwd`
+  verbatim, hoisted the per-check file-set into one `frozenset` instead of
+  rebuilding it per iteration (was O(iterations × files)), and capped
+  `mismatch_details` in `--check --json` at 50 entries (the count in
+  `excluded_mismatched_iterations` stays the uncapped true total) so a
+  thousands-of-iterations polluted task code — the exact HYP-858 shape — can't
+  balloon the JSON payload. A THIRD dogfooded round then added a
+  machine-readable `identity_verification: "ran"|"disabled"|"skipped_unresolvable"`
+  JSON field (the stderr warnings above weren't parseable by a `--json`-only
+  caller) and a regression test for the record-time `diff.noprefix` path (only
+  the check-time path had one). A fourth round found no blocking issues.
+  Separately (caught only by actually trying to COMMIT this change on this
+  repo's own `diff.noprefix=true` dev machine, not by any of the four review
+  rounds — none of them execute a live commit against the pre-commit hook):
+  `_git_diff`'s new `--src-prefix`/`--dst-prefix` pin made the REVIEWED diff
+  text byte-different from the pre-commit hook's own INDEPENDENT, unprefixed
+  `git diff --no-ext-diff --cached` recomputation, so the review-stamp hash
+  `_write_review_stamp` writes stopped matching the hook's own hash — silently
+  breaking the "you must review this exact diff before commit" gate on any
+  `diff.noprefix=true` machine. Fixed by having `_write_review_stamp`
+  independently re-derive the diff with the SAME unprefixed invocation the
+  hook uses, rather than hashing the (now possibly prefixed) reviewed text.
+  A FIFTH dogfooded round then caught a subtler consequence of that same fix
+  (k3 + Opus, independently): re-deriving the hash at stamp-WRITE time (right
+  after the multi-model panel finishes, potentially minutes after dispatch)
+  reopened a narrow TOCTOU window — a concurrent index mutation DURING the
+  review (a second agent/session in a shared checkout; AGENTS.md documents
+  this has happened in production) would get silently certified as reviewed,
+  where the pre-fix behavior (hashing the actually-reviewed `diff` text)
+  failed closed instead. Fixed by capturing the hook-compatible hash ONCE, at
+  DIFF-DISPATCH time (`cli._stamp_hash_for_staged_diff`, called immediately
+  adjacent to the diff capture that feeds the models), and threading it
+  through `mode_review`/`_mode_review_board`/`_stamp_if_staged_commit_review`
+  into `_write_review_stamp` — so the stamp certifies what the models actually
+  saw again, while staying hash-compatible with the hook's own unprefixed
+  recomputation. Falls back to the write-time re-derive for any non-CLI caller
+  of `mode_review` that doesn't thread the new `stamp_diff_hash` parameter.
+
+- **`quorum` — every seat gets a per-seat role/lens, reusing brainstorm's persona
+  pool (review-cli#206).** Each expert answer is now reasoned from an assigned role
+  (Pragmatic Staff Engineer, Security-Paranoid Reviewer, Developer-Experience
+  Designer, Skeptical SRE, Product-Minded Architect, Cost-Conscious Performance
+  Engineer — the same pool `brainstorm` rotates through), shown in the transcript as
+  `glm [Security-paranoid reviewer]`. When a distinct-model pool is scarce or some
+  models are near their usage limit and `expand_flat_models_with_reuse` fills
+  multiple seats with one model, each of that model's seats gets a DIFFERENT lens
+  (keyed by per-model occurrence, not raw seat index) instead of a bare `<model>#N`
+  disclosure label with an otherwise-identical prompt — up to the size of the
+  persona pool (currently 6) per model. One persona was also renamed in the
+  shared pool: `"DX / ergonomics designer"` →
+  `"Developer-experience designer"` (a user-visible change to any brainstorm
+  transcript/log referencing the old name).
+
+- **`review stat` — per-harness/per-model usage + health report, and two concrete
+  token-burn fixes (2026-08 investigation).** `review stat` (`--days`, `--since`,
+  `--top`, `--harness`, `--json`) parses the real per-call logs into a per-backend
+  breakdown (calls/ok/fail, a byte-size proxy for every harness, **real** token counts
+  for the REST backends that emit them, SKILL.md/MEMORY.md context-pollution rate), the
+  Fable (priority-1 board seat) dispatch/failure pattern, retry/promotion totals, and
+  the largest individual calls recorded — see `reviewlib/dashboard/tokenstats.py` and
+  the README's `review stat` section. Two concrete causes the investigation evidenced
+  are now fixed at the source, not just measured: (1) a dispatch-time diff-size cap
+  (`reviewlib.backends.cap_diff_for_dispatch`, default 300,000 bytes,
+  `$REVIEW_DIFF_MAX_BYTES`) truncates an oversized diff before it reaches any backend —
+  a real 6.5MB/583-file diff was previously sent whole to every board seat every round;
+  the canonical diff used by `--commit`'s checkpoint integrity check stays uncapped, and
+  a piped diff is never capped. (2) A cross-invocation cooldown cache
+  (`reviewlib/seat_cooldown.py`) stops the chronically-unavailable Fable seat from
+  paying for one full real dispatch on every single invocation — 4,322 of 6,383
+  recorded runs dispatched Fable and it failed, most with an explicit session-limit
+  notice; a later invocation within the cooldown window now skips the real dispatch and
+  returns the same sentinel shape every downstream consumer already recognizes.
+- **New `omp:` backend — Oh My Pi agentic read-only seats (review-cli#174).** A board or
+  `-m` seat spelled `omp:<provider>/<model>` (e.g. `omp:kimi-code/k3`) now routes to a
+  first-class omp backend instead of falling through to the opencode catch-all. The seat
+  runs `omp -p --no-session --no-extensions --no-skills --tools read,grep,glob --add-dir
+  `<repo> --config <cage-overlay>` from a NEUTRAL temp cwd with a SANITIZED HOME —
+  agentic (it can read any project file) and caged read-only with no egress: omp
+  executes project-shipped `.mcp.json`/`.omp/tools` from its launch cwd, mounts
+  user-scope MCP servers whose tools run arbitrary code, its read tool fetches URLs,
+  and the xd:// device transport carries write/edit/bash around `--tools` (all four
+  verified against omp v17), so the launch dir is an empty temp dir, HOME points at an
+  empty subdir (PI_CODING_AGENT_DIR keeps auth), the repo is mounted read-only via
+  `--add-dir`, and a per-run overlay disables `fetch`, `tools.xdev`, and project MCP.
+  All boundaries are covered by permanent live assertions (tests/test_omp_cage_live.py,
+  opt-in via REVIEW_OMP_CAGE_LIVE=1). The
+  prompt+diff travels as an `@<tempfile>` message arg — omp does not read prompts from
+  stdin, and the `@file` transport dodges the ~1 MB ARG_MAX ceiling argv-passing would
+  hit. `--effort` maps to omp's `--thinking` flag; `REVIEW_OMP_MODE=api` fails loudly
+  (CLI-only). Availability is probed offline (binary on PATH + a non-disabled credential
+  row for the seat's provider in omp's auth db, honoring `PI_CODING_AGENT_DIR` /
+  `OMP_PROFILE`, memoized per db mtime), the seat is `unpaid_providers:`-gateable as
+  provider `omp`, `--show-board` labels it `agentic`, and the dashboard attributes
+  `omp -m <sel>` calls to the `omp:<sel>` seat (mirroring the `oc:` mapping,
+  review-cli#24).
 - **`review qa` now honors the run-scoped `--effort` flag (review-cli#127).** The `--effort`
   flag (#150) lifted every review-panel seat's reasoning effort, but the qa write/exec tester —
   a single seat that rides `claude-p`/`codex`, not the panel — silently ignored it. The resolved

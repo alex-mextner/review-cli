@@ -26,6 +26,7 @@ behaviour scripts and the clock/RNG are injected), prove:
 
 Plain-script harness (mirrors tests/test_failover_pool.py): each test_* is run by __main__.
 """
+
 from __future__ import annotations
 
 import os
@@ -35,6 +36,20 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+
+# This file tests the IN-SEAT RETRY + board reserve-replace layers. Provider-failover
+# (seat-level same-model-across-providers) is a DISTINCT layer tested in
+# tests/test_provider_failover.py; neutralise it to an identity chain here so a chained
+# seat (glm/opus) doesn't silently fall over instead of failing, and redirect its
+# last-working cache to a throwaway file.
+import tempfile  # noqa: E402
+
+os.environ.setdefault(
+    "REVIEW_PROVIDER_CACHE", str(Path(tempfile.mkdtemp()) / "last-provider.json")
+)
+# SCOPED per-test (autouse fixture / __main__ wrapper), NOT module-level — a module-level
+# patch poisons other suites at collection time. See tests/_failover_neutralise.py.
+from _failover_neutralise import identity_provider_chain  # noqa: E402
 
 import reviewlib.panel as panel  # noqa: E402
 import reviewlib.retry as retry  # noqa: E402
@@ -51,6 +66,18 @@ from reviewlib.retry import (  # noqa: E402
 )
 
 PROMPT = "Review this diff."
+
+try:
+    import pytest  # noqa: E402
+
+    @pytest.fixture(autouse=True)
+    def _neutralise_provider_failover():
+        """Seat-level provider-failover is neutralised to an identity chain per-test and
+        RESTORED afterwards, so it never leaks to other suites."""
+        with identity_provider_chain():
+            yield
+except ImportError:  # plain-script harness applies it in __main__ instead
+    pass
 
 
 # A `tmp_log` argument names a FRESH run-log dir for the test (so write_retry_log / log_dir
@@ -71,31 +98,55 @@ except ImportError:  # pytest absent: the plain __main__ harness supplies tmp_lo
     pass
 
 
-def _result(rc: int = 0, out: str = "ok", err: str = "", cmd: str = "fake") -> ReviewResult:
+def _result(
+    rc: int = 0, out: str = "ok", err: str = "", cmd: str = "fake"
+) -> ReviewResult:
     return ReviewResult(model="m", command=cmd, returncode=rc, stdout=out, stderr=err)
 
 
 # === (a) classify_failure: transient vs seat-fatal ===============================
 def test_classify_429_is_retryable():
-    assert classify_failure(_result(1, "", "HTTP 429 Too Many Requests")) is FailureClass.RETRYABLE
+    assert (
+        classify_failure(_result(1, "", "HTTP 429 Too Many Requests"))
+        is FailureClass.RETRYABLE
+    )
+
 
 def test_classify_529_overloaded_is_retryable():
-    assert classify_failure(_result(1, "", "Error 529: overloaded")) is FailureClass.RETRYABLE
+    assert (
+        classify_failure(_result(1, "", "Error 529: overloaded"))
+        is FailureClass.RETRYABLE
+    )
+
 
 def test_classify_5xx_gateway_is_retryable():
     for code in ("500", "502", "503", "504", "520", "524"):
-        assert classify_failure(_result(1, "", f"upstream returned {code}")) is FailureClass.RETRYABLE, code
+        assert (
+            classify_failure(_result(1, "", f"upstream returned {code}"))
+            is FailureClass.RETRYABLE
+        ), code
+
 
 def test_classify_timeout_exit_code_is_retryable():
     """A process timeout (exit 124, the `timeout`/backstop code) is transient by code alone —
     even with no throttle keyword in the partial buffer."""
     assert classify_failure(_result(124, "partial...", "")) is FailureClass.RETRYABLE
 
+
 def test_classify_rate_limit_words_are_retryable():
-    for phrase in ("rate limit exceeded", "rate-limited", "too many requests",
-                   "service unavailable", "server temporarily busy",
-                   "request throttled", "we are at capacity right now"):
-        assert classify_failure(_result(1, "", phrase)) is FailureClass.RETRYABLE, phrase
+    for phrase in (
+        "rate limit exceeded",
+        "rate-limited",
+        "too many requests",
+        "service unavailable",
+        "server temporarily busy",
+        "request throttled",
+        "we are at capacity right now",
+    ):
+        assert classify_failure(_result(1, "", phrase)) is FailureClass.RETRYABLE, (
+            phrase
+        )
+
 
 def test_transient_mentioning_auth_or_billing_word_still_retries():
     """The seat-fatal anchors are TIGHT: a real TRANSIENT that merely contains the word
@@ -107,47 +158,141 @@ def test_transient_mentioning_auth_or_billing_word_still_retries():
         "429 rate limit on the billing region",
         "api key abc123 rate limited, retry later",  # provider echoes the key id in a 429
     ):
-        assert classify_failure(_result(1, "", phrase)) is FailureClass.RETRYABLE, phrase
+        assert classify_failure(_result(1, "", phrase)) is FailureClass.RETRYABLE, (
+            phrase
+        )
+
 
 def test_classify_quota_and_billing_are_seat_fatal_for_in_seat():
     """Unlike the agent-tools cross-harness chain (where a quota error is worth falling to a
     DIFFERENT provider's quota), in-seat retry hits the SAME key — an exhausted quota / billing
     failure won't replenish in the retry window, so it is SEAT_FATAL here: fall to the reserve
     at once, don't burn the budget on a dead key."""
-    for phrase in ("quota exceeded", "monthly quota reached", "insufficient credit",
-                   "insufficient balance", "billing hard limit reached"):
-        assert classify_failure(_result(1, "", phrase)) is FailureClass.SEAT_FATAL, phrase
+    for phrase in (
+        "quota exceeded",
+        "monthly quota reached",
+        "insufficient credit",
+        "insufficient balance",
+        "billing hard limit reached",
+    ):
+        assert classify_failure(_result(1, "", phrase)) is FailureClass.SEAT_FATAL, (
+            phrase
+        )
+
 
 def test_classify_auth_is_seat_fatal():
-    for phrase in ("HTTP 401 Unauthorized", "403 Forbidden", "authentication failed",
-                   "invalid api key", "permission denied"):
-        assert classify_failure(_result(1, "", phrase)) is FailureClass.SEAT_FATAL, phrase
+    for phrase in (
+        "HTTP 401 Unauthorized",
+        "403 Forbidden",
+        "authentication failed",
+        "invalid api key",
+        "permission denied",
+    ):
+        assert classify_failure(_result(1, "", phrase)) is FailureClass.SEAT_FATAL, (
+            phrase
+        )
+
 
 def test_classify_bad_model_is_seat_fatal():
-    for phrase in ("unknown model 'foo'", "model not found", "unsupported model",
-                   "the model does not exist"):
-        assert classify_failure(_result(1, "", phrase)) is FailureClass.SEAT_FATAL, phrase
+    for phrase in (
+        "unknown model 'foo'",
+        "model not found",
+        "unsupported model",
+        "the model does not exist",
+    ):
+        assert classify_failure(_result(1, "", phrase)) is FailureClass.SEAT_FATAL, (
+            phrase
+        )
+
 
 def test_classify_501_not_implemented_is_seat_fatal():
-    assert classify_failure(_result(1, "", "HTTP 501 Not Implemented")) is FailureClass.SEAT_FATAL
+    assert (
+        classify_failure(_result(1, "", "HTTP 501 Not Implemented"))
+        is FailureClass.SEAT_FATAL
+    )
+
+
+def test_classify_dns_and_network_errors_are_retryable():
+    """Network-layer failures the keyed-HTTP backends surface as urllib strings (DNS,
+    connection reset/refused, SSL EOF, name resolution) are TRANSIENT — provider-agnostic,
+    one central classifier (CTO reliability directive). The observed gemini DNS blip and
+    z.ai connection resets must retry (+ fail over), not go straight to the reserve."""
+    for phrase in (
+        # the EXACT gemini DNS string observed in the field:
+        "URLError: <urlopen error [Errno 8] nodename nor servname provided, or not known>",
+        "URLError: <urlopen error [Errno -2] Name or service not known>",
+        "Temporary failure in name resolution",
+        "socket.gaierror: [Errno 8] getaddrinfo failed",
+        "[Errno 54] Connection reset by peer",
+        "ConnectionResetError: [Errno 54] Connection reset by peer",
+        "[Errno 61] Connection refused",
+        "RemoteDisconnected: Remote end closed connection without response",
+        "urlopen error [Errno 51] Network is unreachable",
+        "ssl.SSLEOFError: EOF occurred in violation of protocol",
+        "URLError: <urlopen error [Errno 60] Operation timed out>",
+        "requests.exceptions.ReadTimeout: HTTPSConnectionPool: Read timed out",
+        "OSError: [Errno 65] No route to host",
+        # BARE errno names with no other keyword (Node/libuv-style, some SDK wrappers): the
+        # dedicated \bECONNRESET\b / \bETIMEDOUT\b patterns catch these. Patterns compile with
+        # re.IGNORECASE so the case doesn't matter — a bare, differently-cased errno name still
+        # retries instead of falling through to SEAT_FATAL (guards the classifier's case path).
+        "Error: connect ECONNRESET 10.0.0.1:443",
+        "econnreset",
+        "Error: connect ETIMEDOUT",
+        "ETIMEDOUT",
+    ):
+        assert classify_failure(_result(1, "", phrase)) is FailureClass.RETRYABLE, (
+            phrase
+        )
+
+
+def test_classify_400_insufficient_credits_and_auth_do_not_retry():
+    """Permanent provider errors (400 insufficient-credits — the commandcode paywall — and
+    401/403 auth) must NOT retry: they fail fast (seat-fatal), so the cascade skips/fails
+    over immediately rather than burning backoff on a dead key (CTO reliability directive)."""
+    for phrase in (
+        "HTTP 400: insufficient credits",
+        "400 Bad Request: insufficient balance",
+        "HTTP 401 Unauthorized",
+        "403 Forbidden: permission denied",
+        "invalid api key",
+    ):
+        assert classify_failure(_result(1, "", phrase)) is FailureClass.SEAT_FATAL, (
+            phrase
+        )
+
 
 def test_classify_refusal_capacity_is_not_transient():
     """A refusal that says 'no capacity' / 'great capacity' must NOT read as a transient
     outage (it would burn the reserve on a non-transient failure)."""
-    for phrase in ("I have no capacity to help with that",
-                   "this requires great capacity for nuance"):
-        assert classify_failure(_result(0, phrase, "")) is FailureClass.SEAT_FATAL, phrase
+    for phrase in (
+        "I have no capacity to help with that",
+        "this requires great capacity for nuance",
+    ):
+        assert classify_failure(_result(0, phrase, "")) is FailureClass.SEAT_FATAL, (
+            phrase
+        )
+
 
 def test_classify_unclassifiable_fails_closed_to_seat_fatal():
     """An empty/mystery failure defaults to SEAT_FATAL — fail closed toward the reserve, never
     spin the retry budget on a failure we can't read."""
     assert classify_failure(_result(1, "", "")) is FailureClass.SEAT_FATAL
-    assert classify_failure(_result(1, "", "internal weirdness, no http code")) is FailureClass.SEAT_FATAL
+    assert (
+        classify_failure(_result(1, "", "internal weirdness, no http code"))
+        is FailureClass.SEAT_FATAL
+    )
+
 
 def test_seat_fatal_wins_over_incidental_transient_substring():
     """An auth failure whose text ALSO contains a transient-looking number still classifies
     SEAT_FATAL (the fatal check runs first) — switching/retrying can't fix bad credentials."""
-    assert classify_failure(_result(1, "", "401 unauthorized (after 3 rate limit retries)")) is FailureClass.SEAT_FATAL
+    assert (
+        classify_failure(
+            _result(1, "", "401 unauthorized (after 3 rate limit retries)")
+        )
+        is FailureClass.SEAT_FATAL
+    )
 
 
 # === (b) error-channel discipline ===============================================
@@ -161,6 +306,7 @@ def test_long_review_body_mentioning_503_is_not_in_channel():
     # And even if forced through classification, the long body is NOT in the error channel:
     assert "503" not in retry._error_channel(res)
 
+
 def test_rc0_sentinel_body_is_seat_fatal_not_retried():
     """The rc=0 short 'unavailable' SENTINEL (paywalled/disabled Fable) is an ADMINISTRATIVE,
     chronic state — NOT a throttle. It must classify SEAT_FATAL (immediate reserve), even
@@ -171,26 +317,40 @@ def test_rc0_sentinel_body_is_seat_fatal_not_retried():
         "This model is temporarily unavailable. Please try again later.",
         "Claude Fable 5 is currently unavailable. Learn more: https://x",
     ):
-        res = ReviewResult(model="m", command="fake", returncode=0, stdout=body, stderr="")
+        res = ReviewResult(
+            model="m", command="fake", returncode=0, stdout=body, stderr=""
+        )
         assert not panel.result_is_usable(res)
         assert classify_failure(res) is FailureClass.SEAT_FATAL, body
+
 
 def test_real_stderr_throttle_still_retries():
     """A REAL transient on the ERROR channel (stderr / non-zero exit) still retries — the
     sentinel-is-fatal rule only covers the rc=0 administrative notice, not a genuine 503."""
-    assert classify_failure(_result(1, "", "503 service temporarily unavailable")) is FailureClass.RETRYABLE
+    assert (
+        classify_failure(_result(1, "", "503 service temporarily unavailable"))
+        is FailureClass.RETRYABLE
+    )
     assert classify_failure(_result(1, "", "429 rate limit")) is FailureClass.RETRYABLE
+
 
 def test_nonzero_exit_stdout_error_is_in_channel():
     """A backend that streams to stdout and, on FAILURE, writes the error to stdout with rc!=0
     and EMPTY stderr (a common CLI pattern) must still be classified — a short non-zero stdout
     is an error body, not a review, so it joins the channel and a transient there retries
     (reviewD #1)."""
-    assert classify_failure(_result(1, "503 service unavailable", "")) is FailureClass.RETRYABLE
-    assert classify_failure(_result(1, "429 too many requests", "")) is FailureClass.RETRYABLE
+    assert (
+        classify_failure(_result(1, "503 service unavailable", ""))
+        is FailureClass.RETRYABLE
+    )
+    assert (
+        classify_failure(_result(1, "429 too many requests", ""))
+        is FailureClass.RETRYABLE
+    )
     # ...but a SUCCESSFUL (rc=0) long review mentioning 503 is usable and never classified.
     long_review = "x" * 600 + " consider retrying on 503"
     assert panel.result_is_usable(ReviewResult("m", "c", 0, long_review, ""))
+
 
 def test_429_with_quota_word_still_retries():
     """'429 Too Many Requests — quota resets shortly' is a RECOVERABLE RPM/TPM limit, not an
@@ -199,14 +359,23 @@ def test_429_with_quota_word_still_retries():
         "429 Too Many Requests, quota resets shortly",
         "rate limit hit, per-minute quota will reset",
     ):
-        assert classify_failure(_result(1, "", phrase)) is FailureClass.RETRYABLE, phrase
+        assert classify_failure(_result(1, "", phrase)) is FailureClass.RETRYABLE, (
+            phrase
+        )
+
 
 def test_command_line_is_not_in_error_channel():
     """The backend COMMAND must NOT feed classification: an incidental numeric token in argv
     (a port, a `--timeout 503`, a model version) must not false-match a transient pattern and
     burn the retry budget. With an empty stderr/body, such a command stays unclassifiable ->
     SEAT_FATAL (straight to the reserve, no wasted retry)."""
-    res = ReviewResult(model="m", command="codex exec -m gpt-503 --timeout 429", returncode=1, stdout="", stderr="")
+    res = ReviewResult(
+        model="m",
+        command="codex exec -m gpt-503 --timeout 429",
+        returncode=1,
+        stdout="",
+        stderr="",
+    )
     assert "503" not in retry._error_channel(res)
     assert "429" not in retry._error_channel(res)
     assert classify_failure(res) is FailureClass.SEAT_FATAL
@@ -223,7 +392,9 @@ class _Script:
     def __call__(self) -> ReviewResult:
         rc, out, err = self.outcomes[min(self.calls, len(self.outcomes) - 1)]
         self.calls += 1
-        return ReviewResult(model="m", command="fake", returncode=rc, stdout=out, stderr=err)
+        return ReviewResult(
+            model="m", command="fake", returncode=rc, stdout=out, stderr=err
+        )
 
 
 def _no_sleep(_seconds: float) -> None:
@@ -234,7 +405,9 @@ def test_transient_retried_then_succeeds(tmp_log):
     """A seat that fails transiently once then succeeds is RETRIED in-seat and recovers — the
     runner is called exactly twice, and the final result is the usable one."""
     script = _Script([(1, "", "429 rate limit"), (0, "real verdict", "")])
-    out = run_seat_with_retry("m", script, max_retries=3, rng=random.Random(1), sleeper=_no_sleep)
+    out = run_seat_with_retry(
+        "m", script, max_retries=3, rng=random.Random(1), sleeper=_no_sleep
+    )
     assert out.returncode == 0 and out.stdout == "real verdict"
     assert script.calls == 2  # initial + ONE retry
 
@@ -244,7 +417,9 @@ def test_seat_fatal_does_not_retry(tmp_log):
     """A SEAT-FATAL failure returns immediately — the runner is called ONCE, no retry, so the
     caller (failover) reserve-replaces it without burning the budget."""
     script = _Script([(1, "", "401 unauthorized"), (0, "should-never-reach", "")])
-    out = run_seat_with_retry("m", script, max_retries=5, rng=random.Random(1), sleeper=_no_sleep)
+    out = run_seat_with_retry(
+        "m", script, max_retries=5, rng=random.Random(1), sleeper=_no_sleep
+    )
     assert out.returncode == 1 and "unauthorized" in out.stderr
     assert script.calls == 1  # ZERO retries on a fatal
 
@@ -254,9 +429,14 @@ def test_retry_count_respected_exhausts_budget(tmp_log):
     """A persistently-transient seat is retried EXACTLY `budget` times then handed back failed
     (fail-loud — never faked into a verdict). budget=3 -> 1 initial + 3 retries = 4 calls."""
     script = _Script([(1, "", "503 service unavailable")])  # always transient-fails
-    out = run_seat_with_retry("m", script, max_retries=3, rng=random.Random(1), sleeper=_no_sleep)
-    assert out.returncode == 1  # still failed: handed back for the reserve, not fabricated
+    out = run_seat_with_retry(
+        "m", script, max_retries=3, rng=random.Random(1), sleeper=_no_sleep
+    )
+    assert (
+        out.returncode == 1
+    )  # still failed: handed back for the reserve, not fabricated
     assert script.calls == 4
+
 
 def test_timeout_retry_is_capped(tmp_log):
     """A TIMEOUT (exit 124) retry costs a full per-call timeout, so it is capped independently
@@ -264,9 +444,12 @@ def test_timeout_retry_is_capped(tmp_log):
     (cap=1) then handed back for the reserve — NOT 5 times (which would wait 6 full timeouts on
     a hung seat). Initial + 1 timeout retry = 2 calls."""
     script = _Script([(124, "partial", "")])  # always times out
-    out = run_seat_with_retry("m", script, max_retries=5, rng=random.Random(1), sleeper=_no_sleep)
+    out = run_seat_with_retry(
+        "m", script, max_retries=5, rng=random.Random(1), sleeper=_no_sleep
+    )
     assert out.returncode == 124
     assert script.calls == 2, script.calls  # initial + exactly ONE timeout retry
+
 
 def test_wall_clock_cap_stops_a_slow_transient(tmp_log):
     """The wall-clock cap bounds a SLOW transient the exit-124 sub-cap can't see: a backend
@@ -282,17 +465,24 @@ def test_wall_clock_cap_stops_a_slow_transient(tmp_log):
         def _r():
             clock["t"] += 40.0  # each failed call burns ~40s of wall time
             return ReviewResult("m", "fake", 1, "", "503 service unavailable")
+
         return _r
 
     out = run_seat_with_retry(
-        "m", _slow_runner_factory(), max_retries=8, max_seconds=90.0,
-        rng=random.Random(1), sleeper=_no_sleep, clock=_clock,
+        "m",
+        _slow_runner_factory(),
+        max_retries=8,
+        max_seconds=90.0,
+        rng=random.Random(1),
+        sleeper=_no_sleep,
+        clock=_clock,
     )
     assert out.returncode == 1  # still failed -> reserve takes over (fail-loud)
     # initial (t->40) + retry1 (t->80) ; before retry2 elapsed=80<90 so retry2 runs (t->120);
     # before retry3 elapsed=120>=90 -> stop. So 3 calls, NOT 9. The cap bit well before budget.
     text = "\n".join(p.read_text() for p in log_dir().glob("*-retry*.log"))
     assert "kind=retry-time-exhausted" in text, text
+
 
 def test_retry_max_seconds_env_override():
     """retry_max_seconds() reads $REVIEW_RETRY_MAX_SECONDS at call time, symmetric with
@@ -318,38 +508,59 @@ def test_retry_max_seconds_env_override():
         else:
             os.environ["REVIEW_RETRY_MAX_SECONDS"] = saved
 
+
 def test_zero_sleep_retries_do_not_clobber_each_others_logs(tmp_log):
     """Under zero backoff (the test path, or a future 0-delay config) two retry events for the
     SAME model can land in the same microsecond. The filename seq discriminator must keep them
     as SEPARATE files — assert the NUMBER of retry-log files equals the number of retry events,
     not 1 (which would mean an O_TRUNC clobber)."""
     script = _Script([(1, "", "503"), (1, "", "503"), (0, "ok", "")])
-    run_seat_with_retry("same-model", script, max_retries=3, rng=random.Random(1), sleeper=_no_sleep)
+    run_seat_with_retry(
+        "same-model", script, max_retries=3, rng=random.Random(1), sleeper=_no_sleep
+    )
     files = list(log_dir().glob("*-retry*.log"))
-    assert len(files) == 2, [f.name for f in files]  # two retry events -> two distinct files
+    assert len(files) == 2, [
+        f.name for f in files
+    ]  # two retry events -> two distinct files
+
 
 def test_wall_clock_cap_disabled_with_nonpositive(tmp_log):
     """max_seconds<=0 disables the wall-clock cap — only the count cap applies then."""
     script = _Script([(1, "", "503")])
-    out = run_seat_with_retry("m", script, max_retries=3, max_seconds=0.0,
-                              rng=random.Random(1), sleeper=_no_sleep)
+    out = run_seat_with_retry(
+        "m",
+        script,
+        max_retries=3,
+        max_seconds=0.0,
+        rng=random.Random(1),
+        sleeper=_no_sleep,
+    )
     assert out.returncode == 1
     assert script.calls == 4  # full budget used, the wall-clock cap did not fire
+
 
 def test_fast_transient_still_uses_full_budget_even_after_a_timeout(tmp_log):
     """A cheap (non-timeout) transient still gets the full budget — the timeout cap only bounds
     timeouts. Here a single timeout is retried (cap allows 1), then a 429 keeps retrying until
     the seat recovers, within the budget."""
     script = _Script([(124, "", ""), (1, "", "429"), (1, "", "429"), (0, "ok", "")])
-    out = run_seat_with_retry("m", script, max_retries=5, rng=random.Random(1), sleeper=_no_sleep)
+    out = run_seat_with_retry(
+        "m", script, max_retries=5, rng=random.Random(1), sleeper=_no_sleep
+    )
     assert out.returncode == 0 and out.stdout == "ok"
-    assert script.calls == 4  # initial timeout + 3 retries (1 timeout-retry + 2 fast 429s)
+    assert (
+        script.calls == 4
+    )  # initial timeout + 3 retries (1 timeout-retry + 2 fast 429s)
+
 
 def test_retry_count_zero_disables_retry(tmp_log):
     script = _Script([(1, "", "429"), (0, "x", "")])
-    out = run_seat_with_retry("m", script, max_retries=0, rng=random.Random(1), sleeper=_no_sleep)
+    out = run_seat_with_retry(
+        "m", script, max_retries=0, rng=random.Random(1), sleeper=_no_sleep
+    )
     assert out.returncode == 1
     assert script.calls == 1  # no retry at all
+
 
 def test_cli_retry_flag_overrides_existing_env(tmp_log):
     """The CLI `--retry N` must WIN over a pre-existing $REVIEW_RETRY_COUNT (and clamp). Drives
@@ -363,12 +574,38 @@ def test_cli_retry_flag_overrides_existing_env(tmp_log):
     repo = tempfile.mkdtemp(prefix="review-retry-cli-")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     saved = os.environ.get("REVIEW_RETRY_COUNT")
+    # cli._dispatch runs load_config() + backends.configure_unpaid_providers(...) against the
+    # REAL ~/.config/review-cli/config.yaml, which sets the process-wide `_CONFIG_UNPAID_PROVIDERS`
+    # (e.g. {commandcode, gemini}). Snapshot + restore it so this test never leaks the local
+    # config's unpaid set into later suites (it silently marked oc:commandcode seats dead in
+    # test_reviewer_board's availability assertions when it didn't).
+    import reviewlib.backends as _b
+
+    saved_unpaid = _b._CONFIG_UNPAID_PROVIDERS
     try:
-        for env_val, flag_val, want in [("1", "7", 7), ("9", "-4", 0), ("2", "9999", retry.max_retry_count())]:
+        for env_val, flag_val, want in [
+            ("1", "7", 7),
+            ("9", "-4", 0),
+            ("2", "9999", retry.max_retry_count()),
+        ]:
             os.environ["REVIEW_RETRY_COUNT"] = env_val
-            cli._dispatch(["diff", "--task", "TEST-1", "--staged", "--retry", flag_val, "-C", repo])
-            assert retry_count() == want, f"env={env_val} --retry={flag_val} -> {retry_count()}, want {want}"
+            cli._dispatch(
+                [
+                    "diff",
+                    "--task",
+                    "TEST-1",
+                    "--staged",
+                    "--retry",
+                    flag_val,
+                    "-C",
+                    repo,
+                ]
+            )
+            assert retry_count() == want, (
+                f"env={env_val} --retry={flag_val} -> {retry_count()}, want {want}"
+            )
     finally:
+        _b._CONFIG_UNPAID_PROVIDERS = saved_unpaid
         if saved is None:
             os.environ.pop("REVIEW_RETRY_COUNT", None)
         else:
@@ -401,7 +638,9 @@ def test_retry_count_env_override(tmp_log):
 def test_retry_logged_durably(tmp_log):
     """A retry writes a DURABLE retry-event log file under the run log dir (not stderr-only)."""
     script = _Script([(1, "", "429 rate limit"), (0, "ok", "")])
-    run_seat_with_retry("seat-x", script, max_retries=2, rng=random.Random(1), sleeper=_no_sleep)
+    run_seat_with_retry(
+        "seat-x", script, max_retries=2, rng=random.Random(1), sleeper=_no_sleep
+    )
     logs = list(log_dir().glob("*-retry*.log"))
     assert logs, "no durable retry-event log written"
     text = "\n".join(p.read_text() for p in logs)
@@ -409,20 +648,26 @@ def test_retry_logged_durably(tmp_log):
     assert "kind=retry" in text
     assert "429" in text  # the failing channel detail is persisted
 
+
 def test_seat_fatal_logged_durably(tmp_log):
     """A seat-fatal failure also leaves a durable record (kind=seat-fatal) so a post-mortem
     sees WHY a seat went straight to the reserve."""
     script = _Script([(1, "", "403 forbidden")])
-    run_seat_with_retry("seat-y", script, max_retries=2, rng=random.Random(1), sleeper=_no_sleep)
+    run_seat_with_retry(
+        "seat-y", script, max_retries=2, rng=random.Random(1), sleeper=_no_sleep
+    )
     text = "\n".join(p.read_text() for p in log_dir().glob("*-retry*.log"))
     assert "kind=seat-fatal" in text
+
 
 def test_timeout_exhausted_has_its_own_log_kind(tmp_log):
     """A capped-out TIMEOUT is logged as kind=timeout-exhausted, NOT seat-fatal — so the
     dashboard/post-mortem can tell 'we stopped retrying a hung seat' from a real auth/501
     seat-fatal."""
     script = _Script([(124, "partial", "")])  # always times out
-    run_seat_with_retry("seat-t", script, max_retries=3, rng=random.Random(1), sleeper=_no_sleep)
+    run_seat_with_retry(
+        "seat-t", script, max_retries=3, rng=random.Random(1), sleeper=_no_sleep
+    )
     text = "\n".join(p.read_text() for p in log_dir().glob("*-retry*.log"))
     assert "kind=timeout-exhausted" in text
     assert "kind=seat-fatal" not in text
@@ -431,9 +676,11 @@ def test_timeout_exhausted_has_its_own_log_kind(tmp_log):
 # === (g) backoff + jitter present ===============================================
 def test_backoff_grows_exponentially():
     """Without jitter (a zero-spread RNG) the delay grows by the backoff factor and caps."""
+
     class _Zero(random.Random):
         def uniform(self, a, b):  # no jitter -> deterministic schedule
             return 0.0
+
     rng = _Zero()
     d1 = compute_backoff(1, rng)
     d2 = compute_backoff(2, rng)
@@ -443,11 +690,13 @@ def test_backoff_grows_exponentially():
     # The cap holds for a large attempt index.
     assert compute_backoff(20, rng) <= 8.0 + 1e-9
 
+
 def test_jitter_perturbs_backoff():
     """Jitter is real: two different RNG seeds give different delays for the SAME attempt."""
     a = compute_backoff(3, random.Random(1))
     b = compute_backoff(3, random.Random(99999))
     assert a != b, (a, b)
+
 
 def test_jitter_stays_within_bounds():
     """Jittered delay never exceeds the cap and is never negative, across many seeds."""
@@ -474,11 +723,20 @@ class _FakeBackends:
                 self.dispatched.append(model)
                 seq = self.behaviour.get(model)
                 if seq is None:
-                    return ReviewResult(model=model, command="fake", returncode=0, stdout=f"ok {model}", stderr="")
+                    return ReviewResult(
+                        model=model,
+                        command="fake",
+                        returncode=0,
+                        stdout=f"ok {model}",
+                        stderr="",
+                    )
                 i = self.counts.get(model, 0)
                 rc, out, err = seq[min(i, len(seq) - 1)]
                 self.counts[model] = i + 1
-                return ReviewResult(model=model, command="fake", returncode=rc, stdout=out, stderr=err)
+                return ReviewResult(
+                    model=model, command="fake", returncode=rc, stdout=out, stderr=err
+                )
+
             return _backend
 
         panel.resolve_backend = _resolve
@@ -501,7 +759,9 @@ def test_panel_transient_seat_retried_no_reserve_used(tmp_log):
         board = list(DEFAULT_BOARD)
         pool, reserve = split_pool_reserve(board, 4, _avail({r.model for r in board}))
         # pool[1] throttles once, then succeeds — retried in-seat, no reserve needed.
-        behaviour = {pool[1].model: [(1, "", "429 rate limit"), (0, "recovered verdict", "")]}
+        behaviour = {
+            pool[1].model: [(1, "", "429 rate limit"), (0, "recovered verdict", "")]
+        }
         with _FakeBackends(behaviour) as fb:
             outcome = run_board_with_failover(pool, reserve, PROMPT, "+x", REPO_ROOT, 5)
         assert len(outcome.usable) == 4
@@ -536,7 +796,9 @@ def test_panel_parallel_retries_tally_one_per_logical_seat(tmp_log):
         assert len(outcome.usable) == 4
         assert not outcome.degraded
         # Exactly 4 logical seats, all ok; the retried attempts are NOT counted as fails.
-        assert tally == {"ok": 4, "fail": 0}, tally
+        assert tally == {"ok": 4, "fail": 0, "prompt_tokens": 0, "output_tokens": 0}, (
+            tally
+        )
         # No reserve was needed (every seat recovered on its own retry).
         assert reserve[0].model not in fb.dispatched
     finally:
@@ -562,7 +824,9 @@ def test_panel_tally_one_per_seat_across_reserve_replace(tmp_log):
         assert len(outcome.usable) == 4 and not outcome.degraded
         # 4 logical seats: the dead pool seat is 1 fail, its reserve replacement is 1 ok, the
         # other 3 pool seats are ok -> 4 ok + 1 fail. NOT inflated by the backfill round.
-        assert tally == {"ok": 4, "fail": 1}, tally
+        assert tally == {"ok": 4, "fail": 1, "prompt_tokens": 0, "output_tokens": 0}, (
+            tally
+        )
     finally:
         os.environ.pop("REVIEW_RETRY_COUNT", None)
 
@@ -630,7 +894,7 @@ def test_tally_result_is_suppression_aware(tmp_log):
     # Both suppressed -> zero counted. Then an UN-suppressed call DOES count.
     panel._tally_result(0)
     tally = panel.end_call_tally()
-    assert tally == {"ok": 1, "fail": 0}, tally
+    assert tally == {"ok": 1, "fail": 0, "prompt_tokens": 0, "output_tokens": 0}, tally
 
 
 # === flat `-m` path also retries (not just the board) ==========================
@@ -645,6 +909,7 @@ def test_flat_m_path_retries_transient_seat(tmp_log):
     saved = review_mode.resolve_backend
     counts = {"m1": 0}
     try:
+
         def _resolve(_model):
             def _b(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
                 i = counts["m1"]
@@ -652,11 +917,13 @@ def test_flat_m_path_retries_transient_seat(tmp_log):
                 if model == "m1" and i == 0:
                     return ReviewResult(model, "fake", 1, "", "429 rate limit")
                 return ReviewResult(model, "fake", 0, f"verdict {model}", "")
+
             return _b
+
         review_mode.resolve_backend = _resolve
         rc = review_mode.mode_review(["m1"], "prompt", "+x", REPO_ROOT, 5, staged=False)
-        assert rc == 0, rc                 # recovered on retry -> the run passes
-        assert counts["m1"] == 2           # initial transient fail + one retry
+        assert rc == 0, rc  # recovered on retry -> the run passes
+        assert counts["m1"] == 2  # initial transient fail + one retry
     finally:
         review_mode.resolve_backend = saved
         os.environ.pop("REVIEW_RETRY_COUNT", None)
@@ -693,7 +960,8 @@ if __name__ == "__main__":
         wants_log = "tmp_log" in code.co_varnames[: code.co_argcount]
         restore = _make_tmp_log() if wants_log else (lambda: None)
         try:
-            fn(None) if wants_log else fn()
+            with identity_provider_chain():
+                fn(None) if wants_log else fn()
             print(f"PASS {name}")
         except AssertionError as exc:
             failures += 1

@@ -76,6 +76,34 @@ _TRANSIENT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         # transient outage. The leading \b stops "at capacity" matching inside "great capacity".
         r"\b(?:at|over|out of|insufficient)\s+capacity",
         r"\bthrottl",  # throttle / throttled / throttling
+        # NETWORK-LAYER transients (provider-agnostic). The keyed-HTTP backends (gemini /
+        # z.ai / commandcode) surface a DNS/connection/socket failure as a urllib exception
+        # string, e.g. `URLError: <urlopen error [Errno 8] nodename nor servname provided,
+        # or not known>` (macOS DNS) or `[Errno 54] Connection reset by peer`. These are
+        # RECOVERABLE — a retry (and, failing that, a different provider) clears a transient
+        # DNS/resolver blip or a dropped connection. They were previously unclassified and
+        # fell through to SEAT_FATAL (no retry), so a one-off gemini DNS blip / z.ai read
+        # reset burned the seat instead of retrying (CTO reliability directive). ONE central
+        # vocabulary for ALL providers — never special-cased per backend. A socket read
+        # timeout still arrives as rc=124 (handled by exit code); these cover the non-124
+        # URLError/connection strings.
+        r"urlopen error",
+        r"nodename nor servname",  # macOS getaddrinfo DNS failure
+        r"name or service not known",  # glibc getaddrinfo DNS failure
+        r"temporary failure in name resolution",  # glibc EAI_AGAIN
+        r"\bgetaddrinfo\b",
+        r"name resolution",
+        r"connection reset",
+        r"connection refused",
+        r"connection aborted",
+        r"remote end closed connection",
+        r"broken pipe",
+        r"network is unreachable",
+        r"no route to host",
+        r"\beof occurred\b",  # SSL EOF mid-handshake/stream
+        r"read timed out",
+        r"\bETIMEDOUT\b",
+        r"\bECONNRESET\b",
     )
 )
 

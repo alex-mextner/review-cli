@@ -114,6 +114,19 @@ def _failing_backend(model, prompt, diff, cwd, timeout, round_no=0):
     )
 
 
+def _rc0_unavailable_sentinel_backend(model, prompt, diff, cwd, timeout, round_no=0):
+    """Mirrors the shape `seat_cooldown._cooldown_skip_result` (or a genuine LIVE
+    paywall response) returns: rc=0, but the body is the short administrative
+    "unavailable" notice, not a real review."""
+    return ReviewResult(
+        model=model,
+        command="fake-unavailable",
+        returncode=0,
+        stdout=f"{model} is currently unavailable. Learn more: https://example.com",
+        stderr="",
+    )
+
+
 def test_commit_without_staged_is_a_usage_error():
     """--commit without --staged errors with the dedicated exit code, no commit attempted,
     and no backend is even dispatched (the check runs before the panel)."""
@@ -220,6 +233,89 @@ def test_failing_review_does_not_checkpoint():
             review_mode.resolve_backend = original
         assert rc == 1, rc
         assert _head_count(repo) == before, "a FAILED review must NOT be checkpointed"
+
+
+def _terse_real_backend(model, prompt, diff, cwd, timeout, round_no=0):
+    """A genuine, SHORT, non-sentinel rc=0 review — the mirror image of
+    `_rc0_unavailable_sentinel_backend`. Must NOT be mistaken for the cache-hit
+    sentinel just because it's short."""
+    return ReviewResult(
+        model=model, command="fake-terse", returncode=0, stdout="LGTM", stderr=""
+    )
+
+
+def test_short_but_real_rc0_result_still_checkpoints():
+    """Fable review finding: switching the flat path's `ok` from `returncode == 0` to
+    `result_is_usable` is correct for the sentinel case, but it also means any future
+    change to `result_is_usable`'s heuristics could silently affect a genuine SHORT
+    review's exit code and `--commit` behavior. Pins the mirror image of
+    `test_rc0_unavailable_sentinel_does_not_satisfy_ok_or_checkpoint`: a terse but real
+    rc=0 answer (no "unavailable"-shaped marker) still satisfies `ok`, still stamps, and
+    still checkpoints — the fix narrows what counts as a cache-hit sentinel, it does not
+    newly reject short real answers."""
+    with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        repo, diff = _make_staged_repo(tmp)
+        before = _head_count(repo)
+        original = review_mode.resolve_backend
+        review_mode.resolve_backend = lambda model: _terse_real_backend
+        try:
+            rc = mode_review(
+                ["codex"],
+                prompt="p",
+                diff=diff,
+                cwd=repo,
+                timeout=30,
+                staged=True,
+                commit=True,
+            )
+        finally:
+            review_mode.resolve_backend = original
+        assert rc == 0, rc
+        assert _head_count(repo) == before + 1, (
+            "a genuine short rc=0 review should still checkpoint"
+        )
+
+
+def test_rc0_unavailable_sentinel_does_not_satisfy_ok_or_checkpoint():
+    """Opus review finding (2026-08 seat-cooldown feature): the flat `-m` path's `ok`
+    computation used to check ONLY `result.returncode == 0`, not `result_is_usable`. A
+    live rc=0 "is currently unavailable" sentinel — the SAME shape
+    `seat_cooldown._cooldown_skip_result` deliberately mirrors — would therefore satisfy
+    `ok=True` whenever `_flat_seat_with_provider_failover`'s chain is exhausted without
+    a working alternate (it returns the chain's FINAL result unchanged, usable or not).
+    That is not hypothetical: a single-seat `-m fable` review during a Fable cooldown
+    window, with no failover chain left, would previously produce a "successful"
+    (`ok=True`) result whose entire body is the cache-hit notice — and `--commit` would
+    then checkpoint a commit CERTIFYING a diff that received ZERO real review content.
+    Pins that this rc=0-but-unusable shape now correctly fails `ok` and refuses BOTH the
+    checkpoint and the plain `--staged` stamp, exactly like a genuine rc!=0 failure."""
+    with _EnvSandbox(), tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        repo, diff = _make_staged_repo(tmp)
+        before = _head_count(repo)
+        original = review_mode.resolve_backend
+        review_mode.resolve_backend = lambda model: _rc0_unavailable_sentinel_backend
+        stamp_path = repo / ".git" / "review-stamp"
+        try:
+            rc = mode_review(
+                ["fable"],
+                prompt="p",
+                diff=diff,
+                cwd=repo,
+                timeout=30,
+                staged=True,
+                commit=True,
+            )
+        finally:
+            review_mode.resolve_backend = original
+        assert rc == 1, rc  # ordinary review-failure, not a "successful" checkpoint
+        assert _head_count(repo) == before, (
+            "an unusable rc=0 sentinel result must NOT be checkpointed"
+        )
+        assert not stamp_path.exists(), (
+            "an unusable rc=0 sentinel result must not satisfy the plain --staged stamp either"
+        )
 
 
 def test_piped_staged_diff_does_not_checkpoint():

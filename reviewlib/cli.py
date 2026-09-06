@@ -6,6 +6,7 @@ acquisition, model selection, and dispatch to the mode functions. All behaviour
 lives in the sibling modules — this file is the thin entry the Stage 0
 decomposition was about.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -14,11 +15,12 @@ import io
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 from . import backends
+from . import usage_limits
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
 from .config import (
@@ -38,12 +40,21 @@ from .config import (
     _split_models,
     apply_effort_override,
     board_from_models,
+    expand_flat_models_with_reuse,
     load_board,
     load_config,
     parse_effort_flag,
+    preset_board,
     preset_names,
     preset_pool_size,
     split_pool_reserve,
+)
+from .usage_limits import usage_percent_for_model
+from .pool_guard import (
+    PROCEED,
+    Candidate,
+    default_distinct_key,
+    evaluate_selection,
 )
 from .install import install_commit_hook, install_hook_tg, install_skill
 from .modes.brainstorm import mode_brainstorm
@@ -66,8 +77,11 @@ from .process import _run, git_repo_env, strip_control_sequences
 from .retry import max_retry_count
 from .stats import (
     announce_eta,
+    diff_content_hash,
+    extract_diff_files,
     fmt_duration,
     iterations_for_task,
+    normalize_repo_remote,
     normalize_task_code,
     quorum_check,
     record_run,
@@ -115,9 +129,20 @@ EXIT_QA_NO_SUITES = 6
 # and from no-suites (6), so CI tells "infra broke" apart from "a bug was found". The
 # NO_ENV / ENV_UNHEALTHY classes belong to the (later) compose env harness — reserved here
 # as 7/9 so the executor's BLOCKED code (8) sits between them in the same coherent block.
-EXIT_QA_NO_ENV = 7          # no stage AND no bring-up config for a backend/bot SUT (env harness, later)
-EXIT_QA_SUT_BOOT_FAILED = 8  # the tester could not bring the SUT up at all (VERDICT: BLOCKED)
-EXIT_QA_ENV_UNHEALTHY = 9   # bring-up succeeded but the health gate timed out (env harness, later)
+EXIT_QA_NO_ENV = (
+    7  # no stage AND no bring-up config for a backend/bot SUT (env harness, later)
+)
+EXIT_QA_SUT_BOOT_FAILED = (
+    8  # the tester could not bring the SUT up at all (VERDICT: BLOCKED)
+)
+EXIT_QA_ENV_UNHEALTHY = (
+    9  # bring-up succeeded but the health gate timed out (env harness, later)
+)
+# 10 is the pool-selection FOOLPROOFING class (reviewlib.pool_guard.EXIT_UNSATISFIED): the
+# resolved review selection could not converge, so the CLI printed a proposal / targeted
+# per-provider error instead of dispatching a degenerate panel. Distinct from every class
+# above so a script can tell "the review pool couldn't be assembled" apart from a finding,
+# a usage error, or a not-a-repo run. The value is owned by pool_guard (single source).
 
 # RETIRED Phase-1 scaffold code. Phase 1 returned 70 from the suites-resolved-but-no-executor
 # branch ("not implemented yet"). Phase 2 lands the executor, so that branch is GONE — the
@@ -142,8 +167,12 @@ def _is_git_repo(cwd: Path) -> bool:
     rev-parse` -> `_run` forwards `timeout=` straight to subprocess.run, which raises). `_run`
     is `text=True, stdout=PIPE`, so `proc.stdout` is always a str (never None)."""
     try:
-        proc = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd,
-                    env=git_repo_env(cwd), timeout=10)
+        proc = _run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0 and proc.stdout.strip().lower() == "true"
@@ -156,10 +185,11 @@ def _fail_not_a_repo(cwd: Path) -> int:
     print(
         f"[review-cli] not in a git repository ({cwd}).\n"
         "  the diff review needs a repo to diff (it reviews your working-tree / staged changes).\n"
-        "  fix: run a mode that needs no git — `review just-ask \"...\" --task CODE` / "
-        "`review quorum \"...\" --task CODE` / `review brainstorm \"...\" --task CODE` — "
+        '  fix: run a mode that needs no git — `review just-ask "..." --task CODE` / '
+        '`review quorum "..." --task CODE` / `review brainstorm "..." --task CODE` — '
         "or cd into a repo and re-run.",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     return EXIT_NOT_A_REPO
 
@@ -174,7 +204,8 @@ def _fail_git_diff(cwd: Path, exc: Exception) -> int:
         f"  git diff failed: {exc}\n"
         "  fix: check the repo is healthy (`git status`), or pipe a diff on stdin "
         "(`git diff | review diff --task CODE`).",
-        file=sys.stderr, flush=True,
+        file=sys.stderr,
+        flush=True,
     )
     return EXIT_GIT_DIFF_FAILED
 
@@ -195,8 +226,23 @@ def _git_diff(cwd: Path, staged: bool) -> str:
     /repoB diff --cached` reads the env's repo, not repoB — the review-gate then reviews the
     wrong (or empty) diff (review-cli#71). `git_repo_env` KEEPS the target repo's own hook env
     (a legit pre-commit's GIT_INDEX_FILE/temp `next-index` that scopes `--cached` to the partial
-    commit), dropping only env vars that resolve outside `cwd`'s git dir (codex P2 on PR #72)."""
-    args = ["git", "-C", str(cwd), "diff", "--no-ext-diff"]
+    commit), dropping only env vars that resolve outside `cwd`'s git dir (codex P2 on PR #72).
+
+    `--src-prefix=a/ --dst-prefix=b/` pins the header format regardless of the invoking
+    machine's `diff.noprefix`/custom-prefix git config (some machines set
+    `diff.noprefix=true` globally, which emits headers with NO a/b prefix at all —
+    `diff --git f.txt f.txt` — silently breaking `stats.extract_diff_files`'s
+    `diff --git a/<path> b/<path>` parse, found live on this repo's own dev machine).
+    Content is unaffected — only the path labels in the header/`---`/`+++` lines."""
+    args = [
+        "git",
+        "-C",
+        str(cwd),
+        "diff",
+        "--no-ext-diff",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ]
     if staged:
         args.append("--cached")
     try:
@@ -206,6 +252,199 @@ def _git_diff(cwd: Path, staged: bool) -> str:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "git diff failed")
     return proc.stdout
+
+
+def _stamp_hash_for_staged_diff(cwd: Path) -> str | None:
+    """Sha256 of `git diff --no-ext-diff --cached` with NO `--src-prefix`/
+    `--dst-prefix` — i.e. exactly what the pre-commit hook's own independent
+    verification computes, whatever the machine's ambient `diff.noprefix`/prefix
+    git config happens to produce. None on any failure (best-effort; the review
+    still proceeds without the tightened stamp, falling back to
+    `_write_review_stamp`'s own re-derive at write time).
+
+    Called ONCE, immediately adjacent to the `_git_diff(cwd, staged=True)` call
+    that captures the diff actually sent to the models (reviewlib.install
+    "_write_review_stamp" docstring has the full story of why this exists —
+    round-5 review finding, k3+Opus: hashing at stamp-WRITE time instead of
+    dispatch-CAPTURE time reopened a multi-minute TOCTOU window where a
+    concurrent index mutation during the panel run could get silently
+    certified as reviewed)."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--cached"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    import hashlib
+
+    return hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest()
+
+
+def _git_remote_origin_url(cwd: Path) -> str | None:
+    """`git -C cwd remote get-url origin`, or None on ANY failure (no remote, not a
+    repo, no git binary, a wedge) — best-effort, this only feeds an identity label,
+    never a required path."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "remote", "get-url", "origin"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    url = proc.stdout.strip()
+    return url or None
+
+
+def _git_toplevel(cwd: Path) -> Path | None:
+    """`git -C cwd rev-parse --show-toplevel`, or None on any failure (not a repo,
+    no git binary, a wedge)."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return Path(proc.stdout.strip())
+
+
+def _compute_repo_id(cwd: Path) -> str | None:
+    """Best-effort stable identity for the repo at `cwd`, for run-stats diff-identity
+    binding (reviewlib.stats "Diff-identity binding") — see that module's docstring for
+    WHY this exists (closes 3 real task-code quorum-pollution incidents).
+
+    Prefers the normalized `origin` remote URL (stable across worktrees/clones of the
+    SAME repo, unlike a local path). Falls back to the resolved absolute repo root
+    for a remote-less repo, prefixed `path:` so a path-based id can never collide with
+    a remote-based one. The path fallback SELF-NORMALIZES via `_git_toplevel` rather
+    than trusting `cwd` as-is (review finding on this feature's own PR, round 2: every
+    CURRENT caller already passes an `_effective_cwd`-resolved toplevel, so this was
+    not a live bug today, but the id would silently diverge — `path:/repo/subdir` at
+    record time vs `path:/repo` at check time, a spurious `repo_mismatch` — the moment
+    any future caller passed a subdirectory, and nothing enforced the invariant this
+    function's OWN docstring asserted). Falls back to `cwd` itself only when `cwd` is
+    a real directory but git can't resolve its toplevel (a non-repo directory, kept
+    for the same "reviewing it as-is" posture `_effective_cwd` already has elsewhere).
+    None only when `cwd` isn't even a real directory.
+    """
+    url = _git_remote_origin_url(cwd)
+    if url:
+        normalized = normalize_repo_remote(url)
+        if normalized:
+            return normalized
+    toplevel = _git_toplevel(cwd)
+    if toplevel is not None:
+        return f"path:{toplevel}"
+    try:
+        if cwd.is_dir():
+            return f"path:{cwd}"
+    except OSError:
+        pass
+    return None
+
+
+def _default_branch_ref(cwd: Path) -> str | None:
+    """Best-effort `origin/<default-branch>` ref for `cwd`, or None.
+
+    Tries the recorded `origin/HEAD` symref first (what `git clone` sets up), then
+    falls back to probing the two common default-branch names directly — a shallow
+    CI checkout or a repo cloned with `--single-branch` may lack `origin/HEAD`
+    entirely. Feeds `--check`'s diff-identity file-set comparison for the common
+    post-push case (clean working tree, nothing to diff locally); never raises.
+    """
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip().replace("refs/remotes/", "")
+    for candidate in ("origin/main", "origin/master"):
+        try:
+            proc = _run(
+                ["git", "-C", str(cwd), "rev-parse", "--verify", candidate],
+                cwd=cwd,
+                env=git_repo_env(cwd),
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0:
+            return candidate
+    return None
+
+
+def _diff_name_only(cwd: Path, ref_args: list[str]) -> list[str] | None:
+    """`git diff --name-only <ref_args>` -> sorted touched-file list, or None on ANY
+    failure (non-repo, unresolvable ref, a wedge). `--name-only` sidesteps the
+    `diff.noprefix` footgun `_git_diff` otherwise has to pin `--src-prefix`/
+    `--dst-prefix` against (`extract_diff_files`'s `diff --git a/... b/...` regex
+    doesn't even apply here — there IS no `diff --git` header, just bare file
+    paths) — a real bug this exact fallback shipped with once already (codex/
+    GLM/opus/fable review finding on this feature's own PR: the first cut only
+    pinned the prefix on `_git_diff`, not on this fallback's own separate `git
+    diff` call, silently disabling file-level matching on any `diff.noprefix=true`
+    machine — precisely the class this feature targets). Also far cheaper than a
+    full patch body for an identity check: file NAMES only, not hunks."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--name-only", *ref_args],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
+
+
+def _current_diff_files_for_check(cwd: Path) -> list[str] | None:
+    """Best-effort file list for the diff currently under review at `cwd`, for
+    `--check`'s repo/diff mismatch detection (reviewlib.stats "Diff-identity
+    binding").
+
+    Returns the UNION of `git diff --name-only HEAD` (local uncommitted changes —
+    staged AND unstaged together, the dev-loop case) and the branch's diff against
+    its own default branch when one resolves (the post-push `gh ship` case).
+    Deliberately a UNION, not first-non-empty-wins: two independent review
+    findings (Opus + Fable) on this feature's own PR caught that "HEAD probe wins
+    whenever the tree has ANY uncommitted change" lets a single unrelated dirty
+    file at check time (a stray edit, a version bump in progress) SHADOW the
+    branch's real PR files entirely — the post-push case is exactly when the
+    branch diff is what matters, and it's exactly when a stray local edit is most
+    likely to be sitting around. Unioning means a legitimate iteration whose files
+    overlap the REAL branch diff still verifies even with local dirt present.
+    Returns None (skip the file-level check; `repo_id` alone still gates) only
+    when NEITHER source resolves to anything — never raises.
+    """
+    local = set(_diff_name_only(cwd, ["HEAD"]) or [])
+    default_ref = _default_branch_ref(cwd)
+    branch = (
+        set(_diff_name_only(cwd, [f"{default_ref}...HEAD"]) or [])
+        if default_ref
+        else set()
+    )
+    union = sorted(local | branch)
+    return union or None
 
 
 def _read_stdin_if_piped() -> str | None:
@@ -243,24 +482,29 @@ def _effective_cwd(raw: str, *, warn: bool = True) -> Path:
         # (git_repo_env) so a leaked GIT_DIR/GIT_WORK_TREE can't resolve the toplevel to an
         # UNRELATED repo — the same #71 footgun the diff probe guards against.
         try:
-            proc = _run(["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
-                        cwd=resolved, env=git_repo_env(resolved), timeout=10)
+            proc = _run(
+                ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
+                cwd=resolved,
+                env=git_repo_env(resolved),
+                timeout=10,
+            )
         except (OSError, subprocess.TimeoutExpired):
             proc = None
         if proc is not None and proc.returncode == 0 and proc.stdout.strip():
             return Path(proc.stdout.strip())
     if warn:
-        print(f"[review-cli] warning: {resolved} is not inside a git repository; "
-              "reviewing it as-is — pass -C <project-root> to point review at your repo.",
-              file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] warning: {resolved} is not inside a git repository; "
+            "reviewing it as-is — pass -C <project-root> to point review at your repo.",
+            file=sys.stderr,
+            flush=True,
+        )
     return resolved
 
 
 # Shared between the `__serve` parser and the managed-service parser so the two surfaces never
 # drift on what `--host` means (loopback-only by default; 0.0.0.0 exposes over Tailscale).
-_DASHBOARD_HOST_HELP = (
-    "interface to bind (default: 127.0.0.1 loopback-only; 0.0.0.0 exposes over Tailscale)"
-)
+_DASHBOARD_HOST_HELP = "interface to bind (default: 127.0.0.1 loopback-only; 0.0.0.0 exposes over Tailscale)"
 
 # Printed (exit 4) when a genuine lifecycle action is requested but the shared service lib is
 # absent. Kept as a module constant so the smoke test can grep it and it stays aligned with the
@@ -312,16 +556,29 @@ def _dashboard_serve(rest: list[str]) -> int:
     Binds 127.0.0.1 by default; ``--host 0.0.0.0`` exposes it over Tailscale (mirrors
     ``review spec-web``). Imported lazily so the dashboard's stdlib HTTP stack never loads on
     the hot review path (and a stray import error in dashboard code can't break `review`)."""
-    sub = argparse.ArgumentParser(prog="review dashboard __serve",
-                                  description="Run the review-cli dashboard web server (blocking).")
+    sub = argparse.ArgumentParser(
+        prog="review dashboard __serve",
+        description="Run the review-cli dashboard web server (blocking).",
+    )
     sub.add_argument("--host", default="127.0.0.1", help=_DASHBOARD_HOST_HELP)
-    sub.add_argument("--port", type=int, default=None, help="port to bind (default: a free ephemeral port)")
-    sub.add_argument("--no-open", action="store_true", help="do not open a browser window")
-    sub.add_argument("--verbose", action="store_true", help="log every HTTP request to stderr")
+    sub.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="port to bind (default: a free ephemeral port)",
+    )
+    sub.add_argument(
+        "--no-open", action="store_true", help="do not open a browser window"
+    )
+    sub.add_argument(
+        "--verbose", action="store_true", help="log every HTTP request to stderr"
+    )
     ns = sub.parse_args(rest)
     from .dashboard import run_dashboard
 
-    return run_dashboard(port=ns.port, host=ns.host, open_browser=not ns.no_open, verbose=ns.verbose)
+    return run_dashboard(
+        port=ns.port, host=ns.host, open_browser=not ns.no_open, verbose=ns.verbose
+    )
 
 
 def _dashboard_subcommand(rest: list[str]) -> int:
@@ -385,9 +642,15 @@ def _dashboard_subcommand(rest: list[str]) -> int:
         prog="review dashboard",
         description="review-cli dashboard as a managed service (run/start/status/stop/enable/disable).",
     )
-    parser.add_argument("--host", default=DEFAULT_DASHBOARD_HOST, help=_DASHBOARD_HOST_HELP)
-    parser.add_argument("--port", type=int, default=DEFAULT_DASHBOARD_PORT,
-                        help=f"port to bind the managed dashboard (default: {DEFAULT_DASHBOARD_PORT})")
+    parser.add_argument(
+        "--host", default=DEFAULT_DASHBOARD_HOST, help=_DASHBOARD_HOST_HELP
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_DASHBOARD_PORT,
+        help=f"port to bind the managed dashboard (default: {DEFAULT_DASHBOARD_PORT})",
+    )
     subs = parser.add_subparsers(dest="action")
     # Parse FIRST, then build the manager factory over the parsed namespace. The factory closes
     # over `ns`, so `ns` must exist before any action can invoke it; registering the subcommands
@@ -437,26 +700,64 @@ def _sessions_subcommand(rest: list[str]) -> int:
         prog="review sessions",
         description="List or resume brainstorm sessions (parsed from the discussion logs).",
     )
-    sub.add_argument("-a", "--all", action="store_true",
-                     help="list ALL sessions incl. dead/interrupted (no synthesis); default lists recent completed")
-    sub.add_argument("-s", "--resume", metavar="ID", default=None,
-                     help="resume the session with this id (short id or unambiguous prefix): continue the round loop and synthesize")
-    sub.add_argument("--force", action="store_true",
-                     help="with --resume on an already-completed session, re-synthesize anyway")
+    sub.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="list ALL sessions incl. dead/interrupted (no synthesis); default lists recent completed",
+    )
+    sub.add_argument(
+        "-s",
+        "--resume",
+        metavar="ID",
+        default=None,
+        help="resume the session with this id (short id or unambiguous prefix): continue the round loop and synthesize",
+    )
+    sub.add_argument(
+        "--force",
+        action="store_true",
+        help="with --resume on an already-completed session, re-synthesize anyway",
+    )
     # Resume reuses the saved panel/moderator by default; -m / --moderator override.
-    sub.add_argument("-m", "--model", action="append", default=[],
-                     help="override the resume panel (repeat or comma-separate); default = the saved session's panel")
-    sub.add_argument("-C", "--cwd", default=".", help="repository directory (resume diff/agentic cwd)")
-    sub.add_argument("--moderator", default=None, help="override the resume moderator; default = the saved session's moderator")
+    sub.add_argument(
+        "-m",
+        "--model",
+        action="append",
+        default=[],
+        help="override the resume panel (repeat or comma-separate); default = the saved session's panel",
+    )
+    sub.add_argument(
+        "-C",
+        "--cwd",
+        default=".",
+        help="repository directory (resume diff/agentic cwd)",
+    )
+    sub.add_argument(
+        "--moderator",
+        default=None,
+        help="override the resume moderator; default = the saved session's moderator",
+    )
     # Grounding diff on resume: the original `--diff`/`--staged` grounding is NOT persisted
     # in the discussion log, so a resumed grounded brainstorm would otherwise continue
     # UNgrounded. These flags re-attach the current working-tree (--diff) or staged
     # (--staged) diff as grounding for the resumed rounds + synthesis (opt-in, like the
     # brainstorm mode's own grounding). Absent -> the resume runs ungrounded.
-    sub.add_argument("--diff", action="store_true", help="re-attach the working-tree diff as grounding for the resumed rounds")
-    sub.add_argument("--staged", action="store_true", help="re-attach the staged diff (git diff --cached) as grounding for the resumed rounds")
-    sub.add_argument("--timeout", type=int, default=None,
-                     help=f"per-call timeout seconds for the resumed rounds (default {PANEL_TIMEOUT_DEFAULT})")
+    sub.add_argument(
+        "--diff",
+        action="store_true",
+        help="re-attach the working-tree diff as grounding for the resumed rounds",
+    )
+    sub.add_argument(
+        "--staged",
+        action="store_true",
+        help="re-attach the staged diff (git diff --cached) as grounding for the resumed rounds",
+    )
+    sub.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help=f"per-call timeout seconds for the resumed rounds (default {PANEL_TIMEOUT_DEFAULT})",
+    )
     ns = sub.parse_args(rest)
 
     if ns.resume:
@@ -469,12 +770,18 @@ def _sessions_subcommand(rest: list[str]) -> int:
         if not ns.all:
             print("(pass -a/--all to include dead/interrupted sessions.)")
         return 0
-    header = "all sessions (incl. interrupted)" if ns.all else "recent completed sessions"
-    print(f"Brainstorm {header} — newest first; resume with `review sessions -s <id>`:\n")
+    header = (
+        "all sessions (incl. interrupted)" if ns.all else "recent completed sessions"
+    )
+    print(
+        f"Brainstorm {header} — newest first; resume with `review sessions -s <id>`:\n"
+    )
     for s in sessions:
         ts = s.timestamp.strftime("%Y-%m-%d %H:%M UTC") if s.timestamp else "?"
         topic = (s.topic[:60] + "…") if len(s.topic) > 61 else (s.topic or "(no topic)")
-        print(f"  {s.session_id}  [{s.status:<11}]  r{s.completed_rounds}  {ts}  {topic}")
+        print(
+            f"  {s.session_id}  [{s.status:<11}]  r{s.completed_rounds}  {ts}  {topic}"
+        )
     return 0
 
 
@@ -493,8 +800,12 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
         print(f"[review sessions] {exc}", file=sys.stderr, flush=True)
         return 2
     if sess is None:
-        print(f"[review sessions] no session with id '{ns.resume}'. "
-              "Run `review sessions -a` to list available ids.", file=sys.stderr, flush=True)
+        print(
+            f"[review sessions] no session with id '{ns.resume}'. "
+            "Run `review sessions -a` to list available ids.",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
 
     cwd = _effective_cwd(ns.cwd)
@@ -504,14 +815,18 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
     if explicit_models:
         models = explicit_models
     else:
-        models = [m for m in sess.panel if backends.backend_available(m)] or sess.panel or list(DEFAULT_MODELS)
+        models = (
+            [m for m in sess.panel if backends.backend_available(m)]
+            or sess.panel
+            or list(DEFAULT_MODELS)
+        )
     # Moderator: explicit --moderator override > the saved session moderator > picked.
     # The log records the moderator FALLBACK CHAIN joined with `>` (e.g. `claude:..>codex`),
     # so the saved value must be SPLIT back into candidates — passing the whole `a>b>c`
     # string as one explicit seed would make `pick_moderators` try an invalid single
     # backend id before falling back. Take the FIRST (highest-priority) saved candidate as
     # the explicit seed; pick_moderators rebuilds the rest of the priority order.
-    saved_mod = (sess.moderator.split(">")[0].strip() if sess.moderator else "")
+    saved_mod = sess.moderator.split(">")[0].strip() if sess.moderator else ""
     mod_seed = ns.moderator or (saved_mod or None)
     moderators = pick_moderators(mod_seed, models)
     timeout = ns.timeout if ns.timeout is not None else PANEL_TIMEOUT_DEFAULT
@@ -526,15 +841,24 @@ def _resume_session_cli(ns: argparse.Namespace) -> int:
         except RuntimeError:
             diff = ""
 
-    print(f"[review sessions] resuming '{sess.session_id}' ({sess.status}, "
-          f"{sess.completed_rounds} round(s) done): {sess.topic}", file=sys.stderr, flush=True)
+    print(
+        f"[review sessions] resuming '{sess.session_id}' ({sess.status}, "
+        f"{sess.completed_rounds} round(s) done): {sess.topic}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     # Panel modes announce their live-log paths (the resumed rounds stream to the log).
     backends._ANNOUNCE_LOGS = True
     try:
         return _sessions.resume_session(
-            sess, models=models, cwd=cwd, timeout=timeout,
-            moderators=moderators, diff=diff, force=ns.force,
+            sess,
+            models=models,
+            cwd=cwd,
+            timeout=timeout,
+            moderators=moderators,
+            diff=diff,
+            force=ns.force,
         )
     except _sessions.SessionAlreadyCompleteError as exc:
         # A refused resume (already-complete, no --force) did NO requested work. Return the
@@ -622,7 +946,10 @@ def _session_for_task_iteration(
         delta = abs((_session_started_utc(session) - started).total_seconds())
         if delta > _TASK_SESSION_MATCH_WINDOW_SECONDS:
             continue
-        if all_iterations and _closest_iteration_for_session(session, all_iterations) != iteration:
+        if (
+            all_iterations
+            and _closest_iteration_for_session(session, all_iterations) != iteration
+        ):
             continue
         if best_delta is None or delta < best_delta:
             best = session
@@ -652,25 +979,73 @@ def _task_subcommand(rest: list[str]) -> int:
         description="Show review iterations, models, and transcripts for one task code.",
     )
     parser.add_argument("code", nargs="?", help="task/issue code, e.g. HYP-742")
-    parser.add_argument("--detail", metavar="N|SESSION",
-                        help="print the full transcript for an iteration number or session id")
+    parser.add_argument(
+        "--detail",
+        metavar="N|SESSION",
+        help="print the full transcript for an iteration number or session id",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON")
     parser.add_argument(
         "--check",
         action="store_true",
         help="exit 0 iff the task has enough PASSED recorded iterations across enough "
-        "distinct models (self-merge-authority gate); see --min-iter/--min-models. "
-        "Counts only iterations whose run came back clean — a review that ran but "
-        "failed/degraded does not count toward the bar, and pre-verdict-field "
-        "history never satisfies it either (fail-closed)",
+        "distinct board roles (self-merge-authority gate, default) or distinct "
+        "models (when --min-models is explicitly given); see --min-iter/"
+        "--min-models/--min-roles. Counts only iterations whose run came back "
+        "clean — a review that ran but failed/degraded does not count toward "
+        "the bar, and pre-verdict-field history never satisfies it either "
+        "(fail-closed)",
     )
     parser.add_argument(
-        "--min-iter", type=int, default=3,
+        "--min-iter",
+        type=int,
+        default=3,
         help="review-bar floor: PASSED recorded iterations (default 3)",
     )
     parser.add_argument(
-        "--min-models", type=int, default=3,
-        help="review-bar floor: distinct models among the PASSED iterations (default 3)",
+        "--min-models",
+        type=int,
+        default=None,
+        help="review-bar floor: distinct models among the PASSED iterations. Not "
+        "enforced by default (review-cli#246: role-based coverage is the "
+        "default instead — see --min-roles). When explicitly given, this floor "
+        "is ALWAYS enforced — including alongside --min-roles, where BOTH "
+        "floors must then be met (an explicit request is never silently "
+        "dropped) — and, when there's real review history to check it against, "
+        "a non-blocking advisory is printed noting that role-based coverage is "
+        "usually sufficient on its own.",
+    )
+    parser.add_argument(
+        "--min-roles",
+        type=int,
+        default=None,
+        help="review-cli#221: review-bar floor: distinct BOARD ROLES (architect/"
+        "correctness/security/…) covered among the PASSED iterations, instead of "
+        "distinct model NAMES. This is the DEFAULT check (review-cli#246) when "
+        "neither --min-models nor --min-roles is given, at the same numeric "
+        "floor --min-models used to default to (3) — pass this flag explicitly "
+        "only to override that number. A role filled by the board's "
+        "shortage-resilience duplicate-model pad (PR #207: one model reused "
+        "onto an otherwise-empty role when too few distinct models are "
+        "available) counts once per role, same as any other role, even though "
+        "it repeats a model --min-models already counted. Only iterations from "
+        "a mode that records per-seat roles (currently: the review-diff/visual "
+        "board dispatch) contribute.",
+    )
+    parser.add_argument(
+        "-C",
+        "--cwd",
+        default=".",
+        help="--check only: repo to verify recorded iterations against "
+        "(diff-identity binding — see reviewlib.stats module docstring)",
+    )
+    parser.add_argument(
+        "--no-verify-identity",
+        action="store_true",
+        help="--check only: skip repo/diff mismatch detection entirely (legacy "
+        "behavior — every PASSED iteration counts, exactly as before this gate "
+        "existed). Escape hatch for a cwd that can't resolve a repo; NOT a way "
+        "around a genuine mismatch finding.",
     )
     ns = parser.parse_args(rest)
 
@@ -678,18 +1053,46 @@ def _task_subcommand(rest: list[str]) -> int:
         if not ns.code:
             print("[review task] --check requires a task CODE", file=sys.stderr)
             return 2
+        # Both `--min-models` and `--min-roles` default to None (not a resolved int)
+        # so the CLI can tell "the user explicitly typed this flag" apart from "left
+        # at the default" — and now (review-cli#246) that raw None-or-value is passed
+        # straight through to quorum_check(), which owns ALL default-resolution and
+        # AND-logic itself (see its docstring): an explicitly given floor is always
+        # enforced, and the "neither given" default switches to a role-based check.
         # A floor of 0 would trivially satisfy the bar for a task with ZERO passed
         # iterations (0 >= 0), even one whose every recorded run failed or predates
         # the verdict field -- defeating the fail-closed contract this gate exists
-        # for. Both floors must be at least 1.
-        if ns.min_iter < 1 or ns.min_models < 1:
+        # for. Only an EXPLICITLY given floor is validated here (mirrors
+        # quorum_check's own validation) — the message only names a flag that was
+        # actually part of the input, so a plain --min-iter 0 never prints a
+        # confusing "--min-models None --min-roles None" (Opus round-2 review
+        # finding, still honored under the new sentinel-based design).
+        if (
+            ns.min_iter < 1
+            or (ns.min_models is not None and ns.min_models < 1)
+            or (ns.min_roles is not None and ns.min_roles < 1)
+        ):
+            clauses = [f"--min-iter {ns.min_iter}"]
+            if ns.min_models is not None:
+                clauses.append(f"--min-models {ns.min_models}")
+            if ns.min_roles is not None:
+                clauses.append(f"--min-roles {ns.min_roles}")
             print(
-                "[review task] --min-iter and --min-models must both be >= 1 "
-                f"(got --min-iter {ns.min_iter} --min-models {ns.min_models})",
+                "[review task] --min-iter must be >= 1, and any explicitly given "
+                "--min-models/--min-roles must also be >= 1 "
+                f"(got {' '.join(clauses)})",
                 file=sys.stderr,
             )
             return 2
-        return _quorum_check_subcommand(ns.code, ns.min_iter, ns.min_models, as_json=ns.json)
+        return _quorum_check_subcommand(
+            ns.code,
+            ns.min_iter,
+            ns.min_models,
+            min_roles=ns.min_roles,
+            as_json=ns.json,
+            cwd_raw=ns.cwd,
+            verify_identity=not ns.no_verify_identity,
+        )
 
     if not ns.code:
         summaries = task_summaries()
@@ -744,12 +1147,16 @@ def _task_subcommand(rest: list[str]) -> int:
         used_session_ids: set[str] = set()
         for item in iterations:
             idx = int(item["iteration"])
-            session = _session_for_task_iteration(item, sessions, iterations, used_session_ids)
+            session = _session_for_task_iteration(
+                item, sessions, iterations, used_session_ids
+            )
             if session is not None:
                 used_session_ids.add(session.session_id)
             models = ", ".join(item.get("models") or []) or "-"
             duration = fmt_duration(float(item.get("duration_seconds") or 0))
-            suffix = f" · session {session.session_id}" if session else " · logs not found"
+            suffix = (
+                f" · session {session.session_id}" if session else " · logs not found"
+            )
             print(
                 f"  iteration {idx}: {item.get('ts', '?')} · {item.get('mode', '?')} "
                 f"· pool={item.get('pool_size', 0)} · models: {models} "
@@ -766,48 +1173,568 @@ def _task_subcommand(rest: list[str]) -> int:
     return 0
 
 
-def _quorum_check_subcommand(code: str, min_iter: int, min_models: int, *, as_json: bool) -> int:
-    """`review task CODE --check [--min-iter N] [--min-models M]`.
+def _resolve_stat_since(since_arg: str | None, days: int) -> datetime | None | bool:
+    """Resolve `--since`/`--days` into a UTC datetime floor (None = all history).
+    Returns `False` as a sentinel for an unparseable `--since` — the caller reports it
+    as a usage error rather than silently falling back to "all history".
 
-    Exit 0 iff CODE has >= min_iter PASSED recorded iterations across >= min_models
-    distinct models among those passed iterations; exit 1 otherwise, including the
-    fail-closed cases (invalid code, unreadable/missing stats store, zero records,
-    or a task whose only history predates the verdict field) where reviewlib.stats.
-    quorum_check sets an "error" key or simply comes up short. See quorum_check's
-    docstring for the "passed, not just dispatched" semantics this check enforces.
+    Opus/kimi review finding: `datetime.fromisoformat` only accepts a trailing `Z`
+    (Zulu/UTC) shorthand from Python 3.11 onward, but this project declares
+    `requires-python = ">=3.9"` — and every call-log filename this command's own output
+    is built from uses exactly that `...Z` stamp format. A user copying a timestamp
+    straight out of `review stat`'s own report (or a filename) got a real usage error
+    on 3.9/3.10 while the identical value worked on 3.11+. Normalize the shorthand
+    ourselves before parsing so the accepted syntax doesn't depend on the interpreter."""
+    if since_arg:
+        normalized = since_arg[:-1] + "+00:00" if since_arg.endswith("Z") else since_arg
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return False
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    if days <= 0:
+        return None
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+# glm review finding, round 2: `--harness` filtered on an EXACT match against
+# `report["harnesses"]`'s keys, which are the raw `CallLog.backend` string every OTHER
+# call-log writer uses (`opencode`, `z.ai`, `commandcode`, ...) — not the short aliases
+# `-m`/config actually teach (`-m glm`, `-m cc`, board ids `zai:...`/`oc:...`). So
+# `--harness glm`/`zai`/`oc`/`cc` all printed "no calls recorded" while the data sat in
+# the report under a different spelling. Sourced ONLY from aliases genuinely resolved
+# elsewhere in this codebase — `resolve_backend`'s own alt-spelling matching
+# (`zai`/`zhipu`/`glm` -> the z.ai backend, `oc` -> opencode) and `config.MODEL_ALIASES`
+# (the `glm*` family, `cc`/`commoncode` -> commandcode) — NOT invented here. `cmd` is
+# deliberately absent: despite a stale comment elsewhere once claiming it as a
+# commandcode alias, it resolves NOWHERE in `_match_named_backend` or `MODEL_ALIASES` —
+# it is not a real alias, so it is not silently accepted here either.
+_HARNESS_ARG_ALIASES = {
+    "zai": "z.ai",
+    "zhipu": "z.ai",
+    "glm": "z.ai",
+    "glm52": "z.ai",
+    "glm51": "z.ai",
+    "glm47": "z.ai",
+    "glm46": "z.ai",
+    "glm45": "z.ai",
+    "oc": "opencode",
+    "cc": "commandcode",
+    "commoncode": "commandcode",
+    "command-code": "commandcode",
+    "command_code": "commandcode",
+    "common-code": "commandcode",
+    "common_code": "commandcode",
+}
+
+
+def _normalize_harness_arg(raw: str) -> str:
+    """The `--harness` value, normalized to the exact `CallLog.backend` spelling the
+    report's `harnesses` dict is keyed by — see `_HARNESS_ARG_ALIASES` above.
+
+    Opus review finding, round 4: the fallback for a token NOT in the alias dict used
+    to return `raw` completely UNCHANGED — but every real backend key is lowercase with
+    no surrounding whitespace, so `--harness Codex` (different casing) or `--harness
+    "codex "` (trailing space) fell through as literally `"Codex"`/`"codex "`, which
+    then never equals the report's `"codex"` key — a false "no calls recorded" for data
+    that genuinely exists. The fallback now returns the SAME normalized (stripped,
+    lowercased) key the alias lookup itself used, so an exact name matches regardless
+    of input casing/whitespace, while a genuinely unrecognized token still produces the
+    honest "no calls recorded for harness ..." message, not a silent misroute."""
+    key = raw.strip().lower()
+    return _HARNESS_ARG_ALIASES.get(key, key)
+
+
+def _stat_subcommand(rest: list[str]) -> int:
+    """`review stat [--days N] [--since ISO] [--top N] [--harness NAME] [--json]` —
+    detailed per-harness/per-model usage + health report parsed from the real per-call
+    logs (see `reviewlib.dashboard.tokenstats` for the data model and the 2026-08
+    token-burn investigation this answers). Default window is the last 7 days — a full
+    scan of a long-lived install's log dir (tens of thousands of files) is slow, and
+    most token-burn questions are about recent behaviour; `--days 0` scans everything."""
+    parser = argparse.ArgumentParser(
+        prog="review stat",
+        description="Per-harness/per-model usage + health report from the real call logs.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="only calls from the last N days (default 7; <= 0 = all recorded history)",
+    )
+    parser.add_argument(
+        "--since",
+        metavar="ISO",
+        default=None,
+        help="only calls at/after this ISO-8601 timestamp (overrides --days)",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help="how many largest calls to list (default 10; clamped to >= 1)",
+    )
+    parser.add_argument(
+        "--harness",
+        default=None,
+        help="narrow the per-harness BREAKDOWN TABLE to this backend (e.g. codex, "
+        "opencode, commandcode, omp, claude, z.ai — also accepts common aliases: "
+        "glm/zai/oc/cc) — every other DATA section (models, Fable, retry events, "
+        "call count, top oversized calls) stays whole-window in --json; the text "
+        "report's Fable/retry/oversized sections show it too, but per-model detail is "
+        "--json-only (see `review stat --json`)",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    ns = parser.parse_args(rest)
+    # A non-positive --top has no sensible "top N" meaning, and a negative value would
+    # silently slice as "all but the last |N|" (sorted(...)[:-3]) — a confusing result
+    # under the "Top N oversized calls" heading (kimi review finding). Clamp instead of
+    # erroring: a typo'd --top still gets a useful (if minimal) report.
+    if ns.top < 1:
+        ns.top = 1
+
+    since = _resolve_stat_since(ns.since, ns.days)
+    if since is False:
+        print(
+            f"[review stat] invalid --since value: {ns.since!r} "
+            "(expected ISO-8601, e.g. 2026-08-01T00:00:00+00:00)",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .dashboard.tokenstats import compute_stat_report
+
+    report = compute_stat_report(since=since, top=ns.top)
+    # glm review finding, round 2: normalize BEFORE filtering — see
+    # `_normalize_harness_arg` for why a raw alias (`glm`, `zai`, `oc`, `cc`) used to
+    # always miss even though the report's own footnote teaches it. Displaying the
+    # normalized name (not the raw one the user typed) in the empty-result message is
+    # deliberate: it shows exactly what was actually searched for, so a mistaken alias
+    # mapping is visible, not hidden.
+    harness = _normalize_harness_arg(ns.harness) if ns.harness else None
+    if harness:
+        # Table-only filter (codex review finding): this narrows ONLY the per-harness
+        # breakdown row set, not the whole report — models/fable/retry-events/
+        # call_count/top_oversized_calls are cross-harness context that stays
+        # whole-window on purpose (e.g. seeing where codex's calls rank among the
+        # largest overall). See the --harness help text above.
+        report["harnesses"] = {
+            name: hs for name, hs in report["harnesses"].items() if name == harness
+        }
+        # Opus review finding, round 3: this stderr note used to print UNCONDITIONALLY,
+        # so the text-report path showed the "no calls recorded for harness ..." message
+        # TWICE — once here, once again via `_render_stat_harness_table`'s own empty-
+        # table message in the printed report body. Harmless but redundant. The `--json`
+        # path has no equivalent in-payload message (an empty `harnesses` dict alone
+        # doesn't explain WHY), so it's the only path that still needs this stderr note.
+        if not report["harnesses"] and ns.json:
+            print(
+                f"[review stat] no calls recorded for harness {harness!r} in this window.",
+                file=sys.stderr,
+            )
+
+    if ns.json:
+        import json as _json
+
+        print(_json.dumps(report, indent=2))
+        return 0
+    print(_render_stat_report_text(report, requested_harness=harness))
+    return 0
+
+
+def _render_stat_report_text(
+    report: dict, *, requested_harness: str | None = None
+) -> str:
+    """Assemble the full human-readable `review stat` report from its sections.
+    `requested_harness` (the raw `--harness` value, if any) only affects the empty-table
+    message — see `_render_stat_harness_table`."""
+    sections = [
+        _render_stat_header(report),
+        _render_stat_harness_table(
+            report["harnesses"], requested_harness=requested_harness
+        ),
+        _render_stat_fable_section(report["fable"]),
+        _render_stat_retry_section(report["retry_events_by_kind"]),
+        _render_stat_oversized_section(report["top_oversized_calls"]),
+        "Note: real token counts exist ONLY for REST-backed calls "
+        f"({', '.join(report['tokens_recorded_backends'])}); the agentic CLI harnesses "
+        "(oc/opencode, omp, codex, claude in CLI mode) show tokens: not captured (see "
+        "below) — bytes are the best available cross-harness proxy today. Each of these "
+        "CLIs DOES expose exact usage/cost via its own --json/--format json mode "
+        "(verified live); review-cli doesn't invoke them that way yet because it would "
+        "replace their readable stdout wholesale, breaking the paywall/auth detection "
+        "this report itself relies on — tracked separately, see review-cli"
+        "#186. `cc` is not a separate harness — it resolves to `commandcode`, same as "
+        "`--harness cc` (see `--harness`'s help text for the full alias list).",
+    ]
+    return "\n\n".join(sections)
+
+
+def _render_stat_header(report: dict) -> str:
+    window = f"since {report['since']}" if report["since"] else "all recorded history"
+    return (
+        f"review stat — {report['log_dir']} ({window})\n"
+        f"calls: {report['call_count']}   retry/promotion events: {report['retry_event_count']}"
+    )
+
+
+def _render_stat_harness_table(
+    harnesses: dict, *, requested_harness: str | None = None
+) -> str:
+    """One row per backend: call/health counts, byte-proxy distribution, real tokens
+    (REST backends only), and the SKILL.md/MEMORY.md context-pollution rate.
+
+    `requested_harness` distinguishes "genuinely nothing in this window" from "calls
+    exist, just none for the requested --harness" (kimi review finding: the generic
+    message was false/misleading in the latter case — this table can be legitimately
+    empty here while `report['call_count']` in the header above is nonzero)."""
+    if not harnesses:
+        if requested_harness:
+            return (
+                f"No calls recorded for harness {requested_harness!r} in this window "
+                "(other harnesses may still have activity — see the header above)."
+            )
+        return "No calls recorded in this window."
+    from .dashboard.tokenstats import format_bytes
+
+    header = (
+        f"{'HARNESS':<14}{'CALLS':>7}{'OK':>6}{'FAIL':>6}{'RUN':>5}  "
+        f"{'BYTES':>9}{'AVG':>9}{'P90':>9}{'MAX':>9}  {'TOK(real)':>10}  SKILL.md  MEMORY.md"
+    )
+    rows = [header, "-" * len(header)]
+    for name, hs in harnesses.items():
+        tok = (
+            f"{hs['tokens_prompt']}/{hs['tokens_output']}" if hs["tokens_real"] else "-"
+        )
+        calls = hs["calls"] or 1
+        skill_pct = f"{100 * hs['skill_md_calls'] / calls:.0f}%"
+        mem_pct = f"{100 * hs['memory_md_calls'] / calls:.0f}%"
+        rows.append(
+            f"{name:<14}{hs['calls']:>7}{hs['ok']:>6}{hs['fail']:>6}{hs['running']:>5}  "
+            f"{format_bytes(hs['bytes_total']):>9}{format_bytes(hs['bytes_avg']):>9}"
+            f"{format_bytes(hs['bytes_p90']):>9}{format_bytes(hs['bytes_max']):>9}  "
+            f"{tok:>10}  {skill_pct:>8}  {mem_pct:>9}"
+        )
+    title = (
+        "Per-harness breakdown (bytes = call-log size, a token PROXY for every "
+        "harness; TOK(real) = exact prompt/output tokens, REST backends only):"
+    )
+    return title + "\n" + "\n".join(rows)
+
+
+def _render_stat_fable_section(fable: dict) -> str:
+    """Surfaces the investigation's headline finding: the Fable seat's dispatch/failure
+    rate and WHY it failed (session-limit vs paywall vs auth vs other).
+
+    review-cli#fable-seat-reliability: the label dropped "priority-1" — that demotion
+    (DEFAULT_BOARD priority 1 -> last-resort reserve) is the whole point of that
+    change, so a report still claiming Fable sits at priority 1 would be actively
+    wrong about its own subject."""
+    if not fable["dispatch_attempts"] and not fable["retry_events"]:
+        return "Fable (board seat): no dispatch attempts recorded in this window."
+    rate = (
+        f"{fable['failure_rate']:.0%}" if fable["failure_rate"] is not None else "n/a"
+    )
+    reasons = fable["retry_event_reasons"]
+    return (
+        "Fable (board seat) pattern:\n"
+        f"  dispatch attempts: {fable['dispatch_attempts']}   "
+        f"cached-skips: {fable['cached_skips']}   failure rate: {rate}\n"
+        f"  retry/promotion events: {fable['retry_events']} "
+        f"(session_limit={reasons['session_limit']} paywall={reasons['paywall']} "
+        f"auth={reasons['auth']} other={reasons['other']})\n"
+        "  note: dispatch_attempts/failure_rate are a LOWER BOUND — a claude CLI-mode "
+        "call is only attributable to Fable when its body carries the paywall sentinel; "
+        "a successful Fable dispatch or a session-limit-shaped failure is attributed to "
+        "Opus instead (see reviewlib.dashboard.tokenstats.compute_fable_report)."
+    )
+
+
+def _render_stat_retry_section(by_kind: dict) -> str:
+    if not by_kind:
+        return "Retry/promotion events: none recorded in this window."
+    parts = " ".join(f"{kind}={count}" for kind, count in sorted(by_kind.items()))
+    return f"Retry/promotion events by kind: {parts}"
+
+
+def _render_stat_oversized_section(top: list[dict]) -> str:
+    """The largest calls by log size — the investigation's own outlier-hunting method,
+    now a standing report instead of a one-off manual pass."""
+    if not top:
+        return "Top oversized calls: none recorded in this window."
+    from .dashboard.tokenstats import format_bytes
+
+    lines = [f"Top {len(top)} oversized calls:"]
+    for i, call in enumerate(top, start=1):
+        task = call["task_code"] or "-"
+        flags = []
+        if call["diff_git_files"]:
+            flags.append(f"diff_git_files={call['diff_git_files']}")
+        if call["binary_stub_files"]:
+            flags.append(f"binary_stub_files={call['binary_stub_files']}")
+        if call["skill_md"]:
+            flags.append("SKILL.md")
+        if call["memory_md"]:
+            flags.append("MEMORY.md")
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        lines.append(
+            f"  {i}. {call['backend']:<12} {format_bytes(call['size_bytes']):>9}  "
+            f"task={task}{flag_str}"
+        )
+    return "\n".join(lines)
+
+
+def _resolve_quorum_check_context(
+    cwd_raw: str, verify_identity: bool
+) -> tuple[str | None, list[str] | None, str]:
+    """Resolve the (repo_id, diff_files, status) check context for `--check`. See
+    `_quorum_check_subcommand`.
+
+    `status` is one of ``"ran"`` (repo_id/diff_files are usable), ``"disabled"``
+    (`--no-verify-identity`), or ``"skipped_unresolvable"`` (`-C`/`cwd_raw` isn't
+    even a real directory — `_compute_repo_id` otherwise always has a `path:`
+    fallback). This is a MACHINE-READABLE version of the same distinction the
+    stderr warnings below already make for a human — review finding (Fable) on
+    this feature's own PR: the original cut only had the stderr text, so a
+    machine caller like `gh ship` had no JSON field to assert "verification
+    actually ran" against; it could only infer it from the ABSENCE of the
+    diagnostic keys, which is indistinguishable from "verification ran and this
+    task genuinely has zero passed iterations". `_quorum_check_subcommand` writes
+    `status` into the result as `"identity_verification"`.
     """
-    result = quorum_check(code, min_iter=min_iter, min_models=min_models)
+    if not verify_identity:
+        print(
+            "[review task] warning: diff-identity verification disabled "
+            "(--no-verify-identity) — every PASSED iteration counts regardless of "
+            "recorded repo/diff, exactly as before this gate existed",
+            file=sys.stderr,
+        )
+        return None, None, "disabled"
+    cwd = _effective_cwd(cwd_raw, warn=False)
+    repo_id = _compute_repo_id(cwd)
+    if repo_id is None:
+        print(
+            f"[review task] warning: could not resolve a repo at -C {cwd_raw!r} — "
+            "diff-identity verification skipped, falling back to legacy counting "
+            "(every PASSED iteration counts regardless of recorded repo/diff)",
+            file=sys.stderr,
+        )
+        return None, None, "skipped_unresolvable"
+    return repo_id, _current_diff_files_for_check(cwd), "ran"
+
+
+def _print_quorum_model_audit_line(result: dict, stream=None) -> None:
+    """Role mode's headline line reports covered ROLES, not models — print a
+    secondary line naming which MODELS actually reviewed, so a self-merge-
+    authority audit trail never loses that fact just because roles (not models)
+    governed the verdict (Fable review finding, review-cli#221). `stream` matches
+    the caller's stream choice (stdout for a plain ratio, stderr for an error)."""
+    distinct_models = result["distinct_models_passed"]
+    models_str = ", ".join(result["models"]) or "-"
+    plural_m = "" if distinct_models == 1 else "s"
+    print(
+        f"  models: {distinct_models} distinct model{plural_m} ({models_str})",
+        file=stream,
+    )
+
+
+def _print_quorum_bar_met(result: dict, role_mode: bool, model_mode: bool) -> None:
+    """Text-mode 'review bar met' line. `role_mode`/`model_mode` (review-cli#221,
+    extended in review-cli#246) select which floor(s) actually governed the
+    verdict — the caller derives both from which keys `quorum_check` put in
+    `result` (see `_quorum_check_subcommand`), since that reflects the function's
+    OWN default-resolution/AND-logic, not the raw CLI flags. Either, or both, can
+    be true (review-cli#246: an explicit --min-models alongside --min-roles now
+    means BOTH govern)."""
+    passed_iter = result["passed_iterations"]
+    plural_i = "" if passed_iter == 1 else "s"
+    parts = []
+    if role_mode:
+        distinct = result["distinct_roles_passed"]
+        covered_str = ", ".join(result["roles"]) or "-"
+        plural_u = "" if distinct == 1 else "s"
+        parts.append(f"{distinct} distinct role{plural_u} ({covered_str})")
+    if model_mode:
+        distinct = result["distinct_models_passed"]
+        covered_str = ", ".join(result["models"]) or "-"
+        plural_u = "" if distinct == 1 else "s"
+        parts.append(f"{distinct} distinct model{plural_u} ({covered_str})")
+    print(
+        f"review bar met for {result['task_code']}: {passed_iter} passed "
+        f"iteration{plural_i} across {' and '.join(parts)}"
+    )
+    # Fable review finding: role mode's line above drops WHICH MODELS reviewed
+    # entirely — for a self-merge-authority audit trail that's the fact worth
+    # keeping in the log even when roles (not models) governed the verdict. Only
+    # needed when models weren't ALREADY shown in the headline above.
+    if role_mode and not model_mode:
+        _print_quorum_model_audit_line(result)
+    if advisory := result.get("min_models_advisory"):
+        print(f"  note: {advisory}")
+
+
+def _print_quorum_bar_not_met(result: dict, role_mode: bool, model_mode: bool) -> None:
+    """Text-mode 'review bar NOT met' report: the ratio/error header, the
+    `--min-roles` suggestion hint (review-cli#221, `--min-models`-only mode — see
+    `quorum_check`'s `min_roles_suggestion`), and any currently-stalled attempted
+    model(s). Everything is read from `result` (populated by `quorum_check`, whose
+    own default-resolution/AND-logic decided which floor(s) actually govern — see
+    `_print_quorum_bar_met`) rather than from separately-passed CLI values, so this
+    never drifts from what actually gated the verdict.
+
+    review-cli#221 round-4 review finding (k3/Fable): the header and every detail
+    line below it must land on the SAME stream — a caller capturing only one of
+    stdout/stderr must never see a bare header with no detail, or bare detail lines
+    with no task-code/NOT-met context. An "error" result (invalid code, unreadable
+    store, diff mismatch) reports to stderr; a plain ratio shortfall reports to
+    stdout, matching the pre-existing convention."""
+    detail_stream = sys.stderr if "error" in result else None
+    if "error" in result:
+        print(
+            f"review bar NOT met for {result['task_code']}: {result['error']}",
+            file=detail_stream,
+        )
+    else:
+        passed_iter = result["passed_iterations"]
+        clauses = [f"{passed_iter}/{result['min_iter']} passed iterations"]
+        if role_mode:
+            clauses.append(
+                f"{result['distinct_roles_passed']}/{result['min_roles']} "
+                "distinct roles"
+            )
+        if model_mode:
+            clauses.append(
+                f"{result['distinct_models_passed']}/{result['min_models']} "
+                "distinct models"
+            )
+        print(
+            f"review bar NOT met for {result['task_code']}: {', '.join(clauses)}",
+            file=detail_stream,
+        )
+    # Codex round-5 review finding: this line must not be suppressed on every
+    # "error" result — a diff-identity MISMATCH error still carries real
+    # models/roles data (mismatch exclusion runs AFTER the counts are computed;
+    # only `_rejected()`'s genuinely-empty cases — invalid code, unreadable
+    # store, zero iterations — have nothing to show), so the audit trail must
+    # not go dark there. Gate on there being real data instead of on "error"
+    # presence: `distinct_models_passed > 0` is false for every `_rejected()`
+    # shape and true whenever there's a meaningful roster to report. UNLIKE the
+    # met-path printer, the NOT-met header's model clause above is COUNTS ONLY
+    # (no names, matching the pre-#246 convention) even when `model_mode` is
+    # True — so this line is the only place model NAMES ever appear here, and
+    # must print whenever role_mode is on regardless of model_mode.
+    if role_mode and result["distinct_models_passed"] > 0:
+        _print_quorum_model_audit_line(result, detail_stream)
+    if advisory := result.get("min_models_advisory"):
+        print(f"  note: {advisory}", file=detail_stream)
+    if suggestion := result.get("min_roles_suggestion"):
+        print(f"  hint: {suggestion}", file=detail_stream)
+    # review-cli#221: a bare N/M count (or a bare mismatch-error line) leaves a human
+    # no better off than before — name the SPECIFIC attempted model(s) currently
+    # cooling down (an unavailable sentinel or a session-limit/usage-credits notice —
+    # a plain timeout doesn't record a cooldown, see seat_cooldown.py's docstring) and
+    # why, same signal --json already carries in `stalled_models`. Reached on EITHER
+    # not-met path (round-3 review
+    # finding: an earlier version of this diff returned early on the `error` branch,
+    # before ever reaching this loop, even though `stalled_models` can genuinely be
+    # populated alongside a mismatch error). Text-mode-only (the --json branch above
+    # already returned this data structured) so a plain `review task X --check` run
+    # directly by a developer sees it too, not just a `gh ship` caller parsing --json.
+    for stalled in result.get("stalled_models", []):
+        minutes = max(1, round(stalled["remaining_seconds"] / 60))
+        times = stalled["consecutive_failures"]
+        plural = "" if times == 1 else "s"
+        print(
+            f"  stalled: {stalled['model']} ({stalled['reason']}, "
+            f"{times} consecutive failure{plural}, ~{minutes}m until retry-eligible)",
+            file=detail_stream,
+        )
+
+
+def _quorum_check_subcommand(
+    code: str,
+    min_iter: int,
+    min_models: int | None,
+    *,
+    min_roles: int | None = None,
+    as_json: bool,
+    cwd_raw: str = ".",
+    verify_identity: bool = True,
+) -> int:
+    """`review task CODE --check [--min-iter N] [--min-models M] [--min-roles R] [-C DIR]`.
+
+    Exit 0 iff CODE has >= min_iter PASSED recorded iterations AND every EXPLICITLY
+    given floor among {min_models, min_roles} is met (review-cli#246: an explicit
+    floor is never silently outvoted by the other) — or, when NEITHER is given, >=
+    the default distinct BOARD ROLES floor (review-cli#246's new default; see
+    quorum_check's docstring for the full default-resolution/AND-logic table). Exit 1
+    otherwise, including the fail-closed cases (invalid code, unreadable/missing
+    stats store, zero records, or a task whose only history predates the verdict
+    field) where reviewlib.stats.quorum_check sets an "error" key or simply comes up
+    short. See quorum_check's docstring for the "passed, not just dispatched"
+    semantics this check enforces.
+
+    `verify_identity` (default True) resolves `cwd_raw` (`-C`) to a repo id + the
+    current diff's touched-file set and hands both to `quorum_check`, so a PASSED
+    iteration recorded against a DIFFERENT repo, or a diff sharing no touched file,
+    is EXCLUDED from the count rather than silently trusted — see reviewlib.stats
+    "Diff-identity binding" for why (closes 3 real quorum-pollution incidents).
+    `--no-verify-identity` restores the pre-binding behavior (every passed iteration
+    counts, no repo/diff cross-check) — an escape hatch for a cwd that can't resolve
+    a repo, not a way around a genuine mismatch finding.
+    """
+    repo_id, diff_files, verification_status = _resolve_quorum_check_context(
+        cwd_raw, verify_identity
+    )
+    result = quorum_check(
+        code,
+        min_iter=min_iter,
+        min_models=min_models,
+        min_roles=min_roles,
+        repo_id=repo_id,
+        diff_files=diff_files,
+    )
+    # Machine-readable counterpart to the stderr warnings below: a caller like
+    # `gh ship` parsing --json alone (never sees stderr) can assert on this
+    # directly instead of inferring "did verification run" from key absence.
+    result["identity_verification"] = verification_status
+    # This warning goes to stderr in BOTH --json and text mode: --json's structured
+    # payload already carries excluded_mismatched_iterations/mismatch_details for a
+    # machine reader, but a human watching stderr (e.g. `gh ship`'s own console
+    # output) must see the mismatch surfaced too, not just a smaller-than-expected
+    # number with no explanation.
+    excluded = result.get("excluded_mismatched_iterations", 0)
+    if excluded:
+        print(
+            f"[review task] warning: excluded {excluded} recorded iteration(s) for "
+            f"{result['task_code']} — recorded repo/diff did not match the code "
+            "currently being checked (--json for detail; --no-verify-identity disables "
+            "this check)",
+            file=sys.stderr,
+        )
+
     if as_json:
         import json as _json
 
         print(_json.dumps(result, indent=2))
         return 0 if result["passed"] else 1
 
-    if "error" in result:
-        print(f"review bar NOT met for {result['task_code']}: {result['error']}", file=sys.stderr)
-        return 1
-
-    passed_iter = result["passed_iterations"]
-    distinct = result["distinct_models_passed"]
+    # review-cli#246: derived from the RESULT (which floor(s) quorum_check actually
+    # applied, after its own default-resolution), not from the raw min_models/
+    # min_roles arguments here — those can be None even when quorum_check ends up
+    # enforcing a floor anyway (the "neither given" default substitutes min_roles).
+    role_mode = "min_roles" in result
+    model_mode = "min_models" in result
     if result["passed"]:
-        models = ", ".join(result["models"]) or "-"
-        plural_i = "" if passed_iter == 1 else "s"
-        plural_m = "" if distinct == 1 else "s"
-        print(
-            f"review bar met for {result['task_code']}: {passed_iter} passed "
-            f"iteration{plural_i} across {distinct} distinct model{plural_m} ({models})"
-        )
+        _print_quorum_bar_met(result, role_mode, model_mode)
         return 0
-
-    print(
-        f"review bar NOT met for {result['task_code']}: "
-        f"{passed_iter}/{min_iter} passed iterations, "
-        f"{distinct}/{min_models} distinct models"
-    )
+    _print_quorum_bar_not_met(result, role_mode, model_mode)
     return 1
 
 
-def _task_detail(code: str, selector: str, iterations: list[dict], sessions: list, *, as_json: bool) -> int:
+def _task_detail(
+    code: str, selector: str, iterations: list[dict], sessions: list, *, as_json: bool
+) -> int:
     session = None
     iteration_no: int | None = None
     if selector.isdigit():
@@ -816,9 +1743,15 @@ def _task_detail(code: str, selector: str, iterations: list[dict], sessions: lis
             print("[review task] --detail iteration must be >= 1", file=sys.stderr)
             return 2
         if iterations:
-            record = next((item for item in iterations if item.get("iteration") == iteration_no), None)
+            record = next(
+                (item for item in iterations if item.get("iteration") == iteration_no),
+                None,
+            )
             if record is None:
-                print(f"No review iteration {iteration_no} found for task {code}.", file=sys.stderr)
+                print(
+                    f"No review iteration {iteration_no} found for task {code}.",
+                    file=sys.stderr,
+                )
                 return 1
             session = _session_for_task_iteration(record, sessions, iterations)
         elif iteration_no - 1 < len(sessions):
@@ -826,9 +1759,15 @@ def _task_detail(code: str, selector: str, iterations: list[dict], sessions: lis
     else:
         session = next((s for s in sessions if s.session_id == selector), None)
         if session is not None:
-            iteration_no = _iteration_for_session(session, iterations) or sessions.index(session) + 1
+            iteration_no = (
+                _iteration_for_session(session, iterations)
+                or sessions.index(session) + 1
+            )
     if session is None:
-        print(f"No conversation logs found for task {code} detail {selector}.", file=sys.stderr)
+        print(
+            f"No conversation logs found for task {code} detail {selector}.",
+            file=sys.stderr,
+        )
         return 1
     detail = session.to_detail()
     if as_json:
@@ -847,8 +1786,12 @@ def _task_detail(code: str, selector: str, iterations: list[dict], sessions: lis
         print("\n## Brainstorm transcript")
         print(session.brainstorm.body.rstrip())
     for idx, call in enumerate(session.calls, start=1):
-        status = "error" if call.has_error else ("running" if not call.completed else "ok")
-        print(f"\n## Call {idx}: {call.backend} r{call.round} [{status}] {call.filename}")
+        status = (
+            "error" if call.has_error else ("running" if not call.completed else "ok")
+        )
+        print(
+            f"\n## Call {idx}: {call.backend} r{call.round} [{status}] {call.filename}"
+        )
         if call.body:
             print(call.body)
         if call.stderr_lines:
@@ -889,7 +1832,9 @@ The daemon serves EVERY registered spec by name at /spec/<name> on ONE port (nav
 so one port / Tailscale mapping covers all specs instead of a server per spec."""
 
 # The lifecycle actions handled by the shared agenttools_service ServiceManager.
-_SPECWEB_LIFECYCLE = frozenset({"start", "status", "stop", "run", "enable", "disable", "__serve"})
+_SPECWEB_LIFECYCLE = frozenset(
+    {"start", "status", "stop", "run", "enable", "disable", "__serve"}
+)
 
 
 def _spec_web(argv: list[str]) -> int:
@@ -946,7 +1891,9 @@ def _spec_web_host_port(rest: list[str], *, defaults: bool = True):
 
     parser = argparse.ArgumentParser(prog="review spec-web", add_help=False)
     parser.add_argument("--host", default=DEFAULT_SPECWEB_HOST if defaults else None)
-    parser.add_argument("--port", type=int, default=DEFAULT_SPECWEB_PORT if defaults else None)
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_SPECWEB_PORT if defaults else None
+    )
     parser.add_argument("--agent", default=None)
     return parser.parse_known_args(rest)
 
@@ -1047,7 +1994,9 @@ def _spec_web_print_registry(host: str, port: int) -> None:
         print(f"[review spec-web] navigator {url}")
     specs = registry.list_specs()
     if not specs:
-        print("[review spec-web] no specs registered yet — add one with `review spec-web add <spec.md>`")
+        print(
+            "[review spec-web] no specs registered yet — add one with `review spec-web add <spec.md>`"
+        )
         return
     for rec in specs:
         urls = " ".join(daemon_spec_urls(rec["name"], host, port))
@@ -1105,13 +2054,17 @@ def _spec_web_add(rest: list[str], *, watch: bool) -> int:
             # BLOCKING single-spec server, the opposite of what was asked (and what the
             # backstop classifier assumes). Refuse loudly rather than silently blocking.
             print(_SPECWEB_MISSING_LIB, file=sys.stderr)
-            print("[review spec-web] add/--no-watch need the daemon; without the lib the only "
-                  "mode is the blocking single-spec server (`review spec-web <spec.md>`).",
-                  file=sys.stderr)
+            print(
+                "[review spec-web] add/--no-watch need the daemon; without the lib the only "
+                "mode is the blocking single-spec server (`review spec-web <spec.md>`).",
+                file=sys.stderr,
+            )
             return 4
         # Lib-less host: preserve the classic single-spec foreground server (full backward-compat).
-        print("[review spec-web] shared service lib absent — falling back to a single-spec server.",
-              file=sys.stderr)
+        print(
+            "[review spec-web] shared service lib absent — falling back to a single-spec server.",
+            file=sys.stderr,
+        )
         return _spec_web_legacy_foreground(spec, ns)
 
     if ns.seed is not None and _spec_web_seed(spec, ns.seed) != 0:
@@ -1139,7 +2092,9 @@ def _spec_web_add(rest: list[str], *, watch: bool) -> int:
     if ns.open_browser and urls:
         _spec_web_open_browser(urls[0])
     if watch and not ns.no_watch:
-        print("[review spec-web] waiting for a submit (Ctrl-C to stop; the daemon keeps running).")
+        print(
+            "[review spec-web] waiting for a submit (Ctrl-C to stop; the daemon keeps running)."
+        )
         return watch_submits(spec, exit_on_submit=ns.exit_on_submit, baseline=baseline)
     return 0
 
@@ -1154,8 +2109,11 @@ def _spec_web_ensure_running(mgr, *, agent: str | None = None) -> int | None:
         return None
     rc = _spec_web_require_agent("start", agent)
     if rc is not None:
-        print("[review spec-web] the daemon is not running and cannot be auto-started "
-              "without --agent.", file=sys.stderr)
+        print(
+            "[review spec-web] the daemon is not running and cannot be auto-started "
+            "without --agent.",
+            file=sys.stderr,
+        )
         return rc
     # AlreadyRunningError lives in agenttools_daemon (the pidfile layer agenttools_service
     # builds on) — it is NOT re-exported by agenttools_service. Imported only on the
@@ -1233,7 +2191,9 @@ def _spec_web_list(rest: list[str]) -> int:
 
     specs = registry.list_specs()
     if not specs:
-        print("[review spec-web] no specs registered. Add one with `review spec-web add <spec.md>`.")
+        print(
+            "[review spec-web] no specs registered. Add one with `review spec-web add <spec.md>`."
+        )
         return 0
     for rec in specs:
         try:
@@ -1242,7 +2202,9 @@ def _spec_web_list(rest: list[str]) -> int:
             comments = []
         openc = sum(1 for c in comments if c.get("status") in ("pending", "submitted"))
         flag = "" if rec["exists"] else "  (file missing)"
-        print(f"  {rec['name']:<28} {openc} open / {len(comments)} total  {rec['path']}{flag}")
+        print(
+            f"  {rec['name']:<28} {openc} open / {len(comments)} total  {rec['path']}{flag}"
+        )
     return 0
 
 
@@ -1255,7 +2217,9 @@ def _spec_web_remove(rest: list[str]) -> int:
 
     name = rest[0]
     if registry.unregister(name):
-        print(f"[review spec-web] removed '{name}' (its comment store is left on disk).")
+        print(
+            f"[review spec-web] removed '{name}' (its comment store is left on disk)."
+        )
         return 0
     print(f"[review spec-web] no registered spec named '{name}'.", file=sys.stderr)
     return 1
@@ -1272,7 +2236,9 @@ def _spec_web_watch(rest: list[str]) -> int:
     parser.add_argument("target", help="a registered spec NAME or a spec PATH")
     parser.add_argument("--exit-on-submit", dest="exit_on_submit", action="store_true")
     parser.add_argument(
-        "--emit-current", dest="emit_current", action="store_true",
+        "--emit-current",
+        dest="emit_current",
+        action="store_true",
         help="re-emit the batch already in the store before watching (recover a failed live delivery)",
     )
     ns, _ = parser.parse_known_args(rest)
@@ -1283,10 +2249,15 @@ def _spec_web_watch(rest: list[str]) -> int:
     if spec is None:
         spec = Path(ns.target).expanduser()
     if not spec.is_file():
-        print(f"[review spec-web watch] no such spec (name or path): {ns.target}", file=sys.stderr)
+        print(
+            f"[review spec-web watch] no such spec (name or path): {ns.target}",
+            file=sys.stderr,
+        )
         return 1
     print(f"[review spec-web] watching {spec} for a submit (Ctrl-C to stop).")
-    return watch_submits(spec, exit_on_submit=ns.exit_on_submit, emit_current=ns.emit_current)
+    return watch_submits(
+        spec, exit_on_submit=ns.exit_on_submit, emit_current=ns.emit_current
+    )
 
 
 def _spec_web_reply(argv: list[str]) -> int:
@@ -1301,10 +2272,22 @@ def _spec_web_reply(argv: list[str]) -> int:
         prog="review spec-web reply",
         description="Answer a reviewer's spec-web question/remark (shown in the UI + sent to tg).",
     )
-    parser.add_argument("comment_id", help="the id of the comment/question to answer (from the structured review)")
+    parser.add_argument(
+        "comment_id",
+        help="the id of the comment/question to answer (from the structured review)",
+    )
     parser.add_argument("answer", help="the answer text")
-    parser.add_argument("--spec", required=True, metavar="FILE", help="path to the spec markdown file (the store is keyed per spec)")
-    parser.add_argument("--no-tg", action="store_true", help="do not deliver the reply to Telegram (UI only)")
+    parser.add_argument(
+        "--spec",
+        required=True,
+        metavar="FILE",
+        help="path to the spec markdown file (the store is keyed per spec)",
+    )
+    parser.add_argument(
+        "--no-tg",
+        action="store_true",
+        help="do not deliver the reply to Telegram (UI only)",
+    )
     ns = parser.parse_args(argv)
 
     from .specweb.store import AGENT_AUTHOR, SpecStore
@@ -1321,9 +2304,15 @@ def _spec_web_reply(argv: list[str]) -> int:
     store = SpecStore(spec)
     rec = store.add_reply(ns.comment_id, body=answer, author=AGENT_AUTHOR)
     if rec is None:
-        print(f"[review spec-web reply] unknown comment id: {ns.comment_id}", file=sys.stderr)
+        print(
+            f"[review spec-web reply] unknown comment id: {ns.comment_id}",
+            file=sys.stderr,
+        )
         return 1
-    print(f"[review spec-web reply] replied to {ns.comment_id} (now {rec.get('status')}); shown in the spec-web UI.", flush=True)
+    print(
+        f"[review spec-web reply] replied to {ns.comment_id} (now {rec.get('status')}); shown in the spec-web UI.",
+        flush=True,
+    )
 
     if not ns.no_tg:
         _spec_web_reply_to_tg(spec, rec, answer)
@@ -1339,7 +2328,10 @@ def _spec_web_reply_to_tg(spec: Path, comment: dict, answer: str) -> None:
 
     exe = shutil.which("tg")
     if not exe:
-        print("[review spec-web reply] tg not on PATH — reply saved to the UI only (no Telegram).", flush=True)
+        print(
+            "[review spec-web reply] tg not on PATH — reply saved to the UI only (no Telegram).",
+            flush=True,
+        )
         return
     question = (comment.get("body") or "").strip()
     quote = (comment.get("quote") or "").strip()
@@ -1355,19 +2347,33 @@ def _spec_web_reply_to_tg(spec: Path, comment: dict, answer: str) -> None:
     lines = [f"Spec: {spec.name}"]
     if quote:
         lines.append(f"On: “{_clip(quote, 200)}”")
-    lines.append(f"{'Question' if kind == 'question' else 'Remark'}: {_clip(question, 600)}")
+    lines.append(
+        f"{'Question' if kind == 'question' else 'Remark'}: {_clip(question, 600)}"
+    )
     lines.append(f"Agent answer: {_clip(answer, 3000)}")
     message = "\n".join(lines)
     try:
         proc = subprocess.run(
-            [exe, "--tag", "ANSWER", "--title", f"Spec-web reply — {spec.name}", message],
-            capture_output=True, text=True, timeout=30,
+            [
+                exe,
+                "--tag",
+                "ANSWER",
+                "--title",
+                f"Spec-web reply — {spec.name}",
+                message,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if proc.returncode == 0:
             print("[review spec-web reply] delivered to Telegram via tg.", flush=True)
         else:
             err = (proc.stderr or proc.stdout or "").strip()
-            print(f"[review spec-web reply] tg delivery failed (exit {proc.returncode}): {err}", flush=True)
+            print(
+                f"[review spec-web reply] tg delivery failed (exit {proc.returncode}): {err}",
+                flush=True,
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"[review spec-web reply] tg delivery error: {exc}", flush=True)
 
@@ -1377,8 +2383,12 @@ def _run_mode_with_stats(
     pool_models: list[str],
     dispatch,
     models_after=None,
+    roles_after=None,
     *,
     task_code: str | None = None,
+    repo_id: str | None = None,
+    diff_files: list[str] | None = None,
+    diff_sha256: str | None = None,
 ) -> int:
     """Announce the ETA, time the run on a monotonic clock, and append a stat record.
 
@@ -1397,11 +2407,32 @@ def _run_mode_with_stats(
     recorded `pool_size`/`models` reflect what really ran; the ETA still keys on the
     planned `pool_models` (known up front). Without it, `pool_models` is recorded as-is.
 
+    `roles_after` (optional, review-cli#221) is the role-tracking counterpart: a zero-arg
+    callable read AFTER the run for the board ROLE each usable seat covered (currently
+    only the board dispatch path supplies one — see `panel.FailoverOutcome.usable_roles`).
+    A falsy/erroring result omits the record's `roles` key entirely (see `record_run`'s
+    `roles` param) rather than recording an empty list — there is no "planned roles"
+    fallback the way `models_after` has `pool_models`, since a role only means something
+    tied to a seat that actually produced a verdict. The board dispatch's own
+    `roles_after` closure (`_ran_roles` in `_dispatch`) returns every EXPLICIT `-m`
+    board seat's role for `exact_board` runs, mirroring `_ran_models`'s identical choice
+    there — safe ONLY because an exact board has no reserve, so this function's caller
+    (`_dispatch`) can only ever pass a `passed=True` verdict up to `record_run` when
+    every one of those seats genuinely produced a verdict (any single failure degrades
+    the whole run to a nonzero exit first); a record whose seats didn't ALL succeed is
+    always `passed=False` and therefore never counts toward `--min-roles` regardless
+    of what this callable returned.
+
     A run that dispatched ZERO backend calls (a clean-tree review with no diff, an
     early usage error) is NOT recorded: it has no real wall-clock to contribute and a
     ~0s record would drag every future ETA for that pool toward zero — defeating the
     whole point. The ETA line is still printed (it costs nothing and warns the agent),
     but only real runs land in the history. Stats failures NEVER affect the run.
+
+    `repo_id`/`diff_files`/`diff_sha256` are the diff-identity fields (reviewlib.stats
+    "Diff-identity binding") threaded straight through to `record_run` unchanged — this
+    function doesn't compute or interpret them, it just carries them from the caller
+    (which already has `cwd`/`diff` in scope) to the stat record.
     """
     import time
 
@@ -1426,7 +2457,10 @@ def _run_mode_with_stats(
         elapsed = time.monotonic() - start
         tally = end_call_tally()
         ok_count, fail_count = tally["ok"], tally["fail"]
+        prompt_tokens = tally["prompt_tokens"]
+        output_tokens = tally["output_tokens"]
         recorded_models = pool_models
+        models_after_fell_back = False
         if models_after is not None:
             try:
                 actual = models_after()
@@ -1434,6 +2468,36 @@ def _run_mode_with_stats(
                 actual = None
             if actual:
                 recorded_models = actual
+            else:
+                models_after_fell_back = True
+        recorded_roles = None
+        # Round-5/6 review finding (Opus): `models_after` and `roles_after` both read
+        # the SAME `outcome_sink[0]` snapshot, and `quorum_check`'s monoculture guard
+        # (`_models_behind_role_coverage`) zips `recorded_models` against
+        # `recorded_roles` BY INDEX — so if `models_after` ever fell back to the
+        # PLANNED `pool_models` (its own error/empty-result path) while `roles_after`
+        # still returned the ACTUAL roles, the two lists would no longer describe the
+        # same seats in the same order. Force `recorded_roles` to `None` (omitted,
+        # not a misleadingly-paired list) whenever `recorded_models` isn't the real,
+        # actually-produced roster — there is no "planned roles" fallback that could
+        # keep the pairing honest the way `pool_models` does for models alone. The
+        # round-5 cut only checked `models_after_fell_back`, which stays False when
+        # `models_after` is None entirely (never set) — a FUTURE caller supplying
+        # `roles_after` alone (no current one does) would then pair real roles
+        # against the merely-PLANNED `pool_models`. Requiring `models_after is not
+        # None` too closes that: roles only ever get recorded when there was an
+        # ACTUAL-roster callable in the loop, not just a planned one.
+        if (
+            roles_after is not None
+            and models_after is not None
+            and not models_after_fell_back
+        ):
+            try:
+                actual_roles = roles_after()
+            except Exception:  # noqa: BLE001 — stats must never break the run
+                actual_roles = None
+            if actual_roles:
+                recorded_roles = actual_roles
         # Only record a run that actually dispatched at least one backend call. No
         # dispatch -> nothing real to time -> skip, so no-op invocations never poison
         # the ETA average.
@@ -1499,6 +2563,12 @@ def _run_mode_with_stats(
                 fail_count=fail_count,
                 started=started,
                 passed=verdict,
+                repo_id=repo_id,
+                diff_files=diff_files,
+                diff_sha256=diff_sha256,
+                roles=recorded_roles,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
             )
 
 
@@ -1555,7 +2625,19 @@ def _is_persistent_server_invocation(argv: list[str]) -> bool:
 # spec-web actions that BLOCK (a persistent server / a submit-watch loop) and so must bypass the
 # `-o` tee + run backstop; everything else (lifecycle management, register, list) returns fast.
 _SPECWEB_FAST_ACTIONS = frozenset(
-    {"reply", "start", "status", "stop", "enable", "disable", "add", "list", "remove", "-h", "--help"}
+    {
+        "reply",
+        "start",
+        "status",
+        "stop",
+        "enable",
+        "disable",
+        "add",
+        "list",
+        "remove",
+        "-h",
+        "--help",
+    }
 )
 
 
@@ -1640,26 +2722,50 @@ class _Tee(io.TextIOBase):
 # must be passed through untouched — even if it happens to look like `-o`/`--output`
 # (e.g. `review --just-ask --output` where `--output` is the question text, or a
 # `--prompt -o…`). This keeps the light pre-scan from stealing another flag's value.
-_VALUE_TAKING_OPTS = frozenset({
-    "-m", "--model", "-C", "--cwd", "--task", "-o", "--output", "--prompt", "--timeout",
-    "--pool", "--preset", "--moderator", "--rounds", "--max-rounds",
-    "--visual", "--before", "--intent", "--expect", "--check",
-    "--vision-timeout", "--project",
-    # `--retry N` is a diff-mode-only int option (reviewlib/modes/review.py). It consumes a
-    # value, so the `-o` pre-scan must skip its argument — otherwise `--retry -o…`-shaped input
-    # would have the retry count mis-read as the output flag.
-    "--retry",
-    # `review spec-web reply <id> <answer> --spec <path>`: the value after --spec is a spec
-    # path that could look like an option (e.g. `--spec -odd-name.md`); list it so the `-o`
-    # pre-scan never steals it.
-    "--spec",
-    # The qa mode's VALUE-taking flags (modes/qa.py): `--suites <glob/dir/file>`,
-    # `--kind <shape>`, `--report <path>`, `--max-cases <N>`, plus the Phase-3 env flags
-    # `--stage-url <URL>` and `--config <path>`. Their values can look like an option (a path,
-    # `-1`), so the `-o` pre-scan must skip each one's argument. `--in-place` / `--keep-env`
-    # are boolean flags (no value) and are deliberately NOT listed.
-    "--suites", "--kind", "--report", "--max-cases", "--stage-url", "--config",
-})
+_VALUE_TAKING_OPTS = frozenset(
+    {
+        "-m",
+        "--model",
+        "-C",
+        "--cwd",
+        "--task",
+        "-o",
+        "--output",
+        "--prompt",
+        "--timeout",
+        "--pool",
+        "--preset",
+        "--moderator",
+        "--rounds",
+        "--max-rounds",
+        "--visual",
+        "--before",
+        "--intent",
+        "--expect",
+        "--check",
+        "--vision-timeout",
+        "--project",
+        # `--retry N` is a diff-mode-only int option (reviewlib/modes/review.py). It consumes a
+        # value, so the `-o` pre-scan must skip its argument — otherwise `--retry -o…`-shaped input
+        # would have the retry count mis-read as the output flag.
+        "--retry",
+        # `review spec-web reply <id> <answer> --spec <path>`: the value after --spec is a spec
+        # path that could look like an option (e.g. `--spec -odd-name.md`); list it so the `-o`
+        # pre-scan never steals it.
+        "--spec",
+        # The qa mode's VALUE-taking flags (modes/qa.py): `--suites <glob/dir/file>`,
+        # `--kind <shape>`, `--report <path>`, `--max-cases <N>`, plus the Phase-3 env flags
+        # `--stage-url <URL>` and `--config <path>`. Their values can look like an option (a path,
+        # `-1`), so the `-o` pre-scan must skip each one's argument. `--in-place` / `--keep-env`
+        # are boolean flags (no value) and are deliberately NOT listed.
+        "--suites",
+        "--kind",
+        "--report",
+        "--max-cases",
+        "--stage-url",
+        "--config",
+    }
+)
 
 
 def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
@@ -1689,7 +2795,9 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
     # Exclude it from the value-taking set for a `task` invocation so this pre-scan
     # doesn't mistake a following `-o FILE` for --check's (nonexistent) value.
     value_taking_opts = (
-        _VALUE_TAKING_OPTS - {"--check"} if argv and argv[0] == "task" else _VALUE_TAKING_OPTS
+        _VALUE_TAKING_OPTS - {"--check"}
+        if argv and argv[0] == "task"
+        else _VALUE_TAKING_OPTS
     )
     while i < len(argv):
         tok = argv[i]
@@ -1736,9 +2844,18 @@ def _extract_output_path(argv: list[str]) -> tuple[Path | None, list[str]]:
     return out, rest
 
 
-_LEADING_MODE_VALUE_OPTS = frozenset({
-    "-m", "--model", "-C", "--cwd", "--task", "--timeout", "--pool", "--preset",
-})
+_LEADING_MODE_VALUE_OPTS = frozenset(
+    {
+        "-m",
+        "--model",
+        "-C",
+        "--cwd",
+        "--task",
+        "--timeout",
+        "--pool",
+        "--preset",
+    }
+)
 _LEADING_MODE_FLAG_OPTS = frozenset({"--list-defaults", "--show-board"})
 _LEADING_MODE_INLINE_SHORT_OPTS = ("-m", "-C")
 
@@ -1749,7 +2866,10 @@ def _is_leading_inline_short_option(tok: str) -> bool:
         len(tok) > 2
         and tok.startswith("-")
         and not tok.startswith("--")
-        and any(tok.startswith(opt) and tok != opt for opt in _LEADING_MODE_INLINE_SHORT_OPTS)
+        and any(
+            tok.startswith(opt) and tok != opt
+            for opt in _LEADING_MODE_INLINE_SHORT_OPTS
+        )
     )
 
 
@@ -1771,7 +2891,7 @@ def _normalize_leading_mode_options(argv: list[str]) -> list[str]:
             return argv
         if not tok.startswith("-"):
             if tok in known_subcommands() and moved:
-                return [tok, *moved, *argv[i + 1:]]
+                return [tok, *moved, *argv[i + 1 :]]
             return argv
         if tok in _LEADING_MODE_VALUE_OPTS:
             if i + 1 >= len(argv):
@@ -1783,7 +2903,11 @@ def _normalize_leading_mode_options(argv: list[str]) -> list[str]:
             moved.append(tok)
             i += 1
             continue
-        if any(tok.startswith(f"{opt}=") for opt in _LEADING_MODE_VALUE_OPTS if opt.startswith("--")):
+        if any(
+            tok.startswith(f"{opt}=")
+            for opt in _LEADING_MODE_VALUE_OPTS
+            if opt.startswith("--")
+        ):
             moved.append(tok)
             i += 1
             continue
@@ -1806,12 +2930,89 @@ def _write_output_file(path: Path, text: str) -> None:
     path.write_text(strip_control_sequences(text), encoding="utf-8")
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Entry point: arm the internal run backstop around a review run, then dispatch.
+# Env var that marks "a `review` invocation is already running in this process tree"
+# (review-cli#180). Set for the lifetime of a run by `main()`; checked by
+# `_reject_if_reentrant()` before any backend is touched.
+REVIEW_CLI_ACTIVE_ENV = "REVIEW_CLI_ACTIVE"
+
+
+def _reject_if_reentrant(_argv: list[str]) -> int | None:
+    """Fail closed if this process is already nested inside a running `review`
+    invocation — the review-cli#180 fork-bomb guard.
+
+    A codex/claude/opencode backend can shell out to `review diff` again on the same
+    worktree, which spawns another backend, which can do it again — an unbounded
+    self-reinvocation loop (live-confirmed 2026-08-11: 40+ live `codex exec` processes
+    and 11 `review diff` processes across 4 worktrees, swap at 88.5%, load average
+    60+). The existing process-GROUP kill/backstop machinery (`process._run_streamed`,
+    `reviewlib.backstop`) cannot bound this: each backend child is spawned with
+    `start_new_session=True` so a per-call timeout can kill just that call's tree
+    without also taking down the CLI's own group — but that means every recursive
+    level re-roots into a BRAND NEW OS session, invisible to a `killpg` rooted at an
+    earlier level. An env var is the one signal that survives `exec`/`setsid`
+    regardless of how many session boundaries the recursion crosses, so it is checked
+    here instead.
+
+    Deliberately NOT reset by `call_backend`/panel concurrency — those run several
+    backends in threads WITHIN one process (review-cli#65), not nested `review`
+    invocations, so they never trip this.
+
+    VERIFIED (not assumed — re-raised by every review round on this ticket, so
+    recording the evidence here): $REVIEW_CLI_ACTIVE is set for a persistent SERVER
+    subcommand's (`review dashboard`/`review spec-web`) entire lifetime too (see
+    `main()` — it wraps the whole dispatch, server path included). This is safe
+    because neither server spawns `review` as a child process during normal request
+    handling: `reviewlib/dashboard/server.py` and `reviewlib/specweb/server.py` only
+    shell out to `tailscale`/`git`/`tmux`; `reviewlib/dashboard/service.py`'s
+    `_review_argv0()` launches the server's OWN foreground process at STARTUP (once,
+    from the user's shell — not a request-handling re-invocation) and is itself gated
+    against re-entering the service layer (see that module's docstring: "otherwise
+    run/start would re-enter the service layer and fork-bomb"). If a future change
+    adds a code path where a server-mode process dispatches an actual model review
+    while servicing a request, that path should call the mode/panel functions
+    directly (in-process, the way `reviewlib.panel`/`reviewlib.modes` are normally
+    invoked), not subprocess-invoke `review` on itself.
+
+    Checks PRESENCE (`is not None`), not truthiness: `REVIEW_CLI_ACTIVE= review diff`
+    (a shell setting the var to an EMPTY string for the child) must still trip the
+    guard — `os.environ.get(...)` would return `""`, which is falsy under a bare
+    `if`, and silently let the recursion through (review-cli#180 review finding,
+    glm-5.2). This does NOT defend against a shell that removes the var entirely
+    (`env -u REVIEW_CLI_ACTIVE review diff`) — no env-var-based guard can, since the
+    child then looks identical to a genuinely fresh top-level invocation. That
+    residual gap is why this is layered with, not a substitute for, the codex
+    execpolicy guard (`install.install_codex_recursion_guard`) and the existing
+    process-group timeout/backstop.
+
+    This exact `env -u REVIEW_CLI_ACTIVE` technique is also used DELIBERATELY, not just as an
+    attacker's residual gap: `dashboard.service._env_clear_prefix()` (reused by
+    `specweb.service._serve_argv`) prepends it to the managed `__serve` child's argv, because
+    `run`/`start` are themselves active `review` invocations and the spawned server must NOT
+    inherit that activity marker (review-cli#180 review finding, chatgpt-codex-connector, PR
+    #279) — a sanctioned use of the same bypass this paragraph documents as unstoppable."""
+    if os.environ.get(REVIEW_CLI_ACTIVE_ENV) is not None:
+        print(
+            "[review-cli] refusing to run: $REVIEW_CLI_ACTIVE is already set, meaning "
+            "this process is nested inside another `review` invocation. A backend "
+            "(codex/claude/opencode) appears to have re-invoked `review` on the same "
+            "worktree — this is the unbounded self-reinvocation loop tracked as "
+            "review-cli#180. Refusing to recurse.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def _dispatch_with_backstop(raw: list[str], output_path: str | None) -> int:
+    """Resolve and run `raw`, applying the internal backstop timer + `-o` tee.
+
+    Split out of `main()` so the REVIEW_CLI_ACTIVE reentrancy guard (review-cli#180)
+    can wrap this ENTIRE dispatch — server subcommand included — in one try/finally at
+    the call site, without main() itself growing past a screenful.
 
     `review` advertises NO external timeout — agents must not wrap it in a short
     shell `timeout` (the panel/brainstorm modes only emit their synthesis at the very
-    end). The ONLY time bound is this INTERNAL last-resort backstop, capped at <=4h
+    end). The ONLY time bound is the INTERNAL last-resort backstop, capped at <=4h
     (`reviewlib.backstop`): a watchdog that force-terminates a genuinely wedged run so
     "no external timeout" can never mean "runs forever". A healthy run finishes in
     minutes, far under the ceiling, and the watchdog is cancelled cleanly on return.
@@ -1822,33 +3023,12 @@ def main(argv: list[str] | None = None) -> int:
     at once (codex P2). Every other path (the review/panel run and the instant
     subcommands) is wrapped.
 
-    This is also where `-o FILE` is handled: the flag is pre-scanned out of argv (so it
-    works for every dispatch path, including the bare subcommands), and when present the
-    whole dispatch runs under a stdout TEE whose captured text is persisted to FILE via
-    Python — bypassing the shell redirect (and thus zsh noclobber). The file is always
-    written; stdout still prints live.
+    This is also where `-o FILE` is handled: the flag is pre-scanned out of argv by the
+    caller (so it works for every dispatch path, including the bare subcommands), and
+    when present the whole dispatch runs under a stdout TEE whose captured text is
+    persisted to FILE via Python — bypassing the shell redirect (and thus zsh
+    noclobber). The file is always written; stdout still prints live.
     """
-    raw = sys.argv[1:] if argv is None else argv
-    output_path, raw = _extract_output_path(list(raw))
-    raw = _normalize_leading_mode_options(raw)
-
-    # A REMOVED flag (--mcp/--ln, or a removed mode flag) OR the removed `review review`
-    # SUBCOMMAND verb is a USAGE error — it must behave like argparse's own usage errors
-    # w.r.t. `-o`: print the structured error and exit WITHOUT writing the `-o` file.
-    # Rejecting it INSIDE `_dispatch` only `return`s 2, which the tee path below treats as
-    # "the dispatch completed" and would persist the (empty) captured stdout — truncating a
-    # pre-existing `-o` target (codex P1/P2). Reject it here, before the tee is armed, so no
-    # write happens. Both are pure argv pre-scans; the later calls in `_dispatch` are then
-    # harmless no-ops.
-    for _reject in (
-        _reject_removed_flags,
-        _reject_removed_subcommand,
-        _reject_subcommand_only_flag_without_verb,
-    ):
-        rejected = _reject(raw)
-        if rejected is not None:
-            return rejected
-
     # The persistent SERVER subcommands stream until Ctrl-C — capturing/teeing their
     # output to a single `-o` file makes no sense (and the file would only be written
     # on shutdown), so `-o` is ignored for them and they bypass both the tee and the
@@ -1892,11 +3072,51 @@ def main(argv: list[str] | None = None) -> int:
                 _write_output_file(output_path, captured.getvalue())
             except OSError as exc:
                 write_error = exc
-                print(f"[review-cli] -o: could not write {output_path}: {exc}",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"[review-cli] -o: could not write {output_path}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     return 1 if write_error is not None else rc
 
 
+def main(argv: list[str] | None = None) -> int:
+    """Entry point: reject a reentrant run, then dispatch under the backstop.
+
+    See `_reject_if_reentrant` for the review-cli#180 fork-bomb guard and
+    `_dispatch_with_backstop` for the backstop/`-o`-tee mechanics.
+    """
+    raw = sys.argv[1:] if argv is None else argv
+    output_path, raw = _extract_output_path(list(raw))
+    raw = _normalize_leading_mode_options(raw)
+
+    # A REMOVED flag (--mcp/--ln, or a removed mode flag) OR the removed `review review`
+    # SUBCOMMAND verb is a USAGE error — it must behave like argparse's own usage errors
+    # w.r.t. `-o`: print the structured error and exit WITHOUT writing the `-o` file.
+    # Rejecting it INSIDE `_dispatch` only `return`s 2, which the tee path below treats as
+    # "the dispatch completed" and would persist the (empty) captured stdout — truncating a
+    # pre-existing `-o` target (codex P1/P2). Reject it here, before the tee is armed, so no
+    # write happens. Both are pure argv pre-scans; the later calls in `_dispatch` are then
+    # harmless no-ops.
+    # _reject_if_reentrant runs FIRST: it is the cheapest check (one os.environ.get)
+    # and the highest-severity failure (review-cli#180 review finding, glm-5.2) — a
+    # recursive invocation that happens to also carry a removed flag/verb should get
+    # the reentrancy diagnostic, not a confusing unrelated usage error.
+    for _reject in (
+        _reject_if_reentrant,
+        _reject_removed_flags,
+        _reject_removed_subcommand,
+        _reject_subcommand_only_flag_without_verb,
+    ):
+        rejected = _reject(raw)
+        if rejected is not None:
+            return rejected
+
+    os.environ[REVIEW_CLI_ACTIVE_ENV] = "1"
+    try:
+        return _dispatch_with_backstop(raw, output_path)
+    finally:
+        os.environ.pop(REVIEW_CLI_ACTIVE_ENV, None)
 
 
 def _model_default_help(mode: ModeSpec | None) -> str:
@@ -1999,7 +3219,9 @@ def _moderator_default_help() -> str:
     return " -> ".join(MODERATOR_CANDIDATES).replace("%", "%%")
 
 
-def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | None) -> None:
+def _add_global_options(
+    parser: argparse.ArgumentParser, *, mode: ModeSpec | None
+) -> None:
     """Add the TRULY-GLOBAL options — the only ones the top-level `review --help` should
     list (ROADMAP "Subcommand-only options belong in the subcommand help, not the global
     list"): `-m/--model`, `-C/--cwd`, `-o/--output`, `--timeout`, `--list-defaults`,
@@ -2009,12 +3231,17 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
     Configurable options show their EFFECTIVE default value (ROADMAP "Help must show ACTUAL
     defaults"), resolving the config cascade + the mode where relevant (`--model`)."""
     parser.add_argument(
-        "-m", "--model", action="append", default=[],
+        "-m",
+        "--model",
+        action="append",
+        default=[],
         help=f"model/backend to run; repeat or comma-separate (default: {_model_default_help(mode)})",
     )
     parser.add_argument("-C", "--cwd", default=".", help="repository directory")
     parser.add_argument(
-        "--task", metavar="CODE", default=None,
+        "--task",
+        metavar="CODE",
+        default=None,
         help=(
             "task/issue code for this review iteration (required for recorded review "
             "modes; standalone visual without diff is exempt; may also be supplied by "
@@ -2022,7 +3249,10 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
         ),
     )
     parser.add_argument(
-        "-o", "--output", metavar="FILE", default=None,
+        "-o",
+        "--output",
+        metavar="FILE",
+        default=None,
         help=(
             "write the result to FILE via Python (creates parent dirs, overwrites) "
             "while still printing to stdout. Use this instead of `review … > FILE`, "
@@ -2030,7 +3260,9 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
         ),
     )
     parser.add_argument(
-        "--timeout", type=int, default=None,
+        "--timeout",
+        type=int,
+        default=None,
         help=(
             "per-call timeout seconds; REST uses wall/request timeout; review/panel "
             "agent CLIs use idle/silence timeout with a 20m floor for values >=60 "
@@ -2038,8 +3270,14 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             f"caps (requested defaults: review 1200, panel 240, qa {QA_TIMEOUT_DEFAULT})"
         ),
     )
-    parser.add_argument("--list-defaults", action="store_true", help="print default models and exit")
-    parser.add_argument("--show-board", action="store_true", help="print the active reviewer board (model -> role, availability) and exit")
+    parser.add_argument(
+        "--list-defaults", action="store_true", help="print default models and exit"
+    )
+    parser.add_argument(
+        "--show-board",
+        action="store_true",
+        help="print the active reviewer board (model -> role, availability) and exit",
+    )
     if mode is None or mode.name == "review":
         parser.add_argument(
             "--preset",
@@ -2048,28 +3286,37 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
             help=(
                 "diff-review preset: light = quick/cheap preflight (pool 2, medium effort); "
                 "default = routine change review (pool 4, high effort, excludes Fable/Sol); "
-                "heavy = release/risky-change review (pool 4, highest effort, includes Fable/Sol). "
+                "heavy = release/risky-change review (pool 4, highest effort, excludes "
+                "Fable — a confirmed near-total dispatch failure rate — but includes Sol). "
                 f"If no config board/models are set, review diff uses {DEFAULT_PRESET!r}."
             ),
         )
     parser.add_argument(
-        "--pool", type=int, default=None, metavar="N",
+        "--pool",
+        type=int,
+        default=None,
+        metavar="N",
         help=(
             "how many of the board's seats to run (default "
             f"{preset_pool_size('default')} for default/heavy, {preset_pool_size('light')} "
-            f"for light; {DEFAULT_POOL_SIZE} with no preset); the "
+            f"for light — a bare `review diff` uses {preset_pool_size(DEFAULT_PRESET)}, the "
+            f"{DEFAULT_PRESET!r} preset's pool; {DEFAULT_POOL_SIZE} is only the fallback for a "
+            "custom config `models:`/`board:` roster with no `pool:` key set); the "
             "first N seats participate, the rest are kept in reserve. The board is "
             "never off — --pool only sizes it. N<=0 means all seats. Ignored for explicit -m."
         ),
     )
     parser.add_argument(
-        "--effort", action="append", default=[], metavar="LEVEL|PROVIDER=LEVEL",
+        "--effort",
+        action="append",
+        default=[],
+        metavar="LEVEL|PROVIDER=LEVEL",
         help=(
             "run-scoped reasoning effort, overriding each seat's config effort for THIS run. "
             "A bare level (minimal/low/medium/high/xhigh/max) applies to every seat; "
             "PROVIDER=LEVEL (e.g. codex=high, opencode=max) overrides one backend route. "
             "Repeat or comma-separate; per-provider wins over the global level. "
-            "Reaches the codex, claude, and opencode reasoning-effort levers plus the "
+            "Reaches the codex, claude, opencode, and omp reasoning-effort levers plus the "
             "screenshot vision call."
         ),
     )
@@ -2080,7 +3327,9 @@ def _add_global_options(parser: argparse.ArgumentParser, *, mode: ModeSpec | Non
     # (AGENTS.md: the global list is only truly-global options). codex P1 on #46.
 
 
-def _add_visual_options(parser: argparse.ArgumentParser, *, include_visual_flag: bool = True) -> None:
+def _add_visual_options(
+    parser: argparse.ArgumentParser, *, include_visual_flag: bool = True
+) -> None:
     """Add the composable `--visual` feature flags as their own argument GROUP. These are
     SUBCOMMAND-scoped, NOT global (ROADMAP): `--visual` rides any subcommand, so they live
     on every MODE parser but must NOT clutter the top-level `review --help`. Grouping them
@@ -2092,17 +3341,62 @@ def _add_visual_options(parser: argparse.ArgumentParser, *, include_visual_flag:
     )
     group = parser.add_argument_group(group_title)
     if include_visual_flag:
-        group.add_argument("--visual", metavar="IMAGE", help="image to verify/attach; rides text subcommands (e.g. `review brainstorm \"Q\" --task CODE --visual IMAGE`; prefer `review visual IMAGE` for standalone)")
-    group.add_argument("--before", metavar="IMAGE", help="baseline image for diff-aware judgement / no-effect bypass")
-    group.add_argument("--intent", metavar="TEXT", help="free-text edit intent (untrusted; may only tighten the contract)")
-    group.add_argument("--expect", metavar="KIND", help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text")
-    group.add_argument("--check", action="append", default=[], metavar="NAME", help="force-activate a visual module by name (repeatable)")
-    group.add_argument("--json", action="store_true", help="emit the structured visual verdict as JSON")
-    group.add_argument("--strict", action="store_true", help="exit 10 on a blocking visual verdict (gate use)")
-    group.add_argument("--no-ai", action="store_true", help="run cvGate only (no vision call) — fast CI smoke / offline")
-    group.add_argument("--no-local-model", action="store_true", help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)")
-    group.add_argument("--vision-timeout", type=int, default=60, help="per vision-call timeout seconds (default 60)")
-    group.add_argument("--project", default=None, help="project root for per-project visual modules (default --cwd)")
+        group.add_argument(
+            "--visual",
+            metavar="IMAGE",
+            help='image to verify/attach; rides text subcommands (e.g. `review brainstorm "Q" --task CODE --visual IMAGE`; prefer `review visual IMAGE` for standalone)',
+        )
+    group.add_argument(
+        "--before",
+        metavar="IMAGE",
+        help="baseline image for diff-aware judgement / no-effect bypass",
+    )
+    group.add_argument(
+        "--intent",
+        metavar="TEXT",
+        help="free-text edit intent (untrusted; may only tighten the contract)",
+    )
+    group.add_argument(
+        "--expect",
+        metavar="KIND",
+        help="expectation kind: zero-diff|move|resize|style|wrap|insert|delete|text",
+    )
+    group.add_argument(
+        "--check",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="force-activate a visual module by name (repeatable)",
+    )
+    group.add_argument(
+        "--json", action="store_true", help="emit the structured visual verdict as JSON"
+    )
+    group.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 10 on a blocking visual verdict (gate use)",
+    )
+    group.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="run cvGate only (no vision call) — fast CI smoke / offline",
+    )
+    group.add_argument(
+        "--no-local-model",
+        action="store_true",
+        help="disable the Stage-2a local pre-classifier (known-good cache cost-saver); flow = cvGate → vision (§3.1a)",
+    )
+    group.add_argument(
+        "--vision-timeout",
+        type=int,
+        default=60,
+        help="per vision-call timeout seconds (default 60)",
+    )
+    group.add_argument(
+        "--project",
+        default=None,
+        help="project root for per-project visual modules (default --cwd)",
+    )
 
 
 def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> None:
@@ -2120,16 +3414,27 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
     # --diff / --staged select the diff source. They matter to the diff review (its diff is
     # required) and brainstorm/panel grounding; keep them on every mode parser (a mode that
     # ignores one is harmless) but OFF the top-level overview.
-    parser.add_argument("--diff", action="store_true", help="use the working-tree diff (default for the diff review; optional grounding for brainstorm)")
-    parser.add_argument("--staged", action="store_true", help="use the staged diff (git diff --cached) instead of the working-tree diff")
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="use the working-tree diff (default for the diff review; optional grounding for brainstorm)",
+    )
+    parser.add_argument(
+        "--staged",
+        action="store_true",
+        help="use the staged diff (git diff --cached) instead of the working-tree diff",
+    )
 
     # --prompt is the DIFF REVIEW's prompt override only.
     if mode.name == "review":
-        parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="override the diff-review prompt")
+        parser.add_argument(
+            "--prompt", default=DEFAULT_PROMPT, help="override the diff-review prompt"
+        )
     # --moderator steers the quorum / brainstorm synthesis only.
     if mode.name in ("quorum", "brainstorm"):
         parser.add_argument(
-            "--moderator", default=None,
+            "--moderator",
+            default=None,
             help=f"moderator backend (default: auto-pick, first available of {_moderator_default_help()})",
         )
 
@@ -2145,29 +3450,65 @@ def _add_mode_options(parser: argparse.ArgumentParser, *, mode: ModeSpec) -> Non
 
 # Flags that live ONLY on a subcommand parser (NOT the global top-level parser), per the
 # option-scoping. When one of these LEADS a no-subcommand invocation (e.g. the old pre-commit
-    # `review --staged`, or `review --visual shot.png`), the top-level parser would reject it with
+# `review --staged`, or `review --visual shot.png`), the top-level parser would reject it with
 # argparse's opaque "unrecognized arguments", losing the `review diff` migration pointer. The
 # pre-parse guard below catches them and emits the friendly pointer instead.
-_SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset({
-    "--diff", "--staged", "--prompt", "--moderator", "--rounds", "--max-rounds",
-    "--visual", "--before", "--intent", "--expect", "--check", "--json", "--strict",
-    "--no-ai", "--no-local-model", "--vision-timeout", "--project", "--retry", "--commit",
-    # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
-    # etc. must get the friendly "use the subcommand" pointer, not argparse's opaque error.
-    # Phase 3 adds the SUT-env flags `--stage-url` / `--config` / `--keep-env`.
-    "--suites", "--kind", "--in-place", "--report", "--max-cases",
-    "--stage-url", "--config", "--keep-env",
-})
+_SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset(
+    {
+        "--diff",
+        "--staged",
+        "--prompt",
+        "--moderator",
+        "--rounds",
+        "--max-rounds",
+        "--visual",
+        "--before",
+        "--intent",
+        "--expect",
+        "--check",
+        "--json",
+        "--strict",
+        "--no-ai",
+        "--no-local-model",
+        "--vision-timeout",
+        "--project",
+        "--retry",
+        "--commit",
+        # quorum's opt-in adversarial refutation pass (modes/quorum.py).
+        "--adversarial-check",
+        # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
+        # etc. must get the friendly "use the subcommand" pointer, not argparse's opaque error.
+        # Phase 3 adds the SUT-env flags `--stage-url` / `--config` / `--keep-env`.
+        "--suites",
+        "--kind",
+        "--in-place",
+        "--report",
+        "--max-cases",
+        "--stage-url",
+        "--config",
+        "--keep-env",
+    }
+)
 
 # The BARE management subcommands `_dispatch` handles directly (NOT mode verbs in
 # known_subcommands(), and NOT the diff review): they have their OWN flag parsers (e.g.
 # `review sessions -s <id> --diff --moderator …`). The verb-less migration guard must leave
 # them alone — a `--diff`/`--moderator` after `sessions` belongs to that subparser, not a
 # missing `review diff`.
-_BARE_SUBCOMMANDS: frozenset[str] = frozenset({
-    "install-skill", "install-commit-hook", "install-hook", "dashboard", "sessions",
-    "task", "trust-module", "register-module", "spec-web",
-})
+_BARE_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        "install-skill",
+        "install-commit-hook",
+        "install-hook",
+        "dashboard",
+        "sessions",
+        "task",
+        "stat",
+        "trust-module",
+        "register-module",
+        "spec-web",
+    }
+)
 
 
 def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
@@ -2182,8 +3523,10 @@ def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
     Self-contained (checks the no-subcommand condition itself) so it is safe to call in
     `main()` BEFORE the `-o` tee is armed — a usage error must NOT write/truncate the `-o`
     file (like the removed-flags guards)."""
-    if argv and not argv[0].startswith("-") and (
-        argv[0] in known_subcommands() or argv[0] in _BARE_SUBCOMMANDS
+    if (
+        argv
+        and not argv[0].startswith("-")
+        and (argv[0] in known_subcommands() or argv[0] in _BARE_SUBCOMMANDS)
     ):
         return None  # a recognized subcommand (mode or management) owns these flags
     for tok in argv:
@@ -2194,7 +3537,7 @@ def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
                 "  use:  review visual IMAGE [--diff] [options]\n"
                 if tok.split("=", 1)[0] == "--visual"
                 else "  use:  review diff --task CODE [options]   "
-                     "(e.g. `review diff --staged --task CODE`)\n"
+                "(e.g. `review diff --staged --task CODE`)\n"
             )
             print(
                 "review: no subcommand given. The diff review is now `review diff` "
@@ -2202,7 +3545,8 @@ def _reject_subcommand_only_flag_without_verb(argv: list[str]) -> int | None:
                 "subcommand.\n"
                 f"{use_line}"
                 "  (run `review --help` for all subcommands)",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             return 2
     return None
@@ -2212,7 +3556,13 @@ def _help_topic_config() -> str:
     """The `review help config` deep reference (ROADMAP "Topic-based help across the
     ecosystem"): config file path + cascade, the keys, key/auth env vars, and how the
     reviewer board + model selection resolve. Kept in sync with config.py / backends.py
-    behavior (help-docs-sync); a flag/behavior change updates this topic in the same commit."""
+    behavior (help-docs-sync); a flag/behavior change updates this topic in the same commit.
+
+    NOTE: the "REVIEWER BOARD + PRESETS" section below derives its stated effort from
+    `preset_board(DEFAULT_PRESET)[0].effort` — correct only because DEFAULT_PRESET's board
+    has UNIFORM effort across all seats (true for "light"/"default", not for "heavy",
+    which mixes xhigh/max). If DEFAULT_PRESET ever becomes "heavy", that line needs a
+    real fix, not just re-pointing the same expression."""
     return f"""\
 review — configuration reference
 ================================
@@ -2266,9 +3616,12 @@ SELECTION CASCADE, by mode:
 
 REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints it live)
   A priority-ordered panel of seats, each model carrying its own
-  role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool 4, high effort,
-  without Fable/Sol. Use `--preset light` for quick preflight (pool 2, medium effort) and
-  `--preset heavy` for release/risky changes (Fable/Sol/Opus/GLM-cc at highest effort).
+  role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool
+  {preset_pool_size(DEFAULT_PRESET)}, {preset_board(DEFAULT_PRESET)[0].effort} effort, without
+  Fable/Sol. Use `--preset default` for a routine change review (pool 4, high effort)
+  or `--preset heavy` for release/risky changes (Sol/Opus/GLM-cc/Kimi at highest effort;
+  Fable is excluded from every preset — a confirmed ~100% dispatch failure rate, see
+  DEFAULT_BOARD's own comment — and sits last-resort in the raw board instead).
   `--pool N` sizes the selected board (`--pool 0` = all available). Explicit -m never lets config add extra seats; it narrows
   configured metadata when present, else uses the flat exact panel. To set the priority
   roster, configure `models:`. To add role/name/effort metadata (or a full board when
@@ -2293,7 +3646,76 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
       window. Values under 60s stay exact for tests/probes; otherwise the normal 20m floor
       applies unless REVIEW_IDLE_TIMEOUT_SECONDS is set. QA and vision calls keep wall-clock
       timeout caps.
-  codex / opencode carry their own CLI auth (no key here). The Grok/xai board seat
+    REVIEW_DIFF_MAX_BYTES=N             — dispatch-time diff-size cap (default 300000);
+                                          <= 0 disables it. See `review stat`'s section
+                                          in README.md.
+    REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window for a
+                                          chronically-unavailable claude seat (Fable).
+                                          opencode also consults + records + clears
+                                          this store for a TRUE-SILENCE trip
+                                          (review-cli#235, see
+                                          REVIEW_TRUE_SILENCE_SECONDS below), AND for
+                                          the SAME shared administrative-sentinel/
+                                          quota-marker phrases claude's own detection
+                                          uses (codex review finding, round 18: an
+                                          earlier version of this text wrongly said
+                                          that detection "remains claude-only" — it
+                                          does not, as of #243's round-12 fix).
+                                          opencode-SPECIFIC quota wording that matches
+                                          none of the shared phrases is still not
+                                          recognised (falls through as a genuine
+                                          success) — see review-cli#226.
+                                          commandcode/zai HTTP backends have no
+                                          cooldown consult/record/clear at all yet.
+                                          Unset: the window
+                                          ESCALATES per consecutive failure (10min,
+                                          30min, 2h, then 8h cap), resetting to 10min
+                                          after a success or a 24h quiet period. Set:
+                                          that fixed window every time, no escalation;
+                                          <= 0 disables cooldowns entirely.
+    REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
+                                          ~/.config/review-cli/seat-cooldown.json).
+    REVIEW_TRIVIAL_DELTA_LINES=N        — pre-commit gate: max changed lines tolerated
+                                          against the last reviewed baseline before a
+                                          restage forces a fresh full review (default 10);
+                                          0 disables the tolerance (exact-hash match only).
+    REVIEW_TRUE_SILENCE_SECONDS=N       — how many seconds of ZERO output an opencode
+                                          seat gets before it is reaped as stuck rather
+                                          than silently thinking (default 5min, per-model
+                                          overridable in reviewlib/model_behavior.py's
+                                          registry; review-cli#235). A trip records a
+                                          REVIEW_SEAT_COOLDOWN_SECONDS-governed cooldown
+                                          for that model. <= 0 disables the check
+                                          entirely (mirrors REVIEW_IDLE_TIMEOUT_SECONDS=0).
+                                          Only applies before the call's FIRST byte of
+                                          output ever arrives — see review-cli#239 for
+                                          the currently-uncovered mid-call-silence case.
+                                          Before the first byte, this REPLACES
+                                          REVIEW_IDLE_TIMEOUT_SECONDS as the sole reap
+                                          authority (not a min() of the two) — an
+                                          operator who tightens the idle timeout below
+                                          this value does NOT get an earlier pre-output
+                                          reap. There is no way to COMBINE the two for
+                                          an earlier pre-first-byte cutoff: for any
+                                          positive REVIEW_IDLE_TIMEOUT_SECONDS value,
+                                          it has NO effect before the first byte, no
+                                          matter what it is set to — the only lever
+                                          pre-first-byte is lowering
+                                          REVIEW_TRUE_SILENCE_SECONDS itself (codex
+                                          review finding, review-cli#243 round 15: an
+                                          earlier version of this text wrongly implied
+                                          setting both env vars together could make a
+                                          short idle floor also apply pre-output; it
+                                          cannot — see review-cli#254 for the related
+                                          deadline-clamp discussion). One EXCEPTION
+                                          (codex review finding, round 18):
+                                          REVIEW_IDLE_TIMEOUT_SECONDS=0 (the explicit
+                                          "disable idle reap entirely" value) also
+                                          disables true-silence — it is not just "no
+                                          effect", it turns the check OFF, since the
+                                          true-silence poll branch only runs at all
+                                          when idle reap is enabled.
+  codex / opencode / omp carry their own CLI auth (no key here). The Grok/xai board seat
     (GROK_SEAT) is one of these: opencode's own XAI_API_KEY env var, an inline
     options.apiKey in opencode.json, or `opencode providers login` (OAuth) all work.
     review-cli reads the local auth files to PROBE non-empty-ness at startup (deciding
@@ -2309,23 +3731,31 @@ See also: `review --help` (overview), `review --show-board`, `review <mode> --he
 # topic -> (one-line summary for the main-help listing, zero-arg renderer). Add a topic =
 # add an entry here; the main-help pointer + dispatch pick it up with no other edit.
 HELP_TOPICS: dict[str, tuple[str, "object"]] = {
-    "config": ("config file, the model/board selection cascade, keys/auth", _help_topic_config),
+    "config": (
+        "config file, the model/board selection cascade, keys/auth",
+        _help_topic_config,
+    ),
 }
 
 
 def _subcommand_epilog() -> str:
-    topics = "\n".join(f"  review help {t:<8} {summary}" for t, (summary, _) in HELP_TOPICS.items())
-    return "subcommands:\n" + "\n".join(
-        f"  {m.subcommand:<11} {m.summary}" for m in iter_modes()
-    ) + (
-        "\n  dashboard   managed web dashboard over review-cli runs (run/start/status/stop/enable/disable)"
-        "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
-        "\n  task        show review iterations and transcripts for one task code"
-        "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
-        "\n  install-skill / install-commit-hook / install-hook tg / register-module"
-        "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
-        + topics
-        + "\n  see `review help config` for configuration."
+    topics = "\n".join(
+        f"  review help {t:<8} {summary}" for t, (summary, _) in HELP_TOPICS.items()
+    )
+    return (
+        "subcommands:\n"
+        + "\n".join(f"  {m.subcommand:<11} {m.summary}" for m in iter_modes())
+        + (
+            "\n  dashboard   managed web dashboard over review-cli runs (run/start/status/stop/enable/disable)"
+            "\n  sessions    list / resume brainstorm sessions (-a all, -s <id> resume)"
+            "\n  task        show review iterations and transcripts for one task code"
+            "\n  stat        per-harness/per-model usage + health report from the real call logs"
+            "\n  spec-web    multi-spec web reviewer daemon (start/status/stop/add <spec>; also `spec-web <spec>`)"
+            "\n  install-skill / install-commit-hook / install-hook tg / register-module"
+            "\n\nhelp topics (deep help — `review help <topic>` or `review --help <topic>`):\n"
+            + topics
+            + "\n  see `review help config` for configuration."
+        )
     )
 
 
@@ -2339,8 +3769,8 @@ def _build_top_level_parser() -> argparse.ArgumentParser:
         prog="review",
         description=(
             "Run read-only code reviews / AI panels across multiple model backends "
-            "(one narrow opt-in exception: `review diff --staged --commit` checkpoints "
-            "a commit). Everything is a SUBCOMMAND: `review diff` (review the git diff), "
+            "(one narrow opt-in exception: `review diff --staged --task CODE --commit` "
+            "checkpoints a commit). Everything is a SUBCOMMAND: `review diff` (review the git diff), "
             "`review brainstorm`, `review just-ask`, `review quorum`. A bare `review` "
             "(no subcommand) prints this help — it does NOT run a diff review; use "
             "`review diff` for that."
@@ -2362,7 +3792,8 @@ def _build_mode_parser(mode: ModeSpec) -> argparse.ArgumentParser:
     is `review <subcommand>` and it carries the global options + the mode-relevant flags +
     the composable visual group + the mode's own positional)."""
     parser = argparse.ArgumentParser(
-        prog=f"review {mode.subcommand}", description=mode.summary,
+        prog=f"review {mode.subcommand}",
+        description=mode.summary,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_mode_options(parser, mode=mode)
@@ -2389,13 +3820,16 @@ def _reject_removed_flags(argv: list[str]) -> int | None:
         bare = tok.split("=", 1)[0]
         sub = REMOVED_MODE_FLAGS.get(bare)
         if sub is not None:
-            task_hint = " --task CODE" if sub in {"brainstorm", "just-ask", "quorum"} else ""
+            task_hint = (
+                " --task CODE" if sub in {"brainstorm", "just-ask", "quorum"} else ""
+            )
             print(
                 f"review: `{bare}` is no longer a flag — it is now the `{sub}` subcommand.\n"
-                f"  use:  review {sub} \"<your text>\"{task_hint} [options]\n"
+                f'  use:  review {sub} "<your text>"{task_hint} [options]\n'
                 f"  (modes are subcommands now: brainstorm / just-ask / quorum; "
                 f"run `review --help`)",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             return 2
         removed = REMOVED_FLAGS.get(bare)
@@ -2404,7 +3838,8 @@ def _reject_removed_flags(argv: list[str]) -> int | None:
                 f"review: `{bare}` was removed and is no longer accepted.\n"
                 f"  why:  {removed.reason}\n"
                 f"  fix:  {removed.fix}",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             return 2
     return None
@@ -2425,7 +3860,8 @@ def _reject_removed_subcommand(argv: list[str]) -> int | None:
             f"now `review {replacement}`.\n"
             f"  use:  review {replacement} --task CODE [options]\n"
             f"  (run `review --help` for all subcommands)",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
         return 2
     return None
@@ -2442,7 +3878,11 @@ def _leading_removed_subcommand(argv: list[str]) -> str | None:
         if tok in _LEADING_MODE_VALUE_OPTS:
             i += 2
             continue
-        if any(tok.startswith(f"{opt}=") for opt in _LEADING_MODE_VALUE_OPTS if opt.startswith("--")):
+        if any(
+            tok.startswith(f"{opt}=")
+            for opt in _LEADING_MODE_VALUE_OPTS
+            if opt.startswith("--")
+        ):
             i += 1
             continue
         if tok in _LEADING_MODE_FLAG_OPTS:
@@ -2470,29 +3910,224 @@ def _help_subcommand(rest: list[str]) -> int:
     the tee's `finally` with `completed=False`, so no write happens. The SUCCESS paths (the
     topic listing / a valid topic) still `return 0`: that output is real and SHOULD be teed."""
     if not rest:
-        print("review help topics:\n" + "\n".join(
-            f"  {t:<10} {summary}" for t, (summary, _) in HELP_TOPICS.items()
-        ) + "\n\nRun `review help <topic>` (or `review --help <topic>`) for the full reference.")
+        print(
+            "review help topics:\n"
+            + "\n".join(
+                f"  {t:<10} {summary}" for t, (summary, _) in HELP_TOPICS.items()
+            )
+            + "\n\nRun `review help <topic>` (or `review --help <topic>`) for the full reference."
+        )
         return 0
     # Exactly one topic token — extra trailing args are a usage error, not silently dropped
     # (codex review: `review help config --bogus` / `review --help config extra` must NOT
     # exit 0 ignoring the tail).
     if len(rest) > 1:
-        print(f"review help: takes a single topic, got extra arguments: {' '.join(rest[1:])}\n"
-              f"  use:  review help <topic>   (topics: {', '.join(HELP_TOPICS)})",
-              file=sys.stderr, flush=True)
+        print(
+            f"review help: takes a single topic, got extra arguments: {' '.join(rest[1:])}\n"
+            f"  use:  review help <topic>   (topics: {', '.join(HELP_TOPICS)})",
+            file=sys.stderr,
+            flush=True,
+        )
         raise SystemExit(2)
     topic = rest[0]
     entry = HELP_TOPICS.get(topic)
     if entry is None:
         known = ", ".join(HELP_TOPICS)
-        print(f"review help: unknown topic '{topic}'. Known topics: {known}.",
-              file=sys.stderr, flush=True)
+        print(
+            f"review help: unknown topic '{topic}'. Known topics: {known}.",
+            file=sys.stderr,
+            flush=True,
+        )
         raise SystemExit(2)
     _summary, render = entry
     text = render()
     print(text, end="" if text.endswith("\n") else "\n")
     return 0
+
+
+def _config_default_pool(config: dict) -> int | None:
+    """A `pool:` default from config.yaml (a positive int), or None when absent/invalid.
+
+    Lets a personal config pin the default review pool size (e.g. 3 while a provider is
+    disabled). A non-positive / non-integer value is ignored (falls back to the preset
+    default) rather than erroring — `pool: 0`/`--pool 0` "all seats" stays a CLI-only knob."""
+    raw = config.get("pool")
+    if isinstance(
+        raw, bool
+    ):  # bool is an int subclass; a stray `pool: true` is not a size
+        return None
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    return None
+
+
+def _seats_of(board: list) -> tuple[tuple[str, str], ...]:
+    """Board seats as (model, display-name) pairs for the pool-selection guard."""
+    return tuple((r.model, r.display) for r in board)
+
+
+def _default_review_board(
+    config: dict, config_models: list[str], config_has_board: bool, default_pool: int
+):
+    """The board a no-`-m`/no-`--pool` run would use, with its default pool size — the
+    precedence the guard offers as the 'drop your override' fallback (config `models:` >
+    config `board:` > the default preset). `default_pool` is the pool size a no-override run
+    would ACTUALLY use (config `pool:` > preset default), so a proposal's promised size
+    matches what re-running would do."""
+    if config_models:
+        return board_from_models(config_models, config), default_pool
+    if config_has_board:
+        return load_board(config), default_pool
+    return load_board(config, preset=DEFAULT_PRESET), default_pool
+
+
+def _pool_guard_candidates(
+    config: dict,
+    config_models: list[str],
+    config_has_board: bool,
+    default_pool: int,
+) -> list[Candidate]:
+    """Fallback options the guard proposes when a selection can't converge: the default
+    board plus every preset. Boards are built (cheap, no availability probe — the guard
+    probes lazily only on the non-converge path); a malformed board is skipped, not fatal.
+    A preset identical to the default board is de-duped so the proposal isn't redundant."""
+    candidates: list[Candidate] = []
+    default_seats: tuple[tuple[str, str], ...] | None = None
+    try:
+        board, pool = _default_review_board(
+            config, config_models, config_has_board, default_pool
+        )
+        default_seats = _seats_of(board)
+        candidates.append(
+            Candidate(
+                label="default",
+                why="drop -m / --pool and run the default board (`review diff`)",
+                board=default_seats,
+                pool_size=pool,
+            )
+        )
+    except BoardConfigError:
+        pass
+    for name in preset_names():
+        try:
+            seats = _seats_of(load_board(config, preset=name))
+        except BoardConfigError:
+            continue
+        if seats == default_seats:
+            continue
+        candidates.append(
+            Candidate(
+                label=f"preset:{name}",
+                why=f"use the {name!r} preset (`review diff --preset {name}`)",
+                board=seats,
+                pool_size=preset_pool_size(name),
+            )
+        )
+    return candidates
+
+
+def _warn_if_panel_padded(models: list[str]) -> None:
+    """Operator-facing stderr notice for the flat quorum panel, fired iff
+    `models` contains a repeat -- the only way a repeat can appear here is
+    `expand_flat_models_with_reuse` reusing a model, since its input `src`
+    (DEFAULT_MODELS or config `models:`) is already distinct and `-m` never
+    reaches this call site (`explicit_models` is handled by an earlier,
+    separate branch that bypasses padding entirely). Mirrors the board path's
+    existing failover promotion message (reviewlib.panel.run_board_with_failover)
+    so the token spend is attributable instead of a silent surprise."""
+    if len(set(models)) == len(models):
+        return
+    counts = {m: models.count(m) for m in dict.fromkeys(models)}
+    repeated = ", ".join(f"{m} x{n}" for m, n in counts.items() if n > 1)
+    print(
+        f"[review-cli] panel padded — reusing {repeated} across multiple seats "
+        "(some models near their usage limit)",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _chain_aware_available(model: str) -> bool:
+    """The failover-chain-aware liveness probe: True iff `model` OR any later provider in
+    its `reviewlib.provider_failover` chain is reachable and paid.
+
+    This is THE single liveness predicate every pre-dispatch decision about a seat must
+    share — the pool guard, the startup pool/reserve SPLIT (`split_pool_reserve`, both here
+    for the ETA and in `modes.review._mode_review_board` for the REAL dispatch), and the
+    ETA's `planned_pool`. Before this fix the guard alone became chain-aware while the split
+    stayed on raw `backend_available`, so the guard could approve a pool size the split then
+    silently shrank (a two-seat board where one seat's head is down but its failover
+    alternate is live: the guard says 'fine, 2 live', the split — still raw — says '1 live',
+    and dispatch quietly runs a smaller pool than what was approved). Codex P1 on review of
+    #157: 'the chain-aware guard approves seats that board dispatch still removes.'"""
+    from .provider_failover import any_provider_available
+
+    return any_provider_available(
+        model,
+        available=backends.backend_available,
+        unpaid=backends.runtime_provider_marked_unpaid,
+    )
+
+
+def _evaluate_pool_or_bail(
+    config: dict,
+    config_models: list[str],
+    config_has_board: bool,
+    user_seats: tuple[tuple[str, str], ...],
+    explicit_models: list[str],
+    pool_arg: int | None,
+    default_pool: int,
+) -> int | None:
+    """Pre-dispatch foolproofing (reviewlib.pool_guard): when the resolved review selection
+    (`user_seats` = (model, name) pairs — a board OR the flat `-m` list) can't converge,
+    print a proposal / targeted error and return its exit code; otherwise return None to
+    proceed. Inert under the fake backend (every seat live -> PROCEED)."""
+    # A config `pool: N` default is a SOFT target (graceful auto-shrink), NOT a hard request:
+    # only an EXPLICIT `-m` / `--pool N` sets `explicit=True` so the guard enforces the
+    # requested size and proposes when the live subset can't fill it. A bare `review diff`
+    # with a config `pool:` still runs the live board (down to the min_converge floor) rather
+    # than nagging — an explicit flag is a deliberate ask; a config default is a preference.
+    if explicit_models:
+        requested, explicit = (
+            len({default_distinct_key(m) for m in explicit_models}),
+            True,
+        )
+    elif pool_arg is not None and pool_arg > 0:
+        requested, explicit = pool_arg, True
+    else:
+        requested, explicit = 0, False
+
+    def _guard_reason(model: str) -> str | None:
+        # `backend_unavailable_reason` probes only the requested (head) spelling, and — by
+        # construction — already agrees with `_chain_aware_available` whenever the head
+        # itself is what's down (it embeds the same `runtime_provider_marked_unpaid` check
+        # `any_provider_available` uses). The one gap: if it ever returned None while
+        # `_chain_aware_available` says the WHOLE chain is down (every provider
+        # unavailable/unpaid, a shape only reachable with mismatched injected predicates
+        # today, e.g. in a test), the guard would bail with a blank reason. Fail safe with a
+        # synthesized one rather than ship a misleading empty message (review of #157).
+        reason = backends.backend_unavailable_reason(model)
+        if reason is not None or _chain_aware_available(model):
+            return reason
+        return f"{model}: no provider in its failover chain is currently available"
+
+    decision = evaluate_selection(
+        user_board=user_seats,
+        requested_size=requested,
+        explicit=explicit,
+        # THUNK: the fallback boards (default + presets) are re-resolved only on the
+        # non-converge path, so a converging happy-path run never rebuilds them (and never
+        # re-emits load_board's stderr warnings for a malformed config board — glm review).
+        candidates=lambda: _pool_guard_candidates(
+            config, config_models, config_has_board, default_pool
+        ),
+        available=_chain_aware_available,
+        reason=_guard_reason,
+    )
+    if decision.kind == PROCEED:
+        return None
+    print(decision.text, file=sys.stderr, flush=True)
+    return decision.exit_code
 
 
 def _dispatch(argv: list[str] | None = None) -> int:
@@ -2543,6 +4178,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # `review task CODE` — task-scoped run-stat iterations + log transcripts.
     if argv and argv[0] == "task":
         return _task_subcommand(argv[1:])
+    # `review stat` — detailed per-harness/per-model token-burn + health report parsed
+    # from the real on-disk call logs. A bare MANAGEMENT subcommand (like task/dashboard/
+    # sessions), NOT a fan-out mode.
+    if argv and argv[0] == "stat":
+        return _stat_subcommand(argv[1:])
     # Per-project visual-module subcommands (§6). Kept as bare subcommands (like
     # install-skill) so they don't clutter the main review argparse surface. Project
     # modules load by default (trust-by-default); trust-module only pins under the
@@ -2551,7 +4191,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
         from .features.visual.registry import trust_module
 
         if len(argv) < 2:
-            print("usage: review trust-module <name> [--project DIR]  (only needed under REVIEW_UNTRUSTED_MODULES=1)", file=sys.stderr)
+            print(
+                "usage: review trust-module <name> [--project DIR]  (only needed under REVIEW_UNTRUSTED_MODULES=1)",
+                file=sys.stderr,
+            )
             return 2
         proj = None
         rest = argv[2:]
@@ -2593,7 +4236,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # an unknown verb — routes to the TOP-LEVEL parser, which serves --help / --list-defaults
     # / --show-board and otherwise prints HELP (a bare `review` no longer runs a diff review:
     # that was the mistake this migration fixes — use `review diff`). ----------------------
-    is_subcommand = bool(argv) and not argv[0].startswith("-") and argv[0] in known_subcommands()
+    is_subcommand = (
+        bool(argv) and not argv[0].startswith("-") and argv[0] in known_subcommands()
+    )
     if is_subcommand:
         mode = get_mode(argv[0])
         assert mode is not None  # known_subcommands() guarantees it
@@ -2610,7 +4255,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         rc = _reject_subcommand_only_flag_without_verb(argv)
         if rc is not None:
             return rc
-        mode = diff_mode()  # only used by the meta-flag handlers (--list-defaults / --show-board)
+        mode = (
+            diff_mode()
+        )  # only used by the meta-flag handlers (--list-defaults / --show-board)
         rest = argv
         parser = _build_top_level_parser()
 
@@ -2623,7 +4270,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # board path never has to thread the value through every panel signature. Clamped to the
     # ceiling so a stray `--retry 9999` can't pin a dead seat for minutes.
     if getattr(args, "retry", None) is not None:
-        os.environ["REVIEW_RETRY_COUNT"] = str(max(0, min(args.retry, max_retry_count())))
+        os.environ["REVIEW_RETRY_COUNT"] = str(
+            max(0, min(args.retry, max_retry_count()))
+        )
 
     # Run-scoped `--effort` (global flag): parse ONCE into an EffortOverride here so both the
     # board path (applied CLI-side onto the seats) and the flat-panel modes (threaded via
@@ -2637,29 +4286,52 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
     config = load_config()
     backends.configure_unpaid_providers(config.get("unpaid_providers"))
+    from .provider_failover import configure_provider_chains
+
+    configure_provider_chains(config.get("provider_chains"))
 
     # `models:` / `visual_models:` from config, stripped + alias-expanded + blanks dropped
     # (same rule as _split_models for -m). An "effectively empty" list — absent, or only
     # blank/whitespace entries — is NOT a real preference.
     config_models = _split_models(config.get("models") or [])
     config_visual_models = _split_models(config.get("visual_models") or [])
-    config_has_board = isinstance(config.get("board"), list) and bool(config.get("board"))
+    config_has_board = isinstance(config.get("board"), list) and bool(
+        config.get("board")
+    )
     explicit_models = _split_models(args.model)
     explicit_preset = getattr(args, "preset", None) is not None
     preset_applies = mode.name == "review"
     if explicit_preset and preset_applies:
         active_preset = args.preset
-    elif preset_applies and not explicit_models and not config_models and not config_has_board:
+    elif (
+        preset_applies
+        and not explicit_models
+        and not config_models
+        and not config_has_board
+    ):
         active_preset = DEFAULT_PRESET
     else:
         active_preset = None
-    effective_pool_size = args.pool if args.pool is not None else preset_pool_size(active_preset)
+    # Default pool size precedence: explicit `--pool N` > an explicit `--preset` > a
+    # config `pool:` default > the preset/built-in default. The config key lets a personal
+    # config.yaml pin a smaller board (e.g. 3 while a provider is disabled) without passing
+    # `--pool` every call; an explicit flag/preset still wins.
+    if args.pool is not None:
+        effective_pool_size = args.pool
+    elif explicit_preset and preset_applies:
+        effective_pool_size = preset_pool_size(active_preset)
+    elif _config_default_pool(config) is not None:
+        effective_pool_size = _config_default_pool(config)
+    else:
+        effective_pool_size = preset_pool_size(active_preset)
 
     if args.list_defaults:
         if explicit_models:
             effective = explicit_models
         elif mode.name == "visual":
-            effective = config_visual_models or [_expand_alias(x) for x in VISUAL_MODELS]
+            effective = config_visual_models or [
+                _expand_alias(x) for x in VISUAL_MODELS
+            ]
         elif mode.name == "review" and active_preset is not None:
             try:
                 effective = [r.model for r in load_board(config, preset=active_preset)]
@@ -2675,9 +4347,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
                 return 2
         elif mode.name == "brainstorm":
-            effective = _split_models(config.get("brainstorm_models") or []) or config_models or [
-                _expand_alias(x) for x in DEFAULT_MODELS
-            ]
+            effective = (
+                _split_models(config.get("brainstorm_models") or [])
+                or config_models
+                or [_expand_alias(x) for x in DEFAULT_MODELS]
+            )
         else:
             effective = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
         print("\n".join(effective))
@@ -2687,8 +4361,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # Resolve cwd up front so the agentic/diff-only labels reflect whether opencode
         # would actually run in a real repo for THIS -C (it's diff-only outside a repo).
         return _show_board(
-            config, effective_pool_size, _effective_cwd(args.cwd),
-            preset=active_preset, explicit_models=explicit_models,
+            config,
+            effective_pool_size,
+            _effective_cwd(args.cwd),
+            preset=active_preset,
+            explicit_models=explicit_models,
         )
 
     piped_input = _read_stdin_if_piped()
@@ -2704,7 +4381,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         try:
             task_code = normalize_task_code(raw_task)
         except ValueError as exc:
-            print(f"[review-cli] invalid --task CODE: {exc}", file=sys.stderr, flush=True)
+            print(
+                f"[review-cli] invalid --task CODE: {exc}", file=sys.stderr, flush=True
+            )
             return 2
         if task_code is None:
             print(
@@ -2741,14 +4420,16 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 "\nreview: a diff was piped in but no subcommand given. The diff review is "
                 "now `review diff` (a bare `review` no longer runs one). "
                 "Run `git diff | review diff --task CODE`.",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             raise SystemExit(2)
         if rest:
             print(
                 "\nreview: no subcommand given. The diff review is now `review diff` "
                 "(a bare `review` no longer runs one). Run `review diff --task CODE [options]`.",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             raise SystemExit(2)
         raise SystemExit(0)
@@ -2771,21 +4452,115 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # Precedence: explicit -m > config > code default. Brainstorm prefers
     # config.brainstorm_models and drops unreachable backends gracefully (so a
     # missing GEMINI_API_KEY never aborts the run). Explicit -m is honored as-is.
+    # One usage-limit SNAPSHOT for this whole dispatch (board mode takes the same
+    # approach in modes/review.py) — every seat/candidate checked below reads the
+    # SAME sample set instead of each re-globbing + re-parsing the tg-ctl usage
+    # file independently (and possibly disagreeing mid-selection if it changes).
+    _usage_snapshot = usage_limits.load_snapshot()
+
+    def _usage_percent(model: str) -> float | None:
+        return usage_percent_for_model(model, samples=_usage_snapshot)
+
     if explicit_models:
         models = explicit_models
     elif is_brainstorm:
-        src = _split_models(config.get("brainstorm_models") or []) or config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        src = (
+            _split_models(config.get("brainstorm_models") or [])
+            or config_models
+            or [_expand_alias(x) for x in DEFAULT_MODELS]
+        )
         models = [m for m in src if backends.backend_available(m)]
         if not models:
             models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        else:
+            # Reuse-aware panel: pad back up to the AVAILABILITY-filtered count
+            # (not `len(src)`) when some of the reachable models are near their
+            # usage limit, instead of silently running a smaller panel (Alex,
+            # 2026-08-18). Target is `len(models)`, not `len(src)`, so this ONLY
+            # compensates usage-limit exclusions -- it must never fight brainstorm's
+            # existing "drop unreachable backends gracefully" shrink above.
+            models = expand_flat_models_with_reuse(
+                models, len(models), usage_percent=_usage_percent
+            )
+            _warn_if_panel_padded(models)
     else:
-        models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        src = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        if mode.name == "quorum":
+            # Scoped to quorum specifically: `review` builds its OWN board
+            # from `config_models`/`load_board` (never reads this `models`
+            # var) and `visual`/`qa` use their own model lists too — this
+            # `else` branch is also their fallthrough, so padding it
+            # unconditionally printed a spurious "panel padded" warning for a
+            # panel that was never actually dispatched (k3/Fable review
+            # finding). `just-ask` is EXCLUDED too, deliberately: it sends the
+            # identical prompt to every seat with no per-seat role/lens (see
+            # config's role-less-board carve-out for the same reasoning), so a
+            # duplicated seat there is pure cost with zero added diversity —
+            # unlike quorum, which labels + discloses duplicates to its
+            # moderator so a repeated model is at least an INFORMED tradeoff.
+            #
+            # Availability-filter BEFORE padding (k3 review finding, round 3):
+            # `_is_near_limit` fails OPEN on unknown usage data, so an
+            # UNREACHABLE model (missing API key/CLI — unknown to
+            # usage_percent, hence "not excluded") could otherwise survive
+            # padding while a REACHABLE-but-near-limit model gets excluded —
+            # e.g. src=[claude:opus@90%, gemini(keyless)] would pad to
+            # ["gemini","gemini"], a panel with ZERO live seats, worse than
+            # quorum's pre-reuse behavior of just dispatching both and letting
+            # the dead one fail per-call. Filtering first keeps padding
+            # scoped to seats that can actually answer; the all-unreachable
+            # case is handled below (dispatch `src` unfiltered, no exclusion
+            # — k3 review finding, round 5).
+            #
+            # Target `len(reachable)`, NOT `len(src)` (k3/Fable review finding,
+            # round 4): padding must compensate ONLY usage-limit exclusions,
+            # exactly like the brainstorm branch above — targeting `len(src)`
+            # would ALSO duplicate a live model to paper over a plain
+            # unreachable one (a real paid call replacing what used to be a
+            # free per-call failure), which is a different, unrequested
+            # feature and made `_warn_if_panel_padded`'s "near their usage
+            # limit" text false in that case.
+            #
+            # `_chain_aware_available`, NOT raw `backend_available` (k3/Fable
+            # review finding, round 6): the raw probe false-negatives on a
+            # seat whose HEAD provider is down but has a live failover
+            # alternate (e.g. no ZAI_API_KEY but an authenticated `oc:zai`) —
+            # exactly the case `_chain_aware_available`'s own docstring exists
+            # to cover for every OTHER pre-dispatch liveness decision (the
+            # pool guard, the board split, the ETA). Using the raw probe here
+            # would silently drop a chain-recoverable model from the quorum
+            # panel instead of just letting `run_panel`'s own provider
+            # failover (panel.py) route around the down head provider.
+            reachable = [m for m in src if _chain_aware_available(m)]
+            if reachable:
+                models = expand_flat_models_with_reuse(
+                    reachable, len(reachable), usage_percent=_usage_percent
+                )
+                _warn_if_panel_padded(models)
+            else:
+                # EVERYTHING reads unreachable -- dispatch `src` UNFILTERED
+                # and skip usage-limit exclusion entirely (k3 review finding,
+                # round 5): the comment above claimed this fallback matches
+                # brainstorm's "identical" one, but it didn't -- brainstorm's
+                # actual all-unreachable fallback (`config_models or
+                # [_expand_alias(x) for x in DEFAULT_MODELS]`, a few lines up)
+                # dispatches the raw list with NO exclusion, letting each dead
+                # seat fail per-call (and its provider-chain failover a real
+                # chance to recover a false-negative availability probe).
+                # Applying exclusion here too would silently drop a near-limit
+                # model in favor of duplicating another EQUALLY DEAD one --
+                # pure noise when nothing is going to answer regardless.
+                models = src
+        else:
+            models = src
 
     visual_mode = args.visual is not None
     if explicit_models:
         visual_models = explicit_models
     else:
-        visual_models = config_visual_models or [_expand_alias(x) for x in VISUAL_MODELS]
+        visual_models = config_visual_models or [
+            _expand_alias(x) for x in VISUAL_MODELS
+        ]
     # Timeout default by mode. qa is the carve-out: it is technically a "panel mode" (non-
     # review), but a tester run boots a SUT and drives a whole suite with an un-caged agent —
     # tens of minutes, not the short PANEL_TIMEOUT_DEFAULT (240s) the chat panels use. Give it
@@ -2815,7 +4590,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # configured seats. A configured `models:` list is the full priority-ordered roster from
     # which the active pool + reserve are selected; optional `board:` entries can still
     # provide role/name metadata for those models. The board is NEVER disabled — `--pool N`
-    # only sizes how many of its seats run (default 4; the rest are reserve). `use_board` is
+    # only sizes how many of its seats run (default 2, the light preset; the rest are
+    # reserve). `use_board` is
     # a cheap boolean gate computed now; the actual board resolution + cost-safety validation
     # (and the --pool slice) runs LATER
     # (validate_board, below) — after the standalone-visual path has had its chance to
@@ -2824,7 +4600,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # BEFORE the COMPANION visual fan-out, so a doomed config never spends a paid vision
     # call.
     use_board = not panel_mode and (
-        not explicit_models or bool(config_models) or config_has_board or active_preset is not None
+        not explicit_models
+        or bool(config_models)
+        or config_has_board
+        or active_preset is not None
     )
     board: list | None = None
     board_validated = False
@@ -2844,11 +4623,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         try:
             if explicit_models:
                 try:
-                    board = board_from_models(explicit_models, config, preset=active_preset)
+                    board = board_from_models(
+                        explicit_models, config, preset=active_preset
+                    )
                 except BoardConfigError as exc:
                     print(
                         f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
-                        file=sys.stderr, flush=True,
+                        file=sys.stderr,
+                        flush=True,
                     )
                     board = board_from_models(explicit_models, {}, preset=active_preset)
             elif active_preset is not None:
@@ -2891,8 +4673,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # hard-requires it (the pre-commit gate). So brainstorm is excluded from needs_diff
     # and routed through the caught/optional probe below.
     needs_diff = (
-        args.staged or (mode.name == "review" and not visual_mode)
-    ) and not is_brainstorm and not is_visual_subcommand
+        (args.staged or (mode.name == "review" and not visual_mode))
+        and not is_brainstorm
+        and not is_visual_subcommand
+    )
     if diff is None and needs_diff:
         # This path attaches the working-tree / staged diff. Outside a git repo it must NOT
         # raise a raw `git diff` traceback. Two cases:
@@ -2965,6 +4749,65 @@ def _dispatch(argv: list[str] | None = None) -> int:
             diff = ""
     diff = diff or ""
 
+    # Diff-identity binding (reviewlib.stats "Diff-identity binding"): captured from
+    # the FULL, uncapped diff — computed BEFORE the dispatch-time cap below and before
+    # mode_review's own internal capping, so a huge diff's identity is never truncated
+    # away. `repo_id` is independent of `diff` (cwd alone), so it's computed even for a
+    # diff-less just-ask/quorum/brainstorm run — that still lets --check catch a
+    # cross-REPO mismatch (incident #1) even with no file-set signal to add.
+    repo_id = _compute_repo_id(cwd)
+    diff_files = extract_diff_files(diff)
+    diff_sha256 = diff_content_hash(diff) if diff else None
+
+    # Review-stamp integrity (round-5 review finding, k3+Opus, on this same
+    # diff-identity feature): the pre-commit gate's stamp must certify the diff
+    # actually DISPATCHED to the models, not whatever happens to be staged
+    # MINUTES later when the multi-model panel finishes. Captured HERE,
+    # immediately adjacent to the `diff` capture above (a millisecond gap, not
+    # the minutes-long panel-run gap `_write_review_stamp` used to have when it
+    # independently re-ran `git diff --cached` at stamp-WRITE time) — see
+    # `reviewlib.install._write_review_stamp`'s docstring for the full story
+    # (why it can't just hash `diff` directly: the pre-commit hook's own
+    # verification is UNPREFIXED, `diff` is prefixed via `_git_diff`'s
+    # `diff.noprefix` fix). Only meaningful for `--staged` (the only case
+    # `_write_review_stamp` is ever reached from); None otherwise.
+    stamp_diff_hash = _stamp_hash_for_staged_diff(cwd) if args.staged else None
+
+    # Dispatch-time diff cap for the flat PANEL modes (brainstorm/quorum/just-ask) —
+    # see reviewlib.backends.cap_diff_for_dispatch's docstring for why this is NOT
+    # applied to `review`/`visual` (mode_review owns capping its own two dispatch
+    # paths itself, so it can keep the UNCAPPED canonical diff for the --commit
+    # checkpoint's integrity check; these three modes have no such requirement).
+    # brainstorm in particular auto-probes the diff by DEFAULT (no --diff needed), so
+    # without this an oversized diff is sent uncapped to every persona every round —
+    # the worst token-burn multiplier the 2026-08 investigation found (codex/kimi
+    # review finding on this feature's own PR). A piped diff (`diff_from_stdin`) is
+    # exempt, matching mode_review's identical exemption.
+    #
+    # codex review finding (round 2 on this feature's own PR): each of these three
+    # modes ALSO caps at its own dispatch boundary (`cap_diff_for_dispatch` is called
+    # again inside mode_brainstorm/mode_quorum/mode_just_ask, so a direct library
+    # caller bypassing this CLI layer is still protected). Capping HERE and there both
+    # is a genuine double-application: harmless at the DEFAULT cap (the first call's
+    # output is already <= cap, so the second is a true no-op), but NOT idempotent
+    # when `$REVIEW_DIFF_MAX_BYTES` is set below the truncation marker's own length —
+    # the second call then re-truncates the FIRST call's marker text and reports ITS
+    # byte count as "the full diff", not the real original diff's size. Rather than
+    # remove either capping point (the mode-level one is the ONLY guard for a direct
+    # caller; this CLI-level one is what `test_cli_brainstorm_oversized_worktree_diff_
+    # is_capped_for_dispatch` pins), thread whether THIS layer already capped it so the
+    # mode-level call becomes a genuine no-op for the CLI path instead of a second real
+    # application — see `diff_already_capped` in `ModeContext.extra` below.
+    diff_already_capped = False
+    if (
+        diff
+        and not diff_from_stdin
+        and mode.name in ("brainstorm", "quorum", "just-ask")
+    ):
+        capped_diff = backends.cap_diff_for_dispatch(diff)
+        diff_already_capped = capped_diff != diff
+        diff = capped_diff
+
     # --- --visual composition (§2.1). Build the visual context ONCE; thread it into
     # whichever consumer runs. cvGate fires here regardless of mode (a broken render
     # is flagged before any model call). -----------------------------------------
@@ -2979,7 +4822,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
             print(
                 "[review-cli] qa: --visual is not supported (the tester produces its OWN "
                 "visual proof by driving the SUT). Drop --visual.",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
             return 2
 
@@ -3005,7 +4849,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 no_ai=args.no_ai,
                 # Stage-2a cost-saver default ON; --no-local-model OR `local_model: false`
                 # in config.yaml disables it (CLI flag wins over config).
-                local_model=(not args.no_local_model) and (config.get("local_model", True) is not False),
+                local_model=(not args.no_local_model)
+                and (config.get("local_model", True) is not False),
                 vision_timeout=args.vision_timeout,
                 as_json=args.json,
                 strict=args.strict,
@@ -3046,7 +4891,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # --visual blank.png` would run the review and stamp success). Exit 10 under
         # --strict (the gate/hook block code), else a non-zero advisory exit.
         if visual_ctx.prefilter_verdict == "rollback":
-            print(f"[review visual] ROLLBACK (pre-filter, mode blocked): {visual_ctx.prefilter_reason}")
+            print(
+                f"[review visual] ROLLBACK (pre-filter, mode blocked): {visual_ctx.prefilter_reason}"
+            )
             # An unreadable/missing image is a USAGE error (exit 1), matching the
             # standalone exit-code map — scripts/hooks rely on the distinction between
             # "unreadable input" (1) and "blocking content verdict under --strict" (10).
@@ -3054,7 +4901,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 return 1
             return 10 if args.strict else 1
         if visual_ctx.vision_error:
-            print(f"[review visual] UNVERIFIED (mode blocked): {visual_ctx.vision_error}")
+            print(
+                f"[review visual] UNVERIFIED (mode blocked): {visual_ctx.vision_error}"
+            )
             if visual_ctx.vision_timed_out:
                 return 124
             return 10 if args.strict else 1
@@ -3073,10 +4922,20 @@ def _dispatch(argv: list[str] | None = None) -> int:
     moderator_arg = getattr(args, "moderator", None)
     moderators = pick_moderators(moderator_arg, models) if panel_mode else []
     ctx = ModeContext(
-        args=args, models=models, diff=diff, cwd=cwd, timeout=timeout,
-        with_visual=_with_visual_text, visual_ctx=visual_ctx, moderators=moderators,
+        args=args,
+        models=models,
+        diff=diff,
+        cwd=cwd,
+        timeout=timeout,
+        with_visual=_with_visual_text,
+        visual_ctx=visual_ctx,
+        moderators=moderators,
         effort_override=effort_override,
-        extra={"diff_from_stdin": diff_from_stdin},
+        extra={
+            "diff_from_stdin": diff_from_stdin,
+            "diff_already_capped": diff_already_capped,
+            "stamp_diff_hash": stamp_diff_hash,
+        },
     )
 
     # The recorded mode is the EXACT mode (a brainstorm of 4 is nothing like a plain
@@ -3091,9 +4950,13 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # per-round pool — and the ETA key — is the slot count, not len(models) (codex
         # P2: don't undercount a 1-2 model panel). brainstorm_pool mirrors that.
         return _run_mode_with_stats(
-            mode.stats_mode, brainstorm_pool(models),
+            mode.stats_mode,
+            brainstorm_pool(models),
             lambda: mode.handler(ctx),
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
 
     if mode.name == "qa":
@@ -3106,15 +4969,25 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
         qa_seat = [resolved_tester_backend(_split_models(args.model or []))]
         return _run_mode_with_stats(
-            mode.stats_mode, qa_seat, lambda: mode.handler(ctx),
+            mode.stats_mode,
+            qa_seat,
+            lambda: mode.handler(ctx),
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
 
     if mode.name not in ("review", "visual"):
         # just-ask / quorum: a flat multi-model panel; pool_size == len(models).
         return _run_mode_with_stats(
-            mode.stats_mode, models, lambda: mode.handler(ctx),
+            mode.stats_mode,
+            models,
+            lambda: mode.handler(ctx),
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
 
     # The review mode. Validate the board now if it wasn't already (the no-visual path);
@@ -3124,6 +4997,36 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if rc is not None:
         return rc
     if board:
+        # Foolproofing (review mode + a NON-EMPTY diff ONLY): bail with a proposal / targeted
+        # per-provider error when the live subset can't satisfy the requested pool size,
+        # instead of silently running a degenerate panel (reviewlib.pool_guard). Gated on:
+        #   * mode.name == "review" — the proposal/error text is review-specific
+        #     (`review diff --preset …`, "review pool"), so it must NOT fire for the other
+        #     panel modes (quorum / brainstorm / just-ask / visual) that reach this dispatch;
+        #   * a non-empty diff — an EMPTY diff runs NO panel (mode_review short-circuits with
+        #     "No diff to review", exit 1), so there is no pool to assemble and the guard must
+        #     not preempt that no-op with an EXIT_UNSATISFIED. Inert on the happy path + fake
+        #     backend.
+        if mode.name == "review" and diff.strip():
+            # `preset_pool_size(active_preset)`, NOT `preset_pool_size(DEFAULT_PRESET)`
+            # (2 review-round finding, all 3 reviewers, after the light-default change):
+            # `active_preset` is `None` for a custom config `models:`/`board:` roster —
+            # in that case a no-override run ACTUALLY resolves pool via
+            # `preset_pool_size(None) == DEFAULT_POOL_SIZE` (4, cli.py ~4218), not the
+            # preset system's own default (2). Passing the literal `DEFAULT_PRESET` here
+            # would silently halve the guard's promised pool for every config-roster user,
+            # contradicting the very comment/help text this same change added elsewhere.
+            guard_rc = _evaluate_pool_or_bail(
+                config,
+                config_models,
+                config_has_board,
+                _seats_of(board),
+                explicit_models,
+                args.pool,
+                _config_default_pool(config) or preset_pool_size(active_preset),
+            )
+            if guard_rc is not None:
+                return guard_rc
         review_pool_size = len(board) if explicit_models else effective_pool_size
         # Failover pool. The PLANNED pool keys the up-front ETA: the top `--pool`
         # AVAILABLE seats by priority (startup failover — the same selection mode_review
@@ -3132,8 +5035,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         if explicit_models:
             planned_pool = list(board)
         else:
+            # Chain-aware (`_chain_aware_available`), matching the pool guard above AND the
+            # REAL dispatch split in `modes.review._mode_review_board` — a raw
+            # `backend_available` here would let the ETA plan a smaller pool than the guard
+            # just approved (codex P1 on review of #157).
             planned_pool, _ = split_pool_reserve(
-                board, review_pool_size, lambda r: backends.backend_available(r.model),
+                board,
+                review_pool_size,
+                lambda r: _chain_aware_available(r.model),
             )
         eta_models = [r.model for r in planned_pool]
         outcome_sink: list = []
@@ -3142,6 +5051,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
             pool_size=review_pool_size,
             outcome_sink=outcome_sink,
             exact_board=bool(explicit_models),
+            # None for an explicit -m board (exact_board — usage-limit awareness
+            # doesn't apply to a hand-picked, non-failover roster) or when a
+            # config/default board is priced out entirely — matches this
+            # function's own "explicit -m is honored as-is" precedent above.
+            usage_percent=None if explicit_models else _usage_percent,
         )
 
         def _ran_models() -> list[str]:
@@ -3151,16 +5065,57 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # real id), so the stat record keys on what actually ran — not labels.
             return outcome_sink[0].usable_models if outcome_sink else []
 
+        def _ran_roles() -> list[str]:
+            # review-cli#221: mirrors `_ran_models` exactly, one board ROLE per usable
+            # seat (see `panel.FailoverOutcome.usable_roles`) — including a role filled
+            # by the shortage-resilience duplicate-model pad (PR #207), which repeats a
+            # `.model` string but always carries its OWN distinct `.role`.
+            if explicit_models:
+                return [r.role for r in board]
+            return outcome_sink[0].usable_roles if outcome_sink else []
+
         return _run_mode_with_stats(
-            mode.stats_mode, eta_models, lambda: mode.handler(ctx),
+            mode.stats_mode,
+            eta_models,
+            lambda: mode.handler(ctx),
             models_after=_ran_models,
+            roles_after=_ran_roles,
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
-    # Flat review path (no board): ctx.extra has no "board" key, so the handler reads
-    # board=None and takes the legacy flat call shape.
+    # Flat review path (no board): explicit `-m` with no configured board/models. The
+    # foolproofing guard STILL applies here — an explicit selection whose live subset can't
+    # converge must not silently run a degenerate flat panel either (the board path isn't the
+    # only advertised case). The user's selection IS `models` (the flat `-m` list). Gated to
+    # the review mode ONLY (the flat dispatch is shared by quorum / brainstorm / just-ask,
+    # whose panels keep their own behaviour and never see review-specific proposal text) AND
+    # to a non-empty diff (an empty diff runs no panel — see the board-path note above).
+    if mode.name == "review" and diff.strip():
+        # See the matching `preset_pool_size(active_preset)` comment above — same
+        # config-roster-vs-preset-system distinction applies here.
+        guard_rc = _evaluate_pool_or_bail(
+            config,
+            config_models,
+            config_has_board,
+            tuple((m, m) for m in models),
+            explicit_models,
+            args.pool,
+            _config_default_pool(config) or preset_pool_size(active_preset),
+        )
+        if guard_rc is not None:
+            return guard_rc
+    # ctx.extra has no "board" key, so the handler reads board=None and takes the legacy
+    # flat call shape.
     return _run_mode_with_stats(
-        mode.stats_mode, models, lambda: mode.handler(ctx),
+        mode.stats_mode,
+        models,
+        lambda: mode.handler(ctx),
         task_code=task_code,
+        repo_id=repo_id,
+        diff_files=diff_files,
+        diff_sha256=diff_sha256,
     )
 
 
@@ -3182,6 +5137,10 @@ def _seat_reads_repo(model: str, cwd_is_repo: bool) -> bool:
     backend = backends.resolve_backend(model)
     if backend is backends.review_codex:
         return True
+    if backend is backends.review_omp:
+        # omp runs read-only (`--tools read,grep,glob`) in the real cwd like codex —
+        # agentic regardless of whether `-C` is a git repo.
+        return True
     if backend is backends.review_opencode:
         return cwd_is_repo
     if backend is backends.review_claude:
@@ -3197,8 +5156,12 @@ def _seat_reads_repo(model: str, cwd_is_repo: bool) -> bool:
 
 
 def _show_board(
-    config: dict, pool_size: int = DEFAULT_POOL_SIZE, cwd: Path | None = None,
-    *, preset: str | None = None, explicit_models: list[str] | None = None,
+    config: dict,
+    pool_size: int = DEFAULT_POOL_SIZE,
+    cwd: Path | None = None,
+    *,
+    preset: str | None = None,
+    explicit_models: list[str] | None = None,
 ) -> int:
     """Print the active reviewer board as a PRIORITY-ordered failover pool.
 
@@ -3223,7 +5186,8 @@ def _show_board(
             except BoardConfigError as exc:
                 print(
                     f"[review-cli] {exc}; ignoring malformed board metadata for explicit -m",
-                    file=sys.stderr, flush=True,
+                    file=sys.stderr,
+                    flush=True,
                 )
                 board = board_from_models(exact_models, {}, preset=preset)
             source = f"explicit -m{f' + preset:{preset}' if preset else ''}"
@@ -3235,7 +5199,11 @@ def _show_board(
             source = "config.yaml (models:)"
         else:
             board = load_board(config)
-            source = "config.yaml (board:)" if isinstance(config.get("board"), list) and config.get("board") else "default"
+            source = (
+                "config.yaml (board:)"
+                if isinstance(config.get("board"), list) and config.get("board")
+                else "default"
+            )
     except BoardConfigError as exc:
         print(f"[review-cli] {exc}", file=sys.stderr, flush=True)
         return 2
@@ -3248,16 +5216,38 @@ def _show_board(
     avail = [backends.backend_available(r.model) for r in board]
     available_count = sum(avail)
     exact_board = bool(exact_models)
-    pool_filled = len(board) if exact_board else _effective_pool_size(available_count, pool_size)
-    sized = " (sized by preset/--pool)" if pool_size != DEFAULT_POOL_SIZE else ""
+    pool_filled = (
+        len(board) if exact_board else _effective_pool_size(available_count, pool_size)
+    )
+    # The "sized" marker fires iff the RESOLVED pool differs from the selected preset's
+    # (or the config-roster fallback's) own default pool — typically an explicit
+    # --pool N that isn't equal to that default. It does NOT fire just because a
+    # non-bare --preset was passed (a preset's own resolved pool always equals
+    # preset_pool_size(that preset), so that clause alone can never trip it) — review
+    # finding, comment corrected to match actual behavior, not aspiration. Comparing
+    # against the bare constant DEFAULT_POOL_SIZE (4) unconditionally was wrong once a
+    # bare `review --show-board` started resolving the light preset's pool of 2 (Alex,
+    # 2026-08-28): every unadorned invocation would misleadingly claim to be "sized".
+    # `preset_pool_size(None)` already returns DEFAULT_POOL_SIZE (review finding: a
+    # prior `if preset else DEFAULT_POOL_SIZE` ternary duplicated that same fallback).
+    bare_default_pool = preset_pool_size(preset)
+    sized = " (sized by preset/--pool)" if pool_size != bare_default_pool else ""
     if exact_board:
-        print(f"Reviewer board ({len(board)} explicit seats, source: {source}; "
-              "exact -m run = every listed seat is attempted; --pool is ignored):\n")
+        print(
+            f"Reviewer board ({len(board)} explicit seats, source: {source}; "
+            "exact -m run = every LIVE listed seat is attempted, --pool is ignored — but if the "
+            "live subset can't fill the request the pre-dispatch guard PROPOSES a fitting "
+            "board/preset instead of running a degenerate panel):\n"
+        )
     else:
-        pool_target = "all AVAILABLE seats" if pool_size <= 0 else f"top {pool_size} AVAILABLE"
-        print(f"Reviewer board ({len(board)} seats, priority-ordered, source: {source}; "
-              f"live pool = {pool_target} by priority{sized}, "
-              f"{pool_filled} filled, the rest reserve — size with --pool N):\n")
+        pool_target = (
+            "all AVAILABLE seats" if pool_size <= 0 else f"top {pool_size} AVAILABLE"
+        )
+        print(
+            f"Reviewer board ({len(board)} seats, priority-ordered, source: {source}; "
+            f"live pool = {pool_target} by priority{sized}, "
+            f"{pool_filled} filled, the rest reserve — size with --pool N):\n"
+        )
     name_w = max((len(r.display) for r in board), default=0)
     role_w = max((len(r.role or "general") for r in board), default=0)
     effort_w = max((len(r.effort or "-") for r in board), default=1)
@@ -3272,10 +5262,13 @@ def _show_board(
         elif backends.runtime_provider_marked_unpaid(reviewer.model):
             status = (
                 "will attempt (provider unpaid/disabled)"
-                if exact_board else "SKIPPED (provider unpaid/disabled)"
+                if exact_board
+                else "SKIPPED (provider unpaid/disabled)"
             )
         else:
-            status = "will attempt (no key/CLI)" if exact_board else "SKIPPED (no key/CLI)"
+            status = (
+                "will attempt (no key/CLI)" if exact_board else "SKIPPED (no key/CLI)"
+            )
         role = (reviewer.role or "general").ljust(role_w)
         effort = (reviewer.effort or "-").ljust(effort_w)
         if exact_board:
@@ -3286,34 +5279,48 @@ def _show_board(
             tier = "pool   " if seen_available < pool_filled else "reserve"
             seen_available += 1
         prio = f"#{index + 1}"
-        scope = "agentic" if _seat_reads_repo(reviewer.model, cwd_is_repo) else "diff-only"
-        print(f"  {prio:>3}  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  "
-              f"{reviewer.model}  [{status}]  ({scope})  effort={effort}")
-    print("\nScope: `agentic` seats (codex / opencode / claude-CLI) run read-only in the "
-          "real repo and can read any project file; `diff-only` seats (gemini / z.ai / "
-          "commandcode / claude-API) are stateless HTTP calls that see only the diff.")
+        scope = (
+            "agentic" if _seat_reads_repo(reviewer.model, cwd_is_repo) else "diff-only"
+        )
+        print(
+            f"  {prio:>3}  [{tier}]  {reviewer.display.ljust(name_w)}  {role}  "
+            f"{reviewer.model}  [{status}]  ({scope})  effort={effort}"
+        )
+    print(
+        "\nScope: `agentic` seats (codex / opencode / omp / claude-CLI) run read-only in the "
+        "real repo and can read any project file; `diff-only` seats (gemini / z.ai / "
+        "commandcode / claude-API) are stateless HTTP calls that see only the diff."
+    )
     if exact_board:
-        print("\nWith explicit `-m`, review-cli attempts exactly the listed models in order. "
-              "`--pool` and reserve failover do not slice or reorder explicit seats.")
+        print(
+            "\nWith explicit `-m`, review-cli attempts exactly the listed models in order. "
+            "`--pool` and reserve failover do not slice or reorder explicit seats."
+        )
     elif pool_size <= 0:
-        print("\nA plain `review diff` runs all AVAILABLE seats by priority (--pool 0); "
-              "a higher-priority seat that is unavailable is skipped, and a seat that "
-              "fails mid-run is recorded while the remaining available seats continue. "
-              "`--pool N` sizes the pool.")
+        print(
+            "\nA plain `review diff` runs all AVAILABLE seats by priority (--pool 0); "
+            "a higher-priority seat that is unavailable is skipped, and a seat that "
+            "fails mid-run is recorded while the remaining available seats continue. "
+            "`--pool N` sizes the pool."
+        )
     else:
-        print(f"\nA plain `review diff` runs the top {pool_size} AVAILABLE seats by "
-              f"priority (--pool {pool_size}); a higher-priority seat that is "
-              f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "
-              f"pool keeps {pool_size} working reviewers. `--pool N` sizes the pool; "
-              f"`--pool 0` runs all available seats.")
+        print(
+            f"\nA plain `review diff` runs the top {pool_size} AVAILABLE seats by "
+            f"priority (--pool {pool_size}); a higher-priority seat that is "
+            f"unavailable (or fails mid-run) is replaced by the next-priority reserve so the "
+            f"pool keeps {pool_size} working reviewers. `--pool N` sizes the pool; "
+            f"`--pool 0` runs all available seats."
+        )
     if not all(avail):
-        print("Unavailable reviewers drop out and are backfilled from the reserve; the "
-              "board degrades gracefully only if the reserve is exhausted. The default "
-              "agentic seats (`oc:…` Kimi/GLM/Qwen/DeepSeek/Grok, codex, claude) need their CLI "
-              "on PATH — `oc:` seats need the `opencode` binary plus its own provider auth "
-              "(`opencode auth login`), NOT review-cli's COMMANDCODE_API_KEY/ZAI_API_KEY. "
-              "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "
-              "diff-only `commandcode:`/`zai:` backends for `-m cc`/`-m glm` and config seats.)")
+        print(
+            "Unavailable reviewers drop out and are backfilled from the reserve; the "
+            "board degrades gracefully only if the reserve is exhausted. The default "
+            "agentic seats (`oc:…` Kimi/GLM/Qwen/DeepSeek/Grok, codex, claude) need their CLI "
+            "on PATH — `oc:` seats need the `opencode` binary plus its own provider auth "
+            "(`opencode auth login`), NOT review-cli's COMMANDCODE_API_KEY/ZAI_API_KEY. "
+            "gemini needs GEMINI_API_KEY. (COMMANDCODE_API_KEY/ZAI_API_KEY only power the "
+            "diff-only `commandcode:`/`zai:` backends for `-m cc`/`-m glm` and config seats.)"
+        )
     return 0
 
 

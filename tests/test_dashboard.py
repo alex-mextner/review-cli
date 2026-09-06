@@ -13,6 +13,7 @@ Both the log dir and the store path are redirected to temp dirs (REVIEW_LOG_DIR 
 REVIEW_DASHBOARD_STORE) so the tests never touch the user's real logs or annotations.
 Run: ``python3 tests/test_dashboard.py`` (standalone, like the other reviewlib tests).
 """
+
 from __future__ import annotations
 
 import json
@@ -85,15 +86,33 @@ def _seed_logs(log_dir: Path) -> None:
     _write_call_log(log_dir, "20260601T100000_000000", "codex", 0, "looks good\n")
     _write_call_log(log_dir, "20260601T100005_000000", "gemini", 0, "one nit\n")
     # Session B (>90s later): a single review with an error in the body.
-    _write_call_log(log_dir, "20260601T103000_000000", "claude", 0,
-                    "There's an issue with the selected model. error: not available\n")
+    _write_call_log(
+        log_dir,
+        "20260601T103000_000000",
+        "claude",
+        0,
+        "There's an issue with the selected model. error: not available\n",
+    )
     # Session C (>90s later): a timed-out call.
-    _write_call_log(log_dir, "20260601T110000_000000", "codex", 0,
-                    "partial output\n[review-cli] TIMEOUT after 240s — partial output above]\n")
+    _write_call_log(
+        log_dir,
+        "20260601T110000_000000",
+        "codex",
+        0,
+        "partial output\n[review-cli] TIMEOUT after 240s — partial output above]\n",
+    )
     # Session D: brainstorm — per-call round logs + the discussion md, same time window.
     _write_call_log(log_dir, "20260601T120000_000000", "codex", 1, "round one output\n")
-    _write_call_log(log_dir, "20260601T120010_000000", "gemini", 1, "round one output\n")
-    _write_brainstorm(log_dir, "20260601T120020_000000", "How to decompose a CLI", "codex,gemini", "codex")
+    _write_call_log(
+        log_dir, "20260601T120010_000000", "gemini", 1, "round one output\n"
+    )
+    _write_brainstorm(
+        log_dir,
+        "20260601T120020_000000",
+        "How to decompose a CLI",
+        "codex,gemini",
+        "codex",
+    )
 
 
 def _wait_for_cache_refresh(cache, *, timeout: float = 5.0) -> None:
@@ -115,7 +134,9 @@ def test_parse_call_log_basic():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, "hello\nworld\n")
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, "hello\nworld\n"
+        )
         c = p.parse_call_log(path)
         assert c is not None
         assert c.backend == "codex"
@@ -126,15 +147,406 @@ def test_parse_call_log_basic():
         assert c.has_error is False
 
 
+def test_parse_call_log_body_is_capped_for_a_huge_output():
+    """review-cli#326: CallLog kept the FULL streamed body for every one of ~132k calls
+    on a real install, ballooning the dashboard process to 32.8GB RSS. `has_error`/
+    `completed` are already documented as EXIT-code-authoritative (body-grepping is only
+    a legacy fallback for exit-code-less logs), so bounding what's RETAINED in `.body`
+    caps per-call memory without touching that classification logic. A call whose exit
+    code is present must classify correctly regardless of body size."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        huge_body = "line of real review output\n" * 200_000  # ~5.4MB on disk
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, huge_body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(huge_body), (
+            "the stored body must be bounded, not the full multi-MB text"
+        )
+        assert (
+            len(c.body) <= p.CALL_BODY_STORE_CAP + 200
+        )  # + slack for markers stripped
+        assert c.completed is True
+        assert c.has_error is False, (
+            "exit_code=0 is authoritative regardless of body size/truncation"
+        )
+
+
+def test_parse_call_log_body_cap_bounds_real_retained_memory_for_a_single_astral_char():
+    """review-cli#326 round 4 (codex P1): an encoded-UTF-8-byte-length check (an
+    earlier version of this test) is NOT the same guarantee as bounding the actual
+    retained Python object's memory. CPython's PEP 393 string representation stores
+    the WHOLE string at up to 4 bytes/char once even ONE astral-plane character (an
+    emoji) is present anywhere in it, regardless of how many bytes that string encodes
+    to -- codex concretely reproduced ~262KB retained (4x the 64KB byte cap) from a
+    single retained astral character with an otherwise-ASCII body. `_cap_body` now
+    caps CHARACTER count at a quarter of the byte budget (`_CAP_CHARS`), which bounds
+    `sys.getsizeof()` -- the metric that actually matters -- regardless of script mix."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # codex's own repro shape: one astral character (forces 4-byte/char storage
+        # for the WHOLE string) plus a large ASCII body.
+        huge_body = "😀" + ("a" * 200_000)
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, huge_body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        retained_bytes = sys.getsizeof(c.body)
+        assert retained_bytes <= p.CALL_BODY_STORE_CAP + 512, (
+            f"retained body object is {retained_bytes} bytes -- a single astral "
+            "character anywhere in the body must not blow the memory cap"
+        )
+
+
+def test_parse_call_log_oversized_empty_call_stays_empty_after_capping():
+    """review-cli#326 round 5 (codex P1): `_cap_body` inserts a human-readable
+    truncation marker line into the retained `body`. `_body_has_real_content` (which
+    decides HEALTH_EMPTY vs HEALTH_OK for an EXIT-0 call) must not mistake that marker
+    for real review prose -- a genuinely empty call (all `[review-cli]` framing plus a
+    zero usage line, no real content) that happens to be huge enough to get capped
+    must still classify as HEALTH_EMPTY, not flip to HEALTH_OK just because it was
+    long enough to trigger the cap."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # All framing/usage lines, no real prose -- well past the cap, so capping
+        # definitely fires and the marker line lands in the retained body.
+        body = ("[review-cli] framing line\n" * 2000) + "output_tokens=0\n"
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(body), "sanity check: capping actually fired"
+        assert p.classify_call(c) == p.HEALTH_EMPTY, (
+            "the cap marker line must not be counted as real content"
+        )
+
+
+def test_parse_call_log_oversized_single_line_framing_body_stays_empty():
+    """review-cli#326 round 6 (codex P1 reproduction, two rounds): a body that is ONE
+    giant `[review-cli] ...` framing line, far past the cap, has no newline for
+    `_cap_body`'s slices to anchor on -- an intermediate version of this fix had
+    `_cap_body` drop the un-anchored fragment to avoid it being misread as content,
+    which fixed THIS case but broke the mirror case (see the sibling test below).
+    The real fix: `has_real_content` is computed ONCE from the FULL, uncapped body in
+    `_classify_from_full_text` (same as the other six classification fields), so
+    `_cap_body`'s exact boundary behavior no longer matters for correctness at all --
+    only for what gets shown for display."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = "[review-cli] " + ("x" * 40_000)  # one line, no newlines anywhere
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(body), "sanity check: capping actually fired"
+        assert p.classify_call(c) == p.HEALTH_EMPTY, (
+            "an oversized single-line framing body must not misclassify as HEALTH_OK"
+        )
+
+
+def test_parse_call_log_oversized_single_line_real_verdict_stays_ok():
+    """review-cli#326 round 6 (codex P1, second reproduction): the MIRROR of the test
+    above. A body that is ONE giant line of REAL review prose (no `[review-cli]`
+    framing prefix, no newlines anywhere) must still classify as HEALTH_OK even though
+    `_cap_body` retains almost none of it for display -- `has_real_content` is computed
+    from the FULL body before any capping, so it is unaffected by how little (or how
+    ragged) the displayed `body` ends up being."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = "Looks correct, no further findings. " + ("x" * 40_000)
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) < len(body), "sanity check: capping actually fired"
+        assert p.classify_call(c) == p.HEALTH_OK, (
+            "an oversized single-line real verdict must not misclassify as "
+            "HEALTH_EMPTY just because capping left little/no recognizable content "
+            "in the DISPLAYED body"
+        )
+
+
+def test_parse_call_log_legacy_error_marker_near_start_survives_truncation():
+    """The legacy (no exit-code footer) error-detection fallback still finds a marker
+    that appears early in a huge body -- the common real-world shape (an error message
+    up front, followed by verbose tool output) -- even after the size cap is applied."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = "error: not available\n" + ("filler output line\n" * 200_000)
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) <= p.CALL_BODY_STORE_CAP + 200
+        assert c.has_error is True
+        assert c.error_summary and "error: not available" in c.error_summary
+
+
+def test_parse_call_log_legacy_error_marker_near_end_survives_truncation():
+    """Mirrors the near-start test for the other headline motivation in `_cap_body`'s
+    comment: 'crash at the tail of a long run'. The marker sits in the final ~32KB
+    (`text[-half:]`), which the head+tail split must retain."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body = ("filler output line\n" * 200_000) + "error: not available\n"
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.body) <= p.CALL_BODY_STORE_CAP + 200
+        assert "error: not available" in c.body, (
+            "the tail half must retain the marker, not just detect it blindly"
+        )
+        assert c.has_error is True, (
+            "_looks_like_error scans the whole (capped) body, so a tail marker "
+            "is still detected -- error_summary's own first-non-blank-line pick "
+            "is a separate, pre-existing display heuristic not covered here"
+        )
+
+
+def test_parse_call_log_legacy_error_marker_in_middle_is_still_detected():
+    """review-cli#326 round 2 (codex reproduction): a legacy log with no EXIT footer
+    whose ONLY error marker falls strictly between the retained head and tail halves
+    used to flip `has_error` True->False after capping -- classification is now
+    computed ONCE from the FULL untruncated text in `parse_call_log`, before
+    `_cap_body` ever runs, so a middle-only marker is still correctly detected even
+    though it does not survive into the (capped) `body` kept for display."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + "error: not available\n" + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert "error: not available" not in c.body, (
+            "sanity check: the marker really did land in the truncated-away middle"
+        )
+        assert c.completed is True
+        assert c.has_error is True, (
+            "classification runs on the full body before capping, so a middle-only "
+            "marker in a footerless legacy log is still caught"
+        )
+
+
+def test_parse_call_log_paywall_sentinel_in_middle_is_still_detected():
+    """Sibling of the error-marker case above, for the paywall sentinel: a codex call
+    can stream a long transcript and only hit the sentinel deep in the body (see
+    `_has_paywall_sentinel`'s own docstring) -- past the retained head+tail, that must
+    still classify as HEALTH_PAYWALL, not silently fall back to ok/error."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + "currently unavailable\n" + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert "currently unavailable" not in c.body, (
+            "sanity check: the sentinel really did land in the truncated-away middle"
+        )
+        assert c.is_paywall is True
+        assert p.classify_call(c) == p.HEALTH_PAYWALL
+
+
+def test_parse_call_log_cf_block_marker_in_middle_is_still_detected():
+    """review-cli#326 round 4 (Opus missing-test finding): same middle-truncation
+    class as the error-marker/paywall tests above, but for `_CF_BLOCK_MARKER` --
+    `is_cf_blocked` is computed from the FULL body/stderr in `_classify_from_full_text`,
+    so a marker that only survives in the omitted middle must still be caught."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + "error code: 1010\n" + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert "error code: 1010" not in c.body, (
+            "sanity check: the marker really did land in the truncated-away middle"
+        )
+        assert c.is_cf_blocked is True
+        assert p.classify_call(c) == p.HEALTH_BLOCKED
+
+
+def test_parse_call_log_bad_key_marker_in_middle_is_still_detected():
+    """Sibling of the CF-block test above, for `_BAD_KEY_MARKER`."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        pad = "filler output line\n" * 100_000  # well past half the cap on each side
+        body = pad + '{"error":"bad key"}\n' + pad
+        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body)
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert '{"error":"bad key"}' not in c.body, (
+            "sanity check: the marker really did land in the truncated-away middle"
+        )
+        assert c.is_bad_key is True
+        assert p.classify_call(c) == p.HEALTH_AUTH
+
+
+def test_parse_call_log_huge_stderr_is_capped_too():
+    """review-cli#326 review finding (Opus + Codex, round 1): stderr_lines was the same
+    unbounded-retention bug as body, just through a different field -- a chatty backend
+    dumping megabytes to stderr must not reproduce the RSS blowup this fix exists for."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        stderr_block = "".join(
+            f"[stderr] boom {i}\n" for i in range(200_000)
+        )  # several MB
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, stderr_block + "ok\n"
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        total_stderr = "\n".join(c.stderr_lines)
+        assert len(total_stderr) <= p.CALL_BODY_STORE_CAP + 200
+        assert c.stderr_lines[0] == "boom 0", (
+            "first line still usable for error_summary"
+        )
+        assert c.has_error is True
+
+
+def test_parse_call_log_many_near_empty_stderr_lines_caps_line_count_too():
+    """review-cli#326 round 3 (codex P1): byte-capping alone isn't enough -- a backend
+    emitting tens of thousands of SHORT `[stderr]` lines produces a byte-capped ~64KiB
+    string that still explodes into tens of thousands of separate `str` objects once
+    split back into a list, each one costing real interpreter overhead well beyond its
+    own bytes. `_cap_stderr_lines` must bound the LINE COUNT independently of bytes."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        # 300,000 near-empty stderr lines: byte-cheap (~2.4MB raw) but line-count-huge.
+        stderr_block = "".join(f"[stderr] {i}\n" for i in range(300_000))
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, stderr_block + "ok\n"
+        )
+        c = p.parse_call_log(path)
+        assert c is not None
+        assert len(c.stderr_lines) <= p.CALL_STDERR_LINE_CAP + 1, (
+            "line count must be bounded independently of the byte cap"
+        )
+        assert c.stderr_lines[0] == "0"
+        assert c.has_error is True
+
+
+def test_direct_construction_auto_classifies_from_body():
+    """review-cli#326 round 3 (Fable finding 3 / codex P2): a `CallLog` built directly
+    (a test fixture, any future non-`parse_call_log` constructor) with a paywall/
+    error-shaped body and no explicit classification kwargs must still classify
+    correctly -- matching what the removed `@property`s used to do. `None` is the
+    sentinel `__post_init__` uses to detect "caller left this unset" and auto-derive
+    from `self.body`/`self.stderr_lines`/etc.; passing an explicit value (as
+    `parse_call_log` always does, from the FULL untruncated text) skips it."""
+    from reviewlib.dashboard import parser as p
+
+    call = p.CallLog(
+        path="",
+        filename="x.log",
+        started=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="claude-p",
+        body="currently unavailable",
+        exit_code=0,
+    )
+    assert call.is_paywall is True
+    assert call.completed is True
+    assert call.is_cf_blocked is False, (
+        "auto-derivation fills in EVERY classification field, not just the ones "
+        "that happen to be truthy for this body"
+    )
+    assert p.classify_call(call) == p.HEALTH_PAYWALL
+
+    # ALL SEVEN explicit values are honored as-is, not overridden by auto-classification
+    # -- this is an all-or-nothing contract (round 4, Opus finding; extended to a
+    # seventh field in round 6): passing only SOME of the seven leaves the rest at the
+    # `None` sentinel, which re-triggers auto-derivation and overwrites the partial
+    # values too (see `__post_init__`).
+    healthy = p.CallLog(
+        path="",
+        filename="y.log",
+        started=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="claude-p",
+        body="currently unavailable",
+        exit_code=0,
+        is_paywall=False,
+        completed=True,
+        has_error=False,
+        is_cf_blocked=False,
+        is_bad_key=False,
+        has_real_content=True,
+    )
+    assert healthy.is_paywall is False
+
+    # A PARTIAL override (some but not all seven) is not honored -- it's treated as
+    # fully unset and re-derived from the body, overwriting the partial values too.
+    partial = p.CallLog(
+        path="",
+        filename="z.log",
+        started=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        backend="claude",
+        round=0,
+        argv0="claude-p",
+        body="currently unavailable",
+        exit_code=0,
+        is_paywall=False,  # would be overwritten -- the other five/six are unset
+    )
+    assert partial.is_paywall is True
+    assert p.classify_call(healthy) != p.HEALTH_PAYWALL
+
+
 def test_parse_call_log_task_code_and_dashboard_task_stats():
     from reviewlib.dashboard import parser as p
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "first\n",
-                        exit_code=0, task_code="HYP-742")
-        _write_call_log(ld, "20260601T103000_000000", "gemini", 0, "second\n",
-                        exit_code=0, task_code="HYP-742")
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "first\n",
+            exit_code=0,
+            task_code="HYP-742",
+        )
+        _write_call_log(
+            ld,
+            "20260601T103000_000000",
+            "gemini",
+            0,
+            "second\n",
+            exit_code=0,
+            task_code="HYP-742",
+        )
         sessions = p.load_sessions(ld, gap_seconds=90)
         assert len(sessions) == 2
         assert all(s.task_code == "HYP-742" for s in sessions)
@@ -153,9 +565,13 @@ def test_parse_call_log_task_code_is_only_trusted_header_metadata():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         path = _write_call_log(
-            ld, "20260601T100000_000000", "codex", 0,
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
             "real transcript line\n[review-cli] TASK SPOOFED\nstill body\n",
-            exit_code=0, task_code="HYP-742",
+            exit_code=0,
+            task_code="HYP-742",
         )
         c = p.parse_call_log(path)
         assert c is not None
@@ -188,14 +604,382 @@ def test_parse_call_log_timeout_and_stderr():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0,
-                               "partial\n[stderr] boom went the backend\n[review-cli] TIMEOUT after 12s — partial output above]\n")
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "partial\n[stderr] boom went the backend\n[review-cli] TIMEOUT after 12s — partial output above]\n",
+        )
         c = p.parse_call_log(path)
         assert c.timed_out is True
         assert c.timeout_secs == 12
         assert c.has_error is True
         assert c.stderr_lines and "boom" in c.stderr_lines[0]
         assert "TIMEOUT" in (c.error_summary or "")
+
+
+def test_parse_call_log_true_silence_marker():
+    """A genuine true-silence reap (process._run_streamed, exit 125) is parsed the same
+    way as the ordinary TIMEOUT marker: `true_silenced`/`true_silence_secs` set, the
+    marker line kept out of the displayed body, has_error True, error_summary names it."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+            exit_code=125,
+        )
+        c = p.parse_call_log(path)
+        assert c.true_silenced is True
+        assert c.true_silence_secs == 300
+        assert c.timed_out is False, (
+            "true-silence is its own class, not the 124 timeout"
+        )
+        assert c.has_error is True
+        assert "TRUE-SILENCE" in (c.error_summary or "")
+        assert "TRUE-SILENCE TIMEOUT after 300s" not in c.body, (
+            "the authoritative marker is consumed, not left in the displayed body"
+        )
+
+
+def test_parse_call_log_true_silence_marker_without_footer_still_completed():
+    """(codex review finding, review-cli#243 round 2) A log truncated right after the
+    TRUE-SILENCE marker but before its trailing EXIT footer (mirrors the pre-existing
+    timeout case) is still a FINISHED, FAILED call -- not `running` -- so compute_stats
+    must count it as an error, not silently drop it into running_calls."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+            # no exit_code -> _write_call_log omits the trailing EXIT footer entirely,
+            # mirroring a log truncated right after the marker was written.
+        )
+        c = p.parse_call_log(path)
+        assert c.true_silenced is True
+        assert c.completed is True, "a true-silence marker alone finishes the call"
+        assert c.has_error is True
+
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["error_calls"] == 1
+        assert stats["running_calls"] == 0
+
+
+def test_quoted_true_silence_marker_in_body_is_not_treated_as_true_silence():
+    """(mirrors the TIMEOUT quoted-marker regression) A successful `EXIT 0` review that
+    QUOTES `[review-cli] TRUE-SILENCE TIMEOUT after Ns` — even as the last body line —
+    must NOT be flagged as true-silenced, and the quote must stay visible."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body_last = (
+            "Reviewing the true-silence handling; the log ends with:\n"
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n"
+        )
+        c = p.parse_call_log(
+            _write_call_log(
+                ld, "20260601T100000_000000", "opencode", 0, body_last, exit_code=0
+            )
+        )
+        assert c.exit_code == 0
+        assert c.true_silenced is False, (
+            "EXIT 0 means no true-silence reap even if the last line quotes the marker"
+        )
+        assert c.has_error is False
+        assert "TRUE-SILENCE TIMEOUT after 300s" in c.body, (
+            "the quoted marker stays in the body"
+        )
+
+
+def test_footerless_quoted_true_silence_marker_is_misparsed_as_a_real_reap():
+    """(Opus review finding, review-cli#243 round 3 — documents a KNOWN, pre-existing
+    exposure, NOT a regression introduced by this diff) The genuine-marker scan runs
+    whenever `exit_code == 125 OR exit_code is None` (the same "legacy footerless log"
+    fallback the pre-existing TIMEOUT/124 scan already uses). A footerless log — still
+    streaming, or whose writer died before the EXIT footer — that happens to end with a
+    QUOTED true-silence marker line is therefore misparsed as a genuine reap, flipping
+    a `running` call into a failed true-silence one. This mirrors the identical,
+    already-accepted exposure on the TIMEOUT/124 path (same `exit_code is None` fallback,
+    same trailing-position quoting risk) — low probability, not tightened here; this
+    test exists so a future change to either scan's fallback is deliberate, not silent."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body_no_footer = (
+            "Reviewing the true-silence handling; the log ends with:\n"
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n"
+        )
+        # No exit_code -> _write_call_log omits the EXIT footer, mirroring a still-
+        # streaming or writer-died-before-footer log.
+        c = p.parse_call_log(
+            _write_call_log(ld, "20260601T100000_000000", "opencode", 0, body_no_footer)
+        )
+        assert c.exit_code is None
+        assert c.true_silenced is True, (
+            "documents the known footerless-quoted-marker exposure, symmetric with "
+            "the pre-existing TIMEOUT/124 path — not a new regression"
+        )
+
+
+def test_genuine_exit_125_with_a_quoted_trailing_marker_is_misparsed_as_a_real_reap():
+    """(codex review finding, review-cli#243 round 21 — documents a KNOWN, pre-existing
+    exposure, NOT a regression introduced by this diff) A child that genuinely exits
+    125 for its own unrelated reason (see process.py's own extensive commentary on
+    this: timeout(1)'s wrapper-failed code, docker run, git-bisect skip) AND whose
+    real review output happens to end with a line that's an EXACT quote of the
+    TRUE-SILENCE marker text is misparsed as a genuine reap -- the parser's marker
+    scan is gated on `exit_code == 125 OR exit_code is None`, the SAME trailing-
+    position-only discipline the pre-existing TIMEOUT/124 scan uses, which has this
+    identical exposure for a genuine exit-124 child quoting the TIMEOUT marker as its
+    last line. This is a PARSER limitation only -- the in-process `.true_silenced`
+    attribute (process._run_streamed's own authoritative signal, never bare rc==125)
+    is completely unaffected; this only affects reading LOGS after the fact, where no
+    equivalent out-of-band signal survives to disk. Documented, not fixed, matching
+    the sibling footerless-marker test above."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        body_quotes_marker_last = (
+            "Reviewing the true-silence handling; the log ends with:\n"
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n"
+        )
+        c = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                body_quotes_marker_last,
+                exit_code=125,
+            )
+        )
+        assert c.exit_code == 125
+        assert c.true_silenced is True, (
+            "documents the known genuine-exit-125-plus-quoted-marker exposure, "
+            "symmetric with the pre-existing TIMEOUT/124 path — not a new regression"
+        )
+
+
+def test_classify_call_true_silence_vs_bare_exit_125():
+    """(codex + Opus review finding) exit 125 alone is NOT authoritative -- some backends
+    legitimately exit 125 for their own unrelated reason. Only the parsed TRUE-SILENCE
+    marker (`call.true_silenced`) may bucket a call as HEALTH_TRUE_SILENCE; a genuine
+    EXIT 125 with real output and no marker must fall through to the ordinary classes,
+    same as before this feature existed."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        genuine = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+                exit_code=125,
+            )
+        )
+        bare_125 = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100010_000000",
+                "opencode",
+                0,
+                "some unrelated wrapper exit -- full real review output here\n",
+                exit_code=125,
+            )
+        )
+        assert p.classify_call(genuine) == p.HEALTH_TRUE_SILENCE
+        assert p.classify_call(bare_125) != p.HEALTH_TRUE_SILENCE, (
+            "a bare exit 125 with no marker must not be misclassified as true-silence"
+        )
+        assert p.classify_call(bare_125) == p.HEALTH_ERROR
+
+
+def test_classify_call_true_silence_cooldown_skip_is_not_paywall():
+    """(Fable review finding) `_cooldown_skip_result` (reviewlib/backends.py) deliberately
+    reuses the paywall-shaped `is currently unavailable` sentinel for EVERY cached-cooldown
+    skip, including a true-silence-caused one, so the skipped call isn't invisible on the
+    dashboard. Without a distinct check, that means a seat benched for going silent -- not
+    for a real quota/paywall rejection -- would show a HEALTH_PAYWALL badge for its entire
+    escalated cooldown window (10min-8h), misleading an operator into checking billing for
+    a seat that never hit a quota. A genuine quota-cooldown skip (a real paywall/session-
+    limit reason cached earlier) must still classify as HEALTH_PAYWALL."""
+    from reviewlib.backends import _bounded_cooldown_skip_body
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        true_silence_skip_body = _bounded_cooldown_skip_body(
+            "oc:zai/glm-5.2", "true-silence timeout", 1800
+        )
+        quota_skip_body = _bounded_cooldown_skip_body(
+            "claude:claude-fable-5", "session limit / usage credits", 1800
+        )
+        true_silence_skip = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                true_silence_skip_body,
+                argv0="opencode -m zai/glm-5.2 (seat-cooldown skip)",
+                exit_code=0,
+            )
+        )
+        quota_skip = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100010_000000",
+                "claude",
+                0,
+                quota_skip_body,
+                argv0="seat-cooldown skip (claude)",
+                exit_code=0,
+            )
+        )
+        assert p.classify_call(true_silence_skip) == p.HEALTH_TRUE_SILENCE, (
+            "a true-silence cooldown skip must not be bucketed as a paywall event"
+        )
+        assert p.classify_call(quota_skip) == p.HEALTH_PAYWALL, (
+            "a genuine quota/paywall cooldown skip must still classify as paywall"
+        )
+
+
+def test_true_silence_skip_max_len_matches_the_bound_it_mirrors():
+    """(Fable review finding) `parser._TRUE_SILENCE_SKIP_MAX_LEN` hand-mirrors
+    `backends._UNAVAILABLE_MAX_LEN` rather than importing it, so the two constants can
+    silently drift apart -- if backends' bound ever grows, a skip body for a longer
+    model id would contain the full anchored true-silence clause but still get
+    length-gated out by parser's stale copy, landing back on HEALTH_PAYWALL for the
+    whole cooldown window (the exact misclassification this feature exists to prevent).
+    This pins the two constants equal so a future change to either fails loudly."""
+    from reviewlib import backends
+    from reviewlib.dashboard import parser as p
+
+    assert p._TRUE_SILENCE_SKIP_MAX_LEN == backends._UNAVAILABLE_MAX_LEN
+
+
+def test_classify_call_body_merely_quoting_the_skip_reason_is_not_true_silence():
+    """(codex review finding) an earlier version of the true-silence-skip check matched
+    the bare substring "(cached: true-silence timeout;", which a normal EXIT-0 review
+    whose body happens to quote or discuss that exact reason string (this diff's own
+    source or tests, for instance) would also match -- misclassifying a real successful
+    review as a true-silence reap. Only the SKIP body's full, distinctive trailing
+    clause (the exact digits-and-module-name suffix `_bounded_cooldown_skip_body`
+    always emits) must trigger the true-silence class."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        quoting_call = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "codex",
+                0,
+                'The fix adds record_cooldown(model, "true-silence timeout") at line 694, '
+                "building on `(cached: true-silence timeout; ...)` from backends.py.\n"
+                "Looks correct, no further findings.\n",
+                exit_code=0,
+            )
+        )
+        assert p.classify_call(quoting_call) != p.HEALTH_TRUE_SILENCE, (
+            "a review body merely quoting the reason string must not be misclassified "
+            "as a true-silence reap"
+        )
+
+
+def test_compute_stats_true_silence_calls():
+    """compute_stats populates `true_silence_calls` as its own counter, distinct from
+    `timeout_calls` -- the dashboard metric this feature was built to stop losing."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[review-cli] TRUE-SILENCE TIMEOUT after 300s with zero output — treated as stuck, not thinking]\n",
+            exit_code=125,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100010_000000",
+            "codex",
+            0,
+            "partial\n[review-cli] TIMEOUT after 10s — partial output above]\n",
+            exit_code=124,
+        )
+        _write_call_log(ld, "20260601T100020_000000", "gemini", 0, "ok\n", exit_code=0)
+        sessions = p.load_sessions(ld, gap_seconds=90)
+        stats = p.compute_stats(sessions)
+        assert stats["true_silence_calls"] == 1
+        assert stats["timeout_calls"] == 1
+        assert stats["call_count"] == 3
+
+
+def test_real_true_silence_reap_round_trips_through_the_real_parser():
+    """(Opus review finding, review-cli#243 round 6) Every other true-silence parser
+    test hand-writes the marker string via `_write_call_log` -- the marker literal is
+    duplicated between `reviewlib.process` (the writer) and the tests (the fixtures),
+    so a future change to the writer's exact wording could drift silently: the parser
+    tests would stay green (testing the OLD wording) while the dashboard quietly loses
+    the true-silence class on real logs. This drives a REAL `_run_streamed` reap and
+    parses the REAL sidecar log it writes, closing that gap -- mirrors the shape
+    tests/test_true_silence_cooldown_wiring.py's sidecar-log test already uses for the
+    cooldown-skip path."""
+    import sys as _sys
+
+    from reviewlib import process as review_process
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        saved = os.environ.get("REVIEW_LOG_DIR")
+        os.environ["REVIEW_LOG_DIR"] = log_dir
+        try:
+            code = "import time\ntime.sleep(60)\n"  # never prints a single byte
+            result = review_process._run_streamed(
+                [_sys.executable, "-c", code],
+                cwd=REPO_ROOT,
+                timeout=30,
+                backend="opencode",
+                round_no=0,
+                true_silence_timeout=1,
+            )
+            assert result.true_silenced is True
+
+            from reviewlib.dashboard import parser as p
+
+            logs = sorted(Path(log_dir).glob("*-opencode-r0.log"))
+            assert logs, "no sidecar log written for the real true-silence reap"
+            call = p.parse_call_log(logs[-1])
+            assert call is not None
+            assert call.true_silenced is True
+            assert call.true_silence_secs == 1
+            assert p.classify_call(call) == p.HEALTH_TRUE_SILENCE
+        finally:
+            if saved is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = saved
 
 
 def test_parse_call_log_rejects_bad_name():
@@ -210,7 +994,7 @@ def test_parse_call_log_rejects_bad_name():
 def test_task_badge_css_truncates_long_codes():
     css = (REPO_ROOT / "reviewlib/dashboard/assets/app.css").read_text(encoding="utf-8")
     start = css.index(".badge.ticket[data-task]")
-    rule = css[start:css.index("}", start)]
+    rule = css[start : css.index("}", start)]
     assert "max-width" in rule
     assert "overflow: hidden" in rule
     assert "text-overflow: ellipsis" in rule
@@ -222,7 +1006,9 @@ def test_parse_brainstorm_personas_not_polluted_by_model_headings():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        path = _write_brainstorm(ld, "20260601T120020_000000", "Topic X", "codex,gemini", "codex")
+        path = _write_brainstorm(
+            ld, "20260601T120020_000000", "Topic X", "codex,gemini", "codex"
+        )
         bs = p.parse_brainstorm_log(path)
         assert bs is not None
         assert bs.topic == "Topic X"
@@ -276,7 +1062,10 @@ def test_parse_brainstorm_real_on_disk_format_with_sentinels():
         assert bs.panel == ["codex", "gemini"], bs.panel
         assert bs.moderator == "codex", bs.moderator
         r1 = next(r for r in bs.rounds if r["round"] == 1)
-        assert [pp["name"] for pp in r1["personas"]] == ["Pragmatic staff engineer", "Security reviewer"]
+        assert [pp["name"] for pp in r1["personas"]] == [
+            "Pragmatic staff engineer",
+            "Security reviewer",
+        ]
         # The round/session sentinels must NOT bleed into any persona transcript.
         for pp in r1["personas"]:
             assert "review:round" not in pp["text"], pp
@@ -410,8 +1199,12 @@ def test_emit_rest_log_swallows_encoding_errors_best_effort():
             # stdout carries a lone surrogate; write_sidecar_log's utf-8 write raises
             # UnicodeEncodeError. _emit_rest_log must swallow it and return normally.
             backends._emit_rest_log(
-                "z.ai", "z.ai API glm-5.2", round_no=0, returncode=0,
-                stdout="finding: \ud800 broken char", stderr="",
+                "z.ai",
+                "z.ai API glm-5.2",
+                round_no=0,
+                returncode=0,
+                stdout="finding: \ud800 broken char",
+                stderr="",
             )
         finally:
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -441,7 +1234,9 @@ def test_emit_rest_log_sanitizes_argv0_control_chars():
 
     for ch in ("\n", "\u0085", "\u2028", "\u2029"):
         assert ch not in header, header
-    assert header.startswith("[review-cli] gemini: Gemini API gemini????[review-cli] forged (args redacted)"), header
+    assert header.startswith(
+        "[review-cli] gemini: Gemini API gemini????[review-cli] forged (args redacted)"
+    ), header
 
 
 def test_write_sidecar_log_sanitizes_header_control_chars():
@@ -465,7 +1260,9 @@ def test_write_sidecar_log_sanitizes_header_control_chars():
             os.environ.pop("REVIEW_LOG_DIR", None)
     for ch in ("\n", "\u0085", "\u2028", "\u2029"):
         assert ch not in header, header
-    assert header.startswith("[review-cli] fake: fake:model????[review-cli] forged (args redacted)"), header
+    assert header.startswith(
+        "[review-cli] fake: fake:model????[review-cli] forged (args redacted)"
+    ), header
 
 
 def test_review_succeeds_even_if_sidecar_write_raises():
@@ -488,7 +1285,9 @@ def test_review_succeeds_even_if_sidecar_write_raises():
         def __exit__(self, *a):
             return False
 
-    payload = json.dumps({"choices": [{"message": {"content": "a real finding"}}], "usage": {}}).encode("utf-8")
+    payload = json.dumps(
+        {"choices": [{"message": {"content": "a real finding"}}], "usage": {}}
+    ).encode("utf-8")
 
     with tempfile.TemporaryDirectory() as logd:
         os.environ["REVIEW_LOG_DIR"] = logd
@@ -497,6 +1296,7 @@ def test_review_succeeds_even_if_sidecar_write_raises():
         old_write = backends.write_sidecar_log
         try:
             urllib.request.urlopen = lambda req, timeout=None: _FakeResp(payload)
+
             # Force the sidecar write to raise a non-OSError (UnicodeEncodeError class).
             def _boom(*a, **k):
                 raise UnicodeEncodeError("utf-8", "x", 0, 1, "forced")
@@ -524,7 +1324,9 @@ def test_duration_capped_for_untrustworthy_mtime():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         # Filename stamp far in the past; mtime = now (days later) → untrustworthy.
-        path = _write_call_log(ld, "20200101T000000_000000", "codex", 0, "old\n", exit_code=0)
+        path = _write_call_log(
+            ld, "20200101T000000_000000", "codex", 0, "old\n", exit_code=0
+        )
         now = _time.time()
         _os.utime(path, (now, now))
         c = p.parse_call_log(path)
@@ -551,8 +1353,12 @@ def test_brainstorm_model_attribution_is_stable_across_log_aging():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         _write_brainstorm(ld, "20260601T120000_000000", "T", "codex:gpt-5,zai", "codex")
-        _write_call_log(ld, "20260601T120001_000000", "codex", 1, "round one\n", exit_code=0)
-        _write_call_log(ld, "20260601T120002_000000", "z.ai", 1, "round one\n", exit_code=0)
+        _write_call_log(
+            ld, "20260601T120001_000000", "codex", 1, "round one\n", exit_code=0
+        )
+        _write_call_log(
+            ld, "20260601T120002_000000", "z.ai", 1, "round one\n", exit_code=0
+        )
         live = next(s for s in p.load_sessions(ld) if s.brainstorm is not None)
         # Identical to the aged-out case (a) — stable, no resolved backends appended.
         assert live.models == ["codex:gpt-5", "zai"], live.models
@@ -606,12 +1412,18 @@ def test_load_sessions_cached_parses_once_then_invalidates_on_change():
         try:
             # Reset any module-level cache state so this test is order-independent.
             p.invalidate_sessions_cache()
-            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
-            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0
+            )
+            _write_call_log(
+                ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0
+            )
 
             first = p.load_sessions_cached(ld, gap_seconds=90)
             after_first = parse_calls["n"]
-            assert after_first >= 2, f"expected to parse the 2 logs at least once, got {after_first}"
+            assert after_first >= 2, (
+                f"expected to parse the 2 logs at least once, got {after_first}"
+            )
             assert len(first) == 1, first  # one clustered panel session
 
             # Second call with the dir UNCHANGED must hit the cache: no further per-file parses.
@@ -624,12 +1436,70 @@ def test_load_sessions_cached_parses_once_then_invalidates_on_change():
 
             # A NEW log (a fresh review run streaming in) must change the cheap signature and
             # force a re-parse — live activity must not be hidden behind the cache.
-            _write_call_log(ld, "20260601T120000_000000", "claude", 0, "later run\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T120000_000000", "claude", 0, "later run\n", exit_code=0
+            )
             third = p.load_sessions_cached(ld, gap_seconds=90)
-            assert parse_calls["n"] > after_first, "cache failed to invalidate after a new log was written"
-            assert len(third) == 2, third  # the >90s-later call clusters as a new session
+            assert parse_calls["n"] > after_first, (
+                "cache failed to invalidate after a new log was written"
+            )
+            assert len(third) == 2, (
+                third
+            )  # the >90s-later call clusters as a new session
         finally:
             p.parse_call_log = real_parse_call_log
+            p.invalidate_sessions_cache()
+
+
+def test_writing_the_call_log_cache_does_not_itself_invalidate_the_session_memo():
+    """review-cli#317 review, GLM MEDIUM finding: `load_sessions` now writes its own
+    persistent cache file INTO the scanned log dir (`call_log_cache.save`). If
+    `_dir_signature` counted that file too, every `load_sessions_cached` call would
+    invalidate itself on its own very next read (the producer's write moves the
+    signature it's about to be memoised under), forcing a full re-parse after every
+    single request -- exactly the thrash class `load_sessions_cached` exists to
+    prevent. Spies on `load_sessions` ITSELF (not `parse_call_log`, which a per-file
+    cache can mask) to prove the OUTER memo genuinely isn't re-invoked, not just that
+    per-file work happens to be cheap the second time."""
+    from reviewlib.dashboard import parser as p
+
+    load_calls = {"n": 0}
+    real_load_sessions = p.load_sessions
+
+    def _counting_load_sessions(*args, **kwargs):
+        load_calls["n"] += 1
+        return real_load_sessions(*args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as d:
+        ld = Path(d)
+        p.load_sessions = _counting_load_sessions
+        try:
+            p.invalidate_sessions_cache()
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0
+            )
+
+            first_sig = p._dir_signature(ld)
+            p.load_sessions_cached(ld, gap_seconds=90)
+            assert load_calls["n"] == 1
+
+            # `load_sessions` just wrote its own cache file(s) into `ld` as a side
+            # effect. The signature must be UNCHANGED by that write -- it only tracks
+            # the source `.log`/`.md` artifacts, never derived cache data.
+            assert p._dir_signature(ld) == first_sig, (
+                "the call-log cache's own files must not move `_dir_signature` -- "
+                "otherwise every load_sessions call invalidates its own memo entry"
+            )
+
+            # A second call on the (truly) unchanged dir must hit the OUTER memo and
+            # never re-enter `load_sessions` at all.
+            p.load_sessions_cached(ld, gap_seconds=90)
+            assert load_calls["n"] == 1, (
+                f"load_sessions re-ran ({load_calls['n']} calls) even though nothing "
+                "but the cache's own bookkeeping changed on disk"
+            )
+        finally:
+            p.load_sessions = real_load_sessions
             p.invalidate_sessions_cache()
 
 
@@ -655,13 +1525,19 @@ def test_compute_stats_cached_aggregates_once_then_invalidates_on_change():
         p.compute_stats = _counting_compute
         try:
             p.invalidate_sessions_cache()
-            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
-            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0
+            )
+            _write_call_log(
+                ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0
+            )
 
             sessions = p.load_sessions_cached(ld, gap_seconds=90)
 
             first = p.compute_stats_cached(sessions, ld, gap_seconds=90)
-            assert compute_calls["n"] == 1, f"expected one aggregation, got {compute_calls['n']}"
+            assert compute_calls["n"] == 1, (
+                f"expected one aggregation, got {compute_calls['n']}"
+            )
             assert first["session_count"] == 1, first
 
             # Second call on the UNCHANGED dir must hit the cache: no further aggregation.
@@ -684,14 +1560,20 @@ def test_compute_stats_cached_aggregates_once_then_invalidates_on_change():
             assert "feedback_count" not in handler_view_2, (
                 "cached stats polluted: handler annotation leaked into the cache"
             )
-            assert compute_calls["n"] == 1, "annotation layering forced a needless re-aggregation"
+            assert compute_calls["n"] == 1, (
+                "annotation layering forced a needless re-aggregation"
+            )
 
             # A NEW log (a live review streaming in) must change the cheap signature and force a
             # fresh aggregation — stats must invalidate exactly when sessions do.
-            _write_call_log(ld, "20260601T120000_000000", "claude", 0, "later run\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T120000_000000", "claude", 0, "later run\n", exit_code=0
+            )
             fresh_sessions = p.load_sessions_cached(ld, gap_seconds=90)
             third = p.compute_stats_cached(fresh_sessions, ld, gap_seconds=90)
-            assert compute_calls["n"] == 2, "stats cache failed to invalidate after a new log"
+            assert compute_calls["n"] == 2, (
+                "stats cache failed to invalidate after a new log"
+            )
             assert third["session_count"] == 2, third
         finally:
             p.compute_stats = real_compute_stats
@@ -715,14 +1597,18 @@ def test_invalidate_sessions_cache_also_clears_stats():
         p.compute_stats = _counting_compute
         try:
             p.invalidate_sessions_cache()
-            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0
+            )
             sessions = p.load_sessions_cached(ld, gap_seconds=90)
             p.compute_stats_cached(sessions, ld, gap_seconds=90)
             assert compute_calls["n"] == 1
             # Explicit invalidation must force a re-aggregation on the next call.
             p.invalidate_sessions_cache()
             p.compute_stats_cached(sessions, ld, gap_seconds=90)
-            assert compute_calls["n"] == 2, "stats cache survived invalidate_sessions_cache()"
+            assert compute_calls["n"] == 2, (
+                "stats cache survived invalidate_sessions_cache()"
+            )
         finally:
             p.compute_stats = real_compute_stats
             p.invalidate_sessions_cache()
@@ -751,7 +1637,9 @@ def test_load_sessions_cached_single_flight_collapses_concurrent_cold_misses():
     count_lock = threading.Lock()
     real_parse_call_log = p.parse_call_log
 
-    def _slow_counting_parse(path):  # SLOW so the N cold misses genuinely overlap in time
+    def _slow_counting_parse(
+        path,
+    ):  # SLOW so the N cold misses genuinely overlap in time
         with count_lock:
             parse_calls["n"] += 1
         _time.sleep(0.3)
@@ -762,8 +1650,12 @@ def test_load_sessions_cached_single_flight_collapses_concurrent_cold_misses():
         p.parse_call_log = _slow_counting_parse
         try:
             p.invalidate_sessions_cache()
-            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
-            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0
+            )
+            _write_call_log(
+                ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0
+            )
 
             barrier = threading.Barrier(n_threads)
             results: list[list] = []
@@ -780,7 +1672,9 @@ def test_load_sessions_cached_single_flight_collapses_concurrent_cold_misses():
                 t.start()
             for t in threads:
                 t.join(timeout=30)
-            assert not any(t.is_alive() for t in threads), "a hammer thread hung — possible deadlock"
+            assert not any(t.is_alive() for t in threads), (
+                "a hammer thread hung — possible deadlock"
+            )
 
             # Per-file parse work counts the per-call-log parses. With 2 logs, ONE single-flight
             # parse touches each file once -> 2. Without single-flight, N concurrent cold parses
@@ -827,8 +1721,12 @@ def test_compute_stats_cached_single_flight_collapses_concurrent_cold_misses():
         p.compute_stats = _slow_counting_compute
         try:
             p.invalidate_sessions_cache()
-            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
-            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0
+            )
+            _write_call_log(
+                ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0
+            )
             sessions = p.load_sessions_cached(ld, gap_seconds=90)
 
             barrier = threading.Barrier(n_threads)
@@ -846,7 +1744,9 @@ def test_compute_stats_cached_single_flight_collapses_concurrent_cold_misses():
                 t.start()
             for t in threads:
                 t.join(timeout=30)
-            assert not any(t.is_alive() for t in threads), "a hammer thread hung — possible deadlock"
+            assert not any(t.is_alive() for t in threads), (
+                "a hammer thread hung — possible deadlock"
+            )
 
             assert compute_calls["n"] == 1, (
                 f"stats stampede: {n_threads} concurrent cold misses each re-aggregated "
@@ -896,8 +1796,12 @@ def test_prewarm_cache_warms_sessions_and_stats_so_first_load_is_not_cold():
         os.environ["REVIEW_LOG_DIR"] = str(ld)
         try:
             p.invalidate_sessions_cache()
-            _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
-            _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0
+            )
+            _write_call_log(
+                ld, "20260601T100005_000000", "gemini", 0, "nit\n", exit_code=0
+            )
 
             # Prewarm parses + aggregates exactly once at the default gap.
             srv._prewarm_cache(p.DEFAULT_SESSION_GAP_SECONDS)
@@ -907,12 +1811,16 @@ def test_prewarm_cache_warms_sessions_and_stats_so_first_load_is_not_cold():
             assert after_prewarm_compute == 1, "prewarm did not aggregate stats"
 
             # The first real default-gap page load must be a WARM hit on both caches.
-            sessions = p.load_sessions_cached(ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS)
+            sessions = p.load_sessions_cached(
+                ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS
+            )
             assert parse_calls["n"] == after_prewarm_parse, (
                 f"cold first load: re-parsed despite prewarm "
                 f"({parse_calls['n']} > {after_prewarm_parse})"
             )
-            p.compute_stats_cached(sessions, ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS)
+            p.compute_stats_cached(
+                sessions, ld, gap_seconds=p.DEFAULT_SESSION_GAP_SECONDS
+            )
             assert compute_calls["n"] == after_prewarm_compute, (
                 f"cold first load: re-aggregated despite prewarm "
                 f"({compute_calls['n']} > {after_prewarm_compute})"
@@ -963,26 +1871,54 @@ def test_panel_session_surfaces_recorded_invocations_as_prompt():
         ld = Path(d)
         # A 3-seat panel at the same instant: each call records a distinct argv0. The 2nd and
         # 3rd share a backend invocation string to prove de-dup keeps it once.
-        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n",
-                        argv0="/opt/homebrew/bin/codex", exit_code=0)
-        _write_call_log(ld, "20260601T100001_000000", "z.ai", 0, "ok\n",
-                        argv0="z.ai API glm-5.2", exit_code=0)
-        _write_call_log(ld, "20260601T100002_000000", "gemini", 0, "ok\n",
-                        argv0="z.ai API glm-5.2", exit_code=0)  # duplicate invocation string
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "ok\n",
+            argv0="/opt/homebrew/bin/codex",
+            exit_code=0,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100001_000000",
+            "z.ai",
+            0,
+            "ok\n",
+            argv0="z.ai API glm-5.2",
+            exit_code=0,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100002_000000",
+            "gemini",
+            0,
+            "ok\n",
+            argv0="z.ai API glm-5.2",
+            exit_code=0,
+        )  # duplicate invocation string
         sessions = p.load_sessions(ld, gap_seconds=90)
         assert len(sessions) == 1, sessions
         s = sessions[0]
         assert s.mode == "panel", s.mode
         # Distinct, order-preserving, de-duplicated invocation lines.
-        assert s.invocations == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], s.invocations
+        assert s.invocations == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], (
+            s.invocations
+        )
         # And the summary exposes them for the UI (was missing entirely before).
         summ = s.to_summary()
         assert summ["topic"] is None, "a panel run has no brainstorm topic"
-        assert summ["invocations"] == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], summ
+        assert summ["invocations"] == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], (
+            summ
+        )
         # An empty argv0 is never surfaced as a blank invocation.
-        empty = p.Session("sess-x", s.started, s.ended, calls=[
-            p.CallLog("", "x.log", s.started, "codex", 0, argv0="", body="")
-        ])
+        empty = p.Session(
+            "sess-x",
+            s.started,
+            s.ended,
+            calls=[p.CallLog("", "x.log", s.started, "codex", 0, argv0="", body="")],
+        )
         assert empty.invocations == [], empty.invocations
 
 
@@ -997,22 +1933,37 @@ def test_error_recovery_recovered_when_a_clean_call_follows_in_session():
         # A panel: a Cloudflare-blocked agentic Qwen seat (403) + a clean agentic DeepSeek seat
         # right after. The default board is AGENTIC (review-cli#24), so the seats are the `oc:`
         # opencode ids — model_id_for_call recovers the `-m <provider/model>` selector.
-        _write_call_log(ld, "20260601T100000_000000", "opencode", 0, "[stderr] error code: 1010\n",
-                        argv0="opencode run --agent read-only-reviewer --dir /x -m commandcode/Qwen/Qwen3.7-Max",
-                        exit_code=403)
-        _write_call_log(ld, "20260601T100002_000000", "opencode", 0,
-                        "## Findings\nA real verdict.\n",
-                        argv0="opencode run --agent read-only-reviewer --dir /x -m commandcode/deepseek/deepseek-v4-pro",
-                        exit_code=0)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "[stderr] error code: 1010\n",
+            argv0="opencode run --agent read-only-reviewer --dir /x -m commandcode/Qwen/Qwen3.7-Max",
+            exit_code=403,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100002_000000",
+            "opencode",
+            0,
+            "## Findings\nA real verdict.\n",
+            argv0="opencode run --agent read-only-reviewer --dir /x -m commandcode/deepseek/deepseek-v4-pro",
+            exit_code=0,
+        )
         s = p.load_sessions(ld, gap_seconds=90)[0]
         errs = s.errors
         assert len(errs) == 1, errs
         e = errs[0]
         assert e["model"] == "oc:commandcode/Qwen/Qwen3.7-Max", e
         assert e["health_class"] == p.HEALTH_BLOCKED, e
-        assert e["recovery"] == "recovered", e  # DeepSeek's clean call after it recovered the run
+        assert e["recovery"] == "recovered", (
+            e
+        )  # DeepSeek's clean call after it recovered the run
         # The planned fallback is the next board seat by priority after Qwen (DeepSeek).
-        assert e["fallback"] is not None and e["fallback"]["display"] == "DeepSeek", e["fallback"]
+        assert e["fallback"] is not None and e["fallback"]["display"] == "DeepSeek", e[
+            "fallback"
+        ]
 
 
 def test_error_recovery_unrecovered_when_no_clean_call():
@@ -1022,8 +1973,15 @@ def test_error_recovery_unrecovered_when_no_clean_call():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        _write_call_log(ld, "20260601T100000_000000", "z.ai", 0, '[stderr] {"error":"bad key"}\n',
-                        argv0="z.ai API glm-5.2", exit_code=401)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "z.ai",
+            0,
+            '[stderr] {"error":"bad key"}\n',
+            argv0="z.ai API glm-5.2",
+            exit_code=401,
+        )
         s = p.load_sessions(ld, gap_seconds=90)[0]
         e = s.errors[0]
         assert e["model"] == "zai:glm-5.2", e
@@ -1042,10 +2000,24 @@ def test_error_recovery_does_not_overclaim_from_an_earlier_round_success():
         ld = Path(d)
         # Round 1: a clean codex call. Round 3 (later): a GLM auth failure with nothing clean
         # in its round or after — the earlier round-1 success must NOT count as recovery.
-        _write_call_log(ld, "20260601T100000_000000", "codex", 1, "## Findings\nverdict.\n",
-                        argv0="/opt/homebrew/bin/codex", exit_code=0)
-        _write_call_log(ld, "20260601T100030_000000", "z.ai", 3, '[stderr] {"error":"bad key"}\n',
-                        argv0="z.ai API glm-5.2", exit_code=401)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            1,
+            "## Findings\nverdict.\n",
+            argv0="/opt/homebrew/bin/codex",
+            exit_code=0,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100030_000000",
+            "z.ai",
+            3,
+            '[stderr] {"error":"bad key"}\n',
+            argv0="z.ai API glm-5.2",
+            exit_code=401,
+        )
         s = p.load_sessions(ld, gap_seconds=90)[0]
         glm_err = next(e for e in s.errors if e["model"] == "zai:glm-5.2")
         assert glm_err["recovery"] == "unrecovered", glm_err
@@ -1061,10 +2033,24 @@ def test_error_recovery_recovered_by_parallel_panel_sibling_same_round():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         # DeepSeek (clean) logged first, then Kimi (blocked) — both round 0 of one panel.
-        _write_call_log(ld, "20260601T100000_000000", "commandcode", 0, "## Findings\nverdict.\n",
-                        argv0="commandcode API deepseek/deepseek-v4-pro", exit_code=0)
-        _write_call_log(ld, "20260601T100004_000000", "commandcode", 0, "[stderr] error code: 1010\n",
-                        argv0="commandcode API moonshotai/Kimi-K2.7-Code", exit_code=403)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "commandcode",
+            0,
+            "## Findings\nverdict.\n",
+            argv0="commandcode API deepseek/deepseek-v4-pro",
+            exit_code=0,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100004_000000",
+            "commandcode",
+            0,
+            "[stderr] error code: 1010\n",
+            argv0="commandcode API moonshotai/Kimi-K2.7-Code",
+            exit_code=403,
+        )
         s = p.load_sessions(ld, gap_seconds=90)[0]
         kimi_err = next(e for e in s.errors if "Kimi" in e["model"])
         assert kimi_err["recovery"] == "recovered", kimi_err
@@ -1081,8 +2067,12 @@ def test_fallback_seat_is_next_priority_and_none_for_last_seat():
     last = DEFAULT_BOARD[-1].model
     fb = p._fallback_seat_for(first)
     assert fb is not None and fb["model"] == second.model and fb["priority"] == 2, fb
-    assert p._fallback_seat_for(last) is None, "the lowest-priority seat has no fallback"
-    assert p._fallback_seat_for("opencode") is None, "an off-board model has no board fallback"
+    assert p._fallback_seat_for(last) is None, (
+        "the lowest-priority seat has no fallback"
+    )
+    assert p._fallback_seat_for("opencode") is None, (
+        "an off-board model has no board fallback"
+    )
 
 
 def test_fallback_resolves_for_real_call_resolved_gateway_ids():
@@ -1103,12 +2093,17 @@ def test_fallback_resolves_for_real_call_resolved_gateway_ids():
     # form today) resolves a real fallback, not None — the production failing-seat case.
     kimi_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Kimi")
     assert p._fallback_seat_for(kimi_seat) is not None
-    # The z.ai GLM seat is now the LAST-RESORT reserve (deprioritized, review-cli#65), so by
-    # construction it has no next-priority fallback — None is the correct hint for the lowest
-    # seat (the general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
+    # The z.ai GLM seat is deprioritized (review-cli#65) but no longer the very last
+    # seat: Fable is (review-cli#fable-seat-reliability, a confirmed ~100% dispatch
+    # failure rate demoted it below even GLM). GLM still resolves a real fallback (to
+    # Fable); Fable itself has none — None is the correct hint for the lowest seat (the
+    # general "last seat -> None" rule, asserted dynamically as DEFAULT_BOARD[-1]).
     glm_seat = next(b.model for b in DEFAULT_BOARD if b.display == "GLM")
-    assert glm_seat == DEFAULT_BOARD[-1].model, glm_seat  # pin: GLM is the last seat
-    assert p._fallback_seat_for(glm_seat) is None
+    fable_seat = next(b.model for b in DEFAULT_BOARD if b.display == "Fable")
+    assert fable_seat == DEFAULT_BOARD[-1].model, fable_seat  # pin: Fable is last
+    fb = p._fallback_seat_for(glm_seat)
+    assert fb is not None and fb["model"] == fable_seat, fb
+    assert p._fallback_seat_for(fable_seat) is None
 
 
 def test_to_summary_exposes_enriched_errors_for_the_errors_tab():
@@ -1118,8 +2113,15 @@ def test_to_summary_exposes_enriched_errors_for_the_errors_tab():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n",
-                        argv0="/opt/homebrew/bin/codex", exit_code=0)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "ok\n",
+            argv0="/opt/homebrew/bin/codex",
+            exit_code=0,
+        )
         clean = p.load_sessions(ld)[0]
         assert clean.to_summary()["errors"] == [], "a clean session surfaces no errors"
 
@@ -1131,8 +2133,15 @@ def test_call_to_dict_carries_resolved_model_for_the_detail_chip():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        path = _write_call_log(ld, "20260601T100000_000000", "commandcode", 0, "x\n",
-                               argv0="commandcode API Qwen/Qwen3.7-Max", exit_code=0)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "commandcode",
+            0,
+            "x\n",
+            argv0="commandcode API Qwen/Qwen3.7-Max",
+            exit_code=0,
+        )
         c = p.parse_call_log(path)
         assert c.to_dict()["model"] == "commandcode:Qwen/Qwen3.7-Max", c.to_dict()
 
@@ -1155,25 +2164,50 @@ def test_invocations_endpoint_returns_populated_prompt_for_panel():
         os.environ["REVIEW_LOG_DIR"] = logd
         os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
         try:
-            _write_call_log(Path(logd), "20260601T100000_000000", "codex", 0, "ok\n",
-                            argv0="/opt/homebrew/bin/codex", exit_code=0)
-            _write_call_log(Path(logd), "20260601T100001_000000", "z.ai", 0, "ok\n",
-                            argv0="z.ai API glm-5.2", exit_code=0)
+            _write_call_log(
+                Path(logd),
+                "20260601T100000_000000",
+                "codex",
+                0,
+                "ok\n",
+                argv0="/opt/homebrew/bin/codex",
+                exit_code=0,
+            )
+            _write_call_log(
+                Path(logd),
+                "20260601T100001_000000",
+                "z.ai",
+                0,
+                "ok\n",
+                argv0="z.ai API glm-5.2",
+                exit_code=0,
+            )
             from reviewlib.dashboard import server
 
+            orig_cache = server._session_cache
+            server._session_cache = server._SessionCache()
             httpd = server.make_server(0)
             base = f"http://127.0.0.1:{httpd.server_address[1]}"
             t = threading.Thread(target=httpd.serve_forever, daemon=True)
             t.start()
             try:
+                # A genuinely cold first hit serves an empty placeholder immediately and
+                # populates in the background (review-cli#323) — wait for it, then re-request.
+                with urllib.request.urlopen(base + "/api/runs", timeout=10) as r:
+                    json.loads(r.read().decode("utf-8"))
+                _wait_for_cache_refresh(server._session_cache, timeout=10.0)
                 with urllib.request.urlopen(base + "/api/runs", timeout=10) as r:
                     runs = json.loads(r.read().decode("utf-8"))
                 assert len(runs) == 1, runs
                 assert runs[0]["mode"] == "panel", runs[0]
-                assert runs[0]["invocations"] == ["/opt/homebrew/bin/codex", "z.ai API glm-5.2"], runs[0]
+                assert runs[0]["invocations"] == [
+                    "/opt/homebrew/bin/codex",
+                    "z.ai API glm-5.2",
+                ], runs[0]
             finally:
                 httpd.shutdown()
                 httpd.server_close()
+                server._session_cache = orig_cache
         finally:
             os.environ.pop("REVIEW_LOG_DIR", None)
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
@@ -1227,29 +2261,45 @@ def test_session_cache_is_single_flight_and_invalidates_on_new_run():
             for w in workers:
                 w.join()
 
-            # Single-flight: eight concurrent cold callers => exactly ONE computation.
-            assert calls["n"] == 1, f"expected single-flight (1 compute), got {calls['n']}"
-            assert set(results) == {1}, results  # all saw the same one run
+            # A genuinely cold cache never blocks a caller (review-cli#323): every one of the
+            # 8 concurrent callers gets the empty placeholder immediately, and — single-flight —
+            # exactly ONE background computation was kicked to populate it (not 8 stampeding).
+            assert set(results) == {0}, results
+            assert calls["n"] == 1, (
+                f"expected single-flight (1 compute), got {calls['n']}"
+            )
+            _wait_for_cache_refresh(server._session_cache)
+            assert len(server._summaries_for_gap(90.0)) == 1, (
+                "the single background compute must have landed the real (1-row) result"
+            )
 
             # Unchanged log dir => served from cache, no recompute. /api/stats shares the SAME
             # cached parse, so requesting it must not trigger a second load_sessions.
             server._summaries_for_gap(90.0)
             server.dparser.compute_stats(server._cached_sessions(90.0))
-            assert calls["n"] == 1, f"unchanged dir + stats must not recompute, got {calls['n']}"
+            assert calls["n"] == 1, (
+                f"unchanged dir + stats must not recompute, got {calls['n']}"
+            )
 
             # A new run changes the fingerprint. With window=0 the cache serves the CURRENT
             # (stale, 1-row) list immediately and kicks a single background reparse — no request
             # blocks. The stale read still shows the old count until the refresh lands.
-            _write_call_log(ld, "20260601T200000_000000", "gemini", 0, "ok\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T200000_000000", "gemini", 0, "ok\n", exit_code=0
+            )
             stale = server._summaries_for_gap(90.0)
             assert len(stale) == 1, f"must serve stale immediately, got {len(stale)}"
             # Exactly one background reparse runs; after it lands the new run shows.
             _wait_for_cache_refresh(server._session_cache)
-            assert calls["n"] == 2, f"new run must reparse once (in background), got {calls['n']}"
+            assert calls["n"] == 2, (
+                f"new run must reparse once (in background), got {calls['n']}"
+            )
             runs = server._summaries_for_gap(90.0)
             assert len(runs) == 2, runs
             # Annotation keys are still merged onto the cached summaries (live store read).
-            assert all("feedback" in r and "conscious" in r and "links" in r for r in runs)
+            assert all(
+                "feedback" in r and "conscious" in r and "links" in r for r in runs
+            )
         finally:
             server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
             p.load_sessions = orig_load
@@ -1287,17 +2337,23 @@ def test_session_cache_window_suppresses_thrash_under_active_writes():
         orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
         server._SUMMARY_MIN_RECOMPUTE_SECONDS = 3600.0
         try:
-            # First call computes once and caches.
-            assert len(server._summaries_for_gap(90.0)) == 1
+            # Warm the cache explicitly (this test is about window-thrash suppression on an
+            # already-warm cache, not the cold-start path — force=True still blocks
+            # synchronously, see test_explicit_prewarm_still_blocks_synchronously).
+            assert len(server._session_cache.get(90.0, force=True)) == 1
             assert calls["n"] == 1
 
             # Simulate the active writer: several new logs land, each bumping the fingerprint.
             for i in range(5):
-                _write_call_log(ld, f"20260601T20000{i}_000000", "gemini", 0, "ok\n", exit_code=0)
+                _write_call_log(
+                    ld, f"20260601T20000{i}_000000", "gemini", 0, "ok\n", exit_code=0
+                )
                 server._summaries_for_gap(90.0)
 
             # All within the window => NO extra scans; the cached (stale) list is served.
-            assert calls["n"] == 1, f"window must suppress recompute under writes, got {calls['n']}"
+            assert calls["n"] == 1, (
+                f"window must suppress recompute under writes, got {calls['n']}"
+            )
         finally:
             server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
             p.load_sessions = orig_load
@@ -1333,19 +2389,32 @@ def test_stats_are_memoized_until_session_list_reparses():
         orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
         server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
         try:
+            # Warm the cache explicitly first (force=True still blocks synchronously — this
+            # test is about the derived-stats memo on an established baseline, not the
+            # cold-start path itself, see test_cold_first_request_never_blocks_on_full_parse).
+            server._session_cache.get(90.0, force=True)
+            stat_calls["n"] = (
+                0  # the force=True warm-up above doesn't build derived stats
+            )
             server._cached_stats(90.0)
             server._cached_stats(90.0)
             server._cached_stats(90.0)
-            assert stat_calls["n"] == 1, f"stats must be memoized per parse, got {stat_calls['n']}"
+            assert stat_calls["n"] == 1, (
+                f"stats must be memoized per parse, got {stat_calls['n']}"
+            )
 
             # A new run triggers a background reparse (serve-stale-while-revalidate). Touch the
             # cache to kick it, wait for it to land, then the next read rebuilds stats once for
             # the new generation.
-            _write_call_log(ld, "20260601T200000_000000", "gemini", 0, "ok\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T200000_000000", "gemini", 0, "ok\n", exit_code=0
+            )
             server._cached_stats(90.0)  # serves stale, kicks the async reparse
             _wait_for_cache_refresh(server._session_cache)
             s = server._cached_stats(90.0)
-            assert stat_calls["n"] == 2, f"reparse must rebuild stats once, got {stat_calls['n']}"
+            assert stat_calls["n"] == 2, (
+                f"reparse must rebuild stats once, got {stat_calls['n']}"
+            )
             assert s["session_count"] == 2, s
         finally:
             server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
@@ -1385,22 +2454,383 @@ def test_stale_read_returns_immediately_and_refreshes_in_background():
         orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
         server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
         try:
-            # Warm the cache (this first call IS synchronous — nothing to serve yet).
-            assert len(server._summaries_for_gap(90.0)) == 1
+            # Warm the cache explicitly (force=True still blocks synchronously — see
+            # test_explicit_prewarm_still_blocks_synchronously; an ordinary cold call no
+            # longer blocks here, see test_cold_first_request_never_blocks_on_full_parse,
+            # so this test forces the warm-up itself to isolate the STALE behavior below).
+            assert len(server._session_cache.get(90.0, force=True)) == 1
             # Now make the reparse slow and add a new run; the stale read must come back fast.
             slow["on"] = True
-            _write_call_log(ld, "20260601T200000_000000", "gemini", 0, "ok\n", exit_code=0)
+            _write_call_log(
+                ld, "20260601T200000_000000", "gemini", 0, "ok\n", exit_code=0
+            )
             t0 = _time.monotonic()
             stale = server._summaries_for_gap(90.0)
             elapsed = _time.monotonic() - t0
-            assert elapsed < 0.5, f"stale read must not block on the reparse, took {elapsed:.2f}s"
-            assert len(stale) == 1, "must serve the pre-reparse (stale) list immediately"
+            assert elapsed < 0.5, (
+                f"stale read must not block on the reparse, took {elapsed:.2f}s"
+            )
+            assert len(stale) == 1, (
+                "must serve the pre-reparse (stale) list immediately"
+            )
             # The background refresh lands shortly after and the new run then appears.
             _wait_for_cache_refresh(server._session_cache, timeout=5.0)
-            assert len(server._summaries_for_gap(90.0)) == 2, "refresh must pick up the new run"
+            assert len(server._summaries_for_gap(90.0)) == 2, (
+                "refresh must pick up the new run"
+            )
         finally:
             server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
             p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_cold_first_request_never_blocks_on_full_parse():
+    """review-cli#323: on a real 130k-file/10GB install, the FIRST parse ever (nothing
+    cached yet — a fresh server start racing a request before `prewarm_summary_cache`
+    finishes) took ~130s, and a request landing in that window blocked on the SAME lock
+    the prewarm held — `curl -m 150 /api/stats` came back with ZERO bytes after 150s+.
+    The cold case must behave like the already-warm STALE case above: serve an empty
+    placeholder immediately and populate it via a background parse, never block a real
+    request on the full scan — this is the fix, verified WITHOUT ever having warmed the
+    cache first (unlike the sibling stale-read test, which warms it before making it slow)."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        import time as _time
+
+        orig_load = p.load_sessions
+
+        def _slow_load(*a, **k):
+            _time.sleep(1.0)  # stand in for the ~130s real-scale cold parse
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()  # genuinely cold, never warmed
+        p.load_sessions = _slow_load
+        try:
+            t0 = _time.monotonic()
+            cold = server._summaries_for_gap(90.0)
+            elapsed = _time.monotonic() - t0
+            assert elapsed < 0.5, (
+                f"cold first request must not block on the slow parse, took {elapsed:.2f}s"
+            )
+            assert cold == [], (
+                "a genuinely cold cache must serve an empty placeholder, not fabricate data"
+            )
+            stats = server._cached_stats(90.0)
+            assert stats.get("session_count") == 0, stats
+
+            # The background parse lands shortly after and the real run then appears.
+            _wait_for_cache_refresh(server._session_cache, timeout=5.0)
+            assert len(server._summaries_for_gap(90.0)) == 1, (
+                "the background parse must populate the real session once it lands"
+            )
+        finally:
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_cold_cache_retries_after_a_failed_background_parse():
+    """review-cli#323 review finding: the cold placeholder used to set `_fingerprint` to
+    the CURRENT (real) fingerprint at install time, before the background parse had even
+    run. If that parse then failed, `_should_refresh` saw `_fingerprint == fingerprint`
+    (nothing "changed") and never retried -- the dashboard stayed permanently empty. This
+    must instead retry (bounded by `_SUMMARY_MIN_RECOMPUTE_SECONDS`) once the parse starts
+    succeeding again."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        orig_load = p.load_sessions
+        should_fail = {"on": True}
+
+        def _maybe_fail(*a, **k):
+            if should_fail["on"]:
+                raise ValueError("simulated cold-parse failure")
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()  # genuinely cold
+        p.load_sessions = _maybe_fail
+        orig_window = server._SUMMARY_MIN_RECOMPUTE_SECONDS
+        server._SUMMARY_MIN_RECOMPUTE_SECONDS = 0.0
+        try:
+            cold = server._summaries_for_gap(90.0)
+            assert cold == [], "cold placeholder must still serve empty, not raise"
+            import time as _time
+
+            _time.sleep(0.2)  # let the doomed background parse fail and settle
+            assert server._session_cache._fingerprint is None, (
+                "a failed background parse must not mark the cache as caught-up"
+            )
+
+            # Parsing now succeeds; a later request must actually retry, not stay stuck.
+            should_fail["on"] = False
+            for _ in range(20):
+                server._summaries_for_gap(90.0)
+                if len(server._summaries_for_gap(90.0)) == 1:
+                    break
+                _time.sleep(0.1)
+            assert len(server._summaries_for_gap(90.0)) == 1, (
+                "cache must recover once the parse starts succeeding, not stay "
+                "permanently empty after one failed background parse"
+            )
+        finally:
+            server._SUMMARY_MIN_RECOMPUTE_SECONDS = orig_window
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_malformed_call_log_filename_does_not_crash_the_whole_scan():
+    """review-cli#323 review finding: `load_sessions` reached `parse_call_log` (and its
+    unguarded `_parse_stamp`) directly with no pre-check, unlike `tokenstats.list_call_logs`
+    which already guards this with `_safe_parse_stamp`. A single malformed-date filename
+    used to raise ValueError and abort the ENTIRE directory scan -- combined with the cold-
+    cache fingerprint bug above, this could leave the dashboard permanently blank the first
+    time such a file appeared. One bad file must be skipped, not fatal to the others."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+        # A filename that matches _CALL_RE's shape but has an invalid date component --
+        # _parse_stamp raises ValueError for this (month 99 is not a real month).
+        (ld / "20269999T999999_000000Z-codex-r0.log").write_text("ok\n")
+
+        sessions = p.load_sessions(ld, gap_seconds=90.0)
+        assert len(sessions) == 1, (
+            "the one well-formed call log must still be parsed and clustered despite "
+            "the malformed sibling"
+        )
+
+
+def test_parse_call_log_returns_none_not_raise_for_malformed_date():
+    """Unit-level guard for the fix's actual contract (review-cli#323 review finding):
+    `parse_call_log`'s own docstring says 'Returns None if the name doesn't match' --
+    a shape-matching-but-invalid date must honor that contract too, not raise."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        bad = Path(logd) / "20269999T999999_000000Z-codex-r0.log"
+        bad.write_text("ok\n")
+        assert p.parse_call_log(bad) is None
+
+
+def test_parse_brainstorm_log_returns_none_not_raise_for_malformed_date():
+    """Same contract, same fix, for the brainstorm `.md` sibling (review-cli#323 review
+    finding: a `.log`-only guard left this path still fatal to `load_sessions`)."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        bad = Path(logd) / "20269999T999999_000000Z-brainstorm.md"
+        bad.write_text("# Round 1\n")
+        assert p.parse_brainstorm_log(bad) is None
+
+
+def test_malformed_brainstorm_filename_does_not_crash_the_whole_scan():
+    """Directory-scan-level companion to the two unit tests above -- a malformed `.md`
+    sibling must not abort `load_sessions` any more than a malformed `.log` does."""
+    from reviewlib.dashboard import parser as p
+
+    with tempfile.TemporaryDirectory() as logd:
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+        (ld / "20269999T999999_000000Z-brainstorm.md").write_text("# Round 1\n")
+
+        sessions = p.load_sessions(ld, gap_seconds=90.0)
+        assert len(sessions) == 1, (
+            "the one well-formed call log must still be parsed despite the malformed "
+            "brainstorm sibling"
+        )
+
+
+def test_fresh_sessions_for_never_returns_another_lineages_data_after_retry_bound():
+    """review-cli#323 review finding (HIGH): the bounded lineage-retry loop must NOT
+    silently fall through to whatever is cached once its retry bound is exhausted --
+    that can be a DIFFERENT gap's clustered sessions, served to the caller as if they
+    were its own. Simulates sustained cross-lineage contention (every _ensure_fresh call
+    installs a DIFFERENT gap than the one asked for) and asserts the caller still gets
+    its OWN gap's real data, not someone else's."""
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        cache = server._SessionCache()
+        orig_ensure_fresh = cache._ensure_fresh
+
+        def _always_install_wrong_lineage(gap, *, force):
+            # Simulate another concurrent caller winning the race every single time.
+            with cache._lock:
+                cache._sessions = ["wrong-lineage-placeholder"]
+                cache._lineage = (gap + 999.0, str(ld))
+                cache._generation += 1
+
+        cache._ensure_fresh = _always_install_wrong_lineage
+        try:
+            sessions, _gen = cache._fresh_sessions_for(30.0, force=False)
+            assert sessions != ["wrong-lineage-placeholder"], (
+                "must never return another lineage's cached data after exhausting "
+                "the retry bound"
+            )
+            assert len(sessions) == 1, (
+                "the retry-bound fallback must do a real, correctly-lineaged parse"
+            )
+            assert _gen == -1, (
+                "the fallback's generation must be a sentinel (-1), never the "
+                "currently-cached FOREIGN lineage's real generation -- reusing that "
+                "real generation let get_derived() memoize this gap's derived value "
+                "under a tag a later request for the OTHER gap would also match"
+            )
+        finally:
+            cache._ensure_fresh = orig_ensure_fresh
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_get_derived_never_caches_a_retry_fallback_result_under_a_foreign_generation():
+    """review-cli#323 review finding (HIGH, found independently by two reviewers):
+    get_derived() must not store a derivation computed during the retry-bound fallback
+    (review-cli#323) under the real cache's (foreign-lineage) generation -- a later
+    request for that OTHER gap, at that same generation, would then incorrectly receive
+    THIS gap's derived value from the memo. Verifies the memo is empty after a
+    fallback-path get_derived() call, and that the "poisoned" generation still misses
+    on a normal same-generation lookup."""
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        cache = server._SessionCache()
+        # Seed a real cached lineage/generation, as if gap=90 already won the race.
+        cache._sessions = ["gap90-sessions"]
+        cache._lineage = (90.0, str(ld))
+        cache._fingerprint = (1, 1.0, 1)
+        cache._generation = 3
+        orig_ensure_fresh = cache._ensure_fresh
+        cache._ensure_fresh = lambda gap, *, force: None  # never installs gap=30
+        try:
+            value = cache.get_derived(
+                30.0, "stats", lambda sessions: f"stats-for-{len(sessions)}-sessions"
+            )
+            assert value == "stats-for-1-sessions", (
+                "sanity: the factory really did run over the fallback's real, "
+                "correctly-lineaged parse (one call log written at setup)"
+            )
+            assert "stats" not in cache._derived, (
+                "the fallback-path derived value must NOT be memoized at all -- it "
+                "was never tagged with a real generation, so a later same-generation "
+                "request for gap=90 must NOT receive it"
+            )
+        finally:
+            cache._ensure_fresh = orig_ensure_fresh
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_concurrent_same_lineage_sync_calls_both_complete_without_deadlock():
+    """review-cli#323 review: two concurrent sync callers for the exact same lineage
+    (e.g. two force=True calls, or a request racing the startup prewarm for the same
+    gap) each currently run their OWN full parse rather than sharing one -- a known,
+    deliberately-NOT-fixed-here gap tracked as review-cli#327 (an earlier attempt at a
+    wait-based single-flight fix was reverted after review found it introduced a worse,
+    narrower race). This test only guards the property that matters most: both callers
+    still complete with correct data and never deadlock, regardless of the redundant
+    work."""
+    from reviewlib.dashboard import parser as p
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        import threading as _threading
+        import time as _time
+
+        orig_load = p.load_sessions
+        started = _threading.Event()
+
+        def _slow_load(*a, **k):
+            started.set()
+            _time.sleep(0.3)
+            return orig_load(*a, **k)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        p.load_sessions = _slow_load
+        try:
+            results: list[list] = []
+
+            def _call_force():
+                results.append(server._session_cache.get(90.0, force=True))
+
+            t1 = _threading.Thread(target=_call_force)
+            t1.start()
+            assert started.wait(timeout=2.0), "first parse must have started"
+            t2 = _threading.Thread(target=_call_force)
+            t2.start()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+            assert not t1.is_alive() and not t2.is_alive(), (
+                "both concurrent force=True callers must complete, not deadlock"
+            )
+            assert len(results) == 2
+            assert all(len(r) == 1 for r in results), (
+                "both callers must receive the real (non-empty) parsed result"
+            )
+        finally:
+            p.load_sessions = orig_load
+            server._session_cache = orig_cache
+            os.environ.pop("REVIEW_LOG_DIR", None)
+            os.environ.pop("REVIEW_DASHBOARD_STORE", None)
+
+
+def test_explicit_prewarm_still_blocks_synchronously():
+    """The startup prewarm (`force=True`) is deliberately the ONE caller that still blocks —
+    it runs on its own background thread already (never a real request's thread), and it
+    needs the actual parsed data to warm the derived-stats cache too, not an empty
+    placeholder it would just have to immediately redo."""
+    from reviewlib.dashboard import server
+
+    with tempfile.TemporaryDirectory() as logd, tempfile.TemporaryDirectory() as stored:
+        os.environ["REVIEW_LOG_DIR"] = logd
+        os.environ["REVIEW_DASHBOARD_STORE"] = str(Path(stored) / "dashboard.json")
+        ld = Path(logd)
+        _write_call_log(ld, "20260601T100000_000000", "codex", 0, "ok\n", exit_code=0)
+
+        orig_cache = server._session_cache
+        server._session_cache = server._SessionCache()
+        try:
+            sessions = server._session_cache.get(90.0, force=True)
+            assert len(sessions) == 1, (
+                "an explicit force=True prewarm must synchronously return real data"
+            )
+        finally:
             server._session_cache = orig_cache
             os.environ.pop("REVIEW_LOG_DIR", None)
             os.environ.pop("REVIEW_DASHBOARD_STORE", None)
@@ -1413,7 +2843,10 @@ def test_production_recompute_window_clears_the_scan_floor():
     here instead of silently regressing the live dashboard."""
     from reviewlib.dashboard import server
 
-    assert server._SUMMARY_MIN_RECOMPUTE_SECONDS > server._SUMMARY_MIN_RECOMPUTE_FLOOR_SECONDS, (
+    assert (
+        server._SUMMARY_MIN_RECOMPUTE_SECONDS
+        > server._SUMMARY_MIN_RECOMPUTE_FLOOR_SECONDS
+    ), (
         f"production window {server._SUMMARY_MIN_RECOMPUTE_SECONDS}s must exceed the "
         f"{server._SUMMARY_MIN_RECOMPUTE_FLOOR_SECONDS}s scan floor"
     )
@@ -1434,6 +2867,9 @@ def test_served_summary_does_not_share_mutable_state_with_cache():
         orig_cache = server._session_cache
         server._session_cache = server._SessionCache()
         try:
+            server._session_cache.get(
+                90.0, force=True
+            )  # warm; not testing cold-start here
             a = server._summaries_for_gap(90.0)
             b = server._summaries_for_gap(90.0)
             assert a and b
@@ -1441,11 +2877,15 @@ def test_served_summary_does_not_share_mutable_state_with_cache():
             # and the cached Session's own to_summary() dict must not be the served object.
             assert a[0] is not b[0], "each request must get its own summary dict"
             cached_session = server._cached_sessions(90.0)[0]
-            assert a[0] is not cached_session.to_summary(), "served dict must not be the cache's"
+            assert a[0] is not cached_session.to_summary(), (
+                "served dict must not be the cache's"
+            )
             # Mutating a served response must not leak into the next request.
             a[0]["feedback"] = "scribble"
             c = server._summaries_for_gap(90.0)
-            assert c[0]["feedback"] is None, "mutation of a served dict leaked into the cache"
+            assert c[0]["feedback"] is None, (
+                "mutation of a served dict leaked into the cache"
+            )
         finally:
             server._session_cache = orig_cache
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -1481,7 +2921,9 @@ def test_prewarm_populates_session_cache_before_first_request():
             # Both /api/runs and /api/stats after prewarm are served from cache — no extra parse.
             runs = server._summaries_for_gap(90.0)
             server.dparser.compute_stats(server._cached_sessions(90.0))
-            assert calls["n"] == 1, f"requests after prewarm must hit cache, got {calls['n']}"
+            assert calls["n"] == 1, (
+                f"requests after prewarm must hit cache, got {calls['n']}"
+            )
             assert len(runs) == 1, runs
         finally:
             p.load_sessions = orig_load
@@ -1523,17 +2965,25 @@ def _fable_paywall_log(log_dir: Path, stamp: str) -> Path:
     # the sentinel reads `currentlyunavailable`. EXIT is 0 — the body, not the code, is the
     # failure signal.
     return _write_call_log(
-        log_dir, stamp, "claude", 0,
+        log_dir,
+        stamp,
+        "claude",
+        0,
         "ClaudeFable5iscurrentlyunavailable.Learnmore:\nhttps://www.anthropic.com/news/fable\n",
-        argv0="/Users/x/.local/bin/claude-p", exit_code=0,
+        argv0="/Users/x/.local/bin/claude-p",
+        exit_code=0,
     )
 
 
 def _opus_ok_log(log_dir: Path, stamp: str) -> Path:
     return _write_call_log(
-        log_dir, stamp, "claude", 0,
+        log_dir,
+        stamp,
+        "claude",
+        0,
         "## Findings\n1. A real, substantive review verdict about the diff.\n",
-        argv0="/Users/x/.local/bin/claude-p", exit_code=0,
+        argv0="/Users/x/.local/bin/claude-p",
+        exit_code=0,
     )
 
 
@@ -1545,25 +2995,54 @@ def test_classify_paywall_auth_blocked_timeout_empty_ok():
         # paywall — Fable, EXIT 0, body sentinel
         paywall = p.parse_call_log(_fable_paywall_log(ld, "20260601T100000_000000"))
         # auth — z.ai bad key, EXIT 401
-        auth = p.parse_call_log(_write_call_log(
-            ld, "20260601T100100_000000", "z.ai", 0,
-            '[stderr] {"error":"bad key"}\n', argv0="z.ai API glm-5.2", exit_code=401))
+        auth = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100100_000000",
+                "z.ai",
+                0,
+                '[stderr] {"error":"bad key"}\n',
+                argv0="z.ai API glm-5.2",
+                exit_code=401,
+            )
+        )
         # blocked — commandcode Cloudflare, EXIT 403 + 1010
-        blocked = p.parse_call_log(_write_call_log(
-            ld, "20260601T100200_000000", "commandcode", 0,
-            "[stderr] error code: 1010\n", argv0="commandcode API moonshotai/Kimi-K2.7-Code",
-            exit_code=403))
+        blocked = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100200_000000",
+                "commandcode",
+                0,
+                "[stderr] error code: 1010\n",
+                argv0="commandcode API moonshotai/Kimi-K2.7-Code",
+                exit_code=403,
+            )
+        )
         # timeout — EXIT 124 + marker
-        timeout = p.parse_call_log(_write_call_log(
-            ld, "20260601T100300_000000", "commandcode", 0,
-            "partial\n[stderr] commandcode API request failed: timed out\n"
-            "[review-cli] TIMEOUT after 10s — partial output above]\n",
-            argv0="commandcode API Qwen/Qwen3.7-Max", exit_code=124))
+        timeout = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100300_000000",
+                "commandcode",
+                0,
+                "partial\n[stderr] commandcode API request failed: timed out\n"
+                "[review-cli] TIMEOUT after 10s — partial output above]\n",
+                argv0="commandcode API Qwen/Qwen3.7-Max",
+                exit_code=124,
+            )
+        )
         # empty — EXIT 0, output_tokens=0, no real content
-        empty = p.parse_call_log(_write_call_log(
-            ld, "20260601T100400_000000", "z.ai", 0,
-            "[reasoning_content — no final answer returned]\n\nprompt_tokens=0 output_tokens=0\n",
-            argv0="z.ai API glm-5.2", exit_code=0))
+        empty = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100400_000000",
+                "z.ai",
+                0,
+                "[reasoning_content — no final answer returned]\n\nprompt_tokens=0 output_tokens=0\n",
+                argv0="z.ai API glm-5.2",
+                exit_code=0,
+            )
+        )
         # ok — EXIT 0, real verdict
         ok = p.parse_call_log(_opus_ok_log(ld, "20260601T100500_000000"))
 
@@ -1585,20 +3064,34 @@ def test_real_output_with_zero_usage_fallback_is_ok_not_empty():
         ld = Path(d)
         # claude API mode: real verdict body, then the zero-usage fallback the backend writes
         # when the response carried no usage block.
-        real = p.parse_call_log(_write_call_log(
-            ld, "20260601T100600_000000", "claude", 0,
-            "## Findings\n1. A real, substantive review verdict about the diff.\n"
-            "\n\ninput_tokens=0 output_tokens=0\n",
-            argv0="Anthropic API claude-opus-4-8", exit_code=0))
+        real = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100600_000000",
+                "claude",
+                0,
+                "## Findings\n1. A real, substantive review verdict about the diff.\n"
+                "\n\ninput_tokens=0 output_tokens=0\n",
+                argv0="Anthropic API claude-opus-4-8",
+                exit_code=0,
+            )
+        )
         assert p.classify_call(real) == p.HEALTH_OK
 
         # Guard the other half: a claude API call with ONLY the zero-usage fallback line
         # (no verdict text) is still genuinely EMPTY — dropping the blanket short-circuit
         # must not start mis-classifying a truly empty call as OK.
-        truly_empty = p.parse_call_log(_write_call_log(
-            ld, "20260601T100650_000000", "claude", 0,
-            "input_tokens=0 output_tokens=0\n",
-            argv0="Anthropic API claude-opus-4-8", exit_code=0))
+        truly_empty = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100650_000000",
+                "claude",
+                0,
+                "input_tokens=0 output_tokens=0\n",
+                argv0="Anthropic API claude-opus-4-8",
+                exit_code=0,
+            )
+        )
         assert p.classify_call(truly_empty) == p.HEALTH_EMPTY
 
 
@@ -1610,52 +3103,144 @@ def test_model_attribution_splits_shared_backends_and_claude():
         # The board's Kimi/DeepSeek/GLM seats run AGENTICALLY via opencode now
         # (review-cli#24): the runtime header is `opencode -m <provider/model>`, attributed
         # to the `oc:` board seat (not a single `opencode` row).
-        kimi = p.parse_call_log(_write_call_log(
-            ld, "20260601T100000_000000", "opencode", 0, "x\n",
-            argv0="opencode -m commandcode/moonshotai/Kimi-K2.7-Code", exit_code=0))
-        deepseek = p.parse_call_log(_write_call_log(
-            ld, "20260601T100100_000000", "opencode", 0, "x\n",
-            argv0="opencode -m commandcode/deepseek/deepseek-v4-pro", exit_code=0))
-        glm = p.parse_call_log(_write_call_log(
-            ld, "20260601T100200_000000", "opencode", 0, "x\n",
-            argv0="opencode -m zai/glm-5.2", exit_code=0))
+        kimi = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "opencode",
+                0,
+                "x\n",
+                argv0="opencode -m commandcode/moonshotai/Kimi-K2.7-Code",
+                exit_code=0,
+            )
+        )
+        deepseek = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100100_000000",
+                "opencode",
+                0,
+                "x\n",
+                argv0="opencode -m commandcode/deepseek/deepseek-v4-pro",
+                exit_code=0,
+            )
+        )
+        glm = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100200_000000",
+                "opencode",
+                0,
+                "x\n",
+                argv0="opencode -m zai/glm-5.2",
+                exit_code=0,
+            )
+        )
         # The diff-only commandcode/z.ai REST backends still exist (explicit `-m cc`/`-m glm`,
         # config boards) and must still split into their gateway board prefixes.
-        kimi_rest = p.parse_call_log(_write_call_log(
-            ld, "20260601T100210_000000", "commandcode", 0, "x\n",
-            argv0="commandcode API moonshotai/Kimi-K2.7-Code", exit_code=0))
-        glm_rest = p.parse_call_log(_write_call_log(
-            ld, "20260601T100220_000000", "z.ai", 0, "x\n",
-            argv0="z.ai API glm-5.2", exit_code=0))
+        kimi_rest = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100210_000000",
+                "commandcode",
+                0,
+                "x\n",
+                argv0="commandcode API moonshotai/Kimi-K2.7-Code",
+                exit_code=0,
+            )
+        )
+        glm_rest = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100220_000000",
+                "z.ai",
+                0,
+                "x\n",
+                argv0="z.ai API glm-5.2",
+                exit_code=0,
+            )
+        )
         # OpenRouter is another keyed-HTTP gateway (`openrouter API <slug>`): each model slug
         # must split into its own `openrouter:<slug>` row, not collapse into one `openrouter`.
-        or_claude = p.parse_call_log(_write_call_log(
-            ld, "20260601T100230_000000", "openrouter", 0, "x\n",
-            argv0="openrouter API anthropic/claude-3.5-sonnet", exit_code=0))
-        or_gpt = p.parse_call_log(_write_call_log(
-            ld, "20260601T100240_000000", "openrouter", 0, "x\n",
-            argv0="openrouter API openai/gpt-4o:beta", exit_code=0))
-        codex = p.parse_call_log(_write_call_log(
-            ld, "20260601T100300_000000", "codex", 0, "x\n",
-            argv0="/opt/homebrew/bin/codex", exit_code=0))
-        sol = p.parse_call_log(_write_call_log(
-            ld, "20260601T100310_000000", "codex", 0, "x\n",
-            argv0="codex -m gpt-5.6-sol", exit_code=0))
+        or_claude = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100230_000000",
+                "openrouter",
+                0,
+                "x\n",
+                argv0="openrouter API anthropic/claude-3.5-sonnet",
+                exit_code=0,
+            )
+        )
+        or_gpt = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100240_000000",
+                "openrouter",
+                0,
+                "x\n",
+                argv0="openrouter API openai/gpt-4o:beta",
+                exit_code=0,
+            )
+        )
+        codex = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100300_000000",
+                "codex",
+                0,
+                "x\n",
+                argv0="/opt/homebrew/bin/codex",
+                exit_code=0,
+            )
+        )
+        sol = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100310_000000",
+                "codex",
+                0,
+                "x\n",
+                argv0="codex -m gpt-5.6-sol",
+                exit_code=0,
+            )
+        )
+        # Opus review finding: a real `-m gpt-6-astra` call must attribute to the
+        # ASTRA_SEAT board id, not fall off-board — the argv reconstruction is generic
+        # (any `-m <model>`), not a Sol-only special case, and this is the only test
+        # that exercises it against a real dispatched call rather than a stub.
+        astra = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100320_000000",
+                "codex",
+                0,
+                "x\n",
+                argv0="codex -m gpt-6-astra",
+                exit_code=0,
+            )
+        )
         fable = p.parse_call_log(_fable_paywall_log(ld, "20260601T100400_000000"))
         opus = p.parse_call_log(_opus_ok_log(ld, "20260601T100500_000000"))
 
         # opencode seats attribute to the `oc:provider/model` board id.
         assert p.model_id_for_call(kimi) == "oc:commandcode/moonshotai/Kimi-K2.7-Code"
-        assert p.model_id_for_call(deepseek) == "oc:commandcode/deepseek/deepseek-v4-pro"
+        assert (
+            p.model_id_for_call(deepseek) == "oc:commandcode/deepseek/deepseek-v4-pro"
+        )
         assert p.model_id_for_call(glm) == "oc:zai/glm-5.2"
         # The diff-only REST backends still split into their gateway model ids.
         assert p.model_id_for_call(kimi_rest) == "commandcode:moonshotai/Kimi-K2.7-Code"
         assert p.model_id_for_call(glm_rest) == "zai:glm-5.2"
         # OpenRouter splits per slug (the `/` and any `:variant` survive intact).
-        assert p.model_id_for_call(or_claude) == "openrouter:anthropic/claude-3.5-sonnet"
+        assert (
+            p.model_id_for_call(or_claude) == "openrouter:anthropic/claude-3.5-sonnet"
+        )
         assert p.model_id_for_call(or_gpt) == "openrouter:openai/gpt-4o:beta"
         assert p.model_id_for_call(codex) == "codex"
         assert p.model_id_for_call(sol) == "codex:gpt-5.6-sol"
+        assert p.model_id_for_call(astra) == "codex:gpt-6-astra"
         # claude wrapper is identical on disk; the body splits Fable (paywall) from Opus.
         assert p.model_id_for_call(fable) == "claude:claude-fable-5"
         assert p.model_id_for_call(opus) == "claude:claude-opus-4-8"
@@ -1678,14 +3263,30 @@ def test_opencode_call_attributes_to_oc_board_seat_and_matches_default_board():
         assert oc_seats, "expected agentic oc: seats on the default board (#24)"
         for i, seat in enumerate(oc_seats):
             oc_model = seat.split(":", 1)[1]  # provider/model
-            call = p.parse_call_log(_write_call_log(
-                ld, f"20260601T1000{i:02d}_000000", "opencode", 0, "ok\n",
-                argv0=f"opencode -m {oc_model}", exit_code=0))
+            call = p.parse_call_log(
+                _write_call_log(
+                    ld,
+                    f"20260601T1000{i:02d}_000000",
+                    "opencode",
+                    0,
+                    "ok\n",
+                    argv0=f"opencode -m {oc_model}",
+                    exit_code=0,
+                )
+            )
             assert p.model_id_for_call(call) == seat, (seat, p.model_id_for_call(call))
         # Bare opencode (no -m) -> backend name, not a board seat.
-        bare = p.parse_call_log(_write_call_log(
-            ld, "20260601T100900_000000", "opencode", 0, "ok\n",
-            argv0="/opt/homebrew/bin/opencode", exit_code=0))
+        bare = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100900_000000",
+                "opencode",
+                0,
+                "ok\n",
+                argv0="/opt/homebrew/bin/opencode",
+                exit_code=0,
+            )
+        )
         assert p.model_id_for_call(bare) == "opencode"
 
 
@@ -1699,29 +3300,57 @@ def test_claude_api_argv0_identifies_model_before_opus_default():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         # API-mode Fable: real text body (no paywall sentinel), argv0 names Fable.
-        fable_api = p.parse_call_log(_write_call_log(
-            ld, "20260601T100600_000000", "claude", 0,
-            "## Findings\n1. A real verdict from Fable via the API.\n",
-            argv0="Anthropic API claude-fable-5", exit_code=0))
+        fable_api = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100600_000000",
+                "claude",
+                0,
+                "## Findings\n1. A real verdict from Fable via the API.\n",
+                argv0="Anthropic API claude-fable-5",
+                exit_code=0,
+            )
+        )
         # API-mode Opus, with the trailing `@ <base>` form the backend also emits.
-        opus_api = p.parse_call_log(_write_call_log(
-            ld, "20260601T100700_000000", "claude", 0,
-            "## Findings\n1. A real verdict from Opus via the API.\n",
-            argv0="Anthropic API claude-opus-4-8 @ https://api.anthropic.com", exit_code=0))
+        opus_api = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100700_000000",
+                "claude",
+                0,
+                "## Findings\n1. A real verdict from Opus via the API.\n",
+                argv0="Anthropic API claude-opus-4-8 @ https://api.anthropic.com",
+                exit_code=0,
+            )
+        )
         # CLI mode (claude-p): argv0 has no model, so the body sentinel still decides.
         opus_cli = p.parse_call_log(_opus_ok_log(ld, "20260601T100800_000000"))
         # CLI mode where the `claude-p` binary PATH itself contains `API ` (e.g. installed
         # under `/opt/API Tools/`). A generic `\bAPI ` match would mis-read `Tools/claude-p`
         # as the model; the anchored `^Anthropic API ` match must NOT, so this still falls
         # through to the body sentinel (paywall=Fable / else Opus).
-        opus_cli_apipath = p.parse_call_log(_write_call_log(
-            ld, "20260601T100900_000000", "claude", 0,
-            "## Findings\n1. A real verdict from Opus via the CLI.\n",
-            argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p", exit_code=0))
-        fable_cli_apipath = p.parse_call_log(_write_call_log(
-            ld, "20260601T101000_000000", "claude", 0,
-            "ClaudeFable5iscurrentlyunavailable.Learnmore:\n",
-            argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p", exit_code=0))
+        opus_cli_apipath = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100900_000000",
+                "claude",
+                0,
+                "## Findings\n1. A real verdict from Opus via the CLI.\n",
+                argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p",
+                exit_code=0,
+            )
+        )
+        fable_cli_apipath = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T101000_000000",
+                "claude",
+                0,
+                "ClaudeFable5iscurrentlyunavailable.Learnmore:\n",
+                argv0="/opt/API Tools/claude-p --permission-mode dontAsk -p",
+                exit_code=0,
+            )
+        )
 
         assert p.model_id_for_call(fable_api) == "claude:claude-fable-5"
         assert p.model_id_for_call(opus_api) == "claude:claude-opus-4-8"
@@ -1737,16 +3366,90 @@ def test_paywall_sentinel_survives_whitespace_collapse():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        spaced = p.parse_call_log(_write_call_log(
-            ld, "20260601T100000_000000", "claude", 0,
-            "Claude Fable 5 is currently unavailable. Learn more:\n",
-            argv0="/x/claude-p", exit_code=0))
+        spaced = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "claude",
+                0,
+                "Claude Fable 5 is currently unavailable. Learn more:\n",
+                argv0="/x/claude-p",
+                exit_code=0,
+            )
+        )
         collapsed = p.parse_call_log(_fable_paywall_log(ld, "20260601T100100_000000"))
         assert p.classify_call(spaced) == p.HEALTH_PAYWALL
         assert p.classify_call(collapsed) == p.HEALTH_PAYWALL
 
 
+def test_paywall_sentinel_prefilter_matches_normalize_body():
+    """`_has_paywall_sentinel`'s cheap regex prefilter (review-cli#186's perf fast path)
+    must never diverge from the ground-truth `_PAYWALL_SENTINEL in _normalize_body(text)`
+    check it exists to skip — across the whitespace-collapse shapes, a plain absence, a
+    red herring ("current" as an ordinary word with no "unavailable" nearby — a looser,
+    single-word prefilter tried during development let this kind of body through
+    unfiltered on ~37% of this project's own real logs), and the exact regression a
+    truncation-based earlier attempt at this fast path got wrong on real data: the
+    sentinel landing AFTER a large unrelated prefix, as happens on a real `codex` call
+    that streams a long transcript before hitting a session-limit sentinel at the end."""
+    from reviewlib.dashboard import parser as p
+
+    def _reference(text: str) -> bool:
+        return p._PAYWALL_SENTINEL in p._normalize_body(text)
+
+    cases = {
+        "spaced": "Claude Fable 5 is currently unavailable. Learn more:\n",
+        "collapsed": "ClaudeFable5iscurrentlyunavailable.Learnmore:\n",
+        "absent": "a completely normal review body with no sentinel at all\n",
+        "current_word_only": "the current implementation of current_user is fine\n",
+        "late_after_huge_prefix": ("x" * 200_000) + "\ncurrently unavailable\n",
+    }
+    for name, body in cases.items():
+        assert p._has_paywall_sentinel(body) == _reference(body), name
+    # Not just "equal to a reference that also happens to be False" — assert the actual
+    # expected truth value for each shape too, so a bug that makes BOTH sides wrong the
+    # same way can't hide behind the equality check alone.
+    assert p._has_paywall_sentinel(cases["spaced"]) is True
+    assert p._has_paywall_sentinel(cases["collapsed"]) is True
+    assert p._has_paywall_sentinel(cases["late_after_huge_prefix"]) is True
+    assert p._has_paywall_sentinel(cases["absent"]) is False
+    assert p._has_paywall_sentinel(cases["current_word_only"]) is False
+
+
+def test_paywall_sentinel_prefilter_intra_word_split_diverges_from_reference():
+    """Opus review finding, round 3 (confirmed by direct reproduction — this is NOT
+    theoretical): `_has_paywall_sentinel`'s docstring claims the prefilter "changes
+    NOTHING about which calls classify as paywall", justified by "loggers only collapse
+    INTER-word whitespace, never splitting a word's own letters apart". That is an
+    assumption about real input, not something `_normalize_body` (a blanket
+    `re.sub(r"\\s+", "", text)`) or `_PAYWALL_PREFILTER_RE` (requires "currently"/
+    "unavailable" as literal contiguous tokens) enforces or verifies. A body with
+    whitespace WITHIN one of the two words — not a shape any real provider response or
+    this project's own loggers produce, but not something the code can rule out either —
+    makes the fast path diverge from the reference: `_normalize_body` still collapses it
+    into the matching sentinel, but the prefilter's literal-token requirement misses it
+    entirely. Pins the ACTUAL (divergent) behavior explicitly, per the honest-limitation
+    note added to `_has_paywall_sentinel`'s docstring, rather than leaving the gap
+    silently unverified for a third review round."""
+    from reviewlib.dashboard import parser as p
+
+    def _reference(text: str) -> bool:
+        return p._PAYWALL_SENTINEL in p._normalize_body(text)
+
+    intra_word_split_bodies = [
+        "curre ntly unavailable",  # split inside "currently"
+        "currently un available",  # split inside "unavailable"
+    ]
+    for body in intra_word_split_bodies:
+        assert _reference(body) is True, body  # the ground truth DOES see the sentinel
+        assert p._has_paywall_sentinel(body) is False, body  # the fast path misses it
+        assert p._has_paywall_sentinel(body) != _reference(body), (
+            body
+        )  # the documented gap
+
+
 def test_compute_model_health_covers_board_and_flags_problematic():
+    from reviewlib.config import ASTRA_SEAT
     from reviewlib.dashboard import parser as p
 
     with tempfile.TemporaryDirectory() as d:
@@ -1755,39 +3458,79 @@ def test_compute_model_health_covers_board_and_flags_problematic():
         # problematic. The runtime log is an `opencode -m <provider/model>` header now
         # (review-cli#24), attributed to the `oc:` board seat.
         for i in range(3):
-            _write_call_log(ld, f"20260601T1000{i:02d}_000000", "opencode", 0,
-                            "[stderr] error code: 1010\n",
-                            argv0="opencode -m commandcode/moonshotai/Kimi-K2.7-Code", exit_code=403)
+            _write_call_log(
+                ld,
+                f"20260601T1000{i:02d}_000000",
+                "opencode",
+                0,
+                "[stderr] error code: 1010\n",
+                argv0="opencode -m commandcode/moonshotai/Kimi-K2.7-Code",
+                exit_code=403,
+            )
         # GLM (agentic opencode via the zai provider) — 3 auth failures => problematic.
         for i in range(3):
-            _write_call_log(ld, f"20260601T1100{i:02d}_000000", "opencode", 0,
-                            '[stderr] {"error":"bad key"}\n',
-                            argv0="opencode -m zai/glm-5.2", exit_code=401)
-        # Fable (claude) is a heavy-preset seat; the dashboard covers the full built-in
-        # raw board so heavy runs still get priority/fallback/health treatment.
+            _write_call_log(
+                ld,
+                f"20260601T1100{i:02d}_000000",
+                "opencode",
+                0,
+                '[stderr] {"error":"bad key"}\n',
+                argv0="opencode -m zai/glm-5.2",
+                exit_code=401,
+            )
+        # k3 review finding (review-cli#286, round 3): Fable is now in NO preset
+        # (raw-board last-resort only, post-demotion) — the dashboard still covers
+        # the full built-in raw board (not just the active preset), so priority/
+        # fallback/health treatment for a raw-board-only seat is exercised here.
         _fable_paywall_log(ld, "20260601T120000_000000")
-        # Codex — 4 healthy calls => NOT problematic (ok-rate 100%).
+        # GLM review finding: these are bare `codex` CLI-default calls (argv0 has no
+        # `-m`), which is no longer a DEFAULT_BOARD seat (ASTRA_SEAT replaced it) —
+        # compute_model_health surfaces them as an OFF-BOARD observed row, not the
+        # board's #5 seat. 4 healthy calls => that off-board row is NOT problematic
+        # (ok-rate 100%).
         for i in range(4):
-            _write_call_log(ld, f"20260601T1300{i:02d}_000000", "codex", 0,
-                            "## Findings\nA substantive review verdict.\n",
-                            argv0="/opt/homebrew/bin/codex", exit_code=0)
+            _write_call_log(
+                ld,
+                f"20260601T1300{i:02d}_000000",
+                "codex",
+                0,
+                "## Findings\nA substantive review verdict.\n",
+                argv0="/opt/homebrew/bin/codex",
+                exit_code=0,
+            )
 
         stats = p.compute_stats(p.load_sessions(ld))
         health = {m["model"]: m for m in stats["model_health"]}
 
         # Every built-in board model is represented, even no-data seats.
-        for board_id in ("claude:claude-opus-4-8", "codex",
-                         "claude:claude-fable-5", "codex:gpt-5.6-sol",
-                         "oc:commandcode/moonshotai/Kimi-K2.7-Code", "oc:zai/glm-5.2"):
+        for board_id in (
+            "claude:claude-opus-4-8",
+            ASTRA_SEAT,
+            "claude:claude-fable-5",
+            "codex:gpt-5.6-sol",
+            "oc:commandcode/moonshotai/Kimi-K2.7-Code",
+            "oc:zai/glm-5.2",
+        ):
             assert board_id in health, board_id
+        # Astra had no calls (only bare `codex` calls were logged above) => no_data,
+        # same as Opus below, NOT the off-board bare-`codex` row's 100% ok-rate.
+        assert health[ASTRA_SEAT]["status"] == "no_data"
+        assert health[ASTRA_SEAT]["problematic"] is False
 
         assert health["oc:commandcode/moonshotai/Kimi-K2.7-Code"]["problematic"] is True
-        assert health["oc:commandcode/moonshotai/Kimi-K2.7-Code"]["dominant_class"] == p.HEALTH_BLOCKED
+        assert (
+            health["oc:commandcode/moonshotai/Kimi-K2.7-Code"]["dominant_class"]
+            == p.HEALTH_BLOCKED
+        )
         assert health["oc:zai/glm-5.2"]["problematic"] is True
         assert health["oc:zai/glm-5.2"]["dominant_class"] == p.HEALTH_AUTH
         assert health["claude:claude-fable-5"]["problematic"] is True
         assert health["claude:claude-fable-5"]["dominant_class"] == p.HEALTH_PAYWALL
         assert health["claude:claude-fable-5"]["on_board"] is True
+        # Bare `codex` is an OFF-BOARD observed row now (union of board + observed
+        # models, parser.py) -- pin that explicitly so a future regression that drops
+        # this union can't hide behind an unrelated key.
+        assert health["codex"]["on_board"] is False
         assert health["codex"]["problematic"] is False
         assert health["codex"]["ok_rate"] == 1.0
         # Opus had no calls => no_data, not problematic.
@@ -1807,14 +3550,26 @@ def test_recent_streak_makes_a_model_problematic_even_below_rate_threshold():
         ld = Path(d)
         # 6 healthy OLD codex calls (rate stays high) ...
         for i in range(6):
-            _write_call_log(ld, f"20260601T1000{i:02d}_000000", "codex", 0,
-                            "## Findings\nA real verdict.\n",
-                            argv0="/opt/homebrew/bin/codex", exit_code=0)
+            _write_call_log(
+                ld,
+                f"20260601T1000{i:02d}_000000",
+                "codex",
+                0,
+                "## Findings\nA real verdict.\n",
+                argv0="/opt/homebrew/bin/codex",
+                exit_code=0,
+            )
         # ... then 3 fresh timeouts (newest) — the recent streak should flip problematic.
         for i in range(3):
-            _write_call_log(ld, f"20260601T2000{i:02d}_000000", "codex", 0,
-                            "partial\n[review-cli] TIMEOUT after 10s — partial output above]\n",
-                            argv0="/opt/homebrew/bin/codex", exit_code=124)
+            _write_call_log(
+                ld,
+                f"20260601T2000{i:02d}_000000",
+                "codex",
+                0,
+                "partial\n[review-cli] TIMEOUT after 10s — partial output above]\n",
+                argv0="/opt/homebrew/bin/codex",
+                exit_code=124,
+            )
 
         stats = p.compute_stats(p.load_sessions(ld))
         codex = next(m for m in stats["model_health"] if m["model"] == "codex")
@@ -1825,6 +3580,7 @@ def test_recent_streak_makes_a_model_problematic_even_below_rate_threshold():
 
 
 def test_model_health_empty_log_dir_is_graceful():
+    from reviewlib.config import ASTRA_SEAT
     from reviewlib.dashboard import parser as p
 
     with tempfile.TemporaryDirectory() as d:
@@ -1832,7 +3588,10 @@ def test_model_health_empty_log_dir_is_graceful():
         assert stats["problematic_count"] == 0
         # The board is still listed (all no_data), so the view never shows a blank tab.
         assert all(m["status"] == "no_data" for m in stats["model_health"])
-        assert {m["model"] for m in stats["model_health"]} >= {"codex", "oc:zai/glm-5.2"}
+        assert {m["model"] for m in stats["model_health"]} >= {
+            ASTRA_SEAT,
+            "oc:zai/glm-5.2",
+        }
 
 
 def test_bare_commandcode_probe_keeps_backend_name_and_classifies_error():
@@ -1842,9 +3601,17 @@ def test_bare_commandcode_probe_keeps_backend_name_and_classifies_error():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        probe = p.parse_call_log(_write_call_log(
-            ld, "20260601T100000_000000", "commandcode", 0,
-            "[stderr] something generic went wrong\n", argv0="commandcode", exit_code=2))
+        probe = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "commandcode",
+                0,
+                "[stderr] something generic went wrong\n",
+                argv0="commandcode",
+                exit_code=2,
+            )
+        )
         assert p.model_id_for_call(probe) == "commandcode"
         assert p.classify_call(probe) == p.HEALTH_ERROR  # exit 2, no sentinel
 
@@ -1855,9 +3622,17 @@ def test_blocked_marker_in_body_not_just_stderr_is_blocked():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        in_body = p.parse_call_log(_write_call_log(
-            ld, "20260601T100000_000000", "commandcode", 0,
-            "error code: 1010\n", argv0="commandcode API Qwen/Qwen3.7-Max", exit_code=1))
+        in_body = p.parse_call_log(
+            _write_call_log(
+                ld,
+                "20260601T100000_000000",
+                "commandcode",
+                0,
+                "error code: 1010\n",
+                argv0="commandcode API Qwen/Qwen3.7-Max",
+                exit_code=1,
+            )
+        )
         assert p.classify_call(in_body) == p.HEALTH_BLOCKED
 
 
@@ -1867,9 +3642,12 @@ def test_dominant_class_tie_break_prefers_hard_unavailable():
     from reviewlib.dashboard import parser as p
 
     # 2 timeout + 2 blocked -> blocked wins (hard-unavailable beats timeout on a tie).
-    assert p._dominant_class(
-        [p.HEALTH_TIMEOUT, p.HEALTH_BLOCKED, p.HEALTH_TIMEOUT, p.HEALTH_BLOCKED]
-    ) == p.HEALTH_BLOCKED
+    assert (
+        p._dominant_class(
+            [p.HEALTH_TIMEOUT, p.HEALTH_BLOCKED, p.HEALTH_TIMEOUT, p.HEALTH_BLOCKED]
+        )
+        == p.HEALTH_BLOCKED
+    )
     # All-OK -> no dominant FAILURE class.
     assert p._dominant_class([p.HEALTH_OK, p.HEALTH_OK]) is None
 
@@ -1883,8 +3661,15 @@ def test_non_board_model_is_appended_after_board_in_order():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         # `opencode` is not on the built-in board.
-        _write_call_log(ld, "20260601T100000_000000", "opencode", 0,
-                        "## Findings\nA real verdict.\n", argv0="/x/opencode", exit_code=0)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "opencode",
+            0,
+            "## Findings\nA real verdict.\n",
+            argv0="/x/opencode",
+            exit_code=0,
+        )
         stats = p.compute_stats(p.load_sessions(ld))
         ids = [m["model"] for m in stats["model_health"]]
         board_ids = [b.model for b in DEFAULT_BOARD]
@@ -1904,14 +3689,22 @@ def test_footerless_clean_log_is_running_not_success():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         # An in-flight call: header + partial body, NO EXIT footer, no error markers.
-        running = _write_call_log(ld, "20260601T100000_000000", "codex", 0,
-                                  "still working on the review...\n", exit_code=None)
+        running = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "still working on the review...\n",
+            exit_code=None,
+        )
         c = p.parse_call_log(running)
         assert c.exit_code is None
         assert c.completed is False, "a footerless clean log is not finished"
         assert c.has_error is False, "and it is not (yet) an error either"
         # One finished OK call alongside it, so we can check the rate denominator.
-        _write_call_log(ld, "20260601T100005_000000", "gemini", 0, "looks good\n", exit_code=0)
+        _write_call_log(
+            ld, "20260601T100005_000000", "gemini", 0, "looks good\n", exit_code=0
+        )
         stats = p.compute_stats(p.load_sessions(ld, gap_seconds=90))
         assert stats["call_count"] == 2
         assert stats["running_calls"] == 1, stats
@@ -1929,18 +3722,32 @@ def test_running_session_surfaces_running_flag_for_the_ui():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        _write_call_log(ld, "20260601T100000_000000", "codex", 0,
-                        "still streaming the review...\n", exit_code=None)  # no footer
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "still streaming the review...\n",
+            exit_code=None,
+        )  # no footer
         sessions = p.load_sessions(ld, gap_seconds=90)
         assert len(sessions) == 1
         summary = sessions[0].to_summary()
         assert summary["has_error"] is False
-        assert summary["running"] is True, "footerless in-flight session must surface running"
+        assert summary["running"] is True, (
+            "footerless in-flight session must surface running"
+        )
         detail = sessions[0].to_detail()
-        assert detail["calls"][0]["completed"] is False, "per-call completed must be exposed for the UI badge"
+        assert detail["calls"][0]["completed"] is False, (
+            "per-call completed must be exposed for the UI badge"
+        )
         # A finished OK session is NOT running.
         _write_call_log(ld, "20260602T100000_000000", "codex", 0, "done\n", exit_code=0)
-        done = [s for s in p.load_sessions(Path(d), gap_seconds=90) if not s.running and not s.has_error]
+        done = [
+            s
+            for s in p.load_sessions(Path(d), gap_seconds=90)
+            if not s.running and not s.has_error
+        ]
         assert any(s.to_detail()["calls"][0]["completed"] is True for s in done)
 
 
@@ -1967,11 +3774,15 @@ def test_explicit_exit0_with_error_text_is_not_an_error():
             "Finding: this function can raise error: ValueError on bad input.\n"
             "Also the script prints 'permission denied' and 'command not found' in its help.\n"
         )
-        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body, exit_code=0)
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
         c = p.parse_call_log(path)
         assert c is not None
         assert c.exit_code == 0
-        assert c.has_error is False, "EXIT 0 must be a success even with error words in the body"
+        assert c.has_error is False, (
+            "EXIT 0 must be a success even with error words in the body"
+        )
         assert c.error_summary is None
         # The EXIT footer must be stripped from the displayed body.
         assert "EXIT" not in c.body
@@ -1993,10 +3804,14 @@ def test_quoted_exit_line_in_body_is_not_treated_as_status():
             "which the parser handles. Overall the change looks correct.\n"
         )
         # The real footer (EXIT 0 = success) is appended last by the writer.
-        path = _write_call_log(ld, "20260601T100000_000000", "codex", 0, body, exit_code=0)
+        path = _write_call_log(
+            ld, "20260601T100000_000000", "codex", 0, body, exit_code=0
+        )
         c = p.parse_call_log(path)
         assert c.exit_code == 0, "the TRAILING footer (EXIT 0) is authoritative"
-        assert c.has_error is False, "a quoted EXIT 1 mid-body must not mark the call failed"
+        assert c.has_error is False, (
+            "a quoted EXIT 1 mid-body must not mark the call failed"
+        )
         # The quoted line stays in the displayed body.
         assert "[review-cli] EXIT 1" in c.body
         # But the real trailing footer is stripped (it appears exactly once — the quote).
@@ -2019,7 +3834,11 @@ def test_quoted_timeout_marker_in_body_is_not_treated_as_a_timeout():
             "[review-cli] TIMEOUT after 12s — partial output above]\n"
             "The handling looks fine. Overall the change is correct.\n"
         )
-        c_mid = p.parse_call_log(_write_call_log(ld, "20260601T100000_000000", "codex", 0, body_mid, exit_code=0))
+        c_mid = p.parse_call_log(
+            _write_call_log(
+                ld, "20260601T100000_000000", "codex", 0, body_mid, exit_code=0
+            )
+        )
         assert c_mid.timed_out is False and c_mid.has_error is False
         assert "TIMEOUT after 12s" in c_mid.body
         # (b) quoted as the LAST body line, with EXIT 0 (codex's residual case): position
@@ -2028,9 +3847,15 @@ def test_quoted_timeout_marker_in_body_is_not_treated_as_a_timeout():
             "Reviewing the timeout handling; the log ends with:\n"
             "[review-cli] TIMEOUT after 12s — partial output above]\n"
         )
-        c_last = p.parse_call_log(_write_call_log(ld, "20260601T100010_000000", "codex", 0, body_last, exit_code=0))
+        c_last = p.parse_call_log(
+            _write_call_log(
+                ld, "20260601T100010_000000", "codex", 0, body_last, exit_code=0
+            )
+        )
         assert c_last.exit_code == 0
-        assert c_last.timed_out is False, "EXIT 0 means no timeout even if the last line quotes the marker"
+        assert c_last.timed_out is False, (
+            "EXIT 0 means no timeout even if the last line quotes the marker"
+        )
         assert c_last.has_error is False
         assert "TIMEOUT after 12s" in c_last.body, "the quoted marker stays in the body"
 
@@ -2045,14 +3870,21 @@ def test_real_timeout_marker_before_footer_is_still_detected():
         os.environ["REVIEW_LOG_DIR"] = d
         try:
             path = write_sidecar_log(
-                "gemini", round_no=0, argv0="Gemini API", returncode=124,
-                stdout="partial output before the timeout\n", stderr="",
-                timed_out=True, timeout_secs=240,
+                "gemini",
+                round_no=0,
+                argv0="Gemini API",
+                returncode=124,
+                stdout="partial output before the timeout\n",
+                stderr="",
+                timed_out=True,
+                timeout_secs=240,
             )
         finally:
             os.environ.pop("REVIEW_LOG_DIR", None)
         c = p.parse_call_log(path)
-        assert c.timed_out is True, "the authoritative pre-footer TIMEOUT marker must be detected"
+        assert c.timed_out is True, (
+            "the authoritative pre-footer TIMEOUT marker must be detected"
+        )
         assert c.timeout_secs == 240
         assert c.exit_code == 124
         assert "TIMEOUT" not in c.body, "the real marker is stripped from the body"
@@ -2067,8 +3899,14 @@ def test_orphan_brainstorm_keeps_model_attribution_from_markdown():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         # Only the brainstorm md — no per-call -r{n}.log files (they aged out).
-        _write_brainstorm(ld, "20260601T120000_000000", "How to shard the cache",
-                          panel="codex,gemini", moderator="codex", task_code="HYP-742")
+        _write_brainstorm(
+            ld,
+            "20260601T120000_000000",
+            "How to shard the cache",
+            panel="codex,gemini",
+            moderator="codex",
+            task_code="HYP-742",
+        )
         sessions = p.load_sessions(ld)
         assert len(sessions) == 1, sessions
         s = sessions[0]
@@ -2078,7 +3916,9 @@ def test_orphan_brainstorm_keeps_model_attribution_from_markdown():
         assert s.models == ["codex", "gemini"], s.models
         # And the by_model stats reflect the panel even with no calls.
         stats = p.compute_stats(sessions)
-        assert "codex" in stats["by_model"] and "gemini" in stats["by_model"], stats["by_model"]
+        assert "codex" in stats["by_model"] and "gemini" in stats["by_model"], stats[
+            "by_model"
+        ]
 
 
 def test_claude_api_mode_emits_a_sidecar_log():
@@ -2103,10 +3943,12 @@ def test_claude_api_mode_emits_a_sidecar_log():
         def __exit__(self, *a):
             return False
 
-    fake_payload = json.dumps({
-        "content": [{"type": "text", "text": "A finding: guard the None branch."}],
-        "usage": {"input_tokens": 12, "output_tokens": 6},
-    }).encode("utf-8")
+    fake_payload = json.dumps(
+        {
+            "content": [{"type": "text", "text": "A finding: guard the None branch."}],
+            "usage": {"input_tokens": 12, "output_tokens": 6},
+        }
+    ).encode("utf-8")
 
     with tempfile.TemporaryDirectory() as logd:
         os.environ["REVIEW_LOG_DIR"] = logd
@@ -2114,7 +3956,9 @@ def test_claude_api_mode_emits_a_sidecar_log():
         old_urlopen = urllib.request.urlopen
         try:
             urllib.request.urlopen = lambda req, timeout=None: _FakeResp(fake_payload)
-            result = backends.review_claude_api("claude:claude-opus-4-8", "review", "", Path(logd), 30, round_no=2)
+            result = backends.review_claude_api(
+                "claude:claude-opus-4-8", "review", "", Path(logd), 30, round_no=2
+            )
         finally:
             urllib.request.urlopen = old_urlopen
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -2144,7 +3988,9 @@ def test_claude_api_missing_key_still_emits_a_sidecar():
         old_cfg = backends._anthropic_api_config
         try:
             backends._anthropic_api_config = lambda: None
-            result = backends.review_claude_api("claude:claude-opus-4-8", "review", "", Path(logd), 30, round_no=0)
+            result = backends.review_claude_api(
+                "claude:claude-opus-4-8", "review", "", Path(logd), 30, round_no=0
+            )
         finally:
             backends._anthropic_api_config = old_cfg
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -2162,8 +4008,14 @@ def test_explicit_nonzero_exit_is_an_error_even_with_clean_body():
 
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        path = _write_call_log(ld, "20260601T100000_000000", "gemini", 0,
-                               "all good, nothing to report\n", exit_code=1)
+        path = _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "gemini",
+            0,
+            "all good, nothing to report\n",
+            exit_code=1,
+        )
         c = p.parse_call_log(path)
         assert c.exit_code == 1
         assert c.has_error is True
@@ -2178,7 +4030,9 @@ def test_legacy_log_without_exit_footer_falls_back_to_heuristic():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         ok = _write_call_log(ld, "20260601T100000_000000", "codex", 0, "looks fine\n")
-        bad = _write_call_log(ld, "20260601T100100_000000", "codex", 0, "error: not available\n")
+        bad = _write_call_log(
+            ld, "20260601T100100_000000", "codex", 0, "error: not available\n"
+        )
         assert p.parse_call_log(ok).exit_code is None
         assert p.parse_call_log(ok).has_error is False
         assert p.parse_call_log(bad).has_error is True  # legacy grep still flags it
@@ -2192,16 +4046,36 @@ def test_success_rate_not_corrupted_by_error_text_in_successful_runs():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         # Three successful reviews, each with error words in the prose.
-        _write_call_log(ld, "20260601T100000_000000", "codex", 0,
-                        "error: the diff has a bug on line 5\n", exit_code=0)
-        _write_call_log(ld, "20260601T100003_000000", "gemini", 0,
-                        "permission denied is logged but handled fine\n", exit_code=0)
-        _write_call_log(ld, "20260601T100006_000000", "claude", 0,
-                        "traceback (most recent call last) appears in a test fixture\n", exit_code=0)
+        _write_call_log(
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "error: the diff has a bug on line 5\n",
+            exit_code=0,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100003_000000",
+            "gemini",
+            0,
+            "permission denied is logged but handled fine\n",
+            exit_code=0,
+        )
+        _write_call_log(
+            ld,
+            "20260601T100006_000000",
+            "claude",
+            0,
+            "traceback (most recent call last) appears in a test fixture\n",
+            exit_code=0,
+        )
         sessions = p.load_sessions(ld, gap_seconds=90)
         stats = p.compute_stats(sessions)
         assert stats["call_count"] == 3
-        assert stats["error_calls"] == 0, "successful runs with error text wrongly counted as errors"
+        assert stats["error_calls"] == 0, (
+            "successful runs with error text wrongly counted as errors"
+        )
         assert stats["ok_calls"] == 3
         assert stats["success_rate"] == 1.0
 
@@ -2228,10 +4102,18 @@ def test_gemini_rest_run_emits_parseable_sidecar_log():
         def __exit__(self, *a):
             return False
 
-    fake_payload = json.dumps({
-        "candidates": [{"content": {"parts": [{"text": "One nit: error: handle the None case."}]}}],
-        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
-    }).encode("utf-8")
+    fake_payload = json.dumps(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"text": "One nit: error: handle the None case."}]
+                    }
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+        }
+    ).encode("utf-8")
 
     with tempfile.TemporaryDirectory() as logd:
         os.environ["REVIEW_LOG_DIR"] = logd
@@ -2240,7 +4122,9 @@ def test_gemini_rest_run_emits_parseable_sidecar_log():
         try:
             backends._gemini_key = lambda: "fake-key"
             urllib.request.urlopen = lambda req, timeout=None: _FakeResp(fake_payload)
-            result = backends.review_gemini("gemini", "review this", "", Path(logd), 30, round_no=2)
+            result = backends.review_gemini(
+                "gemini", "review this", "", Path(logd), 30, round_no=2
+            )
         finally:
             urllib.request.urlopen = old_urlopen
             backends._gemini_key = old_key
@@ -2249,7 +4133,7 @@ def test_gemini_rest_run_emits_parseable_sidecar_log():
         assert result.returncode == 0
         # The sidecar log exists, is named with the round we passed, and parses.
         logs = list(Path(logd).glob("*-gemini-r2.log"))
-        assert len(logs) == 1, [x.name for x in Path(logd).glob('*')]
+        assert len(logs) == 1, [x.name for x in Path(logd).glob("*")]
         c = p.parse_call_log(logs[0])
         assert c is not None
         assert c.backend == "gemini"
@@ -2287,15 +4171,24 @@ def test_openai_compatible_rest_runs_emit_per_backend_sidecar_logs():
         def __exit__(self, *a):
             return False
 
-    fake_payload = json.dumps({
-        "choices": [{"message": {"content": "One finding: handle the empty list."}}],
-        "usage": {"prompt_tokens": 11, "completion_tokens": 7},
-    }).encode("utf-8")
+    fake_payload = json.dumps(
+        {
+            "choices": [
+                {"message": {"content": "One finding: handle the empty list."}}
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+        }
+    ).encode("utf-8")
 
     # (backend entry function, model string, expected sidecar backend name, env key)
     cases = [
         (backends.review_zai, "zai", "z.ai", "ZAI_API_KEY"),
-        (backends.review_commandcode, "commandcode", "commandcode", "COMMANDCODE_API_KEY"),
+        (
+            backends.review_commandcode,
+            "commandcode",
+            "commandcode",
+            "COMMANDCODE_API_KEY",
+        ),
     ]
     for entry, model, expected_backend, env_key in cases:
         with tempfile.TemporaryDirectory() as logd:
@@ -2303,7 +4196,9 @@ def test_openai_compatible_rest_runs_emit_per_backend_sidecar_logs():
             os.environ[env_key] = "fake-key"
             old_urlopen = urllib.request.urlopen
             try:
-                urllib.request.urlopen = lambda req, timeout=None: _FakeResp(fake_payload)
+                urllib.request.urlopen = lambda req, timeout=None: _FakeResp(
+                    fake_payload
+                )
                 result = entry(model, "review this", "", Path(logd), 30, round_no=4)
             finally:
                 urllib.request.urlopen = old_urlopen
@@ -2313,17 +4208,26 @@ def test_openai_compatible_rest_runs_emit_per_backend_sidecar_logs():
             assert result.returncode == 0, (expected_backend, result.stderr)
             # The sidecar is named for THIS backend (not "gemini"), with the round we passed.
             logs = list(Path(logd).glob(f"*-{expected_backend}-r4.log"))
-            assert len(logs) == 1, (expected_backend, [x.name for x in Path(logd).glob("*")])
+            assert len(logs) == 1, (
+                expected_backend,
+                [x.name for x in Path(logd).glob("*")],
+            )
             # And NOT misfiled under gemini.
             assert not list(Path(logd).glob("*-gemini-*.log")), expected_backend
             c = p.parse_call_log(logs[0])
-            assert c is not None and c.backend == expected_backend, (expected_backend, c)
+            assert c is not None and c.backend == expected_backend, (
+                expected_backend,
+                c,
+            )
             assert c.round == 4
             assert c.exit_code == 0
             assert "finding" in c.body.lower()
             # The dashboard counts it under the per-backend name, so the run is visible.
             stats = p.compute_stats(p.load_sessions(Path(logd)))
-            assert expected_backend in stats["by_model"], (expected_backend, stats["by_model"])
+            assert expected_backend in stats["by_model"], (
+                expected_backend,
+                stats["by_model"],
+            )
             assert stats["call_count"] == 1
 
 
@@ -2374,7 +4278,9 @@ def test_gemini_network_failure_still_emits_a_sidecar_log():
                 raise urllib.error.URLError("name resolution failed")
 
             urllib.request.urlopen = boom
-            result = backends.review_gemini("gemini", "review this", "", Path(logd), 5, round_no=0)
+            result = backends.review_gemini(
+                "gemini", "review this", "", Path(logd), 5, round_no=0
+            )
         finally:
             urllib.request.urlopen = old_urlopen
             backends._gemini_key = old_key
@@ -2404,8 +4310,14 @@ def test_streamed_exit_footer_anchored_when_stdout_has_no_trailing_newline():
         os.environ["REVIEW_LOG_DIR"] = logd
         try:
             # writes 'no-newline-here' with NO trailing \n, then exits 1
-            argv = [_sys.executable, "-c", "import sys; sys.stdout.write('no-newline-here'); sys.exit(1)"]
-            r = process._run_streamed(argv, cwd=Path(logd), timeout=30, backend="anchortest", round_no=0)
+            argv = [
+                _sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('no-newline-here'); sys.exit(1)",
+            ]
+            r = process._run_streamed(
+                argv, cwd=Path(logd), timeout=30, backend="anchortest", round_no=0
+            )
         finally:
             os.environ.pop("REVIEW_LOG_DIR", None)
         assert r.returncode == 1
@@ -2414,9 +4326,15 @@ def test_streamed_exit_footer_anchored_when_stdout_has_no_trailing_newline():
         text = logs[0].read_text()
         # The footer is on its own line, NOT fused onto the output.
         assert "no-newline-hereEXIT" not in text
-        assert "\n[review-cli] EXIT 1" in text or "\nEXIT 1" in text or text.endswith("[review-cli] EXIT 1\n")
+        assert (
+            "\n[review-cli] EXIT 1" in text
+            or "\nEXIT 1" in text
+            or text.endswith("[review-cli] EXIT 1\n")
+        )
         c = p.parse_call_log(logs[0])
-        assert c.exit_code == 1, "footer must be parseable even with no trailing newline in stdout"
+        assert c.exit_code == 1, (
+            "footer must be parseable even with no trailing newline in stdout"
+        )
         assert c.has_error is True
         assert "no-newline-here" in c.body
 
@@ -2436,8 +4354,13 @@ def test_gemini_sidecar_stamps_call_start_not_write_time():
             started = datetime.now(timezone.utc)
             _time.sleep(0.05)  # simulate the call taking time before we write the log
             path = process.write_sidecar_log(
-                "gemini", round_no=0, argv0="Gemini API gemini-2.5-flash",
-                returncode=0, stdout="ok\n", stderr="", started=started,
+                "gemini",
+                round_no=0,
+                argv0="Gemini API gemini-2.5-flash",
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+                started=started,
             )
         finally:
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -2460,11 +4383,15 @@ def test_gemini_missing_api_key_still_emits_a_sidecar_log():
         old_key = backends._gemini_key
 
         def no_key():
-            raise RuntimeError("GEMINI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env")
+            raise RuntimeError(
+                "GEMINI_API_KEY not found in env, GEMINI_ENV_FILE, or ~/.config/review-cli/.env"
+            )
 
         try:
             backends._gemini_key = no_key
-            result = backends.review_gemini("gemini", "review this", "", Path(logd), 5, round_no=0)
+            result = backends.review_gemini(
+                "gemini", "review this", "", Path(logd), 5, round_no=0
+            )
         finally:
             backends._gemini_key = old_key
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -2500,7 +4427,9 @@ def test_gemini_rest_timeout_is_recorded_as_a_timeout():
                 raise _socket.timeout("timed out")
 
             urllib.request.urlopen = slow
-            result = backends.review_gemini("gemini", "review this", "", Path(logd), 7, round_no=0)
+            result = backends.review_gemini(
+                "gemini", "review this", "", Path(logd), 7, round_no=0
+            )
         finally:
             urllib.request.urlopen = old_urlopen
             backends._gemini_key = old_key
@@ -2510,7 +4439,9 @@ def test_gemini_rest_timeout_is_recorded_as_a_timeout():
         logs = list(Path(logd).glob("*-gemini-r0.log"))
         assert len(logs) == 1
         c = p.parse_call_log(logs[0])
-        assert c.timed_out is True, "the TIMEOUT marker must be written for a REST timeout"
+        assert c.timed_out is True, (
+            "the TIMEOUT marker must be written for a REST timeout"
+        )
         assert c.timeout_secs == 7
         assert c.has_error is True
         # And it shows up in the dashboard's timeout_calls, not just error_calls.
@@ -2529,8 +4460,12 @@ def test_gemini_sidecar_is_private_0600():
         os.environ["REVIEW_LOG_DIR"] = logd
         try:
             path = process.write_sidecar_log(
-                "gemini", round_no=0, argv0="Gemini API gemini-2.5-flash",
-                returncode=0, stdout="ok\n", stderr="",
+                "gemini",
+                round_no=0,
+                argv0="Gemini API gemini-2.5-flash",
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
             )
         finally:
             os.environ.pop("REVIEW_LOG_DIR", None)
@@ -2549,7 +4484,9 @@ def test_panel_threads_round_no_into_backend_logs():
 
     def fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         captured["round_no"] = round_no
-        return panel.ReviewResult(model=model, command="fake", returncode=0, stdout="ok", stderr="")
+        return panel.ReviewResult(
+            model=model, command="fake", returncode=0, stdout="ok", stderr=""
+        )
 
     old_resolve = panel.resolve_backend
     try:
@@ -2557,22 +4494,31 @@ def test_panel_threads_round_no_into_backend_logs():
         with tempfile.TemporaryDirectory() as d:
             results = panel.run_panel(
                 [panel.PanelJob(model="codex", prompt="p", diff="", round_no=3)],
-                Path(d), 30,
+                Path(d),
+                30,
             )
     finally:
         panel.resolve_backend = old_resolve
 
     assert results[0].returncode == 0
-    assert captured["round_no"] == 3, "PanelJob.round_no was not threaded into the backend call"
+    assert captured["round_no"] == 3, (
+        "PanelJob.round_no was not threaded into the backend call"
+    )
 
     # And a brainstorm-shaped log set (round>=1) is inferred as brainstorm by the parser.
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
-        _write_call_log(ld, "20260601T120000_000000", "codex", 1, "round one\n", exit_code=0)
-        _write_call_log(ld, "20260601T120010_000000", "gemini", 1, "round one\n", exit_code=0)
+        _write_call_log(
+            ld, "20260601T120000_000000", "codex", 1, "round one\n", exit_code=0
+        )
+        _write_call_log(
+            ld, "20260601T120010_000000", "gemini", 1, "round one\n", exit_code=0
+        )
         sessions = p.load_sessions(ld, gap_seconds=90)
         assert len(sessions) == 1
-        assert sessions[0].mode == "brainstorm", "round>=1 logs must infer brainstorm mode"
+        assert sessions[0].mode == "brainstorm", (
+            "round>=1 logs must infer brainstorm mode"
+        )
 
 
 def test_every_resolvable_backend_accepts_panel_round_no_dispatch():
@@ -2591,15 +4537,25 @@ def test_every_resolvable_backend_accepts_panel_round_no_dispatch():
     # forwards to. review_claude_api is intentionally excluded: it is internal-only
     # (called by the review_claude dispatcher), never returned by resolve_backend.
     resolvable = [
-        b.review_codex, b.review_gemini, b.review_zai, b.review_commandcode,
-        b.review_claude, b.review_claude_cli, b.review_opencode,
+        b.review_codex,
+        b.review_gemini,
+        b.review_zai,
+        b.review_commandcode,
+        b.review_claude,
+        b.review_claude_cli,
+        b.review_opencode,
+        b.review_omp,
     ]
     for fn in resolvable:
         params = list(inspect.signature(fn).parameters)
         assert "round_no" in params, f"{fn.__name__} is missing the round_no parameter"
         # round_no must be reachable as the 6th positional arg the panel passes.
-        assert len(params) >= 6, f"{fn.__name__} cannot take round_no positionally: {params}"
-        assert params[5] == "round_no", f"{fn.__name__} 6th param is {params[5]!r}, not 'round_no'"
+        assert len(params) >= 6, (
+            f"{fn.__name__} cannot take round_no positionally: {params}"
+        )
+        assert params[5] == "round_no", (
+            f"{fn.__name__} 6th param is {params[5]!r}, not 'round_no'"
+        )
 
 
 def test_cluster_uses_call_end_time_not_start():
@@ -2615,13 +4571,33 @@ def test_cluster_uses_call_end_time_not_start():
     t0 = datetime(2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
     # call A starts at t0 and runs 120s (mtime = t0+120s); call B starts at t0+121s —
     # that's 121s after A's START (> 90s gap) but only 1s after A's END.
-    a = p.CallLog("", "a.log", t0, "codex", 0, "", "", mtime=t0 + timedelta(seconds=120))
-    b = p.CallLog("", "b.log", t0 + timedelta(seconds=121), "gemini", 0, "", "", mtime=t0 + timedelta(seconds=125))
+    a = p.CallLog(
+        "", "a.log", t0, "codex", 0, "", "", mtime=t0 + timedelta(seconds=120)
+    )
+    b = p.CallLog(
+        "",
+        "b.log",
+        t0 + timedelta(seconds=121),
+        "gemini",
+        0,
+        "",
+        "",
+        mtime=t0 + timedelta(seconds=125),
+    )
     sessions = p.cluster_sessions([a, b], [], gap_seconds=90)
     assert len(sessions) == 1, [(s.started, len(s.calls)) for s in sessions]
     assert len(sessions[0].calls) == 2
     # And the inverse: a real >gap idle gap DOES split.
-    c = p.CallLog("", "c.log", t0 + timedelta(seconds=400), "codex", 0, "", "", mtime=t0 + timedelta(seconds=402))
+    c = p.CallLog(
+        "",
+        "c.log",
+        t0 + timedelta(seconds=400),
+        "codex",
+        0,
+        "",
+        "",
+        mtime=t0 + timedelta(seconds=402),
+    )
     sessions2 = p.cluster_sessions([a, b, c], [], gap_seconds=90)
     assert len(sessions2) == 2
 
@@ -2633,12 +4609,22 @@ def test_cluster_splits_adjacent_different_task_codes():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         _write_call_log(
-            ld, "20260601T100000_000000", "codex", 0, "task one\n",
-            exit_code=0, task_code="HYP-1",
+            ld,
+            "20260601T100000_000000",
+            "codex",
+            0,
+            "task one\n",
+            exit_code=0,
+            task_code="HYP-1",
         )
         _write_call_log(
-            ld, "20260601T100030_000000", "gemini", 0, "task two\n",
-            exit_code=0, task_code="HYP-2",
+            ld,
+            "20260601T100030_000000",
+            "gemini",
+            0,
+            "task two\n",
+            exit_code=0,
+            task_code="HYP-2",
         )
         sessions = p.load_sessions(ld, gap_seconds=90)
         assert sorted(s.task_code for s in sessions) == ["HYP-1", "HYP-2"]
@@ -2653,7 +4639,9 @@ def test_brainstorm_session_id_is_stable_after_logs_age_out():
     with tempfile.TemporaryDirectory() as d:
         ld = Path(d)
         # brainstorm md is written FIRST by mode_brainstorm, then the round logs.
-        _write_brainstorm(ld, "20260601T120000_000000", "Topic", "codex,gemini", "codex")
+        _write_brainstorm(
+            ld, "20260601T120000_000000", "Topic", "codex,gemini", "codex"
+        )
         _write_call_log(ld, "20260601T120005_000000", "codex", 1, "r1\n")
         _write_call_log(ld, "20260601T120010_000000", "gemini", 1, "r1\n")
         with_logs = p.load_sessions(ld)
@@ -2678,7 +4666,9 @@ def test_detect_links_from_branch():
     with tempfile.TemporaryDirectory() as d:
         repo = Path(d)
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        subprocess.run(["git", "checkout", "-q", "-b", "HYP-742-dashboard"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "HYP-742-dashboard"], cwd=repo, check=True
+        )
         got = server.detect_links_for_cwd(repo)
         assert got["branch"] == "HYP-742-dashboard"
         assert got["tickets"] == ["HYP-742"]
@@ -2791,18 +4781,24 @@ def test_host_header_guard_blocks_dns_rebinding():
             t.start()
             try:
                 # Foreign Host -> 403 (the rebinding attacker's hostname).
-                req = urllib.request.Request(base + "/api/runs", headers={"Host": "evil.example.com"})
+                req = urllib.request.Request(
+                    base + "/api/runs", headers={"Host": "evil.example.com"}
+                )
                 try:
                     urllib.request.urlopen(req, timeout=10)
                     raise AssertionError("expected 403 for foreign Host")
                 except urllib.error.HTTPError as e:
                     assert e.code == 403, e.code
                 # Loopback Host (with the real port) -> served.
-                req2 = urllib.request.Request(base + "/api/runs", headers={"Host": f"127.0.0.1:{port}"})
+                req2 = urllib.request.Request(
+                    base + "/api/runs", headers={"Host": f"127.0.0.1:{port}"}
+                )
                 with urllib.request.urlopen(req2, timeout=10) as r:
                     assert r.status == 200
                 # localhost is allowed too.
-                req3 = urllib.request.Request(base + "/api/health", headers={"Host": f"localhost:{port}"})
+                req3 = urllib.request.Request(
+                    base + "/api/health", headers={"Host": f"localhost:{port}"}
+                )
                 with urllib.request.urlopen(req3, timeout=10) as r:
                     assert r.status == 200
             finally:
@@ -2838,36 +4834,56 @@ def test_write_endpoints_reject_csrf_and_bad_input():
                 def expect_status(headers, obj, want, *, raw=None, sid_override=None):
                     target = sid_override if sid_override is not None else sid
                     try:
-                        _post(base, f"/api/runs/{target}/feedback", obj, headers=headers, raw=raw)
+                        _post(
+                            base,
+                            f"/api/runs/{target}/feedback",
+                            obj,
+                            headers=headers,
+                            raw=raw,
+                        )
                         raise AssertionError(f"expected {want}")
                     except urllib.error.HTTPError as e:
                         assert e.code == want, f"got {e.code}, want {want}"
 
                 # 1. Foreign Origin -> 403 (cross-site CSRF write).
                 expect_status(
-                    {"Content-Type": "application/json", "Origin": "https://evil.example.com"},
-                    {"feedback": "pwned"}, 403,
+                    {
+                        "Content-Type": "application/json",
+                        "Origin": "https://evil.example.com",
+                    },
+                    {"feedback": "pwned"},
+                    403,
                 )
                 # 2. Non-JSON Content-Type -> 415 (a simple-request form post).
                 expect_status(
                     {"Content-Type": "text/plain"},
-                    {"feedback": "pwned"}, 415,
+                    {"feedback": "pwned"},
+                    415,
                 )
                 # 3. Oversized body -> 413.
                 big = json.dumps({"feedback": "x" * (70 * 1024)}).encode("utf-8")
                 expect_status(
                     {"Content-Type": "application/json"},
-                    None, 413, raw=big,
+                    None,
+                    413,
+                    raw=big,
                 )
                 # 4. Unknown session id -> 404 (can't plant a record for an arbitrary id).
                 expect_status(
                     {"Content-Type": "application/json"},
-                    {"feedback": "x"}, 404, sid_override="sess-does-not-exist",
+                    {"feedback": "x"},
+                    404,
+                    sid_override="sess-does-not-exist",
                 )
                 # 5. Loopback Origin + JSON + real session -> success.
                 st, r = _post(
-                    base, f"/api/runs/{sid}/feedback", {"feedback": "legit same-origin"},
-                    headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                    base,
+                    f"/api/runs/{sid}/feedback",
+                    {"feedback": "legit same-origin"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": f"http://127.0.0.1:{port}",
+                    },
                 )
                 assert st == 200 and r["annotation"]["feedback"] == "legit same-origin"
                 # 6. No Origin / no Referer (curl, the dashboard's own fetch) -> allowed.
@@ -2927,7 +4943,9 @@ def test_endpoints_end_to_end():
                     assert e.code == 404
 
                 # POST feedback round-trip
-                st, r = _post(base, f"/api/runs/{sid}/feedback", {"feedback": "reviewed live"})
+                st, r = _post(
+                    base, f"/api/runs/{sid}/feedback", {"feedback": "reviewed live"}
+                )
                 assert st == 200 and r["annotation"]["feedback"] == "reviewed live"
                 _, detail2 = _get(base, f"/api/runs/{sid}")
                 assert detail2["feedback"] == "reviewed live"
@@ -2939,7 +4957,9 @@ def test_endpoints_end_to_end():
                 assert stats2["conscious_count"] == 1
 
                 # POST link round-trip
-                st, r = _post(base, f"/api/runs/{sid}/links", {"pr": "456", "ticket": "HYP-742"})
+                st, r = _post(
+                    base, f"/api/runs/{sid}/links", {"pr": "456", "ticket": "HYP-742"}
+                )
                 assert st == 200
                 assert r["annotation"]["links"]["prs"] == ["#456"]
                 assert r["annotation"]["links"]["tickets"] == ["HYP-742"]
@@ -2955,15 +4975,21 @@ def test_endpoints_end_to_end():
                 with urllib.request.urlopen(base + "/", timeout=10) as resp:
                     assert resp.status == 200
                     assert b"review-cli" in resp.read()
-                with urllib.request.urlopen(base + "/assets/app.js", timeout=10) as resp:
+                with urllib.request.urlopen(
+                    base + "/assets/app.js", timeout=10
+                ) as resp:
                     assert resp.status == 200
                 # A committed model brand-logo PNG is served from the allowlisted icons/ path
                 # as a real image (the front-end renders each model as <img>, never an emoji).
                 # mini_claude.png is the Anthropic brand mark (always committed — Opus/Fable seats).
-                with urllib.request.urlopen(base + "/assets/icons/mini_claude.png", timeout=10) as resp:
+                with urllib.request.urlopen(
+                    base + "/assets/icons/mini_claude.png", timeout=10
+                ) as resp:
                     assert resp.status == 200
                     assert resp.headers.get("Content-Type") == "image/png"
-                    assert resp.read(8) == b"\x89PNG\r\n\x1a\n"  # real PNG magic, not an HTML error
+                    assert (
+                        resp.read(8) == b"\x89PNG\r\n\x1a\n"
+                    )  # real PNG magic, not an HTML error
                 # An icon name NOT in the discovered allowlist is rejected (no arbitrary read).
                 try:
                     urllib.request.urlopen(base + "/assets/icons/nope.png", timeout=10)
@@ -3015,14 +5041,18 @@ def test_host_allowlist_includes_configured_extra_host():
                     payload = json.loads(r.read().decode("utf-8"))
                     assert "ultras-mbp.tailbfe8ea.ts.net" in payload["allowed_origins"]
                 # An unrelated foreign Host is STILL rejected (rebinding guard intact).
-                bad = urllib.request.Request(base + "/api/health", headers={"Host": "evil.example.com"})
+                bad = urllib.request.Request(
+                    base + "/api/health", headers={"Host": "evil.example.com"}
+                )
                 try:
                     urllib.request.urlopen(bad, timeout=10)
                     raise AssertionError("expected 403 for foreign Host")
                 except urllib.error.HTTPError as e:
                     assert e.code == 403, e.code
                 # Loopback still served.
-                ok = urllib.request.Request(base + "/api/health", headers={"Host": f"127.0.0.1:{port}"})
+                ok = urllib.request.Request(
+                    base + "/api/health", headers={"Host": f"127.0.0.1:{port}"}
+                )
                 with urllib.request.urlopen(ok, timeout=10) as r:
                     assert r.status == 200
             finally:
@@ -3062,16 +5092,27 @@ def test_write_allowed_from_tailscale_origin_rejected_from_foreign():
                     sid = json.loads(r.read().decode("utf-8"))[0]["session_id"]
                 # write from the Tailscale Origin + matching Host -> allowed.
                 st, body = _post(
-                    base, f"/api/runs/{sid}/feedback", {"feedback": "from the phone"},
-                    headers={"Content-Type": "application/json", "Origin": f"http://{ts}", "Host": ts},
+                    base,
+                    f"/api/runs/{sid}/feedback",
+                    {"feedback": "from the phone"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": f"http://{ts}",
+                        "Host": ts,
+                    },
                 )
                 assert st == 200 and body["annotation"]["feedback"] == "from the phone"
                 # write from a FOREIGN Origin -> 403 (CSRF), even with an allowed Host.
                 try:
                     _post(
-                        base, f"/api/runs/{sid}/feedback", {"feedback": "pwned"},
-                        headers={"Content-Type": "application/json",
-                                 "Origin": "https://evil.example.com", "Host": ts},
+                        base,
+                        f"/api/runs/{sid}/feedback",
+                        {"feedback": "pwned"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "Origin": "https://evil.example.com",
+                            "Host": ts,
+                        },
                     )
                     raise AssertionError("expected 403 for foreign Origin")
                 except urllib.error.HTTPError as e:
@@ -3107,7 +5148,9 @@ def test_sse_events_stream_content_type_and_live_event():
                 # /events inherits the Host allowlist (do_GET rejects a foreign Host before
                 # routing) — a rebound page can't open the live stream and exfiltrate logs.
                 bad = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/events", headers={"Host": "evil.example.com"})
+                    f"http://127.0.0.1:{port}/events",
+                    headers={"Host": "evil.example.com"},
+                )
                 try:
                     urllib.request.urlopen(bad, timeout=10)
                     raise AssertionError("expected 403 for foreign Host on /events")
@@ -3125,8 +5168,14 @@ def test_sse_events_stream_content_type_and_live_event():
                 # is already established and a log written now is guaranteed to read as a delta.
                 resp.read(1)  # block until at least one byte is flushed
                 # Now write a NEW call log — the watcher must pick it up and stream an event.
-                _write_call_log(Path(logd), "20260601T100000_000000", "codex", 0,
-                                "live run output\n", exit_code=0)
+                _write_call_log(
+                    Path(logd),
+                    "20260601T100000_000000",
+                    "codex",
+                    0,
+                    "live run output\n",
+                    exit_code=0,
+                )
                 # Accumulate the stream until we see BOTH a `log` and a `run` event, or time out.
                 buf = b""
                 saw_run = saw_log = False
@@ -3134,7 +5183,9 @@ def test_sse_events_stream_content_type_and_live_event():
 
                 deadline = _t.monotonic() + 12
                 while _t.monotonic() < deadline and not (saw_run and saw_log):
-                    chunk = resp.read1(64)  # documented incremental read, no fixed-size block
+                    chunk = resp.read1(
+                        64
+                    )  # documented incremental read, no fixed-size block
                     if not chunk:
                         break
                     buf += chunk
@@ -3147,13 +5198,17 @@ def test_sse_events_stream_content_type_and_live_event():
                 # The log event payload contract: filename + grew + the parsed call fields.
                 text = buf.decode("utf-8", "replace")
                 log_block = next(b for b in text.split("\n\n") if "event: log" in b)
-                data_line = next(ln for ln in log_block.splitlines() if ln.startswith("data: "))
-                log_payload = json.loads(data_line[len("data: "):])
+                data_line = next(
+                    ln for ln in log_block.splitlines() if ln.startswith("data: ")
+                )
+                log_payload = json.loads(data_line[len("data: ") :])
                 assert log_payload["filename"].endswith("-codex-r0.log"), log_payload
                 assert log_payload["kind"] == "call", log_payload
                 assert log_payload["backend"] == "codex", log_payload
                 assert log_payload["completed"] is True, log_payload
-                assert log_payload["grew"] is False, log_payload  # brand-new file, not a grow
+                assert log_payload["grew"] is False, (
+                    log_payload
+                )  # brand-new file, not a grow
                 conn.close()
             finally:
                 httpd._sse_stop = True
@@ -3206,8 +5261,14 @@ def test_sse_baseline_snapshot_is_taken_before_first_byte_no_lost_event():
                 # this byte is flushed, the slow_first_snapshot delay has already elapsed by
                 # the time read(1) returns — so our write below is strictly after the baseline.
                 resp.read(1)
-                _write_call_log(Path(logd), "20260601T100000_000000", "codex", 0,
-                                "live run output\n", exit_code=0)
+                _write_call_log(
+                    Path(logd),
+                    "20260601T100000_000000",
+                    "codex",
+                    0,
+                    "live run output\n",
+                    exit_code=0,
+                )
                 buf = b""
                 saw_run = saw_log = False
                 deadline = _t.monotonic() + 12

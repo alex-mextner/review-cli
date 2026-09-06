@@ -3,17 +3,50 @@
 Extracted verbatim from the original single-file `bin/review` (Stage 0
 decomposition — zero behaviour change).
 """
+
 from __future__ import annotations
 
 import concurrent.futures
+import os
+import re
 import sys
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from .backends import ReviewResult, backend_available, call_backend, resolve_backend, review_with_images
+from .backends import (
+    ReviewResult,
+    _UNAVAILABLE_MARKERS,
+    _UNAVAILABLE_MAX_LEN,
+    backend_available,
+    call_backend,
+    resolve_backend,
+    review_with_images,
+)
 from .config import MODERATOR_CANDIDATES, BoardReviewer
-from .process import write_retry_log
+from .process import set_board_deadline, write_retry_log
+
+# Overall wall-clock BUDGET (seconds, from the start of a board run) that
+# run_board_with_failover clamps its reserve-promotion idle timeouts against via
+# process.set_board_deadline — so a run wrapped in an external `timeout N` degrades
+# gracefully instead of being SIGKILLed mid reserve-promotion (review-cli#221: a
+# promoted reserve's default 20-minute idle floor can outlive a caller's 15-minute
+# external wrapper). Unset by default (None = pre-existing unclamped behaviour,
+# unchanged) since not every caller runs under an external timeout.
+_BOARD_DEADLINE_BUDGET_ENV = "REVIEW_BOARD_DEADLINE_SECONDS"
+
+
+def _board_deadline_budget() -> int | None:
+    raw = os.environ.get(_BOARD_DEADLINE_BUDGET_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
 
 # A backend can report rc=0 with a NON-empty body that is actually an "unavailable"
 # notice rather than a real answer (e.g. the paywalled Fable returns rc=0 with
@@ -28,16 +61,17 @@ from .process import write_retry_log
 # review uses ("`X` is not available before py3.11"). The check fires only when the WHOLE
 # body is short (a one-liner notice, see `_UNAVAILABLE_MAX_LEN`). These shapes may need
 # updating if a provider changes its unavailability wording.
-_UNAVAILABLE_MARKERS = (
-    "is currently unavailable",
-    "is temporarily unavailable",
-    "model is unavailable",
-    "currently not available",
-)
-# Only treat an "unavailable" marker as a sentinel when the whole body is short — a real
-# review is long and may legitimately mention availability; the sentinel notice is a
-# one-liner. 400 chars comfortably covers the notice + its "Learn more" URL.
-_UNAVAILABLE_MAX_LEN = 400
+#
+# `_UNAVAILABLE_MARKERS` / `_UNAVAILABLE_MAX_LEN` are imported FROM `.backends` (above),
+# not defined here — backends.py is now the single canonical source (this module already
+# imports several other names from backends, so this direction has no circularity; the
+# reverse would). retry.py imports `_UNAVAILABLE_MAX_LEN` FROM THIS module unchanged —
+# re-exporting it here keeps that import working without touching retry.py. glm/Opus
+# review finding (2026-08 seat-cooldown feature, round 2): a prior version of
+# backends.py kept its OWN private copy of just one of these four markers, so a Fable
+# response shaped like one of the other three was classified paywall everywhere EXCEPT
+# the cooldown-recording check — silently defeating the cooldown for that wording. A
+# single shared source makes that class of drift impossible, not just commented-against.
 
 # Optional per-call success/fail tally for the run-stats record. The CLI installs a
 # collector (`begin_call_tally`) before a run and reads it after, so every mode that
@@ -61,18 +95,27 @@ _call_tally: dict[str, int] | None = None
 _suppress_autotally = False
 
 
+_EMPTY_TALLY: dict[str, int] = {
+    "ok": 0,
+    "fail": 0,
+    "prompt_tokens": 0,
+    "output_tokens": 0,
+}
+
+
 def begin_call_tally() -> None:
-    """Start counting per-call ok/fail for the current run. CLI-only; idempotent."""
+    """Start counting per-call ok/fail/tokens for the current run. CLI-only; idempotent."""
     global _call_tally
     with _TALLY_LOCK:
-        _call_tally = {"ok": 0, "fail": 0}
+        _call_tally = dict(_EMPTY_TALLY)
 
 
 def end_call_tally() -> dict[str, int]:
-    """Stop counting and return ``{"ok": n, "fail": n}`` for the run just finished."""
+    """Stop counting and return ``{"ok", "fail", "prompt_tokens", "output_tokens"}``
+    for the run just finished."""
     global _call_tally
     with _TALLY_LOCK:
-        tally = _call_tally or {"ok": 0, "fail": 0}
+        tally = _call_tally or dict(_EMPTY_TALLY)
         _call_tally = None
         return dict(tally)
 
@@ -91,6 +134,24 @@ def _tally_result(returncode: int) -> None:
         if _call_tally is None or _suppress_autotally:
             return
         _call_tally["ok" if returncode == 0 else "fail"] += 1
+
+
+def _tally_tokens(result: ReviewResult) -> None:
+    """Add one call's REAL token usage to the active tally (no-op outside a CLI run).
+
+    ``result.prompt_tokens``/``output_tokens`` are only ever non-zero for the REST
+    backends that set them at their own construction site (backends.py) — every
+    agentic/CLI backend defaults to 0, so this can never misattribute a quoted
+    usage-shaped line from a different seat's transcript. Unlike ``_tally_result``
+    this is NOT suppressed by ``_suppress_autotally``: a moderator's single logical
+    call still spends real tokens on every candidate it tries, and those must all be
+    counted even though only the ACCEPTED candidate's ok/fail is tallied.
+    """
+    with _TALLY_LOCK:
+        if _call_tally is None:
+            return
+        _call_tally["prompt_tokens"] += result.prompt_tokens
+        _call_tally["output_tokens"] += result.output_tokens
 
 
 def recount_round_by_usability(results: list[ReviewResult]) -> None:
@@ -142,13 +203,100 @@ def result_is_usable(result: ReviewResult) -> bool:
     return True
 
 
-def format_result(result: ReviewResult) -> str:
+# A clean/no-issues verdict without evidence (audit finding: "no forced structured
+# verdict / no evidence requirement for a clean pass"). DEFAULT_PROMPT now asks every
+# reviewer to back a clean verdict with an explicit "checked: <mode>, ruled out because
+# <reason>" statement, the same way a finding must cite file:line. This is a HEURISTIC
+# surfacing of a body that ignores that ask — not an enforcement gate (flipping the
+# reviewer's exit code on free-text content is the larger effort tracked separately,
+# review-cli#137) — so a body shaped like a bare "looks good" gets a visible warning
+# instead of being silently trusted.
+_FINDING_EVIDENCE_RE = re.compile(
+    r"[\w./-]+\.[a-zA-Z0-9]+:\d+"
+)  # e.g. reviewlib/foo.py:42
+_CHECKED_EVIDENCE_RE = re.compile(r"(?i)\bchecked\s*:")
+# No 'approved' alternative (k3 review finding, round 8): a bare `\bapproved\b` also
+# matches inside a REJECTING verdict — "Not approved — the checkpoint races the
+# stamp write." — attaching the missing-evidence WARNING to a verdict that already
+# blocked the change, actively misdescribing it rather than merely under- or
+# over-warning. DEFAULT_PROMPT never asks a reviewer to say "approved" in the first
+# place (this heuristic exists to catch DEFAULT_PROMPT's own "checked: ..." contract
+# being skipped, not to recognize every possible clean-sounding word), and the
+# remaining alternatives below already catch the common bare rubber-stamp shapes
+# ("Approved, no issues." still matches via "no issues") — so the safer fix is to
+# drop the ambiguous word entirely rather than chase every negation ("not approved",
+# "never approved", "can't be approved") with more lookbehinds.
+_CLEAN_VERDICT_RE = re.compile(
+    r"(?i)\b(no issues|looks good|lgtm|nothing (?:blocking|to flag)|no (?:blocking )?"
+    r"findings|no problems(?: found)?)\b"
+)
+# Above this length the finding-evidence scan is skipped outright (glm-cc review
+# finding, round 1): `_FINDING_EVIDENCE_RE` backtracks per start position across an
+# unbroken `[\w./-]` run with no match inside it (a model echoing a long hex blob,
+# dotted identifier chain, or minified line from the diff), which is O(L^2) on that
+# run's length — and this heuristic only ever targets a SHORT rubber-stamp verdict
+# in the first place, so a long body gets nothing from running it. The cap is well
+# above any plausible "looks good" one-liner and comfortably below where the
+# quadratic cost would be felt.
+_EVIDENCE_SCAN_MAX_LEN = 4000
+
+
+def clean_verdict_missing_evidence(body: str) -> bool:
+    """True when `body` reads like an unsupported clean verdict: it claims something in
+    the "no issues" family but shows neither a file:line citation nor a "checked: ..."
+    ruled-out statement to back that claim. A body that already cites a file:line
+    (findings, or a clean verdict that names what it inspected) or uses the "checked:"
+    phrasing DEFAULT_PROMPT now asks for is never flagged, regardless of wording — this
+    only targets the specific unsupported "looks good" rubber-stamp shape.
+
+    ACCEPTED RESIDUAL (Opus review finding, round 11, in-family with the "approved"
+    fix above): `_CLEAN_VERDICT_RE`'s remaining alternatives ("no issues", "no
+    problems", "nothing blocking", ...) can also fire on a SCOPED clause inside a
+    body that DOES report a real finding elsewhere — e.g. "Missing test: nothing
+    exercises the board render path with a custom --prompt override. No issues
+    found in the flat path." — attaching the WARNING to a response that already did
+    the work, the same class of misdescription round 8 fixed for "approved". Unlike
+    "approved" (a word DEFAULT_PROMPT never asks for at all, so dropping it cost
+    nothing), these ARE the exact words DEFAULT_PROMPT's own "checked: ..." contract
+    expects a genuinely clean SECTION to use — removing them would defeat this
+    heuristic's whole purpose, and telling a "whole verdict is clean" claim apart
+    from a "this one part is clean" clause needs the same real-conclusion-location
+    reasoning already accepted as out of reach for `refutation_verdict`'s own
+    residuals. Left as a documented, low-cost warning-only heuristic gap rather than
+    chased further: worst case is an unnecessary WARNING next to a real finding that
+    already cited its own evidence, never a silently-dropped finding."""
+    if not body.strip() or len(body) > _EVIDENCE_SCAN_MAX_LEN:
+        return False
+    if _FINDING_EVIDENCE_RE.search(body) or _CHECKED_EVIDENCE_RE.search(body):
+        return False
+    return bool(_CLEAN_VERDICT_RE.search(body))
+
+
+def format_result(result: ReviewResult, *, check_evidence: bool = False) -> str:
+    """Render one `ReviewResult` for terminal/transcript output.
+
+    `check_evidence` (default False — glm-cc review finding, round 1) opts a caller
+    into the missing-evidence WARNING: the "checked: ... / file:line" contract
+    `clean_verdict_missing_evidence` looks for is asked for ONLY by
+    `config.DEFAULT_PROMPT` (the diff-review board's base instruction) — quorum's
+    expert/moderator prompts, just-ask's prompt, and brainstorm's persona prompts
+    never ask a model for that phrasing, so applying the check there flagged a
+    perfectly normal "nothing blocking, all experts agree" synthesis as a suspicious
+    skim it was never asked to avoid being. Only `mode_review`'s two render call
+    sites (the flat and board diff-review paths) pass `check_evidence=True`."""
     status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
     body = result.stdout.strip()
     err = result.stderr.strip()
     parts = [f"## {result.model} [{status}]", f"`{result.command}`"]
     if body:
         parts.append(body)
+        if check_evidence and clean_verdict_missing_evidence(body):
+            parts.append(
+                "> [review-cli] WARNING: this reads as a clean verdict with no "
+                "evidence of what was checked (no file:line finding, no 'checked: "
+                "...' statement) — treat with skepticism; it may be a skim rather "
+                "than a real adversarial pass."
+            )
     if err:
         parts.append("stderr:\n" + err)
     return "\n\n".join(parts)
@@ -182,14 +330,25 @@ def pick_moderator(explicit: str | None, panel: list[str]) -> str:
     return pick_moderators(explicit, panel)[0]
 
 
-def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, diff: str = "", round_no: int = 0) -> ReviewResult:
+def run_moderator(
+    candidates: list[str],
+    prompt: str,
+    cwd: Path,
+    timeout: int,
+    diff: str = "",
+    round_no: int = 0,
+) -> ReviewResult:
     """Run the moderator `prompt` against `candidates` in priority order.
 
-    Returns the first result that succeeds (exit 0 with non-empty output). On a
-    failure (non-zero exit OR empty output — the dead-moderator hang surfaces as
-    a timeout exit, and a silently-disabled model as empty output) it logs and
-    falls back to the next candidate. If every candidate fails, returns the last
-    result so the caller still surfaces an error rather than crashing.
+    Returns the first result that is USABLE (`result_is_usable`: exit 0, non-empty,
+    and not a short "is currently unavailable" sentinel body). On a failure
+    (non-zero exit, empty output, or the unavailable sentinel — a cooling-down
+    claude candidate returns exactly that rc=0 sentinel shape, codex review finding:
+    a bare "rc==0 and non-empty" check accepted it as a real moderator summary, so a
+    cooling-down FIRST candidate silently blocked fallback to a healthy one, and
+    `quorum`/`brainstorm` could report the cache-hit notice as the actual synthesis)
+    it logs and falls back to the next candidate. If every candidate fails, returns
+    the last result so the caller still surfaces an error rather than crashing.
 
     Each call retries from the top of the list: the common path (the first
     candidate works) costs one run, and a persistently dead top candidate only
@@ -213,31 +372,63 @@ def run_moderator(candidates: list[str], prompt: str, cwd: Path, timeout: int, d
     finally:
         with _TALLY_LOCK:
             _suppress_autotally = prev_suppress
-    _tally_ok(result.returncode == 0 and bool(result.stdout.strip()))
+    # codex review finding (2026-08 seat-cooldown feature): tallied by the SAME
+    # predicate `_run_moderator_inner` uses to accept/reject a candidate below
+    # (`result_is_usable`, not a bare `rc==0 and non-empty` check) — a cached-skip
+    # sentinel is rc=0 and non-empty, so the old check would have tallied it "ok".
+    _tally_ok(result_is_usable(result))
     return result
 
 
-def _run_moderator_inner(candidates: list[str], prompt: str, cwd: Path, timeout: int, diff: str, round_no: int = 0) -> ReviewResult:
+def _run_moderator_inner(
+    candidates: list[str],
+    prompt: str,
+    cwd: Path,
+    timeout: int,
+    diff: str,
+    round_no: int = 0,
+) -> ReviewResult:
     last: ReviewResult | None = None
     for index, model in enumerate(candidates):
         result = run_single(model, prompt, cwd, timeout, diff=diff, round_no=round_no)
-        if result.returncode == 0 and result.stdout.strip():
+        if result_is_usable(result):
             if index > 0:
-                print(f"[review-cli] moderator fell back to {model} "
-                      f"(higher-priority candidate(s) failed)", file=sys.stderr, flush=True)
+                print(
+                    f"[review-cli] moderator fell back to {model} "
+                    f"(higher-priority candidate(s) failed)",
+                    file=sys.stderr,
+                    flush=True,
+                )
             return result
-        reason = f"exit {result.returncode}" if result.returncode != 0 else "empty output"
+        if result.returncode != 0:
+            reason = f"exit {result.returncode}"
+        elif not result.stdout.strip():
+            reason = "empty output"
+        else:
+            reason = "unavailable sentinel"  # rc=0, non-empty, but result_is_usable rejected it
         nxt = "trying next" if index + 1 < len(candidates) else "no more candidates"
-        print(f"[review-cli] moderator {model} failed ({reason}); {nxt}", file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] moderator {model} failed ({reason}); {nxt}",
+            file=sys.stderr,
+            flush=True,
+        )
         last = result
     if last is None:
-        return ReviewResult(model="(none)", command="moderator", returncode=127,
-                            stdout="", stderr="no moderator candidates")
+        return ReviewResult(
+            model="(none)",
+            command="moderator",
+            returncode=127,
+            stdout="",
+            stderr="no moderator candidates",
+        )
     if last.returncode == 0 and not last.stdout.strip():
         # Every candidate "succeeded" with empty output. Surface as a failure so
         # quorum/brainstorm don't report success for a synthesis that isn't there.
-        return ReviewResult(model=last.model, command=last.command, returncode=1,
-                            stdout=last.stdout, stderr=last.stderr or "moderator produced no output")
+        # `replace()`, not hand reconstruction -- so a future field on ReviewResult
+        # (see the run_panel relabel site below) survives this rewrite automatically.
+        return replace(
+            last, returncode=1, stderr=last.stderr or "moderator produced no output"
+        )
     return last
 
 
@@ -257,7 +448,10 @@ class PanelJob:
 
 
 def build_board_job(
-    reviewer: BoardReviewer, base_prompt: str, diff: str, images: tuple[Path, ...] = (),
+    reviewer: BoardReviewer,
+    base_prompt: str,
+    diff: str,
+    images: tuple[Path, ...] = (),
 ) -> PanelJob:
     """One role-lensed PanelJob for a reviewer (no availability check).
 
@@ -271,14 +465,19 @@ def build_board_job(
     prompt = "\n\n".join(parts)
     role_tag = reviewer.role or "general"
     return PanelJob(
-        model=reviewer.model, prompt=prompt, diff=diff,
-        label=f"{reviewer.display} [{role_tag}]", images=images,
+        model=reviewer.model,
+        prompt=prompt,
+        diff=diff,
+        label=f"{reviewer.display} [{role_tag}]",
+        images=images,
         effort=reviewer.effort,
     )
 
 
 def build_board_jobs(
-    board: list[BoardReviewer], base_prompt: str, diff: str,
+    board: list[BoardReviewer],
+    base_prompt: str,
+    diff: str,
     images: tuple[Path, ...] = (),
 ) -> tuple[list[PanelJob], list[BoardReviewer]]:
     """Turn a reviewer board into PanelJobs, skipping unavailable reviewers.
@@ -319,6 +518,18 @@ class FailoverOutcome:
     # honest run-stats pool: a backfilled reserve appears here under its real model id,
     # so record_run keys the ETA/history on what actually ran, never a display label.
     usable_models: list[str]
+    # The board ROLE (a REVIEW_ROLES key, e.g. "architect"/"security") each usable seat
+    # was reviewing under, index-aligned with `usable_models` (same seat, same position —
+    # both lists are appended to in the same loop iteration, so they can never drift).
+    # review-cli#221: a role-filling seat created by the shortage-resilience duplicate-
+    # model pad (select_pool_with_reuse / config.py) carries its OWN distinct role even
+    # when its `model` repeats one already in the pool — this is what lets a --min-roles
+    # gate count that pass as covering a genuinely different facet of the review, instead
+    # of `_distinct_models` collapsing it into the same already-counted model string.
+    # Defaulted to `[]` (unlike the required `usable_models`) so existing direct
+    # `FailoverOutcome(...)` test fakes that predate this field keep constructing
+    # without passing it.
+    usable_roles: list[str] = field(default_factory=list)
 
 
 def run_board_with_failover(
@@ -349,7 +560,16 @@ def run_board_with_failover(
     all_results: list[ReviewResult] = []
     usable: list[ReviewResult] = []
     usable_models: list[str] = []
+    usable_roles: list[str] = []
     reserve_queue = list(reserve)
+
+    # If REVIEW_BOARD_DEADLINE_SECONDS names an overall wall-clock budget, arm the
+    # process-wide deadline for its duration so a reserve promoted late in this run gets
+    # a clamped (but never starved-to-zero) idle timeout instead of the full default
+    # floor — see process.idle_timeout_seconds / review-cli#221. Cleared in the finally
+    # below regardless of outcome, so it can never leak into an unrelated later call.
+    budget = _board_deadline_budget()
+    set_board_deadline(time.monotonic() + budget if budget is not None else None)
 
     # The failover loop owns the run-stats tally: suppress run_panel's per-call auto-tally
     # so a failed-then-replaced seat isn't double-counted, and record exactly one outcome
@@ -380,6 +600,7 @@ def run_board_with_failover(
                 if result_is_usable(result):
                     usable.append(result)
                     usable_models.append(reviewer.model)
+                    usable_roles.append(reviewer.role)
                     _tally_ok(True)
                 else:
                     # This seat failed — count it as a fail and try to backfill it from
@@ -387,26 +608,39 @@ def run_board_with_failover(
                     _tally_ok(False)
                     if reserve_queue:
                         promoted = reserve_queue.pop(0)
-                        print(f"[review-cli] board: {result.model} failed — promoting "
-                              f"reserve {promoted.display} [{promoted.role or 'general'}] "
-                              f"({promoted.model})", file=sys.stderr, flush=True)
+                        print(
+                            f"[review-cli] board: {result.model} failed — promoting "
+                            f"reserve {promoted.display} [{promoted.role or 'general'}] "
+                            f"({promoted.model})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         # Durable record of the promotion (not stderr-only): a post-mortem /
                         # the dashboard can reconstruct WHICH seat failed and WHICH reserve
                         # backfilled it, with the failing seat's exit code + error channel.
                         write_retry_log(
-                            f"{result.model}->{promoted.model}", kind="promote",
-                            attempt=0, max_attempts=1, delay=0.0, result=result,
+                            f"{result.model}->{promoted.model}",
+                            kind="promote",
+                            attempt=0,
+                            max_attempts=1,
+                            delay=0.0,
+                            result=result,
                         )
                         next_round.append(promoted)
             current = next_round
     finally:
         with _TALLY_LOCK:
             _suppress_autotally = prev_suppress
+        set_board_deadline(None)
 
     degraded = len(usable) < target
     return FailoverOutcome(
-        results=all_results, usable=usable, target=target, degraded=degraded,
+        results=all_results,
+        usable=usable,
+        target=target,
+        degraded=degraded,
         usable_models=usable_models,
+        usable_roles=usable_roles,
     )
 
 
@@ -419,38 +653,55 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
     def _run_job(job: PanelJob) -> ReviewResult:
         if job.images:
             return review_with_images(
-                job.model, job.prompt, job.diff, cwd, timeout, job.round_no, job.images,
+                job.model,
+                job.prompt,
+                job.diff,
+                cwd,
+                timeout,
+                job.round_no,
+                job.images,
                 effort=job.effort,
             )
         return call_backend(
             resolve_backend(job.model),
-            job.model, job.prompt, job.diff, cwd, timeout, job.round_no, effort=job.effort,
+            job.model,
+            job.prompt,
+            job.diff,
+            cwd,
+            timeout,
+            job.round_no,
+            effort=job.effort,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = {
-            pool.submit(_run_job, job): index
-            for index, job in enumerate(jobs)
-        }
+        futures = {pool.submit(_run_job, job): index for index, job in enumerate(jobs)}
         for future in concurrent.futures.as_completed(futures):
             index = futures[future]
             model = jobs[index].label or jobs[index].model
             try:
                 base = future.result()
-                results[index] = ReviewResult(
-                    model=jobs[index].label or base.model,
-                    command=base.command,
-                    returncode=base.returncode,
-                    stdout=base.stdout,
-                    stderr=base.stderr,
-                )
+                # `replace()` (not field-by-field reconstruction) so any FUTURE field
+                # added to ReviewResult carries through this relabel automatically —
+                # a hand-copied field list is a landmine every new field must remember
+                # to update (Fable review finding: this is exactly how prompt_tokens/
+                # output_tokens almost got silently dropped here).
+                results[index] = replace(base, model=jobs[index].label or base.model)
             except Exception as exc:  # noqa: BLE001 - report, never crash the panel
-                results[index] = ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc))
+                results[index] = ReviewResult(
+                    model=model,
+                    command="internal",
+                    returncode=127,
+                    stdout="",
+                    stderr=str(exc),
+                )
             _tally_result(results[index].returncode)
+            _tally_tokens(results[index])
     return [r for r in results if r is not None]
 
 
-def run_panel_with_retry(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResult]:
+def run_panel_with_retry(
+    jobs: list[PanelJob], cwd: Path, timeout: int
+) -> list[ReviewResult]:
     """Run jobs in parallel like `run_panel`, but each seat RETRIES itself on a transient
     failure before giving up — same-order results out.
 
@@ -472,20 +723,92 @@ def run_panel_with_retry(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[
     (`run_board_with_failover` / a future direct user) owns the one-per-logical-seat tally;
     when NOT already suppressed, each seat's FINAL outcome is tallied once below, matching
     `run_panel`'s one-call-one-tally contract."""
-    from .retry import run_seat_with_retry  # lazy: breaks the panel<->retry import cycle
+    # Use the SAME unpaid predicate backend_available uses (runtime_provider_marked_unpaid),
+    # so the pool guard's liveness view and the failover chain's drop set never disagree.
+    from .backends import (
+        runtime_provider_marked_unpaid as provider_marked_unpaid,
+    )  # lazy
+    from .provider_failover import (  # lazy: keeps panel import light
+        forget_working_provider,
+        is_default_provider_selection,
+        provider_chain,
+        remember_working_provider,
+    )
+    from .retry import (
+        run_seat_with_retry,
+    )  # lazy: breaks the panel<->retry import cycle
 
     if not jobs:
         return []
     results: list[ReviewResult | None] = [None] * len(jobs)
 
     def _seat(job: PanelJob) -> ReviewResult:
-        # The per-attempt runner: ONE dispatch of this seat. Auto-tally is already suppressed
-        # (single-threaded) by the wrapper below, so retries are never each counted — this
-        # closure does NOT touch the global, so parallel seats can't race on it.
-        def _once() -> ReviewResult:
-            return run_panel([job], cwd, timeout)[0]
+        # PROVIDER-FAILOVER (mid-review switchover): a logical model can be served by several
+        # providers. Try them in order — each provider first gets the SAME-provider transient
+        # retry (run_seat_with_retry: backoff on 429/5xx/DNS/timeout/reset), and if it is STILL
+        # unusable we switch this SAME model to its NEXT provider and the review CONTINUES on
+        # the working one. The seat only fails (-> board reserve-replace) when EVERY provider
+        # is exhausted. The provider that produces the verdict is cached as last-working (tried
+        # first next run); a total failure rotates the cache. Unpaid providers are dropped from
+        # the chain up front (never dispatched) — distinct from this call-time failover.
+        label = job.label or job.model
+        chain = provider_chain(
+            job.model,
+            available=backend_available,
+            unpaid=provider_marked_unpaid,
+        )
 
-        return run_seat_with_retry(job.label or job.model, _once)
+        # Auto-tally stays suppressed (single-threaded) by the wrapper below; each inner
+        # dispatch does NOT touch the global, so parallel seats can't race on it.
+        def _attempt(seat_job: PanelJob) -> ReviewResult:
+            def _once() -> ReviewResult:
+                return run_panel([seat_job], cwd, timeout)[0]
+
+            return run_seat_with_retry(label, _once)
+
+        # The last-working cache only helps a model with ALTERNATES (so a chronically-flaky
+        # first provider stops costing a failover each run). A single-provider seat (codex,
+        # gemini, a plain claude id) has nothing to rotate, so skip the lock-serialized
+        # load+atomic-rename write entirely instead of accumulating no-op `{"codex":"codex"}`
+        # entries.
+        #
+        # The WRITE side must be gated the SAME way `provider_chain`'s cache-reorder READ is
+        # (`is_default_provider_selection`): an explicit alternate pin (`-m
+        # commandcode:zai-org/GLM-5.2`) succeeding/failing must not train/clear the shared
+        # logical-key cache entry a later BARE alias request (`-m glm52`) reads — otherwise
+        # a one-off pin silently rebiases (or wipes) default routing (review of #157: "cache
+        # write isn't gated the way the read is").
+        cache_eligible = len(chain) > 1 and is_default_provider_selection(job.model)
+        last: ReviewResult | None = None
+        for idx, provider_model in enumerate(chain):
+            result = _attempt(
+                replace(job, model=provider_model)
+                if provider_model != job.model
+                else job
+            )
+            if result_is_usable(result):
+                if cache_eligible:
+                    remember_working_provider(job.model, provider_model)
+                return result
+            last = result
+            if idx + 1 < len(chain):
+                print(
+                    f"[review-cli] seat {label}: provider {provider_model} failed — "
+                    f"switching to {chain[idx + 1]} (review continues)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                write_retry_log(
+                    f"{provider_model}=>{chain[idx + 1]}",
+                    kind="provider-failover",
+                    attempt=idx,
+                    max_attempts=len(chain),
+                    delay=0.0,
+                    result=result,
+                )
+        if cache_eligible:
+            forget_working_provider(job.model)
+        return last if last is not None else _attempt(job)
 
     # Suppress the inner auto-tally ONCE, on THIS thread, around the whole parallel run, then
     # tally each seat's final outcome once afterward. A single toggle here (vs one per worker
@@ -504,7 +827,13 @@ def run_panel_with_retry(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[
                 try:
                     results[index] = future.result()
                 except Exception as exc:  # noqa: BLE001 - report, never crash the panel
-                    results[index] = ReviewResult(model=model, command="internal", returncode=127, stdout="", stderr=str(exc))
+                    results[index] = ReviewResult(
+                        model=model,
+                        command="internal",
+                        returncode=127,
+                        stdout="",
+                        stderr=str(exc),
+                    )
     finally:
         with _TALLY_LOCK:
             _suppress_autotally = prev_suppress
@@ -523,5 +852,11 @@ def run_panel_with_retry(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[
     return [r for r in results if r is not None]
 
 
-def run_single(model: str, prompt: str, cwd: Path, timeout: int, diff: str = "", round_no: int = 0) -> ReviewResult:
-    return run_panel([PanelJob(model=model, prompt=prompt, diff=diff, round_no=round_no)], cwd, timeout)[0]
+def run_single(
+    model: str, prompt: str, cwd: Path, timeout: int, diff: str = "", round_no: int = 0
+) -> ReviewResult:
+    return run_panel(
+        [PanelJob(model=model, prompt=prompt, diff=diff, round_no=round_no)],
+        cwd,
+        timeout,
+    )[0]

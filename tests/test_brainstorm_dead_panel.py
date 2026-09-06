@@ -15,6 +15,7 @@ call / no network. `REVIEW_LOG_DIR` points the discussion log at a throwaway tem
 
 Same plain-function + __main__ harness as the rest of tests/.
 """
+
 from __future__ import annotations
 
 import io
@@ -36,9 +37,16 @@ from reviewlib.modes.brainstorm import (  # noqa: E402
 )
 
 
-def _result(model: str, *, stdout: str = "", returncode: int = 0, stderr: str = "") -> ReviewResult:
-    return ReviewResult(model=model, command=f"fake:{model}", returncode=returncode,
-                        stdout=stdout, stderr=stderr)
+def _result(
+    model: str, *, stdout: str = "", returncode: int = 0, stderr: str = ""
+) -> ReviewResult:
+    return ReviewResult(
+        model=model,
+        command=f"fake:{model}",
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 class _StubBackends:
@@ -59,19 +67,25 @@ class _StubBackends:
 
     def __enter__(self):
         self._old = panel.resolve_backend
-        from reviewlib.modes.brainstorm import MODERATOR_PROMPT_LEADIN, SYNTHESIS_PROMPT_MARKER
+        from reviewlib.modes.brainstorm import (
+            MODERATOR_PROMPT_LEADIN,
+            SYNTHESIS_PROMPT_MARKER,
+        )
 
         def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
             if SYNTHESIS_PROMPT_MARKER in prompt or MODERATOR_PROMPT_LEADIN in prompt:
                 self.moderator_calls += 1
-                body = ("Moderator summary.\nDECISION: CONTINUE"
-                        if MODERATOR_PROMPT_LEADIN in prompt else "FINAL SYNTHESIS: ship idea-A.")
+                body = (
+                    "Moderator summary.\nDECISION: CONTINUE"
+                    if MODERATOR_PROMPT_LEADIN in prompt
+                    else "FINAL SYNTHESIS: ship idea-A."
+                )
                 return _result(model, stdout=body)
             self.persona_calls += 1
             if self.dead_from_round is not None and round_no >= self.dead_from_round:
-                return _result(model, stdout="")          # flake from this round on
+                return _result(model, stdout="")  # flake from this round on
             if self.outcome == "dead":
-                return _result(model, stdout="")          # rc 0, empty -> not usable
+                return _result(model, stdout="")  # rc 0, empty -> not usable
             if self.outcome == "error":
                 return _result(model, stdout="", returncode=1, stderr="backend died")
             return _result(model, stdout=f"idea from {model} r{round_no}")
@@ -84,8 +98,13 @@ class _StubBackends:
         return False
 
 
-def _run_brainstorm(outcome: str, *, rounds: int = 5, max_rounds: int = 8,
-                    dead_from_round: int | None = None):
+def _run_brainstorm(
+    outcome: str,
+    *,
+    rounds: int = 5,
+    max_rounds: int = 8,
+    dead_from_round: int | None = None,
+):
     """Run a real brainstorm with a stubbed backend boundary, in a temp log dir. Returns
     (exit_code, stdout_text, stub)."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -93,10 +112,18 @@ def _run_brainstorm(outcome: str, *, rounds: int = 5, max_rounds: int = 8,
         os.environ["REVIEW_LOG_DIR"] = tmp
         buf = io.StringIO()
         try:
-            with _StubBackends(outcome, dead_from_round=dead_from_round) as stub, redirect_stdout(buf):
+            with (
+                _StubBackends(outcome, dead_from_round=dead_from_round) as stub,
+                redirect_stdout(buf),
+            ):
                 rc = mode_brainstorm(
-                    "How should we cache?", ["m1", "m2", "m3"], REPO_ROOT, 5,
-                    ["mod"], rounds=rounds, max_rounds=max_rounds,
+                    "How should we cache?",
+                    ["m1", "m2", "m3"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=rounds,
+                    max_rounds=max_rounds,
                 )
         finally:
             if old_log is None:
@@ -140,10 +167,14 @@ def test_round_is_dead_empty_list():
 # === end-to-end: a dead panel aborts loud with the stable exit code ==============
 def test_dead_panel_aborts_with_dead_panel_exit_code():
     rc, _out, stub = _run_brainstorm("dead")
-    assert rc == EXIT_DEAD_PANEL, f"expected EXIT_DEAD_PANEL={EXIT_DEAD_PANEL}, got {rc}"
+    assert rc == EXIT_DEAD_PANEL, (
+        f"expected EXIT_DEAD_PANEL={EXIT_DEAD_PANEL}, got {rc}"
+    )
     # It must abort on the FIRST dead round — exactly one round of persona calls (3 seats),
     # NOT all 5 min-rounds, and it must NOT spend a moderator call on a dead round.
-    assert stub.persona_calls == 3, f"expected 1 dead round (3 seats), got {stub.persona_calls} calls"
+    assert stub.persona_calls == 3, (
+        f"expected 1 dead round (3 seats), got {stub.persona_calls} calls"
+    )
     assert stub.moderator_calls == 0, "must not call the moderator on a dead round"
 
 
@@ -157,13 +188,25 @@ def test_dead_panel_prints_actionable_error():
     fix — not a silent empty synthesis. Captured here off stderr."""
     err = io.StringIO()
     from contextlib import redirect_stderr
+
     with tempfile.TemporaryDirectory() as tmp:
         old_log = os.environ.get("REVIEW_LOG_DIR")
         os.environ["REVIEW_LOG_DIR"] = tmp
         try:
-            with _StubBackends("dead"), redirect_stderr(err), redirect_stdout(io.StringIO()):
-                mode_brainstorm("topic", ["m1", "m2", "m3"], REPO_ROOT, 5, ["mod"],
-                                rounds=5, max_rounds=8)
+            with (
+                _StubBackends("dead"),
+                redirect_stderr(err),
+                redirect_stdout(io.StringIO()),
+            ):
+                mode_brainstorm(
+                    "topic",
+                    ["m1", "m2", "m3"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=5,
+                    max_rounds=8,
+                )
         finally:
             if old_log is None:
                 os.environ.pop("REVIEW_LOG_DIR", None)
@@ -188,7 +231,9 @@ def test_live_panel_still_completes_normally():
     rc, out, stub = _run_brainstorm("alive", rounds=5, max_rounds=5)
     assert rc == 0, f"a live brainstorm must succeed, got {rc}"
     assert "# Final synthesis" in out, "a live brainstorm must print its synthesis"
-    assert stub.persona_calls == 5 * 3, f"expected 5 rounds x 3 seats, got {stub.persona_calls}"
+    assert stub.persona_calls == 5 * 3, (
+        f"expected 5 rounds x 3 seats, got {stub.persona_calls}"
+    )
 
 
 def test_dead_round_after_productive_rounds_does_not_abort(capfd=None):
@@ -206,7 +251,9 @@ def test_dead_round_after_productive_rounds_does_not_abort(capfd=None):
         f"a dead round AFTER a productive round must not abort with EXIT_DEAD_PANEL, got {rc}"
     )
     assert rc == 0, f"the run should complete (synthesize the good round), got {rc}"
-    assert "# Final synthesis" in out, "the accumulated good round must still be synthesized"
+    assert "# Final synthesis" in out, (
+        "the accumulated good round must still be synthesized"
+    )
     # The guard did NOT fire on round 1 (it ran at least one productive round before any
     # dead round) — i.e. it did not bail on the first round the way the all-dead case does.
     assert stub.persona_calls > 3, (
@@ -215,7 +262,9 @@ def test_dead_round_after_productive_rounds_does_not_abort(capfd=None):
     )
     # The productive round-1 content must actually be present in the output the user sees —
     # proving the synthesis isn't hollow / the good round wasn't silently dropped.
-    assert "idea from m1 r1" in out, "round-1 productive content must survive into the output"
+    assert "idea from m1 r1" in out, (
+        "round-1 productive content must survive into the output"
+    )
 
 
 def test_midrun_collapse_stops_on_dead_round_not_min_rounds():
@@ -285,8 +334,15 @@ def test_midrun_collapse_not_hollow_even_if_moderator_would_stop_over_dead_round
 
             stub.__enter__ = _enter_stop_happy  # type: ignore[method-assign]
             with stub, redirect_stdout(buf):
-                rc = mode_brainstorm("topic", ["m1", "m2", "m3"], REPO_ROOT, 5, ["mod"],
-                                     rounds=5, max_rounds=8)
+                rc = mode_brainstorm(
+                    "topic",
+                    ["m1", "m2", "m3"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=5,
+                    max_rounds=8,
+                )
         finally:
             if old_log is None:
                 os.environ.pop("REVIEW_LOG_DIR", None)
@@ -295,12 +351,18 @@ def test_midrun_collapse_not_hollow_even_if_moderator_would_stop_over_dead_round
     out = buf.getvalue()
     # The run still completes with a synthesis over the REAL round 1 (rc 0) — not a dead-panel
     # abort (round 1 was productive) and not a hollow synthesis.
-    assert rc == 0, f"a productive round 1 + dead round 2 must synthesize and exit 0, got {rc}"
+    assert rc == 0, (
+        f"a productive round 1 + dead round 2 must synthesize and exit 0, got {rc}"
+    )
     assert "# Final synthesis" in out
-    assert "idea from m1 r1" in out, "the real round-1 ideas must be in the synthesized output"
+    assert "idea from m1 r1" in out, (
+        "the real round-1 ideas must be in the synthesized output"
+    )
     # Crucially, the loop stopped on the dead round 2, NOT after a moderator STOP-over-dead —
     # only round 1's persona+moderator and round 2's dead personas ran.
-    assert "# Round 3" not in out, "the dead round must end the loop, not let STOP run more rounds"
+    assert "# Round 3" not in out, (
+        "the dead round must end the loop, not let STOP run more rounds"
+    )
 
 
 def test_dead_panel_writes_partial_discussion_log():
@@ -311,8 +373,15 @@ def test_dead_panel_writes_partial_discussion_log():
         os.environ["REVIEW_LOG_DIR"] = tmp
         try:
             with _StubBackends("dead"), redirect_stdout(io.StringIO()):
-                mode_brainstorm("topic", ["m1", "m2", "m3"], REPO_ROOT, 5, ["mod"],
-                                rounds=5, max_rounds=8)
+                mode_brainstorm(
+                    "topic",
+                    ["m1", "m2", "m3"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=5,
+                    max_rounds=8,
+                )
             logs = list(Path(tmp).glob("*brainstorm.md"))
             assert logs, "no discussion log written"
             body = logs[0].read_text()
@@ -337,13 +406,21 @@ def test_dead_panel_log_has_zero_completed_rounds_for_resume():
     its '(no output)' transcript and continuing from round 2. Exercises the REAL session parser
     against the REAL log the abort writes."""
     import reviewlib.sessions as sessions
+
     with tempfile.TemporaryDirectory() as tmp:
         old_log = os.environ.get("REVIEW_LOG_DIR")
         os.environ["REVIEW_LOG_DIR"] = tmp
         try:
             with _StubBackends("dead"), redirect_stdout(io.StringIO()):
-                mode_brainstorm("topic", ["m1", "m2", "m3"], REPO_ROOT, 5, ["mod"],
-                                rounds=5, max_rounds=8)
+                mode_brainstorm(
+                    "topic",
+                    ["m1", "m2", "m3"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=5,
+                    max_rounds=8,
+                )
             logs = list(Path(tmp).glob("*brainstorm.md"))
             assert logs, "no discussion log written"
             session = sessions.parse_log(logs[0])
@@ -365,14 +442,22 @@ def test_dead_panel_run_stats_count_dead_seats_as_failures():
     active tally reflects `result_is_usable`. Exercises the REAL tally (begin/end_call_tally)
     around a real dead-panel brainstorm run."""
     import reviewlib.panel as panel
+
     with tempfile.TemporaryDirectory() as tmp:
         old_log = os.environ.get("REVIEW_LOG_DIR")
         os.environ["REVIEW_LOG_DIR"] = tmp
         panel.begin_call_tally()
         try:
             with _StubBackends("dead"), redirect_stdout(io.StringIO()):
-                mode_brainstorm("topic", ["m1", "m2", "m3"], REPO_ROOT, 5, ["mod"],
-                                rounds=5, max_rounds=8)
+                mode_brainstorm(
+                    "topic",
+                    ["m1", "m2", "m3"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=5,
+                    max_rounds=8,
+                )
         finally:
             tally = panel.end_call_tally()
             if old_log is None:
@@ -388,6 +473,7 @@ def test_recount_round_by_usability_reclassifies_only_dead_rc0_seats():
     """Unit: `recount_round_by_usability` moves rc=0-but-empty seats ok->fail and leaves a
     genuinely-usable rc=0 seat and an already-failed (rc!=0) seat alone."""
     import reviewlib.panel as panel
+
     panel.begin_call_tally()
     # Simulate run_panel's auto-tally: 2 rc=0 seats counted ok, 1 rc=1 seat counted fail.
     panel._tally_result(0)
@@ -395,18 +481,19 @@ def test_recount_round_by_usability_reclassifies_only_dead_rc0_seats():
     panel._tally_result(1)
     results = [
         _result("a", stdout="real verdict here"),  # usable -> stays ok
-        _result("b", stdout=""),                   # rc0 empty -> ok->fail
-        _result("c", returncode=1),                # already fail -> untouched
+        _result("b", stdout=""),  # rc0 empty -> ok->fail
+        _result("c", returncode=1),  # already fail -> untouched
     ]
     panel.recount_round_by_usability(results)
     tally = panel.end_call_tally()
-    assert tally == {"ok": 1, "fail": 2}, tally
+    assert tally == {"ok": 1, "fail": 2, "prompt_tokens": 0, "output_tokens": 0}, tally
 
 
 def test_recount_is_a_noop_with_no_active_tally():
     """The docstring advertises a no-op outside a CLI run (no active tally). Calling it
     without `begin_call_tally` must not raise and must not create state."""
     import reviewlib.panel as panel
+
     # Ensure no active tally (a prior test may have left one closed already; end is safe).
     panel.end_call_tally()
     # No exception, and nothing to assert on state (there is none) — the contract is "safe".
@@ -419,6 +506,7 @@ def test_recount_never_inflates_the_total_when_no_ok_to_move():
     tally starts with ZERO ok (nothing run_panel counted ok) but the round has a dead rc=0
     seat — recount must leave the total untouched, not push fail past the real call count."""
     import reviewlib.panel as panel
+
     panel.begin_call_tally()
     panel._tally_result(1)  # one real failure; ok stays 0
     results = [_result("a", stdout="")]  # rc0 empty -> would reclassify, but ok==0
@@ -426,7 +514,115 @@ def test_recount_never_inflates_the_total_when_no_ok_to_move():
     tally = panel.end_call_tally()
     # ok+fail must still equal the 1 call actually made — no phantom fail.
     assert tally["ok"] + tally["fail"] == 1, tally
-    assert tally == {"ok": 0, "fail": 1}, tally
+    assert tally == {"ok": 0, "fail": 1, "prompt_tokens": 0, "output_tokens": 0}, tally
+
+
+# === codex review finding (2026-08 seat-cooldown feature): a cached-skip sentinel
+# (rc=0, non-empty "is currently unavailable" body) is NOT the same failure shape
+# `_StubBackends` above models ("dead" = rc0/empty, "error" = rc!=0) — it needs its
+# own stub so a persona/moderator can return that THIRD shape specifically. =========
+_SENTINEL_BODY = (
+    "claude:claude-fable-5 is currently unavailable (cached: session limit)."
+)
+
+
+def test_normal_round_with_one_sentinel_persona_corrects_the_tally():
+    """A round with 2 usable personas + 1 cached-cooldown sentinel is NOT a dead round
+    (`_round_is_dead` needs a STRICT MAJORITY unusable — 1-of-3 stays alive), so the
+    old dead-round-only `recount_round_by_usability` call never ran for it: the
+    sentinel seat stayed counted `ok` by `run_panel`'s bare exit-code auto-tally,
+    contradicting the sentinel contract the rest of this feature enforces. Pins that
+    the tally is now corrected for every round, not only a dead one."""
+    import reviewlib.panel as panel
+
+    def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
+        from reviewlib.modes.brainstorm import (
+            MODERATOR_PROMPT_LEADIN,
+            SYNTHESIS_PROMPT_MARKER,
+        )
+
+        if SYNTHESIS_PROMPT_MARKER in prompt or MODERATOR_PROMPT_LEADIN in prompt:
+            return _result(model, stdout="Moderator summary.\nDECISION: STOP")
+        if model == "m3":
+            return _result(model, stdout=_SENTINEL_BODY)  # rc=0, non-empty, sentinel
+        return _result(model, stdout=f"idea from {model} r{round_no}")
+
+    old_resolve = panel.resolve_backend
+    panel.resolve_backend = lambda _model: _fake_backend
+    with tempfile.TemporaryDirectory() as tmp:
+        old_log = os.environ.get("REVIEW_LOG_DIR")
+        os.environ["REVIEW_LOG_DIR"] = tmp
+        panel.begin_call_tally()
+        try:
+            with redirect_stdout(io.StringIO()):
+                rc = mode_brainstorm(
+                    "topic",
+                    ["m1", "m2", "m3"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=1,
+                    max_rounds=1,
+                )
+        finally:
+            tally = panel.end_call_tally()
+            panel.resolve_backend = old_resolve
+            if old_log is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = old_log
+    assert rc == 0, rc  # the round itself succeeded (2/3 usable, not dead)
+    # 2 real personas ok, 1 sentinel persona reclassified fail, moderator+synthesis ok.
+    assert tally["fail"] >= 1, tally
+    assert tally["ok"] + tally["fail"] >= 3, tally
+
+
+def test_moderator_sentinel_result_does_not_get_promoted_or_reported_as_success():
+    """codex review finding: `mode_brainstorm`'s own moderator-promotion (`if
+    mod_result.returncode == 0`) and final-exit-code check (`synth.returncode == 0`)
+    used to accept a cached-cooldown sentinel exactly like a real answer — a bare
+    returncode check, not `result_is_usable`. Pins the end-to-end fix: when EVERY
+    moderator candidate returns the sentinel shape, the brainstorm reports FAILURE
+    (not a silent 0-exit success with the cache notice standing in for real
+    synthesis) — `run_moderator`'s own fallback already covers the "not promoted"
+    half; this covers `mode_brainstorm`'s consumption of that result."""
+    import reviewlib.panel as panel
+
+    def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
+        from reviewlib.modes.brainstorm import (
+            MODERATOR_PROMPT_LEADIN,
+            SYNTHESIS_PROMPT_MARKER,
+        )
+
+        if SYNTHESIS_PROMPT_MARKER in prompt or MODERATOR_PROMPT_LEADIN in prompt:
+            return _result(
+                model, stdout=_SENTINEL_BODY
+            )  # every moderator call cooling down
+        return _result(model, stdout=f"idea from {model} r{round_no}")
+
+    old_resolve = panel.resolve_backend
+    panel.resolve_backend = lambda _model: _fake_backend
+    with tempfile.TemporaryDirectory() as tmp:
+        old_log = os.environ.get("REVIEW_LOG_DIR")
+        os.environ["REVIEW_LOG_DIR"] = tmp
+        try:
+            with redirect_stdout(io.StringIO()):
+                rc = mode_brainstorm(
+                    "topic",
+                    ["m1", "m2"],
+                    REPO_ROOT,
+                    5,
+                    ["mod"],
+                    rounds=1,
+                    max_rounds=1,
+                )
+        finally:
+            panel.resolve_backend = old_resolve
+            if old_log is None:
+                os.environ.pop("REVIEW_LOG_DIR", None)
+            else:
+                os.environ["REVIEW_LOG_DIR"] = old_log
+    assert rc == 1, rc  # NOT a hollow success
 
 
 if __name__ == "__main__":

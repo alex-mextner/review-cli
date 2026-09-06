@@ -21,6 +21,7 @@ the same engine is reusable by an MCP wrapper or another CLI (a future research-
 task-cli `just-ask`) without dragging the argparse surface along — see AGENTS.md
 "lib | cli | mcp".
 """
+
 from __future__ import annotations
 
 import argparse
@@ -74,13 +75,33 @@ class ModeContext:
     effort_override: "EffortOverride | None" = None
     # Mode-specific extras resolved by the CLI that don't fit the shared fields above.
     # Kept as an open dict so the registry contract doesn't grow a field per mode; a mode
-    # that needs none ignores it. The currently defined keys (only the `review` mode reads
-    # any) are:
-    #   * "board"        — list[BoardReviewer] | None : the failover board (None = flat).
-    #   * "pool_size"    — int                        : the --pool size (board path only).
+    # that needs none ignores it. The currently defined keys are:
+    #   * "board"        — list[BoardReviewer] | None : the failover board (None = flat;
+    #                                                   `review` mode only).
+    #   * "pool_size"    — int                        : the --pool size (board path only;
+    #                                                   `review` mode only).
     #   * "outcome_sink" — list[FailoverOutcome]      : sink the board path appends its
     #                                                   outcome to, so the CLI can report
-    #                                                   the models that actually ran.
+    #                                                   the models that actually ran
+    #                                                   (`review` mode only).
+    #   * "diff_from_stdin"     — bool : the diff came from a piped stdin (brainstorm/
+    #                                    quorum/just-ask read this to exempt a piped diff
+    #                                    from their own dispatch-time cap).
+    #   * "diff_already_capped" — bool : the CLI's `_dispatch` already ran
+    #                                    `cap_diff_for_dispatch` on `diff` before this
+    #                                    context was built (brainstorm/quorum/just-ask
+    #                                    only). Lets the mode's own dispatch-boundary
+    #                                    capping — which exists so a direct library
+    #                                    caller bypassing this CLI layer is still
+    #                                    protected — skip a REDUNDANT second application:
+    #                                    harmless at the default cap (a second call on an
+    #                                    already-<=cap diff is a no-op anyway), but a real
+    #                                    correctness gap when `$REVIEW_DIFF_MAX_BYTES` is
+    #                                    set below the truncation marker's own length (the
+    #                                    second call would re-truncate the FIRST call's
+    #                                    marker text and report ITS size as "the full
+    #                                    diff" — codex review finding, 2026-08 seat-
+    #                                    cooldown/diff-cap feature, round 2).
     # A mode adding a new extra key should document it here.
     extra: dict = field(default_factory=dict)
 

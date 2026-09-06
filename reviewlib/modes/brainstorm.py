@@ -4,9 +4,13 @@
 `--diff`/`--staged` (or a piped diff) so the personas can brainstorm ABOUT a specific
 change as optional grounding. Originally the `--brainstorm` flag (Stage 0
 decomposition); now a first-class SUBCOMMAND backed by the `MODE` descriptor at the
-bottom of this file (see `modes/contract.py`). PERSONAS lives here because it is only
-used by this mode.
+bottom of this file (see `modes/contract.py`). PERSONAS moved to `modes/__init__.py`
+so quorum can reuse the same role set (Alex, 2026-08-18) — one entry was also
+RENAMED in that move ("DX / ergonomics designer" -> "Developer-experience
+designer", Fable review finding, round 3), a user-visible change to any
+brainstorm transcript using that persona, not a behaviour-neutral extraction.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -17,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..backends import cap_diff_for_dispatch
 from ..panel import (
     PanelJob,
     format_result,
@@ -26,7 +31,7 @@ from ..panel import (
     run_panel,
 )
 from ..process import current_task_code, log_dir
-from . import _run_effort, _visual_images
+from . import PERSONAS, _run_effort, _visual_images
 from .contract import ModeContext, ModeSpec
 
 if TYPE_CHECKING:
@@ -89,42 +94,6 @@ def _read_trusted_header_nonce(log: Path) -> str:
     return ""
 
 
-# Distinct expert personas for brainstorm rotation (pool >= 5). Each round assigns
-# >= 3 of these, rotating so backends see a fresh role each round.
-PERSONAS = (
-    (
-        "Pragmatic staff engineer",
-        "20 years shipping production systems; values simplicity, "
-        "incremental delivery, and proven tech over novelty.",
-    ),
-    (
-        "Security-paranoid reviewer",
-        "thinks adversarially about every input, trust boundary, secret, "
-        "and failure mode; assumes the worst actor and the worst case.",
-    ),
-    (
-        "DX / ergonomics designer",
-        "obsessed with developer and user experience: clear APIs, good "
-        "defaults, discoverability, error messages, and minimal friction.",
-    ),
-    (
-        "Skeptical SRE",
-        "cares about operability, observability, blast radius, rollback, "
-        "and what breaks at 3am; distrusts anything without a failure plan.",
-    ),
-    (
-        "Product-minded architect",
-        "connects technical choices to user value and roadmap; weighs "
-        "long-term flexibility against time-to-market.",
-    ),
-    (
-        "Cost-conscious performance engineer",
-        "watches latency, throughput, token/compute spend, and resource "
-        "footprint; allergic to waste and premature scale.",
-    ),
-)
-
-
 def _round_is_dead(round_results: list) -> bool:
     """Did this brainstorm round come back with NO real persona output?
 
@@ -153,6 +122,8 @@ def mode_brainstorm(
     max_rounds: int,
     diff: str = "",
     *,
+    diff_from_stdin: bool = False,
+    diff_already_capped: bool = False,
     seed_transcript: list[str] | None = None,
     seed_persona_index: int = 0,
     start_round: int = 1,
@@ -178,27 +149,53 @@ def mode_brainstorm(
     round loop entirely and produce a fresh synthesis over the seeded transcript — no new
     rounds, honouring the moderator's prior decision that the brainstorm was done.
     """
-    min_rounds = max(rounds, 5)
+    min_rounds = max(rounds, 3)
     max_rounds = max(max_rounds, min_rounds)
     # `synthesize_only` (a forced re-synthesis of a finished session): skip the round loop
     # entirely and go straight to the synthesis over the seeded transcript. Without this an
-    # explicit "no new rounds" intent is impossible — the min_rounds>=5 re-floor above would
-    # otherwise drag a low cap back up to 5 and run rounds the caller did not want.
+    # explicit "no new rounds" intent is impossible — the min_rounds>=3 re-floor above would
+    # otherwise drag a low cap back up to 3 and run rounds the caller did not want.
     loop_end = (start_round - 1) if synthesize_only else max_rounds
     panel = models  # run-as-is; personas always fill >= 3 slots even if panel < 3
     # OPTIONAL grounding diff: when a working-tree / --staged / piped diff is present,
-    # the brainstorm is ABOUT that specific change — the diff is fed to every persona
-    # (and the moderator) as constant context so the ideation is grounded, not abstract.
-    # An empty diff keeps the classic pure-ideation behaviour unchanged.
+    # the brainstorm is ABOUT that specific change. The moderator gets it as constant
+    # context on EVERY round; personas get it only on the first round of the invocation
+    # (incremental grounding, Alex 2026-08-28 — see the round loop below), so the
+    # ideation is grounded without re-transporting the diff every round. An empty diff
+    # keeps the classic pure-ideation behaviour unchanged.
     grounded = bool(diff.strip())
-    # A one-line note appended to each persona prompt when grounded, so the model knows
-    # the fenced ```diff``` block (added by the backend's _payload from PanelJob.diff) is
-    # the concrete change to brainstorm about, not stray context.
+    # codex review finding: the dispatch-time diff cap used to be applied ONLY by
+    # cli.py's `_dispatch`, so a caller reaching this function directly (a library
+    # consumer, an MCP seam, a test) could still send an uncapped diff to every
+    # persona/moderator every round — reintroducing the exact multi-seat/multi-round
+    # token burn this cap exists to stop. Capped here too, at the mode's own dispatch
+    # boundary, so the guarantee holds regardless of caller. Same stdin exemption as
+    # mode_review: a piped diff was already an explicit, deliberate scope choice by the
+    # caller.
+    #
+    # codex review finding (round 2, applied here to match just_ask.py's identical fix):
+    # capping AGAIN when the CLI layer already capped it (`diff_already_capped`) is
+    # silently harmless at the default cap (the first call's output is already <= cap,
+    # so a second call is a true no-op) but NOT idempotent when
+    # `$REVIEW_DIFF_MAX_BYTES` is set below the truncation marker's own length — a
+    # second application would re-truncate the FIRST call's marker text and report ITS
+    # byte count as "the full diff" every round. `diff_already_capped` (default False,
+    # so a direct library caller bypassing the CLI is still protected) skips the
+    # redundant second call entirely rather than relying on it happening to be a no-op.
+    dispatch_diff = (
+        diff if diff_from_stdin or diff_already_capped else cap_diff_for_dispatch(diff)
+    )
+    # A one-line note appended to the FIRST round's persona prompts (and every
+    # moderator/synthesis prompt) when grounded, so the model knows the fenced
+    # ```diff``` block (added by the backend's _payload from PanelJob.diff) is the
+    # concrete change to brainstorm about, not stray context. Later rounds' personas
+    # get a different pointer note instead — see persona_diff_note in the round loop.
     diff_note = (
         "\n\nA specific code change is provided below as a ```diff``` block — brainstorm "
         "concretely ABOUT this change (its design, risks, alternatives, follow-ups), "
         "grounding every idea in it rather than reasoning in the abstract."
-        if grounded else ""
+        if grounded
+        else ""
     )
     resuming = resume_log is not None
     # On resume, seed the transcript with the prior session's rounds so the personas see
@@ -207,8 +204,11 @@ def mode_brainstorm(
     transcript_blocks: list[str] = list(seed_transcript) if seed_transcript else []
     moderator_label = ">".join(moderators)
     task_part = f" task={task_code}" if (task_code := current_task_code()) else ""
-    out: list[str] = [f"# Brainstorm: {topic}", f"panel={','.join(panel)} moderator={moderator_label} "
-                      f"rounds>={min_rounds} max={max_rounds}{task_part}{' grounded=diff' if grounded else ''}"]
+    out: list[str] = [
+        f"# Brainstorm: {topic}",
+        f"panel={','.join(panel)} moderator={moderator_label} "
+        f"rounds>={min_rounds} max={max_rounds}{task_part}{' grounded=diff' if grounded else ''}",
+    ]
 
     # DISCUSSION LOG: write the conversation to one file as each round/decision
     # lands (line-buffered, 0600, O_EXCL). The whole brainstorm used to be
@@ -220,19 +220,33 @@ def mode_brainstorm(
     if resuming:
         disc_path = resume_log  # type: ignore[assignment]
     else:
-        disc_path = log_dir() / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')}-brainstorm.md"
+        disc_path = (
+            log_dir()
+            / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')}-brainstorm.md"
+        )
     disc = None
     try:
-        flags = (os.O_WRONLY | os.O_APPEND) if resuming else (os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-        disc = os.fdopen(os.open(str(disc_path), flags, 0o600),
-                         "w", encoding="utf-8", buffering=1)
+        flags = (
+            (os.O_WRONLY | os.O_APPEND)
+            if resuming
+            else (os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        )
+        disc = os.fdopen(
+            os.open(str(disc_path), flags, 0o600), "w", encoding="utf-8", buffering=1
+        )
         verb = "resuming discussion log" if resuming else "brainstorm discussion log"
-        print(f"[review-cli] {verb}: {disc_path} (tail -f to follow)",
-              file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] {verb}: {disc_path} (tail -f to follow)",
+            file=sys.stderr,
+            flush=True,
+        )
     except OSError as exc:
         # A read-only log dir must NOT take down a brainstorm that worked without one.
-        print(f"[review-cli] discussion log unavailable ({exc}); continuing without it",
-              file=sys.stderr, flush=True)
+        print(
+            f"[review-cli] discussion log unavailable ({exc}); continuing without it",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _disc(text: str) -> None:
         if disc is None:
@@ -269,10 +283,12 @@ def mode_brainstorm(
         # Collapse the heading to a single line here; the full multi-line `topic` is still fed
         # to the personas unchanged — only this human-readable header line is flattened.
         topic_heading = " ".join(topic.splitlines()).strip()
-        _disc(f"# Brainstorm: {topic_heading}\n{_SESSION_SENTINEL.format(nonce=nonce)}\n\n"
-              f"panel={','.join(panel)} moderator={moderator_label} "
-              f"rounds>={min_rounds} max={max_rounds}{task_part}"
-              f"{' grounded=diff' if grounded else ''}\n")
+        _disc(
+            f"# Brainstorm: {topic_heading}\n{_SESSION_SENTINEL.format(nonce=nonce)}\n\n"
+            f"panel={','.join(panel)} moderator={moderator_label} "
+            f"rounds>={min_rounds} max={max_rounds}{task_part}"
+            f"{' grounded=diff' if grounded else ''}\n"
+        )
 
     persona_index = seed_persona_index
     completed = start_round - 1
@@ -284,7 +300,40 @@ def mode_brainstorm(
     synth = None
     try:
         for round_no in range(start_round, loop_end + 1):
-            shared = "\n\n".join(transcript_blocks) if transcript_blocks else "(this is the first round)"
+            shared = (
+                "\n\n".join(transcript_blocks)
+                if transcript_blocks
+                else "(this is the first round)"
+            )
+            # Incremental diff-grounding (Alex, 2026-08-28): the FIRST round of THIS
+            # invocation gets the full diff, same as before; later rounds almost never
+            # need to re-read it — the shared transcript above already carries forward
+            # what earlier rounds found, so re-sending the (possibly large) diff every
+            # round is pure waste. Gated on `start_round`, NOT the literal `round_no == 1`
+            # (review finding, 3 independent reviewers): a RESUMED session with a freshly
+            # re-attached `--diff`/`--staged` (`review sessions -s <id> --diff`) starts its
+            # loop at `start_round > 1` and never executes round 1 in THIS process — keying
+            # on `round_no == 1` silently dropped the diff from every persona on that path
+            # while still telling them "already provided in round 1" (a false, hallucination-
+            # baiting claim). `start_round` is "the first round THIS invocation dispatches",
+            # correct for both a fresh run (`start_round == 1`) and a diff-bearing resume.
+            # The moderator and final synthesis still get the full diff every round (they
+            # need it to judge convergence / write the recommendation) — only the per-
+            # persona dispatch below is round-gated.
+            if round_no == start_round:
+                persona_diff = dispatch_diff
+                persona_diff_note = diff_note
+            else:
+                persona_diff = ""
+                persona_diff_note = (
+                    "\n\nA specific code change was shown to earlier-round personas — "
+                    "their reactions to it are in the shared transcript above. Ground "
+                    "your ideas in what THEY reported about it (the diff itself is not "
+                    "repeated here — you may not have seen it directly if you're new "
+                    "to this rotation)."
+                    if grounded
+                    else ""
+                )
             jobs: list[PanelJob] = []
             # Assign >= 3 distinct personas this round, rotating across the pool.
             slot_count = max(3, len(panel))
@@ -300,25 +349,42 @@ def mode_brainstorm(
                     "multi-round brainstorm. Build on the shared transcript of prior rounds — "
                     "react, extend, challenge, or propose new angles from YOUR perspective. "
                     "Be concrete; offer ideas, not pleasantries. Do not edit files."
-                    f"{diff_note}\n\n"
+                    f"{persona_diff_note}\n\n"
                     f"TOPIC:\n{topic}\n\n=== SHARED TRANSCRIPT (prior rounds) ===\n{shared}"
                 )
-                # The constant grounding diff (if any) rides PanelJob.diff so the backend's
-                # _payload appends it as a fenced ```diff``` block over STDIN — ARG_MAX-safe,
-                # the same transport the shared transcript uses.
-                jobs.append(PanelJob(
-                    model=model, prompt=prompt, diff=diff,
-                    label=f"{persona_name} ({model})", round_no=round_no,
-                    images=visual_images,
-                    effort=_run_effort(effort_override, model),
-                ))
+                # The grounding diff (round 1 only, see above) rides PanelJob.diff so the
+                # backend's _payload appends it as a fenced ```diff``` block over STDIN —
+                # ARG_MAX-safe, the same transport the shared transcript uses.
+                jobs.append(
+                    PanelJob(
+                        model=model,
+                        prompt=prompt,
+                        diff=persona_diff,
+                        label=f"{persona_name} ({model})",
+                        round_no=round_no,
+                        images=visual_images,
+                        effort=_run_effort(effort_override, model),
+                    )
+                )
 
             round_results = run_panel(jobs, cwd, timeout)
+            # Correct the run-stats tally for EVERY round, not only a dead one (codex
+            # review finding, 2026-08 seat-cooldown feature): `run_panel` auto-tallies
+            # by exit code alone, so a normal round with one cached-cooldown sentinel
+            # (rc=0, non-empty "unavailable" body) among otherwise-usable seats used to
+            # record that seat as `ok`, contradicting the sentinel contract this PR
+            # introduces elsewhere and quietly inflating success/ETA stats. A no-op for
+            # a round whose seats were all genuinely usable (see the function's own
+            # docstring) — safe to call unconditionally, once per round.
+            recount_round_by_usability(round_results)
             round_text = "\n\n".join(
                 f"#### {r.model}\n{(r.stdout.strip() or r.stderr.strip() or '(no output)')}"
                 for r in round_results
             )
-            out.append(f"\n# Round {round_no}\n" + "\n\n---\n\n".join(format_result(r) for r in round_results))
+            out.append(
+                f"\n# Round {round_no}\n"
+                + "\n\n---\n\n".join(format_result(r) for r in round_results)
+            )
 
             # Did THIS round's panel actually produce ideas? (`_round_is_dead`: a strict
             # majority of seats unusable.) The dead-round handler just below uses this to abort
@@ -346,21 +412,22 @@ def mode_brainstorm(
             #     dead backends" the CTO hit), and we do NOT consult the moderator — a moderator
             #     rubber-stamping `DECISION: STOP` over a dead round was the hollow-STOP vector;
             #     here the dead round itself, not the moderator, ends the loop. The min_rounds
-            #     floor is bypassed for a collapse: forcing 5 rounds of dead backends only wastes
+            #     floor is bypassed for a collapse: forcing 3 rounds of dead backends only wastes
             #     time. Mid-run transient-failure resilience (retry/reserve-swap) is a separate
             #     ROADMAP item.
             if round_dead:
                 usable = sum(1 for r in round_results if result_is_usable(r))
-                # Correct the run-stats tally: run_panel auto-counted each rc=0 seat as ok, but a
-                # dead seat (rc=0, empty/"unavailable") is not a real verdict — reclassify it to
-                # fail so the recorded run is honest and doesn't poison the ETA average (codex P2).
-                recount_round_by_usability(round_results)
+                # Run-stats tally already corrected unconditionally right after
+                # run_panel above (covers this dead round too — the call there
+                # supersedes what used to be a dead-round-only correction here).
                 # Diagnosis-only: log the dead round WITHOUT a structural round sentinel, so the
                 # session parser does NOT count it as a completed round (a resume re-runs it).
                 # "ABORTED" marks the round the run ended on — whether by a round-1 abort or a
                 # mid-run collapse-stop; both end the run on this dead round.
-                _disc(f"\n# Round {round_no} (ABORTED: dead panel — "
-                      f"{usable}/{len(round_results)} seats usable)\n{round_text}\n")
+                _disc(
+                    f"\n# Round {round_no} (ABORTED: dead panel — "
+                    f"{usable}/{len(round_results)} seats usable)\n{round_text}\n"
+                )
                 if not transcript_blocks:
                     msg = (
                         f"[review-cli] brainstorm aborted: round {round_no} produced no usable "
@@ -378,14 +445,21 @@ def mode_brainstorm(
                     if out:
                         print("\n\n".join(out))
                     if disc is not None:
-                        print(f"[review-cli] partial discussion log: {disc_path}",
-                              file=sys.stderr, flush=True)
+                        print(
+                            f"[review-cli] partial discussion log: {disc_path}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     return EXIT_DEAD_PANEL
                 # Good rounds exist: stop on the collapse and synthesize what we have.
-                print(f"[review-cli] brainstorm: round {round_no} came back dead "
-                      f"(dead seats: {', '.join(dead_models) or '(none)'}); the panel collapsed "
-                      f"mid-run — synthesizing the {usable_rounds} usable round(s) so far instead "
-                      "of continuing on dead backends.", file=sys.stderr, flush=True)
+                print(
+                    f"[review-cli] brainstorm: round {round_no} came back dead "
+                    f"(dead seats: {', '.join(dead_models) or '(none)'}); the panel collapsed "
+                    f"mid-run — synthesizing the {usable_rounds} usable round(s) so far instead "
+                    "of continuing on dead backends.",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 break
 
             transcript_blocks.append(f"## Round {round_no}\n{round_text}")
@@ -396,7 +470,9 @@ def mode_brainstorm(
             # human-readable `# Round N` heading stays for readability. A legacy resume
             # (nonce == "") writes NO sentinel — the appended rounds stay legacy, parsed by
             # the sequential-heuristic fallback like the rest of that file.
-            round_sentinel = f"{_ROUND_SENTINEL.format(n=round_no, nonce=nonce)}\n" if nonce else ""
+            round_sentinel = (
+                f"{_ROUND_SENTINEL.format(n=round_no, nonce=nonce)}\n" if nonce else ""
+            )
             _disc(f"\n# Round {round_no}\n{round_sentinel}{round_text}\n")
             completed = round_no
             # Reached only for a NON-dead round (a dead round breaks/aborts above before the
@@ -412,15 +488,32 @@ def mode_brainstorm(
                 f"{diff_note}\n\n"
                 f"TOPIC:\n{topic}\n\n=== ROUND {round_no} ===\n{round_text}"
             )
-            mod_result = run_moderator(moderators, mod_prompt, cwd, timeout, diff=diff, round_no=round_no)
-            out.append(f"\n## Moderator (round {round_no})\n" + format_result(mod_result))
-            _disc(f"\n## Moderator (round {round_no})\n"
-                  f"{(mod_result.stdout.strip() or mod_result.stderr.strip() or '(no output)')}\n")
+            mod_result = run_moderator(
+                moderators,
+                mod_prompt,
+                cwd,
+                timeout,
+                diff=dispatch_diff,
+                round_no=round_no,
+            )
+            out.append(
+                f"\n## Moderator (round {round_no})\n" + format_result(mod_result)
+            )
+            _disc(
+                f"\n## Moderator (round {round_no})\n"
+                f"{(mod_result.stdout.strip() or mod_result.stderr.strip() or '(no output)')}\n"
+            )
             # Promote the candidate that actually worked to the front so a dead
             # top moderator (e.g. a timing-out model) is paid once, not re-tried
             # at the head of every subsequent round + the final synthesis.
-            if mod_result.returncode == 0:
-                moderators = [mod_result.model] + [m for m in moderators if m != mod_result.model]
+            # codex review finding (2026-08 seat-cooldown feature): a cached-skip
+            # sentinel is rc=0, so a bare returncode check would promote a COOLING-
+            # DOWN moderator to the front — `result_is_usable` is the same predicate
+            # `run_moderator`'s own fallback uses to reject that shape.
+            if result_is_usable(mod_result):
+                moderators = [mod_result.model] + [
+                    m for m in moderators if m != mod_result.model
+                ]
 
             if round_no < min_rounds:
                 continue
@@ -438,7 +531,14 @@ def mode_brainstorm(
         # Final synthesis is part of the brainstorm: stamp it with the completed round
         # count so it logs as `-r{N}` (>=1), keeping the whole invocation off `-r0` and
         # the parser's brainstorm inference correct (HYP-742 finding 3).
-        synth = run_moderator(moderators, synth_prompt, cwd, timeout, diff=diff, round_no=max(completed, 1))
+        synth = run_moderator(
+            moderators,
+            synth_prompt,
+            cwd,
+            timeout,
+            diff=dispatch_diff,
+            round_no=max(completed, 1),
+        )
         out.append("\n# Final synthesis\n" + format_result(synth))
         # The nonce'd `<!-- review:final nonce=... -->` sentinel marks the REAL synthesis —
         # the parser keys completion on it, so a persona echoing `# Final synthesis` in its
@@ -446,15 +546,26 @@ def mode_brainstorm(
         # session. A legacy resume (nonce == "") writes no sentinel; the parser falls back to
         # completing on the synthesis heading inside the moderator region for that file.
         final_sentinel = f"{_FINAL_SENTINEL.format(nonce=nonce)}\n" if nonce else ""
-        _disc(f"\n# Final synthesis\n{final_sentinel}"
-              f"{(synth.stdout.strip() or synth.stderr.strip() or '(no output)')}\n")
+        _disc(
+            f"\n# Final synthesis\n{final_sentinel}"
+            f"{(synth.stdout.strip() or synth.stderr.strip() or '(no output)')}\n"
+        )
     finally:
         if disc is not None:
             disc.close()
     print("\n\n".join(out))
     if disc is not None:
-        print(f"[review-cli] full discussion log: {disc_path}", file=sys.stderr, flush=True)
-    return 0 if synth is not None and synth.returncode == 0 else 1
+        print(
+            f"[review-cli] full discussion log: {disc_path}",
+            file=sys.stderr,
+            flush=True,
+        )
+    # codex review finding (2026-08 seat-cooldown feature): a cached-skip sentinel is
+    # rc=0 with non-empty stdout, so a bare returncode check reported SUCCESS for a
+    # brainstorm whose final synthesis was actually just the cooldown cache-hit notice
+    # (every moderator candidate cooling down). `result_is_usable` is the same
+    # predicate `run_moderator`'s own fallback already uses to reject that shape.
+    return 0 if synth is not None and result_is_usable(synth) else 1
 
 
 def brainstorm_pool(models: list[str]) -> list[str]:
@@ -478,18 +589,35 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     # Brainstorm-only: how many rounds the loop runs (min and hard cap). Added here (not
     # in the CLI's shared options) so they appear ONLY on `review brainstorm --help` and
     # `review just-ask --rounds 5` errors instead of silently parsing.
-    parser.add_argument("--rounds", type=int, default=5, help="minimum rounds before STOP is allowed (min & default 5)")
-    parser.add_argument("--max-rounds", type=int, default=8, help="hard cap on rounds (default 8)")
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=3,
+        help="minimum rounds before STOP is allowed (min & default 3)",
+    )
+    parser.add_argument(
+        "--max-rounds", type=int, default=8, help="hard cap on rounds (default 8)"
+    )
 
 
 def _handler(ctx: ModeContext) -> int:
     images = _visual_images(ctx)
-    kwargs = {"diff": ctx.diff, "effort_override": ctx.effort_override}
+    kwargs = {
+        "diff": ctx.diff,
+        "diff_from_stdin": bool(ctx.extra.get("diff_from_stdin", False)),
+        "diff_already_capped": bool(ctx.extra.get("diff_already_capped", False)),
+        "effort_override": ctx.effort_override,
+    }
     if images:
         kwargs["visual_images"] = images
     return mode_brainstorm(
-        ctx.with_visual(ctx.args.topic), ctx.models, ctx.cwd, ctx.timeout,
-        ctx.moderators, ctx.args.rounds, ctx.args.max_rounds,
+        ctx.with_visual(ctx.args.topic),
+        ctx.models,
+        ctx.cwd,
+        ctx.timeout,
+        ctx.moderators,
+        ctx.args.rounds,
+        ctx.args.max_rounds,
         # When there IS a diff (working-tree, --staged/--diff, or piped) the personas
         # see it as grounding context so they brainstorm ABOUT a specific change. No
         # diff -> pure ideation, exactly as before.

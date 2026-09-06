@@ -18,6 +18,7 @@ unavailable):
 Runs as a plain script (mirrors tests/test_provider_keys.py): each `test_*` is
 invoked by the __main__ block, no pytest required.
 """
+
 from __future__ import annotations
 
 import os
@@ -31,6 +32,7 @@ import reviewlib.backends as backends  # noqa: E402
 import reviewlib.modes.review as _review_mod  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.config import (  # noqa: E402
+    ASTRA_SEAT,
     DEFAULT_BOARD,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
@@ -42,6 +44,8 @@ from reviewlib.config import (  # noqa: E402
     KIMI_SEAT,
     LIGHT_PRESET_BOARD,
     SOL_SEAT,
+    SONNET_SEAT,
+    TERRA_SEAT,
     REVIEW_ROLES,
     VISUAL_MODELS,
     BoardConfigError,
@@ -81,27 +85,38 @@ class _BackendStateSandbox:
 
 # === DEFAULT_BOARD shape (byte-exact model ids, PRIORITY order from the directive) ==
 def test_default_board_matches_directive_table():
-    # Priority order (failover pool): strongest model first. Each seat keeps a role/lens,
-    # but selection is by PRIORITY + availability, not role order.
+    # Priority order (failover pool): strongest WORKING model first. Each seat keeps a
+    # role/lens, but selection is by PRIORITY + availability, not role order.
     expected = [
-        ("claude:claude-fable-5", "architect", "Fable"),
         ("codex:gpt-5.6-sol", "consistency", "Sol"),
         ("claude:claude-opus-4-8", "correctness", "Opus"),
-        # Seat 4: GLM-5.2 via the Command Code gateway, directly under Opus.
+        # Seat 3: GLM-5.2 via the Command Code gateway, directly under Opus.
         # DIFF-ONLY keyed HTTP (review_commandcode) — opencode's commandcode provider does
         # not register this GLM id, so the agentic form errors; read-only by construction.
         # Role `performance` (NOT correctness) so it doesn't duplicate Opus's lens.
         ("commandcode:zai-org/GLM-5.2", "performance", "GLM-cc"),
-        # Seat 5 is the first reserve and preserves lens diversity when a top seat drops.
+        # Seat 4 is the first reserve and preserves lens diversity when a top seat drops.
         ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "quality", "Kimi"),
-        # Seat 6 is the agentic codex CLI route (see config.py / CHANGELOG for rationale).
-        ("codex", "consistency", "Codex"),
-        # Seats 5 and 7-8 route through opencode (`oc:`) so they run AGENTICALLY (read the repo
-        # read-only), not the diff-only commandcode/z.ai REST call (review-cli#24).
+        # Seat 5 is the agentic codex CLI route, pinned to GPT-6-Astra (ASTRA_SEAT) rather
+        # than the bare `"codex"` seat this used to be (see config.py for rationale). Role
+        # LEFT AS `consistency` (a duplicate of Sol's lens) by review-cli#382 -- an earlier
+        # draft flipped it to `security`, but that left `consistency` with ZERO live
+        # fallback anywhere on the board; see config.py's comment on this exact seat.
+        ("codex:gpt-6-astra", "consistency", "Astra"),
+        # Seats 6-7 (review-cli#382): TERRA_SEAT/SONNET_SEAT, live fallbacks for the
+        # `performance`/`quality` roles whose only prior seats (GLM-cc/Kimi) are disabled
+        # whenever `unpaid_providers` includes `commandcode`. Placed right after Astra so
+        # neither the raw top-4 nor DEFAULT_PRESET_BOARD's top-4 window picks up a
+        # duplicate role in the common (nothing disabled) case.
+        ("codex:gpt-5.6-terra", "performance", "Terra"),
+        ("claude:claude-sonnet-5", "quality", "Sonnet"),
+        # Seats 4, 8-9 and 11 route through opencode (`oc:`) so they run AGENTICALLY (read the
+        # repo read-only), not the diff-only commandcode/z.ai REST call (review-cli#24). Seats
+        # 6-7 (Terra/Sonnet, review-cli#382) run via the codex/claude CLIs, not opencode.
         ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
         ("oc:commandcode/deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
         ("gemini", "contracts", "Gemini"),
-        # Seat 10 — Grok 4.5 via opencode's native `xai` provider, agentic (oauth-
+        # Seat 11 — Grok 4.5 via opencode's native `xai` provider, agentic (oauth-
         # authenticated, no diff-only fallback route exists for this provider). Sits
         # BEFORE the z.ai GLM last-resort seat so deep mid-run failover reaches a fast
         # reserve before paying GLM's #65 pathological-slowness cost. Role `performance`
@@ -110,32 +125,45 @@ def test_default_board_matches_directive_table():
         # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
         # from the seat-3 commandcode GLM: same model family, different provider/transport.
         # DEPRIORITIZED to LAST-RESORT reserve (review-cli#65): it is pathologically slow
-        # under load, so it is the last seat promoted — Qwen/DeepSeek/Gemini/Grok go first.
-        ("oc:zai/glm-5.2", "quality", "GLM"),
+        # under load, so it is promoted before only Fable — Qwen/DeepSeek/Gemini/Grok go first.
+        # review-cli#382: role changed from `quality` (now covered by Sonnet above, which
+        # doesn't share this seat's real-world quota fragility) to `security`.
+        ("oc:zai/glm-5.2", "security", "GLM"),
+        # Fable 5 (Anthropic flagship). DEMOTED from priority 1 to the very LAST seat
+        # (review-cli#fable-seat-reliability): confirmed 97.9-100% dispatch failure rate
+        # (chronic session/usage-limit exhaustion) made priority 1 a near-certain-doomed
+        # dispatch on every single default review. Worse than GLM's "merely slow" profile,
+        # so it sits even later than GLM — still a reserve seat, not removed outright.
+        ("claude:claude-fable-5", "architect", "Fable"),
     ]
     got = [(r.model, r.role, r.display) for r in DEFAULT_BOARD]
     assert got == expected, got
 
 
 def test_default_board_is_priority_ordered():
-    """The CTO's priority sketch (strongest first): Fable, Sol, Opus,
-    GLM-5.2-via-commandcode, Kimi, Codex, Qwen, DeepSeek, Gemini, GLM-5.2-via-z.ai.
-    Re-ranking = reordering
-    DEFAULT_BOARD; this pins the order. Seats 5 and 7-9 are the AGENTIC opencode (`oc:`)
-    routes (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. The z.ai GLM seat is
-    DEPRIORITIZED to last (review-cli#65) — pathologically slow under load, so last-resort."""
+    """The CTO's priority sketch (strongest-WORKING-model first): Sol, Opus,
+    GLM-5.2-via-commandcode, Kimi, Astra, Terra, Sonnet, Qwen, DeepSeek, Gemini,
+    GLM-5.2-via-z.ai, Fable. Re-ranking = reordering
+    DEFAULT_BOARD; this pins the order. Seats 4, 8-9, and 11 are the AGENTIC opencode
+    (`oc:`) routes (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. Terra/Sonnet
+    (review-cli#382) are live fallbacks for performance/quality, inserted right after Astra.
+    The z.ai GLM seat is DEPRIORITIZED to next-to-last (review-cli#65) — pathologically slow
+    under load. Fable is LAST (review-cli#fable-seat-reliability) — a confirmed ~100%
+    dispatch failure rate, worse than merely slow."""
     assert [r.model for r in DEFAULT_BOARD] == [
-        "claude:claude-fable-5",
         "codex:gpt-5.6-sol",
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",
+        "codex:gpt-6-astra",
+        "codex:gpt-5.6-terra",
+        "claude:claude-sonnet-5",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
         "oc:xai/grok-4.5",
         "oc:zai/glm-5.2",
+        "claude:claude-fable-5",
     ]
 
 
@@ -147,16 +175,21 @@ def test_glm_commandcode_seat_sits_directly_under_opus():
     opus_i = models.index("claude:claude-opus-4-8")
     glm_i = models.index(GLM_COMMANDCODE_SEAT)
     assert glm_i == opus_i + 1, (opus_i, glm_i, models)
-    # Sol sits immediately after Fable, so GLM is priority 4 (index 3).
-    assert glm_i == 3, glm_i
+    # Opus sits immediately after Sol (priority 1), so GLM is priority 3 (index 2).
+    assert glm_i == 2, glm_i
 
 
-def test_sol_seat_sits_immediately_after_fable():
+def test_fable_seat_is_last_resort_reserve():
+    """review-cli#fable-seat-reliability: Fable is the LAST seat on the board (the
+    lowest-priority reserve), demoted from priority 1 after a confirmed 97.9-100%
+    dispatch failure rate — see `test_default_board_matches_directive_table`'s comment
+    for the full rationale. Pinned by index (not just membership) so a future re-rank
+    that accidentally moves it back up trips here."""
     models = [r.model for r in DEFAULT_BOARD]
-    assert SOL_SEAT == "codex:gpt-5.6-sol"
-    assert models.index(SOL_SEAT) == models.index("claude:claude-fable-5") + 1, models
-    sol = next(r for r in DEFAULT_BOARD if r.model == SOL_SEAT)
-    assert sol.display == "Sol"
+    assert models[-1] == "claude:claude-fable-5", models
+    fable = next(r for r in DEFAULT_BOARD if r.model == "claude:claude-fable-5")
+    assert fable.display == "Fable"
+    assert fable.role == "architect"
 
 
 def test_glm_commandcode_seat_is_the_canonical_constant():
@@ -352,20 +385,25 @@ def test_glm_commandcode_seat_carries_performance_not_a_duplicate_role():
 def test_default_pool_roles_are_distinct_no_lens_lost():
     """The default top-4 pool (DEFAULT_POOL_SIZE seats) must have FOUR DISTINCT roles, so a
     plain `review diff` always covers four non-overlapping lenses — no seat wasted on a
-    duplicate lens. Pins the coverage the GLM-cc insertion preserved: architect, correctness,
-    performance, consistency (the same four roles the pre-#57 pool had)."""
+    duplicate lens. Coverage is consistency/correctness/performance/quality now
+    (review-cli#fable-seat-reliability: Fable's `architect` lens moved to the LAST seat
+    along with Fable itself; Kimi's `quality` lens fills the vacated top-4 slot)."""
     pool = [r for r in DEFAULT_BOARD[:DEFAULT_POOL_SIZE]]
     roles = [r.role for r in pool]
     assert len(set(roles)) == len(roles), f"duplicate role in default pool: {roles}"
-    assert set(roles) == {"architect", "correctness", "performance", "consistency"}, roles
+    assert set(roles) == {"consistency", "correctness", "performance", "quality"}, roles
 
 
-def test_default_board_has_eleven_seats():
-    assert len(DEFAULT_BOARD) == 11, len(DEFAULT_BOARD)
+def test_default_board_has_thirteen_seats():
+    # review-cli#382: TERRA_SEAT and SONNET_SEAT added as live fallbacks (10 -> 12);
+    # GROK_SEAT (review-cli#165) makes it 13.
+    assert len(DEFAULT_BOARD) == 13, len(DEFAULT_BOARD)
 
 
 def test_preset_boards_pin_model_order_pool_and_effort():
-    assert DEFAULT_PRESET == "default"
+    # Bare `review diff` defaults to the "light" preset (Alex, 2026-08-28); "default"
+    # and "heavy" stay real, selectable presets with their own board/effort below.
+    assert DEFAULT_PRESET == "light"
     assert all(r.effort == "high" for r in DEFAULT_PRESET_BOARD)
     assert SOL_SEAT not in [r.model for r in DEFAULT_PRESET_BOARD]
     assert "claude:claude-fable-5" not in [r.model for r in DEFAULT_PRESET_BOARD]
@@ -373,18 +411,26 @@ def test_preset_boards_pin_model_order_pool_and_effort():
         "claude:claude-opus-4-8",
         GLM_COMMANDCODE_SEAT,
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",
+        ASTRA_SEAT,
     ]
     assert len({r.role for r in DEFAULT_PRESET_BOARD[:4]}) == 4
 
     assert all(r.effort == "medium" for r in LIGHT_PRESET_BOARD)
-    assert [r.model for r in LIGHT_PRESET_BOARD] == [r.model for r in DEFAULT_PRESET_BOARD]
+    assert [r.model for r in LIGHT_PRESET_BOARD] == [
+        r.model for r in DEFAULT_PRESET_BOARD
+    ]
 
+    # Fable is EXCLUDED from HEAVY_PRESET_BOARD entirely (review-cli#fable-seat-reliability,
+    # mirrors the existing DEFAULT_PRESET_BOARD exclusion above) — a "heavy" preset must not
+    # pay for a seat with a confirmed ~100% dispatch failure rate. Kimi is promoted into the
+    # xhigh top-4 in its place (Fable's old DEFAULT_BOARD slot is now the LAST index, so
+    # dropping it doesn't shift anyone else's tier — see HEAVY_PRESET_BOARD's own comment).
+    assert "claude:claude-fable-5" not in [r.model for r in HEAVY_PRESET_BOARD]
     assert [(r.model, r.effort) for r in HEAVY_PRESET_BOARD[:4]] == [
-        ("claude:claude-fable-5", "xhigh"),
         (SOL_SEAT, "xhigh"),
         ("claude:claude-opus-4-8", "xhigh"),
         (GLM_COMMANDCODE_SEAT, "xhigh"),
+        ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "xhigh"),
     ]
     assert all(r.effort == "max" for r in HEAVY_PRESET_BOARD[4:])
 
@@ -394,6 +440,14 @@ def test_preset_boards_pin_model_order_pool_and_effort():
     assert GROK_SEAT in [r.model for r in DEFAULT_PRESET_BOARD]
     assert GROK_SEAT in [r.model for r in LIGHT_PRESET_BOARD]
     assert GROK_SEAT in [r.model for r in HEAVY_PRESET_BOARD]
+    # review-cli#382 (round 4 review finding): explicitly pin Terra's/Sonnet's effort at
+    # "max", not "xhigh" -- they land at raw priority 6-7 (AFTER Kimi at 4), outside the
+    # `i < 4` xhigh-tier cutoff in `_heavy_eligible_seats`, unlike the config.py comment's
+    # bare say-so this actually asserts it.
+    terra_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == TERRA_SEAT)
+    sonnet_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == SONNET_SEAT)
+    assert terra_entry.effort == "max", terra_entry
+    assert sonnet_entry.effort == "max", sonnet_entry
 
 
 def test_package_facade_exports_preset_surface():
@@ -404,31 +458,57 @@ def test_package_facade_exports_preset_surface():
     assert reviewlib.LIGHT_PRESET_BOARD == LIGHT_PRESET_BOARD
     assert reviewlib.HEAVY_PRESET_BOARD == HEAVY_PRESET_BOARD
     assert reviewlib.SOL_SEAT == SOL_SEAT
+    # review-cli#382 (codex review finding, round 3): TERRA_SEAT/SONNET_SEAT must be
+    # re-exported through the facade too, like every other seat constant (SOL_SEAT/
+    # ASTRA_SEAT/FABLE_SEAT above) -- a caller doing `from reviewlib import TERRA_SEAT`
+    # got an ImportError before this was added to reviewlib/__init__.py.
+    assert reviewlib.TERRA_SEAT == TERRA_SEAT
+    assert reviewlib.SONNET_SEAT == SONNET_SEAT
     assert reviewlib.preset_names() == ("default", "heavy", "light")
     assert reviewlib.preset_pool_size("light") == 2
-    assert [r.model for r in reviewlib.preset_board(None)] == [r.model for r in DEFAULT_PRESET_BOARD]
-    assert [r.model for r in preset_board(None)] == [r.model for r in DEFAULT_PRESET_BOARD]
-    assert preset_board(None)[0] == DEFAULT_PRESET_BOARD[0]
-    assert preset_board(None)[0] is not DEFAULT_PRESET_BOARD[0]
+    # preset_board(None) resolves via DEFAULT_PRESET, which is "light" (Alex,
+    # 2026-08-28) — same model order as DEFAULT_PRESET_BOARD, but LIGHT's effort.
+    assert [r.model for r in reviewlib.preset_board(None)] == [
+        r.model for r in DEFAULT_PRESET_BOARD
+    ]
+    assert [r.model for r in preset_board(None)] == [
+        r.model for r in DEFAULT_PRESET_BOARD
+    ]
+    assert preset_board(None)[0] == LIGHT_PRESET_BOARD[0]
+    assert preset_board(None)[0] is not LIGHT_PRESET_BOARD[0]
+    # Review finding (4 review rounds, multiple reviewers): preset_pool_size(None) must
+    # STAY at DEFAULT_POOL_SIZE (4), deliberately NOT tracking DEFAULT_PRESET the way
+    # preset_board(None) does — cli.py's pool guard (`preset_pool_size(active_preset)`)
+    # relies on this exact disagreement to give a config `models:`/`board:` roster (no
+    # explicit `pool:`) its correct no-override pool of 4, not the light preset's 2. A
+    # future "consistency" cleanup that makes these agree would silently re-break that
+    # path with the whole suite otherwise green — this assertion is the guard against it.
+    assert reviewlib.preset_pool_size(None) == DEFAULT_POOL_SIZE == 4
 
 
 def test_explicit_preset_board_overrides_config_board():
     cfg = {"board": [{"model": "gemini", "role": "tests", "effort": "medium"}]}
     board = load_board(cfg, preset="heavy")
     assert [r.model for r in board[:4]] == [
-        "claude:claude-fable-5",
         SOL_SEAT,
         "claude:claude-opus-4-8",
         GLM_COMMANDCODE_SEAT,
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ]
     assert all(r.effort == "xhigh" for r in board[:4])
     assert all(r.effort == "max" for r in board[4:])
+    assert "claude:claude-fable-5" not in [r.model for r in board]
 
 
 def test_explicit_models_with_preset_preserve_config_metadata_and_use_preset_effort():
     cfg = {
         "board": [
-            {"model": "gemini", "role": "tests", "name": "Configured Gemini", "effort": "medium"},
+            {
+                "model": "gemini",
+                "role": "tests",
+                "name": "Configured Gemini",
+                "effort": "medium",
+            },
         ]
     }
     board = board_from_models(["gemini"], cfg, preset="heavy")
@@ -441,7 +521,9 @@ def test_explicit_models_with_preset_preserve_config_metadata_and_use_preset_eff
 
 
 def test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat():
-    board = board_from_models(["claude:claude-fable-5", "custom:model"], {}, preset="light")
+    board = board_from_models(
+        ["claude:claude-fable-5", "custom:model"], {}, preset="light"
+    )
 
     assert [r.model for r in board] == ["claude:claude-fable-5", "custom:model"]
     assert board[0].role == "architect"
@@ -450,10 +532,43 @@ def test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat()
     assert board[1].effort == "medium"
 
 
+def test_bare_codex_explicit_model_no_longer_matches_board_metadata_after_astra_pin():
+    """Opus review finding: before ASTRA_SEAT replaced the bare `"codex"` DEFAULT_BOARD
+    seat, `-m codex` matched that seat byte-for-byte and inherited its role/display/preset
+    effort. Now that the seat is pinned to `codex:gpt-6-astra`, a bare `-m codex` matches NO
+    board/preset entry, so it falls back to the SAME generic unmatched-model path any
+    unrecognised model already gets (role="", a display derived from the model string, and
+    `board_from_models`'s `preset_default_effort` -- the first NON-None `effort` among the
+    preset's own seats, in priority order).
+
+    Deliberately uses `preset="heavy"` (NOT the `preset="light"` that
+    `test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat` uses),
+    because "heavy" grades effort per seat (xhigh for the top 4, max after) while "light"
+    gives every seat a uniform "medium" -- so this test's expected "xhigh" (heavy's own
+    first-seat effort, Sol's) and that other test's expected "medium" (light's uniform
+    effort) are BOTH correct outputs of the identical fallback code path, just fed a
+    different preset; they are not in tension. This pins that the metadata loss for a bare
+    `-m codex` is a deliberate, non-crashing behavior change, not a regression."""
+    board = board_from_models(["codex"], {}, preset="heavy")
+
+    assert len(board) == 1
+    assert board[0].model == "codex"
+    assert board[0].role == ""
+    assert board[0].display == "codex"
+    # Preset default effort (the FIRST seat's effort in priority order, i.e. Sol's xhigh)
+    # -- NOT the "max" effort the old DEFAULT_BOARD seat #5 used to carry.
+    assert board[0].effort == "xhigh"
+
+
 def test_explicit_models_with_preset_prevent_config_effort_downgrade_for_out_of_preset_seat():
     cfg = {
         "board": [
-            {"model": "custom:model", "role": "tests", "name": "Custom", "effort": "low"},
+            {
+                "model": "custom:model",
+                "role": "tests",
+                "name": "Custom",
+                "effort": "low",
+            },
         ]
     }
     board = board_from_models(["custom:model"], cfg, preset="heavy")
@@ -466,7 +581,9 @@ def test_explicit_models_with_preset_prevent_config_effort_downgrade_for_out_of_
 
 
 def test_config_board_unsupported_effort_is_ignored():
-    board = load_board({"board": [{"model": "codex", "role": "tests", "effort": 'bad"value'}]})
+    board = load_board(
+        {"board": [{"model": "codex", "role": "tests", "effort": 'bad"value'}]}
+    )
     assert board[0].effort is None
 
 
@@ -490,10 +607,18 @@ def test_unknown_preset_name_fails_fast_for_api_callers():
 
 def test_call_backend_does_not_break_legacy_custom_backend_without_effort():
     def _legacy(model, prompt, diff, cwd, timeout, round_no=0):
-        return ReviewResult(model=model, command="legacy", returncode=0, stdout=prompt, stderr="")
+        return ReviewResult(
+            model=model, command="legacy", returncode=0, stdout=prompt, stderr=""
+        )
 
     result = backends.call_backend(
-        _legacy, "custom", "prompt", "+x", REPO_ROOT, 5, effort="high",
+        _legacy,
+        "custom",
+        "prompt",
+        "+x",
+        REPO_ROOT,
+        5,
+        effort="high",
     )
     assert result.returncode == 0
     assert result.command == "legacy"
@@ -502,13 +627,23 @@ def test_call_backend_does_not_break_legacy_custom_backend_without_effort():
 
 def test_call_backend_does_not_pass_effort_when_signature_uninspectable():
     def _legacy(model, prompt, diff, cwd, timeout, round_no=0):
-        return ReviewResult(model=model, command="legacy", returncode=0, stdout=prompt, stderr="")
+        return ReviewResult(
+            model=model, command="legacy", returncode=0, stdout=prompt, stderr=""
+        )
 
     old_signature = backends.inspect.signature
-    backends.inspect.signature = lambda _backend: (_ for _ in ()).throw(ValueError("no signature"))
+    backends.inspect.signature = lambda _backend: (_ for _ in ()).throw(
+        ValueError("no signature")
+    )
     try:
         result = backends.call_backend(
-            _legacy, "custom", "prompt", "+x", REPO_ROOT, 5, effort="high",
+            _legacy,
+            "custom",
+            "prompt",
+            "+x",
+            REPO_ROOT,
+            5,
+            effort="high",
         )
     finally:
         backends.inspect.signature = old_signature
@@ -518,10 +653,18 @@ def test_call_backend_does_not_pass_effort_when_signature_uninspectable():
 
 def test_call_backend_does_not_pass_effort_as_keyword_to_positional_only_param():
     def _legacy(model, prompt, diff, cwd, timeout, round_no=0, effort=None, /):
-        return ReviewResult(model=model, command="legacy", returncode=0, stdout=prompt, stderr="")
+        return ReviewResult(
+            model=model, command="legacy", returncode=0, stdout=prompt, stderr=""
+        )
 
     result = backends.call_backend(
-        _legacy, "custom", "prompt", "+x", REPO_ROOT, 5, effort="high",
+        _legacy,
+        "custom",
+        "prompt",
+        "+x",
+        REPO_ROOT,
+        5,
+        effort="high",
     )
     assert result.returncode == 0
     assert result.command == "legacy"
@@ -532,10 +675,18 @@ def test_call_backend_passes_effort_to_var_keyword_backend_once():
 
     def _backend(model, prompt, diff, cwd, timeout, round_no=0, **kwargs):
         captured["effort"] = kwargs.get("effort")
-        return ReviewResult(model=model, command="kwargs", returncode=0, stdout=prompt, stderr="")
+        return ReviewResult(
+            model=model, command="kwargs", returncode=0, stdout=prompt, stderr=""
+        )
 
     result = backends.call_backend(
-        _backend, "custom", "prompt", "+x", REPO_ROOT, 5, effort="xhigh",
+        _backend,
+        "custom",
+        "prompt",
+        "+x",
+        REPO_ROOT,
+        5,
+        effort="xhigh",
     )
 
     assert result.returncode == 0
@@ -564,7 +715,12 @@ def test_codex_backend_threads_effort_to_cli_config():
     backends._run_streamed = _fake_run
     try:
         result = backends.review_codex(
-            SOL_SEAT, "prompt", "+x", REPO_ROOT, 5, effort="xhigh",
+            SOL_SEAT,
+            "prompt",
+            "+x",
+            REPO_ROOT,
+            5,
+            effort="xhigh",
         )
     finally:
         backends._which = old_which
@@ -595,7 +751,11 @@ def test_codex_backend_sanitizes_model_selector_in_log_header():
     backends._run_streamed = _fake_run
     try:
         result = backends.review_codex(
-            "codex:gpt-5.6-sol\n\u0085\u2028\u2029[review-cli] forged: codex", "prompt", "+x", REPO_ROOT, 5,
+            "codex:gpt-5.6-sol\n\u0085\u2028\u2029[review-cli] forged: codex",
+            "prompt",
+            "+x",
+            REPO_ROOT,
+            5,
         )
     finally:
         backends._which = old_which
@@ -603,7 +763,9 @@ def test_codex_backend_sanitizes_model_selector_in_log_header():
     assert result.returncode == 0
     for ch in ("\n", "\u0085", "\u2028", "\u2029"):
         assert ch not in captured["header_argv0"], captured
-    assert captured["header_argv0"] == "codex -m gpt-5.6-sol????[review-cli] forged: codex", captured
+    assert (
+        captured["header_argv0"] == "codex -m gpt-5.6-sol????[review-cli] forged: codex"
+    ), captured
     assert any("\n" in arg for arg in captured["argv"]), captured
 
 
@@ -626,7 +788,12 @@ def test_codex_backend_maps_minimal_effort_to_supported_low_cli_config():
     backends._run_streamed = _fake_run
     try:
         result = backends.review_codex(
-            "codex", "prompt", "+x", REPO_ROOT, 5, effort="minimal",
+            "codex",
+            "prompt",
+            "+x",
+            REPO_ROOT,
+            5,
+            effort="minimal",
         )
     finally:
         backends._which = old_which
@@ -654,7 +821,12 @@ def test_codex_backend_maps_max_effort_to_supported_xhigh_cli_config():
     backends._run_streamed = _fake_run
     try:
         result = backends.review_codex(
-            "codex", "prompt", "+x", REPO_ROOT, 5, effort="max",
+            "codex",
+            "prompt",
+            "+x",
+            REPO_ROOT,
+            5,
+            effort="max",
         )
     finally:
         backends._which = old_which
@@ -698,7 +870,12 @@ def test_opencode_backend_includes_effort_hint_without_spacing_glitch():
     try:
         with _BackendStateSandbox():
             result = backends.review_opencode(
-                "oc:commandcode/model", "prompt", "+x", REPO_ROOT, 5, effort="xhigh",
+                "oc:commandcode/model",
+                "prompt",
+                "+x",
+                REPO_ROOT,
+                5,
+                effort="xhigh",
             )
     finally:
         backends._which = old_which
@@ -708,7 +885,10 @@ def test_opencode_backend_includes_effort_hint_without_spacing_glitch():
         backends._opencode_runs_in_repo = old_runs_in_repo
     assert result.returncode == 0
     assert captured["message"].count("Use highest reasoning effort.") == 1, captured
-    assert "Use highest reasoning effort.\n\nYou are running outside" in captured["message"], captured
+    assert (
+        "Use highest reasoning effort.\n\nYou are running outside"
+        in captured["message"]
+    ), captured
     assert "effort.Review" not in captured["message"], captured
 
 
@@ -743,8 +923,13 @@ def test_call_backend_with_opencode_effort_hint_is_not_duplicated():
     try:
         with _BackendStateSandbox():
             result = backends.call_backend(
-                backends.review_opencode, "oc:commandcode/model", "prompt", "+x",
-                REPO_ROOT, 5, effort="xhigh",
+                backends.review_opencode,
+                "oc:commandcode/model",
+                "prompt",
+                "+x",
+                REPO_ROOT,
+                5,
+                effort="xhigh",
             )
     finally:
         backends._which = old_which
@@ -768,15 +953,22 @@ def test_direct_rest_backend_effort_adds_prompt_hint():
     def _fake_request(**kwargs):
         captured.update(kwargs)
         return ReviewResult(
-            model=kwargs["model"], command="fake-rest", returncode=0,
-            stdout=kwargs["prompt"], stderr="",
+            model=kwargs["model"],
+            command="fake-rest",
+            returncode=0,
+            stdout=kwargs["prompt"],
+            stderr="",
         )
 
     backends._openai_compatible_request = _fake_request
     try:
         with _BackendStateSandbox():
             result = backends.review_commandcode(
-                "commandcode:deepseek/deepseek-v4-pro", "prompt", "+x", REPO_ROOT, 5,
+                "commandcode:deepseek/deepseek-v4-pro",
+                "prompt",
+                "+x",
+                REPO_ROOT,
+                5,
                 effort="high",
             )
     finally:
@@ -815,7 +1007,11 @@ def test_direct_claude_cli_effort_adds_prompt_hint():
     backends._run_streamed = _fake_run
     try:
         result = backends.review_claude_cli(
-            "claude:claude-opus-4-8", "prompt", "+x", REPO_ROOT, 5,
+            "claude:claude-opus-4-8",
+            "prompt",
+            "+x",
+            REPO_ROOT,
+            5,
             effort="high",
         )
     finally:
@@ -834,7 +1030,10 @@ def test_visual_models_have_separate_priority_from_review_board():
     fallbacks, including a GLM vision model rather than the text-only GLM-5.2 seat."""
     assert VISUAL_MODELS[0] == "claude:claude-opus-4-8", VISUAL_MODELS
     assert "commandcode:zai-org/GLM-5.2" not in VISUAL_MODELS, VISUAL_MODELS
-    assert any("glm-4.5v" in model.lower() or "glm-4.6v" in model.lower() for model in VISUAL_MODELS), VISUAL_MODELS
+    assert any(
+        "glm-4.5v" in model.lower() or "glm-4.6v" in model.lower()
+        for model in VISUAL_MODELS
+    ), VISUAL_MODELS
     assert all(
         "vision" in model.lower()
         or "kimi" in model.lower()
@@ -877,7 +1076,9 @@ def test_no_default_model_string_uses_the_dead_route():
 def test_kimi_seat_itself_is_clean():
     low = KIMI_SEAT.lower()
     for tok in _DEAD_ROUTE_TOKENS:
-        assert tok not in low, f"KIMI_SEAT {KIMI_SEAT!r} contains dead-route token {tok!r}"
+        assert tok not in low, (
+            f"KIMI_SEAT {KIMI_SEAT!r} contains dead-route token {tok!r}"
+        )
 
 
 def test_every_default_kimi_entry_is_the_canonical_seat():
@@ -967,8 +1168,13 @@ def test_default_routes_live_catches_dead_and_typo_defaults_through_the_transpor
     # `opencode:` alias). The agentic case is the one a name-only `_match_named_backend(model)`
     # check would have missed; both transports are checked for symmetry.
     assert backends.default_routes_live("comandcode:moonshotai/Kimi-K2.7-Code") is False
-    assert backends.default_routes_live("oc:comandcode/moonshotai/Kimi-K2.7-Code") is False
-    assert backends.default_routes_live("opencode:comandcode/moonshotai/Kimi-K2.7-Code") is False
+    assert (
+        backends.default_routes_live("oc:comandcode/moonshotai/Kimi-K2.7-Code") is False
+    )
+    assert (
+        backends.default_routes_live("opencode:comandcode/moonshotai/Kimi-K2.7-Code")
+        is False
+    )
     # A stale default whose id names no route at all.
     assert backends.default_routes_live("totally-bogus-model-xyz") is False
     # A bare-alias provider + model suffix that resolve_backend does NOT match on the full
@@ -976,9 +1182,14 @@ def test_default_routes_live_catches_dead_and_typo_defaults_through_the_transpor
     # `gemini-api:` form) and so falls through to opencode at runtime. The guard must agree:
     # checking the COLLAPSED provider token would wrongly bless it, so the guard validates
     # the FULL id route (codex review of #49). Same for the `claude-p:` form.
-    assert backends.resolve_backend("gemini-api:gemini-2.5-flash") is backends.review_opencode
+    assert (
+        backends.resolve_backend("gemini-api:gemini-2.5-flash")
+        is backends.review_opencode
+    )
     assert backends.default_routes_live("gemini-api:gemini-2.5-flash") is False
-    assert backends.resolve_backend("claude-p:claude-opus-4-8") is backends.review_opencode
+    assert (
+        backends.resolve_backend("claude-p:claude-opus-4-8") is backends.review_opencode
+    )
     assert backends.default_routes_live("claude-p:claude-opus-4-8") is False
     # ...but the spellings resolve_backend DOES match on the full id still pass.
     assert backends.default_routes_live("gemini:gemini-2.5-flash") is True
@@ -987,13 +1198,18 @@ def test_default_routes_live_catches_dead_and_typo_defaults_through_the_transpor
     # the SAME verdict as its lowercase form (the guard must mirror the dispatcher, codex #49).
     assert backends.resolve_backend("Codex") is backends.resolve_backend("codex")
     assert backends.default_routes_live("Codex") is True
-    assert backends.default_routes_live("OC:Commandcode/moonshotai/Kimi-K2.7-Code") is True
+    assert (
+        backends.default_routes_live("OC:Commandcode/moonshotai/Kimi-K2.7-Code") is True
+    )
     assert backends.default_routes_live("OC:Fireworks/x/y") is False  # dead, mixed case
     # Intentional flat-vs-agentic asymmetry: `oc:gemini-api/model` passes because the agentic
     # opencode transport DOES route an arbitrary `provider/model` (gemini-api is a real
     # opencode provider), whereas the flat keyed-HTTP `gemini-api:model` does not — they have
     # different runtime routes, and the guard tracks each (not a bug).
-    assert backends.resolve_backend("oc:gemini-api/gemini-2.5-flash") is backends.review_opencode
+    assert (
+        backends.resolve_backend("oc:gemini-api/gemini-2.5-flash")
+        is backends.review_opencode
+    )
     assert backends.default_routes_live("oc:gemini-api/gemini-2.5-flash") is True
     # The live defaults pass, via every transport spelling (flat, `oc:`, `opencode:`).
     assert backends.default_routes_live(KIMI_SEAT) is True
@@ -1008,8 +1224,14 @@ def test_effective_provider_peels_transport_and_splits_on_first_separator():
     segment before `:` or `/` — so the provider UNDER an agentic seat is what's checked, not
     the literal "opencode" transport. Covers the spellings the defaults actually use."""
     assert backends.effective_provider("codex") == "codex"
-    assert backends.effective_provider("commandcode:moonshotai/Kimi-K2.7-Code") == "commandcode"
-    assert backends.effective_provider("oc:commandcode/moonshotai/Kimi-K2.7-Code") == "commandcode"
+    assert (
+        backends.effective_provider("commandcode:moonshotai/Kimi-K2.7-Code")
+        == "commandcode"
+    )
+    assert (
+        backends.effective_provider("oc:commandcode/moonshotai/Kimi-K2.7-Code")
+        == "commandcode"
+    )
     assert backends.effective_provider("opencode:zai/glm-5.2") == "zai"
     assert backends.effective_provider("zai:glm-5.2") == "zai"
     assert backends.effective_provider("oc:fireworks/x/y") == "fireworks"
@@ -1026,11 +1248,13 @@ def test_dead_provider_denylist_is_load_bearing_in_the_guard():
     `__main__` runner, where a fixture parameter would be an unfilled positional and the
     test would error. Same save/restore pattern the other tests here use."""
     assert backends._match_named_backend("codex") is not None  # codex IS a named route
-    assert backends.default_routes_live("codex") is True       # ...and live by default
+    assert backends.default_routes_live("codex") is True  # ...and live by default
     saved = backends._DEAD_PROVIDERS
     backends._DEAD_PROVIDERS = frozenset({"codex"})
     try:
-        assert backends.default_routes_live("codex") is False  # denylist flips the verdict
+        assert (
+            backends.default_routes_live("codex") is False
+        )  # denylist flips the verdict
     finally:
         backends._DEAD_PROVIDERS = saved
     # Restored — the guard is back to its real verdict for the rest of the suite.
@@ -1078,12 +1302,18 @@ def test_agentic_helper_rewrites_provider_seat_idempotent_and_canonical():
     to `oc:foo/bar`; canonicalizing keeps the board seat id == the attributed id so a seat
     never splits into a `no_data` board row plus a separate `oc:` health row (review-cli#24,
     codex review). Double-wrapping can't produce a nonsense `oc:oc/...` id."""
-    assert _agentic("commandcode:moonshotai/Kimi-K2.7-Code") == "oc:commandcode/moonshotai/Kimi-K2.7-Code"
+    assert (
+        _agentic("commandcode:moonshotai/Kimi-K2.7-Code")
+        == "oc:commandcode/moonshotai/Kimi-K2.7-Code"
+    )
     assert _agentic("zai:glm-5.2") == "oc:zai/glm-5.2"
     assert _agentic("codex") == "oc:codex"
     # Idempotent: wrapping an already-`oc:` seat is a no-op (no `oc:oc/...`).
     assert _agentic("oc:zai/glm-5.2") == "oc:zai/glm-5.2"
-    assert _agentic(_agentic("commandcode:Qwen/Qwen3.7-Max")) == "oc:commandcode/Qwen/Qwen3.7-Max"
+    assert (
+        _agentic(_agentic("commandcode:Qwen/Qwen3.7-Max"))
+        == "oc:commandcode/Qwen/Qwen3.7-Max"
+    )
     # Canonical: the `opencode:` alias is normalized to the canonical `oc:` spelling, so it
     # matches the dashboard's `oc:`-prefixed attribution of the same opencode run.
     assert _agentic("opencode:foo/bar") == "oc:foo/bar"
@@ -1097,33 +1327,43 @@ def test_default_pool_size_is_four():
 
 def test_select_pool_default_picks_first_four_seats():
     """Default pool (no availability predicate) = the FIRST 4 seats by priority of the
-    11-seat board (the rest are reserve). The pool now leads with Fable, Sol, Opus,
-    then the GLM-5.2-via-commandcode seat."""
+    13-seat board (the rest are reserve). The pool now leads with Sol, Opus, then the
+    GLM-5.2-via-commandcode seat, then Kimi (review-cli#fable-seat-reliability: Fable
+    moved from priority 1 to the very last reserve seat — see
+    `test_default_board_matches_directive_table`'s comment for the full rationale)."""
     pool = select_pool(list(DEFAULT_BOARD), DEFAULT_POOL_SIZE)
     assert len(pool) == 4
     assert [r.model for r in pool] == [r.model for r in DEFAULT_BOARD[:4]]
     assert [r.model for r in pool] == [
-        "claude:claude-fable-5",
         "codex:gpt-5.6-sol",
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ]
-    # The reserve is exactly the remainder (priority order): agentic Kimi first for lens
-    # diversity, Codex, the remaining opencode routes (review-cli#24), plus the diff-only
-    # Gemini. Grok (agentic via opencode's native xai provider) sits directly BEFORE
-    # the z.ai GLM seat, which stays LAST-RESORT (review-cli#65 deprioritization) last.
+    # The reserve is exactly the remainder (priority order): Astra, Terra/Sonnet
+    # (review-cli#382 live fallbacks), the remaining opencode routes (review-cli#24), the
+    # diff-only Gemini, Grok (agentic via opencode's native xai provider, directly BEFORE
+    # the slow GLM seat so failover reaches it first), the slow z.ai GLM seat (LAST-RESORT, review-cli#65
+    # deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
-    assert reserve == ["oc:commandcode/moonshotai/Kimi-K2.7-Code",
-                       "codex",
-                       "oc:commandcode/Qwen/Qwen3.7-Max",
-                       "oc:commandcode/deepseek/deepseek-v4-pro", "gemini",
-                       "oc:xai/grok-4.5",
-                       "oc:zai/glm-5.2"]
+    assert reserve == [
+        "codex:gpt-6-astra",
+        "codex:gpt-5.6-terra",
+        "claude:claude-sonnet-5",
+        "oc:commandcode/Qwen/Qwen3.7-Max",
+        "oc:commandcode/deepseek/deepseek-v4-pro",
+        "gemini",
+        "oc:xai/grok-4.5",
+        "oc:zai/glm-5.2",
+        "claude:claude-fable-5",
+    ]
 
 
 def test_select_pool_zero_or_negative_means_all_seats():
     for n in (0, -1, -8):
-        assert [r.model for r in select_pool(list(DEFAULT_BOARD), n)] == [r.model for r in DEFAULT_BOARD]
+        assert [r.model for r in select_pool(list(DEFAULT_BOARD), n)] == [
+            r.model for r in DEFAULT_BOARD
+        ]
 
 
 def test_select_pool_larger_than_board_is_clamped():
@@ -1134,20 +1374,28 @@ def test_select_pool_boundary_at_and_below_full_size():
     """Exact boundary: pool == len(board) -> all (the `pool >= len` short-circuit);
     pool == len(board) - 1 -> all but the last seat (GLM finding 11)."""
     n = len(DEFAULT_BOARD)
-    assert [r.model for r in select_pool(list(DEFAULT_BOARD), n)] == [r.model for r in DEFAULT_BOARD]
-    assert [r.model for r in select_pool(list(DEFAULT_BOARD), n - 1)] == [r.model for r in DEFAULT_BOARD[:n - 1]]
+    assert [r.model for r in select_pool(list(DEFAULT_BOARD), n)] == [
+        r.model for r in DEFAULT_BOARD
+    ]
+    assert [r.model for r in select_pool(list(DEFAULT_BOARD), n - 1)] == [
+        r.model for r in DEFAULT_BOARD[: n - 1]
+    ]
 
 
 def test_select_pool_picks_first_n_in_order():
-    assert [r.model for r in select_pool(list(DEFAULT_BOARD), 2)] == [r.model for r in DEFAULT_BOARD[:2]]
-    assert [r.model for r in select_pool(list(DEFAULT_BOARD), 1)] == [DEFAULT_BOARD[0].model]
+    assert [r.model for r in select_pool(list(DEFAULT_BOARD), 2)] == [
+        r.model for r in DEFAULT_BOARD[:2]
+    ]
+    assert [r.model for r in select_pool(list(DEFAULT_BOARD), 1)] == [
+        DEFAULT_BOARD[0].model
+    ]
 
 
 def test_select_pool_empty_board_stays_empty():
     assert select_pool([], 4) == []
 
 
-def test_select_pool_does_not_mutate_input(  ):
+def test_select_pool_does_not_mutate_input():
     """select_pool must return a NEW list, leaving the caller's board untouched — a
     future refactor returning a slice-view would silently mutate it (GLM finding 1)."""
     src = list(DEFAULT_BOARD)
@@ -1179,13 +1427,13 @@ def test_all_repo_capable_default_seats_are_agentic():
     claude CLI) — not a stateless diff-only REST/keyed-HTTP call. Exactly TWO seats stay
     diff-only, each because NO agentic transport reaches them:
       * Gemini — a workspace-less REST API, no agentic CLI/opencode provider; and
-      * GLM-cc (`commandcode:zai-org/GLM-5.2`, priority 4) — opencode's `commandcode`
+      * GLM-cc (`commandcode:zai-org/GLM-5.2`, priority 3) — opencode's `commandcode`
         provider does NOT register this GLM id, so `oc:commandcode/zai-org/GLM-5.2` errors;
         the keyed-HTTP route is the only one that reaches it (verified live).
 
     This still pins the agentic-by-default contract for the seats that CAN be agentic:
-    Kimi/z.ai-GLM/Qwen/DeepSeek go through opencode (`oc:`), Codex through the codex CLI, the
-    two Anthropic seats through claude. A future edit that silently reverts one of THOSE to
+    Kimi/z.ai-GLM/Qwen/DeepSeek go through opencode (`oc:`), Sol/Astra through the codex CLI,
+    the two Anthropic seats through claude. A future edit that silently reverts one of THOSE to
     the diff-only REST route fails here. (claude is agentic via its CLI path; resolve_backend
     returns review_claude for both, and the board's claude seats run the CLI on a normal
     host.)"""
@@ -1204,15 +1452,18 @@ def test_all_repo_capable_default_seats_are_agentic():
             continue
         assert backend in agentic, f"{seat.display} ({seat.model}) is not agentic"
     # Belt-and-suspenders: the ONLY diff-only commandcode/z.ai REST seat on the default board
-    # is the deliberate priority-4 GLM-cc one; every other seat is agentic (or Gemini). A
+    # is the deliberate priority-3 GLM-cc one; every other seat is agentic (or Gemini). A
     # second keyed-HTTP commandcode/z.ai seat slipping in is the regression to catch.
     diff_only_backends = {backends.review_commandcode, backends.review_zai}
-    rest_seats = [s.display for s in DEFAULT_BOARD
-                  if backends.resolve_backend(s.model) in diff_only_backends]
+    rest_seats = [
+        s.display
+        for s in DEFAULT_BOARD
+        if backends.resolve_backend(s.model) in diff_only_backends
+    ]
     assert rest_seats == ["GLM-cc"], rest_seats
 
 
-def test_install_skill_text_documents_agentic_default_board(  ):
+def test_install_skill_text_documents_agentic_default_board():
     """The embedded skill text `review install-skill` writes into agent harnesses must
     reflect the agentic default board (review-cli#24, codex review) — otherwise agents keep
     the stale diff-only mental model. It must mention the `oc:` default seats AND clarify
@@ -1221,13 +1472,21 @@ def test_install_skill_text_documents_agentic_default_board(  ):
     from reviewlib.install import SKILL_MD
 
     low = SKILL_MD.lower()
-    assert "oc:commandcode/" in SKILL_MD, "skill text must name the agentic oc: default seats"
+    assert "oc:commandcode/" in SKILL_MD, (
+        "skill text must name the agentic oc: default seats"
+    )
     assert "oc:zai/glm-5.2" in SKILL_MD, SKILL_MD[:0]
     # The keyed-HTTP section must be scoped to explicit `-m cc`/`-m glm`, not the default board.
     assert "diff-only" in low and "default board" in low
     assert "selected preset/board" in low
     assert "--preset heavy --pool 0" in SKILL_MD
-    assert "covers all 11 built-ins" in SKILL_MD
+    # review-cli#fable-seat-reliability: the heavy preset excludes Fable (~100%
+    # dispatch failure rate). review-cli#382 added TERRA_SEAT/SONNET_SEAT, so --pool 0
+    # now covers 11 built-ins, not 10/9. Normalized whitespace (GLM review finding):
+    # matching the raw string coupled this assertion to exactly where install.py's
+    # paragraph happens to line-wrap — a future reflow of that markdown with no content
+    # change would break it for no real reason.
+    assert "covers all 12 heavy-preset-built-ins" in " ".join(SKILL_MD.split())
     """review-cli#24 contract (codex review): the agentic `oc:` board seats authenticate via
     opencode's OWN provider config — NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
     So their availability gates on the `opencode` BINARY plus opencode's OWN provider
@@ -1244,8 +1503,12 @@ def test_install_skill_text_documents_agentic_default_board(  ):
     saved_env = {
         k: os.environ.get(k)
         for k in (
-            "COMMANDCODE_API_KEY", "ZAI_API_KEY", "ZHIPU_API_KEY", "GEMINI_ENV_FILE",
-            "OC_AUTH_FILE", "OC_CONFIG_FILE",
+            "COMMANDCODE_API_KEY",
+            "ZAI_API_KEY",
+            "ZHIPU_API_KEY",
+            "GEMINI_ENV_FILE",
+            "OC_AUTH_FILE",
+            "OC_CONFIG_FILE",
         )
     }
     try:
@@ -1268,7 +1531,9 @@ def test_install_skill_text_documents_agentic_default_board(  ):
             # opencode present but commandcode provider auth missing -> commandcode seats
             # are skipped at startup. Other oc providers keep their existing semantics.
             backends._which = lambda name: f"/fake/bin/{name}"
-            commandcode_seats = [seat for seat in oc_seats if seat.startswith("oc:commandcode/")]
+            commandcode_seats = [
+                seat for seat in oc_seats if seat.startswith("oc:commandcode/")
+            ]
             assert commandcode_seats, oc_seats
             for seat in commandcode_seats:
                 assert backends.backend_available(seat) is False, seat
@@ -1329,7 +1594,9 @@ def test_roles_are_non_overlapping_focus_sentences():
 # === config.yaml board parsing ==================================================
 def test_no_board_key_falls_back_to_default():
     assert [r.model for r in load_board({})] == [r.model for r in DEFAULT_PRESET_BOARD]
-    assert [r.model for r in load_board({"models": ["codex"]})] == [r.model for r in DEFAULT_PRESET_BOARD]
+    assert [r.model for r in load_board({"models": ["codex"]})] == [
+        r.model for r in DEFAULT_PRESET_BOARD
+    ]
 
 
 def test_empty_or_wrong_typed_board_falls_back_to_default():
@@ -1339,10 +1606,12 @@ def test_empty_or_wrong_typed_board_falls_back_to_default():
 
 
 def test_board_config_overrides_default():
-    cfg = {"board": [
-        {"model": "codex", "role": "correctness"},
-        {"model": "gemini", "role": "security", "name": "G"},
-    ]}
+    cfg = {
+        "board": [
+            {"model": "codex", "role": "correctness"},
+            {"model": "gemini", "role": "security", "name": "G"},
+        ]
+    }
     board = load_board(cfg)
     assert len(board) == 2
     assert board[0].model == "codex" and board[0].role == "correctness"
@@ -1366,12 +1635,14 @@ def test_unknown_role_keeps_reviewer_with_generic_prompt():
 
 
 def test_bad_entries_are_skipped_not_crashed():
-    cfg = {"board": [
-        "not-a-mapping",
-        {"role": "correctness"},  # missing model
-        {"model": "   "},  # blank model
-        {"model": "codex", "role": "correctness"},  # the only valid one
-    ]}
+    cfg = {
+        "board": [
+            "not-a-mapping",
+            {"role": "correctness"},  # missing model
+            {"model": "   "},  # blank model
+            {"model": "codex", "role": "correctness"},  # the only valid one
+        ]
+    }
     board = load_board(cfg)
     assert [r.model for r in board] == ["codex"], [r.model for r in board]
 
@@ -1388,7 +1659,7 @@ def test_present_board_all_malformed_raises_not_silent_default():
     """A non-empty `board:` whose entries are ALL malformed must ERROR, NOT
     silently run a built-in board."""
     cfgs = [
-        {"board": ["not-a-mapping", "still-not"]},   # no mappings at all
+        {"board": ["not-a-mapping", "still-not"]},  # no mappings at all
         {"board": [{"role": "correctness"}, {"role": "security"}]},  # all missing model
         {"board": [{"model": "   "}, {"model": ""}]},  # all blank models
         {"board": [{"model": 42}, "x", {"no": "model"}]},  # mixed garbage, none usable
@@ -1406,17 +1677,21 @@ def test_absent_board_key_uses_default_not_error():
     """Absent `board:` -> DEFAULT_PRESET_BOARD (no error): no preference was expressed."""
     assert [r.model for r in load_board({})] == [r.model for r in DEFAULT_PRESET_BOARD]
     # An explicitly empty list is "no preference" too -> default, not an error.
-    assert [r.model for r in load_board({"board": []})] == [r.model for r in DEFAULT_PRESET_BOARD]
+    assert [r.model for r in load_board({"board": []})] == [
+        r.model for r in DEFAULT_PRESET_BOARD
+    ]
 
 
 def test_partial_malformed_board_keeps_valid_entries_no_error():
     """SOME valid + SOME malformed -> keep the valid ones, warn on bad (no error)."""
-    cfg = {"board": [
-        "not-a-mapping",
-        {"role": "correctness"},          # missing model -> skipped
-        {"model": "codex", "role": "correctness"},   # valid
-        {"model": "gemini", "role": "security"},     # valid
-    ]}
+    cfg = {
+        "board": [
+            "not-a-mapping",
+            {"role": "correctness"},  # missing model -> skipped
+            {"model": "codex", "role": "correctness"},  # valid
+            {"model": "gemini", "role": "security"},  # valid
+        ]
+    }
     board = load_board(cfg)
     assert [r.model for r in board] == ["codex", "gemini"], [r.model for r in board]
 
@@ -1448,6 +1723,19 @@ class _AvailabilityPatch:
 
         self._old_review_mod = review_mod.backend_available
         review_mod.backend_available = _fake
+
+        # `_report_pool_shortfall` (review-cli#276) also does
+        # `from ..backends import backend_unavailable_reason` -- a seat this patch marks
+        # unavailable now gets a SECOND real probe from that function whenever the pool
+        # comes up short, undoing the exact hermeticity this class exists to guarantee
+        # (k3 review finding, round 4: real `_which()`/PATH/auth-db reads leak through a
+        # test that has no real CLI/key configured). Keep it deterministic and consistent
+        # with `_fake` above: available -> no reason, unavailable -> a fixed fake reason.
+        def _fake_reason(model: str) -> str | None:
+            return None if model in self._available else "patched unavailable (test)"
+
+        self._old_review_mod_reason = review_mod.backend_unavailable_reason
+        review_mod.backend_unavailable_reason = _fake_reason
         return self
 
     def __exit__(self, *exc):
@@ -1458,6 +1746,7 @@ class _AvailabilityPatch:
         import reviewlib.modes.review as review_mod
 
         review_mod.backend_available = self._old_review_mod
+        review_mod.backend_unavailable_reason = self._old_review_mod_reason
         return False
 
 
@@ -1512,7 +1801,9 @@ def test_run_panel_codex_uses_native_effort_and_text_prompt_hint():
 
     backends._run_streamed = _fake_run
     try:
-        job = build_board_job(BoardReviewer(SOL_SEAT, "consistency", "Sol", "xhigh"), DEFAULT_PROMPT, "+x")
+        job = build_board_job(
+            BoardReviewer(SOL_SEAT, "consistency", "Sol", "xhigh"), DEFAULT_PROMPT, "+x"
+        )
         results = run_panel([job], REPO_ROOT, 5)
     finally:
         backends._which = old_which
@@ -1561,7 +1852,9 @@ def test_mode_review_board_runs_and_succeeds():
     # TypeError into an internal 127.
     def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         calls.append((model, prompt))
-        return ReviewResult(model=model, command="fake", returncode=0, stdout="ok", stderr="")
+        return ReviewResult(
+            model=model, command="fake", returncode=0, stdout="ok", stderr=""
+        )
 
     board = [
         BoardReviewer("codex", "correctness", "Codex"),
@@ -1576,7 +1869,9 @@ def test_mode_review_board_runs_and_succeeds():
     panel.resolve_backend = lambda _m: _fake_backend
     try:
         with _AvailabilityPatch({"codex", "gemini"}):
-            rc = review_mod.mode_review([], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False, board=board)
+            rc = review_mod.mode_review(
+                [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False, board=board
+            )
     finally:
         review_mod.resolve_backend = old_resolve
         panel.resolve_backend = old_panel_resolve
@@ -1592,7 +1887,9 @@ def test_mode_review_board_fails_when_a_reviewer_fails():
 
     def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         rc = 0 if model == "codex" else 1
-        return ReviewResult(model=model, command="fake", returncode=rc, stdout="x", stderr="boom")
+        return ReviewResult(
+            model=model, command="fake", returncode=rc, stdout="x", stderr="boom"
+        )
 
     board = [
         BoardReviewer("codex", "correctness", "Codex"),
@@ -1604,7 +1901,9 @@ def test_mode_review_board_fails_when_a_reviewer_fails():
     panel.resolve_backend = lambda _m: _fake_backend
     try:
         with _AvailabilityPatch({"codex", "gemini"}):
-            rc = review_mod.mode_review([], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False, board=board)
+            rc = review_mod.mode_review(
+                [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False, board=board
+            )
     finally:
         panel.resolve_backend = old_panel_resolve
     assert rc == 1, rc
@@ -1625,7 +1924,9 @@ def test_mode_review_board_backfills_preflight_skip_from_reserve():
                 stdout="",
                 stderr="provider 'commandcode' failed payment/availability preflight (HTTP 402); skipping",
             )
-        return ReviewResult(model=model, command="fake", returncode=0, stdout="ok", stderr="")
+        return ReviewResult(
+            model=model, command="fake", returncode=0, stdout="ok", stderr=""
+        )
 
     board = [
         BoardReviewer("commandcode:deepseek/deepseek-v4-pro", "tests", "CommandCode"),
@@ -1638,8 +1939,14 @@ def test_mode_review_board_backfills_preflight_skip_from_reserve():
     try:
         with _AvailabilityPatch({"commandcode:deepseek/deepseek-v4-pro", "codex"}):
             rc = review_mod.mode_review(
-                [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False,
-                board=board, pool_size=1,
+                [],
+                DEFAULT_PROMPT,
+                "+x",
+                REPO_ROOT,
+                5,
+                False,
+                board=board,
+                pool_size=1,
             )
     finally:
         panel.resolve_backend = old_panel_resolve
@@ -1656,10 +1963,15 @@ def test_mode_review_failover_threads_effort_to_pool_and_reserve():
         calls.append((model, effort, prompt))
         if model == "claude:claude-fable-5":
             return ReviewResult(
-                model=model, command="fake", returncode=1, stdout="",
+                model=model,
+                command="fake",
+                returncode=1,
+                stdout="",
                 stderr="authentication failed",
             )
-        return ReviewResult(model=model, command="fake", returncode=0, stdout="ok", stderr="")
+        return ReviewResult(
+            model=model, command="fake", returncode=0, stdout="ok", stderr=""
+        )
 
     board = [
         BoardReviewer("claude:claude-fable-5", "architect", "Fable", effort="xhigh"),
@@ -1672,14 +1984,23 @@ def test_mode_review_failover_threads_effort_to_pool_and_reserve():
     try:
         with _AvailabilityPatch({"claude:claude-fable-5", SOL_SEAT}):
             rc = review_mod.mode_review(
-                [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False,
-                board=board, pool_size=1,
+                [],
+                DEFAULT_PROMPT,
+                "+x",
+                REPO_ROOT,
+                5,
+                False,
+                board=board,
+                pool_size=1,
             )
     finally:
         panel.resolve_backend = old_panel_resolve
 
     assert rc == 0, rc
-    assert [model for model, _effort, _prompt in calls] == ["claude:claude-fable-5", SOL_SEAT]
+    assert [model for model, _effort, _prompt in calls] == [
+        "claude:claude-fable-5",
+        SOL_SEAT,
+    ]
     assert [effort for _model, effort, _prompt in calls] == ["xhigh", "medium"]
     assert "Use highest reasoning effort." in calls[0][2]
     assert "Use medium reasoning effort." in calls[1][2]
@@ -1689,7 +2010,9 @@ def test_mode_review_board_with_no_available_reviewers_returns_1():
     from reviewlib.modes import review as review_mod
 
     with _AvailabilityPatch(set()):
-        rc = review_mod.mode_review([], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False, board=list(DEFAULT_BOARD))
+        rc = review_mod.mode_review(
+            [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False, board=list(DEFAULT_BOARD)
+        )
     assert rc == 1, rc
 
 
@@ -1702,7 +2025,13 @@ def test_mode_review_exact_board_runs_unavailable_explicit_seat_and_fails():
     def _fake_backend(model, prompt, diff, cwd, timeout, round_no=0, effort=None):
         calls.append(model)
         rc = 0 if model == "codex" else 1
-        return ReviewResult(model=model, command="fake", returncode=rc, stdout="ok" if rc == 0 else "", stderr="missing")
+        return ReviewResult(
+            model=model,
+            command="fake",
+            returncode=rc,
+            stdout="ok" if rc == 0 else "",
+            stderr="missing",
+        )
 
     board = [
         BoardReviewer("codex", "correctness", "Codex"),
@@ -1715,8 +2044,15 @@ def test_mode_review_exact_board_runs_unavailable_explicit_seat_and_fails():
     try:
         with _AvailabilityPatch({"codex"}):
             rc = review_mod.mode_review(
-                [], DEFAULT_PROMPT, "+x", REPO_ROOT, 5, False,
-                board=board, pool_size=len(board), exact_board=True,
+                [],
+                DEFAULT_PROMPT,
+                "+x",
+                REPO_ROOT,
+                5,
+                False,
+                board=board,
+                pool_size=len(board),
+                exact_board=True,
             )
     finally:
         panel.resolve_backend = old_panel_resolve
@@ -1743,8 +2079,13 @@ def test_cli_explicit_models_disable_board():
     # Avoid touching a real config file / git diff: feed the diff via stdin and
     # point the env file at nothing so no provider key resolves.
     old_stdin = sys.stdin
+    # ROUTING test (explicit -m disables the board), not a pool-assembly test. The piped diff
+    # is non-empty, so on a backend-less host the review-mode pool guard would bail (exit 10)
+    # before the stubbed handler runs; force every seat live via the fake backend seam.
+    old_fake = os.environ.get("REVIEW_FAKE_BACKEND")
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        os.environ["REVIEW_FAKE_BACKEND"] = "1"
         import io
 
         sys.stdin = io.StringIO("+added line\n")
@@ -1756,6 +2097,10 @@ def test_cli_explicit_models_disable_board():
         _review_mod.mode_review = old
         cli.load_config = old_load_config
         sys.stdin = old_stdin
+        if old_fake is None:
+            os.environ.pop("REVIEW_FAKE_BACKEND", None)
+        else:
+            os.environ["REVIEW_FAKE_BACKEND"] = old_fake
 
 
 def test_cli_explicit_models_override_config_models_and_board():
@@ -1776,7 +2121,11 @@ def test_cli_explicit_models_override_config_models_and_board():
     cli.load_config = lambda: {
         "models": ["commandcode:deepseek/deepseek-v4-pro", "codex"],
         "board": [
-            {"model": "commandcode:deepseek/deepseek-v4-pro", "role": "tests", "name": "DeepSeek-cc"},
+            {
+                "model": "commandcode:deepseek/deepseek-v4-pro",
+                "role": "tests",
+                "name": "DeepSeek-cc",
+            },
             {"model": "codex", "role": "consistency", "name": "Codex"},
             {"model": "claude:claude-fable-5", "role": "architect", "name": "Fable"},
         ],
@@ -1806,8 +2155,17 @@ def test_cli_explicit_models_are_not_sliced_by_pool():
 
     captured: dict = {}
 
-    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None,
-                          pool_size=DEFAULT_POOL_SIZE, **kw):
+    def _fake_mode_review(
+        models,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        staged,
+        board=None,
+        pool_size=DEFAULT_POOL_SIZE,
+        **kw,
+    ):
         captured["models"] = models
         captured["board"] = board
         captured["pool_size"] = pool_size
@@ -1832,12 +2190,21 @@ def test_cli_explicit_models_are_not_sliced_by_pool():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        cli.main([
-            "diff", "--task", "TEST-1",
-            "-m", "codex", "-m", "fable5",
-            "--pool", "1",
-            "-C", str(REPO_ROOT),
-        ])
+        cli.main(
+            [
+                "diff",
+                "--task",
+                "TEST-1",
+                "-m",
+                "codex",
+                "-m",
+                "fable5",
+                "--pool",
+                "1",
+                "-C",
+                str(REPO_ROOT),
+            ]
+        )
         assert [r.model for r in captured["board"]] == [
             "codex",
             "claude:claude-fable-5",
@@ -1858,8 +2225,17 @@ def test_cli_explicit_models_override_preset_and_config_models():
 
     captured: dict = {}
 
-    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None,
-                          pool_size=DEFAULT_POOL_SIZE, **kw):
+    def _fake_mode_review(
+        models,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        staged,
+        board=None,
+        pool_size=DEFAULT_POOL_SIZE,
+        **kw,
+    ):
         captured["models"] = models
         captured["board"] = board
         captured["pool_size"] = pool_size
@@ -1872,7 +2248,9 @@ def test_cli_explicit_models_override_preset_and_config_models():
     old_avail = backends.backend_available
     cli.load_config = lambda: {
         "models": ["codex", "gemini"],
-        "board": [{"model": "claude:claude-opus-4-8", "role": "tests", "effort": "low"}],
+        "board": [
+            {"model": "claude:claude-opus-4-8", "role": "tests", "effort": "low"}
+        ],
     }
     backends.backend_available = lambda _m: True
     old_stdin = sys.stdin
@@ -1880,13 +2258,28 @@ def test_cli_explicit_models_override_preset_and_config_models():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        cli.main([
-            "diff", "--task", "TEST-1", "--preset", "heavy",
-            "-m", "gemini", "-m", "claude:claude-opus-4-8",
-            "--pool", "1", "-C", str(REPO_ROOT),
-        ])
+        cli.main(
+            [
+                "diff",
+                "--task",
+                "TEST-1",
+                "--preset",
+                "heavy",
+                "-m",
+                "gemini",
+                "-m",
+                "claude:claude-opus-4-8",
+                "--pool",
+                "1",
+                "-C",
+                str(REPO_ROOT),
+            ]
+        )
         assert captured["models"] == ["gemini", "claude:claude-opus-4-8"], captured
-        assert [r.model for r in captured["board"]] == ["gemini", "claude:claude-opus-4-8"], captured
+        assert [r.model for r in captured["board"]] == [
+            "gemini",
+            "claude:claude-opus-4-8",
+        ], captured
         assert [r.effort for r in captured["board"]] == ["max", "xhigh"], captured
         assert captured["pool_size"] == 2, captured
         assert captured["exact_board"] is True, captured
@@ -1985,7 +2378,9 @@ def test_cli_leading_model_option_before_subcommand_is_honored():
     _review_mod.mode_review = _fake_mode_review
     old_load_config = cli.load_config
     old_avail = backends.backend_available
-    cli.load_config = lambda: {"models": ["commandcode:deepseek/deepseek-v4-pro", "codex"]}
+    cli.load_config = lambda: {
+        "models": ["commandcode:deepseek/deepseek-v4-pro", "codex"]
+    }
     backends.backend_available = lambda _m: True
     old_stdin = sys.stdin
     try:
@@ -1994,7 +2389,9 @@ def test_cli_leading_model_option_before_subcommand_is_honored():
         sys.stdin = io.StringIO("+added line\n")
         cli.main(["-m", "fable5", "-C", str(REPO_ROOT), "diff", "--task", "TEST-1"])
         assert captured["board"] is not None, captured
-        assert [r.model for r in captured["board"]] == ["claude:claude-fable-5"], captured
+        assert [r.model for r in captured["board"]] == ["claude:claude-fable-5"], (
+            captured
+        )
         assert captured["models"] == ["claude:claude-fable-5"], captured
         assert captured["cwd"] == REPO_ROOT, captured
     finally:
@@ -2050,8 +2447,17 @@ def test_cli_config_models_form_priority_board():
 
     captured: dict = {}
 
-    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None,
-                          pool_size=DEFAULT_POOL_SIZE, **kw):
+    def _fake_mode_review(
+        models,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        staged,
+        board=None,
+        pool_size=DEFAULT_POOL_SIZE,
+        **kw,
+    ):
         captured["models"] = models
         captured["board"] = board
         captured["pool_size"] = pool_size
@@ -2060,7 +2466,14 @@ def test_cli_config_models_form_priority_board():
     old = _review_mod.mode_review
     _review_mod.mode_review = _fake_mode_review
     old_load_config = cli.load_config
-    cli.load_config = lambda: {"models": ["codex", "gemini", "commandcode:deepseek/deepseek-v4-pro"]}
+    cli.load_config = lambda: {
+        "models": ["codex", "gemini", "commandcode:deepseek/deepseek-v4-pro"]
+    }
+    # Force every seat live so the pre-dispatch pool-selection guard (reviewlib.pool_guard)
+    # doesn't bail on a host without these backends' keys/CLIs — this test checks BOARD
+    # ROUTING, not liveness.
+    old_avail = backends.backend_available
+    backends.backend_available = lambda _m: True
     old_stdin = sys.stdin
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -2084,6 +2497,7 @@ def test_cli_config_models_form_priority_board():
     finally:
         _review_mod.mode_review = old
         cli.load_config = old_load_config
+        backends.backend_available = old_avail
         sys.stdin = old_stdin
 
 
@@ -2096,7 +2510,9 @@ def test_cli_empty_config_models_does_not_disable_board():
     for empty_models in ([], ["", "  ", "\t"]):
         captured: dict = {}
 
-        def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None, **kw):
+        def _fake_mode_review(
+            models, prompt, diff, cwd, timeout, staged, board=None, **kw
+        ):
             captured["board"] = board
             captured["models"] = models
             return 0
@@ -2107,6 +2523,11 @@ def test_cli_empty_config_models_does_not_disable_board():
         cli.load_config = lambda em=empty_models: {"models": em}
         old_load_board = cli.load_board
         cli.load_board = lambda _cfg, **_kw: list(DEFAULT_PRESET_BOARD)
+        # Force liveness: this checks the board is not DISABLED by an empty models list,
+        # not backend availability — keep the pool-selection guard from bailing on a host
+        # lacking these backends.
+        old_avail = backends.backend_available
+        backends.backend_available = lambda _m: True
         old_stdin = sys.stdin
         try:
             os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -2114,13 +2535,16 @@ def test_cli_empty_config_models_does_not_disable_board():
 
             sys.stdin = io.StringIO("+added line\n")
             cli.main(["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)])
-            assert captured["board"] is not None, f"{empty_models!r} must not disable the board"
+            assert captured["board"] is not None, (
+                f"{empty_models!r} must not disable the board"
+            )
             # And no blank model name leaked into the (unused) flat models list.
             assert all(m.strip() for m in captured["models"]), captured["models"]
         finally:
             _review_mod.mode_review = old
             cli.load_config = old_load_config
             cli.load_board = old_load_board
+            backends.backend_available = old_avail
             sys.stdin = old_stdin
 
 
@@ -2170,7 +2594,9 @@ def test_cli_standalone_visual_ignores_malformed_board():
     old_standalone = visual_cli.run_visual_standalone
     visual_cli.run_visual_standalone = _fake_standalone
     old_load_config = cli.load_config
-    cli.load_config = lambda: {"board": ["not-a-mapping"]}  # malformed board, irrelevant here
+    cli.load_config = lambda: {
+        "board": ["not-a-mapping"]
+    }  # malformed board, irrelevant here
     old_stdin = sys.stdin
     try:
         os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
@@ -2179,9 +2605,21 @@ def test_cli_standalone_visual_ignores_malformed_board():
         # No piped diff and the cwd is not inside a diff-producing repo path we control;
         # _git_diff degrades to "" for --visual, so this routes to the standalone pipeline.
         sys.stdin = io.StringIO("")
-        rc = cli.main(["diff", "--task", "TEST-1", "--visual", "/tmp/does-not-exist-zzz.png", "-C", "/tmp"])
+        rc = cli.main(
+            [
+                "diff",
+                "--task",
+                "TEST-1",
+                "--visual",
+                "/tmp/does-not-exist-zzz.png",
+                "-C",
+                "/tmp",
+            ]
+        )
         assert rc == 0, rc
-        assert reached["standalone"] is True, "standalone visual must run despite the malformed board"
+        assert reached["standalone"] is True, (
+            "standalone visual must run despite the malformed board"
+        )
     finally:
         visual_cli.run_visual_standalone = old_standalone
         cli.load_config = old_load_config
@@ -2198,7 +2636,9 @@ def test_cli_all_malformed_board_fails_before_visual_fanout():
 
     def _fake_build(*_a, **_k):
         fanout_calls["n"] += 1
-        raise AssertionError("visual fan-out must not run when the board config is invalid")
+        raise AssertionError(
+            "visual fan-out must not run when the board config is invalid"
+        )
 
     old_mode_review = _review_mod.mode_review
     _review_mod.mode_review = lambda *_a, **_k: 0
@@ -2212,7 +2652,17 @@ def test_cli_all_malformed_board_fails_before_visual_fanout():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        rc = cli.main(["diff", "--task", "TEST-1", "--visual", "/tmp/does-not-exist-zzz.png", "-C", str(REPO_ROOT)])
+        rc = cli.main(
+            [
+                "diff",
+                "--task",
+                "TEST-1",
+                "--visual",
+                "/tmp/does-not-exist-zzz.png",
+                "-C",
+                str(REPO_ROOT),
+            ]
+        )
         assert rc == 2, rc
         assert fanout_calls["n"] == 0, "fan-out ran before the board was validated"
     finally:
@@ -2231,8 +2681,18 @@ def _capture_default_review_board(argv: list[str]) -> dict:
 
     captured: dict = {}
 
-    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None,
-                          pool_size=DEFAULT_POOL_SIZE, outcome_sink=None, **kw):
+    def _fake_mode_review(
+        models,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        staged,
+        board=None,
+        pool_size=DEFAULT_POOL_SIZE,
+        outcome_sink=None,
+        **kw,
+    ):
         captured["board"] = board
         captured["pool_size"] = pool_size
         captured["timeout"] = timeout
@@ -2244,6 +2704,7 @@ def _capture_default_review_board(argv: list[str]) -> dict:
     # test is independent of the dev machine's ~/.config/review-cli/config.yaml.
     # The true default path has neither -m nor config models.
     old_load_board = cli.load_board
+
     def _load_board(_cfg, **kw):
         preset = kw.get("preset")
         if preset == "default":
@@ -2278,42 +2739,152 @@ def _capture_default_review_board(argv: list[str]) -> dict:
 
 
 def test_cli_default_path_passes_full_preset_board_and_default_pool():
-    """No -m -> the full default-preset board is passed into mode_review (reserve incl.)
-    with pool_size = the default preset pool (4)."""
-    captured = _capture_default_review_board(["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)])
+    """No -m/--preset -> the full LIGHT-preset board is passed into mode_review (reserve
+    incl.) with pool_size = the light preset pool (2). Bare `review diff` defaults to
+    "light" (Alex, 2026-08-28) — "default"/"heavy" are now opt-in via --preset."""
+    captured = _capture_default_review_board(
+        ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)]
+    )
     assert captured["board"] is not None, "board should be active by default"
-    assert len(captured["board"]) == len(DEFAULT_PRESET_BOARD), "full board passed (reserve incl.)"
-    assert [r.model for r in captured["board"]] == [r.model for r in DEFAULT_PRESET_BOARD]
-    assert captured["pool_size"] == DEFAULT_POOL_SIZE, captured["pool_size"]
+    assert len(captured["board"]) == len(LIGHT_PRESET_BOARD), (
+        "full board passed (reserve incl.)"
+    )
+    assert [r.model for r in captured["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
+    assert captured["pool_size"] == 2, captured["pool_size"]
 
 
-def test_cli_builtin_default_uses_default_preset_board():
-    captured = _capture_default_review_board(["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)])
-    assert [r.model for r in captured["board"]] == [r.model for r in DEFAULT_PRESET_BOARD]
-    assert all(r.effort == "high" for r in captured["board"])
-    assert captured["pool_size"] == 4
+def test_cli_builtin_default_uses_light_preset_board():
+    captured = _capture_default_review_board(
+        ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)]
+    )
+    assert [r.model for r in captured["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
+    assert all(r.effort == "medium" for r in captured["board"])
+    assert captured["pool_size"] == 2
 
 
 def test_cli_light_and_heavy_presets_set_board_and_default_pool():
-    light = _capture_default_review_board([
-        "diff", "--task", "TEST-1", "--preset", "light", "-C", str(REPO_ROOT),
-    ])
+    light = _capture_default_review_board(
+        [
+            "diff",
+            "--task",
+            "TEST-1",
+            "--preset",
+            "light",
+            "-C",
+            str(REPO_ROOT),
+        ]
+    )
     assert [r.model for r in light["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
     assert all(r.effort == "medium" for r in light["board"])
     assert light["pool_size"] == 2
 
-    heavy = _capture_default_review_board([
-        "diff", "--task", "TEST-1", "--preset", "heavy", "-C", str(REPO_ROOT),
-    ])
+    heavy = _capture_default_review_board(
+        [
+            "diff",
+            "--task",
+            "TEST-1",
+            "--preset",
+            "heavy",
+            "-C",
+            str(REPO_ROOT),
+        ]
+    )
+    # review-cli#fable-seat-reliability: Fable is EXCLUDED from the heavy preset (a
+    # confirmed ~100% dispatch failure rate makes it pure waste at any effort tier) —
+    # Sol now leads, with Kimi promoted into the vacated 4th xhigh slot.
     assert [r.model for r in heavy["board"][:4]] == [
-        "claude:claude-fable-5",
         SOL_SEAT,
         "claude:claude-opus-4-8",
         GLM_COMMANDCODE_SEAT,
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ]
     assert all(r.effort == "xhigh" for r in heavy["board"][:4])
     assert all(r.effort == "max" for r in heavy["board"][4:])
+    assert "claude:claude-fable-5" not in [r.model for r in heavy["board"]]
     assert heavy["pool_size"] == 4
+
+
+def _capture_review_with_config(argv: list[str], config: dict) -> dict:
+    """Run the default-review path with a CUSTOM config (all seats live), capturing the
+    pool_size passed into mode_review. For config `pool:` default-size wiring tests."""
+    from reviewlib import cli
+
+    captured: dict = {}
+
+    def _fake_mode_review(
+        models,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        staged,
+        board=None,
+        pool_size=DEFAULT_POOL_SIZE,
+        outcome_sink=None,
+        **kw,
+    ):
+        captured["board"] = board
+        captured["pool_size"] = pool_size
+        return 0
+
+    old = _review_mod.mode_review
+    _review_mod.mode_review = _fake_mode_review
+    old_load_config = cli.load_config
+    cli.load_config = lambda: config
+    old_avail = backends.backend_available
+    backends.backend_available = lambda _m: True
+    old_stdin = sys.stdin
+    try:
+        os.environ["GEMINI_ENV_FILE"] = "/nonexistent/review-cli/.env"
+        import io
+
+        sys.stdin = io.StringIO("+added line\n")
+        cli.main(argv)
+    finally:
+        _review_mod.mode_review = old
+        cli.load_config = old_load_config
+        backends.backend_available = old_avail
+        sys.stdin = old_stdin
+    return captured
+
+
+def test_config_pool_key_sets_default_pool_size():
+    """A config `pool:` int becomes the default pool size when no --pool is passed."""
+    cap = _capture_review_with_config(
+        ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)],
+        {"models": ["codex", "claude:claude-opus-4-8", "oc:zai/glm-5.2"], "pool": 3},
+    )
+    assert cap["pool_size"] == 3, cap["pool_size"]
+
+
+def test_explicit_pool_flag_overrides_config_pool():
+    """An explicit `--pool N` wins over the config `pool:` default."""
+    cap = _capture_review_with_config(
+        ["diff", "--task", "TEST-1", "--pool", "2", "-C", str(REPO_ROOT)],
+        {"models": ["codex", "claude:claude-opus-4-8", "oc:zai/glm-5.2"], "pool": 3},
+    )
+    assert cap["pool_size"] == 2, cap["pool_size"]
+
+
+def test_explicit_preset_overrides_config_pool():
+    """An explicit `--preset` sizes the pool from the preset, not the config `pool:` key."""
+    cap = _capture_review_with_config(
+        ["diff", "--task", "TEST-1", "--preset", "light", "-C", str(REPO_ROOT)],
+        {"pool": 3},
+    )
+    assert cap["pool_size"] == 2, cap[
+        "pool_size"
+    ]  # light preset pool = 2, not config 3
+
+
+def test_invalid_config_pool_falls_back_to_preset_default():
+    """A non-positive / non-int config `pool:` is ignored (falls back to the preset —
+    DEFAULT_PRESET is "light", pool 2, since Alex's 2026-08-28 default change)."""
+    cap = _capture_review_with_config(
+        ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)],
+        {"pool": 0},  # 0 = "all" is a CLI-only knob; as a config default it's ignored
+    )
+    assert cap["pool_size"] == 2, cap["pool_size"]
 
 
 def test_cli_explicit_preset_overrides_config_board():
@@ -2321,8 +2892,17 @@ def test_cli_explicit_preset_overrides_config_board():
 
     captured: dict = {}
 
-    def _fake_mode_review(models, prompt, diff, cwd, timeout, staged, board=None,
-                          pool_size=DEFAULT_POOL_SIZE, **kw):
+    def _fake_mode_review(
+        models,
+        prompt,
+        diff,
+        cwd,
+        timeout,
+        staged,
+        board=None,
+        pool_size=DEFAULT_POOL_SIZE,
+        **kw,
+    ):
         captured["board"] = board
         captured["pool_size"] = pool_size
         return 0
@@ -2332,7 +2912,14 @@ def test_cli_explicit_preset_overrides_config_board():
     old_load_config = cli.load_config
     old_avail = backends.backend_available
     cli.load_config = lambda: {
-        "board": [{"model": "gemini", "role": "tests", "name": "Configured", "effort": "medium"}],
+        "board": [
+            {
+                "model": "gemini",
+                "role": "tests",
+                "name": "Configured",
+                "effort": "medium",
+            }
+        ],
     }
     backends.backend_available = lambda _m: True
     old_stdin = sys.stdin
@@ -2340,15 +2927,19 @@ def test_cli_explicit_preset_overrides_config_board():
         import io
 
         sys.stdin = io.StringIO("+added line\n")
-        cli.main(["diff", "--task", "TEST-1", "--preset", "heavy", "-C", str(REPO_ROOT)])
+        cli.main(
+            ["diff", "--task", "TEST-1", "--preset", "heavy", "-C", str(REPO_ROOT)]
+        )
+        # review-cli#fable-seat-reliability: Fable is excluded from the heavy preset.
         assert [r.model for r in captured["board"][:4]] == [
-            "claude:claude-fable-5",
             SOL_SEAT,
             "claude:claude-opus-4-8",
             GLM_COMMANDCODE_SEAT,
+            "oc:commandcode/moonshotai/Kimi-K2.7-Code",
         ], captured
         assert captured["board"][0].effort == "xhigh", captured
         assert captured["pool_size"] == 4, captured
+        assert "claude:claude-fable-5" not in [r.model for r in captured["board"]]
     finally:
         _review_mod.mode_review = old_mode
         cli.load_config = old_load_config
@@ -2359,18 +2950,32 @@ def test_cli_explicit_preset_overrides_config_board():
 def test_cli_pool_flag_threads_pool_size():
     """--pool N threads N as pool_size into mode_review (the full board still flows so
     the reserve is available); --pool 0 = all seats."""
-    cap2 = _capture_default_review_board(["diff", "--task", "TEST-1", "--pool", "2", "-C", str(REPO_ROOT)])
+    cap2 = _capture_default_review_board(
+        ["diff", "--task", "TEST-1", "--pool", "2", "-C", str(REPO_ROOT)]
+    )
     assert cap2["pool_size"] == 2, cap2["pool_size"]
     assert len(cap2["board"]) == len(DEFAULT_PRESET_BOARD), "full board still passed"
-    cap_all = _capture_default_review_board(["diff", "--task", "TEST-1", "--pool", "0", "-C", str(REPO_ROOT)])
+    cap_all = _capture_default_review_board(
+        ["diff", "--task", "TEST-1", "--pool", "0", "-C", str(REPO_ROOT)]
+    )
     assert cap_all["pool_size"] == 0, cap_all["pool_size"]
 
 
 def test_cli_leading_pool_and_timeout_options_before_subcommand_are_honored():
     """Value-taking global flags before the mode verb must land on the mode parser."""
-    captured = _capture_default_review_board([
-        "--pool", "2", "--timeout", "77", "diff", "--task", "TEST-1", "-C", str(REPO_ROOT),
-    ])
+    captured = _capture_default_review_board(
+        [
+            "--pool",
+            "2",
+            "--timeout",
+            "77",
+            "diff",
+            "--task",
+            "TEST-1",
+            "-C",
+            str(REPO_ROOT),
+        ]
+    )
     assert captured["pool_size"] == 2, captured
     assert captured["timeout"] == 77, captured
 
@@ -2379,24 +2984,40 @@ def test_cli_leading_meta_flags_before_subcommand_are_honored():
     """Zero-arg global flags before the mode verb must land on the mode parser too."""
     from reviewlib import cli
 
-    assert cli._normalize_leading_mode_options(["--list-defaults", "diff"]) == ["diff", "--list-defaults"]
+    assert cli._normalize_leading_mode_options(["--list-defaults", "diff"]) == [
+        "diff",
+        "--list-defaults",
+    ]
     captured: dict = {}
     old_show_board = cli._show_board
     old_load_config = cli.load_config
     cli.load_config = lambda: {}
-    cli._show_board = lambda config, pool_size, cwd=None, **kw: captured.update(
-        {
-            "pool_size": pool_size,
-            "cwd": cwd,
-            "preset": kw.get("preset"),
-            "explicit_models": kw.get("explicit_models"),
-        }
-    ) or 0
+    cli._show_board = lambda config, pool_size, cwd=None, **kw: (
+        captured.update(
+            {
+                "pool_size": pool_size,
+                "cwd": cwd,
+                "preset": kw.get("preset"),
+                "explicit_models": kw.get("explicit_models"),
+            }
+        )
+        or 0
+    )
     try:
-        rc = cli.main([
-            "--show-board", "--pool", "2", "-m", "codex",
-            "diff", "--preset", "heavy", "-C", str(REPO_ROOT),
-        ])
+        rc = cli.main(
+            [
+                "--show-board",
+                "--pool",
+                "2",
+                "-m",
+                "codex",
+                "diff",
+                "--preset",
+                "heavy",
+                "-C",
+                str(REPO_ROOT),
+            ]
+        )
     finally:
         cli._show_board = old_show_board
         cli.load_config = old_load_config
@@ -2408,9 +3029,12 @@ def test_cli_leading_meta_flags_before_subcommand_are_honored():
 
 
 def _show_board_lines(
-    pool_size: int, board_models: list[str] | None = None,
+    pool_size: int,
+    board_models: list[str] | None = None,
     available: set[str] | None = None,
-    *, preset: str | None = None, explicit_models: list[str] | None = None,
+    *,
+    preset: str | None = None,
+    explicit_models: list[str] | None = None,
 ) -> list[str]:
     """Run cli._show_board(config, pool_size) and return its stdout lines. When
     board_models is given, a config `board:` of those models is used (each role tests).
@@ -2425,11 +3049,15 @@ def _show_board_lines(
     if board_models is not None:
         cfg = {"board": [{"model": m, "role": "tests"} for m in board_models]}
     old_avail = backends.backend_available
-    backends.backend_available = lambda m: True if available is None else (m in available)
+    backends.backend_available = lambda m: (
+        True if available is None else (m in available)
+    )
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            rc = cli._show_board(cfg, pool_size, preset=preset, explicit_models=explicit_models)
+            rc = cli._show_board(
+                cfg, pool_size, preset=preset, explicit_models=explicit_models
+            )
     finally:
         backends.backend_available = old_avail
     assert rc == 0, rc
@@ -2439,7 +3067,9 @@ def _show_board_lines(
 def test_show_board_honors_pool_flag_tagging():
     """`--show-board --pool N` (all seats available) must tag the top N priority seats
     `pool`, the rest `reserve`."""
-    seat_lines = [ln for ln in _show_board_lines(2) if "[pool" in ln or "[reserve]" in ln]
+    seat_lines = [
+        ln for ln in _show_board_lines(2) if "[pool" in ln or "[reserve]" in ln
+    ]
     assert len(seat_lines) == len(DEFAULT_PRESET_BOARD)
     pool_lines = [ln for ln in seat_lines if "[pool" in ln]
     reserve_lines = [ln for ln in seat_lines if "[reserve]" in ln]
@@ -2457,37 +3087,54 @@ def test_show_board_explicit_model_is_exact():
     assert "codex  [available]" in seat_lines[0], lines
     assert "effort=-" in seat_lines[0], lines
     assert "source: explicit -m" in lines[0], lines
-    assert "exact -m run = every listed seat is attempted" in lines[0], lines
+    assert "exact -m run = every LIVE listed seat is attempted" in lines[0], lines
     assert any("--pool` and reserve failover do not slice" in ln for ln in lines), lines
     assert not any("claude:claude-opus-4-8" in ln for ln in seat_lines), lines
 
 
 def test_show_board_explicit_model_with_preset_keeps_exact_model_and_preset_effort_metadata():
-    lines = _show_board_lines(4, preset="heavy", explicit_models=["codex"])
+    # Astra (codex:gpt-6-astra) is the preset seat now outside the xhigh top-4 (the bare
+    # `"codex"` seat this test used before ASTRA_SEAT was pinned no longer appears in the
+    # heavy preset at all), so -m'ing it exactly is what exercises "explicit model reuses
+    # the matching preset entry's effort metadata".
+    lines = _show_board_lines(4, preset="heavy", explicit_models=[ASTRA_SEAT])
     seat_lines = [ln for ln in lines if "[explicit]" in ln]
     assert len(seat_lines) == 1, lines
-    assert "codex  [available]" in seat_lines[0], lines
+    assert f"{ASTRA_SEAT}  [available]" in seat_lines[0], lines
     assert "effort=max" in seat_lines[0], lines
     assert "source: explicit -m + preset:heavy" in lines[0], lines
 
 
 def test_show_board_explicit_models_are_all_live_and_pool_is_ignored():
-    lines = _show_board_lines(1, explicit_models=["codex", "gemini", "missing-provider:model"],
-                              available={"codex", "gemini"})
+    lines = _show_board_lines(
+        1,
+        explicit_models=["codex", "gemini", "missing-provider:model"],
+        available={"codex", "gemini"},
+    )
     seat_lines = [ln for ln in lines if "[explicit]" in ln]
     assert len(seat_lines) == 3, lines
-    assert not any("[pool" in ln or "[reserve]" in ln or "[unavail]" in ln for ln in lines), lines
-    assert any("missing-provider:model" in ln and "will attempt (no key/CLI)" in ln for ln in seat_lines), lines
+    assert not any(
+        "[pool" in ln or "[reserve]" in ln or "[unavail]" in ln for ln in lines
+    ), lines
+    assert any(
+        "missing-provider:model" in ln and "will attempt (no key/CLI)" in ln
+        for ln in seat_lines
+    ), lines
     assert any("--pool` and reserve failover do not slice" in ln for ln in lines), lines
 
 
 def test_show_board_startup_failover_skips_unavailable_top_seat():
     """The live pool is the top-N AVAILABLE seats by priority: an unavailable higher
     priority seat is tagged `unavail` and the next available seat fills the pool."""
-    # Fable (#1) unavailable -> the pool of 2 is Sol (#2) + Opus (#3); Fable is unavail.
-    avail = {r.model for r in DEFAULT_BOARD if r.model != "claude:claude-fable-5"}
-    seat_lines = [ln for ln in _show_board_lines(2, available=avail, preset="heavy")
-                  if "[pool" in ln or "[reserve]" in ln or "[unavail]" in ln]
+    # Sol (#1 in the heavy preset — review-cli#fable-seat-reliability demoted Fable to
+    # LAST, so Fable is no longer in HEAVY_PRESET_BOARD at all) unavailable -> the pool
+    # of 2 is Opus (#2) + GLM-cc (#3); Sol is unavail.
+    avail = {r.model for r in DEFAULT_BOARD if r.model != SOL_SEAT}
+    seat_lines = [
+        ln
+        for ln in _show_board_lines(2, available=avail, preset="heavy")
+        if "[pool" in ln or "[reserve]" in ln or "[unavail]" in ln
+    ]
     by_tier = {"pool": [], "reserve": [], "unavail": []}
     for ln in seat_lines:
         for tier in by_tier:
@@ -2495,9 +3142,9 @@ def test_show_board_startup_failover_skips_unavailable_top_seat():
                 by_tier[tier].append(ln)
                 break
     assert len(by_tier["pool"]) == 2, by_tier["pool"]
-    assert "Fable" in by_tier["unavail"][0], by_tier["unavail"]
-    assert "Sol" in by_tier["pool"][0]
-    assert "Opus" in by_tier["pool"][1]
+    assert "Sol" in by_tier["unavail"][0], by_tier["unavail"]
+    assert "Opus" in by_tier["pool"][0]
+    assert "GLM-cc" in by_tier["pool"][1]
 
 
 def test_show_board_marks_claude_commandcode_api_gateway_unpaid():
@@ -2509,7 +3156,9 @@ def test_show_board_marks_claude_commandcode_api_gateway_unpaid():
     saved = {
         k: os.environ.get(k)
         for k in (
-            "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "REVIEW_CLAUDE_MODE",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "REVIEW_CLAUDE_MODE",
             "REVIEW_UNPAID_PROVIDERS",
         )
     }
@@ -2539,7 +3188,9 @@ def test_show_board_marks_claude_commandcode_api_gateway_unpaid():
 
 def test_show_board_pool_zero_marks_all_seats_pool():
     lines = _show_board_lines(0)
-    assert any("live pool = all AVAILABLE seats by priority" in ln for ln in lines), lines
+    assert any("live pool = all AVAILABLE seats by priority" in ln for ln in lines), (
+        lines
+    )
     assert any("runs all AVAILABLE seats" in ln for ln in lines), lines
     assert not any("top 0 AVAILABLE" in ln for ln in lines), lines
     seat_lines = [ln for ln in lines if "[pool" in ln or "[reserve]" in ln]
@@ -2547,11 +3198,19 @@ def test_show_board_pool_zero_marks_all_seats_pool():
 
 
 def test_show_board_heavy_preset_displays_effort_values():
+    """review-cli#fable-seat-reliability: Fable is excluded from the heavy preset
+    entirely (a confirmed ~100% dispatch failure rate), so it no longer has a row
+    here at all — Sol (the new #1) and Astra (still outside the xhigh top-4) stand
+    in as the xhigh/max examples instead."""
     lines = _show_board_lines(4, preset="heavy")
-    fable = next(ln for ln in lines if "claude:claude-fable-5" in ln)
-    kimi = next(ln for ln in lines if "oc:commandcode/moonshotai/Kimi-K2.7-Code" in ln)
-    assert "effort=xhigh" in fable, fable
-    assert "effort=max" in kimi, kimi
+    assert not any("claude:claude-fable-5" in ln for ln in lines), lines
+    sol = next(ln for ln in lines if SOL_SEAT in ln)
+    # Match the DISPLAY name ("Astra"), not the bare model string — "codex" is also a
+    # substring of both Sol's AND Astra's model ids (`codex:gpt-5.6-sol`,
+    # `codex:gpt-6-astra`), which would false-match here.
+    astra = next(ln for ln in lines if "Astra" in ln)
+    assert "effort=xhigh" in sol, sol
+    assert "effort=max" in astra, astra
 
 
 def test_show_board_tags_by_seat_not_model_for_duplicate_models():
@@ -2587,8 +3246,11 @@ def test_show_board_uses_config_models_as_priority_roster():
     out = buf.getvalue()
     assert "source: config.yaml (models:)" in out, out
     seat_lines = [ln for ln in out.splitlines() if "[pool" in ln or "[reserve]" in ln]
-    assert ["codex" in seat_lines[0], "gemini" in seat_lines[1],
-            "commandcode:deepseek/deepseek-v4-pro" in seat_lines[2]] == [True, True, True], seat_lines
+    assert [
+        "codex" in seat_lines[0],
+        "gemini" in seat_lines[1],
+        "commandcode:deepseek/deepseek-v4-pro" in seat_lines[2],
+    ] == [True, True, True], seat_lines
     assert "[pool" in seat_lines[0] and "[pool" in seat_lines[1], seat_lines
     assert "[reserve]" in seat_lines[2], seat_lines
 
@@ -2678,12 +3340,17 @@ def test_panel_list_defaults_ignore_config_board():
         ]
     }
     try:
-        for argv in (["just-ask", "q", "--list-defaults"], ["quorum", "q", "--list-defaults"]):
+        for argv in (
+            ["just-ask", "q", "--list-defaults"],
+            ["quorum", "q", "--list-defaults"],
+        ):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = cli.main(argv)
             assert rc == 0, (argv, rc)
-            assert buf.getvalue().strip().splitlines() == [_expand_alias(m) for m in DEFAULT_MODELS], argv
+            assert buf.getvalue().strip().splitlines() == [
+                _expand_alias(m) for m in DEFAULT_MODELS
+            ], argv
     finally:
         cli.load_config = old_load_config
 
@@ -2802,7 +3469,9 @@ def test_cli_rejects_preset_outside_diff_review():
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
-                cli.main(["brainstorm", "topic", "--preset", "heavy", "--list-defaults"])
+                cli.main(
+                    ["brainstorm", "topic", "--preset", "heavy", "--list-defaults"]
+                )
             except SystemExit as exc:
                 code = exc.code
             else:
@@ -2824,7 +3493,9 @@ def test_cli_list_defaults_explicit_models_win_over_preset():
     try:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            cli.main(["diff", "--preset", "heavy", "-m", "gemini,codex", "--list-defaults"])
+            cli.main(
+                ["diff", "--preset", "heavy", "-m", "gemini,codex", "--list-defaults"]
+            )
         out = buf.getvalue().strip().splitlines()
     finally:
         cli.load_config = old_load_config
