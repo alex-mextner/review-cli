@@ -32,15 +32,48 @@ sys.path.insert(0, str(REPO_ROOT))
 from reviewlib import backends as review_backends  # noqa: E402
 
 
-class _Captured:
-    """Stand-in for the CompletedProcess `_run_streamed` returns; also records the
-    argv/cwd of the call so the test can assert how opencode was launched."""
+class _FakeProc:
+    def __init__(
+        self,
+        returncode=0,
+        stdout="ok",
+        stderr="",
+        timeout_kind=None,
+        stall_bound_clamped=False,
+    ):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timeout_kind = timeout_kind
+        self.stall_bound_clamped = stall_bound_clamped
 
-    def __init__(self) -> None:
+
+def _stalled_proc() -> _FakeProc:
+    """A `_run_streamed`-shaped result matching what `_opencode_call_stalled` looks for
+    (review-cli#153/#159/#179) -- the real `timeout_kind` attribute `_run_streamed`
+    stamps on a result that timed out via the liveness/stall path, not a text marker."""
+    return _FakeProc(
+        returncode=124,
+        stdout="\n[review-cli] TIMEOUT after 300s waiting for first output — partial output above]\n",
+        timeout_kind="waiting for first output",
+    )
+
+
+class _Captured:
+    """Stand-in for `_run_streamed`; records EVERY call (so a retry-loop test can
+    inspect each attempt) and its argv/cwd/etc. Returns a queued sequence of responses
+    (popped in order, the last one repeats once exhausted) so a test can script a
+    stall-then-succeed or stall-x3 scenario. Defaults to always-success, matching every
+    pre-existing test's expectation of a single successful call."""
+
+    def __init__(self, responses=None) -> None:
+        self._responses = list(responses) if responses else [_FakeProc()]
+        self.calls: list[dict] = []
         self.argv: list[str] | None = None
         self.cwd: Path | None = None
         self.timeout: int | None = None
         self.header_argv0: str | None = None
+        self.liveness_timeout: int | None = None
         self.true_silence_timeout: int | None = None
 
     def __call__(
@@ -52,6 +85,7 @@ class _Captured:
         round_no=0,
         announce=False,
         header_argv0=None,
+        liveness_timeout=None,
         true_silence_timeout=None,
     ):
         self.true_silence_timeout = true_silence_timeout
@@ -59,40 +93,49 @@ class _Captured:
         self.cwd = Path(cwd)
         self.timeout = timeout
         self.header_argv0 = header_argv0
-
-        class _Proc:
-            returncode = 0
-            stdout = "ok"
-            stderr = ""
-
-        return _Proc()
+        self.liveness_timeout = liveness_timeout
+        self.calls.append(
+            {"argv": list(argv), "cwd": Path(cwd), "liveness_timeout": liveness_timeout}
+        )
+        if len(self._responses) > 1:
+            return self._responses.pop(0)
+        return self._responses[0]
 
 
 @contextlib.contextmanager
-def _capture_opencode():
-    """Patch `_run_streamed` (capture), `_which` (hermetic — no real opencode binary
-    needed) AND `_ensure_opencode_readonly_agent` (so the unit tests do NOT touch the
-    developer's / CI's global ~/.config/opencode) for the duration of one test,
-    restoring all three afterward. A single restore point means a typo can't leak the
-    mock into sibling tests (board feedback).
-
-    codex review finding, review-cli#243 round 13: `review_opencode` now consults
-    `active_cooldown(model)` before dispatching (review-cli#235) -- without isolating
-    `REVIEW_SEAT_COOLDOWN_FILE`, every test through this fixture read the developer's
-    REAL cooldown store, and `oc:zai/glm-5.2` (the model this file's tests exercise) is
-    literally the seat this feature benches for up to 8h under escalation. A real
-    active cooldown would silently flip these tests onto the skip path (never reaching
-    `_run_streamed` at all), making them depend on ambient machine state instead of
-    being hermetic. Isolated here, once, for every test using this fixture -- not just
-    the ones caught failing today."""
-    cap = _Captured()
+def _capture_opencode(responses=None):
+    """Patch `_run_streamed` (capture, optionally scripted via `responses`), `_which`
+    (hermetic — no real opencode binary needed), `_ensure_opencode_readonly_agent` (so
+    the unit tests do NOT touch the developer's / CI's global ~/.config/opencode), AND
+    the cooldown/stall env vars (review_opencode now consults `seat_cooldown` before
+    every dispatch — without redirecting $REVIEW_SEAT_COOLDOWN_FILE too, a test run
+    would read/write the developer's real ~/.config/review-cli/seat-cooldown.json,
+    exactly the leak `test_seat_cooldown.py`'s own `_with_store` helper exists to
+    prevent; and without CLEARING $REVIEW_SEAT_COOLDOWN_SECONDS /
+    $REVIEW_OPENCODE_STALL_SECONDS, a developer/CI environment that happens to export
+    either -- e.g. set to 0 to disable a cooldown/stall check for some other purpose --
+    would make these cooldown/liveness assertions fail, codex review finding). Restores
+    everything afterward — a single restore point means a typo can't leak the mock into
+    sibling tests (board feedback)."""
+    cap = _Captured(responses)
     orig_run = review_backends._run_streamed
     orig_which = review_backends._which
     orig_ensure = review_backends._ensure_opencode_readonly_agent
+    saved_env = {
+        k: os.environ.get(k)
+        for k in (
+            "REVIEW_SEAT_COOLDOWN_FILE",
+            "REVIEW_SEAT_COOLDOWN_SECONDS",
+            "REVIEW_OPENCODE_STALL_SECONDS",
+            "REVIEW_OPENCODE_STALL_MODELS",
+        )
+    }
     review_backends._run_streamed = cap  # type: ignore[assignment]
     review_backends._which = lambda name: f"/fake/bin/{name}"  # type: ignore[assignment]
     review_backends._ensure_opencode_readonly_agent = lambda *_a, **_k: None  # type: ignore[assignment]
-    saved_cooldown_file = os.environ.get("REVIEW_SEAT_COOLDOWN_FILE")
+    os.environ.pop("REVIEW_SEAT_COOLDOWN_SECONDS", None)
+    os.environ.pop("REVIEW_OPENCODE_STALL_SECONDS", None)
+    os.environ.pop("REVIEW_OPENCODE_STALL_MODELS", None)
     with tempfile.TemporaryDirectory() as cooldown_dir:
         os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = str(
             Path(cooldown_dir) / "seat-cooldown.json"
@@ -103,10 +146,11 @@ def _capture_opencode():
             review_backends._run_streamed = orig_run
             review_backends._which = orig_which
             review_backends._ensure_opencode_readonly_agent = orig_ensure
-            if saved_cooldown_file is None:
-                os.environ.pop("REVIEW_SEAT_COOLDOWN_FILE", None)
-            else:
-                os.environ["REVIEW_SEAT_COOLDOWN_FILE"] = saved_cooldown_file
+            for key, saved in saved_env.items():
+                if saved is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = saved
 
 
 def _git_init(path: Path) -> None:
@@ -170,6 +214,241 @@ def test_glm52_opencode_keeps_requested_timeout_like_other_models():
         assert cap.timeout == 1200, cap.timeout
 
 
+def test_opencode_seat_passes_a_stall_bound_distinct_from_the_full_timeout():
+    """review-cli#153/#159/#179: opencode's zai/glm seat hangs at 0% CPU with ZERO
+    output when the provider's quota is exhausted. review_opencode must ask
+    `_run_streamed` for a stall (liveness) bound that is much shorter than the full
+    call timeout, so a dead seat is detected in minutes, not the whole requested
+    timeout."""
+    with _capture_opencode() as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
+        assert cap.liveness_timeout is not None, "no stall bound was requested"
+        assert cap.liveness_timeout < cap.timeout, (cap.liveness_timeout, cap.timeout)
+
+
+def test_opencode_stall_bound_also_applies_outside_a_repo():
+    """The temp-dir fallback path (non-repo cwd) must get the same stall bound as
+    the real-repo path -- both go through the same hung-subprocess failure mode."""
+    with _capture_opencode() as cap:
+        with tempfile.TemporaryDirectory() as d:
+            plain = Path(d) / "scratch"
+            plain.mkdir()  # NOT a git repo
+            review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Answer.", "", plain, 1200
+            )
+        assert cap.liveness_timeout is not None, "no stall bound was requested"
+
+
+def test_opencode_stall_seconds_env_override():
+    """$REVIEW_OPENCODE_STALL_SECONDS overrides the default (5 minutes); <=0 disables
+    the check, mirroring $REVIEW_IDLE_TIMEOUT_SECONDS's own convention."""
+    saved = os.environ.get("REVIEW_OPENCODE_STALL_SECONDS")
+    try:
+        os.environ["REVIEW_OPENCODE_STALL_SECONDS"] = "45"
+        assert review_backends._opencode_stall_seconds() == 45
+        os.environ["REVIEW_OPENCODE_STALL_SECONDS"] = "0"
+        assert review_backends._opencode_stall_seconds() is None
+        os.environ["REVIEW_OPENCODE_STALL_SECONDS"] = "-5"
+        assert review_backends._opencode_stall_seconds() is None
+        os.environ.pop("REVIEW_OPENCODE_STALL_SECONDS")
+        assert (
+            review_backends._opencode_stall_seconds()
+            == review_backends._OPENCODE_DEFAULT_STALL_SECONDS
+        )
+        assert review_backends._OPENCODE_DEFAULT_STALL_SECONDS == 300
+    finally:
+        if saved is None:
+            os.environ.pop("REVIEW_OPENCODE_STALL_SECONDS", None)
+        else:
+            os.environ["REVIEW_OPENCODE_STALL_SECONDS"] = saved
+
+
+# ---- stall retry + cooldown (Alex, 2026-08-14 design directive) ---------------------------
+def test_opencode_retries_a_stall_and_succeeds_on_a_later_attempt():
+    """A transient stall (e.g. a network hiccup) must not sideline the seat -- it gets
+    retried up to `_OPENCODE_MAX_STALL_RETRIES` times before being treated as dead."""
+    responses = [
+        _stalled_proc(),
+        _stalled_proc(),
+        _FakeProc(returncode=0, stdout="real answer"),
+    ]
+    with _capture_opencode(responses) as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            result = review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
+        assert len(cap.calls) == 3, cap.calls
+        assert result.returncode == 0, result
+        assert result.stdout == "real answer", result
+        # No cooldown recorded -- the seat eventually answered.
+        from reviewlib.seat_cooldown import active_cooldown
+
+        assert active_cooldown("oc:zai/glm-5.2", access_method="opencode") is None
+
+
+def test_opencode_exhausting_stall_retries_records_a_cooldown():
+    """After `_OPENCODE_MAX_STALL_RETRIES` consecutive stalls, the seat is cooled down
+    (so the NEXT invocation skips the real dispatch) and the call still returns a
+    bounded (stalled) result -- never hangs the caller."""
+    assert review_backends._OPENCODE_MAX_STALL_RETRIES == 3
+    responses = [_stalled_proc(), _stalled_proc(), _stalled_proc()]
+    with _capture_opencode(responses) as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            result = review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
+        assert len(cap.calls) == 3, cap.calls
+        assert result.returncode == 124, result
+        from reviewlib.seat_cooldown import active_cooldown
+
+        cooldown = active_cooldown("oc:zai/glm-5.2", access_method="opencode")
+        assert cooldown is not None, "no cooldown was recorded after exhausting retries"
+        assert "stalled" in cooldown["reason"], cooldown
+        # Exactly ONE record for the whole 3-attempt cycle -- a second writer (e.g.
+        # `_record_true_silence_if_needed` also matching the stalled proc) would
+        # escalate this to 2 (round-2 review finding, Fable).
+        assert cooldown["fail_count"] == 1, cooldown
+
+
+def test_clamped_stall_is_not_retried_and_records_no_cooldown():
+    """A stall whose liveness bound was clamped below the requested window (board
+    deadline / small idle window -- `stall_bound_clamped=True` on the result) is an
+    honest bounded failure, NOT the quota-exhaustion signature: no retry, no cooldown
+    (round-2 review finding, Fable: under deadline pressure a merely slow-to-first-byte
+    seat would otherwise rack up three sub-minute "stalls" and be benched)."""
+    clamped = _FakeProc(
+        returncode=124,
+        stdout="\n[review-cli] TIMEOUT after 40s waiting for first output]\n",
+        timeout_kind="waiting for first output",
+        stall_bound_clamped=True,
+    )
+    with _capture_opencode([clamped, clamped, clamped]) as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            result = review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
+        assert len(cap.calls) == 1, cap.calls
+        assert result.returncode == 124, result
+        from reviewlib.seat_cooldown import active_cooldown
+
+        assert active_cooldown("oc:zai/glm-5.2", access_method="opencode") is None
+
+
+def test_stall_seconds_zero_keeps_true_silence_for_watched_model():
+    """$REVIEW_OPENCODE_STALL_SECONDS=0 disables the liveness watchdog; the watched
+    model must then fall back to the registry-driven true-silence bound instead of
+    losing zero-output protection entirely (round-2 review finding, Fable)."""
+    from reviewlib import model_behavior
+
+    with _capture_opencode() as cap:
+        os.environ["REVIEW_OPENCODE_STALL_SECONDS"] = "0"
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
+        assert cap.liveness_timeout is None
+        assert cap.true_silence_timeout == model_behavior.true_silence_timeout_seconds(
+            "oc:zai/glm-5.2"
+        )
+        assert cap.true_silence_timeout is not None
+
+
+def test_stall_watchdog_owns_zero_output_for_watched_model():
+    """For a WATCHED model the liveness watchdog must be the SOLE zero-output detector:
+    `true_silence_timeout` is NOT forwarded to `_run_streamed` (round-1 review finding,
+    Opus + Fable: the registry's true-silence value for zai/glm equals the 300s stall
+    default, so without this the "retry 3x then cooldown" policy vs "cooldown on first
+    silence" was decided by poll-loop check order). An UNWATCHED opencode seat keeps
+    the registry-driven true-silence bound exactly as before."""
+    from reviewlib import model_behavior
+
+    with _capture_opencode() as cap:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
+            assert cap.liveness_timeout == review_backends._OPENCODE_DEFAULT_STALL_SECONDS
+            assert cap.true_silence_timeout is None, cap.true_silence_timeout
+            unwatched = "oc:moonshotai/kimi-k2.5"
+            assert not review_backends._opencode_model_needs_stall_watchdog(unwatched)
+            review_backends.review_opencode(unwatched, "Review.", "DIFF", repo, 1200)
+            assert cap.liveness_timeout is None
+            assert cap.true_silence_timeout == model_behavior.true_silence_timeout_seconds(
+                unwatched
+            )
+            assert cap.true_silence_timeout is not None
+
+
+def test_opencode_skips_real_dispatch_while_cooling_down():
+    """Once a cooldown is active for (model, opencode), review_opencode must return a
+    synthetic skip WITHOUT spawning any real opencode call."""
+    with _capture_opencode() as cap:
+        from reviewlib.seat_cooldown import record_cooldown
+
+        record_cooldown(
+            "oc:zai/glm-5.2",
+            "opencode stalled with no output after 3 attempts",
+            ttl_seconds=600.0,
+            access_method="opencode",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            result = review_backends.review_opencode(
+                "oc:zai/glm-5.2", "Review.", "DIFF", repo, 1200
+            )
+        assert cap.calls == [], "real dispatch was NOT skipped while cooling down"
+        assert result.returncode == 0, result
+        assert "is currently unavailable" in result.stdout, result
+        assert "cached:" in result.stdout, result
+
+
+def test_opencode_cooldown_does_not_affect_other_opencode_models():
+    """A cooldown recorded for the zai/glm seat must not skip a DIFFERENT opencode
+    model's dispatch -- the cooldown key includes the model, not just the access
+    method."""
+    with _capture_opencode() as cap:
+        from reviewlib.seat_cooldown import record_cooldown
+
+        record_cooldown(
+            "oc:zai/glm-5.2",
+            "opencode stalled",
+            ttl_seconds=600.0,
+            access_method="opencode",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            repo.mkdir()
+            _git_init(repo)
+            result = review_backends.review_opencode(
+                "oc:opencode/deepseek-v4-flash-free", "Review.", "DIFF", repo, 1200
+            )
+        assert len(cap.calls) == 1, "an unrelated model's dispatch was wrongly skipped"
+        assert result.returncode == 0, result
+
+
 def test_other_opencode_models_keep_requested_timeout():
     with _capture_opencode() as cap:
         with tempfile.TemporaryDirectory() as d:
@@ -180,6 +459,48 @@ def test_other_opencode_models_keep_requested_timeout():
                 "oc:commandcode/deepseek/deepseek-v4-pro", "Review.", "DIFF", repo, 1200
             )
         assert cap.timeout == 1200, cap.timeout
+
+
+def test_other_opencode_models_get_no_stall_watchdog():
+    """codex review finding, round 2: the default board runs Kimi/Qwen/DeepSeek
+    AGENTIC seats through opencode besides zai/glm -- there is no evidence any of them
+    share the zero-output hang failure mode, so the stall/liveness bound (and its
+    retry-then-cooldown behavior) must stay scoped to the confirmed-bad route, not
+    blanket-applied to every opencode dispatch."""
+    for model in (
+        "oc:commandcode/deepseek/deepseek-v4-pro",
+        "oc:commandcode/Qwen/Qwen3.7-Max",
+        "oc:kimi-code/k3",
+    ):
+        with _capture_opencode() as cap:
+            with tempfile.TemporaryDirectory() as d:
+                repo = Path(d) / "repo"
+                repo.mkdir()
+                _git_init(repo)
+                review_backends.review_opencode(model, "Review.", "DIFF", repo, 1200)
+            assert cap.liveness_timeout is None, (model, cap.liveness_timeout)
+            assert len(cap.calls) == 1, (model, cap.calls)
+
+
+def test_opencode_model_needs_stall_watchdog_matcher():
+    assert review_backends._opencode_model_needs_stall_watchdog("oc:zai/glm-5.2")
+    assert not review_backends._opencode_model_needs_stall_watchdog(
+        "oc:commandcode/deepseek/deepseek-v4-pro"
+    )
+    saved = os.environ.get("REVIEW_OPENCODE_STALL_MODELS")
+    try:
+        os.environ["REVIEW_OPENCODE_STALL_MODELS"] = "some-other-model"
+        assert not review_backends._opencode_model_needs_stall_watchdog(
+            "oc:zai/glm-5.2"
+        )
+        assert review_backends._opencode_model_needs_stall_watchdog(
+            "oc:some-other-model"
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("REVIEW_OPENCODE_STALL_MODELS", None)
+        else:
+            os.environ["REVIEW_OPENCODE_STALL_MODELS"] = saved
 
 
 def test_non_repo_cwd_falls_back_to_temp_dir():
