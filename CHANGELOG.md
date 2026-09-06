@@ -51,6 +51,17 @@ semantic versioning.
   (out of scope here) for a pre-existing, unrelated gap this review surfaced:
   `_oc_config_has_provider_key` accepts a whitespace-only or non-string inline
   `options.apiKey` as a valid credential for ANY provider, not just xai.
+  - Review round 1 (Sonnet/Fable) follow-ups: the `oc:`/`opencode:` transport peel
+    is one helper (`_peel_oc_transport`) shared by `effective_provider` and
+    `default_routes_live`, and the `provider/model` selector well-formedness check
+    (`_oc_selector_is_well_formed`: slash required, non-blank model, no colon
+    contamination, no double slash) now runs for EVERY `oc:` id before the provider
+    check — a malformed `oc:zai/` or `oc:zai//glm-5.2` default on a NAMED provider
+    no longer slips past the #25 guard; `_AGENTIC_ONLY_PROVIDERS` is a pure
+    membership exemption. Grok's role is `security`, not `performance`: after
+    review-cli#386 `performance` already had a live paid fallback (Terra) while
+    `security` was held only by Qwen (unpaid/disabled) and the slow, quota-fragile
+    GLM seat. `_oc_auth_has_provider`'s docstring trimmed to its invariants.
 
 ## 0.35.8 — 2026-09-06
 

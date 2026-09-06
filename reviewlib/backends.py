@@ -3566,17 +3566,46 @@ def _match_named_backend(lowered: str) -> Callable[..., ReviewResult] | None:
 # provider would have to be remembered there); when another provider dies, add it here.
 _DEAD_PROVIDERS = frozenset({"fireworks"})
 
-# Providers that are legitimately reachable ONLY through opencode's agentic `oc:`/
-# `opencode:` transport — no diff-only REST backend exists for them in this codebase, and
-# (unlike zai/commandcode) they have no bare/colon-form default-model resolution either, so
-# giving them a bare-token branch in `_match_named_backend` would expose a broken `-m xai`
-# or `-m xai:<model>` invocation (review of #166: `review_opencode` peels only the FIRST
-# colon, so `xai:grok-4.5` would hand opencode the wrong spelling `grok-4.5` instead of
-# `xai/grok-4.5`, and bare `xai` has no default model at all). `default_routes_live`'s
-# under-transport check treats a provider in this set as a named route WITHOUT routing bare/
-# colon forms of it anywhere — the only valid spelling stays the documented `oc:xai/<model>`
-# seat form (GROK_SEAT).
+# Providers reachable ONLY through opencode's agentic `oc:`/`opencode:` transport: no
+# diff-only REST backend exists for them, and (unlike zai/commandcode) opencode has no
+# bare/colon-form default-model resolution for them, so `_match_named_backend` must NOT
+# grow a bare-token branch (a `-m xai` / `-m xai:<model>` route would hand opencode the
+# wrong selector). `default_routes_live` treats membership here as the ONLY thing this set
+# decides: the under-transport provider counts as a named route. Selector well-formedness
+# is checked for EVERY `oc:` id by `_oc_selector_is_well_formed`, not here.
 _AGENTIC_ONLY_PROVIDERS = frozenset({"xai"})
+
+
+_OC_TRANSPORT_PREFIXES = ("oc:", "opencode:")
+
+
+def _peel_oc_transport(lowered: str) -> str | None:
+    """The opencode `provider/model` selector under an `oc:`/`opencode:` transport prefix
+    of an already-lower-cased id, or None when the id carries no transport prefix. The ONE
+    place the prefix list lives — `effective_provider` and `default_routes_live` both peel
+    through it, so the two can never disagree on what counts as the agentic transport."""
+    for prefix in _OC_TRANSPORT_PREFIXES:
+        if lowered.startswith(prefix):
+            return lowered[len(prefix) :]
+    return None
+
+
+def _oc_selector_is_well_formed(selector: str, provider: str) -> bool:
+    """True iff an opencode selector (the part after `oc:`) is the exact `provider/model`
+    shape opencode's `-m` wants: a slash, the segment before the FIRST slash canonicalising
+    to the effective `provider` (so a colon-contaminated `xai:grok/model` — whose provider
+    peels as `xai` on the colon — or `zai:/glm` fails, while `gemini-api/...` still matches
+    its canonical `gemini`), and a non-blank model that does not start with `/` (rejects
+    the empty inner segment of `zai//glm-5.2`)."""
+    if "/" not in selector:
+        return False
+    seg_provider, seg_model = selector.split("/", 1)
+    seg_model = seg_model.strip()
+    return (
+        _canonical_provider(seg_provider) == provider
+        and bool(seg_model)
+        and not seg_model.startswith("/")
+    )
 
 
 def effective_provider(model: str) -> str:
@@ -3589,10 +3618,9 @@ def effective_provider(model: str) -> str:
     look THROUGH the `oc:` prefix at the provider underneath — otherwise a dead
     `oc:fireworks/...` default reads as the opencode transport and the rot slips past."""
     lowered = model.lower()
-    for prefix in ("oc:", "opencode:"):
-        if lowered.startswith(prefix):
-            lowered = lowered[len(prefix) :]
-            break
+    peeled = _peel_oc_transport(lowered)
+    if peeled is not None:
+        lowered = peeled
     if lowered.startswith("fable"):
         return "claude"
     # The provider is the first segment before either a `:` (keyed-HTTP `provider:model`)
@@ -4075,14 +4103,11 @@ def _oc_config_file() -> Path:
     return base / "opencode" / "opencode.json"
 
 
-# opencode auth.json fields that are pure metadata, never credential material — excluded
-# from the unknown-auth-type fallback in `_oc_auth_has_provider` below. This is a
-# best-effort denylist for a genuinely UNKNOWN future `type` (the two KNOWN shapes,
-# "api"/"oauth", are matched exactly by field name and never reach this fallback at all
-# — see `_oc_auth_has_provider`). It can't be exhaustive against an auth shape that
-# doesn't exist yet (Codex review of #166 round 7: a future `{"type": "x", "account":
-# "user@example.com"}` with no real token would still pass); it only closes the common,
-# foreseeable descriptive-field cases.
+# opencode auth.json fields that are descriptive metadata, never credential material.
+# Excluded from `_oc_auth_has_provider`'s unknown-auth-type fallback so a future entry
+# with only a label/account and no token is not read as a credential. The two KNOWN shapes
+# ("api"/"oauth") are matched by exact field name and never reach that fallback; this
+# denylist cannot be exhaustive against an auth shape that does not exist yet.
 _OC_AUTH_METADATA_FIELDS = frozenset(
     {"type", "expires", "account", "note", "notes", "url", "email", "label", "name"}
 )
@@ -4091,41 +4116,24 @@ _OC_AUTH_METADATA_FIELDS = frozenset(
 def _oc_auth_has_provider(provider: str) -> bool:
     """True iff opencode's auth.json carries a usable credential for *provider*.
 
-    opencode's auth.json stores at least two credential shapes (`opencode providers
-    login`): keyed API auth (`{"type": "api", "key": "..."}`, e.g. deepseek/commandcode/
-    zai) and OAuth (`{"type": "oauth", "access": "...", "refresh": "...", "expires":
-    ...}`, e.g. `xai` — verified live, `opencode providers list` shows "xAI | oauth").
-    Checking only `key` made an oauth-authenticated provider (xai/GROK_SEAT) report
-    unavailable even though `opencode run -m xai/grok-4.5` works, silently dropping the
-    seat from every pool.
-
-    History of this check (review of #166, three rounds — recorded so nobody re-derives
-    the same over-corrections):
-      1. Enumerating fields one at a time (`key == ... or access == ...`) missed whatever
-         NEXT shape opencode adds.
-      2. A bare `bool(entry)` was too loose — `{"type": "oauth"}` with no token, or every
-         real token field explicitly `""`, reported available purely because `"type"`
-         itself is a non-empty string.
-      3. A field-name-agnostic "any non-`type` string" check was STILL too loose (Codex
-         review): a hypothetical future metadata field (`note`/`account`/`url`) would
-         also count as a credential.
-    This version discriminates by `type` for the two KNOWN shapes — `key` for `"api"`,
-    `access` OR `refresh` for `"oauth"` (opencode auto-refreshes an expired `access` from
-    `refresh`) — trimming whitespace so a whitespace-only value doesn't count. An
-    unrecognized/future `type` falls back to the field-name-agnostic check (excluding
-    `_OC_AUTH_METADATA_FIELDS`), so a genuinely new auth shape still works rather than
-    silently dropping the seat — the fallback is the safety net, not the primary path.
-    This does not prove a token is currently unexpired; opencode's own auth layer owns
-    expiry/refresh at call time."""
+    Recognised shapes (`opencode providers login`): keyed API auth `{"type": "api",
+    "key": ...}` (deepseek/commandcode/zai) and OAuth `{"type": "oauth", "access": ...,
+    "refresh": ..., "expires": ...}` (xai — `opencode providers list` shows "xAI | oauth").
+    Discriminates by `type`: `key` for "api"; `access` OR `refresh` for "oauth" (opencode
+    auto-refreshes an expired `access` from `refresh`). A whitespace-only value is not a
+    credential. An unrecognised `type` falls back to "any non-blank string field that is
+    not in `_OC_AUTH_METADATA_FIELDS`", so a genuinely new auth shape still counts rather
+    than silently dropping the seat; drift INSIDE a known type (opencode renaming `key`)
+    hits the strict branch and is NOT covered by the fallback. Never proves the token is
+    unexpired — opencode's own auth layer owns expiry/refresh at call time."""
 
     def _nonblank(value: object) -> bool:
         return isinstance(value, str) and value.strip() != ""
 
-    # Everything that assumes a dict shape stays INSIDE this try (review of #166 round 4
-    # regression): a corrupted auth.json can carry a truthy NON-dict value for a provider
-    # (`{"xai": "raw-token"}`, a list, a number) — `.get()`/`.items()` on that raises
-    # AttributeError, which must be caught here and reported as "no credential", not
-    # propagate out of the availability probe and abort board selection entirely.
+    # Everything that assumes a dict shape stays INSIDE this try: a corrupted auth.json
+    # can carry a truthy NON-dict value for a provider (`{"xai": "raw-token"}`, a list, a
+    # number) — `.get()`/`.items()` on that raises AttributeError, which must read as "no
+    # credential", not abort board selection.
     try:
         entry = json.loads(_oc_auth_file().read_text()).get(provider) or {}
         if not isinstance(entry, dict) or not entry:
@@ -4347,7 +4355,8 @@ def default_routes_live(model: str) -> bool:
     and adding one on a new provider means giving it a named branch (or, for a provider that
     is legitimately agentic-only with no bare/colon-form route — e.g. xai/GROK_SEAT — adding
     it to `_AGENTIC_ONLY_PROVIDERS` instead of a bare-token branch that would expose a
-    broken invocation shape)."""
+    broken invocation shape). Every `oc:` id, exempt or not, must also be a well-formed
+    `provider/model` selector (`_oc_selector_is_well_formed`)."""
     # Lowercase ONCE and use it for every check, so the guard mirrors `resolve_backend`
     # (which dispatches on `model.lower()`) exactly — a mixed-case id can't pass the guard
     # while routing differently at runtime (codex review of #49).
@@ -4355,33 +4364,20 @@ def default_routes_live(model: str) -> bool:
     if _match_named_backend(lowered) is None:
         return False
     provider = effective_provider(lowered)
-    if lowered.startswith(("oc:", "opencode:")):
-        # Agentic transport: the full id matched only the opencode branch, so verify the
-        # provider UNDER the transport is itself a named backend (not a dead/typo'd one) OR
-        # a documented agentic-only provider (xai) that has no bare/colon-form route.
-        if _match_named_backend(provider) is None:
-            if provider not in _AGENTIC_ONLY_PROVIDERS:
-                return False
-            # An agentic-only provider still needs a real, EXACT `provider/model` selector
-            # (review of #166, rounds 5-6): opencode's CLI wants `-m provider/model`, so
-            # `oc:xai` (no slash), `oc:xai:`/`oc:xai/` (no/blank model), and colon-
-            # contaminated forms like `oc:xai:grok/model` or `oc:xai:/grok` (where the
-            # peeled provider segment before the FIRST `/` isn't exactly `provider` —
-            # `effective_provider` already peeled on `:` OR `/`, whichever came first, so
-            # these slipped through a naive "any slash + nonblank suffix" check) or a
-            # double-slash like `oc:xai//grok` (an empty inner segment, model starting
-            # with `/`) are all malformed and must fail.
-            peeled = lowered
-            for prefix in ("oc:", "opencode:"):
-                if peeled.startswith(prefix):
-                    peeled = peeled[len(prefix):]
-                    break
-            if "/" not in peeled:
-                return False
-            seg_provider, seg_model = peeled.split("/", 1)
-            seg_model = seg_model.strip()
-            if seg_provider != provider or not seg_model or seg_model.startswith("/"):
-                return False
+    selector = _peel_oc_transport(lowered)
+    if selector is not None:
+        # Agentic transport: the full id matched only the opencode branch. Every `oc:` id
+        # — named provider or not — must be the exact `provider/model` selector opencode's
+        # CLI wants (an `oc:zai/` or `oc:zai//glm-5.2` default would otherwise pass the
+        # named-provider half and rot at runtime), AND the provider under the transport
+        # must itself be a named backend or a documented agentic-only one.
+        if not _oc_selector_is_well_formed(selector, provider):
+            return False
+        if (
+            _match_named_backend(provider) is None
+            and provider not in _AGENTIC_ONLY_PROVIDERS
+        ):
+            return False
     return provider not in _DEAD_PROVIDERS
 
 

@@ -121,7 +121,7 @@ def test_default_board_matches_directive_table():
         # BEFORE the z.ai GLM last-resort seat so deep mid-run failover reaches a fast
         # reserve before paying GLM's #65 pathological-slowness cost. Role `performance`
         # duplicates GLM-cc's lens — tolerated among low-priority reserves.
-        ("oc:xai/grok-4.5", "performance", "Grok"),
+        ("oc:xai/grok-4.5", "security", "Grok"),
         # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
         # from the seat-3 commandcode GLM: same model family, different provider/transport.
         # DEPRIORITIZED to LAST-RESORT reserve (review-cli#65): it is pathologically slow
@@ -208,7 +208,10 @@ def test_grok_seat_is_the_canonical_constant_and_resolves_to_opencode():
     assert GROK_SEAT == "oc:xai/grok-4.5"
     seat = next(r for r in DEFAULT_BOARD if r.model == GROK_SEAT)
     assert seat.display == "Grok"
-    assert seat.role == "performance"
+    # `security`, not `performance` (review round 1 of #167, Fable): after review-cli#386
+    # `performance` already has a live paid fallback (Terra) while `security` is held
+    # only by Qwen (unpaid/disabled) and the slow z.ai GLM seat.
+    assert seat.role == "security"
     assert backends.resolve_backend(GROK_SEAT) is backends.review_opencode
     assert backends.default_routes_live(GROK_SEAT) is True
     assert backends.effective_provider(GROK_SEAT) == "xai"
@@ -325,6 +328,38 @@ def test_agentic_only_exemption_rejects_colon_contaminated_selectors():
     assert backends.default_routes_live("oc:xai:grok/model") is False
     assert backends.default_routes_live("oc:xai:/grok") is False
     assert backends.default_routes_live("oc:xai//grok") is False
+
+
+def test_selector_well_formedness_applies_to_named_providers_too():
+    """The `provider/model` well-formedness check is one helper applied to EVERY
+    `oc:`/`opencode:` id before the provider check (review round 1 of #167, Fable/Sonnet):
+    previously it ran only inside the `_AGENTIC_ONLY_PROVIDERS` branch, so a malformed
+    default on a NAMED provider — blank model, double slash, colon contamination, no
+    slash — sailed past the #25 anti-rot guard and would rot at runtime."""
+    assert backends.default_routes_live("oc:zai/glm-5.2") is True
+    assert backends.default_routes_live("oc:zai/") is False
+    assert backends.default_routes_live("oc:zai//glm-5.2") is False
+    assert backends.default_routes_live("oc:zai:glm/x") is False
+    assert backends.default_routes_live("oc:commandcode") is False
+    assert backends.default_routes_live("opencode:commandcode/deepseek/deepseek-v4-pro")
+    assert backends.default_routes_live("opencode:commandcode//deepseek") is False
+
+
+def test_transport_peel_is_shared_by_provider_and_guard():
+    """`effective_provider` and `default_routes_live` peel the agentic transport through
+    ONE helper (`_peel_oc_transport`, over `_OC_TRANSPORT_PREFIXES`), so the two can never
+    disagree on what counts as the transport prefix."""
+    assert backends._OC_TRANSPORT_PREFIXES == ("oc:", "opencode:")
+    assert backends._peel_oc_transport("oc:xai/grok-4.5") == "xai/grok-4.5"
+    assert backends._peel_oc_transport("opencode:zai/glm-5.2") == "zai/glm-5.2"
+    assert backends._peel_oc_transport("zai:glm-5.2") is None
+    # Only ONE prefix is peeled: a doubled transport is not a valid selector.
+    assert backends._peel_oc_transport("opencode:oc:xai/grok-4.5") == "oc:xai/grok-4.5"
+    assert backends.default_routes_live("opencode:oc:xai/grok-4.5") is False
+    assert backends._oc_selector_is_well_formed("xai/grok-4.5", "xai") is True
+    assert backends._oc_selector_is_well_formed("xai:grok/model", "xai") is False
+    assert backends._oc_selector_is_well_formed("xai//grok", "xai") is False
+    assert backends._oc_selector_is_well_formed("xai", "xai") is False
 
 
 def test_glm_commandcode_seat_routes_readonly_through_review_commandcode():

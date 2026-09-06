@@ -418,10 +418,11 @@ DEFAULT_BOARD = (
     # dogfooding review of its addition (`review diff` seat, round 1) flagged that
     # appending it AFTER GLM meant deep mid-run failover always paid GLM's #65
     # pathological-slowness cost before ever reaching Grok, defeating the point of having
-    # a faster reserve. Role `performance` duplicates GLM-cc's/Terra's lens (tolerated
-    # among low-priority reserves — only the top-4 pool needs distinct roles, see
-    # test_default_pool_roles_are_distinct_no_lens_lost).
-    BoardReviewer(GROK_SEAT, "performance", "Grok"),
+    # a faster reserve. ROLE `security`, not `performance`: after review-cli#382/#386
+    # `performance` already has a live paid fallback (Terra) while `security` is held only
+    # by Qwen (commandcode — unpaid/disabled machine-wide) and the slow, quota-fragile GLM
+    # seat below, so this fast, live, oauth-backed reserve is the lens that was missing.
+    BoardReviewer(GROK_SEAT, "security", "Grok"),
     # priority 12 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
     # opencode's `zai` provider. DELIBERATELY DEPRIORITIZED to the bottom of the reserve
     # (review-cli#65): this seat is observed to be PATHOLOGICALLY SLOW under load, so
