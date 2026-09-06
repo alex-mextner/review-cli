@@ -30,6 +30,7 @@ Design:
 from __future__ import annotations
 
 import os
+import time
 import sys
 import threading
 from contextlib import contextmanager
@@ -138,10 +139,7 @@ def _fire(seconds: int, stream) -> None:
     # review). Best-effort like every other step here: a job record we can't write must
     # never block the guaranteed exit.
     try:
-        import os as _os
-        import time as _time
-
-        job_id = _os.environ.get("REVIEW_JOB_ID")
+        job_id = os.environ.get("REVIEW_JOB_ID")
         if job_id:
             from . import jobs
 
@@ -149,7 +147,7 @@ def _fire(seconds: int, stream) -> None:
                 job_id,
                 status="failed",
                 exit_code=BACKSTOP_EXIT_CODE,
-                finished_at=_time.time(),
+                finished_at=time.time(),
             )
     except Exception:  # noqa: BLE001 — best-effort; the deadman + os._exit are the guarantee
         pass

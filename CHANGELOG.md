@@ -5,6 +5,20 @@ semantic versioning.
 
 ## 0.35.10 — 2026-09-06
 
+- **`--detach` hardening from its first review round (review-cli#162 follow-up).**
+  The spawning parent no longer reads stdin to EOF itself (a non-tty stdin held open
+  with nothing in it — agent tool wrappers, pre-commit hooks — used to block the very
+  call that promises to return at once); the caller's stdin fd is handed straight to
+  the detached child, which reads it exactly as a synchronous run would. Leading
+  global options are normalized BEFORE the detachable-mode check, and that check is a
+  whitelist of review modes — `review -m x dashboard run --detach` can no longer sneak
+  past the dashboard/spec-web rejection, and `review jobs/wait/install-skill --detach`
+  is rejected instead of spawning a meaningless background job. A dead pid observed on
+  a "running" record is now written back as `unknown-terminated` once, so a later pid
+  reuse (or a reboot) can never flip the job back to "running" and make `review wait`
+  block; a brand-new record with no pid yet stays "running" for a short spawn grace
+  instead of being misreported as terminated by a concurrent `review jobs`.
+
 - **A sandboxed caller's unwritable log location no longer kills the whole seat
   (review-cli#162).** `log_dir()` (`~/Library/Logs/review-cli` on macOS,
   `$XDG_STATE_HOME/review-cli/logs` elsewhere) and the per-call log file it opens are

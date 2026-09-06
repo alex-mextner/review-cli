@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 from . import backends
+from . import jobs
 from . import usage_limits
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
@@ -1181,7 +1182,6 @@ def _jobs_subcommand(rest: list[str]) -> int:
     Status is the RECONCILED value (`jobs.job_status`): a job whose recorded state is
     still "running" but whose pid is gone is shown as "unknown-terminated" rather than
     a stale "running" that never resolves."""
-    from . import jobs
 
     parser = argparse.ArgumentParser(
         prog="review jobs",
@@ -1238,7 +1238,6 @@ def _status_subcommand(rest: list[str]) -> int:
     Exit code mirrors the job (`_job_exit_code`): 0 while running, the job's OWN
     recorded exit code once it finished, 1 for "unknown-terminated", 2 for an unknown
     job-id (a usage error, like any other bad argument)."""
-    from . import jobs
 
     parser = argparse.ArgumentParser(
         prog="review status",
@@ -1295,7 +1294,6 @@ def _wait_subcommand(rest: list[str]) -> int:
     (`_job_exit_code`) once it finishes — NOT collapsed to a bare 0/1 — so a caller
     scripting against a specific code (2, 10, 124, …) sees the real value; 1 for
     "unknown-terminated" or this wait's own timeout, 2 for an unknown job-id."""
-    from . import jobs
     from .backstop import MAX_BACKSTOP_SECONDS
 
     parser = argparse.ArgumentParser(
@@ -3287,7 +3285,6 @@ def main(argv: list[str] | None = None) -> int:
     # then durably record how it ended — including a SystemExit (argparse usage error,
     # `--help`, or a deliberate `sys.exit`), which otherwise propagates past a plain
     # `return` and would leave the job record stuck at "running" forever.
-    from . import jobs
 
     rc = 1
     try:
@@ -3370,6 +3367,121 @@ def _reviewlib_repo_root() -> str:
     return str(Path(reviewlib.__file__).resolve().parent.parent)
 
 
+def _first_verb(raw: list[str]) -> str | None:
+    """The first non-option token of `raw`, skipping the VALUE of any value-taking
+    option (`-m claude:x dashboard …` -> "dashboard", not "claude:x") — the same
+    value-skipping walk `_extract_detach_flag` does."""
+    skip_value = False
+    for tok in raw:
+        if tok == "--":
+            return None
+        if skip_value:
+            skip_value = False
+            continue
+        if tok.startswith("-"):
+            skip_value = tok in _VALUE_TAKING_OPTS
+            continue
+        return tok
+    return None
+
+
+def _reject_undetachable(raw: list[str]) -> int | None:
+    """The whitelist gate for `--detach` (review round 1, GH-162, Fable #2): only a
+    REVIEW MODE verb (`known_subcommands()` — diff/brainstorm/just-ask/quorum/qa/
+    visual/…) may be detached. Runs on the already-NORMALIZED argv, so a leading
+    global option (`review -m x dashboard run --detach`) can no longer slip a
+    server subcommand past the check with `raw[0] == "-m"`. Persistent SERVER
+    subcommands (`dashboard`, `spec-web`) keep their own message: ANY of their
+    subactions is rejected (not just the blocking foreground server) rather than
+    double-daemonized, since they already have a start/stop lifecycle. Management
+    verbs (`jobs`/`status`/`wait`/`install-*`/…) are rejected too — detaching them is
+    meaningless and would only pollute the jobs list. Returns the exit code to
+    return, or None when `raw` is detachable."""
+    verb = _first_verb(raw)
+    if verb in _SERVER_SUBCOMMANDS:
+        print(
+            "[review-cli] --detach is not supported for dashboard/spec-web — they "
+            "already have their own start/stop lifecycle (`review dashboard start`).",
+            file=sys.stderr,
+        )
+        return 2
+    # ONE verb for both checks (review round 2, GH-162, Opus #2 / Sonnet #1): the
+    # whitelist used to index `raw[0]` directly, so it only agreed with the server
+    # check above when normalization had already moved every leading option behind
+    # the verb — a leading value-taking option normalization does not know would have
+    # been rejected as "got '-o'" even though the mode itself is detachable.
+    if verb is None or verb not in known_subcommands():
+        modes = ", ".join(sorted(known_subcommands()))
+        print(
+            f"[review-cli] --detach requires a review mode as the first argument "
+            f"({modes}); got {verb if verb is not None else 'nothing'!r}. Management commands "
+            "(jobs/status/wait/install-*) run synchronously and cannot be detached.",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
+def _detached_child_argv(raw: list[str], result_path: Path | None) -> list[str]:
+    """`python -m reviewlib <raw>`, with a generated `-o <result_path>` (None when the
+    caller passed its own `-o`) placed BEFORE a `--` end-of-options marker — appending
+    after `--` would make `-o`/its value land as extra POSITIONALS, corrupting any
+    invocation with its own `--` (`review just-ask --task X --detach -- --flag-like
+    -question`, codex review). Built structurally from the split, not via index
+    arithmetic across the two lists (Sonnet review, round 1)."""
+    if result_path is None:
+        return [sys.executable, "-m", "reviewlib", *raw]
+    idx = raw.index("--") if "--" in raw else len(raw)
+    head, tail = raw[:idx], raw[idx:]
+    return [sys.executable, "-m", "reviewlib", *head, "-o", str(result_path), *tail]
+
+
+def _detached_child_env(job_id: str, this_jobs_dir: Path) -> dict[str, str]:
+    """The child's environment: `$REVIEW_JOB_ID` (the marker `main()`'s finalizer keys
+    on), `$REVIEW_JOBS_DIR` pinned to the SAME resolved jobs dir this process used —
+    without this a child that later calls `jobs.jobs_dir()` itself could independently
+    recompute the last-resort `mkdtemp()` fallback and land its bookkeeping in a
+    DIFFERENT directory than the parent (codex review, review-cli#162 follow-up; a
+    no-op when the standard location is writable) — and `$PYTHONPATH` prefixed with
+    THIS process's own resolved repo root (`_reviewlib_repo_root`) so a symlink-only
+    install still finds the package."""
+    env = dict(os.environ)
+    env["REVIEW_JOB_ID"] = job_id
+    env["REVIEW_JOBS_DIR"] = str(this_jobs_dir)
+    repo_root = _reviewlib_repo_root()
+    existing_pp = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+    )
+    return env
+
+
+def _detached_child_stdin() -> int:
+    """What the detached child gets as stdin: the parent's OWN stdin fd passed straight
+    through when it is a pipe/file, `DEVNULL` when it is a tty (or absent).
+
+    Review round 1 (GH-162, Fable #1 / Opus #2): the previous design READ stdin to EOF
+    in the parent and spooled it to a file for the child. That blocked the parent —
+    the very process `--detach` promises returns at once — whenever a caller's stdin
+    was a non-tty pipe held OPEN with nothing in it (agent tool wrappers, pre-commit
+    hooks: the feature's own audience). The synchronous path reads stdin
+    unconditionally for every review mode (a piped diff wins even under `--staged`,
+    see `_dispatch`), so the only way to keep the child's input IDENTICAL to a
+    synchronous run without the parent ever reading is to hand it the same fd: the
+    pipe's writer stays open until the CHILD reads to EOF, the parent never touches
+    it. A tty stdin is never inherited — a session-detached background process
+    reading a tty would stop on SIGTTIN; the synchronous path never reads a tty
+    either (`_read_stdin_if_piped`), so `DEVNULL` gives the child the same "no piped
+    input" answer."""
+    stdin = sys.stdin
+    if stdin is None or getattr(stdin, "closed", True) or stdin.isatty():
+        return subprocess.DEVNULL
+    try:
+        return stdin.fileno()
+    except (OSError, ValueError):
+        return subprocess.DEVNULL
+
+
 def _spawn_detached_job(raw: list[str]) -> int:
     """Implement `--detach`: spawn a SECOND, full `review` invocation (the same argv,
     minus `--detach`) as a session-detached background process, record it as a job, and
@@ -3378,20 +3490,13 @@ def _spawn_detached_job(raw: list[str]) -> int:
     Reuses `python -m reviewlib` (rather than resolving a `review` on PATH, which can be
     a live-symlink into a DIFFERENT checkout — see `dashboard/service.py
     _review_argv0`) so the detached child is guaranteed to run the exact code this
-    process is running, no live-symlink ambiguity — with `$PYTHONPATH` set to THIS
-    process's own resolved repo root (`_reviewlib_repo_root`) so a symlink-only install
-    (whose `sys.path` insert lives in the `bin/review` shim, not something a spawned
-    `python -m reviewlib` inherits) still finds the package. The child is started in its
-    OWN session (`start_new_session=True`) — same isolation `_run_streamed` gives
-    backend children — so it outlives this process's exit and is bounded the same way
-    (its own `install_signal_reaper` + `run_backstop`, wired the moment its `main()`
-    runs).
-
-    A piped diff (`git diff | review diff --detach`) is read HERE and spooled to a file
-    that becomes the child's stdin — the child's own process starts with a fresh, empty
-    stdin, so without this the piped input would silently vanish and the child would
-    fall back to reviewing the live working tree (or fail outside a repo) instead of the
-    diff the caller actually asked for.
+    process is running (see `_detached_child_env` for how it finds the package). The
+    child is started in its OWN session (`start_new_session=True`) — same isolation
+    `_run_streamed` gives backend children — so it outlives this process's exit and is
+    bounded the same way (its own `install_signal_reaper` + `run_backstop`, wired the
+    moment its `main()` runs). Its stdin is the caller's own (`_detached_child_stdin`),
+    so `git diff | review diff --detach` reviews the piped diff exactly like a
+    synchronous run — read by the child, never by this process.
 
     A caller's own `-o FILE` is honored as the job's result file; otherwise a default
     result path under `jobs.jobs_dir()` is used and passed to the child so the review's
@@ -3403,36 +3508,20 @@ def _spawn_detached_job(raw: list[str]) -> int:
     `status` key — so even if the child finishes and writes its terminal status BETWEEN
     these two writes, this second write cannot stomp it back to "running" (`jobs.
     write_job`'s read-modify-write would otherwise silently regress a `done`/`failed`
-    record for a review fast enough to race its own parent). Persistent SERVER
-    subcommands (`dashboard`, `spec-web`) already have their own start/stop lifecycle —
-    ANY of their subactions rejects `--detach` (not just the blocking foreground server)
-    rather than double-daemonizing.
+    record for a review fast enough to race its own parent).
     """
-    if raw and raw[0] in _SERVER_SUBCOMMANDS:
-        print(
-            "[review-cli] --detach is not supported for dashboard/spec-web — they "
-            "already have their own start/stop lifecycle (`review dashboard start`).",
-            file=sys.stderr,
-        )
-        return 2
-    if not raw:
-        print(
-            "[review-cli] --detach requires a mode (e.g. `review diff --detach`)",
-            file=sys.stderr,
-        )
-        return 2
-
-    from . import jobs
+    raw = _normalize_leading_mode_options(raw)
+    rejected = _reject_undetachable(raw)
+    if rejected is not None:
+        return rejected
 
     job_id = jobs.new_job_id()
     # Resolved ONCE and reused for every path below (and propagated to the child via
-    # $REVIEW_JOBS_DIR further down) — `jobs_dir()`'s own last-resort fallback tier
-    # mints a brand-new `tempfile.mkdtemp()` directory the FIRST time it's hit in this
-    # process, so calling it repeatedly without pinning the result could scatter this
-    # one job's result/log/stdin paths across different directories, and the SPAWNED
-    # CHILD (a separate process, with its own memoization) could resolve yet a THIRD
-    # directory of its own if it ever recomputed the fallback independently (codex
-    # review, review-cli#162 follow-up).
+    # $REVIEW_JOBS_DIR) — `jobs_dir()`'s own last-resort fallback tier mints a brand-new
+    # `tempfile.mkdtemp()` directory the FIRST time it's hit in this process, so calling
+    # it repeatedly without pinning the result could scatter this one job's
+    # result/log paths across different directories (codex review, review-cli#162
+    # follow-up).
     this_jobs_dir = jobs.jobs_dir()
     user_output, _ = _extract_output_path(list(raw))
     result_path = (
@@ -3441,38 +3530,7 @@ def _spawn_detached_job(raw: list[str]) -> int:
         else this_jobs_dir / f"{job_id}.result.txt"
     )
     log_path = this_jobs_dir / f"{job_id}.log"
-    child_argv = [sys.executable, "-m", "reviewlib", *raw]
-    if user_output is None:
-        # Insert BEFORE a `--` end-of-options marker if `raw` has one, not append at the
-        # tail — appending after `--` would make the generated `-o`/its value land as an
-        # extra POSITIONAL argument instead of an option, corrupting any invocation with
-        # its own `--` (e.g. `review just-ask --task X --detach -- --flag-like-question`
-        # — codex review).
-        insert_at = len(child_argv)
-        if "--" in raw:
-            insert_at = len(child_argv) - len(raw) + raw.index("--")
-        child_argv[insert_at:insert_at] = ["-o", str(result_path)]
-
-    env = dict(os.environ)
-    env["REVIEW_JOB_ID"] = job_id
-    # Pin the child to the SAME resolved jobs dir this process just used — without
-    # this, a child that later calls `jobs.jobs_dir()` itself (e.g. inside its own
-    # `main()` finally-block job-status write) could independently recompute the
-    # last-resort `mkdtemp()` fallback and land in a DIFFERENT directory than the
-    # parent, splitting one job's bookkeeping across two locations (codex review,
-    # review-cli#162 follow-up). A no-op when the standard location is writable (both
-    # processes already agree on the same fixed path in that case).
-    env["REVIEW_JOBS_DIR"] = str(this_jobs_dir)
-    repo_root = _reviewlib_repo_root()
-    existing_pp = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
-    )
-
-    # Spool a piped diff to a file the child inherits as its OWN stdin — its process
-    # otherwise starts with nothing piped in, silently discarding the caller's input.
-    piped_input = None if sys.stdin.isatty() else sys.stdin.read()
-    stdin_path = this_jobs_dir / f"{job_id}.stdin" if piped_input else None
+    child_argv = _detached_child_argv(raw, None if user_output else result_path)
 
     # Write the initial record BEFORE Popen (see docstring): the child cannot possibly
     # exist yet, so its own terminal-status write can never race a job that doesn't
@@ -3488,67 +3546,23 @@ def _spawn_detached_job(raw: list[str]) -> int:
         started_at=time.time(),
     )
 
-    # Both file opens go through the SAME review-cli#162 sandboxed-write fallback
-    # `_run_streamed`'s own log open uses — a `--detach` job's bookkeeping files are
+    # The log open goes through the SAME review-cli#162 sandboxed-write fallback
+    # `_run_streamed`'s own log open uses — a `--detach` job's bookkeeping file is
     # exactly as likely to hit a sandboxed caller's write deny-list as the review's own
-    # transcript log, and a job whose OWN log/stdin can't be opened must not silently
-    # fail to even start.
+    # transcript log, and a job whose OWN log can't be opened must not silently fail to
+    # even start.
     log_fd, log_path = _open_log_with_fallback(log_path)
-    stdin_fd = subprocess.DEVNULL
-    if stdin_path is not None:
-        # O_RDWR, not the log-file default O_WRONLY: this fd is written once here and
-        # then handed to the CHILD as its stdin below, which needs to READ from it. A
-        # write-only fd made the child's read fail with EBADF, silently discarding the
-        # piped diff — the detached child fell back to reviewing the live working tree
-        # instead (codex review, review-cli#162 follow-up).
-        stdin_fd, stdin_path = _open_log_with_fallback(
-            stdin_path, flags=os.O_RDWR | os.O_CREAT | os.O_TRUNC
-        )
-        if stdin_path == Path(os.devnull):
-            # `_open_log_with_fallback`'s devnull tier is a fine last resort for a
-            # WRITE-only transcript log (losing a nice-to-have log beats crashing the
-            # seat), but silently using it here would be WRONG: a write to
-            # `os.devnull` is discarded, so the spawned child's read returns EOF
-            # immediately and it falls back to reviewing the LIVE WORKING TREE instead
-            # of the piped diff the caller asked for — wrong input, no error at all
-            # (codex review, review-cli#162 follow-up). Fail loud instead: this is an
-            # extreme double-failure (both the standard jobs dir AND the whole system
-            # temp root are unwritable), not the single-failure case this fix targets.
-            os.close(stdin_fd)
-            os.close(log_fd)
-            print(
-                "[review-cli] cannot spool the piped diff to any writable location "
-                "(the jobs dir and the system temp dir are both unwritable) — "
-                "refusing to silently review the wrong input. Set $REVIEW_JOBS_DIR to "
-                "a writable path, or drop --detach and pipe the diff to a synchronous "
-                "run instead.",
-                file=sys.stderr,
-                flush=True,
-            )
-            return 2
-        os.write(stdin_fd, piped_input.encode("utf-8"))
-        os.lseek(stdin_fd, 0, os.SEEK_SET)
-        # Unlink now: the fd stays valid (POSIX keeps the inode alive while any fd
-        # references it) and Popen below inherits it, so the child can still read the
-        # spooled diff — but no `<job>.stdin` file lingers on disk afterward (codex
-        # review: nothing previously cleaned this up).
-        try:
-            stdin_path.unlink()
-        except OSError:
-            pass
     try:
         proc = subprocess.Popen(
             child_argv,
-            stdin=stdin_fd,
+            stdin=_detached_child_stdin(),
             stdout=log_fd,
             stderr=subprocess.STDOUT,
-            env=env,
+            env=_detached_child_env(job_id, this_jobs_dir),
             start_new_session=True,
         )
     finally:
         os.close(log_fd)
-        if stdin_fd != subprocess.DEVNULL:
-            os.close(stdin_fd)
 
     # pid + resolved log_path update: deliberately omits `status` so it can never
     # regress a terminal status the child may have already written (see docstring).

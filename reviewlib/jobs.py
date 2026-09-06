@@ -43,7 +43,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .process import probe_writable_dir
 
@@ -77,15 +77,21 @@ TERMINAL_STATUSES = frozenset({"done", "failed", "unknown-terminated"})
 _jobs_dir_fallback_cache: Path | None = None
 
 
+def _temp_root_path(suffix: str) -> Path:
+    """`<system temp root>/.review-cli-jobs-<uid><suffix>` — the one uid-keyed prefix
+    every fixed pointer-tier path below is built from (keyed by uid so a shared
+    multi-user box doesn't cross-report between users)."""
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / f".review-cli-jobs-{os.getuid()}{suffix}"
+
+
 def _fallback_pointer_path() -> Path:
     """A FIXED, well-known location recording where the last-resort `mkdtemp()`
     directory actually landed — the one thing about that directory that ISN'T random.
     Lives directly under the temp root (NOT inside the unwritable fixed uid-keyed
-    subdir this tier only exists because we couldn't use), keyed by uid so a shared
-    multi-user box doesn't cross-report between users."""
-    import tempfile
-
-    return Path(tempfile.gettempdir()) / f".review-cli-jobs-{os.getuid()}.pointer"
+    subdir this tier only exists because we couldn't use)."""
+    return _temp_root_path(".pointer")
 
 
 def _fallback_pointer_lock_path() -> Path:
@@ -93,9 +99,7 @@ def _fallback_pointer_lock_path() -> Path:
     SEPARATE fixed path from the pointer itself (never the pointer + a suffix swap,
     same reasoning as `_job_lock_path`: the lock must exist even before the pointer
     file itself does, for the very first process to hit this tier)."""
-    import tempfile
-
-    return Path(tempfile.gettempdir()) / f".review-cli-jobs-{os.getuid()}.pointer.lock"
+    return _temp_root_path(".pointer.lock")
 
 
 def _open_pointer_lock() -> int:
@@ -437,26 +441,43 @@ def _job_lock(job_id: str) -> int:
     return fd
 
 
-def write_job(job_id: str, **fields: Any) -> Path:
-    """Create-or-update a job record, merging `fields` over whatever is already on disk
-    (so the terminal-status writer only needs to pass the fields it knows: status,
-    exit_code, finished_at — not repeat the spawner's argv/pid/log_path). The whole
-    read-modify-write is done under `_job_lock` so a concurrent writer for the SAME
-    job-id (see `_job_lock`'s docstring) can never race this one."""
+def _update_job_locked(job_id: str, mutate: Callable[[dict[str, Any]], bool]) -> bool:
+    """The one locked read-modify-write every job-record writer goes through: read the
+    record under `_job_lock`, hand it to `mutate`, and write it back only when `mutate`
+    returns True. Returning False leaves the on-disk record untouched — that is how a
+    compare-and-set writer (`_persist_unknown_terminated`) declines to overwrite a
+    status another process wrote between its own read and this lock. Returns whether
+    a write happened."""
     lock_fd = _job_lock(job_id)
     try:
         path = job_path(job_id)
         data = read_job(job_id) or {}
         data["job_id"] = job_id
-        data.update(fields)
+        if not mutate(data):
+            return False
         data["updated_at"] = time.time()
         _atomic_write(path, data)
-        return path
+        return True
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
+
+
+def write_job(job_id: str, **fields: Any) -> Path:
+    """Create-or-update a job record, merging `fields` over whatever is already on disk
+    (so the terminal-status writer only needs to pass the fields it knows: status,
+    exit_code, finished_at — not repeat the spawner's argv/pid/log_path). The whole
+    read-modify-write is done under `_job_lock` (`_update_job_locked`) so a concurrent
+    writer for the SAME job-id (see `_job_lock`'s docstring) can never race this one."""
+
+    def merge(data: dict[str, Any]) -> bool:
+        data.update(fields)
+        return True
+
+    _update_job_locked(job_id, merge)
+    return job_path(job_id)
 
 
 def _secondary_jobs_dir() -> Path | None:
@@ -561,22 +582,79 @@ def is_pid_alive(pid: int) -> bool:
     return True
 
 
+# How long a "running" record may legitimately have NO pid yet: the spawning parent
+# writes the record BEFORE `Popen` (see `cli._spawn_detached_job`) and adds the pid right
+# after, so a concurrent `review jobs` landing in that window must not misreport a
+# brand-new job as terminated. Past the window, a pid-less running record means the
+# `Popen` itself failed.
+SPAWN_GRACE_SECONDS = 5.0
+
+
+def _pidless_running_is_stale(data: dict[str, Any]) -> bool:
+    started = data.get("started_at")
+    if not isinstance(started, (int, float)):
+        return True
+    return (time.time() - started) > SPAWN_GRACE_SECONDS
+
+
+def _persist_unknown_terminated(job_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Write the reconciled terminal status back ONCE (under `write_job`'s lock) so it
+    sticks: a dead pid is never probed again, and a later pid REUSE by an unrelated
+    process (hours later, or after a reboot) can't flip the job back to "running" and
+    make `review wait` block on a job that died long ago. Best-effort: a read-only
+    jobs dir still gets the reconciled answer, just not persisted.
+
+    Compare-and-set, not a blind merge: `job_status`'s own read and this write are two
+    separately-locked sections, and the child can finish IN BETWEEN them — write its
+    real terminal status via `cli.main`'s finally block and exit, so the pid probe
+    sees it dead. A plain `write_job(status="unknown-terminated")` would then stomp
+    that `done`/`failed` (keeping the child's `exit_code`, an inconsistent record) and
+    `review wait` would report 1 for a job that succeeded (review round 2, GH-162,
+    Opus #1). So the relabel is written only while the stored status is STILL
+    "running"; when it lost the race the fresh record the child wrote is returned."""
+    fresh: dict[str, Any] = {}
+
+    def relabel(current: dict[str, Any]) -> bool:
+        if current.get("status") != "running":
+            fresh.update(current)
+            return False
+        current["status"] = "unknown-terminated"
+        current["finished_at"] = time.time()
+        return True
+
+    try:
+        if not _update_job_locked(job_id, relabel) and fresh:
+            return fresh
+    except OSError:
+        pass
+    data = dict(data)
+    data["status"] = "unknown-terminated"
+    return data
+
+
 def job_status(job_id: str) -> dict[str, Any] | None:
     """The job's record, RECONCILED against reality: a record still marked "running"
     whose pid is no longer alive is relabeled "unknown-terminated" (crash / SIGKILL /
     reboot — none of which give the child a chance to write its own terminal status via
-    `cli.main`'s finally block). Every other status is returned as recorded; None if the
-    job doesn't exist."""
+    `cli.main`'s finally block) — and that relabel is PERSISTED, see
+    `_persist_unknown_terminated`. A record with no pid yet is "running" inside the
+    spawn grace window (`SPAWN_GRACE_SECONDS`) and reported — not persisted — as
+    terminated past it. Every other status is returned as recorded; None if the job
+    doesn't exist."""
     data = read_job(job_id)
     if data is None:
         return None
-    if data.get("status") == "running":
-        pid = data.get("pid")
-        alive = isinstance(pid, int) and is_pid_alive(pid)
-        if not alive:
+    if data.get("status") != "running":
+        return data
+    pid = data.get("pid")
+    if pid is None:
+        if _pidless_running_is_stale(data):
             data = dict(data)
             data["status"] = "unknown-terminated"
-    return data
+        return data
+    if isinstance(pid, int) and is_pid_alive(pid):
+        return data
+    return _persist_unknown_terminated(job_id, data)
 
 
 def tail_lines(path: Path, n: int) -> list[str]:

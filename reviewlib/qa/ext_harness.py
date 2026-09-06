@@ -54,6 +54,8 @@ from collections import deque
 from pathlib import Path
 from typing import Protocol
 
+from ..process import register_external_child, unregister_external_child
+
 # How much of the runner's stderr tail to retain for a BLOCKED-report proof. A drain thread
 # keeps the OS pipe empty (so a chatty runner never blocks on a full pipe); we hold only the
 # last few KiB, plenty for a launch crash/traceback tail.
@@ -458,8 +460,6 @@ class _VSCodeSession:
         # `_run_streamed`'s children and left the whole runner+Electron+VS Code tree
         # behind, since `_VSCodeSession._terminate()`'s own teardown only runs from a
         # live interpreter's normal control flow, not from a raw signal.
-        from ..process import register_external_child
-
         self._reaper_handle = register_external_child(self._proc)
         self._stderr_tail = _StderrTail(self._proc.stderr)
         # One stdout reader for the whole session — used by _await_ready AND handed to the
@@ -538,8 +538,6 @@ class _VSCodeSession:
             pass
         _terminate_group(proc)
         if self._reaper_handle is not None:
-            from ..process import unregister_external_child
-
             unregister_external_child(self._reaper_handle)
             self._reaper_handle = None
 

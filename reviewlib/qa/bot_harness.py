@@ -59,6 +59,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..process import register_external_child, unregister_external_child
+
 # How much of the bot's stdout tail to retain in memory for a BLOCKED-report proof. The drain
 # thread keeps the OS pipe empty (so a chatty bot never blocks); we hold only the last few KiB,
 # which is plenty for a crash/traceback tail.
@@ -574,8 +576,6 @@ class BotProcess:
             # surviving child holding the pipe can't keep the thread alive past the run.
             self._drain_thread.join(timeout=2)
         if self._reaper_handle is not None:
-            from ..process import unregister_external_child
-
             unregister_external_child(self._reaper_handle)
             self._reaper_handle = None
 
@@ -695,8 +695,6 @@ def _spawn_bot_process(
     # SIGTERM/SIGINT (or the internal backstop) reaped only `_run_streamed`'s children
     # and left this bot/poller process group behind, since `BotProcess.reap()`'s own
     # teardown only runs from a live interpreter's normal control flow, not a signal.
-    from ..process import register_external_child
-
     handle = register_external_child(proc)
     bot = BotProcess(proc=proc)
     bot._reaper_handle = handle
@@ -937,8 +935,6 @@ class AskHandle:
         follow-up: this hook client is spawned `start_new_session=True` exactly like the other
         QA harness SUT processes, and was never registered at all before this fix)."""
         if self._reaper_handle is not None:
-            from ..process import unregister_external_child
-
             unregister_external_child(self._reaper_handle)
             self._reaper_handle = None
 
@@ -994,8 +990,6 @@ def emit_question(
     # window an external SIGTERM/the backstop must already be able to find and reap
     # it. This hook client is spawned `start_new_session=True` exactly like the other
     # QA harness SUT processes but was never registered before this fix.
-    from ..process import register_external_child
-
     reaper_handle = register_external_child(proc)
     if proc.stdin is not None:
         try:

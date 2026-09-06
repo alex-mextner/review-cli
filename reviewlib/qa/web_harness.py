@@ -43,6 +43,8 @@ from typing import Protocol
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from ..process import register_external_child, unregister_external_child
+
 # How much of the dev server's stdout tail to retain for a BLOCKED-report proof. A drain thread
 # keeps the OS pipe empty (so a chatty server never blocks on a full pipe before it starts
 # serving); we hold only the last few KiB, plenty for a crash/traceback tail.
@@ -338,8 +340,6 @@ class WebServer:
         if self._drain_thread is not None:
             self._drain_thread.join(timeout=2)
         if self._reaper_handle is not None:
-            from ..process import unregister_external_child
-
             unregister_external_child(self._reaper_handle)
             self._reaper_handle = None
 
@@ -419,8 +419,6 @@ def boot_web_server(
     # SIGTERM/SIGINT (or the internal backstop) reaped only `_run_streamed`'s children
     # and left this SUT process group behind, since `WebServer.reap()`'s own teardown
     # only runs from a live interpreter's normal control flow, not from a raw signal.
-    from ..process import register_external_child
-
     handle = register_external_child(proc)
     server = WebServer(proc=proc)
     server._reaper_handle = handle
