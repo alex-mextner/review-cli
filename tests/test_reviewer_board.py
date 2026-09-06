@@ -43,6 +43,8 @@ from reviewlib.config import (  # noqa: E402
     KIMI_SEAT,
     LIGHT_PRESET_BOARD,
     SOL_SEAT,
+    SONNET_SEAT,
+    TERRA_SEAT,
     REVIEW_ROLES,
     VISUAL_MODELS,
     BoardConfigError,
@@ -95,10 +97,21 @@ def test_default_board_matches_directive_table():
         # Seat 4 is the first reserve and preserves lens diversity when a top seat drops.
         ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "quality", "Kimi"),
         # Seat 5 is the agentic codex CLI route, pinned to GPT-6-Astra (ASTRA_SEAT) rather
-        # than the bare `"codex"` seat this used to be (see config.py for rationale).
+        # than the bare `"codex"` seat this used to be (see config.py for rationale). Role
+        # LEFT AS `consistency` (a duplicate of Sol's lens) by review-cli#382 -- an earlier
+        # draft flipped it to `security`, but that left `consistency` with ZERO live
+        # fallback anywhere on the board; see config.py's comment on this exact seat.
         ("codex:gpt-6-astra", "consistency", "Astra"),
-        # Seats 4 and 6-7 route through opencode (`oc:`) so they run AGENTICALLY (read the repo
-        # read-only), not the diff-only commandcode/z.ai REST call (review-cli#24).
+        # Seats 6-7 (review-cli#382): TERRA_SEAT/SONNET_SEAT, live fallbacks for the
+        # `performance`/`quality` roles whose only prior seats (GLM-cc/Kimi) are disabled
+        # whenever `unpaid_providers` includes `commandcode`. Placed right after Astra so
+        # neither the raw top-4 nor DEFAULT_PRESET_BOARD's top-4 window picks up a
+        # duplicate role in the common (nothing disabled) case.
+        ("codex:gpt-5.6-terra", "performance", "Terra"),
+        ("claude:claude-sonnet-5", "quality", "Sonnet"),
+        # Seats 4, 8-9 and 11 route through opencode (`oc:`) so they run AGENTICALLY (read the
+        # repo read-only), not the diff-only commandcode/z.ai REST call (review-cli#24). Seats
+        # 6-7 (Terra/Sonnet, review-cli#382) run via the codex/claude CLIs, not opencode.
         ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
         ("oc:commandcode/deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
         ("gemini", "contracts", "Gemini"),
@@ -106,7 +119,9 @@ def test_default_board_matches_directive_table():
         # from the seat-3 commandcode GLM: same model family, different provider/transport.
         # DEPRIORITIZED to LAST-RESORT reserve (review-cli#65): it is pathologically slow
         # under load, so it is promoted before only Fable — Qwen/DeepSeek/Gemini go first.
-        ("oc:zai/glm-5.2", "quality", "GLM"),
+        # review-cli#382: role changed from `quality` (now covered by Sonnet above, which
+        # doesn't share this seat's real-world quota fragility) to `security`.
+        ("oc:zai/glm-5.2", "security", "GLM"),
         # Fable 5 (Anthropic flagship). DEMOTED from priority 1 to the very LAST seat
         # (review-cli#fable-seat-reliability): confirmed 97.9-100% dispatch failure rate
         # (chronic session/usage-limit exhaustion) made priority 1 a near-certain-doomed
@@ -120,19 +135,22 @@ def test_default_board_matches_directive_table():
 
 def test_default_board_is_priority_ordered():
     """The CTO's priority sketch (strongest-WORKING-model first): Sol, Opus,
-    GLM-5.2-via-commandcode, Kimi, Astra, Qwen, DeepSeek, Gemini, GLM-5.2-via-z.ai, Fable.
-    Re-ranking = reordering
-    DEFAULT_BOARD; this pins the order. Seats 4 and 6-8 are the AGENTIC opencode (`oc:`)
-    routes (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. The z.ai GLM
-    seat is DEPRIORITIZED to next-to-last (review-cli#65) — pathologically slow under load.
-    Fable is LAST (review-cli#fable-seat-reliability) — a confirmed ~100% dispatch failure
-    rate, worse than merely slow."""
+    GLM-5.2-via-commandcode, Kimi, Astra, Terra, Sonnet, Qwen, DeepSeek, Gemini,
+    GLM-5.2-via-z.ai, Fable. Re-ranking = reordering
+    DEFAULT_BOARD; this pins the order. Seats 4, 8-9, and 11 are the AGENTIC opencode
+    (`oc:`) routes (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. Terra/Sonnet
+    (review-cli#382) are live fallbacks for performance/quality, inserted right after Astra.
+    The z.ai GLM seat is DEPRIORITIZED to next-to-last (review-cli#65) — pathologically slow
+    under load. Fable is LAST (review-cli#fable-seat-reliability) — a confirmed ~100%
+    dispatch failure rate, worse than merely slow."""
     assert [r.model for r in DEFAULT_BOARD] == [
         "codex:gpt-5.6-sol",
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
         "codex:gpt-6-astra",
+        "codex:gpt-5.6-terra",
+        "claude:claude-sonnet-5",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
@@ -241,8 +259,9 @@ def test_default_pool_roles_are_distinct_no_lens_lost():
     assert set(roles) == {"consistency", "correctness", "performance", "quality"}, roles
 
 
-def test_default_board_has_ten_seats():
-    assert len(DEFAULT_BOARD) == 10, len(DEFAULT_BOARD)
+def test_default_board_has_twelve_seats():
+    # review-cli#382: TERRA_SEAT and SONNET_SEAT added as live fallbacks (10 -> 12).
+    assert len(DEFAULT_BOARD) == 12, len(DEFAULT_BOARD)
 
 
 def test_preset_boards_pin_model_order_pool_and_effort():
@@ -278,6 +297,14 @@ def test_preset_boards_pin_model_order_pool_and_effort():
         ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "xhigh"),
     ]
     assert all(r.effort == "max" for r in HEAVY_PRESET_BOARD[4:])
+    # review-cli#382 (round 4 review finding): explicitly pin Terra's/Sonnet's effort at
+    # "max", not "xhigh" -- they land at raw priority 6-7 (AFTER Kimi at 4), outside the
+    # `i < 4` xhigh-tier cutoff in `_heavy_eligible_seats`, unlike the config.py comment's
+    # bare say-so this actually asserts it.
+    terra_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == TERRA_SEAT)
+    sonnet_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == SONNET_SEAT)
+    assert terra_entry.effort == "max", terra_entry
+    assert sonnet_entry.effort == "max", sonnet_entry
 
 
 def test_package_facade_exports_preset_surface():
@@ -288,6 +315,12 @@ def test_package_facade_exports_preset_surface():
     assert reviewlib.LIGHT_PRESET_BOARD == LIGHT_PRESET_BOARD
     assert reviewlib.HEAVY_PRESET_BOARD == HEAVY_PRESET_BOARD
     assert reviewlib.SOL_SEAT == SOL_SEAT
+    # review-cli#382 (codex review finding, round 3): TERRA_SEAT/SONNET_SEAT must be
+    # re-exported through the facade too, like every other seat constant (SOL_SEAT/
+    # ASTRA_SEAT/FABLE_SEAT above) -- a caller doing `from reviewlib import TERRA_SEAT`
+    # got an ImportError before this was added to reviewlib/__init__.py.
+    assert reviewlib.TERRA_SEAT == TERRA_SEAT
+    assert reviewlib.SONNET_SEAT == SONNET_SEAT
     assert reviewlib.preset_names() == ("default", "heavy", "light")
     assert reviewlib.preset_pool_size("light") == 2
     # preset_board(None) resolves via DEFAULT_PRESET, which is "light" (Alex,
@@ -1151,7 +1184,7 @@ def test_default_pool_size_is_four():
 
 def test_select_pool_default_picks_first_four_seats():
     """Default pool (no availability predicate) = the FIRST 4 seats by priority of the
-    10-seat board (the rest are reserve). The pool now leads with Sol, Opus, then the
+    12-seat board (the rest are reserve). The pool now leads with Sol, Opus, then the
     GLM-5.2-via-commandcode seat, then Kimi (review-cli#fable-seat-reliability: Fable
     moved from priority 1 to the very last reserve seat — see
     `test_default_board_matches_directive_table`'s comment for the full rationale)."""
@@ -1164,12 +1197,15 @@ def test_select_pool_default_picks_first_four_seats():
         "commandcode:zai-org/GLM-5.2",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ]
-    # The reserve is exactly the remainder (priority order): Astra, the remaining opencode
-    # routes (review-cli#24), the diff-only Gemini, the slow z.ai GLM seat (LAST-RESORT,
-    # review-cli#65 deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
+    # The reserve is exactly the remainder (priority order): Astra, Terra/Sonnet
+    # (review-cli#382 live fallbacks), the remaining opencode routes (review-cli#24), the
+    # diff-only Gemini, the slow z.ai GLM seat (LAST-RESORT, review-cli#65
+    # deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
     assert reserve == [
         "codex:gpt-6-astra",
+        "codex:gpt-5.6-terra",
+        "claude:claude-sonnet-5",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
@@ -1300,11 +1336,12 @@ def test_install_skill_text_documents_agentic_default_board():
     assert "selected preset/board" in low
     assert "--preset heavy --pool 0" in SKILL_MD
     # review-cli#fable-seat-reliability: the heavy preset excludes Fable (~100%
-    # dispatch failure rate), so --pool 0 covers 9 built-ins, not 10. Normalized
-    # whitespace (GLM review finding): matching the raw string coupled this assertion
-    # to exactly where install.py's paragraph happens to line-wrap — a future reflow
-    # of that markdown with no content change would break it for no real reason.
-    assert "covers all 9 heavy-preset-built-ins" in " ".join(SKILL_MD.split())
+    # dispatch failure rate). review-cli#382 added TERRA_SEAT/SONNET_SEAT, so --pool 0
+    # now covers 11 built-ins, not 10/9. Normalized whitespace (GLM review finding):
+    # matching the raw string coupled this assertion to exactly where install.py's
+    # paragraph happens to line-wrap — a future reflow of that markdown with no content
+    # change would break it for no real reason.
+    assert "covers all 11 heavy-preset-built-ins" in " ".join(SKILL_MD.split())
     """review-cli#24 contract (codex review): the agentic `oc:` board seats authenticate via
     opencode's OWN provider config — NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
     So their availability gates on the `opencode` BINARY plus opencode's OWN provider

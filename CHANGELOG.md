@@ -3,6 +3,34 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
+## 0.35.6 — 2026-09-06
+
+- **The `quality`/`performance`/`security` review-board roles get a genuinely live
+  fallback instead of depending on a single disabled/quota-fragile seat (review-cli#382).**
+  `unpaid_providers: [commandcode, gemini]` disables every commandcode-routed seat
+  (GLM-cc/Kimi/Qwen/DeepSeek) plus Gemini at once, machine-wide. That left `performance`/
+  `quality`/`security`/`tests` with zero or exactly one live seat each, and `quality`'s one
+  live seat (the z.ai-routed GLM) hit a real weekly quota exhaustion with nothing left to
+  promote — hard-blocking a real PR's review-quorum gate with no path forward except a
+  multi-day wait or a manual hatch bypass. Two new `DEFAULT_BOARD` seats — `TERRA_SEAT`
+  (`codex:gpt-5.6-terra`) and `SONNET_SEAT` (`claude:claude-sonnet-5`) — are distinct,
+  already-paid models on the same OpenAI/Codex and Anthropic accounts Sol/Astra and
+  Opus/Fable already use (no new provider account), added as live fallbacks for
+  `performance` and `quality`; the z.ai-routed GLM seat is re-lensed off its now-redundant
+  `quality` role onto `security`, which had none. `tests` (DeepSeek-only), `contracts`
+  (Gemini-only), and `architect` (Fable-only — see Fable's ~100% dispatch failure rate
+  below, still true as of this investigation) remain thin: there was no third distinct
+  already-paid model to give every starved role its own seat without doubling up one
+  account's quota pressure on a single review run, the same failure class this change
+  fixes for Fable. An earlier draft of this change also re-lensed Astra off its
+  pre-existing (duplicate-of-Sol) `consistency` role onto `security`, but a second review
+  round caught that this left `consistency` with zero live fallback anywhere on the
+  board — the exact single-point-of-failure class this change exists to fix, just
+  relocated — so Astra's role is left unchanged. This is a stopgap within the existing
+  harness-prefixed seat-string mechanism, not the "roles declare models, harness/provider
+  auto-resolve" redesign tracked separately as review-cli#364 (this repo's own copy) and
+  rig-cli#337 (the umbrella tracking it across the harness ecosystem).
+
 ## 0.35.5 — 2026-09-05
 
 - **`review diff` board mode: print a visible STDOUT notice when the pool comes up
