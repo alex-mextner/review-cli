@@ -3312,6 +3312,17 @@ def main(argv: list[str] | None = None) -> int:
                 "not recording a job status.",
                 file=sys.stderr,
             )
+        except OSError as exc:
+            # A jobs dir that became unwritable AFTER spawn (a sandbox grant that
+            # expired mid-review) must not replace the review's own real exit code
+            # with a traceback; the record is left "running" and `job_status`'s
+            # dead-pid reconciliation reports it as unknown-terminated later.
+            print(
+                f"[review-cli] could not record the final status of job {job_id}: "
+                f"{type(exc).__name__}: {exc} — the review itself finished with exit "
+                f"code {rc}.",
+                file=sys.stderr,
+            )
     return rc
 
 

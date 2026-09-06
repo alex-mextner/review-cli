@@ -524,8 +524,8 @@ def _secondary_jobs_dir() -> Path | None:
 def read_job(job_id: str) -> dict[str, Any] | None:
     """The raw recorded fields for `job_id`, or None if no such job exists, the job-id
     is malformed (`InvalidJobId` — treated the same as "doesn't exist" for a READ; see
-    `job_path`), or the file is corrupt (a torn read of a job mid-write by another
-    process — `_atomic_write`'s rename makes this rare, but a reader must not crash on
+    `job_path`), or the file is corrupt or not a JSON object (a torn read of a job
+    mid-write by another process — `_atomic_write`'s rename makes this rare, but a reader must not crash on
     it). Falls through to `_secondary_jobs_dir()` on a miss in the primary location —
     see its docstring for why the SAME job-id lookup can legitimately need to check
     two different directories."""
@@ -541,16 +541,23 @@ def read_job(job_id: str) -> dict[str, Any] | None:
         if not path.exists():
             return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        rec = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    # A file holding valid JSON that is not a record (`[]`, `"x"`: stale or hand-edited)
+    # is "no record" too — `write_job`'s read-modify-write would otherwise raise
+    # `TypeError` on `data["job_id"]` inside the finalizer of an otherwise successful
+    # detached review.
+    return rec if isinstance(rec, dict) else None
 
 
 def list_jobs() -> list[dict[str, Any]]:
     """Every recorded job, oldest first (job ids sort chronologically — see `new_job_id`).
-    Skips any record that fails to parse rather than raising, so one corrupt file can't
-    hide every other job from `review jobs`. Merges in `_secondary_jobs_dir()`'s
-    records too (deduped by job_id, primary wins a collision) — see its docstring."""
+    Skips any record that fails to parse — or parses to something other than a dict
+    carrying a well-formed `job_id` (`{}`, `[]`, a bare string: a stale or hand-edited
+    file) — rather than raising, so one bad file can't hide every other job from
+    `review jobs`. Merges in `_secondary_jobs_dir()`'s records too (deduped by job_id,
+    primary wins a collision) — see its docstring."""
     seen: dict[str, dict[str, Any]] = {}
     dirs = [jobs_dir()]
     secondary = _secondary_jobs_dir()
@@ -562,10 +569,22 @@ def list_jobs() -> list[dict[str, Any]]:
             if job_id in seen:
                 continue
             try:
-                seen[job_id] = json.loads(p.read_text(encoding="utf-8"))
+                rec = json.loads(p.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
+            if _is_well_formed_record(rec, job_id):
+                seen[job_id] = rec
     return [seen[k] for k in sorted(seen)]
+
+
+def _is_well_formed_record(rec: Any, job_id: str) -> bool:
+    """A listed record must be a dict whose `job_id` is a valid id matching its own
+    file name — everything `review jobs` indexes by."""
+    return (
+        isinstance(rec, dict)
+        and rec.get("job_id") == job_id
+        and _JOB_ID_RE.match(job_id) is not None
+    )
 
 
 def is_pid_alive(pid: int) -> bool:

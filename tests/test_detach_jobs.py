@@ -456,7 +456,12 @@ def test_detach_rejected_for_leading_options_and_non_review_verbs():
             ["install-skill", "--detach"],
         ):
             proc = _run_cli(args, env)
-            assert proc.returncode == 2, (args, proc.returncode, proc.stdout, proc.stderr)
+            assert proc.returncode == 2, (
+                args,
+                proc.returncode,
+                proc.stdout,
+                proc.stderr,
+            )
             assert "--detach" in proc.stderr, (args, proc.stderr)
             assert "detached job" not in proc.stdout, (args, proc.stdout)
         jobs_dir = tmp / "jobs"
@@ -485,7 +490,9 @@ def test_dead_pid_reconciliation_is_persisted_so_pid_reuse_cannot_resurrect_a_jo
             jobs_mod.is_pid_alive = lambda pid: False
             first = jobs_mod.job_status(job_id)
             assert first and first["status"] == "unknown-terminated", first
-            assert (jobs_mod.read_job(job_id) or {}).get("status") == "unknown-terminated"
+            assert (jobs_mod.read_job(job_id) or {}).get(
+                "status"
+            ) == "unknown-terminated"
             # The pid is now "alive" again (reused by an unrelated process): the
             # persisted terminal status must stick and the pid must not be re-probed.
             probed: list[int] = []
@@ -594,12 +601,97 @@ def test_detach_accepts_a_leading_global_option_before_the_mode():
         tmp = Path(d)
         repo = _make_repo(tmp)
         env = _env(tmp)
-        args = ["-m", "claude:claude-opus-4-8", "diff", "--staged", "-C", str(repo), "--detach"]
+        args = [
+            "-m",
+            "claude:claude-opus-4-8",
+            "diff",
+            "--staged",
+            "-C",
+            str(repo),
+            "--detach",
+        ]
         proc = _run_cli(args, env, timeout=10)
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
         job_id = _extract_job_id(proc.stdout)
         final = _poll_status_json(job_id, env)
         assert final.get("status") == "done", final
+
+
+def test_main_finalizer_never_turns_a_finished_review_into_a_failure():
+    """Review round 3 (GH-162), Codex P1: `main`'s finally-block job-status write caught
+    only `InvalidJobId`. A jobs dir that became unwritable AFTER spawn (a sandbox grant
+    expiring mid-review) made that write raise `OSError`, which escaped the finalizer
+    and replaced an otherwise successful review's exit code with a traceback. The
+    write is best-effort: the review's own exit code wins, and stderr says why the
+    record was not updated. Simulated by parking a DIRECTORY at the record's path so
+    `_atomic_write`'s `os.replace` fails with `OSError` exactly where a permission
+    error would."""
+    from reviewlib import jobs as jobs_mod
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        env = _env(tmp)
+        (tmp / "jobs").mkdir()
+        job_id = jobs_mod.new_job_id()
+        env["REVIEW_JOB_ID"] = job_id
+        (tmp / "jobs" / f"{job_id}.json").mkdir()
+        proc = _run_cli(["--help"], env, timeout=10)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        assert proc.stdout.startswith("usage:"), proc.stdout
+        assert "Traceback" not in proc.stderr, proc.stderr
+        assert "could not record the final status" in proc.stderr, proc.stderr
+        assert job_id in proc.stderr
+        # Same P1, second shape (Codex, staged round): the record file holds valid JSON
+        # that is not an object. `write_job`'s read-modify-write used to raise
+        # `TypeError` on it; `read_job` now treats a non-dict as "no record" and the
+        # finalizer simply (re)creates the record.
+        for body in ("[]", '"x"', "null"):
+            other = jobs_mod.new_job_id()
+            env["REVIEW_JOB_ID"] = other
+            (tmp / "jobs" / f"{other}.json").write_text(body, encoding="utf-8")
+            proc = _run_cli(["--help"], env, timeout=10)
+            assert proc.returncode == 0, (body, proc.stdout, proc.stderr)
+            assert "Traceback" not in proc.stderr, (body, proc.stderr)
+            assert (
+                json.loads((tmp / "jobs" / f"{other}.json").read_text())["status"]
+                == "done"
+            ), body
+
+
+def test_jobs_listing_skips_schema_malformed_records():
+    """Review round 3 (GH-162), Codex P2: `list_jobs` accepted ANY parsed JSON value,
+    so one stale/hand-edited `<id>.json` holding `{}`, `[]` or a bare string crashed
+    `review jobs` (`rec["job_id"]`) and hid every legitimate job. Such records are
+    skipped like a corrupt file, and a dict whose `job_id` disagrees with its own file
+    name is skipped too."""
+    from reviewlib import jobs as jobs_mod
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        env = _env(tmp)
+        jobs_dir = tmp / "jobs"
+        jobs_dir.mkdir()
+        good = jobs_mod.new_job_id()
+        bad_ids = [jobs_mod.new_job_id() for _ in range(4)]
+        for bad, body in zip(bad_ids, ("{}", "[]", '"x"', '{"job_id": "other"}')):
+            (jobs_dir / f"{bad}.json").write_text(body, encoding="utf-8")
+        (jobs_dir / "not-a-job-id.json").write_text(
+            '{"job_id": "not-a-job-id"}', encoding="utf-8"
+        )
+        saved = os.environ.get("REVIEW_JOBS_DIR")
+        os.environ["REVIEW_JOBS_DIR"] = str(jobs_dir)
+        try:
+            jobs_mod.write_job(good, status="done", exit_code=0, started_at=time.time())
+            listed = [rec["job_id"] for rec in jobs_mod.list_jobs()]
+        finally:
+            if saved is None:
+                os.environ.pop("REVIEW_JOBS_DIR", None)
+            else:
+                os.environ["REVIEW_JOBS_DIR"] = saved
+        assert listed == [good], listed
+        proc = _run_cli(["jobs", "--json"], env, timeout=10)
+        assert proc.returncode == 0, (proc.stdout, proc.stderr)
+        assert [rec["job_id"] for rec in json.loads(proc.stdout)] == [good]
 
 
 if __name__ == "__main__":

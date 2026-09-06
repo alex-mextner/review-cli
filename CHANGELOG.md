@@ -17,7 +17,11 @@ semantic versioning.
   a "running" record is now written back as `unknown-terminated` once, so a later pid
   reuse (or a reboot) can never flip the job back to "running" and make `review wait`
   block; a brand-new record with no pid yet stays "running" for a short spawn grace
-  instead of being misreported as terminated by a concurrent `review jobs`.
+  instead of being misreported as terminated by a concurrent `review jobs`. The
+  finalizer's own job-status write is best-effort: a jobs dir that became unwritable
+  after spawn no longer turns a finished review into a traceback exit, and one
+  schema-malformed `<id>.json` (`{}`, `[]`, a bare string) no longer crashes
+  `review jobs` — it is skipped like a corrupt file.
 
 - **A sandboxed caller's unwritable log location no longer kills the whole seat
   (review-cli#162).** `log_dir()` (`~/Library/Logs/review-cli` on macOS,
