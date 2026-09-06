@@ -56,6 +56,17 @@ SOL_SEAT = "codex:gpt-5.6-sol"
 # distinct model, and this seat no longer drifts if the operator's global codex default
 # changes.
 ASTRA_SEAT = "codex:gpt-6-astra"
+# GPT-5.6-Terra ("Terra") — review-cli#382: a THIRD, distinct codex model on the same
+# already-paid OpenAI/Codex account as SOL_SEAT/ASTRA_SEAT. Live `performance` fallback
+# for the disabled GLM_COMMANDCODE_SEAT. Pinned explicitly (not bare `"codex"`), same
+# anti-duplicate reason as ASTRA_SEAT above.
+TERRA_SEAT = "codex:gpt-5.6-terra"
+# claude-sonnet-5 ("Sonnet") — review-cli#382: a SECOND, distinct Anthropic model on the
+# same already-paid Claude account as Opus/FABLE_SEAT. Live `quality` fallback for Kimi
+# (commandcode) and the quota-fragile z.ai-GLM seat. `review stat` telemetry (2026-09-05):
+# dispatched cleanly 7/7 times historically, zero recorded failures — unlike FABLE_SEAT's
+# ~100% dispatch failure rate (see its own entry below).
+SONNET_SEAT = "claude:claude-sonnet-5"
 # review-cli#fable-seat-reliability (GLM review finding): the single source of truth
 # for the Fable seat's model id — every sibling seat (KIMI_SEAT/SOL_SEAT/
 # GLM_COMMANDCODE_SEAT above) already has one; the Fable id was the one left as a
@@ -141,6 +152,12 @@ MODEL_ALIASES = {
     # the same failure class documented on `opus` above. Pin it, like Sol.
     "astra": ASTRA_SEAT,
     "gpt6astra": ASTRA_SEAT,
+    # Terra falls through the same opencode catch-all without this — same class as
+    # opus/astra above. Pin it too (review-cli#382).
+    "terra": TERRA_SEAT,
+    "gpt56terra": TERRA_SEAT,
+    "sonnet": SONNET_SEAT,
+    "sonnet5": SONNET_SEAT,
     # z.ai (Zhipu / GLM) — OpenAI-compatible keyed HTTP backend. Bare `zai` resolves
     # directly in resolve_backend (env ZAI_MODEL / glm-5.2 default — the newest GLM,
     # reachable on the Coding-Plan endpoint). These aliases pin specific GLM model ids;
@@ -273,7 +290,7 @@ class BoardReviewer:
         return REVIEW_ROLES.get(self.role, "")
 
 
-# DEFAULT_BOARD: the raw 10-seat board used as the source of truth for built-in presets
+# DEFAULT_BOARD: the raw 12-seat board used as the source of truth for built-in presets
 # and for custom/config fallback paths. A plain `review diff` runs the default preset,
 # not this tuple directly. The board is ordered by *priority* — strongest WORKING model
 # first, weakest (or least-reliable, review-cli#fable-seat-reliability) last — NOT by
@@ -291,18 +308,39 @@ class BoardReviewer:
 # To RE-RANK the board, just reorder this tuple (top = highest priority). Model ids are
 # byte-exact against the provider catalogs (commandcode gateway /models, z.ai Coding-Plan)
 # — do not alter the strings. Each is the TOP available version of its model family
-# (fable-5, Sol, opus-4-8, GLM-5.2-via-gateway, Kimi-K2.7, GPT-6-Astra,
-# Qwen3.7-Max, deepseek-v4-pro, Gemini, glm-5.2-via-z.ai).
+# (fable-5, Sol, opus-4-8, GLM-5.2-via-gateway, Kimi-K2.7, GPT-6-Astra, GPT-5.6-Terra,
+# claude-sonnet-5, Qwen3.7-Max, deepseek-v4-pro, Gemini, glm-5.2-via-z.ai).
+#
+# review-cli#382: TERRA_SEAT/SONNET_SEAT were added as live `performance`/`quality`
+# fallbacks (unpaid_providers disabling commandcode left those roles with zero live
+# seats — full incident writeup in CHANGELOG.md), and the z.ai-GLM seat was re-lensed
+# `quality` -> `security`. Astra's pre-existing `consistency` role (a duplicate of Sol's)
+# was DELIBERATELY LEFT UNCHANGED — an earlier draft flipped it to `security`, but that
+# left `consistency` with zero live fallback board-wide; see its own entry below. `tests`/
+# `contracts`/`architect` stay thin (no third distinct already-paid model existed to give
+# them one too). Stopgap within the existing hardcoded seat-string mechanism, not the
+# "roles declare models, harness auto-resolves" redesign tracked as review-cli#364/
+# rig-cli#337.
+#
+# KNOWN LIMIT: `pool: 4` can't fit every distinct role once Sol AND commandcode disabled
+# are both in play (`--preset heavy`'s available top-4 becomes Sol/Opus/Astra/Terra —
+# `consistency` x2, `correctness`, `performance` — with `quality`/`security` in reserve),
+# and `pool: 2` (the `light` preset a bare `review diff` uses) can never show more than 2
+# roles at all. Neither is a #382 regression (both predate it) and neither is fixed by
+# reordering — only a role-aware selector (review-cli#364/rig-cli#337, out of scope) or
+# more paid seats would. See test_heavy_preset_double_failure_still_beats_pre_382_board /
+# test_light_preset_double_failure_pool_unchanged_but_reserve_deepens for the traced proof
+# that #382 still strictly improves both (deeper reserve, no fewer pool seats) even here.
 #
 # AGENTIC BY DEFAULT (review-cli#24): every board seat that CAN read the repo does. The
-# two claude seats run via the agentic claude CLI; Sol/Astra via the codex CLI
+# claude seats run via the agentic claude CLI; Sol/Astra/Terra via the codex CLI
 # (`codex exec -s read-only -C <cwd>`); Kimi/z.ai-GLM/Qwen/DeepSeek through opencode
 # (`oc:provider/model`, built by `_agentic()` from the diff-only constant) so they ALSO
 # run read-only inside `-C` and can open ANY project file — not just the diff in the
 # prompt. The board has a reserve, so an `oc:` seat that opencode can't reach on a given
 # host probes UNAVAILABLE and is backfilled (startup or mid-run failover) — the board
 # degrades gracefully rather than blocking. Two seats stay diff-only stateless HTTP calls:
-# Gemini (no agentic transport) and the priority-3 GLM-5.2-via-commandcode seat
+# Gemini (no agentic transport) and the GLM-5.2-via-commandcode seat
 # (`GLM_COMMANDCODE_SEAT` — opencode's commandcode provider does not register this GLM id, so
 # the agentic form errors; the keyed-HTTP route is the one that reaches it). Both are read-
 # only by construction (they POST only the diff). The diff-only `commandcode:`/`zai:` REST
@@ -329,45 +367,64 @@ DEFAULT_BOARD = (
     # errors — the diff-only route is the one that actually reaches it. Read-only by
     # construction (POSTs only the diff; no repo/tools/exec). Distinct from the lower-priority
     # `oc:zai/glm-5.2` seat (same model FAMILY, different provider/transport: z.ai vs gateway).
-    # ROLE: `performance` — NOT `correctness` (which would duplicate Opus's lens). Inserting
-    # GLM-cc carries `performance` to keep the default top-4 pool's lens coverage intact
-    # (consistency/correctness/performance/quality — review-cli#fable-seat-reliability:
-    # was architect/consistency/correctness/performance before Fable's demotion moved
-    # Kimi's `quality` lens into the top-4 in its place), instead of dropping performance
-    # from a plain `review diff` and duplicating correctness (review of #57).
+    # ROLE: `performance` — NOT `correctness` (which would duplicate Opus's lens).
     BoardReviewer(GLM_COMMANDCODE_SEAT, "performance", "GLM-cc"),
     # priority 4 — Kimi K2.7, AGENTIC through opencode (reads the repo). Same model id as
     # the flat panel's KIMI_SEAT (one source of truth via `_agentic`); transport-only diff.
+    # Kept at this exact position: both the raw top-4 (Sol/Opus/GLM-cc/Kimi) and
+    # DEFAULT_PRESET_BOARD's top-4 (Opus/GLM-cc/Kimi/Astra) need it here to stay
+    # 4-distinct-roles — see test_default_pool_roles_are_distinct_no_lens_lost /
+    # test_preset_boards_pin_model_order_pool_and_effort. TERRA_SEAT/SONNET_SEAT (below)
+    # are placed AFTER Astra, outside both windows, for the same reason.
     BoardReviewer(_agentic(KIMI_SEAT), "quality", "Kimi"),
     # priority 5 — Astra, the agentic codex CLI route (reads the whole repo), pinned via
-    # ASTRA_SEAT rather than the bare `"codex"` seat this used to be (see ASTRA_SEAT's
-    # comment for why). Same role (`consistency`) as before — this replaces the seat, it
-    # doesn't add a new one, so the board's role/lens coverage is unchanged.
+    # ASTRA_SEAT rather than the bare `"codex"` seat this used to be. ROLE LEFT AS
+    # `consistency` (a duplicate of Sol's) — an earlier draft of #382 flipped it to
+    # `security`, but that left `consistency` with ZERO live fallback board-wide; see the
+    # KNOWN LIMIT comment above DEFAULT_BOARD and
+    # test_glm_cc_unavailable_backfills_from_astra_with_a_duplicate_lens.
     BoardReviewer(ASTRA_SEAT, "consistency", "Astra"),
-    # priority 6 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
+    # priority 6 — Terra (review-cli#382): live `performance` fallback, promoted whenever
+    # GLM-cc is unavailable.
+    BoardReviewer(TERRA_SEAT, "performance", "Terra"),
+    # priority 7 — Sonnet (review-cli#382): live `quality` fallback for Kimi — the exact
+    # role the 2026-09-05 z.ai-quota incident exposed (see CHANGELOG.md).
+    BoardReviewer(SONNET_SEAT, "quality", "Sonnet"),
+    # priority 8 — Qwen3.7-Max, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(_agentic("commandcode:Qwen/Qwen3.7-Max"), "security", "Qwen"),
-    # priority 7 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
+    # priority 9 — DeepSeek-V4-Pro, AGENTIC through opencode's commandcode provider (reads the repo).
     BoardReviewer(
         _agentic("commandcode:deepseek/deepseek-v4-pro"), "tests", "DeepSeek"
     ),
-    # priority 8 — Gemini.
+    # priority 10 — Gemini. `contracts` has no other live seat (review-cli#382: there was
+    # no third distinct already-paid model left to give it without doubling up quota
+    # pressure on an account already carrying two board seats — see the block comment
+    # above DEFAULT_BOARD) — it stays thin until commandcode/gemini are re-enabled or a
+    # new paid seat is added.
     BoardReviewer("gemini", "contracts", "Gemini"),
-    # priority 9 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
+    # priority 11 — GLM-5.2 (his z.ai subscription, the newest GLM), AGENTIC through
     # opencode's `zai` provider. DELIBERATELY DEPRIORITIZED to the bottom of the reserve
     # (review-cli#65): this seat is observed to be PATHOLOGICALLY SLOW under load, so
     # promoting it onto the failover critical path stalls the pool's path to a verdict.
     # It stays on the board (still backfills when every faster reserve is also
     # exhausted), but it no longer blocks a fast verdict — Qwen / DeepSeek / Gemini are
-    # promoted before it (review-cli#fable-seat-reliability: now above only Fable, not
-    # literally last — that demotion added a still-worse seat below it). To re-rank,
-    # move this line up; its position IS its priority.
-    BoardReviewer(_agentic("zai:glm-5.2"), "quality", "GLM"),
-    # priority 10 (LAST-RESORT reserve) — Fable 5 (Anthropic flagship). DEMOTED from
+    # promoted before it (review-cli#fable-seat-reliability: above only Fable). To
+    # re-rank, move this line up; its position IS its priority. ROLE CHANGED (review-cli#382)
+    # from `quality` to `security`: Sonnet now covers `quality` more reliably, freeing this
+    # live-but-fragile seat to backfill `security` (whose only other seat, Qwen, is
+    # disabled) instead of duplicating Sonnet.
+    BoardReviewer(_agentic("zai:glm-5.2"), "security", "GLM"),
+    # priority 12 (LAST-RESORT reserve) — Fable 5 (Anthropic flagship). DEMOTED from
     # priority 1 to LAST (review-cli#fable-seat-reliability, 2026-08): `review stat`
     # telemetry showed a 97.9-100% dispatch failure rate (chronic session/usage-limit
     # exhaustion on the account it runs through — being priority 1 made it the FIRST
     # seat to exhaust that account's quota on every run), up from 67.7% two weeks
-    # earlier and still climbing. At priority 1 this cost a near-certain-doomed real
+    # earlier and still climbing. STILL TRUE as of 2026-09-05 (review-cli#382 investigation,
+    # `review stat --days 14`): 422 dispatch attempts, 100% failure rate, 674 retry/
+    # promotion events (session_limit=7, paywall=278, auth=214, other=175) — no
+    # improvement, so Fable stays last-resort rather than being promoted to help any of
+    # the roles this change targets; a seat that answers ~0% of the time is not a real
+    # fallback, it is decoration. At priority 1 this cost a near-certain-doomed real
     # dispatch on literally every default review before a single working seat ever
     # answered. Mirrors the review-cli#65 precedent right above (a seat with a
     # confirmed pathological failure mode is deprioritized to the bottom of the
@@ -403,7 +460,11 @@ DEFAULT_PRESET_BOARD = tuple(
 # moving Fable anywhere else would have silently shifted every later seat's tier by one slot
 # with no test catching it (the tuple-order pin would read as a membership change, not a
 # tier-boundary bug). The named `_heavy_eligible_seats` intermediate makes both the filter-
-# first ordering and the resulting 9-seat invariant self-documenting.
+# first ordering and the resulting seat-count invariant self-documenting (11 seats as of
+# review-cli#382's TERRA_SEAT/SONNET_SEAT addition — first 4 get `xhigh` effort: Sol, Opus,
+# GLM-cc, Kimi (unchanged from before #382 — TERRA_SEAT/SONNET_SEAT were inserted at raw
+# priority 6-7, AFTER Kimi at priority 4, so they land in the `max` tier, not `xhigh`); the
+# rest get `max`).
 _heavy_eligible_seats = tuple(r for r in DEFAULT_BOARD if r.model != FABLE_SEAT)
 HEAVY_PRESET_BOARD = tuple(
     BoardReviewer(r.model, r.role, r.display, "xhigh" if i < 4 else "max")

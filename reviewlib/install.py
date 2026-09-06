@@ -132,9 +132,9 @@ failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "over
 501 / refusal) is never retried and falls straight to the reserve. `--retry N` (or
 `$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
 `--pool N` sizes the pool (top-N available, same failover); `--pool 0` runs all available
-seats in the selected preset/board (`--preset heavy --pool 0` covers all 9
-heavy-preset-built-ins; the raw 10-seat board, incl. last-resort Fable, needs an
-explicit `board:`).
+seats in the selected preset/board (`--preset heavy --pool 0` covers all 11
+heavy-preset-built-ins; the raw 12-seat board, incl. last-resort Fable, needs an
+explicit `board:`/`models:`).
 The board is **never disabled** — there is **no `--no-board` flag**. An explicit `-m`
 always limits the run to exactly those models; with no configured `models:`/`board:` it is
 the legacy flat panel unless an explicit preset supplies metadata, and with config present it

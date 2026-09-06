@@ -390,7 +390,7 @@ def test_board_flags_and_listing():
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "oc:zai/glm-5.2",
         "contracts",
-        "8 seats",
+        "10 seats",
         "#1",
         # The CTO-directed GLM-5.2-via-commandcode seat (light preset, diff-only keyed HTTP).
         "commandcode:zai-org/GLM-5.2",
@@ -399,12 +399,13 @@ def test_board_flags_and_listing():
         assert_in(needle, board, "in --show-board")
     heavy = review_out("--show-board", "--preset", "heavy")
     # review-cli#fable-seat-reliability: claude:claude-fable-5 is EXCLUDED from the
-    # heavy preset (a confirmed ~100% dispatch failure rate) — 9 seats, not 10, and no
-    # "architect" lens (Fable was the only seat carrying it).
+    # heavy preset (a confirmed ~100% dispatch failure rate) — no "architect" lens
+    # (Fable was the only seat carrying it). review-cli#382 added TERRA_SEAT/SONNET_SEAT,
+    # so heavy is now 11 seats, not 9/10.
     for needle in (
         "source: preset:heavy",
         "codex:gpt-5.6-sol",
-        "9 seats",
+        "11 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
     assert_not_in("claude:claude-fable-5", heavy)

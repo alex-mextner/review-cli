@@ -57,13 +57,33 @@ from reviewlib.config import (  # noqa: E402
     DEFAULT_BOARD,
     DEFAULT_POOL_SIZE,
     GLM_COMMANDCODE_SEAT,
+    HEAVY_PRESET_BOARD,
+    KIMI_SEAT,
+    LIGHT_PRESET_BOARD,
     SOL_SEAT,
+    SONNET_SEAT,
+    TERRA_SEAT,
     BoardReviewer,
+    _agentic,
+    preset_pool_size,
     split_pool_reserve,
 )
 from reviewlib.panel import (  # noqa: E402
     result_is_usable,
     run_board_with_failover,
+)
+
+# review-cli#382 (round 5 review finding): shared by both the heavy- and light-preset
+# double-failure tests below, so a future commandcode seat addition/removal/rename is a
+# single edit instead of two independently-drifting copies.
+_COMMANDCODE_AND_GEMINI_SEATS = frozenset(
+    {
+        GLM_COMMANDCODE_SEAT,
+        _agentic(KIMI_SEAT),
+        _agentic("commandcode:Qwen/Qwen3.7-Max"),
+        _agentic("commandcode:deepseek/deepseek-v4-pro"),
+        "gemini",
+    }
 )
 
 PROMPT = "Review this diff."
@@ -217,7 +237,12 @@ def test_glm_cc_unavailable_backfills_from_astra_with_a_duplicate_lens():
     rate made that trade worth it — see DEFAULT_BOARD's Fable comment), the next
     backfill is Astra, whose `consistency` lens duplicates Sol's — a real, accepted,
     narrow trade-off: this combo (GLM-cc down AND a 4th seat needed) is far rarer than
-    Fable's near-certain failure on literally every default review."""
+    Fable's near-certain failure on literally every default review. review-cli#382 (round
+    2): an earlier draft of that change re-lensed Astra to `security` specifically to
+    close this duplicate, but a codex re-review caught that doing so left `consistency`
+    with ZERO live fallback anywhere on the whole board — worse than this narrow,
+    pre-existing trade-off. Astra's role is deliberately left unchanged; see its own
+    DEFAULT_BOARD comment."""
     board = list(DEFAULT_BOARD)
     available = {r.model for r in board if r.model != GLM_COMMANDCODE_SEAT}
     pool, _ = split_pool_reserve(board, DEFAULT_POOL_SIZE, _avail(available))
@@ -232,6 +257,108 @@ def test_glm_cc_unavailable_backfills_from_astra_with_a_duplicate_lens():
     roles = [r.role for r in pool]
     assert roles.count("consistency") == 2, roles  # Sol + Astra, the accepted trade-off
     assert set(roles) == {"consistency", "correctness", "quality"}, roles
+
+
+def test_heavy_preset_double_failure_still_beats_pre_382_board():
+    """codex review finding (review-cli#382): `--preset heavy` (which keeps Sol, unlike
+    `DEFAULT_PRESET_BOARD`) can only fit 4 distinct roles in its pool once commandcode is
+    ALSO disabled -- its top-4-available becomes Sol/Opus/Astra/Terra, i.e. `consistency`
+    (Sol AND Astra -- Astra's pre-existing role, deliberately left unchanged, see its
+    DEFAULT_BOARD comment) / `correctness` / `performance`, with `quality` (Sonnet) AND
+    `security` (the z.ai-GLM seat) both pushed to reserve. No re-ordering fixes this for
+    every board at once (see the KNOWN LIMIT comment above DEFAULT_BOARD) -- pool=4 cannot
+    hold every distinct role Sol+Opus+Astra+performance+quality+security would need. This
+    test proves the change is still a genuine improvement for heavy in the ACTUAL incident
+    shape: not just commandcode disabled, but the z.ai GLM seat (the SAME seat that hit a
+    real quota exhaustion in the 2026-09-05 incident) also down. Before review-cli#382,
+    that left heavy with only 3 available seats (Sol, Opus, Astra) and ZERO reserve. After
+    #382, heavy still gets a full 4-seat pool, with Sonnet as the immediate first-reserve
+    `quality` backfill on any pool-seat failure."""
+    board = list(HEAVY_PRESET_BOARD)
+    pool_size = preset_pool_size("heavy")
+    available = {r.model for r in board} - _COMMANDCODE_AND_GEMINI_SEATS
+
+    expected_pool_models = [SOL_SEAT, "claude:claude-opus-4-8", ASTRA_SEAT, TERRA_SEAT]
+
+    # Post-#382: commandcode/gemini disabled only -- the routine incident precursor.
+    pool, reserve = split_pool_reserve(board, pool_size, _avail(available))
+    assert [r.model for r in pool] == expected_pool_models
+    assert [r.role for r in pool] == [
+        "consistency",
+        "correctness",
+        "consistency",
+        "performance",
+    ]
+    reserve_models = {r.model for r in reserve}
+    assert SONNET_SEAT in reserve_models and "oc:zai/glm-5.2" in reserve_models
+
+    # Post-#382: the z.ai GLM seat -- the seat that hit the REAL 2026-09-05 quota
+    # exhaustion -- ALSO down, mirroring the real incident shape exactly.
+    available_double_failure = available - {"oc:zai/glm-5.2"}
+    pool_double_failure, reserve_double_failure = split_pool_reserve(
+        board, pool_size, _avail(available_double_failure)
+    )
+    assert len(pool_double_failure) == 4, pool_double_failure  # still FULL, not degraded
+    assert {r.model for r in pool_double_failure} == set(expected_pool_models)
+    # quality is the FIRST backfill
+    assert (
+        reserve_double_failure
+        and reserve_double_failure[0].model == SONNET_SEAT
+    )
+
+    # Pre-#382 comparison (drop TERRA_SEAT/SONNET_SEAT -- the two seats #382 added):
+    # since Astra's role is UNCHANGED by #382, this accurately reconstructs the board as
+    # it existed before this change. The equivalent double failure left only Sol/Opus/
+    # Astra available (3, one seat short of the pool, with `consistency` ALREADY
+    # duplicated) and NO reserve whatsoever.
+    pre_382_board = [r for r in board if r.model not in {TERRA_SEAT, SONNET_SEAT}]
+    pre_382_available = {
+        r.model for r in pre_382_board if r.model in available_double_failure
+    }
+    pre_382_pool, pre_382_reserve = split_pool_reserve(
+        pre_382_board, pool_size, _avail(pre_382_available)
+    )
+    assert len(pre_382_pool) == 3, pre_382_pool  # degraded pool, one seat short
+    assert not pre_382_reserve, pre_382_reserve  # nothing left to backfill with
+
+
+def test_light_preset_double_failure_pool_unchanged_but_reserve_deepens():
+    """codex review finding (review-cli#382, round 4): a bare `review diff` runs the
+    `light` preset at `pool: 2` (Alex, 2026-08-28 -- cheap-by-default). With only 2 seats
+    in the pool, it can NEVER show more than 2 of the 8 board roles at once, incident or
+    not -- that is a deliberate, pre-existing cost/behavior choice (out of scope for #382
+    to change; see the KNOWN LIMIT comment above DEFAULT_BOARD) and not something a live
+    fallback seat can fix. What #382 DOES change for light: in the exact 2026-09-05
+    incident shape (commandcode/gemini disabled AND the z.ai GLM seat also down), the
+    DISPATCHED pool is IDENTICAL before and after this change (Opus/Astra --
+    correctness/consistency), but the RESERVE is no longer empty -- Terra and Sonnet now
+    backfill if Opus or Astra ALSO fail mid-run, where pre-#382 there was nothing left at
+    all."""
+    board = list(LIGHT_PRESET_BOARD)
+    pool_size = preset_pool_size("light")
+    available_double_failure = (
+        {r.model for r in board} - _COMMANDCODE_AND_GEMINI_SEATS - {"oc:zai/glm-5.2"}
+    )
+
+    pool, reserve = split_pool_reserve(
+        board, pool_size, _avail(available_double_failure)
+    )
+    assert [r.model for r in pool] == ["claude:claude-opus-4-8", ASTRA_SEAT]
+    assert [r.role for r in pool] == ["correctness", "consistency"]
+    reserve_models = [r.model for r in reserve]
+    assert reserve_models == [TERRA_SEAT, SONNET_SEAT]
+
+    # Pre-#382 comparison: same board minus TERRA_SEAT/SONNET_SEAT -- the dispatched pool
+    # is byte-identical, but the reserve was empty (nothing left to backfill Opus/Astra).
+    pre_382_board = [r for r in board if r.model not in {TERRA_SEAT, SONNET_SEAT}]
+    pre_382_available = {
+        r.model for r in pre_382_board if r.model in available_double_failure
+    }
+    pre_382_pool, pre_382_reserve = split_pool_reserve(
+        pre_382_board, pool_size, _avail(pre_382_available)
+    )
+    assert [r.model for r in pre_382_pool] == [r.model for r in pool]  # unchanged
+    assert not pre_382_reserve, pre_382_reserve  # nothing left to backfill with
 
 
 def test_startup_failover_respects_priority_order():
