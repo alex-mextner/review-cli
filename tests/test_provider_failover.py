@@ -13,6 +13,7 @@ Plain-script harness (mirrors tests/test_pool_guard.py): each test_* is run by _
 
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -557,6 +558,154 @@ def test_flat_m_seat_switches_provider_midreview_and_completes():
         assert fb.dispatched[:2] == ["zai:glm-5.2", "oc:zai/glm-5.2"], fb.dispatched
         assert "commandcode:zai-org/GLM-5.2" not in fb.dispatched, fb.dispatched
         assert json.loads(Path(fb.cache).read_text()).get("glm-5.2") == "oc:zai/glm-5.2"
+
+
+def test_flat_m_tallies_tokens_from_every_dispatch_attempt_not_just_the_final_one():
+    """codex review finding: the flat `-m` path's per-seat tally used to count only the
+    seat's FINAL ReviewResult, undercounting a seat whose first provider attempt also
+    spent real tokens before failing over. Provider A dispatches (and is tallied) with
+    real tokens, then fails; provider B dispatches (and is tallied) with real tokens and
+    succeeds. The recorded total must be the SUM of both attempts, not just B's -- and
+    not MORE than the sum either (would mean B got double-counted)."""
+    old_resolve = _review_mod.resolve_backend
+    old_avail = _review_mod.backend_available
+    old_unpaid = _review_mod.runtime_provider_marked_unpaid
+    old_env = {
+        k: os.environ.get(k) for k in ("REVIEW_PROVIDER_CACHE", "REVIEW_RETRY_COUNT")
+    }
+
+    def _resolve(model):
+        def _backend(m, prompt, diff, cwd, timeout, round_no=0, effort=None):
+            if m == "zai:glm-5.2":
+                return _backends.ReviewResult(
+                    model=m,
+                    command="fake",
+                    returncode=1,
+                    stdout="",
+                    stderr="boom",
+                    prompt_tokens=50,
+                    output_tokens=10,
+                )
+            return _backends.ReviewResult(
+                model=m,
+                command="fake",
+                returncode=0,
+                stdout="real review",
+                stderr="",
+                prompt_tokens=200,
+                output_tokens=40,
+            )
+
+        return _backend
+
+    try:
+        _review_mod.resolve_backend = _resolve
+        _review_mod.backend_available = lambda _m: True
+        _review_mod.runtime_provider_marked_unpaid = lambda _m: False
+        os.environ["REVIEW_PROVIDER_CACHE"] = str(
+            Path(tempfile.mkdtemp()) / "last-provider.json"
+        )
+        os.environ["REVIEW_RETRY_COUNT"] = "0"
+        _panel.begin_call_tally()
+        rc = _review_mod.mode_review(
+            ["zai:glm-5.2"], "Review this.", "+x", REPO_ROOT, 5, False, board=None
+        )
+        tally = _panel.end_call_tally()
+        assert rc == 0, "seat should have completed via the failover provider"
+        assert tally["prompt_tokens"] == 250, tally  # 50 (failed A) + 200 (ok B)
+        assert tally["output_tokens"] == 50, tally  # 10 (failed A) + 40 (ok B)
+    finally:
+        _review_mod.resolve_backend = old_resolve
+        _review_mod.backend_available = old_avail
+        _review_mod.runtime_provider_marked_unpaid = old_unpaid
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if _panel._call_tally is not None:
+            _panel.end_call_tally()
+
+
+def test_flat_m_tallies_tokens_across_an_in_seat_retry_of_the_same_provider():
+    """Companion to the failover test above, covering the OTHER attempt multiplier
+    codex/Fable flagged as untested: `run_seat_with_retry`'s in-seat retry (same
+    provider, transient failure then success) -- not provider failover. The first
+    attempt gets a TRANSIENT failure (503) with real token usage, retries the SAME
+    provider, and the retry succeeds with its own real token usage. Both attempts
+    must be tallied exactly once each."""
+    old_resolve = _review_mod.resolve_backend
+    old_avail = _review_mod.backend_available
+    old_unpaid = _review_mod.runtime_provider_marked_unpaid
+    old_env = {
+        k: os.environ.get(k)
+        for k in ("REVIEW_PROVIDER_CACHE", "REVIEW_RETRY_COUNT", "REVIEW_LOG_DIR")
+    }
+    calls: list[str] = []
+    tmp_dir = tempfile.mkdtemp()
+
+    def _resolve(model):
+        def _backend(m, prompt, diff, cwd, timeout, round_no=0, effort=None):
+            calls.append(m)
+            if len(calls) == 1:
+                return _backends.ReviewResult(
+                    model=m,
+                    command="fake",
+                    returncode=1,
+                    stdout="",
+                    stderr="503 service unavailable",  # TRANSIENT -> in-seat retry
+                    prompt_tokens=30,
+                    output_tokens=5,
+                )
+            return _backends.ReviewResult(
+                model=m,
+                command="fake",
+                returncode=0,
+                stdout="real review after retry",
+                stderr="",
+                prompt_tokens=180,
+                output_tokens=35,
+            )
+
+        return _backend
+
+    try:
+        _review_mod.resolve_backend = _resolve
+        _review_mod.backend_available = lambda _m: True
+        _review_mod.runtime_provider_marked_unpaid = lambda _m: False
+        os.environ["REVIEW_PROVIDER_CACHE"] = str(Path(tmp_dir) / "last-provider.json")
+        os.environ["REVIEW_RETRY_COUNT"] = "1"
+        # A transient failure writes a durable retry-event log (write_retry_log) --
+        # redirect it into the same throwaway dir instead of the user's real
+        # ~/.config/review-cli (codex review finding: this test previously polluted
+        # the real log directory on every run).
+        os.environ["REVIEW_LOG_DIR"] = tmp_dir
+        # No sleeper override available through mode_review()'s public surface -- accepts
+        # the real ~0.5s base backoff (retry.py's _BASE_DELAY_SECONDS) for this one retry.
+        _panel.begin_call_tally()
+        rc = _review_mod.mode_review(
+            ["zai:glm-5.2"], "Review this.", "+x", REPO_ROOT, 5, False, board=None
+        )
+        tally = _panel.end_call_tally()
+        assert rc == 0, "seat should have completed on the in-seat retry"
+        # Both attempts must have dispatched the SAME provider -- an in-seat retry, not
+        # a provider failover (Fable review finding: the prior version of this test
+        # never checked this, so it couldn't tell the two paths apart).
+        assert calls == ["zai:glm-5.2", "zai:glm-5.2"], calls
+        assert tally["prompt_tokens"] == 210, tally  # 30 (failed) + 180 (retried ok)
+        assert tally["output_tokens"] == 40, tally  # 5 (failed) + 35 (retried ok)
+    finally:
+        _review_mod.resolve_backend = old_resolve
+        _review_mod.backend_available = old_avail
+        _review_mod.runtime_provider_marked_unpaid = old_unpaid
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if _panel._call_tally is not None:
+            _panel.end_call_tally()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def test_flat_m_all_providers_fail_reports_the_final_failure():

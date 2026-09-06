@@ -107,7 +107,32 @@ from .config import REVIEW_ROLES
 # binding" section. A record with none of these predates v4 (or ran in a context
 # with no resolvable repo/diff) — readers must treat that as identity UNKNOWN,
 # not as a mismatch.
-STATS_VERSION = 4
+#
+# v5 adds "prompt_tokens"/"output_tokens": int — aggregate REAL token usage summed
+# across every backend call in the run (panel.py's call tally, fed from
+# `ReviewResult.prompt_tokens`/`output_tokens`, which backends.py sets ONLY at the
+# REST call sites that parse a provider's own usage payload — gemini/OpenAI-shape
+# z.ai|commandcode|openrouter/anthropic). A CLI/agentic backend (codex, opencode,
+# omp, claude in CLI mode) never sets these, so it contributes 0, same as any error
+# path that never got a successful usage payload. 0 therefore means "no REST usage
+# data for this run" — NOT necessarily "zero tokens spent" — and a record with no
+# "prompt_tokens"/"output_tokens" key at all predates v4; both cases must be read
+# the same way (unknown/absent), never treated as a confirmed zero-token run.
+#
+# Relationship to reviewlib.dashboard.tokenstats (#194): that module is a SEPARATE,
+# complementary source — it derives token counts by re-parsing the per-call `.log`
+# files on disk (`extract_usage_tokens`, scoped to `_REST_USAGE_BACKENDS` to avoid a
+# real cross-contamination bug it already fixed) for the DETAILED per-model/
+# per-harness `review stat` report. This module's `prompt_tokens`/`output_tokens`
+# instead come from the SAME run's in-memory `ReviewResult` fields, aggregated once
+# per run for the lighter-weight ETA/quorum-gate store. Both trace back to the same
+# underlying provider usage payload, so they are two different aggregation
+# granularities over one source of truth, not two independent measurements — but
+# nothing in either module actively verifies the two stay in agreement; a scoping
+# divergence between `_REST_USAGE_BACKENDS` and what actually sets `ReviewResult`'s
+# token fields would drift silently. Worth a reconciliation check if this ever
+# needs to be load-bearing rather than directional.
+STATS_VERSION = 5
 _TASK_CODE_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,120}$")
 # `diff --git a/<path> b/<path>` header. Paths containing spaces/special chars are
 # C-quoted by git (`"a/weird\tname"`) and NOT unescaped here — extraction degrades
@@ -250,6 +275,8 @@ def record_run(
     diff_files: list[str] | None = None,
     diff_sha256: str | None = None,
     roles: list[str] | None = None,
+    prompt_tokens: int = 0,
+    output_tokens: int = 0,
 ) -> bool:
     """Append one run record to the JSONL store. Best-effort: never raises.
 
@@ -302,6 +329,10 @@ def record_run(
     ``passed``/``task_code``). ``diff_files`` MAY be an empty list (a real run with
     no diff, e.g. a diff-less ``just-ask``) — that is recorded as ``[]``, distinct
     from omitting the key entirely.
+
+    ``prompt_tokens``/``output_tokens`` are aggregate REAL token counts for the run
+    (see the v5 STATS_VERSION comment above) — default 0, which means "no REST usage
+    data", not a confirmed zero-token run.
     """
     try:
         clean_task = normalize_task_code(task_code)
@@ -316,6 +347,8 @@ def record_run(
         "duration_seconds": round(float(duration_seconds), 3),
         "ok_count": int(ok_count),
         "fail_count": int(fail_count),
+        "prompt_tokens": int(prompt_tokens),
+        "output_tokens": int(output_tokens),
     }
     if clean_task is not None:
         record["task_code"] = clean_task
@@ -1001,6 +1034,8 @@ def task_summaries() -> list[dict]:
                 "duration_seconds": 0.0,
                 "ok_count": 0,
                 "fail_count": 0,
+                "prompt_tokens": 0,
+                "output_tokens": 0,
             },
         )
         group["iterations"] += 1
@@ -1019,7 +1054,7 @@ def task_summaries() -> list[dict]:
         dur = record.get("duration_seconds")
         if isinstance(dur, (int, float)):
             group["duration_seconds"] += float(dur)
-        for key in ("ok_count", "fail_count"):
+        for key in ("ok_count", "fail_count", "prompt_tokens", "output_tokens"):
             value = record.get(key)
             if isinstance(value, int):
                 group[key] += value

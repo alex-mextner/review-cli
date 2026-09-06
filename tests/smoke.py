@@ -43,6 +43,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_qa_mode.py",
         "test_review_marker.py",
         "test_review_commit_checkpoint.py",
+        "test_review_stamp_delta_tolerance.py",
         "test_run_stats.py",
         "test_staged_diff_honors_c_repo.py",
     }
@@ -390,7 +391,7 @@ def test_board_flags_and_listing():
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "oc:zai/glm-5.2",
         "contracts",
-        "8 seats",
+        "10 seats",
         "#1",
         # The CTO-directed GLM-5.2-via-commandcode seat (light preset, diff-only keyed HTTP).
         "commandcode:zai-org/GLM-5.2",
@@ -399,12 +400,13 @@ def test_board_flags_and_listing():
         assert_in(needle, board, "in --show-board")
     heavy = review_out("--show-board", "--preset", "heavy")
     # review-cli#fable-seat-reliability: claude:claude-fable-5 is EXCLUDED from the
-    # heavy preset (a confirmed ~100% dispatch failure rate) — 9 seats, not 10, and no
-    # "architect" lens (Fable was the only seat carrying it).
+    # heavy preset (a confirmed ~100% dispatch failure rate) — no "architect" lens
+    # (Fable was the only seat carrying it). review-cli#382 added TERRA_SEAT/SONNET_SEAT,
+    # so heavy is now 11 seats, not 9/10.
     for needle in (
         "source: preset:heavy",
         "codex:gpt-5.6-sol",
-        "9 seats",
+        "11 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
     assert_not_in("claude:claude-fable-5", heavy)
@@ -716,6 +718,12 @@ _UNIT_FILES = [
     # (ok/staged/not-piped), the real `git commit` it makes, and the distinct
     # EXIT_COMMIT_FAILED when the commit subprocess itself (e.g. a rejecting hook) fails.
     ("test_review_commit_checkpoint.py", {}),
+    # The pre-commit gate's trivial-follow-up delta tolerance (review-cli#208): a small
+    # restage on top of an already-reviewed baseline is accepted without a fresh full
+    # review, a substantive one is still blocked, and a pre-#208 stamp (no companion
+    # review-stamp-diff) keeps today's exact-hash-only behavior. Exercises the ACTUAL
+    # `_PRECOMMIT` shell script via subprocess against real temp git repos.
+    ("test_review_stamp_delta_tolerance.py", {}),
     ("test_failover_pool.py", {}),
     # Provider-failover: the per-model provider chain + last-working cache + the MID-REVIEW
     # switchover (provider A fails on the call, the model completes via B, board not degraded).

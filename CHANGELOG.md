@@ -3,7 +3,7 @@
 All notable changes to `review` are documented here. This project adheres to
 semantic versioning.
 
-## 0.35.6 — 2026-09-05
+## 0.35.9 — 2026-09-06
 
 - **Opencode zai/glm stall watchdog + cooldown keyed by access method
   (review-cli#153/#159/#179).** Opencode's `oc:zai/glm-5.2` agentic seat hangs
@@ -22,6 +22,84 @@ semantic versioning.
     keyword, so a cooldown recorded from one transport (e.g. claude's CLI)
     never shadows a different, independently-healthy one (claude's API route,
     or opencode's separate route to the same underlying model/quota).
+
+## 0.35.8 — 2026-09-06
+
+- **Real token counts now reach `run-stats.jsonl` (review-cli#195).** `record_run()` (the
+  ETA/quorum-gate JSONL store) never recorded token usage even though the REST backends
+  already parse it from every provider response. `ReviewResult` now carries
+  `prompt_tokens`/`output_tokens` (set only at the REST construction sites), the panel's
+  call tally sums them per run across EVERY dispatch attempt (an in-seat retry or a
+  provider failover no longer undercounts), the flat `-m` review path tallies at all (it
+  previously always recorded 0/0), and `record_run`/`task_summaries` persist and aggregate
+  them. STATS_VERSION 4 → 5; older records without the keys read as "usage unknown", not
+  zero. Two Codex review findings folded in: a 2xx with a valid `usage` but no assistant
+  content still fails closed but keeps the prompt tokens it spent on the failed result;
+  and a `usage` object with only one valid field collapses to 0/0 ("unknown") instead of
+  persisting a half-real `(prompt, 0)` pair — the same validity rule `review stat`'s
+  `tokenstats` applies to successful calls. The two stores still differ by design on
+  FAILED-but-billed attempts: `run-stats.jsonl` counts the prompt tokens an empty-content
+  failure spent (it aggregates every dispatch attempt), while `review stat` reads only
+  successful calls' log footers and reports those as unknown. Gemini now also fails
+  closed on a 2xx with no candidate text (it used to return rc=0 with only the token
+  footer, which passed `result_is_usable()` as review content).
+
+## 0.35.7 — 2026-09-06
+
+- **Pre-commit gate: trivial-follow-up delta tolerance (review-cli#208).** The
+  `review install-commit-hook` gate used to require the staged diff's sha256 to match
+  the last reviewed one EXACTLY — any restage, even a one-line follow-up fix during an
+  iterative review-fix cycle, forced a brand-new full multi-model review round (observed:
+  9 rounds for one ticket). `review diff --staged` now also writes a `review-stamp-diff`
+  companion holding the reviewed diff's raw text; on a hash miss the gate re-diffs the
+  current staged diff against it and allows the commit — without dispatching a fresh
+  review — when the line-level delta is within `$REVIEW_TRIVIAL_DELTA_LINES` (default
+  10; `0` restores the old exact-hash-only behavior). Fails CLOSED (falls through to a
+  full review requirement) on binary-file or submodule-gitlink content, which a line
+  count can't measure, and excludes diff-generation metadata (`index` lines, shifted `@@`
+  hunk headers) from the count so a genuine one-line edit in a file with existing hunks
+  doesn't get miscounted as a large change. The baseline only ever advances via a real
+  `review diff --staged` pass, so drift is always measured from the last genuine review.
+  The count is `max(insertions, removals)` between the reviewed diff and the current one,
+  not a raw `+`/`-` line total — a modified line shows up as a `-old`/`+new` pair in a
+  unified diff, so a raw total would silently count every genuinely-edited line as 2,
+  making `REVIEW_TRIVIAL_DELTA_LINES=N` roughly half as tolerant as documented. The
+  metadata-exclusion patterns are anchored to git's actual header shapes, not bare
+  prefixes — a removed source line that itself starts with `-- ` (SQL/Lua/Haskell
+  comments) can't be misread as a `--- ` file header and silently undercounted — and a
+  mode change or rename/copy line anywhere in EITHER diff — the reviewed baseline or the
+  current staged one, whether or not that file also carries a real content hunk — fails
+  CLOSED to a full review instead of reading as a free, unboundedly-sized trivial change
+  (a rename/mode-change that also touches real content costs one full review it might not
+  strictly have needed; that's the accepted conservative trade).
+
+## 0.35.6 — 2026-09-06
+
+- **The `quality`/`performance`/`security` review-board roles get a genuinely live
+  fallback instead of depending on a single disabled/quota-fragile seat (review-cli#382).**
+  `unpaid_providers: [commandcode, gemini]` disables every commandcode-routed seat
+  (GLM-cc/Kimi/Qwen/DeepSeek) plus Gemini at once, machine-wide. That left `performance`/
+  `quality`/`security`/`tests` with zero or exactly one live seat each, and `quality`'s one
+  live seat (the z.ai-routed GLM) hit a real weekly quota exhaustion with nothing left to
+  promote — hard-blocking a real PR's review-quorum gate with no path forward except a
+  multi-day wait or a manual hatch bypass. Two new `DEFAULT_BOARD` seats — `TERRA_SEAT`
+  (`codex:gpt-5.6-terra`) and `SONNET_SEAT` (`claude:claude-sonnet-5`) — are distinct,
+  already-paid models on the same OpenAI/Codex and Anthropic accounts Sol/Astra and
+  Opus/Fable already use (no new provider account), added as live fallbacks for
+  `performance` and `quality`; the z.ai-routed GLM seat is re-lensed off its now-redundant
+  `quality` role onto `security`, which had none. `tests` (DeepSeek-only), `contracts`
+  (Gemini-only), and `architect` (Fable-only — see Fable's ~100% dispatch failure rate
+  below, still true as of this investigation) remain thin: there was no third distinct
+  already-paid model to give every starved role its own seat without doubling up one
+  account's quota pressure on a single review run, the same failure class this change
+  fixes for Fable. An earlier draft of this change also re-lensed Astra off its
+  pre-existing (duplicate-of-Sol) `consistency` role onto `security`, but a second review
+  round caught that this left `consistency` with zero live fallback anywhere on the
+  board — the exact single-point-of-failure class this change exists to fix, just
+  relocated — so Astra's role is left unchanged. This is a stopgap within the existing
+  harness-prefixed seat-string mechanism, not the "roles declare models, harness/provider
+  auto-resolve" redesign tracked separately as review-cli#364 (this repo's own copy) and
+  rig-cli#337 (the umbrella tracking it across the harness ecosystem).
 
 ## 0.35.5 — 2026-09-05
 
@@ -97,6 +175,7 @@ semantic versioning.
   Every rerun command the notice (and the `--commit` refusals) print carries a
   `--task <CODE>` placeholder — a recorded review mode requires a task code, so a
   remediation without one failed at the first keystroke (Codex finding on #359).
+
 
 ## 0.35.3 — 2026-09-05
 

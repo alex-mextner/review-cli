@@ -132,9 +132,9 @@ failure is **transient** (429 rate-limit / 529 or 5xx overload / timeout / "over
 501 / refusal) is never retried and falls straight to the reserve. `--retry N` (or
 `$REVIEW_RETRY_COUNT`; default 2, `0` disables) sizes the in-seat retry budget.
 `--pool N` sizes the pool (top-N available, same failover); `--pool 0` runs all available
-seats in the selected preset/board (`--preset heavy --pool 0` covers all 9
-heavy-preset-built-ins; the raw 10-seat board, incl. last-resort Fable, needs an
-explicit `board:`).
+seats in the selected preset/board (`--preset heavy --pool 0` covers all 11
+heavy-preset-built-ins; the raw 12-seat board, incl. last-resort Fable, needs an
+explicit `board:`/`models:`).
 The board is **never disabled** — there is **no `--no-board` flag**. An explicit `-m`
 always limits the run to exactly those models; with no configured `models:`/`board:` it is
 the legacy flat panel unless an explicit preset supplies metadata, and with config present it
@@ -682,6 +682,198 @@ _PRECOMMIT_MARKER = "# review-before-commit-gate"
 # `command git` bypasses shell aliases/functions (e.g. an rtk-style wrapper that rewrites
 # `git diff` output) so the hash matches the one written by review-cli, which calls the
 # real git binary via subprocess directly.
+#
+# review-cli#208: the exact-hash check above has zero tolerance -- restaging after even a
+# one-line follow-up produces a different hash and used to force a brand-new full
+# multi-model review round every time. This block runs ONLY on an exact-hash MISS and
+# tolerates a SMALL trailing delta against the last diff that was actually reviewed,
+# instead of requiring a byte-for-byte match. `review diff --staged`
+# (`_write_review_stamp` below) writes that reviewed diff's raw TEXT to a companion
+# `review-stamp-diff` file alongside the hash stamp; this block re-diffs the CURRENT
+# staged diff against that stored text (`diff -U0`, symmetric add+remove line count) and
+# allows the commit without dispatching a fresh review when the count is within
+# `$REVIEW_TRIVIAL_DELTA_LINES` (default 10).
+#
+# The outer `diff -U0` always emits EXACTLY two header lines (`--- old` / `+++ new`)
+# before its first `@@` hunk, so those two lines are dropped positionally (`tail -n +3`),
+# NOT by matching their `+`/`-` prefix textually -- the diff TEXT being compared is itself
+# a unified diff whose every real content line already starts with `+`/`-`, so a
+# second-character content match (an earlier, broken version of this block used
+# `grep -c '^[+-][^+-]'`) would misfire: it happens to also exclude a genuinely-changed
+# outer line whenever the underlying reviewed line itself starts with `+`/`-` -- which is
+# effectively ALWAYS true for diff content, undercounting real drift to near zero
+# (caught by this feature's own `test_substantive_change_after_same_baseline_is_still_blocked`
+# test, which a naive second-character filter passed through as "trivial"). Skipping a
+# fixed line COUNT instead of pattern-matching content sidesteps that collision entirely.
+#
+# Two more counting pitfalls, both caught by genuine review of this feature's own PR
+# (review task REVIEW-208):
+#   * GLM-cc-last [Medium-High]: without excluding it, the `index <old>..<new>` metadata
+#     line changes for EVERY touched file (always +2 to the outer delta) and every
+#     `@@ -a,b +c,d @@` hunk header downstream of a length-changing edit shifts too (+2 per
+#     shifted hunk) -- so a genuine one-line insertion in a file that already has several
+#     hunks could exceed the threshold and force a full review anyway, defeating the whole
+#     point. `index `/`@@ ` lines are pure diff-generation artifacts, not real content
+#     drift, so they are excluded from the count (`grep -Ecv '^[+-](@@ |index )'`).
+#   * k3 [Security]: binary/gitlink content is invisible to a line-count ruler -- a swapped
+#     binary shows only a 2-line `index` change (or zero, if the reviewed diff already had
+#     an identical "Binary files ... differ" line) and a submodule bump shows 2
+#     `Subproject commit` lines, regardless of how large or opaque the real change is. This
+#     block fails CLOSED (skips the fast path entirely, falls through to the block message)
+#     whenever either the reviewed baseline or the current diff contains `Binary files ...
+#     differ` or a `[+-]Subproject commit <sha>` line -- an unmeasurable delta is never
+#     "trivial". (The sha is required in the pattern, not a bare `Subproject commit` prefix
+#     -- round-5, below -- so ordinary prose that happens to start with those two words
+#     can't force a spurious fail-closed on an unrelated file.)
+#   * round-2 finding: a MODIFIED line always appears in the outer diff-of-diffs as a
+#     `-oldcontent`/`+newcontent` PAIR (the old text is removed, the new text is added), so a
+#     raw `+`/`-` line count doubles every genuinely-edited line -- `REVIEW_TRIVIAL_DELTA_LINES`
+#     documented (README/CHANGELOG/--help) and was meant to mean "N edited lines" but the
+#     code actually measured "N raw diff lines", roughly 2x the edited-line count for the
+#     common in-place-edit case. Fixed by counting ADDED and REMOVED lines SEPARATELY and
+#     taking `changed = max(added, removed)`, not a naive `raw / 2`: for a balanced
+#     modification (a lines removed, a lines added) `max(a, a) == a`, correctly reporting `a`
+#     edited lines instead of `2a` raw ones -- but for a PURE insertion or deletion (only one
+#     side present, e.g. inserting k brand-new lines with nothing removed) `max(0, k) == k`
+#     stays exact, whereas `raw / 2 == k / 2` would silently DOUBLE the effective tolerance
+#     for pure insertions/deletions (a k-line unreviewed addition would only cost k/2 against
+#     the threshold) -- a real loosening a naive halving would introduce, verified empirically
+#     (a k-line pure insertion after a reviewed baseline raw-counts as exactly k, not 2k, so
+#     halving it would undercount). `max()` matches the documented "N edited lines" meaning
+#     in the common case and never undercounts the size of an unreviewed pure add/remove.
+#   * round-3 finding (Opus + Fable, independently, same PR): the `index `/`@@ ` exclusion
+#     covers a length-changing edit inside an ALREADY-TOUCHED file, but not a follow-up that
+#     adds, deletes, or renames a WHOLE file -- that introduces MORE pure diff-generation
+#     lines that were not excluded: `diff --git a/x b/x`, `--- `/`+++ ` (esp. `--- /dev/null`
+#     for a new file or `+++ /dev/null` for a deletion), `new file mode `/`deleted file mode
+#     `/`old mode `/`new mode `, and `rename from/to `/`copy from/to `/`similarity index
+#     `/`dissimilarity index ` for renames/copies. Left unexcluded, a small brand-new file
+#     (e.g. 3 real lines) could raw-count as ~7 (the metadata lines plus the content),
+#     tipping past the default threshold and forcing a full review for exactly the trivial
+#     case this feature exists to accept. Direction was always SAFE (over-counts, never
+#     under -- no unreviewed change could slip through undercounted), so this was a
+#     correctness-vs-intent gap, not a security hole; fixed by extending the exclusion list
+#     to cover all of the above, same treatment as `index `/`@@ `.
+#   * round-4 finding (Opus, next round, on the round-3 fix itself) [Security -- undercount]:
+#     a bare `--- `/`+++ ` exclusion (round-3's fix, above) is UNSAFE, unlike every other
+#     entry in this list. `index `, `diff --git `, `old mode `, etc. can only ever match a
+#     genuine header line, because a real CONTENT line's full outer-diff text is always
+#     <outer +/-><inner +/-/space><source text>, and the inner marker can never spell out
+#     those words' first letters. But `--- `/`+++ ` are each 3 repeats of a character that
+#     IS itself a valid inner marker (`-`/`+`) -- so a REMOVED source line whose own text
+#     starts with `-- ` (SQL/Lua/Haskell line-comment syntax, e.g. `-- explanation`) renders
+#     in git-diff as `--- explanation` (git's own `-` marker + the source's leading `-- `),
+#     and if that removal is new in the current diff, the OUTER diff-of-diffs shows it as
+#     `+--- explanation` -- which the bare `--- ` pattern wrongly excludes as "just a file
+#     header", undercounting a REAL unreviewed deletion. (Symmetrically for `++ `-prefixed
+#     added content colliding with `+++ `.) This is the one direction this whole mechanism
+#     must never take: a small enough series of such lines makes `changed` read 0 for a
+#     real, unreviewed change, and the gate `exit 0`s it through unreviewed. Fixed by
+#     anchoring both patterns to the ACTUAL header shapes git emits -- `--- a/`, `---
+#     /dev/null`, `+++ b/`, `+++ /dev/null` -- which a plain `-- `/`++ `-prefixed content
+#     line cannot spell (it would need to literally start with `a/` or `/dev/null` right
+#     after the two extra dashes/pluses, astronomically narrower than the bare-prefix
+#     collision, and in the same accepted-risk class as the pre-existing `index `/`@@ `
+#     collision risk this codebase already tolerates). A header that fails to match the
+#     tightened pattern (e.g. a git-quoted path with spaces) just falls through to being
+#     COUNTED -- safe/conservative, not a new bypass.
+#   * round-5 finding (Opus, on this feature's own PR, reviewing rounds 1-4 together)
+#     [Security -- unbounded undercount]: `old mode `/`new mode `/`rename from `/`rename
+#     to `/`copy from `/`copy to `/`similarity index ` are pure diff-generation metadata,
+#     same class as `index `/`@@ ` (round-1's own exclusion) -- but unlike a metadata line
+#     attached to a real content edit, a PURE mode change or a 100%-similarity rename has
+#     NO content hunk at all: `git diff` emits ONLY `diff --git `+ one or two of those
+#     excluded lines, nothing else. So `changed` reads exactly 0 no matter how many files
+#     are touched this way -- `chmod +x` on an arbitrary number of scripts, or renaming an
+#     arbitrary number of files, is UNBOUNDED by the threshold and sails through unreviewed
+#     every time, not just when small (verified empirically: 5 unreviewed `chmod +x`
+#     follow-ups on a reviewed baseline pass at `REVIEW_TRIVIAL_DELTA_LINES=2`). This breaks
+#     the block's own core premise (a SIZE heuristic bounded by `threshold`) for this one
+#     line-type family, the same "unmeasurable by line count" failure class the k3 binary/
+#     gitlink fail-closed pre-check (above) already exists to reject -- so fixed the same
+#     way, not by trying to count mode/rename lines (they have no natural size unit): the
+#     fail-closed pre-check now ALSO fires whenever either diff contains an `old mode `/`new
+#     mode `/`rename from `/`rename to `/`copy from `/`copy to ` line, forcing a full review
+#     instead of silently passing. A rename or mode change that also touches real content
+#     (an actual hunk) now costs one full review it might not strictly have needed --
+#     safe/conservative, same tradeoff already accepted for `Subproject commit`/binary.
+#
+# This is a SIZE heuristic, not a semantic one -- a small but security-critical one-line
+# edit gets the same pass as a typo fix. That trade-off is deliberate and matches
+# review-cli#208's own filed acceptance criteria (a configurable line-count threshold).
+# The baseline is NEVER advanced by this block itself (it only reads review-stamp-diff,
+# never writes it) -- only a real `review diff --staged` pass moves the baseline forward,
+# so drift is always measured from the last GENUINE review, not a sliding window where
+# many small unreviewed commits could add up to something large. Sizing the threshold to
+# 0 (`REVIEW_TRIVIAL_DELTA_LINES=0`) disables this block entirely and restores today's
+# exact-hash-only behavior -- the default for any stamp that predates this feature (no
+# review-stamp-diff file -> the `-f "$stamp_diff"` check below is false -> falls straight
+# through to the block message, unchanged from before this feature existed).
+_TRIVIAL_DELTA_BLOCK = """\
+threshold="${REVIEW_TRIVIAL_DELTA_LINES:-10}"
+case "$threshold" in ''|*[!0-9]*) threshold=10 ;; esac
+if [ "$threshold" -gt 0 ]; then
+  stamp_diff=$(command git rev-parse --git-path review-stamp-diff)
+  if [ -f "$stamp_diff" ]; then
+    # A stale review-stamp-diff left on disk after the reviewed change is committed
+    # must not anchor the comparison for a later unrelated change, so only proceed
+    # if the HEAD it was reviewed against (this file's first line, written by
+    # _write_review_stamp_diff) still matches the current HEAD; otherwise fall
+    # through to the exact-hash gate below. Empty/empty is a legitimate match (the
+    # documented pre-first-commit review-then-followup case), not a bypass.
+    recorded_head=$(head -n 1 "$stamp_diff" 2>/dev/null)
+    # On a repo with no commits, `git rev-parse HEAD` prints the unresolved arg
+    # ("HEAD") to stdout and exits non-zero -- check the exit status, not just
+    # stdout, or a pre-first-commit review's legitimate empty HEAD never matches.
+    if current_head=$(command git rev-parse HEAD 2>/dev/null); then
+      :
+    else
+      current_head=""
+    fi
+    if [ "$recorded_head" = "$current_head" ]; then
+      baseline_tmp=$(mktemp 2>/dev/null) && trap 'rm -f "$baseline_tmp"' EXIT
+      cur_tmp=$(mktemp 2>/dev/null) && trap 'rm -f "$baseline_tmp" "$cur_tmp"' EXIT
+      if [ -n "$baseline_tmp" ] && [ -n "$cur_tmp" ] \\
+        && tail -n +2 "$stamp_diff" > "$baseline_tmp" \\
+        && command git diff --no-ext-diff --cached > "$cur_tmp"; then
+        # git, diff, and grep each decide "binary" over a different byte-window of
+        # a different input, so trusting any one tool's own heuristic leaves a gap
+        # a NUL can fall into (silently truncating the `content` pipeline below to
+        # nothing, undercounting an arbitrarily large unreviewed change as trivial).
+        # Scan both whole files for a NUL up front instead of any partial window.
+        # `tr -d '\\000' | cmp -s -` is POSIX-portable (unlike `wc -c`, which BSD
+        # pads) and reports a real difference (a NUL was present) via exit status.
+        contains_nul() { ! (LC_ALL=C tr -d '\\000' < "$1" | cmp -s - "$1"); }
+        if ! contains_nul "$baseline_tmp" && ! contains_nul "$cur_tmp" \\
+          && ! LC_ALL=C grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$baseline_tmp" "$cur_tmp" 2>/dev/null; then
+          diff_out=$(diff -U0 "$baseline_tmp" "$cur_tmp" 2>/dev/null)
+          diff_rc=$?
+          # diff exits 0 (no diff) or 1 (differences found) on success, 2 on error --
+          # only those two mean diff_out is a usable unified diff of two text files.
+          # The "Binary files" case is defense-in-depth: the NUL scan above should make
+          # it unreachable on GNU/BSD diff (both binary-detect solely on NUL), but a
+          # diff implementation with any other heuristic would print that single line
+          # with exit 1, and `tail -n +3` would then count it as an empty, trivial diff.
+          if [ "$diff_rc" -le 1 ]; then
+            case "$diff_out" in
+              "Binary files "*) : ;;
+              *)
+                content=$(printf '%s\\n' "$diff_out" | tail -n +3 | LC_ALL=C grep -Ev '^[+-]( |@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
+                added=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^+')
+                removed=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^-')
+                changed=$added
+                [ "$removed" -gt "$changed" ] && changed=$removed
+                if [ "$changed" -le "$threshold" ] 2>/dev/null; then
+                  exit 0
+                fi
+                ;;
+            esac
+          fi
+        fi
+      fi
+    fi
+  fi
+fi"""
 _PRECOMMIT = (
     """\
 #!/bin/sh
@@ -706,6 +898,10 @@ fi
 h=$(command git diff --no-ext-diff --cached | shasum -a 256 | cut -d' ' -f1)
 stamp=$(command git rev-parse --git-path review-stamp)
 if [ -f "$stamp" ] && grep -q "$h" "$stamp"; then exit 0; fi
+
+"""
+    + _TRIVIAL_DELTA_BLOCK
+    + """
 echo "review-before-commit: staged changes have not been reviewed." >&2
 echo "  run:  review diff --staged --task TASK-CODE      (then commit)" >&2
 echo "  skip: REVIEW_SKIP=1 git commit ...   |   git commit --no-verify" >&2
@@ -762,7 +958,11 @@ def _write_review_stamp(
     `stamp_diff_hash` is None (any caller that doesn't thread it -- a
     non-CLI/library caller of `mode_review`), falls back to that same
     independent re-derive so the stamp still writes something hook-compatible,
-    just without the tightened timing guarantee."""
+    just without the tightened timing guarantee.
+
+    Also writes the `review-stamp-diff` companion (review-cli#208) so the pre-commit
+    gate's trivial-follow-up tolerance (`_TRIVIAL_DELTA_BLOCK`) has a reviewed-diff
+    baseline to measure drift against."""
     import hashlib
 
     from .process import git_repo_env
@@ -816,6 +1016,72 @@ def _write_review_stamp(
     except Exception as exc:
         # Deliberately broad, as before — the stamp is never worth breaking a review
         # over — but no longer INVISIBLE: the caller turns this into one stderr line.
+        return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+    _write_review_stamp_diff(cwd, diff)
+    return None
+
+
+def _write_review_stamp_diff(cwd: Path, diff: str) -> str | None:
+    """Companion to `_write_review_stamp` (review-cli#208): persist the RAW reviewed diff
+    TEXT (not just its hash) next to the hash stamp, so the pre-commit gate can tolerate a
+    small trailing follow-up instead of requiring an exact byte-for-byte restage match on
+    every commit. Best-effort, like `_write_review_stamp` itself -- a failure here must
+    never break a review or the exact-hash stamp it accompanies; it only means the gate's
+    delta-tolerance fast path stays unavailable (falls back to exact-hash-only, same as
+    before this feature existed). Unlike `_write_review_stamp`'s marker/stamp, a failure
+    here is deliberately NOT surfaced as a stderr line (Opus review finding on this
+    feature's own PR corrected an earlier draft's docstring that falsely claimed it was):
+    the caller (`_write_review_stamp`) invokes this as a bare statement and discards the
+    return, exactly matching the "never break a review" contract above -- losing the
+    tolerance fast path costs at most one extra full review round, not a blocked commit,
+    so it doesn't warrant the same "green review, blocked commit, no reason anywhere"
+    alarm the marker/stamp notices exist to prevent. The return value exists only so a
+    future caller CAN surface it if that judgment call ever changes.
+
+    Opus round-3 finding (gate bypass): the file's FIRST LINE is the reviewed HEAD sha
+    (`git rev-parse HEAD` at write time), with the raw diff text following. Without this
+    binding, a stale `review-stamp-diff` left on disk after the reviewed change is
+    COMMITTED becomes a fixed, small, permanent anchor: `git diff --cached` after that
+    commit is measured against the OLD diff regardless of which file changed or how many
+    commits have landed since, so an unrelated, unreviewed small change to a DIFFERENT
+    file compares favorably against it and passes the gate -- repeatably, unboundedly,
+    one small unreviewed commit at a time, directly contradicting this feature's own
+    "drift is always measured from the last genuine review" safety claim. The hook
+    (`_TRIVIAL_DELTA_BLOCK`) rejects the file outright when the recorded HEAD doesn't
+    match the current one, falling back to the pre-existing exact-hash gate."""
+    from .process import git_repo_env
+
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            capture_output=True,
+            text=True,
+        )
+        # A repo with no commits yet has no HEAD to record -- writes an empty first
+        # line rather than skipping the write entirely. This is a real, matchable
+        # state (not a sentinel): the hook's HEAD check compares this string against
+        # `git rev-parse HEAD` verbatim, and BOTH sides read empty for "no commits
+        # yet" -- the documented review-then-uncommitted-followup use case this
+        # feature exists for. What the check actually catches is empty-vs-non-empty
+        # (reviewed pre-first-commit, but a commit landed since) or two different
+        # non-empty shas (reviewed against one commit, HEAD has since moved) --
+        # either way, the reviewed content and the current HEAD have diverged.
+        head_line = head.stdout.strip() if head.returncode == 0 else ""
+        p = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--git-path", "review-stamp-diff"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            capture_output=True,
+            text=True,
+        )
+        if p.returncode != 0:
+            return None
+        rel = p.stdout.strip()
+        stamp_diff = Path(rel) if os.path.isabs(rel) else Path(cwd) / rel
+        stamp_diff.write_text(f"{head_line}\n{diff}", encoding="utf-8")
+    except Exception as exc:
         return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     return None
 

@@ -2457,6 +2457,8 @@ def _run_mode_with_stats(
         elapsed = time.monotonic() - start
         tally = end_call_tally()
         ok_count, fail_count = tally["ok"], tally["fail"]
+        prompt_tokens = tally["prompt_tokens"]
+        output_tokens = tally["output_tokens"]
         recorded_models = pool_models
         models_after_fell_back = False
         if models_after is not None:
@@ -2565,6 +2567,8 @@ def _run_mode_with_stats(
                 diff_files=diff_files,
                 diff_sha256=diff_sha256,
                 roles=recorded_roles,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
             )
 
 
@@ -3671,6 +3675,10 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           <= 0 disables cooldowns entirely.
     REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
                                           ~/.config/review-cli/seat-cooldown.json).
+    REVIEW_TRIVIAL_DELTA_LINES=N        — pre-commit gate: max changed lines tolerated
+                                          against the last reviewed baseline before a
+                                          restage forces a fresh full review (default 10);
+                                          0 disables the tolerance (exact-hash match only).
     REVIEW_TRUE_SILENCE_SECONDS=N       — how many seconds of ZERO output an opencode
                                           seat gets before it is reaped as stuck rather
                                           than silently thinking (default 5min, per-model

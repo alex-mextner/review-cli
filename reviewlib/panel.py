@@ -95,18 +95,27 @@ _call_tally: dict[str, int] | None = None
 _suppress_autotally = False
 
 
+_EMPTY_TALLY: dict[str, int] = {
+    "ok": 0,
+    "fail": 0,
+    "prompt_tokens": 0,
+    "output_tokens": 0,
+}
+
+
 def begin_call_tally() -> None:
-    """Start counting per-call ok/fail for the current run. CLI-only; idempotent."""
+    """Start counting per-call ok/fail/tokens for the current run. CLI-only; idempotent."""
     global _call_tally
     with _TALLY_LOCK:
-        _call_tally = {"ok": 0, "fail": 0}
+        _call_tally = dict(_EMPTY_TALLY)
 
 
 def end_call_tally() -> dict[str, int]:
-    """Stop counting and return ``{"ok": n, "fail": n}`` for the run just finished."""
+    """Stop counting and return ``{"ok", "fail", "prompt_tokens", "output_tokens"}``
+    for the run just finished."""
     global _call_tally
     with _TALLY_LOCK:
-        tally = _call_tally or {"ok": 0, "fail": 0}
+        tally = _call_tally or dict(_EMPTY_TALLY)
         _call_tally = None
         return dict(tally)
 
@@ -125,6 +134,24 @@ def _tally_result(returncode: int) -> None:
         if _call_tally is None or _suppress_autotally:
             return
         _call_tally["ok" if returncode == 0 else "fail"] += 1
+
+
+def _tally_tokens(result: ReviewResult) -> None:
+    """Add one call's REAL token usage to the active tally (no-op outside a CLI run).
+
+    ``result.prompt_tokens``/``output_tokens`` are only ever non-zero for the REST
+    backends that set them at their own construction site (backends.py) — every
+    agentic/CLI backend defaults to 0, so this can never misattribute a quoted
+    usage-shaped line from a different seat's transcript. Unlike ``_tally_result``
+    this is NOT suppressed by ``_suppress_autotally``: a moderator's single logical
+    call still spends real tokens on every candidate it tries, and those must all be
+    counted even though only the ACCEPTED candidate's ok/fail is tallied.
+    """
+    with _TALLY_LOCK:
+        if _call_tally is None:
+            return
+        _call_tally["prompt_tokens"] += result.prompt_tokens
+        _call_tally["output_tokens"] += result.output_tokens
 
 
 def recount_round_by_usability(results: list[ReviewResult]) -> None:
@@ -397,12 +424,10 @@ def _run_moderator_inner(
     if last.returncode == 0 and not last.stdout.strip():
         # Every candidate "succeeded" with empty output. Surface as a failure so
         # quorum/brainstorm don't report success for a synthesis that isn't there.
-        return ReviewResult(
-            model=last.model,
-            command=last.command,
-            returncode=1,
-            stdout=last.stdout,
-            stderr=last.stderr or "moderator produced no output",
+        # `replace()`, not hand reconstruction -- so a future field on ReviewResult
+        # (see the run_panel relabel site below) survives this rewrite automatically.
+        return replace(
+            last, returncode=1, stderr=last.stderr or "moderator produced no output"
         )
     return last
 
@@ -655,13 +680,12 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
             model = jobs[index].label or jobs[index].model
             try:
                 base = future.result()
-                results[index] = ReviewResult(
-                    model=jobs[index].label or base.model,
-                    command=base.command,
-                    returncode=base.returncode,
-                    stdout=base.stdout,
-                    stderr=base.stderr,
-                )
+                # `replace()` (not field-by-field reconstruction) so any FUTURE field
+                # added to ReviewResult carries through this relabel automatically —
+                # a hand-copied field list is a landmine every new field must remember
+                # to update (Fable review finding: this is exactly how prompt_tokens/
+                # output_tokens almost got silently dropped here).
+                results[index] = replace(base, model=jobs[index].label or base.model)
             except Exception as exc:  # noqa: BLE001 - report, never crash the panel
                 results[index] = ReviewResult(
                     model=model,
@@ -671,6 +695,7 @@ def run_panel(jobs: list[PanelJob], cwd: Path, timeout: int) -> list[ReviewResul
                     stderr=str(exc),
                 )
             _tally_result(results[index].returncode)
+            _tally_tokens(results[index])
     return [r for r in results if r is not None]
 
 

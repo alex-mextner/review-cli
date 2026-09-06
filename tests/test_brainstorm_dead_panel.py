@@ -486,7 +486,7 @@ def test_recount_round_by_usability_reclassifies_only_dead_rc0_seats():
     ]
     panel.recount_round_by_usability(results)
     tally = panel.end_call_tally()
-    assert tally == {"ok": 1, "fail": 2}, tally
+    assert tally == {"ok": 1, "fail": 2, "prompt_tokens": 0, "output_tokens": 0}, tally
 
 
 def test_recount_is_a_noop_with_no_active_tally():
@@ -514,7 +514,7 @@ def test_recount_never_inflates_the_total_when_no_ok_to_move():
     tally = panel.end_call_tally()
     # ok+fail must still equal the 1 call actually made — no phantom fail.
     assert tally["ok"] + tally["fail"] == 1, tally
-    assert tally == {"ok": 0, "fail": 1}, tally
+    assert tally == {"ok": 0, "fail": 1, "prompt_tokens": 0, "output_tokens": 0}, tally
 
 
 # === codex review finding (2026-08 seat-cooldown feature): a cached-skip sentinel
