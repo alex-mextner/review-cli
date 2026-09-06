@@ -43,6 +43,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_qa_mode.py",
         "test_review_marker.py",
         "test_review_commit_checkpoint.py",
+        "test_review_stamp_delta_tolerance.py",
         "test_run_stats.py",
         "test_staged_diff_honors_c_repo.py",
     }
@@ -717,6 +718,12 @@ _UNIT_FILES = [
     # (ok/staged/not-piped), the real `git commit` it makes, and the distinct
     # EXIT_COMMIT_FAILED when the commit subprocess itself (e.g. a rejecting hook) fails.
     ("test_review_commit_checkpoint.py", {}),
+    # The pre-commit gate's trivial-follow-up delta tolerance (review-cli#208): a small
+    # restage on top of an already-reviewed baseline is accepted without a fresh full
+    # review, a substantive one is still blocked, and a pre-#208 stamp (no companion
+    # review-stamp-diff) keeps today's exact-hash-only behavior. Exercises the ACTUAL
+    # `_PRECOMMIT` shell script via subprocess against real temp git repos.
+    ("test_review_stamp_delta_tolerance.py", {}),
     ("test_failover_pool.py", {}),
     # Provider-failover: the per-model provider chain + last-working cache + the MID-REVIEW
     # switchover (provider A fails on the call, the model completes via B, board not degraded).

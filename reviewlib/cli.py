@@ -3671,6 +3671,10 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
                                           <= 0 disables cooldowns entirely.
     REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
                                           ~/.config/review-cli/seat-cooldown.json).
+    REVIEW_TRIVIAL_DELTA_LINES=N        — pre-commit gate: max changed lines tolerated
+                                          against the last reviewed baseline before a
+                                          restage forces a fresh full review (default 10);
+                                          0 disables the tolerance (exact-hash match only).
     REVIEW_TRUE_SILENCE_SECONDS=N       — how many seconds of ZERO output an opencode
                                           seat gets before it is reaped as stuck rather
                                           than silently thinking (default 5min, per-model
