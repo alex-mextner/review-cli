@@ -28,7 +28,13 @@ sys.path.insert(0, str(REPO_ROOT))
 from reviewlib import backends as review_backends  # noqa: E402
 from reviewlib import seat_cooldown as sc  # noqa: E402
 
-MODEL = "oc:zai/glm-5.2"
+# An UNWATCHED opencode seat: for a model under the zai/glm stall watchdog
+# (`_opencode_model_needs_stall_watchdog`) the liveness bound is the sole owner of the
+# zero-output signal and `true_silence_timeout` is deliberately NOT forwarded (see
+# `_run_opencode_with_stall_retry`; pinned by
+# tests/test_opencode_realrepo.py::test_stall_watchdog_owns_zero_output_for_watched_model),
+# so the generic true-silence plumbing is exercised on a seat that still carries it.
+MODEL = "oc:moonshotai/kimi-k2.5"
 
 
 def _with_store(fn):

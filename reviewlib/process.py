@@ -1061,7 +1061,13 @@ def _run_streamed(
                     # output still gets the full, generous idle window below — "no
                     # output yet" and "went quiet after producing output" are
                     # different signals, and only the former is fast-failed here.
-                    no_output_yet = not out_buf and not err_buf
+                    # Keys off the SAME `activity["got_output"]` latch the true-silence
+                    # branch below uses (round-1 review finding, Opus + Fable: buffer
+                    # emptiness was a second, independent definition of "has produced
+                    # output" that could drift from the latch), and inherits the same
+                    # `activity["last"]`-first write ordering in `_drain` that closes
+                    # the first-byte race for that branch.
+                    no_output_yet = not activity["got_output"]
                     if (
                         effective_liveness_timeout is not None
                         and no_output_yet

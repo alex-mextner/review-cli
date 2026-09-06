@@ -22,6 +22,13 @@ semantic versioning.
     keyword, so a cooldown recorded from one transport (e.g. claude's CLI)
     never shadows a different, independently-healthy one (claude's API route,
     or opencode's separate route to the same underlying model/quota).
+  - For a watchdog-scoped model the liveness bound is the SOLE owner of the
+    "zero output since spawn" signal — `true_silence_timeout` is not forwarded
+    for it (review round 1, Opus + Fable: the registry's true-silence value for
+    zai/glm equals the 300s stall default, so "retry 3x then cool down" vs
+    "cool down on the first silence" was decided by poll-loop check order).
+    Unwatched opencode seats keep the true-silence wiring unchanged, and the
+    liveness check now keys off the same `got_output` latch as true-silence.
 
 ## 0.35.8 — 2026-09-06
 

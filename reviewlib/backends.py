@@ -782,12 +782,25 @@ def _run_opencode_with_stall_retry(
 
     Only applies the stall bound to `model`s matching
     `_opencode_model_needs_stall_watchdog` — every OTHER opencode seat dispatches
-    exactly as before this feature (no liveness bound, no retry, no cooldown)."""
+    exactly as before this feature (no liveness bound, no retry, no cooldown).
+
+    For a WATCHED model the liveness watchdog is the SOLE owner of the "zero output
+    since spawn" signal: `true_silence_timeout` is NOT forwarded to `_run_streamed`
+    for it (round-1 review finding, Opus + Fable: both detectors fire on the same
+    signal but with opposite policies — liveness retries up to 3x then cools down,
+    true-silence cools down on the FIRST trip with no retry — and the registry's
+    true-silence value for zai/glm equals the 300s stall default, so which policy
+    applied was decided by poll-loop check order, not by design; a user raising
+    $REVIEW_OPENCODE_STALL_SECONDS above the registry value would silently have
+    flipped the seat to "cooldown on first silence"). Unwatched models keep the
+    true-silence wiring exactly as before."""
     stall_seconds = (
         _opencode_stall_seconds()
         if _opencode_model_needs_stall_watchdog(model)
         else None
     )
+    if stall_seconds is not None:
+        true_silence_timeout = None
     proc = None
     for attempt in range(1, _OPENCODE_MAX_STALL_RETRIES + 1):
         proc = _run_streamed(
