@@ -22,7 +22,9 @@ So this parser is a READER over those artifacts. It:
     surfaces models, roles (personas, parsed from the brainstorm md), durations,
     success/fail, errors, and the redacted prompt/argv per call.
 
-Nothing here writes; the only new persistence is in ``store.py``. Anything review-core
+The only writes here are `call_log_cache`'s own perf memo (derived data, keyed off
+the source logs' identity — never a source of truth); the actual overseer
+persistence (feedback/conscious/links) lives in ``store.py``. Anything review-core
 does not record yet (real token/cost numbers, an explicit run id) is reported as an
 empty/`null` field with a note rather than faked.
 """
@@ -37,6 +39,8 @@ from datetime import datetime, timedelta, timezone
 from functools import cached_property, lru_cache
 from pathlib import Path
 
+from . import call_log_cache
+
 # Per-call log filename: 20260613T040611_516399Z-claude-r0.log
 _CALL_RE = re.compile(r"^(\d{8}T\d{6})_(\d+)Z-(.+)-r(\d+)\.log$")
 # Brainstorm discussion md: 20260613T114552_999796Z-brainstorm.md
@@ -49,6 +53,9 @@ _WAITING_RE = re.compile(
     r"^\[review-cli\] .+?: waiting for a concurrency slot \(cap \d+\)\s*$"
 )
 _TIMEOUT_RE = re.compile(r"^\[review-cli\] TIMEOUT after (?P<secs>\d+)s")
+_TRUE_SILENCE_RE = re.compile(
+    r"^\[review-cli\] TRUE-SILENCE TIMEOUT after (?P<secs>\d+)s"
+)
 # Explicit status footer written by every log writer (process._run_streamed and
 # backends' REST sidecar). This is the authoritative success/failure signal (finding 4).
 _EXIT_RE = re.compile(r"^\[review-cli\] EXIT (?P<code>-?\d+)\s*$")
@@ -78,6 +85,11 @@ HEALTH_PAYWALL = (
 HEALTH_AUTH = "auth"  # EXIT 401 / stderr {"error":"bad key"} (z.ai / GLM bad key).
 HEALTH_BLOCKED = "blocked"  # EXIT 403 / "error code: 1010" (Cloudflare bot block).
 HEALTH_TIMEOUT = "timeout"  # EXIT 124 / "timed out".
+# A true-silence reap (EXIT 125): process._run_streamed's tighter pre-first-byte cutoff
+# for a model that never produced a single byte (reviewlib#238) — kept as its own bucket,
+# separate from the ordinary idle timeout, so the two failure modes stay distinguishable
+# on the dashboard instead of true-silence vanishing into the generic ERROR class.
+HEALTH_TRUE_SILENCE = "true_silence"
 HEALTH_EMPTY = (
     "empty"  # EXIT 0 but no real content (output_tokens=0 / framing-only body).
 )
@@ -96,6 +108,7 @@ FAILURE_CLASSES = (
     HEALTH_AUTH,
     HEALTH_BLOCKED,
     HEALTH_TIMEOUT,
+    HEALTH_TRUE_SILENCE,
     HEALTH_EMPTY,
     HEALTH_ERROR,
 )
@@ -111,6 +124,18 @@ PROBLEMATIC_RECENT_N = 3
 # NORMALIZED (whitespace-stripped, lower-cased) form so both the spaced and the collapsed
 # rendering hit. "unavailable" alone is too broad (a real review could mention it), so we
 # anchor on the full `currentlyunavailable` phrase.
+#
+# review-cli#326 (Fable review, round 3): `_classify_from_full_text` now bakes what this
+# sentinel (and `_CF_BLOCK_MARKER`/`_BAD_KEY_MARKER`/`_ERROR_MARKERS` below) matches into
+# `CallLog.is_paywall`/`is_cf_blocked`/`is_bad_key`/`has_error` AT PARSE TIME, and that
+# result is PERSISTED in the SQLite cache keyed on `_PARSER_VERSION`
+# (`call_log_cache.py`). A finished `.log` file's (mtime, size) never changes again, so
+# editing any marker constant here has NO EFFECT on an already-cached row unless
+# `_PARSER_VERSION` is also bumped -- bump it in the SAME change as any edit to these four
+# constants (same rule applies to `CALL_BODY_STORE_CAP`/`_CAP_CHARS`/
+# `CALL_STDERR_LINE_CAP` below and to `_classify_from_full_text`'s own logic -- see the
+# fuller note on `_PARSER_VERSION` in call_log_cache.py), or the change silently never
+# applies on a long-lived install.
 _PAYWALL_SENTINEL = "currentlyunavailable"
 # Cloudflare bot-block body marker (commandcode gateway behind CF).
 _CF_BLOCK_MARKER = "error code: 1010"
@@ -171,6 +196,11 @@ class CallLog:
     stderr_lines: list[str] = field(default_factory=list)
     timed_out: bool = False
     timeout_secs: int | None = None
+    # A true-silence reap (process._run_streamed's tighter pre-first-byte cutoff,
+    # reviewlib#238) is exit 125 + its own marker line — distinct from an ordinary
+    # idle timeout (exit 124) so the dashboard doesn't bucket it as a generic error.
+    true_silenced: bool = False
+    true_silence_secs: int | None = None
     size_bytes: int = 0
     mtime: datetime | None = None
     # The explicit return code recorded by the writer as a trailing
@@ -181,6 +211,88 @@ class CallLog:
     # (HYP-742 finding 4: that grep inflated the Errors panel and tanked the success rate).
     exit_code: int | None = None
     task_code: str | None = None
+    # review-cli#326 review findings (Opus + Codex, all rounds): these seven used to be
+    # `@property`s (or, for `has_real_content`, a free function reading `call.body`)
+    # that re-derived from `self.body`/`self.stderr_lines` on every access. Once those
+    # fields are capped (memory fix above), a marker/boundary artifact landing in the
+    # OMITTED or MANGLED part of a huge log would silently flip the verdict --
+    # concretely reproduced by Codex for paywall detection, footer-less failed calls
+    # going permanently "running", and (round 6) an oversized single-line real verdict
+    # misclassifying as empty once `body` was capped down to just the truncation
+    # marker. `parse_call_log` computes them ONCE, from the FULL untruncated text via
+    # `_classify_from_full_text`, before `_cap_body` ever runs -- so classification is
+    # correct for the full body regardless of what's later retained for display.
+    #
+    # `None` is the sentinel for "caller left classification unset" -- `__post_init__`
+    # below auto-derives real values from `self.body`/`self.stderr_lines`/etc. in that
+    # case (round 3, Fable finding 3 / codex P2: a `CallLog` built directly -- a test
+    # fixture, a future non-`parse_call_log` constructor -- must still classify
+    # correctly, matching what the removed `@property`s did). `parse_call_log` always
+    # passes real computed bools/strs explicitly (from the FULL text, before
+    # `_cap_body`), so `__post_init__` is a no-op on that path -- see
+    # `test_direct_construction_auto_classifies_from_body` in tests/test_dashboard.py.
+    completed: bool | None = None
+    has_error: bool | None = None
+    error_summary: str | None = None
+    is_paywall: bool | None = None
+    is_cf_blocked: bool | None = None
+    is_bad_key: bool | None = None
+    # EXIT-0 empty-vs-real-verdict split (see `_body_has_real_content`) -- moved here
+    # in round 6 alongside the other six: `classify_call` used to call
+    # `_body_has_real_content(call)`, which read the CAPPED `call.body` directly, so an
+    # oversized single-line real verdict (no newlines anywhere) got capped down to just
+    # the truncation marker and misclassified as HEALTH_EMPTY (codex round 6
+    # reproduction). Computed from the full body here instead, same as the other six.
+    has_real_content: bool | None = None
+
+    def __post_init__(self) -> None:
+        # SHARP EDGE (round 4, Fable finding 2): this only runs at construction time.
+        # `dataclasses.replace(call, exit_code=...)` (or any post-construction mutation
+        # of `body`/`stderr_lines`/`exit_code`/`timed_out`/`true_silenced`) copies the
+        # EXISTING (already non-None) classification fields into the new instance, so
+        # this gate sees nothing to derive and the copy keeps its OLD, now-stale
+        # classification. Nothing in this codebase does that today (verified: no
+        # `dataclasses.replace(` / direct attribute assignment on a `CallLog` outside
+        # this file and `call_log_cache.py`) -- if you add one, either construct a fresh
+        # `CallLog` with the seven fields at their `None` default, or call
+        # `_classify_from_full_text` yourself and pass the results explicitly.
+        #
+        # ALL-OR-NOTHING gate (round 4, Opus finding): checking `completed` alone let a
+        # caller that explicitly sets SOME of the seven (e.g. `completed=True`) but not
+        # others (e.g. `is_cf_blocked`) skip auto-derivation and end up with a mixed
+        # state -- real bools next to a still-`None` `is_cf_blocked`/`is_bad_key`, which
+        # every current consumer happens to treat as falsy but is a latent trap for a
+        # future `is False`/schema check. `error_summary` is excluded: `None` is its own
+        # legitimate classified value (no error), not an "unset" signal. If ANY of the
+        # six bool fields is still `None`, auto-derive and overwrite ALL SEVEN -- a
+        # partial explicit override is not a supported shape; pass none of them (fully
+        # auto-derived) or all of them (fully explicit).
+        if None not in (
+            self.completed,
+            self.has_error,
+            self.is_paywall,
+            self.is_cf_blocked,
+            self.is_bad_key,
+            self.has_real_content,
+        ):
+            return
+        (
+            self.completed,
+            self.has_error,
+            self.error_summary,
+            self.is_paywall,
+            self.is_cf_blocked,
+            self.is_bad_key,
+            self.has_real_content,
+        ) = _classify_from_full_text(
+            self.body,
+            self.stderr_lines,
+            self.exit_code,
+            self.timed_out,
+            self.timeout_secs,
+            self.true_silenced,
+            self.true_silence_secs,
+        )
 
     @property
     def duration_seconds(self) -> float | None:
@@ -220,66 +332,6 @@ class CallLog:
             return self.started
         return self.mtime
 
-    @property
-    def completed(self) -> bool:
-        """Did this call FINISH (so its success/failure is known)?
-
-        Every writer stamps a terminal `EXIT {code}` footer (and a timeout also gets the
-        marker). A log with NEITHER an exit code NOR a timeout marker is NOT finished — it
-        is either a long call still streaming, or a call whose writer died before the footer
-        (e.g. a Popen / E2BIG failure). Such a log must NOT be counted as a success (codex
-        P2); it is `running`/unknown. (A truncated old log with a body error marker is still
-        surfaced as an error by has_error — only the clean, footerless case is `running`.)
-        """
-        return (
-            self.exit_code is not None
-            or self.timed_out
-            or bool(self.stderr_lines)
-            or _looks_like_error(self.body)
-        )
-
-    @property
-    def has_error(self) -> bool:
-        """Did this call FAIL?
-
-        Success/failure is decided by the EXPLICIT return code (the `EXIT {code}` footer),
-        never by grepping the body for `error:` — a review's own output legitimately
-        contains those strings (HYP-742 finding 4). When the explicit code exists it is
-        authoritative: rc 0 = success (even if the prose mentions errors), rc != 0 = fail.
-
-        A timeout is always a failure (the writer records it as EXIT 124, but a log
-        truncated before the footer can still carry the TIMEOUT marker — honor it either
-        way). Only when NO explicit code was recorded do we fall back to the legacy
-        heuristic (stderr present / error-marker grep) so pre-footer logs still surface.
-        A clean footerless log is neither an error NOR a success — it is `running` (see
-        `completed`); has_error stays False there but stats must not bucket it as OK.
-        """
-        if self.timed_out:
-            return True
-        if self.exit_code is not None:
-            return self.exit_code != 0
-        # Legacy fallback: log predates the EXIT footer (or was truncated before it).
-        return bool(self.stderr_lines) or _looks_like_error(self.body)
-
-    @property
-    def error_summary(self) -> str | None:
-        if not self.has_error:
-            return None
-        if self.timed_out:
-            return f"TIMEOUT after {self.timeout_secs}s"
-        if self.exit_code is not None and self.exit_code != 0:
-            # Prefer a concrete stderr line; fall back to the explicit exit code so the
-            # Errors panel always has a reason even when stderr is empty.
-            if self.stderr_lines:
-                return self.stderr_lines[0].strip()[:300]
-            return f"exit code {self.exit_code}"
-        if self.stderr_lines:
-            return self.stderr_lines[0].strip()[:300]
-        if _looks_like_error(self.body):
-            first = next((ln for ln in self.body.splitlines() if ln.strip()), "")
-            return first.strip()[:300]
-        return None
-
     def to_dict(self) -> dict:
         return {
             "filename": self.filename,
@@ -294,6 +346,8 @@ class CallLog:
             "duration_seconds": self.duration_seconds,
             "timed_out": self.timed_out,
             "timeout_secs": self.timeout_secs,
+            "true_silenced": self.true_silenced,
+            "true_silence_secs": self.true_silence_secs,
             "exit_code": self.exit_code,
             "task_code": self.task_code,
             "completed": self.completed,
@@ -331,6 +385,8 @@ class BrainstormLog:
         }
 
 
+# See the `_PAYWALL_SENTINEL` comment above: editing this tuple needs a `_PARSER_VERSION`
+# bump in the same change, or an already-cached row silently never re-evaluates it.
 _ERROR_MARKERS = (
     "error:",
     "may not exist or you may not have access",
@@ -339,6 +395,81 @@ _ERROR_MARKERS = (
     "command not found",
     "permission denied",
 )
+
+
+# review-cli#326: on a real long-lived install (~132k call logs), keeping the FULL
+# streamed body of every CallLog in memory (the cross-request session cache never
+# releases them) ballooned the dashboard process to 32.8GB RSS and thrashed the whole
+# machine. `has_error`/`completed` are EXIT-code-authoritative (see `_looks_like_error`'s
+# own docstring) -- body-grepping is only a legacy fallback for logs with no `EXIT {code}`
+# footer -- so bounding what gets RETAINED here caps per-call memory without touching
+# that classification logic for the modern (footer-present) majority of calls. Half the
+# cap is kept from the START and half from the END (not just a head truncation) so an
+# error marker appearing near either end of a huge legacy log still survives -- the
+# common real shape for both "error up front, verbose output after" and "crash at the
+# tail of a long run". `CALL_BODY_STORE_CAP` is a BYTE budget, but the cap operates on
+# CHARACTER count at a QUARTER of it (`_CAP_CHARS` below) -- CPython's string
+# representation uses 1/2/4 bytes per character depending on the widest codepoint
+# present in the WHOLE string (PEP 393), so a body containing even a single non-Latin-1
+# character (any Cyrillic/CJK text -- routine for this project's own Russian-language
+# logs, not just an emoji edge case) forces the entire retained string to at least
+# 2 bytes/char, and a single emoji/astral character forces 4 bytes/char, REGARDLESS of
+# how many bytes that string encodes to. A byte-length cap on the ENCODED size (an
+# earlier version of this fix) does not bound the actual retained Python object size --
+# review-cli#326 round 4, codex P1 concretely reproduced ~262KB retained (4x the 64KB
+# byte cap) from a single retained astral character. Capping CHARACTER count at
+# `CAP // 4` is a simple, worst-case-provable guarantee: retained memory is always
+# <= `CALL_BODY_STORE_CAP` bytes regardless of script mix, at the cost of retaining
+# less content (16KB head + 16KB tail instead of 64KB) even for pure-ASCII bodies --
+# still generous for finding an error near either end of a huge log.
+CALL_BODY_STORE_CAP = 65536
+_CAP_CHARS = CALL_BODY_STORE_CAP // 4
+
+
+def _truncation_marker(omitted: int, unit: str) -> str:
+    return f"... [{omitted} {unit} truncated, review-cli#326 memory cap] ..."
+
+
+def _cap_body(text: str) -> str:
+    if len(text) <= _CAP_CHARS:
+        return text
+    half = _CAP_CHARS // 2
+    head_raw = text[:half]
+    tail_raw = text[-half:]
+    # Trim each raw char-offset slice back to the nearest LINE BOUNDARY, purely for
+    # DISPLAY quality -- a straight offset cut can land mid-line and leave a
+    # ragged partial-line fragment at either edge. This is NOT correctness-critical:
+    # `completed`/`has_error`/`is_paywall`/`has_real_content`/etc. are computed in
+    # `_classify_from_full_text` from the FULL, uncapped text before this function
+    # ever runs (round 6: moving `has_real_content` there too closed the last gap,
+    # where an earlier version scanned the CAPPED `call.body` for "real content" and
+    # a boundary/marker artifact could flip the verdict either direction -- round 5
+    # codex P1, round 6 codex P1). Falls back to the raw (possibly ragged) slice when
+    # the half itself contains no newline at all (one line longer than the whole
+    # per-side budget) -- harmless now that nothing safety-relevant reads this string.
+    head = head_raw.rsplit("\n", 1)[0] if "\n" in head_raw else head_raw
+    tail = tail_raw.split("\n", 1)[1] if "\n" in tail_raw else tail_raw
+    omitted = len(text) - len(head) - len(tail)
+    return head + f"\n\n{_truncation_marker(omitted, 'chars')}\n\n" + tail
+
+
+# review-cli#326 round 3 (codex P1): capping stderr by BYTES alone isn't enough. A
+# backend that emits e.g. `"[stderr] \n"` tens of thousands of times still produces a
+# byte-capped ~64KiB string, but `.split("\n")` on it turns that into tens of
+# thousands of separate (short) `str` objects — each one carries real CPython object
+# overhead well beyond its own bytes, so the LIST can cost far more than the 64KiB the
+# byte cap was meant to bound, across ~132k logs. This caps the retained LINE COUNT
+# independently of the byte cap, same head+tail split rationale as `_cap_body`.
+CALL_STDERR_LINE_CAP = 500
+
+
+def _cap_stderr_lines(lines: list[str]) -> list[str]:
+    capped = _cap_body("\n".join(lines)).split("\n")
+    if len(capped) <= CALL_STDERR_LINE_CAP:
+        return capped
+    half = CALL_STDERR_LINE_CAP // 2
+    omitted = len(capped) - CALL_STDERR_LINE_CAP
+    return capped[:half] + [_truncation_marker(omitted, "lines")] + capped[-half:]
 
 
 def _looks_like_error(text: str) -> bool:
@@ -352,12 +483,97 @@ def _looks_like_error(text: str) -> bool:
     return any(m in low for m in _ERROR_MARKERS)
 
 
+def _classify_from_full_text(
+    full_body: str,
+    stderr_lines: list[str],
+    exit_code: int | None,
+    timed_out: bool,
+    timeout_secs: int | None,
+    true_silenced: bool,
+    true_silence_secs: int | None,
+) -> tuple[bool, bool, str | None, bool, bool, bool, bool]:
+    """Compute completed/has_error/error_summary/is_paywall/is_cf_blocked/is_bad_key/
+    has_real_content from the FULL, untruncated body/stderr text.
+
+    Must run BEFORE `_cap_body` (review-cli#326 round 2, codex reproduction): deriving
+    these from the capped body would silently flip the verdict whenever the only marker
+    sits in the omitted middle of a huge legacy log -- a footer-less failed call would
+    stay `running` forever, a paywall sentinel past the cap would classify as `ok`, and
+    (round 6) an oversized single-line real verdict would cap down to nothing but the
+    truncation marker and misclassify as empty. `_has_paywall_sentinel`/
+    `_CF_BLOCK_MARKER`/`_BAD_KEY_MARKER`/`_body_has_real_content` are module globals
+    defined later in this file -- fine here since this function only runs at call time,
+    after the whole module is loaded."""
+    completed = (
+        exit_code is not None
+        or timed_out
+        or true_silenced
+        or bool(stderr_lines)
+        or _looks_like_error(full_body)
+    )
+    if timed_out or true_silenced:
+        has_error = True
+    elif exit_code is not None:
+        has_error = exit_code != 0
+    else:
+        has_error = bool(stderr_lines) or _looks_like_error(full_body)
+
+    error_summary: str | None = None
+    if has_error:
+        if timed_out:
+            error_summary = f"TIMEOUT after {timeout_secs}s"
+        elif true_silenced:
+            error_summary = f"TRUE-SILENCE TIMEOUT after {true_silence_secs}s"
+        elif exit_code is not None and exit_code != 0:
+            error_summary = (
+                stderr_lines[0].strip()[:300]
+                if stderr_lines
+                else f"exit code {exit_code}"
+            )
+        elif stderr_lines:
+            error_summary = stderr_lines[0].strip()[:300]
+        elif _looks_like_error(full_body):
+            first = next((ln for ln in full_body.splitlines() if ln.strip()), "")
+            error_summary = first.strip()[:300]
+
+    is_paywall = _has_paywall_sentinel(full_body)
+    blob = ("\n".join(stderr_lines) + "\n" + full_body).lower()
+    # `is_cf_blocked`/`is_bad_key` carry ONLY the body/stderr marker signal, not the
+    # exit_code check -- `exit_code` is already a live, directly-observable `CallLog`
+    # field (review-cli#326 round 3, Fable finding 2: baking `exit_code == 403/401` in
+    # here too made it a second, independent source of truth from the stored field,
+    # inconsistent with how `classify_call` still checks `exit_code == 124` live for
+    # HEALTH_TIMEOUT alongside the stored `timed_out`). `classify_call` combines the two.
+    is_cf_blocked = _CF_BLOCK_MARKER in blob
+    is_bad_key = _BAD_KEY_MARKER in blob
+    has_real_content = _body_has_real_content(full_body)
+    return (
+        completed,
+        has_error,
+        error_summary,
+        is_paywall,
+        is_cf_blocked,
+        is_bad_key,
+        has_real_content,
+    )
+
+
 def parse_call_log(path: Path) -> CallLog | None:
-    """Parse one ``*-r{n}.log`` file. Returns None if the name doesn't match."""
+    """Parse one ``*-r{n}.log`` file. Returns None if the name doesn't match, INCLUDING
+    a name that matches the shape but carries a date `_parse_stamp` can't parse (a
+    corrupted/restored/typo'd filename) — review-cli#323 review finding: this used to
+    raise ValueError straight out of `_parse_stamp`, which is fatal to every caller that
+    doesn't specifically guard for it (both `load_sessions`'s directory scan AND the SSE
+    `_emit_activity` path reach this function with no such guard). Matching the
+    documented "Returns None if the name doesn't match" contract for an invalid date too
+    means every caller gets the fix for free, instead of needing its own guard."""
     m = _CALL_RE.match(path.name)
     if not m:
         return None
-    started = _parse_stamp(m.group(1), m.group(2))
+    try:
+        started = _parse_stamp(m.group(1), m.group(2))
+    except ValueError:
+        return None
     backend = m.group(3)
     round_no = int(m.group(4))
     try:
@@ -370,6 +586,8 @@ def parse_call_log(path: Path) -> CallLog | None:
     stderr_lines: list[str] = []
     timed_out = False
     timeout_secs: int | None = None
+    true_silenced = False
+    true_silence_secs: int | None = None
     exit_code: int | None = None
     task_code: str | None = None
     header_seen = False
@@ -409,6 +627,20 @@ def parse_call_log(path: Path) -> CallLog | None:
             if _TIMEOUT_RE.match(lines[j]):
                 timeout_line_idx = j
             break  # only the trailing-most non-body line is decisive
+    # A true-silence reap (reviewlib#238) is the same shape as the ordinary timeout
+    # marker above, tied to its own return code (125, process._run_streamed) instead
+    # of 124 — same trailing-position discipline, same EXIT-0-quotes-the-marker guard.
+    true_silence_line_idx: int | None = None
+    if exit_code == 125 or exit_code is None:
+        scan_start = (
+            (exit_line_idx - 1) if exit_line_idx is not None else (len(lines) - 1)
+        )
+        for j in range(scan_start, -1, -1):
+            if not lines[j].strip():
+                continue  # skip blank lines between body and footer
+            if _TRUE_SILENCE_RE.match(lines[j]):
+                true_silence_line_idx = j
+            break  # only the trailing-most non-body line is decisive
     for i, line in enumerate(lines):
         if i == exit_line_idx:
             continue  # the authoritative trailing status footer — kept out of the body
@@ -434,6 +666,11 @@ def parse_call_log(path: Path) -> CallLog | None:
             timed_out = True
             timeout_secs = int(tm.group("secs"))
             continue  # the authoritative timeout marker — kept out of the body
+        if i == true_silence_line_idx:
+            tsm = _TRUE_SILENCE_RE.match(line)
+            true_silenced = True
+            true_silence_secs = int(tsm.group("secs"))
+            continue  # the authoritative true-silence marker — kept out of the body
         if line.startswith(_STDERR_PREFIX):
             stderr_lines.append(line[len(_STDERR_PREFIX) :])
         body_lines.append(line)
@@ -444,6 +681,24 @@ def parse_call_log(path: Path) -> CallLog | None:
     except OSError:
         size = len(raw.encode("utf-8"))
         mtime = None
+    full_body = "\n".join(body_lines).strip()
+    (
+        completed,
+        has_error,
+        error_summary,
+        is_paywall,
+        is_cf_blocked,
+        is_bad_key,
+        has_real_content,
+    ) = _classify_from_full_text(
+        full_body,
+        stderr_lines,
+        exit_code,
+        timed_out,
+        timeout_secs,
+        true_silenced,
+        true_silence_secs,
+    )
     return CallLog(
         path=str(path),
         filename=path.name,
@@ -451,12 +706,28 @@ def parse_call_log(path: Path) -> CallLog | None:
         backend=backend,
         round=round_no,
         argv0=argv0,
-        body="\n".join(body_lines).strip(),
-        stderr_lines=stderr_lines,
+        body=_cap_body(full_body),
+        # review-cli#326 review finding (Opus + Codex, round 1; line-count fix codex
+        # round 3 P1): a chatty backend dumping megabytes of `[stderr]`-prefixed
+        # diagnostics -- or thousands of near-empty ones -- reproduces the exact
+        # unbounded-retention blowup this fix exists for, just through this field
+        # instead of `body`; `_cap_stderr_lines` bounds both bytes and line count so
+        # every existing list-shaped caller (`stderr_lines[0]`, `"\n".join(...)`)
+        # still works.
+        stderr_lines=_cap_stderr_lines(stderr_lines) if stderr_lines else [],
         timed_out=timed_out,
         timeout_secs=timeout_secs,
+        true_silenced=true_silenced,
+        true_silence_secs=true_silence_secs,
         exit_code=exit_code,
         task_code=task_code,
+        completed=completed,
+        has_error=has_error,
+        error_summary=error_summary,
+        is_paywall=is_paywall,
+        is_cf_blocked=is_cf_blocked,
+        is_bad_key=is_bad_key,
+        has_real_content=has_real_content,
         size_bytes=size,
         mtime=mtime,
     )
@@ -476,10 +747,17 @@ _BS_SECTION_RE = re.compile(r"^(?:## Moderator \(round \d+\)|# Final synthesis)\
 
 
 def parse_brainstorm_log(path: Path) -> BrainstormLog | None:
+    """Returns None if the name doesn't match, INCLUDING a name that matches the shape
+    but carries a date `_parse_stamp` can't parse — same fix and rationale as
+    `parse_call_log` (review-cli#323 review finding: a `.log`-only guard left this
+    `.md` sibling still fatal to `load_sessions`'s directory scan)."""
     m = _BRAINSTORM_RE.match(path.name)
     if not m:
         return None
-    started = _parse_stamp(m.group(1), m.group(2))
+    try:
+        started = _parse_stamp(m.group(1), m.group(2))
+    except ValueError:
+        return None
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -783,11 +1061,21 @@ def cluster_sessions(
     ordered = sorted(calls, key=lambda c: c.started)
     sessions: list[Session] = []
     cur: Session | None = None
+    # Tracks `cur.task_code` incrementally instead of calling the `Session.task_code`
+    # PROPERTY on every iteration — that property scans `cur.calls` from index 0 for the
+    # first truthy task_code, so calling it once per considered call made this loop O(n^2)
+    # in the (common, for a task-less ad-hoc review) case where no call in a growing
+    # session has a task_code: the scan never short-circuits and re-walks the whole
+    # (growing) list every time. Measured live: dominated `load_sessions` at real scale
+    # (review-cli#323 follow-on) even after the per-file parse itself was cached. `cur` is
+    # always brainstorm-less during this loop (brainstorms attach in a separate pass
+    # below), so "first truthy task_code among cur.calls" is exactly what this tracks.
+    cur_task_code: str | None = None
     for call in ordered:
         # Gap is measured from the prior call's END (last write), not its start, so a
         # single invocation whose individual call runs longer than `gap` is not split
         # into multiple sessions. `cur.ended` therefore tracks the max call end-time.
-        same_task = cur is not None and (cur.task_code or "") == (call.task_code or "")
+        same_task = cur is not None and (cur_task_code or "") == (call.task_code or "")
         if (
             cur is None
             or not same_task
@@ -800,8 +1088,10 @@ def cluster_sessions(
                 calls=[call],
             )
             sessions.append(cur)
+            cur_task_code = call.task_code
         else:
             cur.calls.append(call)
+            cur_task_code = cur_task_code or call.task_code
             if call.ended_at > cur.ended:
                 cur.ended = call.ended_at
     # Attach each brainstorm.md to the session whose window contains/precedes it.
@@ -850,13 +1140,26 @@ def load_sessions(
         if not entry.is_file():
             continue
         if entry.suffix == ".log":
-            c = parse_call_log(entry)
+            # Call-log files are write-once, so a repeat scan of the same directory can
+            # reuse a prior parse keyed on (filename, mtime, size) instead of re-reading
+            # and re-parsing potentially tens of thousands of files on every request —
+            # the documented cause of the dashboard's default view rendering blank
+            # before a cold parse of a long-lived install's log dir finishes.
+            #
+            # A malformed filename (a bad date component `_parse_stamp` can't parse) is
+            # handled INSIDE `parse_call_log` now (returns None, same as any other
+            # non-matching name) — see its docstring for why (review-cli#323 review
+            # finding). One bad file must not crash the entire scan, and fixing it at
+            # that source covers every caller (this scan AND the SSE `_emit_activity`
+            # path) instead of needing a guard at each call site.
+            c = call_log_cache.get_or_parse(log_dir_path, entry, parse_call_log)
             if c:
                 calls.append(c)
         elif entry.suffix == ".md":
             b = parse_brainstorm_log(entry)
             if b:
                 brainstorms.append(b)
+    call_log_cache.save(log_dir_path)
     return cluster_sessions(calls, brainstorms, gap_seconds)
 
 
@@ -869,7 +1172,9 @@ def load_sessions(
 # past the browser/Tailscale-proxy timeout, never resolved, and the panel stayed stuck on
 # "Loading…" — i.e. an EMPTY dashboard. The fix is a short-lived memo of the parsed sessions,
 # invalidated by a CHEAP directory signature so live activity is never hidden behind a stale
-# cache. `load_sessions` itself stays PURE (no caching) so tests keep deterministic parses.
+# cache. `load_sessions` itself stays DETERMINISTIC given the same on-disk `.log`/`.md`
+# content (tests still get repeatable parses) — it does now persist its own per-file perf
+# memo (`call_log_cache`) as a side effect, but that memo never changes what it RETURNS.
 _CacheKey = tuple[str, float]  # (resolved dir str, gap)
 _Signature = tuple[int, float]  # (entry-count, max-mtime), from `_dir_signature`
 
@@ -891,7 +1196,9 @@ class _SingleFlightCache:
     WAIT for that in-flight result instead of starting a duplicate producer. A waiter accepts
     whatever that one in-flight cycle produced even if the dir signature has since moved again —
     staleness of a single parse-cycle is fine, and it guarantees forward progress (no re-parse
-    loop while a writer hammers the dir). `load_sessions` / `compute_stats` themselves stay pure.
+    loop while a writer hammers the dir). `load_sessions` / `compute_stats` themselves stay
+    deterministic (same source logs in, same result out) — see the note above `_CacheKey`
+    on `load_sessions`'s own perf-memo side effect.
 
     Thread-safety / deadlock-freedom: one `threading.Condition` (and its single underlying lock)
     guards `_cache` and `_in_flight`. The lock is held ONLY for the cheap bookkeeping + the
@@ -989,6 +1296,17 @@ def _dir_signature(log_dir_path: Path) -> tuple[int, float]:
     try:
         with os.scandir(log_dir_path) as it:
             for entry in it:
+                # Only source artifacts move this signature -- derived data written into
+                # the SAME directory (the persistent call-log cache's db/wal/shm files,
+                # `call_log_cache.py`) must NOT count, or every `load_sessions` call that
+                # writes/updates its own cache invalidates this exact memo on its very next
+                # read, guaranteeing a full re-parse after every productive scan. Same
+                # `Path.suffix` idiom (not a bare `.endswith`) as `_log_dir_fingerprint`/
+                # `_snapshot_logs`, so a dotfile literally named `.log` (suffix `""` under
+                # `Path`) is treated identically by all three -- a prior `endswith` version
+                # of this filter disagreed with its siblings on exactly that edge case.
+                if Path(entry.name).suffix not in (".log", ".md"):
+                    continue
                 count += 1
                 try:
                     mtime = entry.stat().st_mtime
@@ -1069,6 +1387,7 @@ def compute_stats(sessions: list[Session]) -> dict:
     call_total = 0
     error_calls = 0
     timeout_calls = 0
+    true_silence_calls = 0
     ok_calls = 0
     running_calls = 0
     for s in sessions:
@@ -1110,6 +1429,8 @@ def compute_stats(sessions: list[Session]) -> dict:
                 durations.append(d)
             if c.timed_out:
                 timeout_calls += 1
+            if c.true_silenced:
+                true_silence_calls += 1
             if not c.completed:
                 # A footerless, error-free log = a call still streaming or whose writer died
                 # before the footer. It is neither success nor failure — don't inflate the
@@ -1140,6 +1461,7 @@ def compute_stats(sessions: list[Session]) -> dict:
         "ok_calls": ok_calls,
         "error_calls": error_calls,
         "timeout_calls": timeout_calls,
+        "true_silence_calls": true_silence_calls,
         "running_calls": running_calls,
         # success_rate is over COMPLETED calls only (ok + error) — an in-flight / aborted
         # footerless call has no known outcome and must not drag the rate either way.
@@ -1198,6 +1520,19 @@ def _normalize_body(text: str) -> str:
 # is far more specific: 33 of 6,981 real calls (0.5%) in the same window.
 _PAYWALL_PREFILTER_RE = re.compile(r"currently\s*unavailable", re.IGNORECASE)
 
+# `_cooldown_skip_result`'s true-silence branch (backends.py `_bounded_cooldown_skip_body`)
+# always emits this exact trailing clause verbatim, including the digit-only remaining-
+# seconds field and the literal module name — anchoring on the FULL shape (not just the
+# "true-silence timeout" reason fragment) keeps this from firing on a normal review body
+# that merely quotes or discusses that reason string, e.g. this diff's own source or tests.
+_TRUE_SILENCE_SKIP_RE = re.compile(
+    r"\(cached: true-silence timeout; skip expires in \d+s — reviewlib\.seat_cooldown\)\."
+)
+# Mirrors `backends._UNAVAILABLE_MAX_LEN` (400) — `_bounded_cooldown_skip_body` guarantees
+# every skip body it returns is <= this length, so a longer body can never match the
+# pattern above and the regex scan can be skipped entirely (see `classify_call`).
+_TRUE_SILENCE_SKIP_MAX_LEN = 400
+
 
 def _has_paywall_sentinel(text: str) -> bool:
     """`_PAYWALL_SENTINEL in _normalize_body(text)`, byte-for-byte — this is a perf
@@ -1251,7 +1586,7 @@ def _has_paywall_sentinel(text: str) -> bool:
     return _PAYWALL_SENTINEL in _normalize_body(text)
 
 
-def _body_has_real_content(call: "CallLog") -> bool:
+def _body_has_real_content(full_body: str) -> bool:
     """Did this EXIT-0 call return a real verdict, or is it empty/framing-only?
 
     A call is EMPTY when it exited cleanly but produced no usable review: a body that —
@@ -1263,8 +1598,17 @@ def _body_has_real_content(call: "CallLog") -> bool:
     that returns REAL review text but omits usage metadata still appends a zero fallback
     usage line (`input_tokens=0 output_tokens=0`). The verdict above that line is real, so
     presence of actual prose decides — we only treat the usage line itself as non-content,
-    not the whole call (codex P2)."""
-    for raw in call.body.splitlines():
+    not the whole call (codex P2).
+
+    review-cli#326 round 6: takes the FULL, uncapped body (called from
+    `_classify_from_full_text`, before `_cap_body` ever runs) -- an earlier version
+    took the `CallLog` and read its already-CAPPED `call.body`, which broke two ways:
+    a genuinely-empty oversized call's injected truncation-marker line got counted as
+    real content (round 5, codex P1), and an oversized single-line REAL verdict (no
+    newlines anywhere) capped down to just the marker and misclassified as empty
+    (round 6, codex P1). Operating on the full text sidesteps both -- the marker
+    literally cannot appear in this function's input."""
+    for raw in full_body.splitlines():
         line = raw.strip()
         if not line:
             continue
@@ -1286,31 +1630,81 @@ def _body_has_real_content(call: "CallLog") -> bool:
 def classify_call(call: "CallLog") -> str:
     """Bucket one finished call into a health class (see HEALTH_* constants).
 
-    Precedence is by how hard/actionable the failure is: timeout and the three
-    hard-unavailable classes (paywall/auth/blocked) are recognised first, because their
-    sentinels are unambiguous and they explain a model being down NOW. EMPTY vs OK is the
-    EXIT-0 split (no content vs a real verdict). A non-zero exit with no recognised sentinel
-    falls through to the generic ERROR class so it still counts against the ok-rate."""
+    Precedence is by how hard/actionable the failure is: timeout, true-silence, and the
+    three hard-unavailable classes (paywall/auth/blocked) are recognised first, because
+    their sentinels are unambiguous and they explain a model being down NOW. EMPTY vs OK
+    is the EXIT-0 split (no content vs a real verdict). A non-zero exit with no recognised
+    sentinel falls through to the generic ERROR class so it still counts against the
+    ok-rate."""
+    # A true-silence cooldown-SKIP (`_cooldown_skip_result` in backends.py) deliberately
+    # reuses the paywall-shaped sentinel body so the skipped call isn't invisible on the
+    # dashboard — but that means a seat benched for going silent, not for a real quota/
+    # paywall rejection, would otherwise show a HEALTH_PAYWALL badge for its entire
+    # escalated cooldown window (10min-8h), misleading an operator into checking billing
+    # for a seat that never hit one.
+    #
+    # codex review finding: an earlier version of this check matched the bare substring
+    # "(cached: true-silence timeout;", which a normal EXIT-0 review whose body happens
+    # to quote or discuss that exact code/string (this diff's own source, for instance)
+    # would also match, misclassifying a real successful review as true-silence. The
+    # anchored pattern below requires the SKIP body's full, distinctive trailing clause
+    # (`_bounded_cooldown_skip_body`'s fixed suffix, including the em dash and the
+    # module name) to appear, not just the reason fragment — this is the same residual
+    # "a reviewed body could theoretically quote our own sentinel text" risk the paywall
+    # check below already accepts for its own marker, not a new class of exposure.
+    #
+    # GLM review finding (performance): `classify_call` is a documented hot path
+    # (review-cli#186 profiled a single unconditional full-body regex scan here at 20+
+    # of a ~50s report over ~7,000 calls) -- an earlier version of this check ran
+    # unconditionally, adding a second such scan ahead of the paywall prefilter. But a
+    # true-silence SKIP body is provably bounded (`_bounded_cooldown_skip_body` in
+    # backends.py guarantees <= `_UNAVAILABLE_MAX_LEN` (400) chars on every return
+    # path), so a body longer than that can never be a skip body -- gating on length
+    # first makes this O(1) for every real (non-skip) review body, semantically
+    # identical to running the regex unconditionally.
+    if len(call.body) <= _TRUE_SILENCE_SKIP_MAX_LEN and _TRUE_SILENCE_SKIP_RE.search(
+        call.body
+    ):
+        return HEALTH_TRUE_SILENCE
     # Paywall: the body sentinel is authoritative even when EXIT is 0 (Fable returns 0 with
     # an "unavailable" body — the EXIT code lies, the body tells the truth). This is the only
     # check that must run on the EXIT-0 happy path, so it leads.
-    if _has_paywall_sentinel(call.body):
+    #
+    # review-cli#326 round 2 (codex reproduction): `is_paywall`/`is_cf_blocked`/
+    # `is_bad_key` are precomputed once in `parse_call_log`, from the FULL untruncated
+    # body/stderr, before `_cap_body` ever runs — re-deriving them here from
+    # `call.body`/`call.stderr_lines` (which are capped for display) would miss a
+    # sentinel that only survives in the OMITTED middle of a huge legacy log.
+    if call.is_paywall:
         return HEALTH_PAYWALL
     if call.timed_out or call.exit_code == 124:
         return HEALTH_TIMEOUT
-    # The CF bot-block / bad-key markers can land in stderr OR the body; build the haystack
-    # once, only for the error-bearing calls that need it (the healthy majority skips this).
-    blob = ("\n".join(call.stderr_lines) + "\n" + call.body).lower()
-    # Blocked (Cloudflare): EXIT 403 or the CF marker.
-    if call.exit_code == 403 or _CF_BLOCK_MARKER in blob:
+    # Unlike the 124/timeout check above, exit 125 is NOT unambiguous on its own (codex +
+    # Opus review finding): some backends/wrappers legitimately exit 125 for their own
+    # unrelated reason, even with full real output and no reap. `call.true_silenced` —
+    # set only when parse_call_log found the authoritative TRUE-SILENCE marker in the
+    # writer's trailing position — is the sole signal; a bare exit-125 falls through to
+    # the ordinary error/empty/ok classification below, same as before this feature.
+    if call.true_silenced:
+        return HEALTH_TRUE_SILENCE
+    # Blocked (Cloudflare): EXIT 403 or the CF marker. `is_cf_blocked` carries ONLY the
+    # marker signal (see `_classify_from_full_text`) -- exit_code is checked live here,
+    # same pattern as `exit_code == 124` for HEALTH_TIMEOUT above (round 3, Fable
+    # finding 2: an earlier version folded exit_code into the stored field too, a
+    # second, inconsistent source of truth for the same fact).
+    if call.exit_code == 403 or call.is_cf_blocked:
         return HEALTH_BLOCKED
-    # Auth: EXIT 401 or the bad-key marker.
-    if call.exit_code == 401 or _BAD_KEY_MARKER in blob:
+    # Auth: EXIT 401 or the bad-key marker -- same live-exit_code pattern.
+    if call.exit_code == 401 or call.is_bad_key:
         return HEALTH_AUTH
     if call.has_error:
         return HEALTH_ERROR
-    # EXIT 0 from here: real verdict vs empty/framing-only.
-    if not _body_has_real_content(call):
+    # EXIT 0 from here: real verdict vs empty/framing-only. `has_real_content` is
+    # precomputed on the full untruncated body (see `_classify_from_full_text`) --
+    # round 6, codex P1: reading the CAPPED `call.body` here missed both an oversized
+    # empty call's own truncation marker (looked like content) and an oversized
+    # single-line real verdict (capped down to nothing but the marker, looked empty).
+    if not call.has_real_content:
         return HEALTH_EMPTY
     return HEALTH_OK
 
@@ -1341,7 +1735,8 @@ def model_id_for_call(call: "CallLog") -> str:
         m = _CLAUDE_API_MODEL_RE.match(call.argv0)
         if m:
             return f"claude:{m.group('model')}"
-        if _has_paywall_sentinel(call.body):
+        # review-cli#326: precomputed on the full untruncated body (see classify_call).
+        if call.is_paywall:
             return _CLAUDE_FABLE_MODEL
         return _CLAUDE_OPUS_MODEL
     if backend == "codex":
@@ -1382,8 +1777,10 @@ def _board_models() -> list[dict]:
     lazily so the parser stays import-light and free of a config dependency at module load.
 
     Carries the 1-based raw-board PRIORITY so the Models tab and the Errors-tab fallback hint
-    cover optional heavy-preset seats (Fable/Sol) as well as the default preset. This
-    returns FRESH dict copies so a caller can never mutate the shared cache (glm review
+    cover seats outside the default preset too — Sol (heavy-preset only) and Fable
+    (review-cli#fable-seat-reliability: no preset at all, a raw-board last-resort
+    reserve seat). This returns FRESH dict copies so a caller can never mutate the
+    shared cache (glm review
     finding 7 — the lookup runs once per failed call on the runs-list endpoint, so rebuilding
     the config objects each time was the wasteful part; copying small dicts is cheap)."""
     return [dict(b) for b in _board_models_cached()]
@@ -1487,9 +1884,11 @@ def compute_model_health(sessions: list[Session]) -> dict:
     MODEL id (commandcode/z.ai gateway model, Fable-vs-Opus split, etc.), classifies it, and
     rolls up per model: total/ok/fail counts, ok-rate, the dominant failure class, the most
     recent class, and a `problematic` flag. Built-in raw-board models with NO calls in the
-    window are still listed (status `no_data`) so the view covers optional heavy-preset
-    seats (Fable/Sol) as well as the default preset; any non-board model that appears in
-    the logs is appended too. Returns `{"models": [...], "problematic_count": N}`;
+    window are still listed (status `no_data`) so the view covers seats outside the default
+    preset too — Sol (heavy-preset only) and Fable (review-cli#fable-seat-reliability: no
+    preset at all, a raw-board last-resort reserve seat) — as well as the default preset;
+    any non-board model that appears in the logs is appended too. Returns
+    `{"models": [...], "problematic_count": N}`;
     `problematic_count` is over built-in board models (the tab badge)."""
     # Gather calls per model, newest-first (sessions arrive newest-first; within a session
     # we keep call order then reverse so the most-recent call leads).

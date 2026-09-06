@@ -41,7 +41,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import reviewlib.backends as backends  # noqa: E402
-from reviewlib.config import BoardReviewer, split_pool_reserve, _expand_alias  # noqa: E402
+from reviewlib.config import (  # noqa: E402
+    ASTRA_SEAT,
+    SOL_SEAT,
+    SONNET_SEAT,
+    TERRA_SEAT,
+    BoardReviewer,
+    split_pool_reserve,
+    _expand_alias,
+)
 
 _KEY_ENV_NAMES = (
     "ZAI_API_KEY",
@@ -200,6 +208,18 @@ def test_aliases_expand():
     assert _expand_alias("cc") == "commandcode"
     # Pre-existing aliases survive.
     assert _expand_alias("fable5") == "claude:claude-fable-5"
+    # Sol/Astra: pinned so a bare `-m sol`/`-m astra` doesn't fall through
+    # `_match_named_backend` to the opencode catch-all (the same failure class `opus`
+    # was pinned against, config.py's MODEL_ALIASES comment).
+    assert _expand_alias("sol") == SOL_SEAT
+    assert _expand_alias("gpt56sol") == SOL_SEAT
+    assert _expand_alias("astra") == ASTRA_SEAT
+    assert _expand_alias("gpt6astra") == ASTRA_SEAT
+    # Terra/Sonnet (review-cli#382): pinned for the same reason as Sol/Astra above.
+    assert _expand_alias("terra") == TERRA_SEAT
+    assert _expand_alias("gpt56terra") == TERRA_SEAT
+    assert _expand_alias("sonnet") == SONNET_SEAT
+    assert _expand_alias("sonnet5") == SONNET_SEAT
 
 
 # === z.ai request shape (OpenAI-compatible, NOT gemini contents/parts) ===========
@@ -394,7 +414,7 @@ def test_commandcode_base_url_and_model_override():
 
 
 def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
-    """The priority-4 GLM-5.2 board seat (`commandcode:zai-org/GLM-5.2`) must POST the
+    """The priority-3 GLM-5.2 board seat (`commandcode:zai-org/GLM-5.2`) must POST the
     byte-exact gateway model id `zai-org/GLM-5.2` — INCLUDING the embedded slash. The id has
     TWO `/`-free segments around a single `/` plus the `commandcode:` provider prefix, so a
     naive split could truncate it; this pins that `review_commandcode` strips ONLY the
@@ -423,7 +443,7 @@ def test_commandcode_glm_seat_posts_the_byte_exact_gateway_id():
 
 
 def test_commandcode_glm_seat_id_beats_commandcode_model_env():
-    """The priority-4 GLM-cc seat id WINS over a `COMMANDCODE_MODEL` env override — so a host
+    """The priority-3 GLM-cc seat id WINS over a `COMMANDCODE_MODEL` env override — so a host
     that exports `COMMANDCODE_MODEL` (a legitimate override for the bare `-m cc` path) can NOT
     silently hijack the default-board seat into POSTing a different model. `review_commandcode`
     only consults `COMMANDCODE_MODEL` for a BARE `commandcode` id (no suffix); a suffixed seat

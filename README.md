@@ -6,7 +6,7 @@
 > caged — they cannot edit, run shell, or hit the network), with two explicit, narrow
 > exceptions. The **`qa`** mode runs an **un-caged write/exec tester** that drives a
 > System-Under-Test (see [QA — agent-as-tester](#qa--agent-as-tester-review-qa) for the
-> safety model). And **`review diff --staged --commit`** creates a checkpoint commit of
+> safety model). And **`review diff --staged --task CODE --commit`** creates a checkpoint commit of
 > the staged diff it just reviewed (opt-in via `--commit`; see
 > [Diff review](#diff-review-review-diff) below). Don't assume every subcommand is
 > read-only.
@@ -143,8 +143,8 @@ git show --format= --no-ext-diff HEAD | review diff --task HYP-742 -m gemini,cod
 > **Never use `git reset --hard` to discard a bad attempt mid-review** — a review→fix→
 > re-review loop that resets hard can destroy unrelated uncommitted work from other
 > sessions/agents sharing the same checkout (it has happened). Use `git checkout --
-> <file>` to discard specific files, or `review diff --staged --commit` (below) to
-> checkpoint progress instead — undo a bad checkpoint safely with `git reset --soft
+> <file>` to discard specific files, or `review diff --staged --task CODE --commit` (below)
+> to checkpoint progress instead — undo a bad checkpoint safely with `git reset --soft
 > HEAD~1`, which does not touch untracked/foreign files.
 
 **Diff size cap.** The auto-detected diff is capped at 300,000 bytes by default
@@ -208,11 +208,33 @@ git diff | review just-ask "Is this safe to merge?" --task HYP-742
 
 Two-phase structured panel. **Phase 1:** every expert answers in parallel and must cite
 concrete evidence (file/line/fact); if they lack an evidence base they must say
-`INSUFFICIENT EVIDENCE` rather than guess. **Phase 2:** a moderator runs sequentially,
-reads all expert answers, and emits a structured summary with three sections — QUORUM
-(points of majority agreement with evidence), DISAGREEMENT / NO QUORUM, and ABSTAINED.
+`INSUFFICIENT EVIDENCE` rather than guess. Each seat also reasons from an assigned
+role/lens (the same persona pool `brainstorm` rotates through — pragmatic staff
+engineer, security-paranoid reviewer, skeptical SRE, etc.), shown in the transcript as
+`glm [Security-paranoid reviewer]`; when a distinct-model pool is scarce or some
+models are near their usage limit, one model can fill several seats (`fable#1`,
+`fable#2`, ...) and each of ITS seats gets a different lens, up to the size of the
+persona pool (currently 6) — beyond that a model's lens can repeat. A model covering
+multiple roles in parallel is a fully valid panel shape; each of its seats is a genuine,
+undiscounted opinion in its own right. **Phase 2:** a moderator runs sequentially, reads
+all expert answers, and emits a structured summary with three sections — QUORUM (points
+of majority agreement with evidence), DISAGREEMENT / NO QUORUM, and ABSTAINED.
 
 Use when a question has real stakes and you want cited consensus, not vibes.
+
+**`--adversarial-check` — an opt-in refutation pass for ship-gate-critical
+questions.** After Phase 2 reaches a CLEAN verdict (no blocking disagreement), this
+spawns one more pass whose only job is to try to REFUTE "no issues found" — not
+another vote, an explicit attempt to find what the panel missed. If it finds a
+genuine problem, that's surfaced as a new finding (never silently discarded) and the
+run exits non-zero. Skipped automatically when the panel already disagreed (nothing
+clean to refute) or when the flag is absent, so it costs nothing on routine
+questions — reach for it specifically before a merge/ship decision, not every
+`review quorum` call:
+
+```bash
+review quorum "should we ship this?" --adversarial-check --task HYP-742
+```
 
 **Live logs & partial output.** Each backend call streams its output in real time
 to a per-call log in the OS-standard per-user log dir — **macOS** `~/Library/Logs/review-cli/`,
@@ -283,10 +305,10 @@ review quorum "Should we switch to a plugin architecture?" --task HYP-742 --mode
 ![brainstorm mode](docs/mode-brainstorm.svg)
 
 Iterative ideation loop. Each round assigns at least three distinct **rotating personas**
-(Pragmatic Staff Engineer, Security-Paranoid Reviewer, DX Designer, Skeptical SRE,
-Product-Minded Architect, Cost-Conscious Perf Engineer) to your panel backends in
-parallel. After each round a moderator summarizes and decides STOP/CONTINUE — but
-**cannot stop before `--rounds`** (minimum and default: 5). `--max-rounds` (default 8)
+(Pragmatic Staff Engineer, Security-Paranoid Reviewer, Developer-Experience Designer,
+Skeptical SRE, Product-Minded Architect, Cost-Conscious Perf Engineer) to your panel
+backends in parallel. After each round a moderator summarizes and decides STOP/CONTINUE — but
+**cannot stop before `--rounds`** (minimum and default: 3). `--max-rounds` (default 8)
 is a hard cap. Ends with a full moderator synthesis: best ideas, tradeoffs, and a
 concrete recommendation.
 
@@ -295,8 +317,11 @@ rounds rather than converge in one shot.
 
 **Brainstorm about a specific change (`brainstorm` + a diff).** brainstorm is composable
 with the diff. When there IS a diff — an uncommitted working-tree diff in `-C` (pass
-`--diff`), a `--staged` diff, or a piped diff — every persona (and the moderator) sees it
-as constant **grounding context**, so you can brainstorm concretely ABOUT a change
+`--diff`), a `--staged` diff, or a piped diff — the moderator sees it as constant
+**grounding context** on every round, and personas see it on the first round of the
+invocation (Alex, 2026-08-28: later rounds rely on the shared transcript instead of
+re-reading the diff — cheaper, since personas rotate and the transcript already carries
+forward what earlier rounds found), so you can brainstorm concretely ABOUT a change
 instead of in the abstract. With **no** diff present it stays pure ideation, exactly as
 before. The diff is optional: an absent diff or a non-repo `-C` degrades silently to
 ideation.
@@ -508,7 +533,101 @@ JSON top-level shapes:
 | `review task --json` | `{"tasks": [{"task_code": str, "iterations": int, "models": [str], "modes": [str], "first_ts": str, "last_ts": str, "duration_seconds": number, "ok_count": int, "fail_count": int}]}` |
 | `review task CODE --json` | `{"task_code": str, "iterations": [run_stats_record], "sessions": [dashboard_session_summary]}` |
 | `review task CODE --detail N --json` | `dashboard_session_detail` with `session_id`, `task_code`, `calls`, `errors`, `brainstorm`, and `roles` |
-| `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models": int, "passed": bool, "error"?: str}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). |
+| `review task CODE --check --json` | `{"task_code": str, "passed_iterations": int, "total_iterations": int, "distinct_models_passed": int, "models": [str], "min_iter": int, "min_models"?: int, "passed": bool, "error"?: str, "identity_verification": "ran" \| "disabled" \| "skipped_unresolvable", "verified_iterations"?: int, "unverifiable_iterations"?: int, "excluded_mismatched_iterations"?: int, "mismatch_details"?: [{"iteration": int, "reason": str, "recorded_repo_id": str, "recorded_diff_files": [str] | null, "ts": str}], "mismatch_details_truncated"?: true, "stalled_models"?: [{"model": str, "reason": str, "remaining_seconds": int, "consecutive_failures": int}], "min_roles_suggestion"?: str, "roles"?: [str], "distinct_roles_passed"?: int, "min_roles"?: int, "min_models_advisory"?: str}` — self-merge-authority gate; only iterations whose run came back clean count toward `passed_iterations`/`distinct_models_passed` (see `--check`'s own help). `mismatch_details` is capped at 50 entries — `excluded_mismatched_iterations` is always the uncapped true count. `stalled_models` (review-cli#221) is present only when the bar ISN'T met and names any ATTEMPTED model that's currently cooling down (an unavailable-sentinel response or a session-limit/usage-credits notice — the two chronic signals `seat_cooldown` records; a plain timeout does NOT currently start a cooldown, see the "Deliberately narrow" note above) — the same signal `stalled: <model> (...)` lines print in text mode. `min_models` (review-cli#246: now optional) appears only when `--min-models` was explicitly given. `roles`/`distinct_roles_passed`/`min_roles` (review-cli#221, `--min-roles`) appear whenever a role-based floor is ACTIVE — either `--min-roles` was explicitly given, or NEITHER flag was given (review-cli#246's new default, see below). `min_roles_suggestion` appears only when `--min-roles` was NOT passed and the gate failed because `distinct_models_passed` fell short of an explicit `--min-models`. `min_models_advisory` (review-cli#246) appears whenever `--min-models` was explicitly given AND at least one iteration is recorded for the task AND the store was readable (met, not-met, or a diff-identity-mismatch denial all qualify) — a non-blocking nudge, never affecting `passed`; it is NOT added to any of the fail-closed shapes that carry NO real history to evaluate (invalid task code, unreadable store, zero recorded iterations, a floor-validation failure). |
+
+**`--min-roles N`** (review-cli#221, defaults changed in review-cli#246) switches the
+SECOND half of the gate — normally "N distinct MODEL NAMES among the passed iterations"
+(`--min-models`) — to "N distinct BOARD ROLES (architect/correctness/security/…) covered
+by the passed iterations" instead.
+
+**Explicit-vs-default semantics (review-cli#246):** both `--min-models` and `--min-roles`
+are optional; the gate reacts differently depending on which were actually TYPED:
+
+- **Neither flag given** (the true default): the bar is role-based, at the SAME numeric
+  floor `--min-models` used to default to (3) — "at least 3 distinct board roles", not "at
+  least 3 distinct models". This is the new default everywhere (Alex's direction: role-based
+  counting by default, no default model-count floor).
+- **Only `--min-models` given**: reproduces the exact pre-#221 PASS/FAIL decision — a
+  strict count of distinct model-name strings decides the gate. The `--json` payload
+  itself gains one new key here (the `min_models_advisory` described below), so a
+  strict-key-set consumer of the OLD shape still needs updating even though the gate's
+  logic hasn't changed.
+- **Only `--min-roles` given**: reproduces the exact pre-#246 `--min-roles` behavior — a
+  count of distinct board roles decides the gate; `--min-models`/`distinct_models_passed`
+  are still computed and reported for visibility, but never gate.
+- **BOTH given explicitly**: an explicitly requested floor is now ALWAYS enforced — the gate
+  requires `--min-iter` AND the model floor AND the role floor to all be met (an AND, not
+  "whichever is passed governs"). This fixes a review-cli#221 round-3 review finding: a
+  caller explicitly passing `--min-models 5 --min-roles 1` used to get `passed: true` from a
+  single-model review, because `--min-roles` silently outvoted the explicit model floor —
+  Alex's policy is "if a model limit is explicitly set, it must work". Whenever `--min-models`
+  is explicit, the response also carries a non-blocking `min_models_advisory` note (both in
+  `--json` and as a `  note: ...` stderr/stdout line in text mode) suggesting that role-based
+  coverage is usually sufficient on its own — it never affects `passed`.
+
+This exists because the board's shortage-resilience behavior (PR #207:
+`select_pool_with_reuse`, review-cli#207) fills an otherwise-empty role by reusing an
+already-picked model instead of shrinking the panel — each duplicated pass reviews under
+its OWN distinct role, but `--min-models` still only counts it as the SAME model string it
+already counted once. A task whose recent history is "2 real distinct models + 1 role-fill
+pass that reused one of them under a third role" can never satisfy `--min-models 3`, even
+though 3 genuinely distinct facets of the diff were reviewed — `--min-roles 3` counts that
+correctly. Only a role that is an actual `REVIEW_ROLES` key counts (an unknown/typo'd role
+string on a custom config `board:` entry is kept for its own diagnostics but never a
+distinct FACET — the seat degrades to the generic prompt, so it earns no lens credit here).
+When an EXPLICIT `--min-models` (with no `--min-roles`) fails, the text/`--json` denial
+includes a `min_roles_suggestion` pointing at `--min-roles` — but ONLY when re-running with
+`--min-roles` set to the SAME number, IN PLACE of `--min-models`, would actually pass: the
+iteration floor is already met, the recorded history covers enough distinct roles, AND at
+least 2 distinct models actually EARNED one of those roles (a model sharing a multi-seat
+record with a valid-role seat, but whose own role was unknown/typo'd, doesn't count toward
+that "2 distinct models" check — only a model whose own recorded role is a real
+`REVIEW_ROLES` key does). A task with no recorded roles at all, one that's ALSO short on
+`--min-iter`, or one whose qualifying role coverage traces back to a single model (a
+monoculture — technically `--min-roles`-passable, but not what the hint should ever steer a
+caller toward), never gets the hint. Role-mode text output also prints a secondary
+`models: N distinct model (...)` line naming which models actually reviewed. On the MET
+path this is skipped when `--min-models` was ALSO explicitly given, since that floor's own
+count clause already lists the names inline; on the NOT-met path the count clause is always
+bare numbers (no names, matching the pre-#246 convention), so the secondary line prints
+whenever a role floor is active, REGARDLESS of whether `--min-models` was also explicit —
+including on a diff-identity-mismatch denial, which still carries real model/role counts
+alongside its error message — so a self-merge-authority audit trail never loses which
+models actually reviewed just because roles (not models) governed the verdict. Only
+iterations from a mode
+that records per-seat roles (currently: the `review diff`/`review visual` board dispatch)
+contribute a role — `quorum`/`just-ask`/`brainstorm`/`qa` iterations count toward
+`--min-iter` as always, but never toward `--min-roles` — and a role only ever counts from
+a genuinely PASSED iteration that diff-identity verification did NOT exclude (the same
+verified-or-unverifiable gate `--min-models` already respects; see below).
+
+`--check` also runs **diff-identity verification** by default: it resolves `-C`/cwd
+to a repo id (the normalized `origin` remote, or a local path when there is no
+remote) and the current diff's touched files, then EXCLUDES any recorded PASSED
+iteration whose own repo differs, or whose touched files share nothing with the
+current diff — instead of trusting a task-code match alone. This closes a real
+incident class: task-code reuse (a typo, a shared parent-ticket convention, or an
+accidental/naive substitution) that let one diff's real reviews silently count
+toward a completely different diff's quorum. **Threat-model boundary:** the store
+is a local, self-reported JSONL an agent can append to directly (as the test
+suite does, deliberately, to simulate history) — this closes the "wrong string
+still matches history that's actually unrelated" class of bug, not a
+cryptographic guarantee against a FULLY malicious agent fabricating a fresh
+record with spoofed `repo_id`/`diff_files` that happen to match. Nor is file-set
+overlap a strong signal in a repo where every PR conventionally touches the same
+file (a CHANGELOG, a lockfile) — a shared "always touched" file alone can make
+an unrelated same-repo iteration look verified; this gate substantially narrows
+the incident classes it targets, it does not eliminate every same-repo
+false-positive (tracked: issue #214).
+`identity_verification` is the MACHINE-READABLE form of whether verification
+actually ran — `"ran"`, `"disabled"` (`--no-verify-identity`), or
+`"skipped_unresolvable"` (`-C` didn't resolve to a real directory) — so a
+`--json`-only caller (which never sees the stderr warning printed in the same
+two skip cases) can assert on it directly instead of inferring "did
+verification run" from whether the `verified_iterations`/etc. keys are present.
+`unverifiable_iterations` covers history recorded before this field existed,
+which still counts (fail-open only for "no data to check", never for a confirmed
+mismatch). `--no-verify-identity` restores the old task-code-only behavior.
 
 ---
 
@@ -517,8 +636,8 @@ JSON top-level shapes:
 Detailed breakdown parsed from the real per-call logs under `log_dir()`: calls/ok/fail
 per harness (backend), a byte-size proxy for usage (the only cross-harness signal that
 exists — see below), **real** token counts where a backend actually emits them, the
-SKILL.md/MEMORY.md context-pollution rate for agentic seats, the Fable (priority-1 board
-seat) dispatch/failure pattern, and the largest individual calls recorded.
+SKILL.md/MEMORY.md context-pollution rate for agentic seats, the Fable (board seat)
+dispatch/failure pattern, and the largest individual calls recorded.
 
 ```bash
 review stat                        # last 7 days (default), text report
@@ -950,7 +1069,13 @@ delivers the structured review to the launching agent.)
 And before every commit, `review diff --staged --task HYP-742` is a multi-model gate —
 optionally *enforced* with `review install-commit-hook` (a global pre-commit hook that
 blocks unreviewed staged changes; bypass with `REVIEW_SKIP=1 git commit` or
-`git commit --no-verify`).
+`git commit --no-verify`). The gate tolerates a small trailing follow-up on top of an
+already-reviewed baseline — up to `$REVIEW_TRIVIAL_DELTA_LINES` changed lines (default
+10) since the last real review — without forcing a brand-new full multi-model round on
+every restage during an iterative fix loop; a genuinely larger change, or any binary /
+submodule-gitlink content (unmeasurable by a line count), still requires a fresh review.
+Set `REVIEW_TRIVIAL_DELTA_LINES=0` to disable the tolerance and require an exact-hash
+match on every commit, as before.
 
 ---
 
@@ -1053,7 +1178,8 @@ install-skill | install-commit-hook | install-hook tg | register-module
 
 TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what applies)
 -m / --model        Backend to run; repeat or comma-separate. Default (no -m) is mode-aware:
-                    `review diff` runs the default preset board (or your config `models:`);
+                    `review diff` runs the active default preset board — "light" as of
+                    2026-08-28, see --preset — (or your config `models:`);
                     brainstorm uses `brainstorm_models:`, just-ask/quorum the defaults.
                     Each subcommand's `--help` shows its own effective default.
 -C / --cwd DIR      Run against a different repository directory.
@@ -1072,7 +1198,9 @@ TOP-LEVEL / SHARED FLAGS (shown by `review --help`; subcommand help shows what a
 --show-board        Print the active reviewer board (model -> role + availability) and exit.
 --preset NAME       Diff-review and --show-board preset: light for quick preflight,
                     default for routine review, heavy for release/risky changes with
-                    Fable/Sol. Other subcommands reject it.
+                    Sol (Fable is excluded from every preset — a confirmed ~100%
+                    dispatch failure rate; it sits last-resort in the raw board
+                    instead). Other subcommands reject it.
 --pool N            How many of the selected preset/board's seats to run (default
                     preset-dependent: 4 for default/heavy, 2 for light); the first N seats run,
                     the rest are kept in reserve. The board is never off — --pool only sizes
@@ -1092,7 +1220,7 @@ SUBCOMMAND-SCOPED FLAGS (shown by `review <mode> --help`, not the global list)
                     review the diff is required; optional grounding for brainstorm.
 --prompt TEXT       (review diff) Override the diff-review prompt.
 --moderator M       (quorum / brainstorm) Override the auto-picked moderator.
---rounds N          (brainstorm) Minimum rounds before STOP is allowed (default 5).
+--rounds N          (brainstorm) Minimum rounds before STOP is allowed (default 3).
 --max-rounds N      (brainstorm) Hard cap on rounds (default 8).
 --visual IMAGE …    Composable visual-verification group for text modes: attach/verify a
                     render; rides subcommands such as
@@ -1159,19 +1287,24 @@ out of the box — no config file required.
 
 ### Priority-ordered failover pool
 
-The raw built-in board is a **priority-ordered** list of 10 models — strongest first — and
-a plain `review diff` runs the `default` preset: a **pool of 4** without Fable/Sol, at high effort.
-Use `--preset light` for a quick/cheap pool of 2 at medium effort, and `--preset heavy` for
-release/risky changes: Fable, Sol, Opus, and GLM-cc at `xhigh` effort, with the remaining
-board seats as `max`-effort reserve. The pool is chosen by **priority + availability**,
-with two layers of failover so the run keeps the requested number of working reviewers even
-when models drop:
+The raw built-in board is a **priority-ordered** list of 12 models — strongest WORKING
+model first — and a plain `review diff` runs the `light` preset (Alex, 2026-08-28): a
+**pool of 2** without Fable/Sol, at medium effort — cheap by default for routine
+pre-commit checks. Use `--preset default` for a routine change review at a pool of 4,
+high effort, and `--preset heavy` for release/risky changes: Sol, Opus, GLM-cc, and Kimi at
+`xhigh` effort, with the remaining board seats as `max`-effort reserve. Fable is excluded
+from every preset — `review stat` telemetry showed a confirmed ~97.9-100% dispatch failure
+rate (chronic session/usage-limit exhaustion on the account it runs through), so it is
+demoted to the raw board's LAST seat instead (see the table below) — a last-resort reserve,
+not a routinely-dispatched pool seat, in any preset. The pool is chosen by **priority +
+availability**, with two layers of failover so the run keeps the requested number of
+working reviewers even when models drop:
 
 - **Startup failover** — the active pool is the **top N AVAILABLE** seats by priority.
   A higher-priority seat whose backend isn't reachable (no key / not on PATH) is
   **skipped** and the next-priority seat is pulled up, so you still start with the
-  requested number of working models. (E.g. if Fable 5 is paywalled/unavailable in the
-  heavy preset, the pool starts at Sol.)
+  requested number of working models. (E.g. if Sol is unavailable in the heavy preset,
+  the pool starts at Opus.)
 - **Mid-run failover** — if an active seat **fails during the review** (backend error,
   timeout, empty output, or an "unavailable" reply such as a paywalled model returning
   *"… is currently unavailable"*), the next-priority **reserve** model is promoted and
@@ -1184,31 +1317,52 @@ the panel still covers a broad set of facets.
 
 `--pool N` overrides the preset default (the top-N available, with the same failover);
 `--pool 0` runs **all available** seats in the selected preset/board. Use
-`--preset heavy --pool 0` for all 10 built-in seats. The board is **never disabled** —
-`--pool` only sizes the pool.
+`--preset heavy --pool 0` for all 11 heavy-preset built-in seats (the raw 12-seat board,
+including last-resort Fable, needs an explicit `board:`/`models:` config). The board is **never
+disabled** — `--pool` only sizes the pool.
 
 The built-in board, in **priority order** (the `tier` column shows the `heavy` preset split
 on a fully-keyed environment):
 
 | # | Tier | Reviewer | Backend | Role | Lens focus |
 |---|---|---|---|---|---|
-| 1 | pool | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries |
-| 2 | pool | Sol | `codex:gpt-5.6-sol` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
-| 3 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
-| 4 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
-| 5 | reserve | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
-| 6 | reserve | Codex | `codex` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
-| 7 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
-| 8 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
-| 9 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
-| 10 | reserve (last) | GLM | `oc:zai/glm-5.2` | `quality` | readability, naming, duplication, code smells, idiom (z.ai subscription route; **deprioritized to last-resort — pathologically slow under load**, review-cli#65) |
+| 1 | pool | Sol | `codex:gpt-5.6-sol` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence |
+| 2 | pool | Opus | `claude:claude-opus-4-8` | `correctness` | logic bugs, regressions, edge cases, null/async/race, off-by-one (also the moderator) |
+| 3 | pool | GLM-cc | `commandcode:zai-org/GLM-5.2` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (GLM 5.2 via the Command Code gateway; diff-only, read-only by construction) |
+| 4 | pool | Kimi | `oc:commandcode/moonshotai/Kimi-K2.7-Code` | `quality` | readability, naming, duplication, code smells, idiom |
+| 5 | reserve | Astra | `codex:gpt-6-astra` | `consistency` | cross-file consistency, dead refs, contract drift, whole-repo coherence (GPT-6-Astra, OpenAI's flagship codex model; explicitly pinned, unlike a bare `codex` seat which would silently track the CLI's own default; duplicates Sol's lens — a pre-existing, deliberately accepted trade-off, see review-cli#382 below) |
+| 6 | reserve | Terra | `codex:gpt-5.6-terra` | `performance` | complexity, hot paths, allocations, async/concurrency, N+1 (a distinct, already-paid codex model — live `performance` fallback for GLM-cc, review-cli#382) |
+| 7 | reserve | Sonnet | `claude:claude-sonnet-5` | `quality` | readability, naming, duplication, code smells, idiom (a distinct, already-paid Anthropic model — live `quality` fallback for Kimi, review-cli#382) |
+| 8 | reserve | Qwen | `oc:commandcode/Qwen/Qwen3.7-Max` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF |
+| 9 | reserve | DeepSeek | `oc:commandcode/deepseek/deepseek-v4-pro` | `tests` | missing tests, untested branches, boundary conditions, error-path coverage |
+| 10 | reserve | Gemini | `gemini` | `contracts` | public API shape, contracts, types, backward-compat, interface design |
+| 11 | reserve | GLM | `oc:zai/glm-5.2` | `security` | injection, authz, secrets, unsafe deserialization, path traversal, SSRF (z.ai subscription route; **deprioritized — pathologically slow under load, and the single point of failure in the 2026-09-05 quota incident that motivated review-cli#382** — live `security` fallback for Qwen, freed from `quality` now that Sonnet covers it) |
+| 12 | reserve (last, no preset) | Fable | `claude:claude-fable-5` | `architect` | architecture, design coherence, API shape, abstraction boundaries (**deprioritized to last-resort — confirmed ~100% dispatch failure rate as of 2026-09-05**, review-cli#fable-seat-reliability) |
+
+**review-cli#382 (2026-09-05):** `unpaid_providers: [commandcode, gemini]` disables every
+commandcode-routed seat (GLM-cc/Kimi/Qwen/DeepSeek) plus Gemini at once, machine-wide. That
+used to leave `performance`/`quality`/`security`/`tests`/`contracts` with zero or exactly one
+live seat each — `quality`'s one live seat (GLM, the z.ai route above) hit a real weekly quota
+exhaustion with nothing left to promote, hard-blocking a real PR's review-quorum gate. Terra
+and Sonnet are genuinely distinct, already-paid fallbacks on the same OpenAI/Codex and
+Anthropic accounts Sol/Astra and Opus/Fable already use (no new provider), giving
+`performance`/`quality` a real live seat each. GLM was re-lensed off its now-redundant
+`quality` role (Sonnet covers it more reliably) onto `security`, which had none. `tests`
+(DeepSeek-only), `contracts` (Gemini-only), and `architect` (Fable-only, and Fable is ~100%
+failing) remain thin — there was no third distinct already-paid model to give every starved
+role its own seat without doubling up one account's quota pressure on a single review run,
+the exact failure class this same change fixes for Fable. Astra's pre-existing `consistency`
+role (a duplicate of Sol's) is deliberately left unchanged — an earlier draft flipped it to
+`security` to close that duplicate, but doing so left `consistency` with zero live fallback
+anywhere on the board, the exact single-point-of-failure class this change exists to fix,
+just relocated.
 
 **Agentic by default.** Every board seat that *can* read the repo does. Fable/Opus run via
 the agentic claude CLI **when `claude-p` is on PATH** (they fall back to the diff-only
-Anthropic API only on a host that lacks the CLI but has an API key), Codex via the codex
+Anthropic API only on a host that lacks the CLI but has an API key), Sol/Astra via the codex
 CLI, and Kimi/z.ai-GLM/Qwen/DeepSeek through opencode (`oc:provider/model`) — all run
 read-only *inside* `-C` and can open any project file, not just the diff. Two seats are
-always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-4
+always diff-only stateless HTTP calls: **Gemini** (no agentic transport) and the priority-3
 **GLM-cc** seat (`commandcode:zai-org/GLM-5.2` — opencode's `commandcode` provider does not
 register this GLM id, so the agentic form errors; the keyed-HTTP route is the one that
 reaches it). Both are read-only by construction (they POST only the diff).
@@ -1240,13 +1394,60 @@ paid for one full `claude-p` dispatch on *every* review invocation before fallin
 reserve — real evidence: 4,322 of 6,383 recorded runs dispatched Fable and it failed, most
 with an explicit session-limit notice. Once a dispatch comes back with that notice or the
 administrative "... is currently unavailable" sentinel, `reviewlib.seat_cooldown` records a
-short cooldown (default 10 minutes, `$REVIEW_SEAT_COOLDOWN_SECONDS`, `<= 0` disables it;
-store path overridable via `$REVIEW_SEAT_COOLDOWN_FILE`) so the *next* invocation within
-that window skips the real dispatch and returns the same sentinel shape immediately — every
-downstream consumer (failover, the dashboard's paywall classification) sees it exactly as it
-would a live paywall response. Deliberately narrow: only these two chronic signals start a
-cooldown, never a bare auth/bad-model seat-fatal (which can be a transient misconfiguration
-a human just fixed).
+cooldown (`$REVIEW_SEAT_COOLDOWN_SECONDS` pins a fixed window for FUTURE writes and
+disables escalation going forward — it does not retroactively shorten an already-
+escalated entry's `until`, only `<= 0` (the documented un-stick hatch, disabling
+cooldowns entirely) does that; store path overridable via `$REVIEW_SEAT_COOLDOWN_FILE`)
+so the *next* invocation within that window skips the real
+dispatch and returns the same sentinel shape immediately — every downstream consumer
+(failover, the dashboard's paywall classification) sees it exactly as it would a live
+paywall response. **Escalating window (review-cli#221):** left unset, the window starts at
+10 minutes and climbs per CONSECUTIVE failure (30min, 2h, then an 8-hour cap) — a seat that
+keeps getting re-dispatched and re-failing across many separate `review` invocations
+(minutes apart, so a flat 10-minute window kept lapsing before the next check) gets pushed
+out of the active pool long enough for `run_board_with_failover`'s reserve-promotion to
+substitute a different model instead. A genuine SUCCESSFUL dispatch clears the escalation
+immediately; absent that, a 24-hour gap since the last failure also resets it to 10 minutes.
+`review task CODE --check` (both text and `--json`) names any currently-stalled attempted
+model plus why, instead of leaving an operator to guess from a bare pass/fail count.
+Deliberately narrow: only these two chronic signals start a cooldown, never a bare
+auth/bad-model seat-fatal (which can be a transient misconfiguration a human just fixed).
+An explicit `$REVIEW_SEAT_COOLDOWN_SECONDS` override always resets `fail_count` to 1 on
+its next write, the same as a genuine success — it's a human asking for a specific window,
+which takes priority over the escalation history the way any explicit request does.
+
+**Diagnostic gap (known, tracked):** `stalled_models` is scoped to the models a task's
+recorded runs actually attempted (`record_run`'s `models=`), which on the normal
+board/failover dispatch path only ever contains the SEATS THAT SURVIVED — a chronically-
+cooling seat that a reserve successfully backfilled never appears there, so the
+diagnostic stays silent in exactly the case (a stuck seat masked by working failover)
+it exists to surface. Tracked as
+[review-cli#227](https://github.com/alex-mextner/review-cli/issues/227).
+
+**Scope gap (known, tracked):** the FULL check/record/clear trio — including the
+administrative-sentinel/quota-marker body detection that decides a call is
+chronically-unavailable in the first place — is wired into only the two claude
+dispatch paths (`review_with_images`, `review_claude` in `backends.py`).
+`review_opencode` (review-cli#235) additionally consults + records + clears this same
+store, but ONLY for its own narrower TRUE-SILENCE failure mode (see the next section):
+a seat that never produces a single byte of output within `REVIEW_TRUE_SILENCE_SECONDS`
+is reaped and cooled down the same way a chronically-unavailable claude seat is.
+`review_opencode`'s success path now ALSO reuses the SAME shared chronic-unavailable/
+quota-marker body detector `review_claude`'s clear-gate uses (`_chronic_unavailable_reason`
+— not actually claude-specific in implementation, it just wasn't wired into any other
+call site before this) — a rc=0 body matching one of those known marker phrases is
+recorded as a chronic failure rather than wrongly clearing true-silence escalation
+history. This narrows, but does not fully close, the gap: an opencode-specific quota
+wording that matches NONE of the shared marker phrases is treated as a genuine success
+and DOES clear the cooldown (any non-empty rc=0 body defaults to "recovered" unless it
+matches a known chronic sentinel) — the same behavior `review_claude`'s identical
+sibling pattern has always had for an unrecognised claude quota wording, not a new gap
+this feature introduces. `review_codex` and the `commandcode:`/`zai:` HTTP backends
+have no cooldown consult/record/clear at all. Extending the full trio (including
+genuinely opencode-specific body detection, so an unrecognised wording is correctly
+classified as chronic rather than defaulting to "success") to the non-claude backends
+is tracked as [review-cli#226](https://github.com/alex-mextner/review-cli/issues/226),
+not done here.
 
 **Memory-aware concurrency cap.** Each heavy seat (codex / claude / opencode) spawns a fat
 model-runner subprocess, and a `review` runs its whole pool in parallel — so a high `--pool`
@@ -1256,7 +1457,7 @@ subprocesses run at once (default **4**, overridable via `$REVIEW_MAX_CONCURRENC
 disables it, and a value above **64** is clamped to that ceiling so a typo can't pin an
 absurd number of children). A seat over the cap simply **waits** for a slot — it is never dropped, and its
 per-call timeout starts only once it actually spawns, so queueing on the cap can't falsely
-time it out. The common single-seat gate (`--pool 1`) and the default pool of 4 are
+time it out. The common single-seat gate (`--pool 1`) and the default (light) pool of 2 are
 unaffected (both `<=` the cap). This is a *per-process* cap; a swarm of separate `review`
 processes also leans on the per-seat timeout (a stalled seat frees its slot fast) and on the
 slow `oc:zai/glm-5.2` seat being **deprioritized to last-resort reserve** (review-cli#65).
@@ -1272,11 +1473,12 @@ commandcode gateway the same way. opencode must be installed for the agentic sea
 it they fall back to the reserve.
 
 ```bash
-review --show-board        # active default preset board; add --preset heavy to show Fable/Sol/full board
+review --show-board        # active default preset board (light); add --preset heavy to show Sol (Fable excluded)
 export REVIEW_TASK_CODE=HYP-742
-review diff                # default failover pool: the top 4 AVAILABLE seats by priority
-review diff --pool 0       # run all available default-preset seats
-review diff --preset heavy --pool 0  # run all 10 built-in seats, including Fable/Sol
+review diff                # default (light) failover pool: the top 2 AVAILABLE seats by priority
+review diff --pool 0       # run all available light-preset seats
+review diff --preset default --pool 0  # run all 10 default-preset built-in seats (Fable/Sol excluded)
+review diff --preset heavy --pool 0  # run all 11 heavy-preset built-in seats (Fable excluded)
 review diff --pool 2       # run the top 2 available seats (with failover)
 review diff --retry 4      # up to 4 in-seat retries on a transient failure before the reserve
 review diff --retry 0      # disable in-seat retry (straight to reserve-replace, legacy)
@@ -1291,7 +1493,7 @@ Precedence:
 
 ```
 explicit -m requested models   >   explicit --preset   >   `models:` priority roster   >
-configured `board:`   >   default preset
+configured `board:`   >   default preset (light)
 ```
 
 - A `models:` list in `config.yaml` is the **full priority roster** for `review diff`:
@@ -1301,8 +1503,10 @@ configured `board:`   >   default preset
   `models:`/`board:` it is the legacy flat exact panel; with config present it narrows
   the configured board metadata to only the requested models. The board can otherwise
   never be disabled — there is no `--no-board` flag. Use `--pool N` to size the failover
-  pool (default 4 for the default preset; `--pool 0` runs all available seats in the
-  selected preset/board; `--preset heavy --pool 0` currently covers all 10 built-ins).
+  pool (default 2 for a bare `review diff` — the light preset, Alex 2026-08-28 — or 4 if
+  you pass `--preset default`; `--pool 0` runs all available seats in the
+  selected preset/board; `--preset heavy --pool 0` currently covers all 11 heavy-preset
+  built-ins — Fable is excluded from every preset, see "Reviewer board" above).
   `--pool` does not reduce an explicit `-m` list:
   every requested `-m` seat is attempted.
 - An "effectively empty" `models:` (absent, `[]`, or only blank entries) is **not** a
@@ -1318,10 +1522,16 @@ When `models:` is present,
 `models:`. When `models:` is absent, `board:` is the full priority-ordered board.
 An unknown `role` keeps the reviewer but falls back to the generic prompt (with a
 warning); a single malformed entry is skipped (the valid ones are kept). With **no**
-`models:` or `board:` configured, the CLI uses the default preset; the raw 10-seat board
-above is used by `--preset heavy` or as the source for explicit configured boards. A `board:` that is
-**present but has no usable entry at all** is a hard error (non-zero exit) — it never
-silently falls back to the paid default board.
+`models:` or `board:` configured, the CLI uses the default preset (light as of
+2026-08-28); `--preset default` uses the same 10 seats at high effort, and `--preset
+heavy` uses the 11-seat `HEAVY_PRESET_BOARD` (review-cli#fable-seat-reliability: Fable
+excluded, see "Reviewer board" above) — the raw 12-seat board (including last-resort
+Fable) is only reached by an EXPLICIT, non-empty `board:`/`models:` listing naming the
+seats you want; an absent or empty `board:`/`models:` falls back to the same 10-seat
+`LIGHT_PRESET_BOARD` (no Fable, no Sol; same model order as `DEFAULT_PRESET_BOARD`, at
+medium instead of high effort) that the default preset now resolves to. A
+`board:` that is **present but has no usable entry at all** is a hard error (non-zero
+exit) — it never silently falls back to the paid default board.
 
 ```yaml
 # Priority order: the first 4 reachable models are the live pool; the rest are the
@@ -1329,7 +1539,7 @@ silently falls back to the paid default board.
 board:
   - { model: "claude:claude-fable-5",  role: architect, effort: xhigh }
   - { model: "claude:claude-opus-4-8", role: correctness, effort: high }
-  - { model: "codex",                  role: consistency, name: Codex, effort: high }
+  - { model: "codex:gpt-6-astra",      role: consistency, name: Astra, effort: high }
   # Agentic via opencode (oc:provider/model) — reads the repo read-only, like the default
   # board (review-cli#24). Use the diff-only `commandcode:`/`zai:` forms only if you want a
   # stateless keyed-HTTP seat that sees just the diff (and needs no opencode install).
@@ -1338,14 +1548,14 @@ board:
   - { model: "oc:commandcode/Qwen/Qwen3.7-Max", role: security, name: Qwen }
 ```
 
-**Optional heavyweight seats** (NOT enabled by default — the board stays at 10). Add
+**Optional heavyweight seats** (NOT enabled by default — the board stays at 12). Add
 either to your `board:` list for an extra 1M-context resilience / holistic-senior
 pass; both run agentically through opencode's commandcode provider (needs opencode +
 `opencode auth login`, like the default `oc:` seats):
 
 ```yaml
 board:
-  # ... the 10 built-in seats ...
+  # ... the 12 built-in seats ...
   - { model: "oc:commandcode/MiniMaxAI/MiniMax-M3", role: performance, name: MiniMax }   # 1M ctx — resilience
   - { model: "oc:commandcode/nvidia/nemotron-3-ultra-550b-a55b", role: architect, name: Nemotron }  # 550B, 1M ctx — holistic senior
 ```
@@ -1362,7 +1572,10 @@ Known roles: `architect`, `correctness`, `consistency`, `performance`, `quality`
 `GEMINI_ENV_FILE=/path/to/.env` overrides the search path.
 
 **Codex / Claude / opencode:** must be on PATH and authenticated per their own setup.
-Codex is the #6 board seat (GPT-5.5 IS codex — the agentic CLI route, free).
+Astra (GPT-6-Astra, pinned via `codex:gpt-6-astra`) is the #5 board seat (review-cli#286:
+was #6 before Fable's demotion moved every subsequent seat up one slot; it replaced a bare
+`"codex"` seat that silently tracked the CLI's own default model — see "Reviewer board"
+above). It runs through the same agentic codex CLI route as the bare `codex` seat / Sol.
 
 **omp (Oh My Pi) seats (`omp:<provider>/<model>`):** must be on PATH and authenticated
 via omp's own setup (`omp setup`; `omp token <provider>` shows the stored credential).
@@ -1381,15 +1594,27 @@ exists but the provider is not currently paid/entitled, configure `unpaid_provid
 `REVIEW_UNPAID_PROVIDERS` so the seat is skipped before launch. Either way the board
 degrades gracefully rather than blocking. The default GLM
 seat pins `oc:zai/glm-5.2` (the flagship). Agentic opencode seats use the same per-seat
-idle timeout as every other subprocess backend: progress output keeps the call alive, while
-a fully silent call is reaped after the idle window and reserve backfill can take over. To
-run an older GLM, override the seat in a `config.yaml` `board:` list (e.g.
-`{ model: "oc:zai/glm-5.1", role: quality }`).
+idle timeout as every other subprocess backend: progress output keeps the call alive.
+A call that produces at least one byte of output but then goes quiet is reaped after the
+ordinary idle window, same as any other backend. A call that NEVER produces a single byte
+is instead governed SOLELY by a separate TRUE-SILENCE check (review-cli#235,
+`REVIEW_TRUE_SILENCE_SECONDS`, default 5 minutes) — the ordinary idle window does not
+apply at all pre-first-byte, only after. With the default 20-minute idle window this
+means a silent seat is normally reaped sooner (5 min vs 20 min); but an operator who has
+tightened `REVIEW_IDLE_TIMEOUT_SECONDS` below 5 minutes will see the OPPOSITE — a silent
+seat now waits the full true-silence timeout instead of the operator's shorter idle
+window (review-cli#254). Tune `REVIEW_TRUE_SILENCE_SECONDS` directly if this matters for
+your setup. This only applies pre-first-byte and only to opencode seats today; see the
+seat-cooldown section above. Either reap lets reserve backfill take over. To run an older GLM, override the seat in a `config.yaml`
+`board:` list (e.g. `{ model: "oc:zai/glm-5.1", role: quality }`).
 
 **Advanced timeout env:** `REVIEW_IDLE_TIMEOUT_SECONDS=N` overrides the review/panel
 subprocess idle window for CLI seats; `0` disables idle reap and uses wall-clock
-`--timeout` instead. It does not change REST HTTP timeouts, QA wall-clock caps, or vision
-wall-clock caps.
+`--timeout` instead (and also disables the true-silence check below, since it runs inside
+the same idle-mode wait path). It does not change REST HTTP timeouts, QA wall-clock caps,
+or vision wall-clock caps. `REVIEW_TRUE_SILENCE_SECONDS=N` overrides how long an opencode
+seat gets before its FIRST byte of output arrives; `<= 0` disables that check. See the
+seat-cooldown section above for the full contract.
 
 **`COMMANDCODE_API_KEY` / `ZAI_API_KEY` (diff-only `-m cc` / `-m glm` + config boards):**
 set `COMMANDCODE_API_KEY` (a Command Code `user_...` token) and/or `ZAI_API_KEY` (or

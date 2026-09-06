@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 from . import backends
+from . import usage_limits
 from .backends import _which  # re-export for tests/compat  # noqa: F401
 from .backstop import run_backstop
 from .config import (
@@ -39,13 +40,16 @@ from .config import (
     _split_models,
     apply_effort_override,
     board_from_models,
+    expand_flat_models_with_reuse,
     load_board,
     load_config,
     parse_effort_flag,
+    preset_board,
     preset_names,
     preset_pool_size,
     split_pool_reserve,
 )
+from .usage_limits import usage_percent_for_model
 from .pool_guard import (
     PROCEED,
     Candidate,
@@ -73,8 +77,11 @@ from .process import _run, git_repo_env, strip_control_sequences
 from .retry import max_retry_count
 from .stats import (
     announce_eta,
+    diff_content_hash,
+    extract_diff_files,
     fmt_duration,
     iterations_for_task,
+    normalize_repo_remote,
     normalize_task_code,
     quorum_check,
     record_run,
@@ -219,8 +226,23 @@ def _git_diff(cwd: Path, staged: bool) -> str:
     /repoB diff --cached` reads the env's repo, not repoB — the review-gate then reviews the
     wrong (or empty) diff (review-cli#71). `git_repo_env` KEEPS the target repo's own hook env
     (a legit pre-commit's GIT_INDEX_FILE/temp `next-index` that scopes `--cached` to the partial
-    commit), dropping only env vars that resolve outside `cwd`'s git dir (codex P2 on PR #72)."""
-    args = ["git", "-C", str(cwd), "diff", "--no-ext-diff"]
+    commit), dropping only env vars that resolve outside `cwd`'s git dir (codex P2 on PR #72).
+
+    `--src-prefix=a/ --dst-prefix=b/` pins the header format regardless of the invoking
+    machine's `diff.noprefix`/custom-prefix git config (some machines set
+    `diff.noprefix=true` globally, which emits headers with NO a/b prefix at all —
+    `diff --git f.txt f.txt` — silently breaking `stats.extract_diff_files`'s
+    `diff --git a/<path> b/<path>` parse, found live on this repo's own dev machine).
+    Content is unaffected — only the path labels in the header/`---`/`+++` lines."""
+    args = [
+        "git",
+        "-C",
+        str(cwd),
+        "diff",
+        "--no-ext-diff",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ]
     if staged:
         args.append("--cached")
     try:
@@ -230,6 +252,199 @@ def _git_diff(cwd: Path, staged: bool) -> str:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "git diff failed")
     return proc.stdout
+
+
+def _stamp_hash_for_staged_diff(cwd: Path) -> str | None:
+    """Sha256 of `git diff --no-ext-diff --cached` with NO `--src-prefix`/
+    `--dst-prefix` — i.e. exactly what the pre-commit hook's own independent
+    verification computes, whatever the machine's ambient `diff.noprefix`/prefix
+    git config happens to produce. None on any failure (best-effort; the review
+    still proceeds without the tightened stamp, falling back to
+    `_write_review_stamp`'s own re-derive at write time).
+
+    Called ONCE, immediately adjacent to the `_git_diff(cwd, staged=True)` call
+    that captures the diff actually sent to the models (reviewlib.install
+    "_write_review_stamp" docstring has the full story of why this exists —
+    round-5 review finding, k3+Opus: hashing at stamp-WRITE time instead of
+    dispatch-CAPTURE time reopened a multi-minute TOCTOU window where a
+    concurrent index mutation during the panel run could get silently
+    certified as reviewed)."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--cached"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    import hashlib
+
+    return hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest()
+
+
+def _git_remote_origin_url(cwd: Path) -> str | None:
+    """`git -C cwd remote get-url origin`, or None on ANY failure (no remote, not a
+    repo, no git binary, a wedge) — best-effort, this only feeds an identity label,
+    never a required path."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "remote", "get-url", "origin"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    url = proc.stdout.strip()
+    return url or None
+
+
+def _git_toplevel(cwd: Path) -> Path | None:
+    """`git -C cwd rev-parse --show-toplevel`, or None on any failure (not a repo,
+    no git binary, a wedge)."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return Path(proc.stdout.strip())
+
+
+def _compute_repo_id(cwd: Path) -> str | None:
+    """Best-effort stable identity for the repo at `cwd`, for run-stats diff-identity
+    binding (reviewlib.stats "Diff-identity binding") — see that module's docstring for
+    WHY this exists (closes 3 real task-code quorum-pollution incidents).
+
+    Prefers the normalized `origin` remote URL (stable across worktrees/clones of the
+    SAME repo, unlike a local path). Falls back to the resolved absolute repo root
+    for a remote-less repo, prefixed `path:` so a path-based id can never collide with
+    a remote-based one. The path fallback SELF-NORMALIZES via `_git_toplevel` rather
+    than trusting `cwd` as-is (review finding on this feature's own PR, round 2: every
+    CURRENT caller already passes an `_effective_cwd`-resolved toplevel, so this was
+    not a live bug today, but the id would silently diverge — `path:/repo/subdir` at
+    record time vs `path:/repo` at check time, a spurious `repo_mismatch` — the moment
+    any future caller passed a subdirectory, and nothing enforced the invariant this
+    function's OWN docstring asserted). Falls back to `cwd` itself only when `cwd` is
+    a real directory but git can't resolve its toplevel (a non-repo directory, kept
+    for the same "reviewing it as-is" posture `_effective_cwd` already has elsewhere).
+    None only when `cwd` isn't even a real directory.
+    """
+    url = _git_remote_origin_url(cwd)
+    if url:
+        normalized = normalize_repo_remote(url)
+        if normalized:
+            return normalized
+    toplevel = _git_toplevel(cwd)
+    if toplevel is not None:
+        return f"path:{toplevel}"
+    try:
+        if cwd.is_dir():
+            return f"path:{cwd}"
+    except OSError:
+        pass
+    return None
+
+
+def _default_branch_ref(cwd: Path) -> str | None:
+    """Best-effort `origin/<default-branch>` ref for `cwd`, or None.
+
+    Tries the recorded `origin/HEAD` symref first (what `git clone` sets up), then
+    falls back to probing the two common default-branch names directly — a shallow
+    CI checkout or a repo cloned with `--single-branch` may lack `origin/HEAD`
+    entirely. Feeds `--check`'s diff-identity file-set comparison for the common
+    post-push case (clean working tree, nothing to diff locally); never raises.
+    """
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip().replace("refs/remotes/", "")
+    for candidate in ("origin/main", "origin/master"):
+        try:
+            proc = _run(
+                ["git", "-C", str(cwd), "rev-parse", "--verify", candidate],
+                cwd=cwd,
+                env=git_repo_env(cwd),
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode == 0:
+            return candidate
+    return None
+
+
+def _diff_name_only(cwd: Path, ref_args: list[str]) -> list[str] | None:
+    """`git diff --name-only <ref_args>` -> sorted touched-file list, or None on ANY
+    failure (non-repo, unresolvable ref, a wedge). `--name-only` sidesteps the
+    `diff.noprefix` footgun `_git_diff` otherwise has to pin `--src-prefix`/
+    `--dst-prefix` against (`extract_diff_files`'s `diff --git a/... b/...` regex
+    doesn't even apply here — there IS no `diff --git` header, just bare file
+    paths) — a real bug this exact fallback shipped with once already (codex/
+    GLM/opus/fable review finding on this feature's own PR: the first cut only
+    pinned the prefix on `_git_diff`, not on this fallback's own separate `git
+    diff` call, silently disabling file-level matching on any `diff.noprefix=true`
+    machine — precisely the class this feature targets). Also far cheaper than a
+    full patch body for an identity check: file NAMES only, not hunks."""
+    try:
+        proc = _run(
+            ["git", "-C", str(cwd), "diff", "--no-ext-diff", "--name-only", *ref_args],
+            cwd=cwd,
+            env=git_repo_env(cwd),
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
+
+
+def _current_diff_files_for_check(cwd: Path) -> list[str] | None:
+    """Best-effort file list for the diff currently under review at `cwd`, for
+    `--check`'s repo/diff mismatch detection (reviewlib.stats "Diff-identity
+    binding").
+
+    Returns the UNION of `git diff --name-only HEAD` (local uncommitted changes —
+    staged AND unstaged together, the dev-loop case) and the branch's diff against
+    its own default branch when one resolves (the post-push `gh ship` case).
+    Deliberately a UNION, not first-non-empty-wins: two independent review
+    findings (Opus + Fable) on this feature's own PR caught that "HEAD probe wins
+    whenever the tree has ANY uncommitted change" lets a single unrelated dirty
+    file at check time (a stray edit, a version bump in progress) SHADOW the
+    branch's real PR files entirely — the post-push case is exactly when the
+    branch diff is what matters, and it's exactly when a stray local edit is most
+    likely to be sitting around. Unioning means a legitimate iteration whose files
+    overlap the REAL branch diff still verifies even with local dirt present.
+    Returns None (skip the file-level check; `repo_id` alone still gates) only
+    when NEITHER source resolves to anything — never raises.
+    """
+    local = set(_diff_name_only(cwd, ["HEAD"]) or [])
+    default_ref = _default_branch_ref(cwd)
+    branch = (
+        set(_diff_name_only(cwd, [f"{default_ref}...HEAD"]) or [])
+        if default_ref
+        else set()
+    )
+    union = sorted(local | branch)
+    return union or None
 
 
 def _read_stdin_if_piped() -> str | None:
@@ -774,10 +989,12 @@ def _task_subcommand(rest: list[str]) -> int:
         "--check",
         action="store_true",
         help="exit 0 iff the task has enough PASSED recorded iterations across enough "
-        "distinct models (self-merge-authority gate); see --min-iter/--min-models. "
-        "Counts only iterations whose run came back clean — a review that ran but "
-        "failed/degraded does not count toward the bar, and pre-verdict-field "
-        "history never satisfies it either (fail-closed)",
+        "distinct board roles (self-merge-authority gate, default) or distinct "
+        "models (when --min-models is explicitly given); see --min-iter/"
+        "--min-models/--min-roles. Counts only iterations whose run came back "
+        "clean — a review that ran but failed/degraded does not count toward "
+        "the bar, and pre-verdict-field history never satisfies it either "
+        "(fail-closed)",
     )
     parser.add_argument(
         "--min-iter",
@@ -788,8 +1005,47 @@ def _task_subcommand(rest: list[str]) -> int:
     parser.add_argument(
         "--min-models",
         type=int,
-        default=3,
-        help="review-bar floor: distinct models among the PASSED iterations (default 3)",
+        default=None,
+        help="review-bar floor: distinct models among the PASSED iterations. Not "
+        "enforced by default (review-cli#246: role-based coverage is the "
+        "default instead — see --min-roles). When explicitly given, this floor "
+        "is ALWAYS enforced — including alongside --min-roles, where BOTH "
+        "floors must then be met (an explicit request is never silently "
+        "dropped) — and, when there's real review history to check it against, "
+        "a non-blocking advisory is printed noting that role-based coverage is "
+        "usually sufficient on its own.",
+    )
+    parser.add_argument(
+        "--min-roles",
+        type=int,
+        default=None,
+        help="review-cli#221: review-bar floor: distinct BOARD ROLES (architect/"
+        "correctness/security/…) covered among the PASSED iterations, instead of "
+        "distinct model NAMES. This is the DEFAULT check (review-cli#246) when "
+        "neither --min-models nor --min-roles is given, at the same numeric "
+        "floor --min-models used to default to (3) — pass this flag explicitly "
+        "only to override that number. A role filled by the board's "
+        "shortage-resilience duplicate-model pad (PR #207: one model reused "
+        "onto an otherwise-empty role when too few distinct models are "
+        "available) counts once per role, same as any other role, even though "
+        "it repeats a model --min-models already counted. Only iterations from "
+        "a mode that records per-seat roles (currently: the review-diff/visual "
+        "board dispatch) contribute.",
+    )
+    parser.add_argument(
+        "-C",
+        "--cwd",
+        default=".",
+        help="--check only: repo to verify recorded iterations against "
+        "(diff-identity binding — see reviewlib.stats module docstring)",
+    )
+    parser.add_argument(
+        "--no-verify-identity",
+        action="store_true",
+        help="--check only: skip repo/diff mismatch detection entirely (legacy "
+        "behavior — every PASSED iteration counts, exactly as before this gate "
+        "existed). Escape hatch for a cwd that can't resolve a repo; NOT a way "
+        "around a genuine mismatch finding.",
     )
     ns = parser.parse_args(rest)
 
@@ -797,19 +1053,45 @@ def _task_subcommand(rest: list[str]) -> int:
         if not ns.code:
             print("[review task] --check requires a task CODE", file=sys.stderr)
             return 2
+        # Both `--min-models` and `--min-roles` default to None (not a resolved int)
+        # so the CLI can tell "the user explicitly typed this flag" apart from "left
+        # at the default" — and now (review-cli#246) that raw None-or-value is passed
+        # straight through to quorum_check(), which owns ALL default-resolution and
+        # AND-logic itself (see its docstring): an explicitly given floor is always
+        # enforced, and the "neither given" default switches to a role-based check.
         # A floor of 0 would trivially satisfy the bar for a task with ZERO passed
         # iterations (0 >= 0), even one whose every recorded run failed or predates
         # the verdict field -- defeating the fail-closed contract this gate exists
-        # for. Both floors must be at least 1.
-        if ns.min_iter < 1 or ns.min_models < 1:
+        # for. Only an EXPLICITLY given floor is validated here (mirrors
+        # quorum_check's own validation) — the message only names a flag that was
+        # actually part of the input, so a plain --min-iter 0 never prints a
+        # confusing "--min-models None --min-roles None" (Opus round-2 review
+        # finding, still honored under the new sentinel-based design).
+        if (
+            ns.min_iter < 1
+            or (ns.min_models is not None and ns.min_models < 1)
+            or (ns.min_roles is not None and ns.min_roles < 1)
+        ):
+            clauses = [f"--min-iter {ns.min_iter}"]
+            if ns.min_models is not None:
+                clauses.append(f"--min-models {ns.min_models}")
+            if ns.min_roles is not None:
+                clauses.append(f"--min-roles {ns.min_roles}")
             print(
-                "[review task] --min-iter and --min-models must both be >= 1 "
-                f"(got --min-iter {ns.min_iter} --min-models {ns.min_models})",
+                "[review task] --min-iter must be >= 1, and any explicitly given "
+                "--min-models/--min-roles must also be >= 1 "
+                f"(got {' '.join(clauses)})",
                 file=sys.stderr,
             )
             return 2
         return _quorum_check_subcommand(
-            ns.code, ns.min_iter, ns.min_models, as_json=ns.json
+            ns.code,
+            ns.min_iter,
+            ns.min_models,
+            min_roles=ns.min_roles,
+            as_json=ns.json,
+            cwd_raw=ns.cwd,
+            verify_identity=not ns.no_verify_identity,
         )
 
     if not ns.code:
@@ -1141,16 +1423,21 @@ def _render_stat_harness_table(
 
 
 def _render_stat_fable_section(fable: dict) -> str:
-    """Surfaces the investigation's headline finding: the priority-1 Fable seat's
-    dispatch/failure rate and WHY it failed (session-limit vs paywall vs auth vs other)."""
+    """Surfaces the investigation's headline finding: the Fable seat's dispatch/failure
+    rate and WHY it failed (session-limit vs paywall vs auth vs other).
+
+    review-cli#fable-seat-reliability: the label dropped "priority-1" — that demotion
+    (DEFAULT_BOARD priority 1 -> last-resort reserve) is the whole point of that
+    change, so a report still claiming Fable sits at priority 1 would be actively
+    wrong about its own subject."""
     if not fable["dispatch_attempts"] and not fable["retry_events"]:
-        return "Fable (priority-1 board seat): no dispatch attempts recorded in this window."
+        return "Fable (board seat): no dispatch attempts recorded in this window."
     rate = (
         f"{fable['failure_rate']:.0%}" if fable["failure_rate"] is not None else "n/a"
     )
     reasons = fable["retry_event_reasons"]
     return (
-        "Fable (priority-1 board seat) pattern:\n"
+        "Fable (board seat) pattern:\n"
         f"  dispatch attempts: {fable['dispatch_attempts']}   "
         f"cached-skips: {fable['cached_skips']}   failure rate: {rate}\n"
         f"  retry/promotion events: {fable['retry_events']} "
@@ -1197,49 +1484,251 @@ def _render_stat_oversized_section(top: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _quorum_check_subcommand(
-    code: str, min_iter: int, min_models: int, *, as_json: bool
-) -> int:
-    """`review task CODE --check [--min-iter N] [--min-models M]`.
+def _resolve_quorum_check_context(
+    cwd_raw: str, verify_identity: bool
+) -> tuple[str | None, list[str] | None, str]:
+    """Resolve the (repo_id, diff_files, status) check context for `--check`. See
+    `_quorum_check_subcommand`.
 
-    Exit 0 iff CODE has >= min_iter PASSED recorded iterations across >= min_models
-    distinct models among those passed iterations; exit 1 otherwise, including the
-    fail-closed cases (invalid code, unreadable/missing stats store, zero records,
-    or a task whose only history predates the verdict field) where reviewlib.stats.
-    quorum_check sets an "error" key or simply comes up short. See quorum_check's
-    docstring for the "passed, not just dispatched" semantics this check enforces.
+    `status` is one of ``"ran"`` (repo_id/diff_files are usable), ``"disabled"``
+    (`--no-verify-identity`), or ``"skipped_unresolvable"`` (`-C`/`cwd_raw` isn't
+    even a real directory — `_compute_repo_id` otherwise always has a `path:`
+    fallback). This is a MACHINE-READABLE version of the same distinction the
+    stderr warnings below already make for a human — review finding (Fable) on
+    this feature's own PR: the original cut only had the stderr text, so a
+    machine caller like `gh ship` had no JSON field to assert "verification
+    actually ran" against; it could only infer it from the ABSENCE of the
+    diagnostic keys, which is indistinguishable from "verification ran and this
+    task genuinely has zero passed iterations". `_quorum_check_subcommand` writes
+    `status` into the result as `"identity_verification"`.
     """
-    result = quorum_check(code, min_iter=min_iter, min_models=min_models)
+    if not verify_identity:
+        print(
+            "[review task] warning: diff-identity verification disabled "
+            "(--no-verify-identity) — every PASSED iteration counts regardless of "
+            "recorded repo/diff, exactly as before this gate existed",
+            file=sys.stderr,
+        )
+        return None, None, "disabled"
+    cwd = _effective_cwd(cwd_raw, warn=False)
+    repo_id = _compute_repo_id(cwd)
+    if repo_id is None:
+        print(
+            f"[review task] warning: could not resolve a repo at -C {cwd_raw!r} — "
+            "diff-identity verification skipped, falling back to legacy counting "
+            "(every PASSED iteration counts regardless of recorded repo/diff)",
+            file=sys.stderr,
+        )
+        return None, None, "skipped_unresolvable"
+    return repo_id, _current_diff_files_for_check(cwd), "ran"
+
+
+def _print_quorum_model_audit_line(result: dict, stream=None) -> None:
+    """Role mode's headline line reports covered ROLES, not models — print a
+    secondary line naming which MODELS actually reviewed, so a self-merge-
+    authority audit trail never loses that fact just because roles (not models)
+    governed the verdict (Fable review finding, review-cli#221). `stream` matches
+    the caller's stream choice (stdout for a plain ratio, stderr for an error)."""
+    distinct_models = result["distinct_models_passed"]
+    models_str = ", ".join(result["models"]) or "-"
+    plural_m = "" if distinct_models == 1 else "s"
+    print(
+        f"  models: {distinct_models} distinct model{plural_m} ({models_str})",
+        file=stream,
+    )
+
+
+def _print_quorum_bar_met(result: dict, role_mode: bool, model_mode: bool) -> None:
+    """Text-mode 'review bar met' line. `role_mode`/`model_mode` (review-cli#221,
+    extended in review-cli#246) select which floor(s) actually governed the
+    verdict — the caller derives both from which keys `quorum_check` put in
+    `result` (see `_quorum_check_subcommand`), since that reflects the function's
+    OWN default-resolution/AND-logic, not the raw CLI flags. Either, or both, can
+    be true (review-cli#246: an explicit --min-models alongside --min-roles now
+    means BOTH govern)."""
+    passed_iter = result["passed_iterations"]
+    plural_i = "" if passed_iter == 1 else "s"
+    parts = []
+    if role_mode:
+        distinct = result["distinct_roles_passed"]
+        covered_str = ", ".join(result["roles"]) or "-"
+        plural_u = "" if distinct == 1 else "s"
+        parts.append(f"{distinct} distinct role{plural_u} ({covered_str})")
+    if model_mode:
+        distinct = result["distinct_models_passed"]
+        covered_str = ", ".join(result["models"]) or "-"
+        plural_u = "" if distinct == 1 else "s"
+        parts.append(f"{distinct} distinct model{plural_u} ({covered_str})")
+    print(
+        f"review bar met for {result['task_code']}: {passed_iter} passed "
+        f"iteration{plural_i} across {' and '.join(parts)}"
+    )
+    # Fable review finding: role mode's line above drops WHICH MODELS reviewed
+    # entirely — for a self-merge-authority audit trail that's the fact worth
+    # keeping in the log even when roles (not models) governed the verdict. Only
+    # needed when models weren't ALREADY shown in the headline above.
+    if role_mode and not model_mode:
+        _print_quorum_model_audit_line(result)
+    if advisory := result.get("min_models_advisory"):
+        print(f"  note: {advisory}")
+
+
+def _print_quorum_bar_not_met(result: dict, role_mode: bool, model_mode: bool) -> None:
+    """Text-mode 'review bar NOT met' report: the ratio/error header, the
+    `--min-roles` suggestion hint (review-cli#221, `--min-models`-only mode — see
+    `quorum_check`'s `min_roles_suggestion`), and any currently-stalled attempted
+    model(s). Everything is read from `result` (populated by `quorum_check`, whose
+    own default-resolution/AND-logic decided which floor(s) actually govern — see
+    `_print_quorum_bar_met`) rather than from separately-passed CLI values, so this
+    never drifts from what actually gated the verdict.
+
+    review-cli#221 round-4 review finding (k3/Fable): the header and every detail
+    line below it must land on the SAME stream — a caller capturing only one of
+    stdout/stderr must never see a bare header with no detail, or bare detail lines
+    with no task-code/NOT-met context. An "error" result (invalid code, unreadable
+    store, diff mismatch) reports to stderr; a plain ratio shortfall reports to
+    stdout, matching the pre-existing convention."""
+    detail_stream = sys.stderr if "error" in result else None
+    if "error" in result:
+        print(
+            f"review bar NOT met for {result['task_code']}: {result['error']}",
+            file=detail_stream,
+        )
+    else:
+        passed_iter = result["passed_iterations"]
+        clauses = [f"{passed_iter}/{result['min_iter']} passed iterations"]
+        if role_mode:
+            clauses.append(
+                f"{result['distinct_roles_passed']}/{result['min_roles']} "
+                "distinct roles"
+            )
+        if model_mode:
+            clauses.append(
+                f"{result['distinct_models_passed']}/{result['min_models']} "
+                "distinct models"
+            )
+        print(
+            f"review bar NOT met for {result['task_code']}: {', '.join(clauses)}",
+            file=detail_stream,
+        )
+    # Codex round-5 review finding: this line must not be suppressed on every
+    # "error" result — a diff-identity MISMATCH error still carries real
+    # models/roles data (mismatch exclusion runs AFTER the counts are computed;
+    # only `_rejected()`'s genuinely-empty cases — invalid code, unreadable
+    # store, zero iterations — have nothing to show), so the audit trail must
+    # not go dark there. Gate on there being real data instead of on "error"
+    # presence: `distinct_models_passed > 0` is false for every `_rejected()`
+    # shape and true whenever there's a meaningful roster to report. UNLIKE the
+    # met-path printer, the NOT-met header's model clause above is COUNTS ONLY
+    # (no names, matching the pre-#246 convention) even when `model_mode` is
+    # True — so this line is the only place model NAMES ever appear here, and
+    # must print whenever role_mode is on regardless of model_mode.
+    if role_mode and result["distinct_models_passed"] > 0:
+        _print_quorum_model_audit_line(result, detail_stream)
+    if advisory := result.get("min_models_advisory"):
+        print(f"  note: {advisory}", file=detail_stream)
+    if suggestion := result.get("min_roles_suggestion"):
+        print(f"  hint: {suggestion}", file=detail_stream)
+    # review-cli#221: a bare N/M count (or a bare mismatch-error line) leaves a human
+    # no better off than before — name the SPECIFIC attempted model(s) currently
+    # cooling down (an unavailable sentinel or a session-limit/usage-credits notice —
+    # a plain timeout doesn't record a cooldown, see seat_cooldown.py's docstring) and
+    # why, same signal --json already carries in `stalled_models`. Reached on EITHER
+    # not-met path (round-3 review
+    # finding: an earlier version of this diff returned early on the `error` branch,
+    # before ever reaching this loop, even though `stalled_models` can genuinely be
+    # populated alongside a mismatch error). Text-mode-only (the --json branch above
+    # already returned this data structured) so a plain `review task X --check` run
+    # directly by a developer sees it too, not just a `gh ship` caller parsing --json.
+    for stalled in result.get("stalled_models", []):
+        minutes = max(1, round(stalled["remaining_seconds"] / 60))
+        times = stalled["consecutive_failures"]
+        plural = "" if times == 1 else "s"
+        print(
+            f"  stalled: {stalled['model']} ({stalled['reason']}, "
+            f"{times} consecutive failure{plural}, ~{minutes}m until retry-eligible)",
+            file=detail_stream,
+        )
+
+
+def _quorum_check_subcommand(
+    code: str,
+    min_iter: int,
+    min_models: int | None,
+    *,
+    min_roles: int | None = None,
+    as_json: bool,
+    cwd_raw: str = ".",
+    verify_identity: bool = True,
+) -> int:
+    """`review task CODE --check [--min-iter N] [--min-models M] [--min-roles R] [-C DIR]`.
+
+    Exit 0 iff CODE has >= min_iter PASSED recorded iterations AND every EXPLICITLY
+    given floor among {min_models, min_roles} is met (review-cli#246: an explicit
+    floor is never silently outvoted by the other) — or, when NEITHER is given, >=
+    the default distinct BOARD ROLES floor (review-cli#246's new default; see
+    quorum_check's docstring for the full default-resolution/AND-logic table). Exit 1
+    otherwise, including the fail-closed cases (invalid code, unreadable/missing
+    stats store, zero records, or a task whose only history predates the verdict
+    field) where reviewlib.stats.quorum_check sets an "error" key or simply comes up
+    short. See quorum_check's docstring for the "passed, not just dispatched"
+    semantics this check enforces.
+
+    `verify_identity` (default True) resolves `cwd_raw` (`-C`) to a repo id + the
+    current diff's touched-file set and hands both to `quorum_check`, so a PASSED
+    iteration recorded against a DIFFERENT repo, or a diff sharing no touched file,
+    is EXCLUDED from the count rather than silently trusted — see reviewlib.stats
+    "Diff-identity binding" for why (closes 3 real quorum-pollution incidents).
+    `--no-verify-identity` restores the pre-binding behavior (every passed iteration
+    counts, no repo/diff cross-check) — an escape hatch for a cwd that can't resolve
+    a repo, not a way around a genuine mismatch finding.
+    """
+    repo_id, diff_files, verification_status = _resolve_quorum_check_context(
+        cwd_raw, verify_identity
+    )
+    result = quorum_check(
+        code,
+        min_iter=min_iter,
+        min_models=min_models,
+        min_roles=min_roles,
+        repo_id=repo_id,
+        diff_files=diff_files,
+    )
+    # Machine-readable counterpart to the stderr warnings below: a caller like
+    # `gh ship` parsing --json alone (never sees stderr) can assert on this
+    # directly instead of inferring "did verification run" from key absence.
+    result["identity_verification"] = verification_status
+    # This warning goes to stderr in BOTH --json and text mode: --json's structured
+    # payload already carries excluded_mismatched_iterations/mismatch_details for a
+    # machine reader, but a human watching stderr (e.g. `gh ship`'s own console
+    # output) must see the mismatch surfaced too, not just a smaller-than-expected
+    # number with no explanation.
+    excluded = result.get("excluded_mismatched_iterations", 0)
+    if excluded:
+        print(
+            f"[review task] warning: excluded {excluded} recorded iteration(s) for "
+            f"{result['task_code']} — recorded repo/diff did not match the code "
+            "currently being checked (--json for detail; --no-verify-identity disables "
+            "this check)",
+            file=sys.stderr,
+        )
+
     if as_json:
         import json as _json
 
         print(_json.dumps(result, indent=2))
         return 0 if result["passed"] else 1
 
-    if "error" in result:
-        print(
-            f"review bar NOT met for {result['task_code']}: {result['error']}",
-            file=sys.stderr,
-        )
-        return 1
-
-    passed_iter = result["passed_iterations"]
-    distinct = result["distinct_models_passed"]
+    # review-cli#246: derived from the RESULT (which floor(s) quorum_check actually
+    # applied, after its own default-resolution), not from the raw min_models/
+    # min_roles arguments here — those can be None even when quorum_check ends up
+    # enforcing a floor anyway (the "neither given" default substitutes min_roles).
+    role_mode = "min_roles" in result
+    model_mode = "min_models" in result
     if result["passed"]:
-        models = ", ".join(result["models"]) or "-"
-        plural_i = "" if passed_iter == 1 else "s"
-        plural_m = "" if distinct == 1 else "s"
-        print(
-            f"review bar met for {result['task_code']}: {passed_iter} passed "
-            f"iteration{plural_i} across {distinct} distinct model{plural_m} ({models})"
-        )
+        _print_quorum_bar_met(result, role_mode, model_mode)
         return 0
-
-    print(
-        f"review bar NOT met for {result['task_code']}: "
-        f"{passed_iter}/{min_iter} passed iterations, "
-        f"{distinct}/{min_models} distinct models"
-    )
+    _print_quorum_bar_not_met(result, role_mode, model_mode)
     return 1
 
 
@@ -1894,8 +2383,12 @@ def _run_mode_with_stats(
     pool_models: list[str],
     dispatch,
     models_after=None,
+    roles_after=None,
     *,
     task_code: str | None = None,
+    repo_id: str | None = None,
+    diff_files: list[str] | None = None,
+    diff_sha256: str | None = None,
 ) -> int:
     """Announce the ETA, time the run on a monotonic clock, and append a stat record.
 
@@ -1914,11 +2407,32 @@ def _run_mode_with_stats(
     recorded `pool_size`/`models` reflect what really ran; the ETA still keys on the
     planned `pool_models` (known up front). Without it, `pool_models` is recorded as-is.
 
+    `roles_after` (optional, review-cli#221) is the role-tracking counterpart: a zero-arg
+    callable read AFTER the run for the board ROLE each usable seat covered (currently
+    only the board dispatch path supplies one — see `panel.FailoverOutcome.usable_roles`).
+    A falsy/erroring result omits the record's `roles` key entirely (see `record_run`'s
+    `roles` param) rather than recording an empty list — there is no "planned roles"
+    fallback the way `models_after` has `pool_models`, since a role only means something
+    tied to a seat that actually produced a verdict. The board dispatch's own
+    `roles_after` closure (`_ran_roles` in `_dispatch`) returns every EXPLICIT `-m`
+    board seat's role for `exact_board` runs, mirroring `_ran_models`'s identical choice
+    there — safe ONLY because an exact board has no reserve, so this function's caller
+    (`_dispatch`) can only ever pass a `passed=True` verdict up to `record_run` when
+    every one of those seats genuinely produced a verdict (any single failure degrades
+    the whole run to a nonzero exit first); a record whose seats didn't ALL succeed is
+    always `passed=False` and therefore never counts toward `--min-roles` regardless
+    of what this callable returned.
+
     A run that dispatched ZERO backend calls (a clean-tree review with no diff, an
     early usage error) is NOT recorded: it has no real wall-clock to contribute and a
     ~0s record would drag every future ETA for that pool toward zero — defeating the
     whole point. The ETA line is still printed (it costs nothing and warns the agent),
     but only real runs land in the history. Stats failures NEVER affect the run.
+
+    `repo_id`/`diff_files`/`diff_sha256` are the diff-identity fields (reviewlib.stats
+    "Diff-identity binding") threaded straight through to `record_run` unchanged — this
+    function doesn't compute or interpret them, it just carries them from the caller
+    (which already has `cwd`/`diff` in scope) to the stat record.
     """
     import time
 
@@ -1946,6 +2460,7 @@ def _run_mode_with_stats(
         prompt_tokens = tally["prompt_tokens"]
         output_tokens = tally["output_tokens"]
         recorded_models = pool_models
+        models_after_fell_back = False
         if models_after is not None:
             try:
                 actual = models_after()
@@ -1953,6 +2468,36 @@ def _run_mode_with_stats(
                 actual = None
             if actual:
                 recorded_models = actual
+            else:
+                models_after_fell_back = True
+        recorded_roles = None
+        # Round-5/6 review finding (Opus): `models_after` and `roles_after` both read
+        # the SAME `outcome_sink[0]` snapshot, and `quorum_check`'s monoculture guard
+        # (`_models_behind_role_coverage`) zips `recorded_models` against
+        # `recorded_roles` BY INDEX — so if `models_after` ever fell back to the
+        # PLANNED `pool_models` (its own error/empty-result path) while `roles_after`
+        # still returned the ACTUAL roles, the two lists would no longer describe the
+        # same seats in the same order. Force `recorded_roles` to `None` (omitted,
+        # not a misleadingly-paired list) whenever `recorded_models` isn't the real,
+        # actually-produced roster — there is no "planned roles" fallback that could
+        # keep the pairing honest the way `pool_models` does for models alone. The
+        # round-5 cut only checked `models_after_fell_back`, which stays False when
+        # `models_after` is None entirely (never set) — a FUTURE caller supplying
+        # `roles_after` alone (no current one does) would then pair real roles
+        # against the merely-PLANNED `pool_models`. Requiring `models_after is not
+        # None` too closes that: roles only ever get recorded when there was an
+        # ACTUAL-roster callable in the loop, not just a planned one.
+        if (
+            roles_after is not None
+            and models_after is not None
+            and not models_after_fell_back
+        ):
+            try:
+                actual_roles = roles_after()
+            except Exception:  # noqa: BLE001 — stats must never break the run
+                actual_roles = None
+            if actual_roles:
+                recorded_roles = actual_roles
         # Only record a run that actually dispatched at least one backend call. No
         # dispatch -> nothing real to time -> skip, so no-op invocations never poison
         # the ETA average.
@@ -2018,6 +2563,10 @@ def _run_mode_with_stats(
                 fail_count=fail_count,
                 started=started,
                 passed=verdict,
+                repo_id=repo_id,
+                diff_files=diff_files,
+                diff_sha256=diff_sha256,
+                roles=recorded_roles,
                 prompt_tokens=prompt_tokens,
                 output_tokens=output_tokens,
             )
@@ -2381,12 +2930,89 @@ def _write_output_file(path: Path, text: str) -> None:
     path.write_text(strip_control_sequences(text), encoding="utf-8")
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Entry point: arm the internal run backstop around a review run, then dispatch.
+# Env var that marks "a `review` invocation is already running in this process tree"
+# (review-cli#180). Set for the lifetime of a run by `main()`; checked by
+# `_reject_if_reentrant()` before any backend is touched.
+REVIEW_CLI_ACTIVE_ENV = "REVIEW_CLI_ACTIVE"
+
+
+def _reject_if_reentrant(_argv: list[str]) -> int | None:
+    """Fail closed if this process is already nested inside a running `review`
+    invocation — the review-cli#180 fork-bomb guard.
+
+    A codex/claude/opencode backend can shell out to `review diff` again on the same
+    worktree, which spawns another backend, which can do it again — an unbounded
+    self-reinvocation loop (live-confirmed 2026-08-11: 40+ live `codex exec` processes
+    and 11 `review diff` processes across 4 worktrees, swap at 88.5%, load average
+    60+). The existing process-GROUP kill/backstop machinery (`process._run_streamed`,
+    `reviewlib.backstop`) cannot bound this: each backend child is spawned with
+    `start_new_session=True` so a per-call timeout can kill just that call's tree
+    without also taking down the CLI's own group — but that means every recursive
+    level re-roots into a BRAND NEW OS session, invisible to a `killpg` rooted at an
+    earlier level. An env var is the one signal that survives `exec`/`setsid`
+    regardless of how many session boundaries the recursion crosses, so it is checked
+    here instead.
+
+    Deliberately NOT reset by `call_backend`/panel concurrency — those run several
+    backends in threads WITHIN one process (review-cli#65), not nested `review`
+    invocations, so they never trip this.
+
+    VERIFIED (not assumed — re-raised by every review round on this ticket, so
+    recording the evidence here): $REVIEW_CLI_ACTIVE is set for a persistent SERVER
+    subcommand's (`review dashboard`/`review spec-web`) entire lifetime too (see
+    `main()` — it wraps the whole dispatch, server path included). This is safe
+    because neither server spawns `review` as a child process during normal request
+    handling: `reviewlib/dashboard/server.py` and `reviewlib/specweb/server.py` only
+    shell out to `tailscale`/`git`/`tmux`; `reviewlib/dashboard/service.py`'s
+    `_review_argv0()` launches the server's OWN foreground process at STARTUP (once,
+    from the user's shell — not a request-handling re-invocation) and is itself gated
+    against re-entering the service layer (see that module's docstring: "otherwise
+    run/start would re-enter the service layer and fork-bomb"). If a future change
+    adds a code path where a server-mode process dispatches an actual model review
+    while servicing a request, that path should call the mode/panel functions
+    directly (in-process, the way `reviewlib.panel`/`reviewlib.modes` are normally
+    invoked), not subprocess-invoke `review` on itself.
+
+    Checks PRESENCE (`is not None`), not truthiness: `REVIEW_CLI_ACTIVE= review diff`
+    (a shell setting the var to an EMPTY string for the child) must still trip the
+    guard — `os.environ.get(...)` would return `""`, which is falsy under a bare
+    `if`, and silently let the recursion through (review-cli#180 review finding,
+    glm-5.2). This does NOT defend against a shell that removes the var entirely
+    (`env -u REVIEW_CLI_ACTIVE review diff`) — no env-var-based guard can, since the
+    child then looks identical to a genuinely fresh top-level invocation. That
+    residual gap is why this is layered with, not a substitute for, the codex
+    execpolicy guard (`install.install_codex_recursion_guard`) and the existing
+    process-group timeout/backstop.
+
+    This exact `env -u REVIEW_CLI_ACTIVE` technique is also used DELIBERATELY, not just as an
+    attacker's residual gap: `dashboard.service._env_clear_prefix()` (reused by
+    `specweb.service._serve_argv`) prepends it to the managed `__serve` child's argv, because
+    `run`/`start` are themselves active `review` invocations and the spawned server must NOT
+    inherit that activity marker (review-cli#180 review finding, chatgpt-codex-connector, PR
+    #279) — a sanctioned use of the same bypass this paragraph documents as unstoppable."""
+    if os.environ.get(REVIEW_CLI_ACTIVE_ENV) is not None:
+        print(
+            "[review-cli] refusing to run: $REVIEW_CLI_ACTIVE is already set, meaning "
+            "this process is nested inside another `review` invocation. A backend "
+            "(codex/claude/opencode) appears to have re-invoked `review` on the same "
+            "worktree — this is the unbounded self-reinvocation loop tracked as "
+            "review-cli#180. Refusing to recurse.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def _dispatch_with_backstop(raw: list[str], output_path: str | None) -> int:
+    """Resolve and run `raw`, applying the internal backstop timer + `-o` tee.
+
+    Split out of `main()` so the REVIEW_CLI_ACTIVE reentrancy guard (review-cli#180)
+    can wrap this ENTIRE dispatch — server subcommand included — in one try/finally at
+    the call site, without main() itself growing past a screenful.
 
     `review` advertises NO external timeout — agents must not wrap it in a short
     shell `timeout` (the panel/brainstorm modes only emit their synthesis at the very
-    end). The ONLY time bound is this INTERNAL last-resort backstop, capped at <=4h
+    end). The ONLY time bound is the INTERNAL last-resort backstop, capped at <=4h
     (`reviewlib.backstop`): a watchdog that force-terminates a genuinely wedged run so
     "no external timeout" can never mean "runs forever". A healthy run finishes in
     minutes, far under the ceiling, and the watchdog is cancelled cleanly on return.
@@ -2397,33 +3023,12 @@ def main(argv: list[str] | None = None) -> int:
     at once (codex P2). Every other path (the review/panel run and the instant
     subcommands) is wrapped.
 
-    This is also where `-o FILE` is handled: the flag is pre-scanned out of argv (so it
-    works for every dispatch path, including the bare subcommands), and when present the
-    whole dispatch runs under a stdout TEE whose captured text is persisted to FILE via
-    Python — bypassing the shell redirect (and thus zsh noclobber). The file is always
-    written; stdout still prints live.
+    This is also where `-o FILE` is handled: the flag is pre-scanned out of argv by the
+    caller (so it works for every dispatch path, including the bare subcommands), and
+    when present the whole dispatch runs under a stdout TEE whose captured text is
+    persisted to FILE via Python — bypassing the shell redirect (and thus zsh
+    noclobber). The file is always written; stdout still prints live.
     """
-    raw = sys.argv[1:] if argv is None else argv
-    output_path, raw = _extract_output_path(list(raw))
-    raw = _normalize_leading_mode_options(raw)
-
-    # A REMOVED flag (--mcp/--ln, or a removed mode flag) OR the removed `review review`
-    # SUBCOMMAND verb is a USAGE error — it must behave like argparse's own usage errors
-    # w.r.t. `-o`: print the structured error and exit WITHOUT writing the `-o` file.
-    # Rejecting it INSIDE `_dispatch` only `return`s 2, which the tee path below treats as
-    # "the dispatch completed" and would persist the (empty) captured stdout — truncating a
-    # pre-existing `-o` target (codex P1/P2). Reject it here, before the tee is armed, so no
-    # write happens. Both are pure argv pre-scans; the later calls in `_dispatch` are then
-    # harmless no-ops.
-    for _reject in (
-        _reject_removed_flags,
-        _reject_removed_subcommand,
-        _reject_subcommand_only_flag_without_verb,
-    ):
-        rejected = _reject(raw)
-        if rejected is not None:
-            return rejected
-
     # The persistent SERVER subcommands stream until Ctrl-C — capturing/teeing their
     # output to a single `-o` file makes no sense (and the file would only be written
     # on shutdown), so `-o` is ignored for them and they bypass both the tee and the
@@ -2473,6 +3078,45 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
     return 1 if write_error is not None else rc
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point: reject a reentrant run, then dispatch under the backstop.
+
+    See `_reject_if_reentrant` for the review-cli#180 fork-bomb guard and
+    `_dispatch_with_backstop` for the backstop/`-o`-tee mechanics.
+    """
+    raw = sys.argv[1:] if argv is None else argv
+    output_path, raw = _extract_output_path(list(raw))
+    raw = _normalize_leading_mode_options(raw)
+
+    # A REMOVED flag (--mcp/--ln, or a removed mode flag) OR the removed `review review`
+    # SUBCOMMAND verb is a USAGE error — it must behave like argparse's own usage errors
+    # w.r.t. `-o`: print the structured error and exit WITHOUT writing the `-o` file.
+    # Rejecting it INSIDE `_dispatch` only `return`s 2, which the tee path below treats as
+    # "the dispatch completed" and would persist the (empty) captured stdout — truncating a
+    # pre-existing `-o` target (codex P1/P2). Reject it here, before the tee is armed, so no
+    # write happens. Both are pure argv pre-scans; the later calls in `_dispatch` are then
+    # harmless no-ops.
+    # _reject_if_reentrant runs FIRST: it is the cheapest check (one os.environ.get)
+    # and the highest-severity failure (review-cli#180 review finding, glm-5.2) — a
+    # recursive invocation that happens to also carry a removed flag/verb should get
+    # the reentrancy diagnostic, not a confusing unrelated usage error.
+    for _reject in (
+        _reject_if_reentrant,
+        _reject_removed_flags,
+        _reject_removed_subcommand,
+        _reject_subcommand_only_flag_without_verb,
+    ):
+        rejected = _reject(raw)
+        if rejected is not None:
+            return rejected
+
+    os.environ[REVIEW_CLI_ACTIVE_ENV] = "1"
+    try:
+        return _dispatch_with_backstop(raw, output_path)
+    finally:
+        os.environ.pop(REVIEW_CLI_ACTIVE_ENV, None)
 
 
 def _model_default_help(mode: ModeSpec | None) -> str:
@@ -2642,7 +3286,8 @@ def _add_global_options(
             help=(
                 "diff-review preset: light = quick/cheap preflight (pool 2, medium effort); "
                 "default = routine change review (pool 4, high effort, excludes Fable/Sol); "
-                "heavy = release/risky-change review (pool 4, highest effort, includes Fable/Sol). "
+                "heavy = release/risky-change review (pool 4, highest effort, excludes "
+                "Fable — a confirmed near-total dispatch failure rate — but includes Sol). "
                 f"If no config board/models are set, review diff uses {DEFAULT_PRESET!r}."
             ),
         )
@@ -2654,7 +3299,9 @@ def _add_global_options(
         help=(
             "how many of the board's seats to run (default "
             f"{preset_pool_size('default')} for default/heavy, {preset_pool_size('light')} "
-            f"for light; {DEFAULT_POOL_SIZE} with no preset); the "
+            f"for light — a bare `review diff` uses {preset_pool_size(DEFAULT_PRESET)}, the "
+            f"{DEFAULT_PRESET!r} preset's pool; {DEFAULT_POOL_SIZE} is only the fallback for a "
+            "custom config `models:`/`board:` roster with no `pool:` key set); the "
             "first N seats participate, the rest are kept in reserve. The board is "
             "never off — --pool only sizes it. N<=0 means all seats. Ignored for explicit -m."
         ),
@@ -2827,6 +3474,8 @@ _SUBCOMMAND_ONLY_FLAGS: frozenset[str] = frozenset(
         "--project",
         "--retry",
         "--commit",
+        # quorum's opt-in adversarial refutation pass (modes/quorum.py).
+        "--adversarial-check",
         # The qa mode's own flags (modes/qa.py); a verb-less `review --suites …` / `--kind …`
         # etc. must get the friendly "use the subcommand" pointer, not argparse's opaque error.
         # Phase 3 adds the SUT-env flags `--stage-url` / `--config` / `--keep-env`.
@@ -2907,7 +3556,13 @@ def _help_topic_config() -> str:
     """The `review help config` deep reference (ROADMAP "Topic-based help across the
     ecosystem"): config file path + cascade, the keys, key/auth env vars, and how the
     reviewer board + model selection resolve. Kept in sync with config.py / backends.py
-    behavior (help-docs-sync); a flag/behavior change updates this topic in the same commit."""
+    behavior (help-docs-sync); a flag/behavior change updates this topic in the same commit.
+
+    NOTE: the "REVIEWER BOARD + PRESETS" section below derives its stated effort from
+    `preset_board(DEFAULT_PRESET)[0].effort` — correct only because DEFAULT_PRESET's board
+    has UNIFORM effort across all seats (true for "light"/"default", not for "heavy",
+    which mixes xhigh/max). If DEFAULT_PRESET ever becomes "heavy", that line needs a
+    real fix, not just re-pointing the same expression."""
     return f"""\
 review — configuration reference
 ================================
@@ -2961,9 +3616,12 @@ SELECTION CASCADE, by mode:
 
 REVIEWER BOARD + PRESETS (the diff-review default; `review --show-board` prints it live)
   A priority-ordered panel of seats, each model carrying its own
-  role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool 4, high effort,
-  without Fable/Sol. Use `--preset light` for quick preflight (pool 2, medium effort) and
-  `--preset heavy` for release/risky changes (Fable/Sol/Opus/GLM-cc at highest effort).
+  role/lens. A plain `review diff` runs the `{DEFAULT_PRESET}` preset: pool
+  {preset_pool_size(DEFAULT_PRESET)}, {preset_board(DEFAULT_PRESET)[0].effort} effort, without
+  Fable/Sol. Use `--preset default` for a routine change review (pool 4, high effort)
+  or `--preset heavy` for release/risky changes (Sol/Opus/GLM-cc/Kimi at highest effort;
+  Fable is excluded from every preset — a confirmed ~100% dispatch failure rate, see
+  DEFAULT_BOARD's own comment — and sits last-resort in the raw board instead).
   `--pool N` sizes the selected board (`--pool 0` = all available). Explicit -m never lets config add extra seats; it narrows
   configured metadata when present, else uses the flat exact panel. To set the priority
   roster, configure `models:`. To add role/name/effort metadata (or a full board when
@@ -2991,11 +3649,72 @@ KEYS / AUTH (resolved from the process env first, then the shared .env)
     REVIEW_DIFF_MAX_BYTES=N             — dispatch-time diff-size cap (default 300000);
                                           <= 0 disables it. See `review stat`'s section
                                           in README.md.
-    REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window (default 600)
-                                          for a chronically-unavailable claude seat
-                                          (Fable); <= 0 disables it.
+    REVIEW_SEAT_COOLDOWN_SECONDS=N      — cross-invocation cooldown window for a
+                                          chronically-unavailable claude seat (Fable).
+                                          opencode also consults + records + clears
+                                          this store for a TRUE-SILENCE trip
+                                          (review-cli#235, see
+                                          REVIEW_TRUE_SILENCE_SECONDS below), AND for
+                                          the SAME shared administrative-sentinel/
+                                          quota-marker phrases claude's own detection
+                                          uses (codex review finding, round 18: an
+                                          earlier version of this text wrongly said
+                                          that detection "remains claude-only" — it
+                                          does not, as of #243's round-12 fix).
+                                          opencode-SPECIFIC quota wording that matches
+                                          none of the shared phrases is still not
+                                          recognised (falls through as a genuine
+                                          success) — see review-cli#226.
+                                          commandcode/zai HTTP backends have no
+                                          cooldown consult/record/clear at all yet.
+                                          Unset: the window
+                                          ESCALATES per consecutive failure (10min,
+                                          30min, 2h, then 8h cap), resetting to 10min
+                                          after a success or a 24h quiet period. Set:
+                                          that fixed window every time, no escalation;
+                                          <= 0 disables cooldowns entirely.
     REVIEW_SEAT_COOLDOWN_FILE=PATH      — override the cooldown store location (default
                                           ~/.config/review-cli/seat-cooldown.json).
+    REVIEW_TRIVIAL_DELTA_LINES=N        — pre-commit gate: max changed lines tolerated
+                                          against the last reviewed baseline before a
+                                          restage forces a fresh full review (default 10);
+                                          0 disables the tolerance (exact-hash match only).
+    REVIEW_TRUE_SILENCE_SECONDS=N       — how many seconds of ZERO output an opencode
+                                          seat gets before it is reaped as stuck rather
+                                          than silently thinking (default 5min, per-model
+                                          overridable in reviewlib/model_behavior.py's
+                                          registry; review-cli#235). A trip records a
+                                          REVIEW_SEAT_COOLDOWN_SECONDS-governed cooldown
+                                          for that model. <= 0 disables the check
+                                          entirely (mirrors REVIEW_IDLE_TIMEOUT_SECONDS=0).
+                                          Only applies before the call's FIRST byte of
+                                          output ever arrives — see review-cli#239 for
+                                          the currently-uncovered mid-call-silence case.
+                                          Before the first byte, this REPLACES
+                                          REVIEW_IDLE_TIMEOUT_SECONDS as the sole reap
+                                          authority (not a min() of the two) — an
+                                          operator who tightens the idle timeout below
+                                          this value does NOT get an earlier pre-output
+                                          reap. There is no way to COMBINE the two for
+                                          an earlier pre-first-byte cutoff: for any
+                                          positive REVIEW_IDLE_TIMEOUT_SECONDS value,
+                                          it has NO effect before the first byte, no
+                                          matter what it is set to — the only lever
+                                          pre-first-byte is lowering
+                                          REVIEW_TRUE_SILENCE_SECONDS itself (codex
+                                          review finding, review-cli#243 round 15: an
+                                          earlier version of this text wrongly implied
+                                          setting both env vars together could make a
+                                          short idle floor also apply pre-output; it
+                                          cannot — see review-cli#254 for the related
+                                          deadline-clamp discussion). One EXCEPTION
+                                          (codex review finding, round 18):
+                                          REVIEW_IDLE_TIMEOUT_SECONDS=0 (the explicit
+                                          "disable idle reap entirely" value) also
+                                          disables true-silence — it is not just "no
+                                          effect", it turns the check OFF, since the
+                                          true-silence poll branch only runs at all
+                                          when idle reap is enabled.
   codex / opencode / omp carry their own CLI auth (no key here).
 
 See also: `review --help` (overview), `review --show-board`, `review <mode> --help`.
@@ -3045,8 +3764,8 @@ def _build_top_level_parser() -> argparse.ArgumentParser:
         prog="review",
         description=(
             "Run read-only code reviews / AI panels across multiple model backends "
-            "(one narrow opt-in exception: `review diff --staged --commit` checkpoints "
-            "a commit). Everything is a SUBCOMMAND: `review diff` (review the git diff), "
+            "(one narrow opt-in exception: `review diff --staged --task CODE --commit` "
+            "checkpoints a commit). Everything is a SUBCOMMAND: `review diff` (review the git diff), "
             "`review brainstorm`, `review just-ask`, `review quorum`. A bare `review` "
             "(no subcommand) prints this help — it does NOT run a diff review; use "
             "`review diff` for that."
@@ -3300,6 +4019,27 @@ def _pool_guard_candidates(
             )
         )
     return candidates
+
+
+def _warn_if_panel_padded(models: list[str]) -> None:
+    """Operator-facing stderr notice for the flat quorum panel, fired iff
+    `models` contains a repeat -- the only way a repeat can appear here is
+    `expand_flat_models_with_reuse` reusing a model, since its input `src`
+    (DEFAULT_MODELS or config `models:`) is already distinct and `-m` never
+    reaches this call site (`explicit_models` is handled by an earlier,
+    separate branch that bypasses padding entirely). Mirrors the board path's
+    existing failover promotion message (reviewlib.panel.run_board_with_failover)
+    so the token spend is attributable instead of a silent surprise."""
+    if len(set(models)) == len(models):
+        return
+    counts = {m: models.count(m) for m in dict.fromkeys(models)}
+    repeated = ", ".join(f"{m} x{n}" for m, n in counts.items() if n > 1)
+    print(
+        f"[review-cli] panel padded — reusing {repeated} across multiple seats "
+        "(some models near their usage limit)",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _chain_aware_available(model: str) -> bool:
@@ -3707,6 +4447,15 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # Precedence: explicit -m > config > code default. Brainstorm prefers
     # config.brainstorm_models and drops unreachable backends gracefully (so a
     # missing GEMINI_API_KEY never aborts the run). Explicit -m is honored as-is.
+    # One usage-limit SNAPSHOT for this whole dispatch (board mode takes the same
+    # approach in modes/review.py) — every seat/candidate checked below reads the
+    # SAME sample set instead of each re-globbing + re-parsing the tg-ctl usage
+    # file independently (and possibly disagreeing mid-selection if it changes).
+    _usage_snapshot = usage_limits.load_snapshot()
+
+    def _usage_percent(model: str) -> float | None:
+        return usage_percent_for_model(model, samples=_usage_snapshot)
+
     if explicit_models:
         models = explicit_models
     elif is_brainstorm:
@@ -3718,8 +4467,87 @@ def _dispatch(argv: list[str] | None = None) -> int:
         models = [m for m in src if backends.backend_available(m)]
         if not models:
             models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        else:
+            # Reuse-aware panel: pad back up to the AVAILABILITY-filtered count
+            # (not `len(src)`) when some of the reachable models are near their
+            # usage limit, instead of silently running a smaller panel (Alex,
+            # 2026-08-18). Target is `len(models)`, not `len(src)`, so this ONLY
+            # compensates usage-limit exclusions -- it must never fight brainstorm's
+            # existing "drop unreachable backends gracefully" shrink above.
+            models = expand_flat_models_with_reuse(
+                models, len(models), usage_percent=_usage_percent
+            )
+            _warn_if_panel_padded(models)
     else:
-        models = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        src = config_models or [_expand_alias(x) for x in DEFAULT_MODELS]
+        if mode.name == "quorum":
+            # Scoped to quorum specifically: `review` builds its OWN board
+            # from `config_models`/`load_board` (never reads this `models`
+            # var) and `visual`/`qa` use their own model lists too — this
+            # `else` branch is also their fallthrough, so padding it
+            # unconditionally printed a spurious "panel padded" warning for a
+            # panel that was never actually dispatched (k3/Fable review
+            # finding). `just-ask` is EXCLUDED too, deliberately: it sends the
+            # identical prompt to every seat with no per-seat role/lens (see
+            # config's role-less-board carve-out for the same reasoning), so a
+            # duplicated seat there is pure cost with zero added diversity —
+            # unlike quorum, which labels + discloses duplicates to its
+            # moderator so a repeated model is at least an INFORMED tradeoff.
+            #
+            # Availability-filter BEFORE padding (k3 review finding, round 3):
+            # `_is_near_limit` fails OPEN on unknown usage data, so an
+            # UNREACHABLE model (missing API key/CLI — unknown to
+            # usage_percent, hence "not excluded") could otherwise survive
+            # padding while a REACHABLE-but-near-limit model gets excluded —
+            # e.g. src=[claude:opus@90%, gemini(keyless)] would pad to
+            # ["gemini","gemini"], a panel with ZERO live seats, worse than
+            # quorum's pre-reuse behavior of just dispatching both and letting
+            # the dead one fail per-call. Filtering first keeps padding
+            # scoped to seats that can actually answer; the all-unreachable
+            # case is handled below (dispatch `src` unfiltered, no exclusion
+            # — k3 review finding, round 5).
+            #
+            # Target `len(reachable)`, NOT `len(src)` (k3/Fable review finding,
+            # round 4): padding must compensate ONLY usage-limit exclusions,
+            # exactly like the brainstorm branch above — targeting `len(src)`
+            # would ALSO duplicate a live model to paper over a plain
+            # unreachable one (a real paid call replacing what used to be a
+            # free per-call failure), which is a different, unrequested
+            # feature and made `_warn_if_panel_padded`'s "near their usage
+            # limit" text false in that case.
+            #
+            # `_chain_aware_available`, NOT raw `backend_available` (k3/Fable
+            # review finding, round 6): the raw probe false-negatives on a
+            # seat whose HEAD provider is down but has a live failover
+            # alternate (e.g. no ZAI_API_KEY but an authenticated `oc:zai`) —
+            # exactly the case `_chain_aware_available`'s own docstring exists
+            # to cover for every OTHER pre-dispatch liveness decision (the
+            # pool guard, the board split, the ETA). Using the raw probe here
+            # would silently drop a chain-recoverable model from the quorum
+            # panel instead of just letting `run_panel`'s own provider
+            # failover (panel.py) route around the down head provider.
+            reachable = [m for m in src if _chain_aware_available(m)]
+            if reachable:
+                models = expand_flat_models_with_reuse(
+                    reachable, len(reachable), usage_percent=_usage_percent
+                )
+                _warn_if_panel_padded(models)
+            else:
+                # EVERYTHING reads unreachable -- dispatch `src` UNFILTERED
+                # and skip usage-limit exclusion entirely (k3 review finding,
+                # round 5): the comment above claimed this fallback matches
+                # brainstorm's "identical" one, but it didn't -- brainstorm's
+                # actual all-unreachable fallback (`config_models or
+                # [_expand_alias(x) for x in DEFAULT_MODELS]`, a few lines up)
+                # dispatches the raw list with NO exclusion, letting each dead
+                # seat fail per-call (and its provider-chain failover a real
+                # chance to recover a false-negative availability probe).
+                # Applying exclusion here too would silently drop a near-limit
+                # model in favor of duplicating another EQUALLY DEAD one --
+                # pure noise when nothing is going to answer regardless.
+                models = src
+        else:
+            models = src
 
     visual_mode = args.visual is not None
     if explicit_models:
@@ -3757,7 +4585,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # configured seats. A configured `models:` list is the full priority-ordered roster from
     # which the active pool + reserve are selected; optional `board:` entries can still
     # provide role/name metadata for those models. The board is NEVER disabled — `--pool N`
-    # only sizes how many of its seats run (default 4; the rest are reserve). `use_board` is
+    # only sizes how many of its seats run (default 2, the light preset; the rest are
+    # reserve). `use_board` is
     # a cheap boolean gate computed now; the actual board resolution + cost-safety validation
     # (and the --pool slice) runs LATER
     # (validate_board, below) — after the standalone-visual path has had its chance to
@@ -3914,6 +4743,30 @@ def _dispatch(argv: list[str] | None = None) -> int:
         except RuntimeError:
             diff = ""
     diff = diff or ""
+
+    # Diff-identity binding (reviewlib.stats "Diff-identity binding"): captured from
+    # the FULL, uncapped diff — computed BEFORE the dispatch-time cap below and before
+    # mode_review's own internal capping, so a huge diff's identity is never truncated
+    # away. `repo_id` is independent of `diff` (cwd alone), so it's computed even for a
+    # diff-less just-ask/quorum/brainstorm run — that still lets --check catch a
+    # cross-REPO mismatch (incident #1) even with no file-set signal to add.
+    repo_id = _compute_repo_id(cwd)
+    diff_files = extract_diff_files(diff)
+    diff_sha256 = diff_content_hash(diff) if diff else None
+
+    # Review-stamp integrity (round-5 review finding, k3+Opus, on this same
+    # diff-identity feature): the pre-commit gate's stamp must certify the diff
+    # actually DISPATCHED to the models, not whatever happens to be staged
+    # MINUTES later when the multi-model panel finishes. Captured HERE,
+    # immediately adjacent to the `diff` capture above (a millisecond gap, not
+    # the minutes-long panel-run gap `_write_review_stamp` used to have when it
+    # independently re-ran `git diff --cached` at stamp-WRITE time) — see
+    # `reviewlib.install._write_review_stamp`'s docstring for the full story
+    # (why it can't just hash `diff` directly: the pre-commit hook's own
+    # verification is UNPREFIXED, `diff` is prefixed via `_git_diff`'s
+    # `diff.noprefix` fix). Only meaningful for `--staged` (the only case
+    # `_write_review_stamp` is ever reached from); None otherwise.
+    stamp_diff_hash = _stamp_hash_for_staged_diff(cwd) if args.staged else None
 
     # Dispatch-time diff cap for the flat PANEL modes (brainstorm/quorum/just-ask) —
     # see reviewlib.backends.cap_diff_for_dispatch's docstring for why this is NOT
@@ -4076,6 +4929,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         extra={
             "diff_from_stdin": diff_from_stdin,
             "diff_already_capped": diff_already_capped,
+            "stamp_diff_hash": stamp_diff_hash,
         },
     )
 
@@ -4095,6 +4949,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             brainstorm_pool(models),
             lambda: mode.handler(ctx),
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
 
     if mode.name == "qa":
@@ -4111,6 +4968,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             qa_seat,
             lambda: mode.handler(ctx),
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
 
     if mode.name not in ("review", "visual"):
@@ -4120,6 +4980,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             models,
             lambda: mode.handler(ctx),
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
 
     # The review mode. Validate the board now if it wasn't already (the no-visual path);
@@ -4140,6 +5003,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         #     not preempt that no-op with an EXIT_UNSATISFIED. Inert on the happy path + fake
         #     backend.
         if mode.name == "review" and diff.strip():
+            # `preset_pool_size(active_preset)`, NOT `preset_pool_size(DEFAULT_PRESET)`
+            # (2 review-round finding, all 3 reviewers, after the light-default change):
+            # `active_preset` is `None` for a custom config `models:`/`board:` roster —
+            # in that case a no-override run ACTUALLY resolves pool via
+            # `preset_pool_size(None) == DEFAULT_POOL_SIZE` (4, cli.py ~4218), not the
+            # preset system's own default (2). Passing the literal `DEFAULT_PRESET` here
+            # would silently halve the guard's promised pool for every config-roster user,
+            # contradicting the very comment/help text this same change added elsewhere.
             guard_rc = _evaluate_pool_or_bail(
                 config,
                 config_models,
@@ -4147,7 +5018,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 _seats_of(board),
                 explicit_models,
                 args.pool,
-                _config_default_pool(config) or DEFAULT_POOL_SIZE,
+                _config_default_pool(config) or preset_pool_size(active_preset),
             )
             if guard_rc is not None:
                 return guard_rc
@@ -4175,6 +5046,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
             pool_size=review_pool_size,
             outcome_sink=outcome_sink,
             exact_board=bool(explicit_models),
+            # None for an explicit -m board (exact_board — usage-limit awareness
+            # doesn't apply to a hand-picked, non-failover roster) or when a
+            # config/default board is priced out entirely — matches this
+            # function's own "explicit -m is honored as-is" precedent above.
+            usage_percent=None if explicit_models else _usage_percent,
         )
 
         def _ran_models() -> list[str]:
@@ -4184,12 +5060,25 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # real id), so the stat record keys on what actually ran — not labels.
             return outcome_sink[0].usable_models if outcome_sink else []
 
+        def _ran_roles() -> list[str]:
+            # review-cli#221: mirrors `_ran_models` exactly, one board ROLE per usable
+            # seat (see `panel.FailoverOutcome.usable_roles`) — including a role filled
+            # by the shortage-resilience duplicate-model pad (PR #207), which repeats a
+            # `.model` string but always carries its OWN distinct `.role`.
+            if explicit_models:
+                return [r.role for r in board]
+            return outcome_sink[0].usable_roles if outcome_sink else []
+
         return _run_mode_with_stats(
             mode.stats_mode,
             eta_models,
             lambda: mode.handler(ctx),
             models_after=_ran_models,
+            roles_after=_ran_roles,
             task_code=task_code,
+            repo_id=repo_id,
+            diff_files=diff_files,
+            diff_sha256=diff_sha256,
         )
     # Flat review path (no board): explicit `-m` with no configured board/models. The
     # foolproofing guard STILL applies here — an explicit selection whose live subset can't
@@ -4199,6 +5088,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # whose panels keep their own behaviour and never see review-specific proposal text) AND
     # to a non-empty diff (an empty diff runs no panel — see the board-path note above).
     if mode.name == "review" and diff.strip():
+        # See the matching `preset_pool_size(active_preset)` comment above — same
+        # config-roster-vs-preset-system distinction applies here.
         guard_rc = _evaluate_pool_or_bail(
             config,
             config_models,
@@ -4206,7 +5097,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             tuple((m, m) for m in models),
             explicit_models,
             args.pool,
-            _config_default_pool(config) or DEFAULT_POOL_SIZE,
+            _config_default_pool(config) or preset_pool_size(active_preset),
         )
         if guard_rc is not None:
             return guard_rc
@@ -4217,6 +5108,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         models,
         lambda: mode.handler(ctx),
         task_code=task_code,
+        repo_id=repo_id,
+        diff_files=diff_files,
+        diff_sha256=diff_sha256,
     )
 
 
@@ -4320,7 +5214,19 @@ def _show_board(
     pool_filled = (
         len(board) if exact_board else _effective_pool_size(available_count, pool_size)
     )
-    sized = " (sized by preset/--pool)" if pool_size != DEFAULT_POOL_SIZE else ""
+    # The "sized" marker fires iff the RESOLVED pool differs from the selected preset's
+    # (or the config-roster fallback's) own default pool — typically an explicit
+    # --pool N that isn't equal to that default. It does NOT fire just because a
+    # non-bare --preset was passed (a preset's own resolved pool always equals
+    # preset_pool_size(that preset), so that clause alone can never trip it) — review
+    # finding, comment corrected to match actual behavior, not aspiration. Comparing
+    # against the bare constant DEFAULT_POOL_SIZE (4) unconditionally was wrong once a
+    # bare `review --show-board` started resolving the light preset's pool of 2 (Alex,
+    # 2026-08-28): every unadorned invocation would misleadingly claim to be "sized".
+    # `preset_pool_size(None)` already returns DEFAULT_POOL_SIZE (review finding: a
+    # prior `if preset else DEFAULT_POOL_SIZE` ternary duplicated that same fallback).
+    bare_default_pool = preset_pool_size(preset)
+    sized = " (sized by preset/--pool)" if pool_size != bare_default_pool else ""
     if exact_board:
         print(
             f"Reviewer board ({len(board)} explicit seats, source: {source}; "

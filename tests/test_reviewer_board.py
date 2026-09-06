@@ -32,6 +32,7 @@ import reviewlib.backends as backends  # noqa: E402
 import reviewlib.modes.review as _review_mod  # noqa: E402
 from reviewlib.backends import ReviewResult  # noqa: E402
 from reviewlib.config import (  # noqa: E402
+    ASTRA_SEAT,
     DEFAULT_BOARD,
     DEFAULT_MODELS,
     DEFAULT_POOL_SIZE,
@@ -42,6 +43,8 @@ from reviewlib.config import (  # noqa: E402
     KIMI_SEAT,
     LIGHT_PRESET_BOARD,
     SOL_SEAT,
+    SONNET_SEAT,
+    TERRA_SEAT,
     REVIEW_ROLES,
     VISUAL_MODELS,
     BoardConfigError,
@@ -81,54 +84,78 @@ class _BackendStateSandbox:
 
 # === DEFAULT_BOARD shape (byte-exact model ids, PRIORITY order from the directive) ==
 def test_default_board_matches_directive_table():
-    # Priority order (failover pool): strongest model first. Each seat keeps a role/lens,
-    # but selection is by PRIORITY + availability, not role order.
+    # Priority order (failover pool): strongest WORKING model first. Each seat keeps a
+    # role/lens, but selection is by PRIORITY + availability, not role order.
     expected = [
-        ("claude:claude-fable-5", "architect", "Fable"),
         ("codex:gpt-5.6-sol", "consistency", "Sol"),
         ("claude:claude-opus-4-8", "correctness", "Opus"),
-        # Seat 4: GLM-5.2 via the Command Code gateway, directly under Opus.
+        # Seat 3: GLM-5.2 via the Command Code gateway, directly under Opus.
         # DIFF-ONLY keyed HTTP (review_commandcode) — opencode's commandcode provider does
         # not register this GLM id, so the agentic form errors; read-only by construction.
         # Role `performance` (NOT correctness) so it doesn't duplicate Opus's lens.
         ("commandcode:zai-org/GLM-5.2", "performance", "GLM-cc"),
-        # Seat 5 is the first reserve and preserves lens diversity when a top seat drops.
+        # Seat 4 is the first reserve and preserves lens diversity when a top seat drops.
         ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "quality", "Kimi"),
-        # Seat 6 is the agentic codex CLI route (see config.py / CHANGELOG for rationale).
-        ("codex", "consistency", "Codex"),
-        # Seats 5 and 7-8 route through opencode (`oc:`) so they run AGENTICALLY (read the repo
-        # read-only), not the diff-only commandcode/z.ai REST call (review-cli#24).
+        # Seat 5 is the agentic codex CLI route, pinned to GPT-6-Astra (ASTRA_SEAT) rather
+        # than the bare `"codex"` seat this used to be (see config.py for rationale). Role
+        # LEFT AS `consistency` (a duplicate of Sol's lens) by review-cli#382 -- an earlier
+        # draft flipped it to `security`, but that left `consistency` with ZERO live
+        # fallback anywhere on the board; see config.py's comment on this exact seat.
+        ("codex:gpt-6-astra", "consistency", "Astra"),
+        # Seats 6-7 (review-cli#382): TERRA_SEAT/SONNET_SEAT, live fallbacks for the
+        # `performance`/`quality` roles whose only prior seats (GLM-cc/Kimi) are disabled
+        # whenever `unpaid_providers` includes `commandcode`. Placed right after Astra so
+        # neither the raw top-4 nor DEFAULT_PRESET_BOARD's top-4 window picks up a
+        # duplicate role in the common (nothing disabled) case.
+        ("codex:gpt-5.6-terra", "performance", "Terra"),
+        ("claude:claude-sonnet-5", "quality", "Sonnet"),
+        # Seats 4, 8-9 and 11 route through opencode (`oc:`) so they run AGENTICALLY (read the
+        # repo read-only), not the diff-only commandcode/z.ai REST call (review-cli#24). Seats
+        # 6-7 (Terra/Sonnet, review-cli#382) run via the codex/claude CLIs, not opencode.
         ("oc:commandcode/Qwen/Qwen3.7-Max", "security", "Qwen"),
         ("oc:commandcode/deepseek/deepseek-v4-pro", "tests", "DeepSeek"),
         ("gemini", "contracts", "Gemini"),
         # GLM-5.2 via opencode's `zai` provider (his z.ai subscription), agentic. Distinct
         # from the seat-3 commandcode GLM: same model family, different provider/transport.
         # DEPRIORITIZED to LAST-RESORT reserve (review-cli#65): it is pathologically slow
-        # under load, so it is the last seat promoted — Qwen/DeepSeek/Gemini go first.
-        ("oc:zai/glm-5.2", "quality", "GLM"),
+        # under load, so it is promoted before only Fable — Qwen/DeepSeek/Gemini go first.
+        # review-cli#382: role changed from `quality` (now covered by Sonnet above, which
+        # doesn't share this seat's real-world quota fragility) to `security`.
+        ("oc:zai/glm-5.2", "security", "GLM"),
+        # Fable 5 (Anthropic flagship). DEMOTED from priority 1 to the very LAST seat
+        # (review-cli#fable-seat-reliability): confirmed 97.9-100% dispatch failure rate
+        # (chronic session/usage-limit exhaustion) made priority 1 a near-certain-doomed
+        # dispatch on every single default review. Worse than GLM's "merely slow" profile,
+        # so it sits even later than GLM — still a reserve seat, not removed outright.
+        ("claude:claude-fable-5", "architect", "Fable"),
     ]
     got = [(r.model, r.role, r.display) for r in DEFAULT_BOARD]
     assert got == expected, got
 
 
 def test_default_board_is_priority_ordered():
-    """The CTO's priority sketch (strongest first): Fable, Sol, Opus,
-    GLM-5.2-via-commandcode, Kimi, Codex, Qwen, DeepSeek, Gemini, GLM-5.2-via-z.ai.
-    Re-ranking = reordering
-    DEFAULT_BOARD; this pins the order. Seats 5 and 7-9 are the AGENTIC opencode (`oc:`)
-    routes (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. The z.ai GLM seat is
-    DEPRIORITIZED to last (review-cli#65) — pathologically slow under load, so last-resort."""
+    """The CTO's priority sketch (strongest-WORKING-model first): Sol, Opus,
+    GLM-5.2-via-commandcode, Kimi, Astra, Terra, Sonnet, Qwen, DeepSeek, Gemini,
+    GLM-5.2-via-z.ai, Fable. Re-ranking = reordering
+    DEFAULT_BOARD; this pins the order. Seats 4, 8-9, and 11 are the AGENTIC opencode
+    (`oc:`) routes (review-cli#24); the commandcode GLM at #3 is diff-only keyed HTTP. Terra/Sonnet
+    (review-cli#382) are live fallbacks for performance/quality, inserted right after Astra.
+    The z.ai GLM seat is DEPRIORITIZED to next-to-last (review-cli#65) — pathologically slow
+    under load. Fable is LAST (review-cli#fable-seat-reliability) — a confirmed ~100%
+    dispatch failure rate, worse than merely slow."""
     assert [r.model for r in DEFAULT_BOARD] == [
-        "claude:claude-fable-5",
         "codex:gpt-5.6-sol",
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",
+        "codex:gpt-6-astra",
+        "codex:gpt-5.6-terra",
+        "claude:claude-sonnet-5",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
         "oc:zai/glm-5.2",
+        "claude:claude-fable-5",
     ]
 
 
@@ -140,16 +167,21 @@ def test_glm_commandcode_seat_sits_directly_under_opus():
     opus_i = models.index("claude:claude-opus-4-8")
     glm_i = models.index(GLM_COMMANDCODE_SEAT)
     assert glm_i == opus_i + 1, (opus_i, glm_i, models)
-    # Sol sits immediately after Fable, so GLM is priority 4 (index 3).
-    assert glm_i == 3, glm_i
+    # Opus sits immediately after Sol (priority 1), so GLM is priority 3 (index 2).
+    assert glm_i == 2, glm_i
 
 
-def test_sol_seat_sits_immediately_after_fable():
+def test_fable_seat_is_last_resort_reserve():
+    """review-cli#fable-seat-reliability: Fable is the LAST seat on the board (the
+    lowest-priority reserve), demoted from priority 1 after a confirmed 97.9-100%
+    dispatch failure rate — see `test_default_board_matches_directive_table`'s comment
+    for the full rationale. Pinned by index (not just membership) so a future re-rank
+    that accidentally moves it back up trips here."""
     models = [r.model for r in DEFAULT_BOARD]
-    assert SOL_SEAT == "codex:gpt-5.6-sol"
-    assert models.index(SOL_SEAT) == models.index("claude:claude-fable-5") + 1, models
-    sol = next(r for r in DEFAULT_BOARD if r.model == SOL_SEAT)
-    assert sol.display == "Sol"
+    assert models[-1] == "claude:claude-fable-5", models
+    fable = next(r for r in DEFAULT_BOARD if r.model == "claude:claude-fable-5")
+    assert fable.display == "Fable"
+    assert fable.role == "architect"
 
 
 def test_glm_commandcode_seat_is_the_canonical_constant():
@@ -218,22 +250,24 @@ def test_glm_commandcode_seat_carries_performance_not_a_duplicate_role():
 def test_default_pool_roles_are_distinct_no_lens_lost():
     """The default top-4 pool (DEFAULT_POOL_SIZE seats) must have FOUR DISTINCT roles, so a
     plain `review diff` always covers four non-overlapping lenses — no seat wasted on a
-    duplicate lens. Pins the coverage the GLM-cc insertion preserved: architect, correctness,
-    performance, consistency (the same four roles the pre-#57 pool had)."""
+    duplicate lens. Coverage is consistency/correctness/performance/quality now
+    (review-cli#fable-seat-reliability: Fable's `architect` lens moved to the LAST seat
+    along with Fable itself; Kimi's `quality` lens fills the vacated top-4 slot)."""
     pool = [r for r in DEFAULT_BOARD[:DEFAULT_POOL_SIZE]]
     roles = [r.role for r in pool]
     assert len(set(roles)) == len(roles), f"duplicate role in default pool: {roles}"
-    assert set(roles) == {"architect", "correctness", "performance", "consistency"}, (
-        roles
-    )
+    assert set(roles) == {"consistency", "correctness", "performance", "quality"}, roles
 
 
-def test_default_board_has_ten_seats():
-    assert len(DEFAULT_BOARD) == 10, len(DEFAULT_BOARD)
+def test_default_board_has_twelve_seats():
+    # review-cli#382: TERRA_SEAT and SONNET_SEAT added as live fallbacks (10 -> 12).
+    assert len(DEFAULT_BOARD) == 12, len(DEFAULT_BOARD)
 
 
 def test_preset_boards_pin_model_order_pool_and_effort():
-    assert DEFAULT_PRESET == "default"
+    # Bare `review diff` defaults to the "light" preset (Alex, 2026-08-28); "default"
+    # and "heavy" stay real, selectable presets with their own board/effort below.
+    assert DEFAULT_PRESET == "light"
     assert all(r.effort == "high" for r in DEFAULT_PRESET_BOARD)
     assert SOL_SEAT not in [r.model for r in DEFAULT_PRESET_BOARD]
     assert "claude:claude-fable-5" not in [r.model for r in DEFAULT_PRESET_BOARD]
@@ -241,7 +275,7 @@ def test_preset_boards_pin_model_order_pool_and_effort():
         "claude:claude-opus-4-8",
         GLM_COMMANDCODE_SEAT,
         "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",
+        ASTRA_SEAT,
     ]
     assert len({r.role for r in DEFAULT_PRESET_BOARD[:4]}) == 4
 
@@ -250,13 +284,27 @@ def test_preset_boards_pin_model_order_pool_and_effort():
         r.model for r in DEFAULT_PRESET_BOARD
     ]
 
+    # Fable is EXCLUDED from HEAVY_PRESET_BOARD entirely (review-cli#fable-seat-reliability,
+    # mirrors the existing DEFAULT_PRESET_BOARD exclusion above) — a "heavy" preset must not
+    # pay for a seat with a confirmed ~100% dispatch failure rate. Kimi is promoted into the
+    # xhigh top-4 in its place (Fable's old DEFAULT_BOARD slot is now the LAST index, so
+    # dropping it doesn't shift anyone else's tier — see HEAVY_PRESET_BOARD's own comment).
+    assert "claude:claude-fable-5" not in [r.model for r in HEAVY_PRESET_BOARD]
     assert [(r.model, r.effort) for r in HEAVY_PRESET_BOARD[:4]] == [
-        ("claude:claude-fable-5", "xhigh"),
         (SOL_SEAT, "xhigh"),
         ("claude:claude-opus-4-8", "xhigh"),
         (GLM_COMMANDCODE_SEAT, "xhigh"),
+        ("oc:commandcode/moonshotai/Kimi-K2.7-Code", "xhigh"),
     ]
     assert all(r.effort == "max" for r in HEAVY_PRESET_BOARD[4:])
+    # review-cli#382 (round 4 review finding): explicitly pin Terra's/Sonnet's effort at
+    # "max", not "xhigh" -- they land at raw priority 6-7 (AFTER Kimi at 4), outside the
+    # `i < 4` xhigh-tier cutoff in `_heavy_eligible_seats`, unlike the config.py comment's
+    # bare say-so this actually asserts it.
+    terra_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == TERRA_SEAT)
+    sonnet_entry = next(r for r in HEAVY_PRESET_BOARD if r.model == SONNET_SEAT)
+    assert terra_entry.effort == "max", terra_entry
+    assert sonnet_entry.effort == "max", sonnet_entry
 
 
 def test_package_facade_exports_preset_surface():
@@ -267,29 +315,46 @@ def test_package_facade_exports_preset_surface():
     assert reviewlib.LIGHT_PRESET_BOARD == LIGHT_PRESET_BOARD
     assert reviewlib.HEAVY_PRESET_BOARD == HEAVY_PRESET_BOARD
     assert reviewlib.SOL_SEAT == SOL_SEAT
+    # review-cli#382 (codex review finding, round 3): TERRA_SEAT/SONNET_SEAT must be
+    # re-exported through the facade too, like every other seat constant (SOL_SEAT/
+    # ASTRA_SEAT/FABLE_SEAT above) -- a caller doing `from reviewlib import TERRA_SEAT`
+    # got an ImportError before this was added to reviewlib/__init__.py.
+    assert reviewlib.TERRA_SEAT == TERRA_SEAT
+    assert reviewlib.SONNET_SEAT == SONNET_SEAT
     assert reviewlib.preset_names() == ("default", "heavy", "light")
     assert reviewlib.preset_pool_size("light") == 2
+    # preset_board(None) resolves via DEFAULT_PRESET, which is "light" (Alex,
+    # 2026-08-28) — same model order as DEFAULT_PRESET_BOARD, but LIGHT's effort.
     assert [r.model for r in reviewlib.preset_board(None)] == [
         r.model for r in DEFAULT_PRESET_BOARD
     ]
     assert [r.model for r in preset_board(None)] == [
         r.model for r in DEFAULT_PRESET_BOARD
     ]
-    assert preset_board(None)[0] == DEFAULT_PRESET_BOARD[0]
-    assert preset_board(None)[0] is not DEFAULT_PRESET_BOARD[0]
+    assert preset_board(None)[0] == LIGHT_PRESET_BOARD[0]
+    assert preset_board(None)[0] is not LIGHT_PRESET_BOARD[0]
+    # Review finding (4 review rounds, multiple reviewers): preset_pool_size(None) must
+    # STAY at DEFAULT_POOL_SIZE (4), deliberately NOT tracking DEFAULT_PRESET the way
+    # preset_board(None) does — cli.py's pool guard (`preset_pool_size(active_preset)`)
+    # relies on this exact disagreement to give a config `models:`/`board:` roster (no
+    # explicit `pool:`) its correct no-override pool of 4, not the light preset's 2. A
+    # future "consistency" cleanup that makes these agree would silently re-break that
+    # path with the whole suite otherwise green — this assertion is the guard against it.
+    assert reviewlib.preset_pool_size(None) == DEFAULT_POOL_SIZE == 4
 
 
 def test_explicit_preset_board_overrides_config_board():
     cfg = {"board": [{"model": "gemini", "role": "tests", "effort": "medium"}]}
     board = load_board(cfg, preset="heavy")
     assert [r.model for r in board[:4]] == [
-        "claude:claude-fable-5",
         SOL_SEAT,
         "claude:claude-opus-4-8",
         GLM_COMMANDCODE_SEAT,
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ]
     assert all(r.effort == "xhigh" for r in board[:4])
     assert all(r.effort == "max" for r in board[4:])
+    assert "claude:claude-fable-5" not in [r.model for r in board]
 
 
 def test_explicit_models_with_preset_preserve_config_metadata_and_use_preset_effort():
@@ -322,6 +387,34 @@ def test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat()
     assert board[0].effort == "medium"
     assert board[1].role == ""
     assert board[1].effort == "medium"
+
+
+def test_bare_codex_explicit_model_no_longer_matches_board_metadata_after_astra_pin():
+    """Opus review finding: before ASTRA_SEAT replaced the bare `"codex"` DEFAULT_BOARD
+    seat, `-m codex` matched that seat byte-for-byte and inherited its role/display/preset
+    effort. Now that the seat is pinned to `codex:gpt-6-astra`, a bare `-m codex` matches NO
+    board/preset entry, so it falls back to the SAME generic unmatched-model path any
+    unrecognised model already gets (role="", a display derived from the model string, and
+    `board_from_models`'s `preset_default_effort` -- the first NON-None `effort` among the
+    preset's own seats, in priority order).
+
+    Deliberately uses `preset="heavy"` (NOT the `preset="light"` that
+    `test_explicit_models_with_preset_apply_preset_effort_to_out_of_preset_seat` uses),
+    because "heavy" grades effort per seat (xhigh for the top 4, max after) while "light"
+    gives every seat a uniform "medium" -- so this test's expected "xhigh" (heavy's own
+    first-seat effort, Sol's) and that other test's expected "medium" (light's uniform
+    effort) are BOTH correct outputs of the identical fallback code path, just fed a
+    different preset; they are not in tension. This pins that the metadata loss for a bare
+    `-m codex` is a deliberate, non-crashing behavior change, not a regression."""
+    board = board_from_models(["codex"], {}, preset="heavy")
+
+    assert len(board) == 1
+    assert board[0].model == "codex"
+    assert board[0].role == ""
+    assert board[0].display == "codex"
+    # Preset default effort (the FIRST seat's effort in priority order, i.e. Sol's xhigh)
+    # -- NOT the "max" effort the old DEFAULT_BOARD seat #5 used to carry.
+    assert board[0].effort == "xhigh"
 
 
 def test_explicit_models_with_preset_prevent_config_effort_downgrade_for_out_of_preset_seat():
@@ -1091,29 +1184,33 @@ def test_default_pool_size_is_four():
 
 def test_select_pool_default_picks_first_four_seats():
     """Default pool (no availability predicate) = the FIRST 4 seats by priority of the
-    10-seat board (the rest are reserve). The pool now leads with Fable, Sol, Opus,
-    then the GLM-5.2-via-commandcode seat."""
+    12-seat board (the rest are reserve). The pool now leads with Sol, Opus, then the
+    GLM-5.2-via-commandcode seat, then Kimi (review-cli#fable-seat-reliability: Fable
+    moved from priority 1 to the very last reserve seat — see
+    `test_default_board_matches_directive_table`'s comment for the full rationale)."""
     pool = select_pool(list(DEFAULT_BOARD), DEFAULT_POOL_SIZE)
     assert len(pool) == 4
     assert [r.model for r in pool] == [r.model for r in DEFAULT_BOARD[:4]]
     assert [r.model for r in pool] == [
-        "claude:claude-fable-5",
         "codex:gpt-5.6-sol",
         "claude:claude-opus-4-8",
         "commandcode:zai-org/GLM-5.2",
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ]
-    # The reserve is exactly the remainder (priority order): agentic Kimi first for lens
-    # diversity, Codex, the remaining opencode routes (review-cli#24), plus the diff-only
-    # Gemini. The slow z.ai GLM seat is LAST-RESORT (review-cli#65 deprioritization), so it
-    # sits at the bottom of the reserve.
+    # The reserve is exactly the remainder (priority order): Astra, Terra/Sonnet
+    # (review-cli#382 live fallbacks), the remaining opencode routes (review-cli#24), the
+    # diff-only Gemini, the slow z.ai GLM seat (LAST-RESORT, review-cli#65
+    # deprioritization), and finally Fable (LAST-RESORT, ~100% failure rate).
     reserve = [r.model for r in DEFAULT_BOARD[4:]]
     assert reserve == [
-        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
-        "codex",
+        "codex:gpt-6-astra",
+        "codex:gpt-5.6-terra",
+        "claude:claude-sonnet-5",
         "oc:commandcode/Qwen/Qwen3.7-Max",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "gemini",
         "oc:zai/glm-5.2",
+        "claude:claude-fable-5",
     ]
 
 
@@ -1185,13 +1282,13 @@ def test_all_repo_capable_default_seats_are_agentic():
     claude CLI) — not a stateless diff-only REST/keyed-HTTP call. Exactly TWO seats stay
     diff-only, each because NO agentic transport reaches them:
       * Gemini — a workspace-less REST API, no agentic CLI/opencode provider; and
-      * GLM-cc (`commandcode:zai-org/GLM-5.2`, priority 4) — opencode's `commandcode`
+      * GLM-cc (`commandcode:zai-org/GLM-5.2`, priority 3) — opencode's `commandcode`
         provider does NOT register this GLM id, so `oc:commandcode/zai-org/GLM-5.2` errors;
         the keyed-HTTP route is the only one that reaches it (verified live).
 
     This still pins the agentic-by-default contract for the seats that CAN be agentic:
-    Kimi/z.ai-GLM/Qwen/DeepSeek go through opencode (`oc:`), Codex through the codex CLI, the
-    two Anthropic seats through claude. A future edit that silently reverts one of THOSE to
+    Kimi/z.ai-GLM/Qwen/DeepSeek go through opencode (`oc:`), Sol/Astra through the codex CLI,
+    the two Anthropic seats through claude. A future edit that silently reverts one of THOSE to
     the diff-only REST route fails here. (claude is agentic via its CLI path; resolve_backend
     returns review_claude for both, and the board's claude seats run the CLI on a normal
     host.)"""
@@ -1210,7 +1307,7 @@ def test_all_repo_capable_default_seats_are_agentic():
             continue
         assert backend in agentic, f"{seat.display} ({seat.model}) is not agentic"
     # Belt-and-suspenders: the ONLY diff-only commandcode/z.ai REST seat on the default board
-    # is the deliberate priority-4 GLM-cc one; every other seat is agentic (or Gemini). A
+    # is the deliberate priority-3 GLM-cc one; every other seat is agentic (or Gemini). A
     # second keyed-HTTP commandcode/z.ai seat slipping in is the regression to catch.
     diff_only_backends = {backends.review_commandcode, backends.review_zai}
     rest_seats = [
@@ -1238,7 +1335,13 @@ def test_install_skill_text_documents_agentic_default_board():
     assert "diff-only" in low and "default board" in low
     assert "selected preset/board" in low
     assert "--preset heavy --pool 0" in SKILL_MD
-    assert "covers all 10 built-ins" in SKILL_MD
+    # review-cli#fable-seat-reliability: the heavy preset excludes Fable (~100%
+    # dispatch failure rate). review-cli#382 added TERRA_SEAT/SONNET_SEAT, so --pool 0
+    # now covers 11 built-ins, not 10/9. Normalized whitespace (GLM review finding):
+    # matching the raw string coupled this assertion to exactly where install.py's
+    # paragraph happens to line-wrap — a future reflow of that markdown with no content
+    # change would break it for no real reason.
+    assert "covers all 11 heavy-preset-built-ins" in " ".join(SKILL_MD.split())
     """review-cli#24 contract (codex review): the agentic `oc:` board seats authenticate via
     opencode's OWN provider config — NOT review-cli's `COMMANDCODE_API_KEY`/`ZAI_API_KEY`.
     So their availability gates on the `opencode` BINARY plus opencode's OWN provider
@@ -1475,6 +1578,19 @@ class _AvailabilityPatch:
 
         self._old_review_mod = review_mod.backend_available
         review_mod.backend_available = _fake
+
+        # `_report_pool_shortfall` (review-cli#276) also does
+        # `from ..backends import backend_unavailable_reason` -- a seat this patch marks
+        # unavailable now gets a SECOND real probe from that function whenever the pool
+        # comes up short, undoing the exact hermeticity this class exists to guarantee
+        # (k3 review finding, round 4: real `_which()`/PATH/auth-db reads leak through a
+        # test that has no real CLI/key configured). Keep it deterministic and consistent
+        # with `_fake` above: available -> no reason, unavailable -> a fixed fake reason.
+        def _fake_reason(model: str) -> str | None:
+            return None if model in self._available else "patched unavailable (test)"
+
+        self._old_review_mod_reason = review_mod.backend_unavailable_reason
+        review_mod.backend_unavailable_reason = _fake_reason
         return self
 
     def __exit__(self, *exc):
@@ -1485,6 +1601,7 @@ class _AvailabilityPatch:
         import reviewlib.modes.review as review_mod
 
         review_mod.backend_available = self._old_review_mod
+        review_mod.backend_unavailable_reason = self._old_review_mod_reason
         return False
 
 
@@ -2477,30 +2594,27 @@ def _capture_default_review_board(argv: list[str]) -> dict:
 
 
 def test_cli_default_path_passes_full_preset_board_and_default_pool():
-    """No -m -> the full default-preset board is passed into mode_review (reserve incl.)
-    with pool_size = the default preset pool (4)."""
+    """No -m/--preset -> the full LIGHT-preset board is passed into mode_review (reserve
+    incl.) with pool_size = the light preset pool (2). Bare `review diff` defaults to
+    "light" (Alex, 2026-08-28) — "default"/"heavy" are now opt-in via --preset."""
     captured = _capture_default_review_board(
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)]
     )
     assert captured["board"] is not None, "board should be active by default"
-    assert len(captured["board"]) == len(DEFAULT_PRESET_BOARD), (
+    assert len(captured["board"]) == len(LIGHT_PRESET_BOARD), (
         "full board passed (reserve incl.)"
     )
-    assert [r.model for r in captured["board"]] == [
-        r.model for r in DEFAULT_PRESET_BOARD
-    ]
-    assert captured["pool_size"] == DEFAULT_POOL_SIZE, captured["pool_size"]
+    assert [r.model for r in captured["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
+    assert captured["pool_size"] == 2, captured["pool_size"]
 
 
-def test_cli_builtin_default_uses_default_preset_board():
+def test_cli_builtin_default_uses_light_preset_board():
     captured = _capture_default_review_board(
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)]
     )
-    assert [r.model for r in captured["board"]] == [
-        r.model for r in DEFAULT_PRESET_BOARD
-    ]
-    assert all(r.effort == "high" for r in captured["board"])
-    assert captured["pool_size"] == 4
+    assert [r.model for r in captured["board"]] == [r.model for r in LIGHT_PRESET_BOARD]
+    assert all(r.effort == "medium" for r in captured["board"])
+    assert captured["pool_size"] == 2
 
 
 def test_cli_light_and_heavy_presets_set_board_and_default_pool():
@@ -2530,14 +2644,18 @@ def test_cli_light_and_heavy_presets_set_board_and_default_pool():
             str(REPO_ROOT),
         ]
     )
+    # review-cli#fable-seat-reliability: Fable is EXCLUDED from the heavy preset (a
+    # confirmed ~100% dispatch failure rate makes it pure waste at any effort tier) —
+    # Sol now leads, with Kimi promoted into the vacated 4th xhigh slot.
     assert [r.model for r in heavy["board"][:4]] == [
-        "claude:claude-fable-5",
         SOL_SEAT,
         "claude:claude-opus-4-8",
         GLM_COMMANDCODE_SEAT,
+        "oc:commandcode/moonshotai/Kimi-K2.7-Code",
     ]
     assert all(r.effort == "xhigh" for r in heavy["board"][:4])
     assert all(r.effort == "max" for r in heavy["board"][4:])
+    assert "claude:claude-fable-5" not in [r.model for r in heavy["board"]]
     assert heavy["pool_size"] == 4
 
 
@@ -2615,12 +2733,13 @@ def test_explicit_preset_overrides_config_pool():
 
 
 def test_invalid_config_pool_falls_back_to_preset_default():
-    """A non-positive / non-int config `pool:` is ignored (falls back to the preset)."""
+    """A non-positive / non-int config `pool:` is ignored (falls back to the preset —
+    DEFAULT_PRESET is "light", pool 2, since Alex's 2026-08-28 default change)."""
     cap = _capture_review_with_config(
         ["diff", "--task", "TEST-1", "-C", str(REPO_ROOT)],
         {"pool": 0},  # 0 = "all" is a CLI-only knob; as a config default it's ignored
     )
-    assert cap["pool_size"] == DEFAULT_POOL_SIZE, cap["pool_size"]
+    assert cap["pool_size"] == 2, cap["pool_size"]
 
 
 def test_cli_explicit_preset_overrides_config_board():
@@ -2666,14 +2785,16 @@ def test_cli_explicit_preset_overrides_config_board():
         cli.main(
             ["diff", "--task", "TEST-1", "--preset", "heavy", "-C", str(REPO_ROOT)]
         )
+        # review-cli#fable-seat-reliability: Fable is excluded from the heavy preset.
         assert [r.model for r in captured["board"][:4]] == [
-            "claude:claude-fable-5",
             SOL_SEAT,
             "claude:claude-opus-4-8",
             GLM_COMMANDCODE_SEAT,
+            "oc:commandcode/moonshotai/Kimi-K2.7-Code",
         ], captured
         assert captured["board"][0].effort == "xhigh", captured
         assert captured["pool_size"] == 4, captured
+        assert "claude:claude-fable-5" not in [r.model for r in captured["board"]]
     finally:
         _review_mod.mode_review = old_mode
         cli.load_config = old_load_config
@@ -2827,10 +2948,14 @@ def test_show_board_explicit_model_is_exact():
 
 
 def test_show_board_explicit_model_with_preset_keeps_exact_model_and_preset_effort_metadata():
-    lines = _show_board_lines(4, preset="heavy", explicit_models=["codex"])
+    # Astra (codex:gpt-6-astra) is the preset seat now outside the xhigh top-4 (the bare
+    # `"codex"` seat this test used before ASTRA_SEAT was pinned no longer appears in the
+    # heavy preset at all), so -m'ing it exactly is what exercises "explicit model reuses
+    # the matching preset entry's effort metadata".
+    lines = _show_board_lines(4, preset="heavy", explicit_models=[ASTRA_SEAT])
     seat_lines = [ln for ln in lines if "[explicit]" in ln]
     assert len(seat_lines) == 1, lines
-    assert "codex  [available]" in seat_lines[0], lines
+    assert f"{ASTRA_SEAT}  [available]" in seat_lines[0], lines
     assert "effort=max" in seat_lines[0], lines
     assert "source: explicit -m + preset:heavy" in lines[0], lines
 
@@ -2856,8 +2981,10 @@ def test_show_board_explicit_models_are_all_live_and_pool_is_ignored():
 def test_show_board_startup_failover_skips_unavailable_top_seat():
     """The live pool is the top-N AVAILABLE seats by priority: an unavailable higher
     priority seat is tagged `unavail` and the next available seat fills the pool."""
-    # Fable (#1) unavailable -> the pool of 2 is Sol (#2) + Opus (#3); Fable is unavail.
-    avail = {r.model for r in DEFAULT_BOARD if r.model != "claude:claude-fable-5"}
+    # Sol (#1 in the heavy preset — review-cli#fable-seat-reliability demoted Fable to
+    # LAST, so Fable is no longer in HEAVY_PRESET_BOARD at all) unavailable -> the pool
+    # of 2 is Opus (#2) + GLM-cc (#3); Sol is unavail.
+    avail = {r.model for r in DEFAULT_BOARD if r.model != SOL_SEAT}
     seat_lines = [
         ln
         for ln in _show_board_lines(2, available=avail, preset="heavy")
@@ -2870,9 +2997,9 @@ def test_show_board_startup_failover_skips_unavailable_top_seat():
                 by_tier[tier].append(ln)
                 break
     assert len(by_tier["pool"]) == 2, by_tier["pool"]
-    assert "Fable" in by_tier["unavail"][0], by_tier["unavail"]
-    assert "Sol" in by_tier["pool"][0]
-    assert "Opus" in by_tier["pool"][1]
+    assert "Sol" in by_tier["unavail"][0], by_tier["unavail"]
+    assert "Opus" in by_tier["pool"][0]
+    assert "GLM-cc" in by_tier["pool"][1]
 
 
 def test_show_board_marks_claude_commandcode_api_gateway_unpaid():
@@ -2926,11 +3053,19 @@ def test_show_board_pool_zero_marks_all_seats_pool():
 
 
 def test_show_board_heavy_preset_displays_effort_values():
+    """review-cli#fable-seat-reliability: Fable is excluded from the heavy preset
+    entirely (a confirmed ~100% dispatch failure rate), so it no longer has a row
+    here at all — Sol (the new #1) and Astra (still outside the xhigh top-4) stand
+    in as the xhigh/max examples instead."""
     lines = _show_board_lines(4, preset="heavy")
-    fable = next(ln for ln in lines if "claude:claude-fable-5" in ln)
-    kimi = next(ln for ln in lines if "oc:commandcode/moonshotai/Kimi-K2.7-Code" in ln)
-    assert "effort=xhigh" in fable, fable
-    assert "effort=max" in kimi, kimi
+    assert not any("claude:claude-fable-5" in ln for ln in lines), lines
+    sol = next(ln for ln in lines if SOL_SEAT in ln)
+    # Match the DISPLAY name ("Astra"), not the bare model string — "codex" is also a
+    # substring of both Sol's AND Astra's model ids (`codex:gpt-5.6-sol`,
+    # `codex:gpt-6-astra`), which would false-match here.
+    astra = next(ln for ln in lines if "Astra" in ln)
+    assert "effort=xhigh" in sol, sol
+    assert "effort=max" in astra, astra
 
 
 def test_show_board_tags_by_seat_not_model_for_duplicate_models():

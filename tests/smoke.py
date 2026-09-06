@@ -43,6 +43,7 @@ _GIT_REQUIRED_UNIT_FILES = frozenset(
         "test_qa_mode.py",
         "test_review_marker.py",
         "test_review_commit_checkpoint.py",
+        "test_review_stamp_delta_tolerance.py",
         "test_run_stats.py",
         "test_staged_diff_honors_c_repo.py",
     }
@@ -383,34 +384,40 @@ def test_board_flags_and_listing():
     assert_not_in("--no-board", top)
     board = review_out("--show-board")
     for needle in (
-        "source: preset:default",
+        # Bare `--show-board` now resolves to the "light" preset (Alex, 2026-08-28:
+        # cheap/quick preflight is the default; "default"/"heavy" are opt-in).
+        "source: preset:light",
         "claude:claude-opus-4-8",
         "oc:commandcode/deepseek/deepseek-v4-pro",
         "oc:zai/glm-5.2",
         "contracts",
-        "8 seats",
+        "10 seats",
         "#1",
-        # The CTO-directed GLM-5.2-via-commandcode seat (default preset, diff-only keyed HTTP).
+        # The CTO-directed GLM-5.2-via-commandcode seat (light preset, diff-only keyed HTTP).
         "commandcode:zai-org/GLM-5.2",
         "GLM-cc",
     ):
         assert_in(needle, board, "in --show-board")
     heavy = review_out("--show-board", "--preset", "heavy")
+    # review-cli#fable-seat-reliability: claude:claude-fable-5 is EXCLUDED from the
+    # heavy preset (a confirmed ~100% dispatch failure rate) — no "architect" lens
+    # (Fable was the only seat carrying it). review-cli#382 added TERRA_SEAT/SONNET_SEAT,
+    # so heavy is now 11 seats, not 9/10.
     for needle in (
         "source: preset:heavy",
-        "architect",
-        "claude:claude-fable-5",
         "codex:gpt-5.6-sol",
-        "10 seats",
+        "11 seats",
     ):
         assert_in(needle, heavy, "in --show-board --preset heavy")
+    assert_not_in("claude:claude-fable-5", heavy)
+    assert_not_in("architect", heavy)
     assert_in("agentic", board.lower())
     assert_in("diff-only", board.lower())
     assert_in("priority", board.lower())
-    # The codex seat is agentic.
-    codex_line = next((ln for ln in board.splitlines() if "Codex" in ln), "")
-    assert_in("codex", codex_line)
-    assert_in("agentic", codex_line)
+    # The Astra seat (codex:gpt-6-astra, the agentic codex CLI route) is agentic.
+    astra_line = next((ln for ln in board.splitlines() if "Astra" in ln), "")
+    assert_in("codex:gpt-6-astra", astra_line)
+    assert_in("agentic", astra_line)
     # In the default preset, GLM-cc sits directly under Opus at #2 and is diff-only.
     glmcc_line = next((ln for ln in board.splitlines() if "GLM-cc" in ln), "")
     assert_in("#2", glmcc_line)
@@ -421,7 +428,14 @@ def test_failover_pool_listing():
     board = review_out("--show-board")
     assert_in("live pool", board.lower())
     assert_in("reserve", board)
-    assert_in("pool 4", board.lower())
+    # Bare --show-board resolves the light preset (Alex, 2026-08-28): pool 2.
+    assert_in("pool 2", board.lower())
+    # Review finding: the bare invocation must NOT claim to be "sized" (it wasn't —
+    # this is the exact bug the light-default change fixed), but an explicit --pool
+    # override must.
+    assert_not_in("sized by preset", board)
+    sized_pool3 = review_out("--show-board", "--pool", "3")
+    assert_in("sized by preset", sized_pool3)
     pool2 = review_out("--show-board", "--pool", "2")
     if pool2.count("[pool") > 2:
         raise SmokeError(f"--pool 2 tagged more than 2 seats:\n{pool2}")
@@ -643,6 +657,11 @@ _UNIT_FILES = [
     ("test_dashboard_service.py", {}),
     ("test_dashboard.py", {}),
     ("test_streaming.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # review-cli#221: run_board_with_failover arms/clears the wall-clock board deadline
+    # at the right moments (the clamp math itself is covered in test_streaming.py). One
+    # test intentionally fails a seat, which writes a retry log — REVIEW_LOG_DIR isolates
+    # that away from the real log directory.
+    ("test_board_deadline_wiring.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_claude_seat_robust.py", {}),
     ("test_workspace_trust.py", {}),
     ("test_moderator.py", {}),
@@ -656,6 +675,14 @@ _UNIT_FILES = [
     ("test_staged_diff_honors_c_repo.py", {}),
     ("test_output_flag.py", {}),
     ("test_opencode_realrepo.py", {}),
+    # Versioned per-model true-silence behavior registry (review-cli#235). Pure data
+    # lookups + env-override precedence — no I/O, no git.
+    ("test_model_behavior.py", {}),
+    # review_opencode's true-silence cooldown wiring (review-cli#235): recording AND
+    # consulting a cooldown, escalation on repeat trips, dashboard attribution, and the
+    # no-cooldown-on-a-genuine-child-exit-125 safeguard (codex/Fable review findings).
+    # Isolates its own $REVIEW_SEAT_COOLDOWN_FILE per test — no shared env needed here.
+    ("test_true_silence_cooldown_wiring.py", {}),
     # The omp (Oh My Pi) agentic read-only backend (review-cli#174): routing, the
     # `@payloadfile` launch contract, the offline sqlite auth probe, unpaid gating,
     # board scope label + dashboard attribution. Hermetic — fake _which/_run_streamed
@@ -691,11 +718,44 @@ _UNIT_FILES = [
     # (ok/staged/not-piped), the real `git commit` it makes, and the distinct
     # EXIT_COMMIT_FAILED when the commit subprocess itself (e.g. a rejecting hook) fails.
     ("test_review_commit_checkpoint.py", {}),
+    # The pre-commit gate's trivial-follow-up delta tolerance (review-cli#208): a small
+    # restage on top of an already-reviewed baseline is accepted without a fresh full
+    # review, a substantive one is still blocked, and a pre-#208 stamp (no companion
+    # review-stamp-diff) keeps today's exact-hash-only behavior. Exercises the ACTUAL
+    # `_PRECOMMIT` shell script via subprocess against real temp git repos.
+    ("test_review_stamp_delta_tolerance.py", {}),
     ("test_failover_pool.py", {}),
     # Provider-failover: the per-model provider chain + last-working cache + the MID-REVIEW
     # switchover (provider A fails on the call, the model completes via B, board not degraded).
     # Offline — availability/unpaid injected, cache is a throwaway temp file.
     ("test_provider_failover.py", {}),
+    # Reuse-aware board/panel composition (review-cli#205): scarce/near-limit models
+    # reuse across roles instead of shrinking the panel. Pure algorithm, no I/O.
+    ("test_pool_reuse.py", {}),
+    # The tg-ctl usage-percent bridge test_pool_reuse.py's consumer relies on — offline
+    # (every core assertion passes `samples=`); the few real-file tests manage their own
+    # $REVIEW_USAGE_LIMITS_FILE/_DIR save-restore internally, no shared env needed.
+    ("test_usage_limits.py", {}),
+    # The operator-facing "panel/board padded" warnings + quorum's <model>#N
+    # duplicate-seat labelling (review-cli#205 round 2). Pure functions +
+    # mocked run_panel/run_moderator, no real dispatch.
+    ("test_reuse_warnings.py", {}),
+    # The pre-dispatch "pool came up short" STDOUT notice (2026-08-28): names every
+    # board seat unavailable before dispatch whenever the live pool is smaller than
+    # requested, so the shrink is visible in the review output itself, not only in
+    # stderr/logs. Mostly a pure function with `backend_unavailable_reason`
+    # monkeypatched, no real backend/network -- except one call-site wiring test that
+    # drives the real mode_review -> run_board_with_failover dispatch path (with a
+    # patched-in fake backend), so it gets REVIEW_LOG_DIR isolated like its sibling
+    # dispatch-driving tests (test_streaming.py, test_board_deadline_wiring.py) rather
+    # than writing to the real log dir if a seat there ever fails (GLM review finding,
+    # round 8).
+    ("test_pool_shortfall_warning.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # Adversarial review-rigor audit fixes (Alex, 2026-08-21): the adversarial base
+    # prompt + evidence-for-a-clean-verdict surfacing, the security/tests role
+    # blending, and quorum's opt-in --adversarial-check refutation pass. Pure
+    # functions + mocked run_panel/run_moderator, no real dispatch.
+    ("test_adversarial_review_rigor.py", {}),
     # The concurrency cap drives real _run_streamed subprocesses (which write live logs), so
     # give it a FRESH temp log dir like the other log-touching tests (review-cli#65).
     ("test_concurrency_cap.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
@@ -771,7 +831,25 @@ _UNIT_FILES = [
     ("test_sessions.py", {}),
     ("test_e2e_resume.py", {}),
     ("test_run_stats.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
+    # Diff-identity binding (review-cli#213): repo/diff mismatch detection for
+    # `review task CODE --check`'s self-merge-authority gate.
+    ("test_diff_identity.py", {"REVIEW_LOG_DIR": _FRESH_TMP}),
     ("test_backstop.py", {}),
+    # review-cli#180: the $REVIEW_CLI_ACTIVE reentrancy guard that stops a codex/claude/
+    # opencode backend from re-invoking `review` on the same worktree (each level of
+    # recursion re-roots into a fresh OS session via `start_new_session=True`, so the
+    # existing process-GROUP kill/backstop machinery structurally cannot bound it — an
+    # env var is the one signal that survives that). Exercises main()'s guard wiring, a
+    # real nested `bin/review` subprocess, and an end-to-end regression against a
+    # stubbed codex binary that attempts self-reinvocation.
+    ("test_reentrancy_guard.py", {}),
+    # review-cli#180: the codex execpolicy `.rules` guard (`install.
+    # install_codex_recursion_guard`) — the closest available equivalent to the claude
+    # backend's `--tools ""` / opencode's `bash: deny` for a backend whose core
+    # capability IS shell exec. Hermetic install/idempotency/content checks always run;
+    # the integration check against codex's own `execpolicy check` engine SKIPs when
+    # the `codex` CLI isn't on PATH.
+    ("test_codex_recursion_guard_rules.py", {}),
     # From main's review-UX-chain (review-cli#44): help defaults, install hook text / state, topic help.
     ("test_help_defaults.py", {}),
     ("test_install_hook_text.py", {}),
@@ -810,6 +888,10 @@ _UNIT_FILES = [
     # `review stat`'s CLI surface (argparse wiring, --since/--days resolution, --json vs
     # text rendering, --harness table filtering). Deterministic, no network/backend.
     ("test_stat_subcommand.py", {}),
+    # The persistent call-log cache (reviewlib.dashboard.call_log_cache) that lets a
+    # repeat `review stat`/dashboard scan skip re-parsing unchanged log files.
+    # Deterministic — synthetic tmpdirs, no real log dir, no network.
+    ("test_call_log_cache.py", {}),
 ]
 # The visual-verification files run from test_visual_verification_suite (gated on magick/Pillow);
 # smoke.py itself is the runner, not a unit file. Everything else in tests/test_*.py must be in

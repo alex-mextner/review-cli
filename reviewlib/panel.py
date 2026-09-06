@@ -7,9 +7,12 @@ decomposition — zero behaviour change).
 from __future__ import annotations
 
 import concurrent.futures
+import os
+import re
 import sys
 import threading
-from dataclasses import dataclass, replace
+import time
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .backends import (
@@ -22,7 +25,28 @@ from .backends import (
     review_with_images,
 )
 from .config import MODERATOR_CANDIDATES, BoardReviewer
-from .process import write_retry_log
+from .process import set_board_deadline, write_retry_log
+
+# Overall wall-clock BUDGET (seconds, from the start of a board run) that
+# run_board_with_failover clamps its reserve-promotion idle timeouts against via
+# process.set_board_deadline — so a run wrapped in an external `timeout N` degrades
+# gracefully instead of being SIGKILLed mid reserve-promotion (review-cli#221: a
+# promoted reserve's default 20-minute idle floor can outlive a caller's 15-minute
+# external wrapper). Unset by default (None = pre-existing unclamped behaviour,
+# unchanged) since not every caller runs under an external timeout.
+_BOARD_DEADLINE_BUDGET_ENV = "REVIEW_BOARD_DEADLINE_SECONDS"
+
+
+def _board_deadline_budget() -> int | None:
+    raw = os.environ.get(_BOARD_DEADLINE_BUDGET_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
 
 # A backend can report rc=0 with a NON-empty body that is actually an "unavailable"
 # notice rather than a real answer (e.g. the paywalled Fable returns rc=0 with
@@ -179,13 +203,100 @@ def result_is_usable(result: ReviewResult) -> bool:
     return True
 
 
-def format_result(result: ReviewResult) -> str:
+# A clean/no-issues verdict without evidence (audit finding: "no forced structured
+# verdict / no evidence requirement for a clean pass"). DEFAULT_PROMPT now asks every
+# reviewer to back a clean verdict with an explicit "checked: <mode>, ruled out because
+# <reason>" statement, the same way a finding must cite file:line. This is a HEURISTIC
+# surfacing of a body that ignores that ask — not an enforcement gate (flipping the
+# reviewer's exit code on free-text content is the larger effort tracked separately,
+# review-cli#137) — so a body shaped like a bare "looks good" gets a visible warning
+# instead of being silently trusted.
+_FINDING_EVIDENCE_RE = re.compile(
+    r"[\w./-]+\.[a-zA-Z0-9]+:\d+"
+)  # e.g. reviewlib/foo.py:42
+_CHECKED_EVIDENCE_RE = re.compile(r"(?i)\bchecked\s*:")
+# No 'approved' alternative (k3 review finding, round 8): a bare `\bapproved\b` also
+# matches inside a REJECTING verdict — "Not approved — the checkpoint races the
+# stamp write." — attaching the missing-evidence WARNING to a verdict that already
+# blocked the change, actively misdescribing it rather than merely under- or
+# over-warning. DEFAULT_PROMPT never asks a reviewer to say "approved" in the first
+# place (this heuristic exists to catch DEFAULT_PROMPT's own "checked: ..." contract
+# being skipped, not to recognize every possible clean-sounding word), and the
+# remaining alternatives below already catch the common bare rubber-stamp shapes
+# ("Approved, no issues." still matches via "no issues") — so the safer fix is to
+# drop the ambiguous word entirely rather than chase every negation ("not approved",
+# "never approved", "can't be approved") with more lookbehinds.
+_CLEAN_VERDICT_RE = re.compile(
+    r"(?i)\b(no issues|looks good|lgtm|nothing (?:blocking|to flag)|no (?:blocking )?"
+    r"findings|no problems(?: found)?)\b"
+)
+# Above this length the finding-evidence scan is skipped outright (glm-cc review
+# finding, round 1): `_FINDING_EVIDENCE_RE` backtracks per start position across an
+# unbroken `[\w./-]` run with no match inside it (a model echoing a long hex blob,
+# dotted identifier chain, or minified line from the diff), which is O(L^2) on that
+# run's length — and this heuristic only ever targets a SHORT rubber-stamp verdict
+# in the first place, so a long body gets nothing from running it. The cap is well
+# above any plausible "looks good" one-liner and comfortably below where the
+# quadratic cost would be felt.
+_EVIDENCE_SCAN_MAX_LEN = 4000
+
+
+def clean_verdict_missing_evidence(body: str) -> bool:
+    """True when `body` reads like an unsupported clean verdict: it claims something in
+    the "no issues" family but shows neither a file:line citation nor a "checked: ..."
+    ruled-out statement to back that claim. A body that already cites a file:line
+    (findings, or a clean verdict that names what it inspected) or uses the "checked:"
+    phrasing DEFAULT_PROMPT now asks for is never flagged, regardless of wording — this
+    only targets the specific unsupported "looks good" rubber-stamp shape.
+
+    ACCEPTED RESIDUAL (Opus review finding, round 11, in-family with the "approved"
+    fix above): `_CLEAN_VERDICT_RE`'s remaining alternatives ("no issues", "no
+    problems", "nothing blocking", ...) can also fire on a SCOPED clause inside a
+    body that DOES report a real finding elsewhere — e.g. "Missing test: nothing
+    exercises the board render path with a custom --prompt override. No issues
+    found in the flat path." — attaching the WARNING to a response that already did
+    the work, the same class of misdescription round 8 fixed for "approved". Unlike
+    "approved" (a word DEFAULT_PROMPT never asks for at all, so dropping it cost
+    nothing), these ARE the exact words DEFAULT_PROMPT's own "checked: ..." contract
+    expects a genuinely clean SECTION to use — removing them would defeat this
+    heuristic's whole purpose, and telling a "whole verdict is clean" claim apart
+    from a "this one part is clean" clause needs the same real-conclusion-location
+    reasoning already accepted as out of reach for `refutation_verdict`'s own
+    residuals. Left as a documented, low-cost warning-only heuristic gap rather than
+    chased further: worst case is an unnecessary WARNING next to a real finding that
+    already cited its own evidence, never a silently-dropped finding."""
+    if not body.strip() or len(body) > _EVIDENCE_SCAN_MAX_LEN:
+        return False
+    if _FINDING_EVIDENCE_RE.search(body) or _CHECKED_EVIDENCE_RE.search(body):
+        return False
+    return bool(_CLEAN_VERDICT_RE.search(body))
+
+
+def format_result(result: ReviewResult, *, check_evidence: bool = False) -> str:
+    """Render one `ReviewResult` for terminal/transcript output.
+
+    `check_evidence` (default False — glm-cc review finding, round 1) opts a caller
+    into the missing-evidence WARNING: the "checked: ... / file:line" contract
+    `clean_verdict_missing_evidence` looks for is asked for ONLY by
+    `config.DEFAULT_PROMPT` (the diff-review board's base instruction) — quorum's
+    expert/moderator prompts, just-ask's prompt, and brainstorm's persona prompts
+    never ask a model for that phrasing, so applying the check there flagged a
+    perfectly normal "nothing blocking, all experts agree" synthesis as a suspicious
+    skim it was never asked to avoid being. Only `mode_review`'s two render call
+    sites (the flat and board diff-review paths) pass `check_evidence=True`."""
     status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
     body = result.stdout.strip()
     err = result.stderr.strip()
     parts = [f"## {result.model} [{status}]", f"`{result.command}`"]
     if body:
         parts.append(body)
+        if check_evidence and clean_verdict_missing_evidence(body):
+            parts.append(
+                "> [review-cli] WARNING: this reads as a clean verdict with no "
+                "evidence of what was checked (no file:line finding, no 'checked: "
+                "...' statement) — treat with skepticism; it may be a skim rather "
+                "than a real adversarial pass."
+            )
     if err:
         parts.append("stderr:\n" + err)
     return "\n\n".join(parts)
@@ -407,6 +518,18 @@ class FailoverOutcome:
     # honest run-stats pool: a backfilled reserve appears here under its real model id,
     # so record_run keys the ETA/history on what actually ran, never a display label.
     usable_models: list[str]
+    # The board ROLE (a REVIEW_ROLES key, e.g. "architect"/"security") each usable seat
+    # was reviewing under, index-aligned with `usable_models` (same seat, same position —
+    # both lists are appended to in the same loop iteration, so they can never drift).
+    # review-cli#221: a role-filling seat created by the shortage-resilience duplicate-
+    # model pad (select_pool_with_reuse / config.py) carries its OWN distinct role even
+    # when its `model` repeats one already in the pool — this is what lets a --min-roles
+    # gate count that pass as covering a genuinely different facet of the review, instead
+    # of `_distinct_models` collapsing it into the same already-counted model string.
+    # Defaulted to `[]` (unlike the required `usable_models`) so existing direct
+    # `FailoverOutcome(...)` test fakes that predate this field keep constructing
+    # without passing it.
+    usable_roles: list[str] = field(default_factory=list)
 
 
 def run_board_with_failover(
@@ -437,7 +560,16 @@ def run_board_with_failover(
     all_results: list[ReviewResult] = []
     usable: list[ReviewResult] = []
     usable_models: list[str] = []
+    usable_roles: list[str] = []
     reserve_queue = list(reserve)
+
+    # If REVIEW_BOARD_DEADLINE_SECONDS names an overall wall-clock budget, arm the
+    # process-wide deadline for its duration so a reserve promoted late in this run gets
+    # a clamped (but never starved-to-zero) idle timeout instead of the full default
+    # floor — see process.idle_timeout_seconds / review-cli#221. Cleared in the finally
+    # below regardless of outcome, so it can never leak into an unrelated later call.
+    budget = _board_deadline_budget()
+    set_board_deadline(time.monotonic() + budget if budget is not None else None)
 
     # The failover loop owns the run-stats tally: suppress run_panel's per-call auto-tally
     # so a failed-then-replaced seat isn't double-counted, and record exactly one outcome
@@ -468,6 +600,7 @@ def run_board_with_failover(
                 if result_is_usable(result):
                     usable.append(result)
                     usable_models.append(reviewer.model)
+                    usable_roles.append(reviewer.role)
                     _tally_ok(True)
                 else:
                     # This seat failed — count it as a fail and try to backfill it from
@@ -498,6 +631,7 @@ def run_board_with_failover(
     finally:
         with _TALLY_LOCK:
             _suppress_autotally = prev_suppress
+        set_board_deadline(None)
 
     degraded = len(usable) < target
     return FailoverOutcome(
@@ -506,6 +640,7 @@ def run_board_with_failover(
         target=target,
         degraded=degraded,
         usable_models=usable_models,
+        usable_roles=usable_roles,
     )
 
 

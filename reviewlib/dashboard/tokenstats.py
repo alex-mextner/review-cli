@@ -64,8 +64,9 @@ Given that, this module reports TWO tiers, never conflating them:
 Also parses the retry/promotion sidecar logs (``reviewlib.process.write_retry_log``) that
 nothing else in the codebase reads today — the durable trail of every in-seat retry,
 seat-fatal short-circuit, and reserve promotion, including the Fable-specific pattern the
-investigation found (the priority-1 board seat failing on a majority of runs with an
-explicit session-limit / paywall notice).
+investigation found (the priority-1 board seat AT THAT TIME failing on a majority of runs
+with an explicit session-limit / paywall notice — see review-cli#fable-seat-reliability for
+the fix, which also demoted Fable to DEFAULT_BOARD's last seat).
 """
 
 from __future__ import annotations
@@ -76,6 +77,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..process import log_dir as _dashboard_log_dir
+from . import call_log_cache
 from .parser import (
     HEALTH_OK,
     HEALTH_PAYWALL,
@@ -245,9 +247,14 @@ def list_call_logs(directory: Path, *, since: datetime | None = None) -> list[Ca
             continue
         if since is not None and stamp < since:
             continue
-        call = parse_call_log(path)
+        # Call-log files are write-once, so a repeat scan of the same directory can
+        # reuse a prior parse keyed on (filename, mtime, size) instead of re-reading
+        # and re-parsing potentially tens of thousands of files every invocation (the
+        # documented cause of `review stat --days 0` timing out on a long-lived install).
+        call = call_log_cache.get_or_parse(directory, path, parse_call_log)
         if call is not None:
             calls.append(call)
+    call_log_cache.save(directory)
     return calls
 
 
@@ -447,14 +454,19 @@ def compute_model_stats(calls: list[CallLog]) -> dict[str, dict]:
 
 
 # ---- Fable-specific report ---------------------------------------------------------------
-# The investigation's headline finding: the priority-1 board seat (claude:claude-fable-5,
-# display "Fable") is dispatched on most default reviews and fails on a majority of them —
-# 1,836/4,322 sampled failures an explicit session/usage-limit notice, 714 the rc=0
-# administrative "... is currently unavailable" sentinel. Surfaced as its own section
-# (not buried in the per-harness table) because it is a distinct, actionable pattern:
-# review-cli's own default panel burns real Claude-account session quota before ever
-# reaching a working seat (reviewlib.seat_cooldown is the fix for the dispatch side; this
-# report is how you'd SEE the pattern without another manual log-archaeology pass).
+# The investigation's headline finding: the board seat (claude:claude-fable-5, display
+# "Fable") — priority 1 in DEFAULT_BOARD AT THE TIME of this investigation — was
+# dispatched on most default reviews and failed on a majority of them — 1,836/4,322
+# sampled failures an explicit session/usage-limit notice, 714 the rc=0 administrative
+# "... is currently unavailable" sentinel. Surfaced as its own section (not buried in
+# the per-harness table) because it was a distinct, actionable pattern: review-cli's
+# own default panel burned real Claude-account session quota before ever reaching a
+# working seat. review-cli#fable-seat-reliability fixed both halves of that: a gap in
+# reviewlib.seat_cooldown's cooldown-recording (the dispatch-side fix this section's
+# own note below already anticipated) AND the priority-1 placement itself (Fable is
+# now DEFAULT_BOARD's LAST seat, a last-resort reserve — see that module for the
+# current board order). This report stays useful going forward as the ongoing "how
+# would you SEE it if this regressed again" check, not just a historical record.
 _SESSION_LIMIT_MARKERS = ("session limit", "usage-credits", "usage credits")
 # kimi review finding: a bare `"auth" in low` substring match mis-buckets an unrelated
 # retry detail into "auth" whenever it happens to contain "author"/"authoritative" —
