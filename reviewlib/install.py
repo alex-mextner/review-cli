@@ -815,28 +815,16 @@ case "$threshold" in ''|*[!0-9]*) threshold=10 ;; esac
 if [ "$threshold" -gt 0 ]; then
   stamp_diff=$(command git rev-parse --git-path review-stamp-diff)
   if [ -f "$stamp_diff" ]; then
-    # Opus round-3 finding (gate bypass): a stale review-stamp-diff left on disk after
-    # the reviewed change is COMMITTED must never anchor the comparison -- without this
-    # check it becomes a fixed, small, permanent baseline, and an unrelated unreviewed
-    # change to a DIFFERENT file after that commit measures favorably against it and
-    # passes, repeatably and unboundedly. The file's first line is the HEAD the diff was
-    # reviewed against (written by _write_review_stamp_diff); only proceed if that still
-    # matches the current HEAD -- otherwise fall through to the exact-hash gate below,
-    # same as if no companion file existed at all.
-    # A repo with NO commits yet legitimately has an empty HEAD on both sides -- the
-    # documented, tested use case IS "stage + review, then a further uncommitted
-    # follow-up, all before the first commit ever lands" -- so an empty/empty match is
-    # a real match, not a bypass: nothing has been committed for the anchor to go stale
-    # against. What must NOT match is empty-recorded vs non-empty-current (reviewed
-    # before any commit, but a commit landed since) or two different non-empty shas.
+    # A stale review-stamp-diff left on disk after the reviewed change is committed
+    # must not anchor the comparison for a later unrelated change, so only proceed
+    # if the HEAD it was reviewed against (this file's first line, written by
+    # _write_review_stamp_diff) still matches the current HEAD; otherwise fall
+    # through to the exact-hash gate below. Empty/empty is a legitimate match (the
+    # documented pre-first-commit review-then-followup case), not a bypass.
     recorded_head=$(head -n 1 "$stamp_diff" 2>/dev/null)
-    # `git rev-parse HEAD` on a repo with NO commits yet does not print an empty
-    # string on failure -- it echoes the unresolved arg ("HEAD" itself) to STDOUT
-    # and exits non-zero (verified live: exit 128, stdout "HEAD", the "fatal:
-    # ambiguous argument" text going to stderr only). Checking only stdout would
-    # read that as a real, distinct HEAD value and never match the equally
-    # legitimate empty `recorded_head` from a pre-first-commit review -- so the
-    # exit status, not just stdout, decides whether HEAD resolved at all.
+    # On a repo with no commits, `git rev-parse HEAD` prints the unresolved arg
+    # ("HEAD") to stdout and exits non-zero -- check the exit status, not just
+    # stdout, or a pre-first-commit review's legitimate empty HEAD never matches.
     if current_head=$(command git rev-parse HEAD 2>/dev/null); then
       :
     else
@@ -848,36 +836,39 @@ if [ "$threshold" -gt 0 ]; then
       if [ -n "$baseline_tmp" ] && [ -n "$cur_tmp" ] \\
         && tail -n +2 "$stamp_diff" > "$baseline_tmp" \\
         && command git diff --no-ext-diff --cached > "$cur_tmp"; then
-        if ! LC_ALL=C grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$baseline_tmp" "$cur_tmp" 2>/dev/null; then
+        # git, diff, and grep each decide "binary" over a different byte-window of
+        # a different input, so trusting any one tool's own heuristic leaves a gap
+        # a NUL can fall into (silently truncating the `content` pipeline below to
+        # nothing, undercounting an arbitrarily large unreviewed change as trivial).
+        # Scan both whole files for a NUL up front instead of any partial window.
+        # `tr -d '\\000' | cmp -s -` is POSIX-portable (unlike `wc -c`, which BSD
+        # pads) and reports a real difference (a NUL was present) via exit status.
+        contains_nul() { ! (LC_ALL=C tr -d '\\000' < "$1" | cmp -s - "$1"); }
+        if ! contains_nul "$baseline_tmp" && ! contains_nul "$cur_tmp" \\
+          && ! LC_ALL=C grep -qE '^(Binary files |[-+]Subproject commit [0-9a-f]{40}|old mode |new mode |rename from |rename to |copy from |copy to )' "$baseline_tmp" "$cur_tmp" 2>/dev/null; then
           diff_out=$(diff -U0 "$baseline_tmp" "$cur_tmp" 2>/dev/null)
           diff_rc=$?
-          # Opus round-4 finding (security / undercount -> gate bypass): git's OWN
-          # binary check (the fail-closed grep above) scans the first ~8000 bytes of
-          # the BLOB and decides per its own rules; this outer `diff -U0` makes an
-          # INDEPENDENT binary determination by scanning the DIFF TEXT it was just
-          # handed -- a different input, on a different threshold. A NUL byte placed
-          # past git's own scan window (or a `.gitattributes`-forced git-text file
-          # that still contains one) can therefore produce a diff git call TEXT but
-          # `diff -U0` calls BINARY -- collapsing to a single "Binary files ... differ"
-          # line instead of the expected two-header unified-diff shape. The blind
-          # `tail -n +3` below assumed that shape unconditionally and dropped this
-          # single line as if it were the two normal headers, leaving `content` EMPTY
-          # -- `changed=0` for a real, unreviewed, unbounded-size change. Must fail
-          # closed here instead, the same way the pre-check above already does for
-          # every OTHER unmeasurable-by-line-count shape.
-          case "$diff_out" in
-            "Binary files "*) : ;;
-            *)
-            content=$(printf '%s\\n' "$diff_out" | tail -n +3 | LC_ALL=C grep -Ev '^[+-]( |@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
-            added=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^+')
-            removed=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^-')
-            changed=$added
-            [ "$removed" -gt "$changed" ] && changed=$removed
-            if [ "$changed" -le "$threshold" ] 2>/dev/null; then
-              exit 0
-            fi
-            ;;
-          esac
+          # diff exits 0 (no diff) or 1 (differences found) on success, 2 on error --
+          # only those two mean diff_out is a usable unified diff of two text files.
+          # The "Binary files" case is defense-in-depth: the NUL scan above should make
+          # it unreachable on GNU/BSD diff (both binary-detect solely on NUL), but a
+          # diff implementation with any other heuristic would print that single line
+          # with exit 1, and `tail -n +3` would then count it as an empty, trivial diff.
+          if [ "$diff_rc" -le 1 ]; then
+            case "$diff_out" in
+              "Binary files "*) : ;;
+              *)
+                content=$(printf '%s\\n' "$diff_out" | tail -n +3 | LC_ALL=C grep -Ev '^[+-]( |@@ |index |diff --git |--- (a/|/dev/null)|\\+\\+\\+ (b/|/dev/null)|old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to )')
+                added=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^+')
+                removed=$(printf '%s\\n' "$content" | LC_ALL=C grep -c '^-')
+                changed=$added
+                [ "$removed" -gt "$changed" ] && changed=$removed
+                if [ "$changed" -le "$threshold" ] 2>/dev/null; then
+                  exit 0
+                fi
+                ;;
+            esac
+          fi
         fi
       fi
     fi

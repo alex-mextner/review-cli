@@ -133,6 +133,18 @@ def _staged_diff(repo: Path) -> str:
     ).stdout
 
 
+def _staged_diff_bytes(repo: Path) -> bytes:
+    """Raw-bytes twin of `_staged_diff` -- `text=True`'s strict UTF-8 decode raises on
+    a genuinely invalid byte sequence (not on a bare NUL, which is valid UTF-8, but
+    tests that construct arbitrary byte content should not depend on that)."""
+    return subprocess.run(
+        ["git", "diff", "--no-ext-diff", "--cached"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+
 def _write_and_stage(repo: Path, name: str, content: str) -> None:
     (repo / name).write_text(content, encoding="utf-8")
     subprocess.run(["git", "add", name], cwd=repo, check=True)
@@ -897,12 +909,7 @@ def test_diff_binary_detection_mismatch_does_not_defeat_the_line_count():
         followup_lines.extend(f"unrev{i}" for i in range(30))
         (repo / "d.txt").write_text("\n".join(followup_lines) + "\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(repo), "add", "d.txt"], check=True)
-        cur_diff_bytes = subprocess.run(
-            ["git", "diff", "--no-ext-diff", "--cached"],
-            cwd=repo,
-            capture_output=True,
-            check=True,
-        ).stdout
+        cur_diff_bytes = _staged_diff_bytes(repo)
         assert b"Binary files" not in cur_diff_bytes, (
             "test setup invalid: git itself must call this a TEXT diff"
         )
@@ -915,6 +922,147 @@ def test_diff_binary_detection_mismatch_does_not_defeat_the_line_count():
             "a real ~30-line unreviewed change must BLOCK even when the inner `diff "
             "-U0` binary-detects on an embedded NUL git itself calls text -- "
             f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+
+def _commit_window_straddling_file(repo: Path) -> str:
+    """Commit `d.txt` with a ~16000-byte first line -- past git's (~8000 byte) and
+    `diff`'s (~1KB/few KB) binary-scan windows but within `grep`'s (~32KB) -- so a
+    NUL inserted right after it lands in the gap between those windows. Returns
+    the committed content (without its trailing newline)."""
+    base_content = "line" + ("x" * 16000) + "\n" + "\n".join(f"a{i}" for i in range(20))
+    (repo / "d.txt").write_text(base_content + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "d.txt"], check=True)
+    _commit_all(repo, "initial: >16000-byte text file")
+    return base_content
+
+
+def _current_side_nul_scenario(repo: Path, followup_line: str) -> subprocess.CompletedProcess:
+    """Shared setup for the pair of tests below: an unrelated reviewed baseline
+    (`a.py`, via `_stage_baseline`), then a SINGLE inserted line `followup_line`
+    (with or without an embedded NUL) into the committed window-straddling `d.txt`,
+    staged as the live follow-up -- 1 line, well under the threshold -- and the
+    hook run against it."""
+    hook = _install_hook(repo)
+    base_content = _commit_window_straddling_file(repo)
+    _stage_baseline(repo)  # an unrelated reviewed baseline (a.py)
+
+    followup_lines = base_content.split("\n")
+    followup_lines.insert(1, followup_line)
+    (repo / "d.txt").write_text("\n".join(followup_lines) + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "d.txt"], check=True)
+    cur_diff_bytes = _staged_diff_bytes(repo)
+    assert b"Binary files" not in cur_diff_bytes, (
+        "test setup invalid: git itself must call this a TEXT diff"
+    )
+    assert (b"\x00" in cur_diff_bytes) == ("\x00" in followup_line), (
+        "test setup invalid: the NUL byte must reach the diff text iff it was inserted"
+    )
+    return _run_hook(hook, repo, {"REVIEW_TRIVIAL_DELTA_LINES": "10"})
+
+
+def test_nul_past_diffs_window_but_within_greps_still_fails_closed():
+    """A NUL positioned past git's (~8000 byte) and `diff`'s (~1KB/few KB) own
+    binary-detection windows, but still within `grep`'s (~32KB), must still block:
+    the gate scans the whole file for a NUL up front rather than trusting either
+    tool's own partial-window heuristic. The follow-up is a SINGLE inserted line
+    (well under the threshold) so that only the current-diff-side NUL check --
+    not an incidentally large line-count delta -- can be responsible for the
+    block (Codex review finding: an earlier version used a 30-line follow-up
+    against a threshold of 10, which would have blocked from the line count alone
+    even with the NUL check removed). Paired with the positive control below."""
+    with _isolated_repo() as repo:
+        proc = _current_side_nul_scenario(repo, "unrev\x00iewed")
+        assert proc.returncode != 0, (
+            "a trivially small (1-line) unreviewed change must still BLOCK when "
+            "the NUL falls in the gap between git's, diff's, and grep's differing "
+            f"binary-scan windows -- stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+
+def test_current_side_without_a_nul_positive_control_takes_the_fast_path():
+    """Positive control for the test above (Opus review finding): the IDENTICAL
+    scenario, except the inserted follow-up line has no NUL, must be accepted via
+    the trivial-delta fast path (exit 0). Without it, `returncode != 0` alone
+    could not distinguish a real current-side NUL detection from the fast path
+    never having been reached at all."""
+    with _isolated_repo() as repo:
+        proc = _current_side_nul_scenario(repo, "unreviewed")
+        assert proc.returncode == 0, (
+            "the identical 1-line scenario WITHOUT a NUL must pass via the fast "
+            f"path -- stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+
+def _baseline_nul_scenario(repo: Path, reviewed_middle_line: str) -> subprocess.CompletedProcess:
+    """Shared setup for the pair of tests below: review-stamp a change to `d.txt`
+    whose inserted middle line is `reviewed_middle_line` (with or without an
+    embedded NUL, past git's and diff's binary-scan windows but within grep's),
+    via `install._write_review_stamp` -- the SAME production entry point a real
+    `review diff --staged` uses, confirmed (reviewlib/install.py) to also write
+    the `review-stamp-diff` companion via `_write_review_stamp_diff`, so this
+    exercises the real baseline path, not a hand-rolled stand-in for it. Then
+    stages a trivially small (2-line), always-clean-text live follow-up on top,
+    reverting the inserted middle line so ONLY the recorded baseline can differ
+    between the two calling tests -- and runs the hook."""
+    base_content = _commit_window_straddling_file(repo)
+
+    reviewed_lines = base_content.split("\n")
+    reviewed_lines.insert(1, reviewed_middle_line)
+    (repo / "d.txt").write_text("\n".join(reviewed_lines) + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "d.txt"], check=True)
+    reviewed_diff = _staged_diff_bytes(repo)
+    assert b"Binary files" not in reviewed_diff, (
+        "test setup invalid: git itself must call the reviewed diff TEXT"
+    )
+    install._write_review_stamp(repo, reviewed_diff.decode("utf-8", errors="replace"))
+
+    # Live follow-up: revert the reviewed middle line and add two clean, trivial
+    # lines instead. Net staged diff from HEAD is always NUL-free and only 2 lines
+    # -- comfortably under the default threshold -- regardless of what the
+    # recorded baseline above contained.
+    final_lines = base_content.split("\n") + ["unrev0", "unrev1"]
+    (repo / "d.txt").write_text("\n".join(final_lines) + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "d.txt"], check=True)
+    cur_diff_bytes = _staged_diff_bytes(repo)
+    assert b"\x00" not in cur_diff_bytes, "test setup invalid: the live staged diff must be clean text"
+
+    hook = _install_hook(repo)
+    return _run_hook(hook, repo, {"REVIEW_TRIVIAL_DELTA_LINES": "10"})
+
+
+def test_nul_in_the_reviewed_baseline_itself_still_fails_closed():
+    """The gate checks BOTH `baseline_tmp` (the on-disk recorded review) and
+    `cur_tmp` (the current staged diff) for a NUL -- this test puts the NUL on the
+    baseline side only, with the live follow-up a TRIVIALLY small, genuinely
+    clean-text change (well under the threshold). Without the baseline-side
+    check, this would wrongly pass via the fast path on line count alone; the
+    recorded review having ever contained a NUL must still force a fall-through
+    to the full review requirement. Paired with the positive control below (Opus
+    review finding): without it, "blocked" alone can't distinguish a real
+    baseline-NUL detection from the trivial-delta block never having run at all
+    (e.g. a broken `review-stamp-diff` write) -- the positive control proves the
+    exact same setup, minus the NUL, exits 0, so the NUL is what flips it."""
+    with _isolated_repo() as repo:
+        proc = _baseline_nul_scenario(repo, "review\x00ed")
+        assert proc.returncode != 0, (
+            "a trivially small, clean-text live follow-up must still BLOCK when "
+            "the RECORDED review baseline itself once contained a NUL -- "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+
+
+def test_baseline_without_a_nul_positive_control_takes_the_fast_path():
+    """Positive control for the test above: the IDENTICAL scenario, except the
+    recorded baseline's inserted line has no NUL -- so the live 2-line follow-up
+    must be accepted via the trivial-delta fast path (exit 0). This is what
+    proves the previous test's block is actually caused by the NUL (not by the
+    trivial-delta block failing to run at all for some unrelated setup reason)."""
+    with _isolated_repo() as repo:
+        proc = _baseline_nul_scenario(repo, "reviewed")
+        assert proc.returncode == 0, (
+            "the identical scenario WITHOUT a NUL in the recorded baseline must "
+            f"pass via the fast path -- stdout={proc.stdout!r} stderr={proc.stderr!r}"
         )
 
 
